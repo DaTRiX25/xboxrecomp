@@ -118,6 +118,8 @@ extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
+extern int xbox_IrqlEnterInterrupt(int level);
+extern void xbox_IrqlLeaveInterrupt(int saved);
 #if defined(_MSC_VER)
 #  define APU_TLS __declspec(thread)
 #else
@@ -170,7 +172,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
-    fn();
+    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
 
@@ -666,6 +668,20 @@ static void *mcpx_apu_frame_thread(void *arg)
             d->set_irq = false;
         }
         apu_deliver_irq(d);
+
+        /* Let the guest in once per frame.
+         *
+         * The thread holds d->lock for its whole loop and only drops it inside
+         * throttle()'s wait. Once voices really play, processing can run
+         * behind real time, throttle never waits, and the lock is never
+         * released -- while every VOICE_ON/OFF/RELEASE the title writes needs
+         * it (voice_lock). A critical section is not fair, so the title's
+         * thread starved there indefinitely: Burnout 3 froze on its vehicle
+         * select, blocked in voice_lock at raised IRQL, which in turn held
+         * off every USB interrupt. */
+        qemu_mutex_unlock(&d->lock);
+        SwitchToThread();
+        qemu_mutex_lock(&d->lock);
     }
 
     qemu_mutex_unlock(&d->lock);
