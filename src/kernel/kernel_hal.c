@@ -50,12 +50,14 @@ static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
  * froze with IRQL raised on the blocked thread. Every change of
  * g_current_irql is published here. */
 extern RECOMP_TLS uint32_t g_fs_base;
-extern ptrdiff_t xbox_GetMemoryOffset(void);
+/* The offset lifted code adds to every guest address; host code that reads
+ * guest memory on its behalf uses the same one. */
+extern ptrdiff_t g_xbox_mem_offset;
 
 static void irql_publish(void)
 {
     if (g_fs_base)
-        *(volatile uint8_t *)((uintptr_t)xbox_GetMemoryOffset() + g_fs_base
+        *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base
                               + 0x24) = (uint8_t)g_current_irql;
 }
 
@@ -133,7 +135,7 @@ static void irql_holder_add(void *ra)
             s_holders[i].ra = ra;
             s_holders[i].guest_esp = g_esp;
             s_holders[i].guest_ra = g_esp
-                ? *(uint32_t *)((uintptr_t)xbox_GetMemoryOffset() + g_esp) : 0;
+                ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
             return;
         }
 }
