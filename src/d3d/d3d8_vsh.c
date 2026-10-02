@@ -910,6 +910,86 @@ static ID3D11InputLayout *create_vsh_input_layout(
 }
 
 /* ================================================================
+ * Input Layouts from NV2A Vertex Attribute Formats
+ *
+ * The pushbuffer describes each of the 16 attribute streams itself
+ * (SET_VERTEX_DATA_ARRAY_FORMAT: type, size, stride), so a backend that
+ * draws from the decoded NV2A state needs no FVF. Each attribute gets its
+ * own input slot, so the streams keep their own strides and offsets and no
+ * CPU gather is needed. The formats D3D11 has no exact match for are
+ * expanded to float4 on the CPU, which d3d8_vsh_nv2a_attr_format reports.
+ * ================================================================ */
+
+DXGI_FORMAT d3d8_vsh_nv2a_attr_format(uint32_t type, uint32_t size,
+                                      int *expand)
+{
+    *expand = 0;
+    switch (type) {
+    case NV2A_VTX_D3DCOLOR:
+        /* 0xAARRGGBB: B,G,R,A in memory, read as R,G,B,A. */
+        if (size == 4)
+            return DXGI_FORMAT_B8G8R8A8_UNORM;
+        break;
+    case NV2A_VTX_FLOAT:
+        switch (size) {
+        case 1: return DXGI_FORMAT_R32_FLOAT;
+        case 2: return DXGI_FORMAT_R32G32_FLOAT;
+        case 3: return DXGI_FORMAT_R32G32B32_FLOAT;
+        case 4: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        }
+        break;
+    case NV2A_VTX_UBYTE:
+        switch (size) {
+        case 1: return DXGI_FORMAT_R8_UNORM;
+        case 2: return DXGI_FORMAT_R8G8_UNORM;
+        case 4: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+        break;
+    case NV2A_VTX_S1:
+        /* SNORM maps -32768 to -1 as well, like the CPU path's clamp. */
+        switch (size) {
+        case 1: return DXGI_FORMAT_R16_SNORM;
+        case 2: return DXGI_FORMAT_R16G16_SNORM;
+        case 4: return DXGI_FORMAT_R16G16B16A16_SNORM;
+        }
+        break;
+    default:
+        /* S32K (shorts used as is: DXGI has no SSCALED) and CMP (11:11:10
+         * signed normalised) have no DXGI format at all. */
+        break;
+    }
+    *expand = 1;
+    return DXGI_FORMAT_R32G32B32A32_FLOAT;
+}
+
+int d3d8_vsh_nv2a_input_layout(uint16_t inputs_read,
+                               const uint32_t type[NV2A_VS_MAX_INPUTS],
+                               const uint32_t size[NV2A_VS_MAX_INPUTS],
+                               D3D11_INPUT_ELEMENT_DESC out[NV2A_VS_MAX_INPUTS])
+{
+    int i, n = 0;
+
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
+        int expand;
+        if (!(inputs_read & (1u << i)))
+            continue;
+        out[n].SemanticName         = "ATTR";
+        out[n].SemanticIndex        = (UINT)i;
+        /* A stream the title did not enable reads its SET_VERTEX_DATA
+         * value: one float4 in a stride-0 buffer. */
+        out[n].Format               = size[i]
+            ? d3d8_vsh_nv2a_attr_format(type[i], size[i], &expand)
+            : DXGI_FORMAT_R32G32B32A32_FLOAT;
+        out[n].InputSlot            = (UINT)i;
+        out[n].AlignedByteOffset    = 0;
+        out[n].InputSlotClass       = D3D11_INPUT_PER_VERTEX_DATA;
+        out[n].InstanceDataStepRate = 0;
+        n++;
+    }
+    return n;
+}
+
+/* ================================================================
  * Shader Compilation and Caching
  * ================================================================ */
 

@@ -413,6 +413,40 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
 int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
                                char *buf, int bufsize);
 
+/* ================================================================
+ * Input layouts from NV2A vertex attribute formats
+ * ================================================================ */
+
+/** NV097_SET_VERTEX_DATA_ARRAY_FORMAT type field. */
+#define NV2A_VTX_D3DCOLOR 0   /* 4 bytes, 0xAARRGGBB */
+#define NV2A_VTX_S1       1   /* signed short, normalised */
+#define NV2A_VTX_FLOAT    2
+#define NV2A_VTX_UBYTE    4   /* unsigned byte, normalised */
+#define NV2A_VTX_S32K     5   /* signed short, not normalised */
+#define NV2A_VTX_CMP      6   /* 11:11:10 signed normalised, one dword */
+
+/**
+ * The DXGI format that reads one NV2A attribute (type, size components)
+ * as the CPU path does. Sets *expand when there is none: the caller then
+ * converts that stream to float4 (R32G32B32A32_FLOAT, 16-byte stride)
+ * before upload. S32K, CMP and 3-component bytes/shorts expand.
+ */
+DXGI_FORMAT d3d8_vsh_nv2a_attr_format(uint32_t type, uint32_t size,
+                                      int *expand);
+
+/**
+ * Input elements for the attributes a program reads (`inputs_read`, from
+ * NV2AVshProgram): ATTR<i> from input slot i at offset 0, so each stream
+ * is bound as its own vertex buffer with its own stride. size[i] == 0
+ * means the stream is not enabled; it gets R32G32B32A32_FLOAT, for a
+ * stride-0 buffer holding the attribute's current SET_VERTEX_DATA value.
+ * Expanded streams also get R32G32B32A32_FLOAT. Returns the count.
+ */
+int d3d8_vsh_nv2a_input_layout(uint16_t inputs_read,
+                               const uint32_t type[NV2A_VS_MAX_INPUTS],
+                               const uint32_t size[NV2A_VS_MAX_INPUTS],
+                               D3D11_INPUT_ELEMENT_DESC out[NV2A_VS_MAX_INPUTS]);
+
 #ifdef __cplusplus
 }
 #endif

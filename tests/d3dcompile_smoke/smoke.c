@@ -12,7 +12,9 @@
  *   4. the HLSL d3d8_vsh_generate_hlsl emits compiles, for every program
  *      given on the command line as a RECOMP_VSH_DUMP file;
  *   5. the HLSL d3d8_combiners_generate_hlsl emits for a one-stage
- *      texture * diffuse state compiles.
+ *      texture * diffuse state compiles;
+ *   6. an input layout built from NV2A attribute formats
+ *      (d3d8_vsh_nv2a_input_layout) matches each program's signature.
  *
  * Exit code 0 only if every step passed. Output goes to stdout and, because
  * Proton drops a GUI process's stdio, also to the file named by
@@ -56,7 +58,8 @@ static PFN_D3DCOMPILE s_compile;
 static ID3D11Device *s_dev;
 
 /* Compile one shader; with a device, also create the shader object. */
-static int compile(const char *what, const char *src, const char *target)
+static int compile_keep(const char *what, const char *src, const char *target,
+                        ID3DBlob **keep)
 {
     ID3DBlob *code = NULL, *err = NULL;
     LARGE_INTEGER f, t0, t1;
@@ -105,8 +108,58 @@ static int compile(const char *what, const char *src, const char *target)
             say("ok   create  %s\n", what);
         }
     }
-    ID3D10Blob_Release(code);
+    if (keep)
+        *keep = code;
+    else
+        ID3D10Blob_Release(code);
     return 1;
+}
+
+static int compile(const char *what, const char *src, const char *target)
+{
+    return compile_keep(what, src, target, NULL);
+}
+
+/* An input layout for the program's inputs, from NV2A attribute formats:
+ * the shapes the title's streams take (float position, D3DCOLOR, CMP
+ * normals, float texcoords), and one stream left disabled. */
+static void check_layout(const char *what, const NV2AVshProgram *prog,
+                         ID3DBlob *code)
+{
+    uint32_t type[NV2A_VS_MAX_INPUTS], size[NV2A_VS_MAX_INPUTS];
+    D3D11_INPUT_ELEMENT_DESC el[NV2A_VS_MAX_INPUTS];
+    ID3D11InputLayout *il = NULL;
+    HRESULT hr;
+    int i, n, expanded = 0;
+
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
+        int e = 0;
+        switch (i) {
+        case 0:  type[i] = NV2A_VTX_FLOAT;    size[i] = 3; break;
+        case 1:  type[i] = NV2A_VTX_CMP;      size[i] = 1; break;
+        case 2:
+        case 3:  type[i] = NV2A_VTX_D3DCOLOR; size[i] = 4; break;
+        case 4:  type[i] = NV2A_VTX_FLOAT;    size[i] = 2; break;
+        default: type[i] = NV2A_VTX_FLOAT;    size[i] = 0; break;
+        }
+        if (size[i] && (prog->inputs_read & (1u << i))) {
+            d3d8_vsh_nv2a_attr_format(type[i], size[i], &e);
+            expanded += e;
+        }
+    }
+    n = d3d8_vsh_nv2a_input_layout(prog->inputs_read, type, size, el);
+    hr = ID3D11Device_CreateInputLayout(s_dev, el, (UINT)n,
+                                        ID3D10Blob_GetBufferPointer(code),
+                                        ID3D10Blob_GetBufferSize(code), &il);
+    if (FAILED(hr)) {
+        say("FAIL layout  %-24s %d elements hr=0x%08lX\n", what, n,
+            (unsigned long)hr);
+        s_fail++;
+    } else {
+        say("ok   layout  %-24s %d elements, %d expanded on the CPU\n", what,
+            n, expanded);
+        ID3D11InputLayout_Release(il);
+    }
 }
 
 static const char k_vs[] =
@@ -160,7 +213,14 @@ static void compile_dump(const char *path)
     }
     if (getenv("SMOKE_PRINT_HLSL"))
         say("--- %s ---\n%s--- end ---\n", name, hlsl);
-    compile(name, hlsl, "vs_5_0");
+    {
+        ID3DBlob *code = NULL;
+        if (compile_keep(name, hlsl, "vs_5_0", &code) && code) {
+            if (s_dev)
+                check_layout(name, &parsed, code);
+            ID3D10Blob_Release(code);
+        }
+    }
 }
 
 static void compile_combiner(void)
