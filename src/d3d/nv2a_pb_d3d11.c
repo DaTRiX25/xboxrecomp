@@ -41,6 +41,7 @@
 #include "d3d8_combiners.h"
 #include "d3d8_swizzle.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_backend_common.h"
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 
@@ -1219,13 +1220,6 @@ static uint32_t *s_texels;
 static size_t    s_texels_cap;
 static ID3D11ShaderResourceView *s_black_srv;   /* too large: (0,0,0,1) */
 static ID3D11ShaderResourceView *s_magenta_srv; /* format not decoded */
-static const uint32_t *s_pal;                   /* P8 palette, while decoding */
-static uint32_t        s_pal_len;
-
-static int tex_size_from_format(uint32_t fmt)
-{
-    return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
-}
 
 static int no_mips(void)
 {
@@ -1253,7 +1247,7 @@ static void build_stages(void)
         memset(t, 0, sizeof *t);
         t->offset = r[0] ? nv2a_pb_dma_resolve(r[0]) : 0;
         t->color = (fmt >> 8) & 0xFF;
-        if (tex_size_from_format(t->color)) {
+        if (nv2a_tex_size_from_format(t->color)) {
             t->width  = 1u << ((fmt >> 20) & 0xF);
             t->height = 1u << ((fmt >> 24) & 0xF);
         } else {
@@ -1262,7 +1256,7 @@ static void build_stages(void)
         }
         /* CONTROL1's pitch means nothing to a swizzled or DXT texture,
          * and left in the cache key a stale one splits it in two. */
-        t->pitch  = tex_size_from_format(t->color) ? 0 : r[0x10 / 4] >> 16;
+        t->pitch  = nv2a_tex_size_from_format(t->color) ? 0 : r[0x10 / 4] >> 16;
         t->addr_u =  r[0x08 / 4]       & 0xF;
         t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
         t->filter = r[0x14 / 4];
@@ -1274,7 +1268,7 @@ static void build_stages(void)
             t->pal_len = 256u >> ((pal >> 2) & 3u);
         }
         t->levels = 1;
-        if (tex_size_from_format(t->color) && !no_mips()) {
+        if (nv2a_tex_size_from_format(t->color) && !no_mips()) {
             /* As xemu's pgraph_get_texture_shape: the format's count, no
              * more than MAX_LOD_CLAMP + 1, none smaller than 1x1. The
              * clamps are whole levels (xemu reads the 12-bit fields as is). */
@@ -1288,7 +1282,7 @@ static void build_stages(void)
             t->lod_max = lmax < t->levels - 1u ? lmax : t->levels - 1u;
         }
         t->valid = t->offset && t->width && t->height
-                && (tex_size_from_format(t->color) || t->pitch)
+                && (nv2a_tex_size_from_format(t->color) || t->pitch)
                 && (t->color != 0x0B || t->palette);
         if (n == 0 && !set[0x0C / 4])
             on = 1;                        /* never configured: as the CPU path */
@@ -1320,224 +1314,17 @@ static void build_stages(void)
     }
 }
 
-/* The linear format with the same texel encoding as a swizzled one. */
-static uint32_t linear_twin(uint32_t fmt)
-{
-    switch (fmt) {
-    case 0x00: return 0x13;
-    case 0x02: return 0x10;
-    case 0x03: return 0x1C;
-    case 0x04: return 0x1D;
-    case 0x05: return 0x11;
-    case 0x06: return 0x12;
-    case 0x07: return 0x1E;
-    case 0x19: return 0x1F;
-    case 0x01: return 0x1B;     /* AY8 */
-    case 0x1A: return 0x20;     /* A8Y8 */
-    case 0x27: return 0x37;     /* R6G5B5 */
-    case 0x28: return 0x17;     /* G8B8 */
-    case 0x32: return 0x35;     /* Y16 */
-    case 0x38: return 0x3D;     /* R5G5B5A1 */
-    case 0x39: return 0x3E;     /* R4G4B4A4 */
-    case 0x3A: return 0x3F;     /* A8B8G8R8 */
-    case 0x3B: return 0x40;     /* B8G8R8A8 */
-    case 0x3C: return 0x41;     /* R8G8B8A8 */
-    default:   return fmt;      /* already linear, P8, or not decoded */
-    }
-}
-
-static uint32_t texel_bytes(uint32_t lin)
-{
-    switch (lin) {
-    case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
-    case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25:
-    case 0x20: case 0x37: case 0x35: case 0x3D: case 0x3E: case 0x17: return 2;
-    case 0x13: case 0x1F: case 0x1B: case 0x0B: return 1;
-    default: return 0;
-    }
-}
-
 /* Bytes of guest memory the texture occupies; 0 if it cannot be decoded. */
 static uint32_t tex_extent(const Stage *t)
 {
-    uint32_t bb = d3d8_format_dxt_block_bytes(t->color), tb, l, w, h, n = 0;
     if (!t->valid || (uint64_t)t->width * t->height > TEX_MAX_TEXELS)
         return 0;
-    if (bb || d3d8_format_is_swizzled(t->color)) {
-        tb = bb ? 0 : texel_bytes(linear_twin(t->color));
-        if (!bb && !tb)
-            return 0;
-        for (l = 0, w = t->width, h = t->height; l < t->levels; l++) {
-            n += bb ? ((w + 3u) / 4u) * ((h + 3u) / 4u) * bb : w * h * tb;
-            w = w > 1 ? w / 2 : 1;
-            h = h > 1 ? h / 2 : 1;
-        }
-        return n;
-    }
-    tb = texel_bytes(t->color);
-    if (!tb || !t->pitch)
-        return 0;
-    return t->pitch * (t->height - 1u) + t->width * tb;
+    return nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
 }
 
 static uint64_t tex_hash(const uint8_t *p, uint32_t n)
 {
-    uint64_t h = 0xCBF29CE484222325ull;
-    uint64_t l[4] = { h, h ^ 1u, h ^ 2u, h ^ 3u };
-    uint32_t i;
-    for (i = 0; i + 32 <= n; i += 32) {
-        uint64_t w[4];
-        memcpy(w, p + i, 32);
-        l[0] = (l[0] ^ w[0]) * 0x100000001B3ull;
-        l[1] = (l[1] ^ w[1]) * 0x100000001B3ull;
-        l[2] = (l[2] ^ w[2]) * 0x100000001B3ull;
-        l[3] = (l[3] ^ w[3]) * 0x100000001B3ull;
-    }
-    for (; i < n; i++)
-        l[0] = (l[0] ^ p[i]) * 0x100000001B3ull;
-    return (l[0] ^ (l[1] << 1) ^ (l[2] << 2) ^ (l[3] << 3)) * 0x100000001B3ull;
-}
-
-static uint8_t clamp255(int x) { return (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x); }
-
-/* One texel as A8R8G8B8, from texel index u of the row at p (linear
- * formats; for swizzled ones p is the image base and u the Morton index). */
-static uint32_t decode_texel(uint32_t fmt, const uint8_t *p, uint32_t u)
-{
-    uint32_t t;
-    switch (fmt) {
-    case 0x12: return ((const uint32_t *)p)[u];
-    case 0x1E: return ((const uint32_t *)p)[u] | 0xFF000000u;
-    case 0x3F:
-        t = ((const uint32_t *)p)[u];
-        return (t & 0xFF00FF00u) | ((t & 0xFF) << 16) | ((t >> 16) & 0xFF);
-    case 0x40:
-        t = ((const uint32_t *)p)[u];
-        return ((t & 0xFFu) << 24) | (((t >> 8) & 0xFFu) << 16)
-             | (((t >> 16) & 0xFFu) << 8) | ((t >> 24) & 0xFFu);
-    case 0x41:
-        t = ((const uint32_t *)p)[u];
-        return ((t & 0xFFu) << 24) | (t >> 8);
-    case 0x10:
-        t = ((const uint16_t *)p)[u];
-        return ((t & 0x8000u) ? 0xFF000000u : 0u)
-             | (d3d8_expand_channel((t >> 10) & 0x1F, 5) << 16)
-             | (d3d8_expand_channel((t >> 5) & 0x1F, 5) << 8)
-             |  d3d8_expand_channel(t & 0x1F, 5);
-    case 0x1C:
-        t = ((const uint16_t *)p)[u];
-        return 0xFF000000u
-             | (d3d8_expand_channel((t >> 10) & 0x1F, 5) << 16)
-             | (d3d8_expand_channel((t >> 5) & 0x1F, 5) << 8)
-             |  d3d8_expand_channel(t & 0x1F, 5);
-    case 0x11:
-        t = ((const uint16_t *)p)[u];
-        return 0xFF000000u
-             | (d3d8_expand_channel((t >> 11) & 0x1F, 5) << 16)
-             | (d3d8_expand_channel((t >> 5) & 0x3F, 6) << 8)
-             |  d3d8_expand_channel(t & 0x1F, 5);
-    case 0x1D:
-        t = ((const uint16_t *)p)[u];
-        return (d3d8_expand_channel((t >> 12) & 0xF, 4) << 24)
-             | (d3d8_expand_channel((t >> 8) & 0xF, 4) << 16)
-             | (d3d8_expand_channel((t >> 4) & 0xF, 4) << 8)
-             |  d3d8_expand_channel(t & 0xF, 4);
-    case 0x13:
-        t = p[u];
-        return 0xFF000000u | (t << 16) | (t << 8) | t;
-    case 0x1F:
-        return ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
-    case 0x1B:                              /* AY8: Y in all four */
-        return (uint32_t)p[u] * 0x01010101u;
-    case 0x20:                              /* A8Y8: Y low byte, A high */
-        t = ((const uint16_t *)p)[u];
-        return ((t >> 8) << 24) | (t & 0xFFu) * 0x010101u;
-    case 0x17:                              /* G8B8: xemu RG8, swizzle (R,G,R,G) */
-        t = ((const uint16_t *)p)[u];
-        return ((t >> 8) << 24) | ((t & 0xFFu) << 16) | ((t >> 8) << 8) | (t & 0xFFu);
-    case 0x35:                              /* Y16: top byte */
-        t = ((const uint16_t *)p)[u] >> 8;
-        return 0xFF000000u | t * 0x010101u;
-    case 0x37:                              /* R6G5B5 */
-        t = ((const uint16_t *)p)[u];
-        return 0xFF000000u
-             | (d3d8_expand_channel((t >> 10) & 0x3F, 6) << 16)
-             | (d3d8_expand_channel((t >> 5) & 0x1F, 5) << 8)
-             |  d3d8_expand_channel(t & 0x1F, 5);
-    case 0x3D:                              /* R5G5B5A1 */
-        t = ((const uint16_t *)p)[u];
-        return ((t & 1u) ? 0xFF000000u : 0u)
-             | (d3d8_expand_channel((t >> 11) & 0x1F, 5) << 16)
-             | (d3d8_expand_channel((t >> 6) & 0x1F, 5) << 8)
-             |  d3d8_expand_channel((t >> 1) & 0x1F, 5);
-    case 0x3E:                              /* R4G4B4A4 */
-        t = ((const uint16_t *)p)[u];
-        return (d3d8_expand_channel(t & 0xF, 4) << 24)
-             | (d3d8_expand_channel((t >> 12) & 0xF, 4) << 16)
-             | (d3d8_expand_channel((t >> 8) & 0xF, 4) << 8)
-             |  d3d8_expand_channel((t >> 4) & 0xF, 4);
-    case 0x0B:                              /* P8, through the palette */
-        t = p[u];
-        return t < s_pal_len ? s_pal[t] : 0xFFFF00FFu;
-    case 0x24:                              /* YUY2 */
-    case 0x25: {                            /* UYVY */
-        uint32_t yoff = (fmt == 0x24) ? 0u : 1u;
-        const uint8_t *g = p + (size_t)(u & ~1u) * 2;
-        int c  = (int)g[(u & 1u) ? 2 + yoff : yoff] - 16;
-        int cu = (int)g[1 - yoff] - 128;
-        int cv = (int)g[3 - yoff] - 128;
-        return 0xFF000000u
-             | ((uint32_t)clamp255((298 * c + 409 * cv + 128) >> 8) << 16)
-             | ((uint32_t)clamp255((298 * c - 100 * cu - 208 * cv + 128) >> 8) << 8)
-             |  (uint32_t)clamp255((298 * c + 516 * cu + 128) >> 8);
-    }
-    default:
-        return 0;
-    }
-}
-
-/* Level l's size: halved per level, never below 1. */
-static uint32_t level_dim(uint32_t d, uint32_t l)
-{
-    d >>= l;
-    return d ? d : 1u;
-}
-
-/* Texels in levels 0..levels-1, the size s_texels needs. */
-static size_t tex_texels(const Stage *t)
-{
-    size_t n = 0;
-    uint32_t l;
-    for (l = 0; l < t->levels; l++)
-        n += (size_t)level_dim(t->width, l) * level_dim(t->height, l);
-    return n;
-}
-
-/* One swizzled or DXT level of w x h at mem into out (A8R8G8B8); returns
- * the guest bytes it took, which is where the next level starts. */
-static uint32_t decode_level(const uint8_t *mem, uint32_t fmt, uint32_t w,
-                             uint32_t h, uint32_t *out)
-{
-    uint32_t x, y, bb = d3d8_format_dxt_block_bytes(fmt);
-    if (bb) {
-        for (y = 0; y < h; y++)
-            for (x = 0; x < w; x++) {
-                uint32_t argb = 0;
-                d3d8_dxt_decode_texel(mem, fmt, x, y, w, &argb);
-                out[(size_t)y * w + x] = argb;
-            }
-        return ((w + 3u) / 4u) * ((h + 3u) / 4u) * bb;
-    } else {
-        uint32_t mx, my, lin = linear_twin(fmt);
-        xbox_swizzle_masks(w, h, &mx, &my);
-        for (y = 0; y < h; y++) {
-            uint32_t oy = swizzle_deposit(y, my);
-            for (x = 0; x < w; x++)
-                out[(size_t)y * w + x] =
-                    decode_texel(lin, mem, swizzle_deposit(x, mx) | oy);
-        }
-        return w * h * texel_bytes(lin);
-    }
+    return nv2a_tex_hash(p, n, NV2A_TEX_HASH_SEED);
 }
 
 /* The whole texture into s_texels (A8R8G8B8): level 0 (width x height),
@@ -1545,8 +1332,8 @@ static uint32_t decode_level(const uint8_t *mem, uint32_t fmt, uint32_t w,
 static int decode_texture(const Stage *t)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset() + t->offset;
-    size_t n = tex_texels(t);
-    uint32_t x, y, fmt = t->color;
+    size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
+    const uint32_t *pal = NULL;
 
     if (n > s_texels_cap) {
         uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
@@ -1555,25 +1342,11 @@ static int decode_texture(const Stage *t)
         s_texels = p;
         s_texels_cap = n;
     }
-    if (fmt == 0x0B) {
-        s_pal = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset()
-                                   + t->palette);
-        s_pal_len = t->pal_len;
-    }
-    if (tex_size_from_format(fmt)) {
-        uint32_t *out = s_texels, l;
-        for (l = 0; l < t->levels; l++) {
-            uint32_t w = level_dim(t->width, l), h = level_dim(t->height, l);
-            mem += decode_level(mem, fmt, w, h, out);
-            out += (size_t)w * h;
-        }
-        return 1;
-    }
-    for (y = 0; y < t->height; y++) {
-        const uint8_t *row = mem + (size_t)y * t->pitch;
-        for (x = 0; x < t->width; x++)
-            s_texels[(size_t)y * t->width + x] = decode_texel(fmt, row, x);
-    }
+    if (t->color == NV2A_TEX_P8)
+        pal = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset()
+                                 + t->palette);
+    nv2a_tex_decode(mem, t->color, t->width, t->height, t->pitch, t->levels,
+                    pal, pal ? t->pal_len : 0, s_texels);
     return 1;
 }
 
@@ -1604,7 +1377,7 @@ static int tex_upload(TexEntry *e, const Stage *t)
         }
     }
     for (l = 0, src = s_texels; l < t->levels; l++) {
-        uint32_t w = level_dim(t->width, l), h = level_dim(t->height, l);
+        uint32_t w = nv2a_tex_level_dim(t->width, l), h = nv2a_tex_level_dim(t->height, l);
         ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex,
                                               l, NULL, src, w * 4, 0);
         src += (size_t)w * h;
@@ -2020,7 +1793,7 @@ static RenderTarget *rt_texture(const Stage *t)
     if (off)
         return NULL;
     if (!t->offset || d3d8_format_dxt_block_bytes(t->color)
-            || texel_bytes(linear_twin(t->color)) != 4)
+            || nv2a_tex_texel_bytes(nv2a_tex_linear_twin(t->color)) != 4)
         return NULL;
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
@@ -2117,7 +1890,7 @@ static ID3D11PixelShader *setup_pixel(void)
     memset(&pc, 0, sizeof pc);
     for (n = 0; n < 4; n++) {
         const Stage *t = &s_stage[n];
-        int scaled = tex_size_from_format(t->color);
+        int scaled = nv2a_tex_size_from_format(t->color);
         RenderTarget *src = (t->mode && t->mode != 4) ? rt_texture(t) : NULL;
         pc.tex_mode[n] = (uint32_t)t->mode;
         pc.tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;

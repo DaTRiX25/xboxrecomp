@@ -37,6 +37,7 @@
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_cpu.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_backend_common.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -295,15 +296,6 @@ static int s_unhandled_count;
 static uint32_t s_tex_reg[NV_TEX_REGS];
 static uint8_t  s_tex_set[NV_TEX_REGS];
 
-/* Formats whose dimensions come from the format word and whose coordinates
- * arrive normalised, rather than from a pitch and SET_TEXTURE_IMAGE_RECT with
- * coordinates in texels. Swizzled and block-compressed are both in this group,
- * and every place that used to test only for swizzled needs the pair. */
-static int tex_size_from_format(uint32_t fmt)
-{
-    return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
-}
-
 static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
@@ -314,7 +306,7 @@ static void record_tex_reg(uint32_t method, uint32_t param)
      * left the title's own textures unsampled and every textured quad drawn in
      * flat vertex colour. */
     s_gpu.tex.valid = s_gpu.tex.offset && s_gpu.tex.width && s_gpu.tex.height
-                   && (tex_size_from_format(s_gpu.tex.color)
+                   && (nv2a_tex_size_from_format(s_gpu.tex.color)
                        || s_gpu.tex.pitch);
 }
 
@@ -1181,43 +1173,6 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
     return c >= size ? size - 1 : c;       /* clamp, and everything else */
 }
 
-static uint32_t expand(uint32_t v, uint32_t bits)
-{
-    return d3d8_expand_channel(v, bits);
-}
-
-/* The linear format that decodes the same texels as a swizzled one.
- *
- * Swizzling changes where a texel lives, not what it says: A8R8G8B8 (0x06) and
- * LIN_A8R8G8B8 (0x12) are the same four bytes in the same order. So the whole
- * difference is the address calculation, and one of those lets every format
- * below serve both. Pairs read off the table in d3d8_xbox.h rather than
- * recalled -- the comment above this one is about getting exactly that wrong. */
-static uint32_t linear_twin(uint32_t fmt)
-{
-    switch (fmt) {
-    case 0x00: return 0x13;                /* L8        -> LIN_L8        */
-    case 0x02: return 0x10;                /* A1R5G5B5  -> LIN_A1R5G5B5  */
-    case 0x03: return 0x1C;                /* X1R5G5B5  -> LIN_X1R5G5B5  */
-    case 0x04: return 0x1D;                /* A4R4G4B4  -> LIN_A4R4G4B4  */
-    case 0x05: return 0x11;                /* R5G6B5    -> LIN_R5G6B5    */
-    case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
-    case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
-    case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
-    case 0x01: return 0x1B;                /* AY8       -> LIN_AY8       */
-    case 0x1A: return 0x20;                /* A8Y8      -> LIN_A8Y8      */
-    case 0x27: return 0x37;                /* R6G5B5    -> LIN_R6G5B5    */
-    case 0x28: return 0x17;                /* G8B8      -> LIN_G8B8      */
-    case 0x32: return 0x35;                /* Y16       -> LIN_Y16       */
-    case 0x38: return 0x3D;                /* R5G5B5A1  -> LIN_R5G5B5A1  */
-    case 0x39: return 0x3E;                /* R4G4B4A4  -> LIN_R4G4B4A4  */
-    case 0x3A: return 0x3F;                /* A8B8G8R8  -> LIN_A8B8G8R8  */
-    case 0x3B: return 0x40;                /* B8G8R8A8  -> LIN_B8G8R8A8  */
-    case 0x3C: return 0x41;                /* R8G8B8A8  -> LIN_R8G8B8A8  */
-    default:   return fmt;                 /* already linear, P8, or unhandled */
-    }
-}
-
 static uint64_t s_tex_fail[256];        /* texels refused, by format code */
 
 /* SET_TEXTURE_PALETTE (0x1B20 + 0x40 * stage): the DMA offset in bits 6-31,
@@ -1253,182 +1208,28 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
          * v*pitch + u, so index from the base of the image. The switch below
          * casts to each format's own width, which makes that index a texel
          * index for every one of them. */
-        fmt = linear_twin(fmt);
+        fmt = nv2a_tex_linear_twin(fmt);
         p = mem + t->offset;
         u = swizzle_offset(u, v, t->width, t->height);
     } else {
         p = mem + t->offset + (size_t)v * t->pitch;
     }
 
-    switch (fmt) {
-
-    /* 32-bit, alpha-red-green-blue in the dword. */
-    case 0x12:                                      /* LIN_A8R8G8B8 */
-        *argb = ((const uint32_t *)p)[u];
-        return 1;
-    case 0x1E:                                      /* LIN_X8R8G8B8 */
-        *argb = ((const uint32_t *)p)[u] | 0xFF000000u;
-        return 1;
-
-    /* 32-bit, other channel orders. The name gives the byte order from the
-     * top of the dword down, so each is a permutation of the same four. */
-    case 0x3F: {                                    /* LIN_A8B8G8R8 */
-        uint32_t t = ((const uint32_t *)p)[u];
-        *argb = (t & 0xFF00FF00u) | ((t & 0xFF) << 16) | ((t >> 16) & 0xFF);
-        return 1;
-    }
-    case 0x40: {                                    /* LIN_B8G8R8A8 */
-        uint32_t t = ((const uint32_t *)p)[u];
-        *argb = ((t & 0xFFu) << 24)                 /* A, from the bottom */
-              | (((t >>  8) & 0xFFu) << 16)         /* R */
-              | (((t >> 16) & 0xFFu) <<  8)         /* G */
-              |  ((t >> 24) & 0xFFu);               /* B, from the top */
-        return 1;
-    }
-    case 0x41: {                                    /* LIN_R8G8B8A8 */
-        uint32_t t = ((const uint32_t *)p)[u];
-        *argb = ((t & 0xFFu) << 24) | (t >> 8);
-        return 1;
-    }
-
-    /* 16-bit. */
-    case 0x10: {                                    /* LIN_A1R5G5B5 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = ((t & 0x8000u) ? 0xFF000000u : 0u)
-              | (expand((t >> 10) & 0x1F, 5) << 16)
-              | (expand((t >>  5) & 0x1F, 5) <<  8)
-              |  expand( t        & 0x1F, 5);
-        return 1;
-    }
-    case 0x1C: {                                    /* LIN_X1R5G5B5 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = 0xFF000000u
-              | (expand((t >> 10) & 0x1F, 5) << 16)
-              | (expand((t >>  5) & 0x1F, 5) <<  8)
-              |  expand( t        & 0x1F, 5);
-        return 1;
-    }
-    case 0x11: {                                    /* LIN_R5G6B5 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = 0xFF000000u
-              | (expand((t >> 11) & 0x1F, 5) << 16)
-              | (expand((t >>  5) & 0x3F, 6) <<  8)
-              |  expand( t        & 0x1F, 5);
-        return 1;
-    }
-    case 0x1D: {                                    /* LIN_A4R4G4B4 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = (expand((t >> 12) & 0x0F, 4) << 24)
-              | (expand((t >>  8) & 0x0F, 4) << 16)
-              | (expand((t >>  4) & 0x0F, 4) <<  8)
-              |  expand( t        & 0x0F, 4);
-        return 1;
-    }
-
-    /* 8-bit. */
-    case 0x13: {                                    /* LIN_L8 */
-        uint32_t t = p[u];
-        *argb = 0xFF000000u | (t << 16) | (t << 8) | t;
-        return 1;
-    }
-    case 0x1F:                                      /* LIN_A8 */
-        *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
-        return 1;
-    case 0x1B:                                      /* LIN_AY8: Y in all four */
-        *argb = (uint32_t)p[u] * 0x01010101u;
-        return 1;
-    case 0x0B: {                                    /* P8, through the palette */
-        uint32_t len, i = p[u];
+    if (fmt == NV2A_TEX_P8) {
+        uint32_t len;
         const uint32_t *pal = tex_palette(t, &len);
-        *argb = (pal && i < len) ? pal[i] : 0xFFFF00FFu;
-        return 1;
+        return nv2a_tex_decode_texel(fmt, p, u, pal, len, argb);
     }
-
-    /* 16-bit, the rest of the D3D8 set. */
-    case 0x20: {                                    /* LIN_A8Y8: Y low, A high */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = ((t >> 8) << 24) | (t & 0xFFu) * 0x010101u;
+    if (nv2a_tex_decode_texel(fmt, p, u, NULL, 0, argb))
         return 1;
-    }
-    case 0x17: {                                    /* LIN_G8B8 (and V8U8) */
-        /* xemu's table loads it as GL_RG8 (low byte red, high byte green)
-         * and swizzles to (R, G, R, G): so B and R are the low byte, G and
-         * A the high one. A bump-map stage reads it back from b and g. */
-        uint32_t t = ((const uint16_t *)p)[u], lo = t & 0xFFu, hi = t >> 8;
-        *argb = (hi << 24) | (lo << 16) | (hi << 8) | lo;
-        return 1;
-    }
-    case 0x35: {                                    /* LIN_Y16: top byte */
-        uint32_t t = ((const uint16_t *)p)[u] >> 8;
-        *argb = 0xFF000000u | t * 0x010101u;
-        return 1;
-    }
-    case 0x37: {                                    /* LIN_R6G5B5 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = 0xFF000000u
-              | (expand((t >> 10) & 0x3F, 6) << 16)
-              | (expand((t >>  5) & 0x1F, 5) <<  8)
-              |  expand( t        & 0x1F, 5);
-        return 1;
-    }
-    case 0x3D: {                                    /* LIN_R5G5B5A1 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = ((t & 1u) ? 0xFF000000u : 0u)
-              | (expand((t >> 11) & 0x1F, 5) << 16)
-              | (expand((t >>  6) & 0x1F, 5) <<  8)
-              |  expand((t >>  1) & 0x1F, 5);
-        return 1;
-    }
-    case 0x3E: {                                    /* LIN_R4G4B4A4 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = (expand( t        & 0x0F, 4) << 24)
-              | (expand((t >> 12) & 0x0F, 4) << 16)
-              | (expand((t >>  8) & 0x0F, 4) <<  8)
-              |  expand((t >>  4) & 0x0F, 4);
-        return 1;
-    }
-
-    /* 4:2:2 packed YUV, two texels per four bytes.
-     *
-     * This is how a title hands over a decoded video frame, and without it
-     * the frame falls through to `default` -- which returns 0, so the caller
-     * paints the quad's vertex colour and the movie is a flat rectangle.
-     *
-     * The chroma pair is shared between an even texel and the one after it,
-     * so the group is found by masking the bottom bit of the index. BT.601,
-     * the same coefficients the D3D8 upload path converts with, so the two
-     * paths agree rather than each having its own idea of the colour. */
-    case 0x24:                                      /* LC_CR8YB8CB8YA8, YUY2 */
-    case 0x25: {                                    /* LC_YB8CR8YA8CB8, UYVY */
-        uint32_t yoff = (fmt == 0x24) ? 0u : 1u;
-        const uint8_t *g = p + (size_t)(u & ~1u) * 2;
-        int c  = (int)g[(u & 1u) ? 2 + yoff : yoff] - 16;
-        int cu = (int)g[1 - yoff] - 128;
-        int cv = (int)g[3 - yoff] - 128;
-        int r = (298 * c + 409 * cv + 128) >> 8;
-        int gg = (298 * c - 100 * cu - 208 * cv + 128) >> 8;
-        int b = (298 * c + 516 * cu + 128) >> 8;
-        if (r < 0) r = 0;
-        if (r > 255) r = 255;
-        if (gg < 0) gg = 0;
-        if (gg > 255) gg = 255;
-        if (b < 0) b = 0;
-        if (b > 255) b = 255;
-        *argb = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)gg << 8)
-              | (uint32_t)b;
-        return 1;
-    }
-
-    default:
-        /* Magenta, so an undecoded format shows up as itself rather than as
-         * the vertex colour (which made BLiNX 2's P8 and G8B8 surfaces look
-         * like plain white boxes). Logged once per format. */
-        if (!s_tex_fail[t->color & 0xFF]++)
-            fprintf(stderr, "  [GPU] texture format 0x%02X has no decoder;"
-                            " sampling magenta\n", t->color);
-        *argb = 0xFFFF00FFu;
-        return 1;
-    }
+    /* Magenta, so an undecoded format shows up as itself rather than as the
+     * vertex colour (which made BLiNX 2's P8 and G8B8 surfaces look like
+     * plain white boxes). Logged once per format. */
+    if (!s_tex_fail[t->color & 0xFF]++)
+        fprintf(stderr, "  [GPU] texture format 0x%02X has no decoder;"
+                        " sampling magenta\n", t->color);
+    *argb = NV2A_TEX_MAGENTA;
+    return 1;
 }
 
 static Texture s_stage_tex[4];          /* defined with the stage state below */
@@ -1810,7 +1611,7 @@ static int fetch_texcoord(uint32_t index, float out[2])
         return 0;
     out[0] = t[0];
     out[1] = t[1];
-    if (tex_size_from_format(s_gpu.tex.color)) {
+    if (nv2a_tex_size_from_format(s_gpu.tex.color)) {
         out[0] *= (float)s_gpu.tex.width;
         out[1] *= (float)s_gpu.tex.height;
     }
@@ -2645,7 +2446,7 @@ static void tex_log_note(int stage, const Texture *t, uint32_t fmtw,
     uint32_t dummy;
     if (!tex_log_on())
         return;
-    if (tex_size_from_format(t->color)) {
+    if (nv2a_tex_size_from_format(t->color)) {
         /* A swizzled or compressed texture has no pitch or image rect; the
          * registers keep whatever a linear one last left there. */
         ctl1 = rect = 0;
@@ -2783,7 +2584,7 @@ static void vsh_build_stages(void)
         memset(t, 0, sizeof *t);
         t->offset = r[0] ? dma_resolve(r[0]) : 0;
         t->color = (fmt >> 8) & 0xFF;
-        if (tex_size_from_format(t->color)) {
+        if (nv2a_tex_size_from_format(t->color)) {
             t->width  = 1u << ((fmt >> 20) & 0xF);
             t->height = 1u << ((fmt >> 24) & 0xF);
         } else {
@@ -2794,7 +2595,7 @@ static void vsh_build_stages(void)
         t->addr_u =  r[0x08 / 4]       & 0xF;
         t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
         t->valid = t->offset && t->width && t->height
-                && (tex_size_from_format(t->color) || t->pitch);
+                && (nv2a_tex_size_from_format(t->color) || t->pitch);
         if (n == 0 && !set[0x0C / 4])
             on = 1;                        /* never configured: as before */
         if (s_vsh.shader_set)
@@ -2807,8 +2608,8 @@ static void vsh_build_stages(void)
         s_stage_mode[n] = mode;
         if (mode != 0 && mode != 4)
             tex_log_note(n, t, fmt, r[0x10 / 4], r[0x1C / 4]);
-        s_stage_scale[n][0] = tex_size_from_format(t->color) ? (float)t->width : 1.0f;
-        s_stage_scale[n][1] = tex_size_from_format(t->color) ? (float)t->height : 1.0f;
+        s_stage_scale[n][0] = nv2a_tex_size_from_format(t->color) ? (float)t->width : 1.0f;
+        s_stage_scale[n][1] = nv2a_tex_size_from_format(t->color) ? (float)t->height : 1.0f;
     }
 }
 
@@ -3263,53 +3064,14 @@ static uint32_t       s_tc_clock;
 static uint64_t       s_tc_tiles_filled, s_tc_refp, s_tc_dropped, s_tc_binds;
 static uint64_t       s_tc_feedback;    /* binds read live: texture is the target */
 
-/* Bytes per texel of a format sample_tex reads directly, 0 if it does not. */
-static uint32_t tc_texel_bytes(uint32_t lin)
-{
-    switch (lin) {
-    case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
-    case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25:
-    case 0x20: case 0x35: case 0x37: case 0x3D: case 0x3E: case 0x17: return 2;
-    case 0x13: case 0x1F: case 0x1B: return 1;    /* not P8: its palette is not in the key */
-    default: return 0;
-    }
-}
-
-/* Bytes the sampler can read for this texture, 0 if it is not cacheable. */
+/* Bytes the sampler can read for this texture, 0 if it is not cacheable:
+ * level 0 only, and not P8, whose palette is not in the key. */
 static uint32_t tc_extent(const Texture *t)
 {
-    uint32_t bb = d3d8_format_dxt_block_bytes(t->color), tb;
-    if (!t->valid || !t->width || !t->height
+    if (!t->valid || !t->width || !t->height || t->color == NV2A_TEX_P8
             || (uint64_t)t->width * t->height > TC_MAX_TEXELS)
         return 0;
-    if (bb)
-        return ((t->width + 3u) / 4u) * ((t->height + 3u) / 4u) * bb;
-    if (d3d8_format_is_swizzled(t->color)) {
-        tb = tc_texel_bytes(linear_twin(t->color));
-        return tb ? t->width * t->height * tb : 0;
-    }
-    tb = tc_texel_bytes(t->color);
-    if (!tb || !t->pitch)
-        return 0;
-    return t->pitch * (t->height - 1u) + t->width * tb;
-}
-
-/* FNV-style, four independent lanes so it runs at memory speed. */
-static uint64_t tc_hash(const uint8_t *p, uint32_t n, uint64_t h)
-{
-    uint64_t l[4] = { h, h ^ 1u, h ^ 2u, h ^ 3u };
-    uint32_t i;
-    for (i = 0; i + 32 <= n; i += 32) {
-        uint64_t w[4];
-        memcpy(w, p + i, 32);
-        l[0] = (l[0] ^ w[0]) * 0x100000001B3ull;
-        l[1] = (l[1] ^ w[1]) * 0x100000001B3ull;
-        l[2] = (l[2] ^ w[2]) * 0x100000001B3ull;
-        l[3] = (l[3] ^ w[3]) * 0x100000001B3ull;
-    }
-    for (; i < n; i++)
-        l[0] = (l[0] ^ p[i]) * 0x100000001B3ull;
-    return (l[0] ^ (l[1] << 1) ^ (l[2] << 2) ^ (l[3] << 3)) * 0x100000001B3ull;
+    return nv2a_tex_extent(t->color, t->width, t->height, t->pitch, 1);
 }
 
 /* The texture's bytes, all of them.
@@ -3323,7 +3085,7 @@ static uint64_t tc_hash(const uint8_t *p, uint32_t n, uint64_t h)
 static uint64_t tc_fingerprint(const Texture *t, uint32_t bytes)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset() + t->offset;
-    return tc_hash(mem, bytes, 0xCBF29CE484222325ull);
+    return nv2a_tex_hash(mem, bytes, NV2A_TEX_HASH_SEED);
 }
 
 static TexCacheEntry *tc_bind(const Texture *t)
@@ -5965,7 +5727,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * only uses swizzled textures never sends one -- this title sends it
          * once and sets a format 3,176 times. Without this the width and
          * height stayed zero and nothing was ever sampled. */
-        if (tex_size_from_format((param >> 8) & 0xFF)) {
+        if (nv2a_tex_size_from_format((param >> 8) & 0xFF)) {
             s_gpu.tex.width  = 1u << ((param >> 20) & 0xF);
             s_gpu.tex.height = 1u << ((param >> 24) & 0xF);
         }
