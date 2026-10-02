@@ -385,10 +385,17 @@ static void test_threads(void)
           G32(obj2 + 0x120) == 0,
           "returning signals it with STATUS_SUCCESS (via a duplicate)", d);
     obderef(obj2);
-    /* Not checked: that the duplicate outlives the first handle. On POSIX
-     * DuplicateHandle returns the same pointer and bridge_handle_token
-     * dedupes, so both are one token -- true of every handle kind. */
+    snprintf(d, sizeof d, "source 0x%08X duplicate 0x%08X", h2, dup);
+    check(dup != 0 && dup != h2, "NtDuplicateObject gives a new token", d);
     CALL(ORD_NTCLOSE, h2);
+    st = CALL(ORD_NTWAIT, dup, 0, 0);
+    snprintf(d, sizeof d, "status 0x%08X", st);
+    check(st == 0, "the duplicate outlives the first handle", d);
+    obj2 = obref(dup);
+    check(obj2 && obj2 != 0xCCCCCCCCu && G8(obj2) == 6,
+          "the duplicate still leads to the thread object", NULL);
+    obderef(obj2);
+    CALL(ORD_NTCLOSE, dup);
 
     obj = obref(0xFFFFFFFEu);
     check(obj && obj != 0xCCCCCCCCu && G8(obj) == 6 && G32(obj + 4) == 0,

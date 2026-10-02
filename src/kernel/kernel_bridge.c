@@ -3096,11 +3096,15 @@ typedef char thobj_tag_matches[(BRIDGE_HANDLE_TAG == 0x48000000u &&
                                 BRIDGE_HANDLE_MAX == 16384) ? 1 : -1];
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
 
-static uint32_t bridge_handle_token(HANDLE h)
+/* A token for h. The same HANDLE normally gets the same token. A duplicate
+ * must not: on POSIX, DuplicateHandle returns its source pointer with one
+ * more reference. If the duplicate shared the source's token, NtClose on
+ * either one would clear the slot that both of them use. */
+static uint32_t bridge_handle_token_ex(HANDLE h, int fresh)
 {
     int i;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+    for (i = 1; !fresh && i < BRIDGE_HANDLE_MAX; i++)
         if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
         if (s_handle_table[i] == NULL) {
@@ -3109,6 +3113,11 @@ static uint32_t bridge_handle_token(HANDLE h)
         }
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
+}
+
+static uint32_t bridge_handle_token(HANDLE h)
+{
+    return bridge_handle_token_ex(h, 0);
 }
 
 /* Store a native HANDLE into a 32-bit Xbox memory slot (as a token). */
@@ -5478,7 +5487,7 @@ static void bridge_NtDuplicateObject(void)
         g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
         return;
     }
-    bridge_write_handle(target_va, dup);
+    BRIDGE_MEM32(target_va) = bridge_handle_token_ex(dup, 1);
     thobj_attach_token(BRIDGE_MEM32(target_va), thobj_from_token(STACK_ARG(0)));
     if (opts & DUPLICATE_CLOSE_SOURCE)
         thobj_detach_token(STACK_ARG(0));
