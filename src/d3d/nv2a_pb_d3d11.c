@@ -91,6 +91,7 @@ static uint32_t s_state_gen;
 static struct {
     uint32_t                  gen;
     ID3D11BlendState         *bs;
+    float                     bf[4];    /* OMSetBlendState's blend factor */
     ID3D11RasterizerState    *rs;
     ID3D11InputLayout        *il;
     D3D11_PRIMITIVE_TOPOLOGY  topo;
@@ -140,6 +141,7 @@ typedef struct {
     "};\n"
 
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
+static uint64_t s_draws_bconst;   /* drawn with a CONSTANT_* blend factor */
 static uint64_t s_tex_uploads, s_tex_rehash, s_tex_changed;
 static uint64_t s_tex_mip_uploads;   /* uploads with more than one level */
 static uint64_t s_vb_native, s_vb_expanded;  /* vertex bytes copied / made */
@@ -1094,6 +1096,35 @@ static ID3D11BlendState *blend_state(void)
         s_blend[s_blend_n++].bs = bs;
     }
     return bs;
+}
+
+/* The factor D3D11_BLEND_BLEND_FACTOR reads: SET_BLEND_COLOR, unpacked
+ * from ARGB to RGBA. D3D11 has no CONSTANT_ALPHA, so when only the
+ * _ALPHA factors are in use the alpha is replicated into all four; a
+ * draw mixing _COLOR and _ALPHA keeps the colour (not seen so far). With
+ * no constant factor the default (1,1,1,1) is used, so a colour the title
+ * sets without using it does not rebind the blend state. Returns whether a
+ * constant factor is in use. */
+static int blend_color(float bf[4])
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    uint32_t s = g->blend_sfactor, d = g->blend_dfactor, c = g->blend_color;
+    int col = s == 0x8001 || s == 0x8002 || d == 0x8001 || d == 0x8002;
+    int alp = s == 0x8003 || s == 0x8004 || d == 0x8003 || d == 0x8004;
+
+    if (!g->blend_enable || (!col && !alp)) {
+        bf[0] = bf[1] = bf[2] = bf[3] = 1.0f;
+        return 0;
+    }
+    bf[3] = (float)(c >> 24) / 255.0f;
+    if (col) {
+        bf[0] = (float)((c >> 16) & 0xFF) / 255.0f;
+        bf[1] = (float)((c >>  8) & 0xFF) / 255.0f;
+        bf[2] = (float)( c        & 0xFF) / 255.0f;
+    } else {
+        bf[0] = bf[1] = bf[2] = bf[3];
+    }
+    return 1;
 }
 
 /* ---- textures -------------------------------------------------------------
@@ -2381,6 +2412,7 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
                 t->width, t->height, t->offset, t->pitch, t->addr_u, t->addr_v,
                 t->filter, t->palette,
                 s_stage_src[k] ? s_stage_src[k] : "?");
+        fprintf(stderr, " levels %u lod %u-%u", t->levels, t->lod_min, t->lod_max);
         if (s_stage_rt[k])
             fprintf(stderr, " (surface 0x%08X %ux%u, drawn %llu, cleared %llu)",
                     s_stage_rt[k]->offset, s_stage_rt[k]->w, s_stage_rt[k]->h,
@@ -2678,7 +2710,7 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
     /* back to the real draw's state; the state-call filter's view of it
      * stays true for everything restored here */
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, dsv);
-    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_sc.bs, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_sc.bs, s_sc.bf, 0xFFFFFFFF);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_sc.ps, NULL, 0);
     s_state_gen++;              /* and the next draw rebinds everything */
 
@@ -2939,9 +2971,12 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             ID3D11BlendState *bs = blend_state();
             ID3D11InputLayout *il = input_layout(vs, fmts);
             int sc = sc_on();
-            if (!sc || s_sc.bs != bs) {
-                ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, NULL, 0xFFFFFFFF);
+            float bf[4];
+            s_draws_bconst += (uint64_t)blend_color(bf);
+            if (!sc || s_sc.bs != bs || memcmp(s_sc.bf, bf, sizeof bf)) {
+                ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFF);
                 s_sc.bs = bs;
+                memcpy(s_sc.bf, bf, sizeof bf);
             }
             if (!sc || memcmp(&s_sc.vp, &vp, sizeof vp)) {
                 ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
@@ -3195,6 +3230,12 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_rc_compiles,
                 (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
                 (unsigned long long)s_rtt_binds);
+    if (s_presents == 1 || (s_presents % 300) == 0)
+        fprintf(stderr, LOGP "blend: %llu draws with a constant factor,"
+                " %u SET_BLEND_COLOR writes (last 0x%08X)\n",
+                (unsigned long long)s_draws_bconst,
+                nv2a_pb_gpu_state()->blend_color_writes,
+                nv2a_pb_gpu_state()->blend_color);
 }
 
 /* ---- registration ---------------------------------------------------------- */
