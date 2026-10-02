@@ -1462,7 +1462,7 @@ static struct {
     uint32_t batches_prog, batches_fixed, verts_run, verts_bad;
     uint32_t tris, tris_culled, tris_clipped, tris_textured;
     uint64_t z_rejected, a_rejected;
-    uint32_t clears_seen, zclears;
+    uint32_t clears_seen, zclears, batches_3d, dumps_3d;
     uint32_t zclear_color_off, zclear_zeta_off, zclear_batch;
     uint32_t batches_rc, batches_norc, stage_mode_seen[4][32];
     uint32_t fmt_seen[NV_VERTEX_ATTRS][8];  /* per slot: batches by type */
@@ -1648,8 +1648,9 @@ static int vsh_batch_active(void)
     return vsh_enabled() && (s_vsh.mode & 3u) == 2u;
 }
 
-/* Track the program a batch runs, for the report and for RECOMP_VSH_TRACE. */
-static void vsh_note_program(void)
+/* Track the program a batch runs, for the report and for RECOMP_VSH_TRACE.
+ * Returns the program's length in slots. */
+static uint32_t vsh_note_program(void)
 {
     uint32_t h = 2166136261u, len = 0, pc, k;
     int i;
@@ -1664,10 +1665,10 @@ static void vsh_note_program(void)
     for (i = 0; i < s_vsh_prog_count; i++)
         if (s_vsh_progs[i].hash == h && s_vsh_progs[i].start == s_vsh.start) {
             s_vsh_progs[i].batches++;
-            return;
+            return len;
         }
     if (s_vsh_prog_count >= VSH_MAX_PROGS)
-        return;
+        return len;
     s_vsh_progs[s_vsh_prog_count].hash = h;
     s_vsh_progs[s_vsh_prog_count].start = s_vsh.start;
     s_vsh_progs[s_vsh_prog_count].len = len;
@@ -1703,6 +1704,7 @@ static void vsh_note_program(void)
             }
         }
     }
+    return len;
 }
 
 /* Gather v0..v15 for one vertex: array data where the title enabled an array,
@@ -2221,11 +2223,11 @@ static void raster_batch_vsh(void)
 {
     static XfVert xv[NV_MAX_INDICES];
     uint32_t i, n = s_gpu.idx_count, a;
-    uint32_t before = s_gpu.tris_drawn;
+    uint32_t before = s_gpu.tris_drawn, plen;
     int textured;
 
     s_vsh.batches_prog++;
-    vsh_note_program();
+    plen = vsh_note_program();
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
         if (s_gpu.attr[a].size)
             s_vsh.fmt_seen[a][s_gpu.attr[a].type & 7]++;
@@ -2312,6 +2314,18 @@ static void raster_batch_vsh(void)
     if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW) {
         s_drawn_dumps++;
         dump_surface_bmp();
+    }
+    /* Longer than the pretransformed passthroughs (7 and 10 slots): a real
+     * transform. Dump every 400th such batch, first included, up to 12, so a
+     * run that reaches 3D leaves frames of it behind. */
+    if (plen > 12 && s_gpu.tris_drawn != before) {
+        s_vsh.batches_3d++;
+        if (s_vsh.batches_3d % 400 == 1 && s_vsh.dumps_3d < 12) {
+            s_vsh.dumps_3d++;
+            fprintf(stderr, "  [VSH] 3D batch %u (program len %u): dumping\n",
+                    s_vsh.batches_3d, plen);
+            dump_surface_bmp();
+        }
     }
 }
 
