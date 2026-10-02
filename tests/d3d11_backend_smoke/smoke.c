@@ -227,7 +227,11 @@ int main(int argc, char **argv)
          * first thing: a poll at GET_REPORT ahead of the supersede would
          * finish the old one over the reset, done with 100 right here. If
          * the old one is already done (always so in sync mode) the case
-         * proves nothing; that is counted, not failed. */
+         * proves nothing; that is counted, and in deferred mode a run where
+         * it never ran live fails. It runs live only because the smoke is
+         * single-threaded: no ack thread ticks on_poll during the Sleep(16),
+         * as one would in a title, so nothing finishes the old report
+         * between the flip and this push. */
         if (have_reports && f > 0) {
             volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)REPORT_GUEST;
             if (r[15] == 0xFFFFFFFFu)
@@ -373,8 +377,10 @@ int main(int argc, char **argv)
         if (have_reports) {
             volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)REPORT_GUEST;
             /* Spin on the status as a title would, ticking on_poll the way
-             * the ack thread does, at most 300 ms (past the backend's 250 ms
-             * fallback). Still pending after that is late, not wrong. */
+             * the ack thread does, at most 300 ms, then once more. The
+             * backend's 250 ms fallback has fired by then (one thread, so
+             * nothing else holds a report back): a report still pending is
+             * one the backend lost, and a title spinning on it would hang. */
             if (f > 0) {
                 const struct nv2a_pb_backend *b = nv2a_pb_get_backend();
                 DWORD t0 = GetTickCount();
@@ -390,6 +396,8 @@ int main(int argc, char **argv)
                         cross_first = r[14];
                     spins++;
                 }
+                if (b->on_poll)
+                    b->on_poll();
                 if (reuse_first == 0xFFFFFFFFu && !r[11])
                     reuse_first = r[10];
                 if (cross_first == 0xFFFFFFFFu && !r[15])
@@ -409,7 +417,7 @@ int main(int argc, char **argv)
                             " reused slot first count %u status 0x%08X, cross-frame"
                             " reuse first count %u%s status 0x%08X (want 0, 100, 0, 0)"
                             " (%d polls, %lu ms)\n", f - 1,
-                            bad ? " FAIL" : late ? " LATE" : "",
+                            bad ? " FAIL" : late ? " LOST" : "",
                             r[2], r[3], r[6], r[7], reuse_first, r[11], cross_first,
                             cross_early != 0xFFFFFFFFu ? " (done at push)" : "",
                             r[15], spins, GetTickCount() - t0);
@@ -615,14 +623,45 @@ int main(int argc, char **argv)
         M(0x0130, 0);                          /* FLIP_STALL */
         Sleep(16);
     }
-    if (have_reports)
-        fprintf(stderr, "[backend-smoke] visibility: %d frames wrong, %d late;"
-                " cross-frame reuse live in %d frames, vacuous in %d\n",
-                s_vis_failures, s_vis_late, s_cross_live, s_cross_vacuous);
-    if (s_vis_failures) {
-        fprintf(stderr, "[backend-smoke] FAIL: %d frames with a wrong visibility"
-                " result\n", s_vis_failures);
-        return 1;
+    if (have_reports && frames > 0) {
+        /* The last frame's reports: spin and check them too (report 2 was
+         * superseded by the occluded test, report 3 holds an open one). */
+        volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)REPORT_GUEST;
+        const struct nv2a_pb_backend *b = nv2a_pb_get_backend();
+        DWORD t0 = GetTickCount();
+        while ((r[3] || r[7] || r[11] || r[15]) && GetTickCount() - t0 < 300)
+            if (b->on_poll)
+                b->on_poll();
+        if (b->on_poll)
+            b->on_poll();
+        if (r[3] || r[7] || r[11] || r[15]) {
+            s_vis_late++;
+            fprintf(stderr, "[backend-smoke] last frame visibility LOST: status"
+                    " 0x%08X 0x%08X 0x%08X 0x%08X\n", r[3], r[7], r[11], r[15]);
+        } else if (r[2] != 0 || r[6] != 100 || r[10] != 0 || r[14] != 100) {
+            s_vis_failures++;
+            fprintf(stderr, "[backend-smoke] last frame visibility FAIL: counts"
+                    " %u %u %u %u (want 0, 100, 0, 100)\n", r[2], r[6], r[10], r[14]);
+        }
+    }
+    if (have_reports) {
+        const char *occ = getenv("RECOMP_D3D11_OCC");
+        int deferred = !occ || (_stricmp(occ, "sync") && _stricmp(occ, "fixed"));
+        fprintf(stderr, "[backend-smoke] visibility over %d frames and the last:"
+                " %d wrong, %d lost; cross-frame reuse live in %d of %d, vacuous"
+                " in %d\n", frames > 0 ? frames - 1 : 0, s_vis_failures,
+                s_vis_late, s_cross_live, frames > 0 ? frames - 1 : 0,
+                s_cross_vacuous);
+        if (s_vis_failures || s_vis_late) {
+            fprintf(stderr, "[backend-smoke] FAIL: %d wrong visibility results,"
+                    " %d reports the backend lost\n", s_vis_failures, s_vis_late);
+            return 1;
+        }
+        if (deferred && frames > 1 && !s_cross_live) {
+            fprintf(stderr, "[backend-smoke] FAIL: cross-frame reuse case never"
+                    " ran\n");
+            return 2;
+        }
     }
     fprintf(stderr, "[backend-smoke] done\n");
     return 0;
