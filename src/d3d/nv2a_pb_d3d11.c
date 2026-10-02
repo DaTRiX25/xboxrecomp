@@ -39,6 +39,7 @@
 #include "d3d8_combiners.h"
 #include "d3d8_swizzle.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 
 #define LOGP "[d3d11] "
@@ -108,6 +109,7 @@ typedef struct {
     int                     flipped;    /* the walker named it at a flip */
 } RenderTarget;
 
+typedef struct Stage Stage;
 static RenderTarget s_rt[RT_MAX];
 static RenderTarget *s_drawn;   /* what the last flip presented */
 static RenderTarget *s_cur;     /* the target of the batch being drawn */
@@ -938,14 +940,17 @@ static ID3D11BlendState *blend_state(void)
  * decoded rather than uploaded as BC1-3; a texture rewritten between two
  * batches of one flip is not seen. */
 
-typedef struct {
+struct Stage {
     uint32_t offset, color, width, height, pitch, addr_u, addr_v;
     uint32_t palette, pal_len;  /* P8: resolved palette address, entries */
     int      valid;
     int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
-} Stage;
+};
 
 static Stage s_stage[4];
+/* What each stage's SRV came from, for the batch trace. */
+static const char   *s_stage_src[4];
+static RenderTarget *s_stage_rt[4];
 
 #define TEX_MAX_TEXELS (2048u * 2048u)
 #define TEX_CACHE 512   /* a demo frame binds ~100; 64 thrashed */
@@ -1536,8 +1541,13 @@ static void argb_to_float4(uint32_t c, float o[4])
  * surface's address only, and never the surface being drawn into. */
 static RenderTarget *rt_texture(const Stage *t)
 {
+    static int off = -1;
     int i;
 
+    if (off < 0)
+        off = getenv("RECOMP_D3D11_NO_RTT") != NULL;   /* A/B: decode memory */
+    if (off)
+        return NULL;
     if (!t->offset || d3d8_format_dxt_block_bytes(t->color)
             || texel_bytes(linear_twin(t->color)) != 4)
         return NULL;
@@ -1551,6 +1561,60 @@ static RenderTarget *rt_texture(const Stage *t)
         return rt;
     }
     return NULL;
+}
+
+/* The combiner state of the batch being drawn (for the trace), and whether
+ * it ran through combiners at all. */
+static NV2ACombinerState s_last_rc;
+static int               s_last_rc_on;
+
+/* RECOMP_D3D11_DEBUG_PS=<what>: every batch draws one input of the pixel
+ * stage instead of its real shader, to see which one goes wrong:
+ *   d0 / d1     the interpolated diffuse / specular colour
+ *   t0 .. t3    stage n's texture at its coordinates (alpha forced to 1)
+ *   tc0 .. tc3  stage n's coordinates as colour (frac of s, t)
+ * Unknown values draw white. */
+static ID3D11PixelShader *debug_ps(void)
+{
+    static int tried;
+    static ID3D11PixelShader *ps;
+    const char *w;
+    char src[4096], expr[256];
+    ID3DBlob *code = NULL;
+
+    if (tried)
+        return ps;
+    tried = 1;
+    w = getenv("RECOMP_D3D11_DEBUG_PS");
+    if (!w || !*w)
+        return NULL;
+    if (!strcmp(w, "d0"))
+        snprintf(expr, sizeof expr, "float4(i.oD0.rgb, 1)");
+    else if (!strcmp(w, "d1"))
+        snprintf(expr, sizeof expr, "float4(i.oD1.rgb, 1)");
+    else if (w[0] == 't' && w[1] >= '0' && w[1] <= '3' && !w[2])
+        snprintf(expr, sizeof expr,
+                 "float4(tex%c.Sample(samp%c, i.oT%c.xy * tex_scale[%c].xy).rgb, 1)",
+                 w[1], w[1], w[1], w[1]);
+    else if (w[0] == 't' && w[1] == 'c' && w[2] >= '0' && w[2] <= '3' && !w[3])
+        snprintf(expr, sizeof expr, "float4(frac(i.oT%c.xy), 0, 1)", w[2]);
+    else
+        snprintf(expr, sizeof expr, "float4(1, 1, 1, 1)");
+    snprintf(src, sizeof src, "%s%s"
+             "Texture2D tex0 : register(t0); Texture2D tex1 : register(t1);\n"
+             "Texture2D tex2 : register(t2); Texture2D tex3 : register(t3);\n"
+             "SamplerState samp0 : register(s0); SamplerState samp1 : register(s1);\n"
+             "SamplerState samp2 : register(s2); SamplerState samp3 : register(s3);\n"
+             "float4 main(VS_OUT i) : SV_Target { return %s; }\n",
+             VS_OUT_DECL, PS_CB_DECL, expr);
+    if (compile("nv2a_ps_debug", src, "ps_5_0", &code)) {
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                       ID3D10Blob_GetBufferSize(code), NULL, &ps);
+        ID3D10Blob_Release(code);
+    }
+    fprintf(stderr, LOGP "RECOMP_D3D11_DEBUG_PS=%s: every batch draws %s%s\n",
+            w, expr, ps ? "" : " (FAILED to build)");
+    return ps;
 }
 
 /* Stages, textures, samplers and PS constants for the batch about to be
@@ -1573,7 +1637,10 @@ static ID3D11PixelShader *setup_pixel(void)
         pc.tex_mode[n] = (uint32_t)t->mode;
         pc.tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;
         pc.tex_scale[n][1] = scaled || !t->height ? 1.0f : 1.0f / (float)t->height;
+        s_stage_rt[n] = src;
+        s_stage_src[n] = !t->mode ? "none" : t->mode == 4 ? "passthru" : "cache";
         if (src) {
+            s_stage_src[n] = "render-target";
             /* Linear coordinates are texels of the surface as drawn. */
             if (!scaled) {
                 pc.tex_scale[n][0] = 1.0f / (float)src->w;
@@ -1584,6 +1651,8 @@ static ID3D11PixelShader *setup_pixel(void)
             textured = 1;
         } else if (t->mode && t->mode != 4) {
             srv[n] = tex_bind(t);
+            if (srv[n] == s_magenta_srv) s_stage_src[n] = "MAGENTA(undecoded)";
+            else if (srv[n] == s_black_srv) s_stage_src[n] = "BLACK(too large/failed)";
             textured = 1;
         } else {
             srv[n] = s_black_srv;
@@ -1632,11 +1701,296 @@ static ID3D11PixelShader *setup_pixel(void)
         d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw,
                                  v->rc_aocw, v->rc_ctl, v->rc_fcw0,
                                  v->rc_fcw1, modes, &st);
+        s_last_rc = st;
+        s_last_rc_on = 1;
+        if ((ps = debug_ps()) != NULL)
+            return ps;
         ps = combiner_ps(&st);
         if (ps)
             return ps;
     }
+    if (!(v->rc_set && (v->rc_ctl & 0xFF)))
+        s_last_rc_on = 0;
+    {
+        ID3D11PixelShader *ps = debug_ps();
+        if (ps)
+            return ps;
+    }
     return s_ps;
+}
+
+
+/* ---- batch trace (RECOMP_WHITE_TRACE) ---------------------------------------
+ *
+ * The D3D11 side of the CPU path's [WHITE] trace, selected the same way:
+ * RECOMP_WHITE_TRACE=N traces the first N program batches of at least
+ * RECOMP_WHITE_MIN vertices (default 300), or with RECOMP_WHITE_TEXOFF=<hex>
+ * the first N with a texture at that address (low 27 bits). For each one:
+ * the state, every stage and where its SRV came from, the input layout, the
+ * vertex program's outputs for the first three vertices twice -- from the CPU
+ * interpreter on the same inputs, and read back from the GPU through stream
+ * output -- the generated HLSL (once per program/combiner), and the colour
+ * of the first triangle's centroid before and after the draw. Lines start
+ * "[D3D11-WHITE]". */
+
+static int trace_pick(const struct nv2a_pb_draw *d)
+{
+    static int left = -1, min_n, by_tex;
+    static uint32_t texoff;
+    int n;
+
+    if (left < 0) {
+        const char *e = getenv("RECOMP_WHITE_TRACE"), *m = getenv("RECOMP_WHITE_MIN");
+        const char *to = getenv("RECOMP_WHITE_TEXOFF");
+        left = e ? atoi(e) : 0;
+        min_n = m ? atoi(m) : 300;
+        if (to) {
+            by_tex = 1;
+            texoff = (uint32_t)strtoul(to, NULL, 16);
+        }
+    }
+    if (left <= 0 || !d->program)
+        return 0;
+    if (by_tex) {
+        int hit = 0;
+        for (n = 0; n < 4; n++)
+            if (s_stage[n].mode && ((s_stage[n].offset ^ texoff) & 0x07FFFFFFu) == 0)
+                hit = 1;
+        if (!hit)
+            return 0;
+    } else if (d->idx_count < (uint32_t)min_n) {
+        return 0;
+    }
+    left--;
+    return 1;
+}
+
+static uint32_t read_pixel(RenderTarget *rt, int x, int y)
+{
+    static ID3D11Texture2D *st;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_BOX b;
+    uint32_t px = 0xDEADBEEFu;
+
+    if (x < 0 || y < 0 || (UINT)x >= rt->w || (UINT)y >= rt->h)
+        return px;
+    if (!st) {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = td.Height = 1;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
+            return px;
+    }
+    b.left = (UINT)x; b.right = (UINT)x + 1;
+    b.top = (UINT)y; b.bottom = (UINT)y + 1;
+    b.front = 0; b.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)st, 0, 0, 0, 0,
+                                              (ID3D11Resource *)rt->tex, 0, &b);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
+                                          D3D11_MAP_READ, 0, &m))) {
+        px = *(const uint32_t *)m.pData;   /* B,G,R,A bytes: 0xAARRGGBB */
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+    }
+    return px;
+}
+
+/* The first three vertices of the bound batch through the VS, read back by
+ * stream output: 7 float4 each (SV_POSITION, COLOR0/1, TEXCOORD0..3). */
+static int trace_stream_out(VsEntry *vs, D3D11_PRIMITIVE_TOPOLOGY topo,
+                            float out[3][7][4])
+{
+    static const D3D11_SO_DECLARATION_ENTRY so[7] = {
+        {0, "SV_POSITION", 0, 0, 4, 0}, {0, "COLOR", 0, 0, 4, 0},
+        {0, "COLOR", 1, 0, 4, 0},       {0, "TEXCOORD", 0, 0, 4, 0},
+        {0, "TEXCOORD", 1, 0, 4, 0},    {0, "TEXCOORD", 2, 0, 4, 0},
+        {0, "TEXCOORD", 3, 0, 4, 0},
+    };
+    static ID3D11Buffer *buf, *stage;
+    UINT stride = 7 * 16, zero = 0;
+    ID3D11GeometryShader *gs = NULL;
+    ID3D11Buffer *none = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    HRESULT hr;
+    int ok = 0;
+
+    if (!buf) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = 3 * 7 * 16;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_STREAM_OUTPUT;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &buf)))
+            return 0;
+        bd.Usage = D3D11_USAGE_STAGING;
+        bd.BindFlags = 0;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &stage)))
+            return 0;
+    }
+    hr = ID3D11Device_CreateGeometryShaderWithStreamOutput(
+        s_dev, ID3D10Blob_GetBufferPointer(vs->code), ID3D10Blob_GetBufferSize(vs->code),
+        so, 7, &stride, 1, D3D11_SO_NO_RASTERIZED_STREAM, NULL, &gs);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[D3D11-WHITE]  stream output: hr 0x%08lX\n", (unsigned long)hr);
+        return 0;
+    }
+    ID3D11DeviceContext_SOSetTargets(s_ctx, 1, &buf, &zero);
+    ID3D11DeviceContext_GSSetShader(s_ctx, gs, NULL, 0);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, 3, 0, 0);
+    ID3D11DeviceContext_SOSetTargets(s_ctx, 1, &none, &zero);
+    ID3D11DeviceContext_GSSetShader(s_ctx, NULL, NULL, 0);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, topo);
+    ID3D11GeometryShader_Release(gs);
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)stage, (ID3D11Resource *)buf);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)stage, 0,
+                                          D3D11_MAP_READ, 0, &m))) {
+        memcpy(out, m.pData, 3 * 7 * 16);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)stage, 0);
+        ok = 1;
+    }
+    return ok;
+}
+
+static void trace_print_hlsl_once(uint32_t key, const char *what, const char *src)
+{
+    static uint32_t seen[64];
+    static int n;
+    int i;
+    for (i = 0; i < n; i++)
+        if (seen[i] == key)
+            return;
+    if (n < 64)
+        seen[n++] = key;
+    fprintf(stderr, "[D3D11-WHITE] ---- %s %08X ----\n%s\n[D3D11-WHITE] ---- end ----\n",
+            what, key, src);
+}
+
+/* Before the draw: everything but the pixel. Returns the pixel to read back
+ * after it in *px, *py (-1 if none). */
+static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt,
+                        const uint8_t fmts[16], const UINT strides[16],
+                        const UINT offs[16], D3D11_PRIMITIVE_TOPOLOGY topo,
+                        int *px, int *py)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    float so[3][7][4];
+    int k, i, have_so;
+
+    *px = *py = -1;
+    fprintf(stderr, "[D3D11-WHITE] batch prim %u n %u prog %08X start %u | rc %d ctl %08X"
+            " shader %08X | depth %d func 0x%X mask %d | blend %d 0x%X 0x%X | atest %d"
+            " 0x%X %u | surface 0x%08X %ux%u | fog en %d colour %08X\n",
+            d->prim, d->idx_count, vs->hash, v->start, s_last_rc_on, v->rc_ctl,
+            v->shader_prog, v->depth_enable, v->depth_func, v->depth_mask,
+            g->blend_enable, g->blend_sfactor, g->blend_dfactor, v->atest_enable,
+            v->atest_func, v->atest_ref, rt->offset, rt->w, rt->h, v->fog_enable,
+            v->fog_color);
+    for (k = 0; k < 4; k++) {
+        const Stage *t = &s_stage[k];
+        fprintf(stderr, "[D3D11-WHITE]  tex%d mode %d fmt %02X %ux%u off %08X pitch %u"
+                " addr %u/%u pal %08X src %s", k, t->mode, t->color, t->width,
+                t->height, t->offset, t->pitch, t->addr_u, t->addr_v, t->palette,
+                s_stage_src[k] ? s_stage_src[k] : "?");
+        if (s_stage_rt[k])
+            fprintf(stderr, " (surface 0x%08X %ux%u, drawn %llu, cleared %llu)",
+                    s_stage_rt[k]->offset, s_stage_rt[k]->w, s_stage_rt[k]->h,
+                    (unsigned long long)s_stage_rt[k]->last_draw,
+                    (unsigned long long)s_stage_rt[k]->last_clear);
+        fprintf(stderr, "\n");
+    }
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
+        const VertexAttr *a = &d->attr[i];
+        if (!(vs->inputs & (1u << i)) && !a->size)
+            continue;
+        fprintf(stderr, "[D3D11-WHITE]  attr%d %s type %u size %u stride %u offset 0x%X"
+                " inline %d | IA dxgi %u stride %u at %u | inl %g %g %g %g\n", i,
+                (vs->inputs & (1u << i)) ? "read" : "unread", a->type, a->size,
+                a->stride, a->offset, d->inline_data, fmts[i], strides[i], offs[i],
+                v->inl[i][0], v->inl[i][1], v->inl[i][2], v->inl[i][3]);
+    }
+    fprintf(stderr, "[D3D11-WHITE]  c58 %g %g %g %g c59 %g %g %g %g\n",
+            v->c[58][0], v->c[58][1], v->c[58][2], v->c[58][3],
+            v->c[59][0], v->c[59][1], v->c[59][2], v->c[59][3]);
+
+    have_so = trace_stream_out(vs, topo, so);
+    for (k = 0; k < 3 && (uint32_t)k < d->idx_count; k++) {
+        float in[NV2A_VSH_INPUTS][4];
+        Nv2aVshOut o;
+        uint32_t index = d->idx[k];
+        memset(in, 0, sizeof in);
+        for (i = 0; i < NV2A_VSH_INPUTS && i < NV2A_VS_MAX_INPUTS; i++) {
+            const VertexAttr *a = &d->attr[i];
+            if (!(a->size && a->stride) || !fetch(d, a, index, in[i]))
+                memcpy(in[i], v->inl[i], 16);
+        }
+        nv2a_vsh_run((const uint32_t (*)[4])v->prog, v->start,
+                     (float (*)[4])v->c, 0, (const float (*)[4])in, &o);
+        fprintf(stderr, "[D3D11-WHITE]  vert %u (index %u):", k, index);
+        for (i = 0; i < 16; i++)
+            if (d->attr[i].size)
+                fprintf(stderr, " v%d(%g %g %g %g)", i, in[i][0], in[i][1], in[i][2], in[i][3]);
+        fprintf(stderr, "\n[D3D11-WHITE]   cpu pos %g %g %g %g D0 %g %g %g %g D1 %g %g %g %g"
+                " T0 %g %g %g %g T1 %g %g %g %g\n",
+                o.o[0][0], o.o[0][1], o.o[0][2], o.o[0][3],
+                o.o[3][0], o.o[3][1], o.o[3][2], o.o[3][3],
+                o.o[4][0], o.o[4][1], o.o[4][2], o.o[4][3],
+                o.o[9][0], o.o[9][1], o.o[9][2], o.o[9][3],
+                o.o[10][0], o.o[10][1], o.o[10][2], o.o[10][3]);
+        if (have_so)
+            fprintf(stderr, "[D3D11-WHITE]   gpu clip %g %g %g %g D0 %g %g %g %g D1 %g %g %g %g"
+                    " T0 %g %g %g %g T1 %g %g %g %g\n",
+                    so[k][0][0], so[k][0][1], so[k][0][2], so[k][0][3],
+                    so[k][1][0], so[k][1][1], so[k][1][2], so[k][1][3],
+                    so[k][2][0], so[k][2][1], so[k][2][2], so[k][2][3],
+                    so[k][3][0], so[k][3][1], so[k][3][2], so[k][3][3],
+                    so[k][4][0], so[k][4][1], so[k][4][2], so[k][4][3]);
+    }
+    if (have_so && d->idx_count >= 3) {
+        float sx = 0, sy = 0;
+        int ok = 1;
+        for (k = 0; k < 3; k++) {
+            float w = so[k][0][3];
+            if (w <= 0.0f) { ok = 0; break; }
+            sx += (so[k][0][0] / w * 0.5f + 0.5f) * (float)rt->w;
+            sy += (0.5f - so[k][0][1] / w * 0.5f) * (float)rt->h;
+        }
+        if (ok) {
+            *px = (int)(sx / 3.0f);
+            *py = (int)(sy / 3.0f);
+        }
+    }
+    {
+        static NV2AVshProgram parsed;
+        static char hlsl[65536];
+        d3d8_vsh_parse((const DWORD *)&v->prog[v->start][0],
+                       NV2A_VSH_SLOTS - (int)v->start, &parsed);
+        if (d3d8_vsh_generate_hlsl_ex(&parsed, NV2A_VSH_HLSL_SCREEN_SPACE,
+                                      hlsl, sizeof hlsl) > 0)
+            trace_print_hlsl_once(vs->hash, "vertex program", hlsl);
+        if (s_last_rc_on && d3d8_combiners_generate_hlsl(&s_last_rc, hlsl, (int)sizeof hlsl) >= 0) {
+            uint32_t h = 2166136261u;
+            const char *c;
+            for (c = hlsl; *c; c++) { h ^= (uint8_t)*c; h *= 16777619u; }
+            trace_print_hlsl_once(h, "combiner", hlsl);
+        }
+    }
+    {
+        for (k = 0; k < 8; k++)
+            fprintf(stderr, "%s%08X/%08X%s", k ? " " : "[D3D11-WHITE]  factors c0/c1: ",
+                    v->rc_f0[k], v->rc_f1[k], k == 7 ? "\n" : "");
+        fprintf(stderr, "[D3D11-WHITE]  final cw %08X %08X, sf %08X %08X\n",
+                v->rc_fcw0, v->rc_fcw1, v->rc_sf[0], v->rc_sf[1]);
+    }
+    if (*px >= 0)
+        fprintf(stderr, "[D3D11-WHITE]  px (%d,%d) before %08X\n", *px, *py,
+                read_pixel(rt, *px, *py));
 }
 
 /* ---- draw ------------------------------------------------------------------ */
@@ -1827,7 +2181,16 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 3, cbs);
         s_cur = rt;
         ID3D11DeviceContext_PSSetShader(s_ctx, setup_pixel(), NULL, 0);
-        ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+        if (trace_pick(d)) {
+            int px, py;
+            trace_batch(d, vs, rt, fmts, strides, offs, topo, &px, &py);
+            ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+            if (px >= 0)
+                fprintf(stderr, "[D3D11-WHITE]  px (%d,%d) after %08X\n", px, py,
+                        read_pixel(rt, px, py));
+        } else {
+            ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+        }
     }
     rt->last_draw = ++s_seq;
     s_cur = NULL;

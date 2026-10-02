@@ -316,6 +316,36 @@ int main(int argc, char **argv)
                 M(0x17FC, 0);
             }
         }
+        /* A vertex-program batch: mov oPos, v0; mov oD0, v3; mov oT0, v9,
+         * hand-encoded, with the checker texture. It draws the same as a
+         * pass-through quad would, and gives RECOMP_WHITE_TRACE a program
+         * batch to trace (stream output and the CPU interpreter must agree). */
+        {
+            static const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+            static const uint32_t outs[3][2] = {{0, 0}, {3, 3}, {9, 9}}; /* {o, v} */
+            int k;
+            M(0x1E9C, 0);                      /* PROGRAM_LOAD: slot 0 */
+            for (k = 0; k < 3; k++) {
+                M(0x0B00 + 16 * k + 0, 0);
+                M(0x0B00 + 16 * k + 4, (1u << 21) | (outs[k][1] << 9) | 0x1Bu);
+                M(0x0B00 + 16 * k + 8, 2u << 26);          /* A = v */
+                M(0x0B00 + 16 * k + 12, (0xFu << 12) | (1u << 11)
+                                        | (outs[k][0] << 3) | (k == 2 ? 1u : 0u));
+            }
+            M(0x1EA0, 0);                      /* PROGRAM_START */
+            M(0x1E94, 2);                      /* EXECUTION_MODE: program */
+            M(0x1B00, TEX_GUEST);
+            M(0x1B04, (0x06u << 8) | (TEX_LOG2 << 20) | (TEX_LOG2 << 24)
+                      | (1u << 4) | (2u << 0));
+            M(0x1B08, 0x00000101u);
+            M(0x17FC, 8);
+            vertex_uv(300.0f, 110.0f, 0xFFFFFFFFu, uv[0]);
+            vertex_uv(380.0f, 110.0f, 0xFFFFFFFFu, uv[1]);
+            vertex_uv(380.0f, 190.0f, 0xFFFFFFFFu, uv[2]);
+            vertex_uv(300.0f, 190.0f, 0xFFFFFFFFu, uv[3]);
+            M(0x17FC, 0);
+            M(0x1E94, 0);                      /* fixed function again */
+        }
         M(0x1760 + 4 * 9, 0x02u);
         M(0x1B0C, 0);
 
