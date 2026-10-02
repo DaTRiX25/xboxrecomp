@@ -13,9 +13,10 @@
  *
  * Opt-in: RECOMP_PB_BACKEND=d3d11 (see nv2a_pb_d3d11_register_from_env).
  *
- * Depth: a D32_FLOAT buffer per zeta offset, cleared by on_zclear.
+ * Depth and stencil: a D32_FLOAT_S8X24_UINT buffer per zeta offset, cleared
+ * by on_zclear.
  *
- * Not yet: stencil, the clear rectangle (whole surface), 16-bit surfaces, guest readback of
+ * Not yet: the clear rectangle (whole surface), 16-bit surfaces, guest readback of
  * the rendered surface (the title never sees D3D11's pixels).
  *
  * Everything runs on the NV2A ack thread: the device, the window and its
@@ -443,9 +444,10 @@ static RenderTarget *surface(void)
 
 /* ---- depth ------------------------------------------------------------------ */
 
-/* One depth buffer per zeta offset and surface size, D32_FLOAT so the test
- * compares the same normalised z (depth units / zmax) the CPU path stores in
- * its float buffer. Stencil is not emulated. */
+/* One depth-stencil buffer per zeta offset and surface size. The depth half
+ * is float, so the test compares the same normalised z (depth units / zmax)
+ * the CPU path stores in its float buffer, rather than D24S8's 24-bit fixed
+ * point; the 8 stencil bits are the guest's Z24S8 stencil. */
 #define DT_MAX 4
 typedef struct {
     uint32_t                zeta;
@@ -456,7 +458,9 @@ typedef struct {
 } DepthTarget;
 
 static DepthTarget s_dt[DT_MAX];
-static ID3D11DepthStencilState *s_dss[8][2];   /* [func - 0x200][write] */
+#define DSS_MAX 64
+static struct { uint64_t key; ID3D11DepthStencilState *dss; } s_dss[DSS_MAX];
+static int s_dss_count;
 static uint64_t s_zclears, s_draws_z;
 
 static DepthTarget *depth_target(UINT w, UINT h)
@@ -488,7 +492,7 @@ static DepthTarget *depth_target(UINT w, UINT h)
     td.Height = h;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D32_FLOAT;
+    td.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
@@ -500,8 +504,9 @@ static DepthTarget *depth_target(UINT w, UINT h)
         e->tex = NULL;
         return NULL;
     }
-    /* The CPU path starts its buffer at the far plane. */
-    ID3D11DeviceContext_ClearDepthStencilView(s_ctx, e->dsv, D3D11_CLEAR_DEPTH,
+    /* The CPU path starts its buffer at the far plane, stencil 0. */
+    ID3D11DeviceContext_ClearDepthStencilView(s_ctx, e->dsv,
+                                              D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
                                               1.0f, 0);
     e->zeta = zeta;
     e->w = w;
@@ -511,28 +516,72 @@ static DepthTarget *depth_target(UINT w, UINT h)
     return e;
 }
 
-/* SET_DEPTH_FUNC takes GL's codes, 0x200 NEVER .. 0x207 ALWAYS, in the order
- * D3D11_COMPARISON_* numbers them from 1. Anything else tests as ALWAYS, as
- * on the CPU. */
-static ID3D11DepthStencilState *depth_state(uint32_t func, int write)
+/* GL's stencil op codes as D3D11_STENCIL_OP; anything else keeps, as on the
+ * CPU. */
+static uint32_t stencil_op(uint32_t op)
 {
-    uint32_t f = (func >= 0x200 && func <= 0x207) ? func - 0x200 : 7;
-    ID3D11DepthStencilState **slot = &s_dss[f][write ? 1 : 0];
-    if (!*slot) {
-        D3D11_DEPTH_STENCIL_DESC dd;
-        memset(&dd, 0, sizeof dd);
-        dd.DepthEnable = TRUE;
-        dd.DepthWriteMask = write ? D3D11_DEPTH_WRITE_MASK_ALL
-                                  : D3D11_DEPTH_WRITE_MASK_ZERO;
-        dd.DepthFunc = (D3D11_COMPARISON_FUNC)(f + 1);
-        if (FAILED(ID3D11Device_CreateDepthStencilState(s_dev, &dd, slot)))
-            return s_ds_off;
+    switch (op) {
+    case 0x0000: return D3D11_STENCIL_OP_ZERO;
+    case 0x1E01: return D3D11_STENCIL_OP_REPLACE;
+    case 0x1E02: return D3D11_STENCIL_OP_INCR_SAT;
+    case 0x1E03: return D3D11_STENCIL_OP_DECR_SAT;
+    case 0x150A: return D3D11_STENCIL_OP_INVERT;
+    case 0x8507: return D3D11_STENCIL_OP_INCR;
+    case 0x8508: return D3D11_STENCIL_OP_DECR;
+    default:     return D3D11_STENCIL_OP_KEEP;
     }
-    return *slot;
+}
+
+/* SET_DEPTH_FUNC takes GL's codes, 0x200 NEVER .. 0x207 ALWAYS, in the order
+ * D3D11_COMPARISON_* numbers them from 1, and SET_STENCIL_FUNC the same (the
+ * walker keeps its low nibble). Anything else tests as ALWAYS, as on the CPU.
+ * Depth and stencil each only when enabled; one state per distinct key. */
+static ID3D11DepthStencilState *depth_state(int depth, int stencil)
+{
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    uint32_t f = (v->depth_func >= 0x200 && v->depth_func <= 0x207)
+               ? v->depth_func - 0x200 : 7;
+    uint64_t key = 0;
+    D3D11_DEPTH_STENCIL_DESC dd;
+    int i;
+
+    if (depth)
+        key |= 1u | f << 1 | (v->depth_mask ? 1u : 0u) << 4;
+    if (stencil)
+        key |= (uint64_t)(1u | (v->stencil_func & 7u) << 1
+                          | stencil_op(v->stencil_op[0]) << 4
+                          | stencil_op(v->stencil_op[1]) << 8
+                          | stencil_op(v->stencil_op[2]) << 12
+                          | (v->stencil_rmask & 0xFFu) << 16
+                          | (v->stencil_wmask & 0xFFu) << 24) << 8;
+    for (i = 0; i < s_dss_count; i++)
+        if (s_dss[i].key == key)
+            return s_dss[i].dss;
+    memset(&dd, 0, sizeof dd);
+    dd.DepthEnable = depth ? TRUE : FALSE;
+    dd.DepthWriteMask = depth && v->depth_mask ? D3D11_DEPTH_WRITE_MASK_ALL
+                                               : D3D11_DEPTH_WRITE_MASK_ZERO;
+    dd.DepthFunc = depth ? (D3D11_COMPARISON_FUNC)(f + 1) : D3D11_COMPARISON_ALWAYS;
+    if (stencil) {
+        dd.StencilEnable = TRUE;
+        dd.StencilReadMask = (UINT8)v->stencil_rmask;
+        dd.StencilWriteMask = (UINT8)v->stencil_wmask;
+        dd.FrontFace.StencilFailOp = (D3D11_STENCIL_OP)stencil_op(v->stencil_op[0]);
+        dd.FrontFace.StencilDepthFailOp = (D3D11_STENCIL_OP)stencil_op(v->stencil_op[1]);
+        dd.FrontFace.StencilPassOp = (D3D11_STENCIL_OP)stencil_op(v->stencil_op[2]);
+        dd.FrontFace.StencilFunc = (D3D11_COMPARISON_FUNC)((v->stencil_func & 7u) + 1);
+        dd.BackFace = dd.FrontFace;             /* GL one-sided stencil */
+    }
+    if (s_dss_count >= DSS_MAX)
+        return s_ds_off;
+    if (FAILED(ID3D11Device_CreateDepthStencilState(s_dev, &dd, &s_dss[s_dss_count].dss)))
+        return s_ds_off;
+    s_dss[s_dss_count].key = key;
+    return s_dss[s_dss_count++].dss;
 }
 
 /* CLEAR_SURFACE with the Z bit: the clear value scaled as the CPU path
- * scales it, by the zeta format's range. */
+ * scales it, by the zeta format's range. The stencil bit: its low byte. */
 static void d3d11_on_zclear(uint32_t param)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -541,7 +590,7 @@ static void d3d11_on_zclear(uint32_t param)
     DepthTarget *dt;
     float z;
 
-    if (!(param & 1u) || !init())
+    if (!(param & 3u) || !init())
         return;
     rt = surface();
     if (!rt)
@@ -552,9 +601,11 @@ static void d3d11_on_zclear(uint32_t param)
     z = ((g->format >> 4) & 0xF) == 1
       ? (float)(v->zclear & 0xFFFFu) / 65535.0f
       : (float)(v->zclear >> 8) / 16777215.0f;
-    ID3D11DeviceContext_ClearDepthStencilView(s_ctx, dt->dsv, D3D11_CLEAR_DEPTH,
-                                              z, 0);
-    s_zclears++;
+    ID3D11DeviceContext_ClearDepthStencilView(s_ctx, dt->dsv,
+        ((param & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((param & 2u) ? D3D11_CLEAR_STENCIL : 0u),
+        z, (UINT8)(v->zclear & 0xFFu));
+    if (param & 1u)
+        s_zclears++;
 }
 
 static void d3d11_on_clear(uint32_t param)
@@ -2273,16 +2324,19 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         cbs[2] = s_cb_vp;
         ID3D11DepthStencilView *dsv = NULL;
         ID3D11DepthStencilState *dss = s_ds_off;
-        if (v->depth_enable) {
+        /* Stencil only on a Z24S8 zeta surface, as on the CPU. */
+        int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
+        if (v->depth_enable || use_s) {
             DepthTarget *dt = depth_target(rt->w, rt->h);
             if (dt) {
                 dsv = dt->dsv;
-                dss = depth_state(v->depth_func, v->depth_mask);
+                dss = depth_state(v->depth_enable, use_s);
                 s_draws_z++;
             }
         }
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, dsv);
-        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, 0);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss,
+                                                   use_s ? v->stencil_ref & 0xFFu : 0);
         ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(), NULL, 0xFFFFFFFF);
         ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
         ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
