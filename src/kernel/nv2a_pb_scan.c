@@ -53,12 +53,9 @@ static int s_seen_count;
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 
-/* Walks that stopped short of PUT. The words from the stop to PUT are never
- * executed, and they may hold the semaphore release the title's next fence
- * wait spins on, so the fence mirror reads this and catches the fence up
- * once (fence_mirrors_tick). Counted here as well because after eight
- * warning lines a stop is otherwise silent. */
-static uint32_t s_tot_stops;
+/* Walks that stopped short of PUT. Counted because after eight warning lines
+ * a stop is otherwise silent. */
+static uint32_t s_tot_stops, s_tot_salvaged, s_catchups;
 uint32_t nv2a_pb_scan_stops(void) { return s_tot_stops; }
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
@@ -193,9 +190,10 @@ void nv2a_pb_scan_report(void)
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
     fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised,"
-                    " %u stopped -- %d distinct (subchannel, method) pairs\n",
+                    " %u stopped (%u fence releases salvaged, %u catch-ups)"
+                    " -- %d distinct (subchannel, method) pairs\n",
             s_tot_segments, s_tot_words, s_tot_jumps, s_tot_unknown,
-            s_tot_stops, s_seen_count);
+            s_tot_stops, s_tot_salvaged, s_catchups, s_seen_count);
     for (i = 0; i < s_seen_count; i++)
         fprintf(stderr, "  [PB]   subch %u  method 0x%04X  x%-6u %s\n",
                 s_seen[i].subch, s_seen[i].method, s_seen[i].count,
@@ -216,16 +214,57 @@ void nv2a_pb_poll(void)
         b->on_poll();
 }
 
+static int pb_in_window(uint32_t va)
+{
+    return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;
+}
+
+/* The words from a stop to PUT are never executed, and they may hold the
+ * semaphore release the title's next fence wait spins on. stop_salvage
+ * looks for it; when it cannot, it asks for a catch-up instead, and the
+ * fence mirror then writes the title's submitted count once
+ * (fence_mirrors_tick). */
+uint32_t nv2a_pb_scan_catchups(void) { return s_catchups; }
+
+/* The XDK writes a fence as the pair (BACK_END_WRITE_SEMAPHORE_RELEASE,
+ * count 1, subchannel 0) and its value. Run the largest value found in
+ * [from, to): releasing that one marks all the earlier ones done too, and
+ * none beyond PUT. Mirroring the submitted count would also pass fences
+ * the title has not yet handed over, and a resource it is still using
+ * could then be freed. Returns how the fence was handled, for the log. */
+static const char *stop_salvage(const uint8_t *mem, uint32_t from, uint32_t to,
+                                uint32_t *value)
+{
+    uint32_t va, best = 0;
+    int found = 0;
+
+    if (!s_exec_enabled)
+        return "not executing";
+    if (from >= to || !pb_in_window(from) || !pb_in_window(to - 4)) {
+        s_catchups++;
+        return "span wraps or is unreadable; fence catch-up requested";
+    }
+    for (va = from; va + 4 < to; va += 4) {
+        if (*(const uint32_t *)(mem + va) == 0x00041D70u) {
+            uint32_t v = *(const uint32_t *)(mem + va + 4);
+            if (!found || (int32_t)(v - best) > 0)
+                best = v;
+            found = 1;
+        }
+    }
+    if (!found)
+        return "no fence release in the rest";
+    nv2a_pb_exec_method(0, 0x1D70u, best);
+    s_tot_salvaged++;
+    *value = best;
+    return "fence release salvaged";
+}
+
 /* A method header's parameters can go past PUT: the title may submit
  * the header and some of its data now and the rest with the next PUT. So
  * the method in progress outlives one walk. */
 static uint32_t s_left, s_subch, s_method;
 static int s_noninc;
-
-static int pb_in_window(uint32_t va)
-{
-    return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;
-}
 
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
@@ -316,12 +355,14 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (why) {
         static unsigned said;
         s_left = 0;                 /* out of step: drop the method in progress */
+        uint32_t v = 0;
+        const char *fence = stop_salvage(mem, at, end_va, &v);
         s_tot_stops++;
         if (said++ < 8)
             fprintf(stderr, "[PB] walk 0x%08X -> 0x%08X stopped at 0x%08X"
                     " (word 0x%08X) after %u words without reaching PUT (%s);"
-                    " fence caught up\n",
-                    start_va, end_va, at, w, words, why);
+                    " %s 0x%08X\n",
+                    start_va, end_va, at, w, words, why, fence, v);
     }
 
     if (s_exec_enabled)
