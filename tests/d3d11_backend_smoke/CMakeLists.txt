@@ -9,4 +9,6 @@ if(WIN32)
     add_executable(d3d11_backend_smoke smoke.c)
     target_link_libraries(d3d11_backend_smoke PRIVATE xbox_kernel xbox_d3d8 xbox_video
                           d3d11 dxgi dxguid)
+    target_include_directories(d3d11_backend_smoke PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/../../src/d3d)
 endif()

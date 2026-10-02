@@ -13,8 +13,7 @@
  *
  * Opt-in: RECOMP_PB_BACKEND=d3d11 (see nv2a_pb_d3d11_register_from_env).
  *
- * Not yet: textures, register combiners (the pixel shader is oD0), depth,
- * the clear rectangle (whole surface), 16-bit surfaces, guest readback of
+ * Not yet: register combiners, depth, the clear rectangle (whole surface), 16-bit surfaces, guest readback of
  * the rendered surface (the title never sees D3D11's pixels).
  *
  * Everything runs on the NV2A ack thread: the device, the window and its
@@ -35,6 +34,7 @@
 #include <string.h>
 
 #include "d3d8_vsh.h"
+#include "d3d8_swizzle.h"
 #include "nv2a_pb_state.h"
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 
@@ -58,6 +58,7 @@ static compile_fn              s_compile;
 
 static ID3D11Buffer           *s_cb_consts;     /* b1: c[192]            */
 static ID3D11Buffer           *s_cb_vp;         /* b2: vp_scale, vp_off  */
+static ID3D11Buffer           *s_cb_ps;         /* PS b0: PsConsts       */
 static ID3D11Buffer           *s_vb;            /* ring of float4 streams */
 static UINT                    s_vb_size, s_vb_pos;
 static ID3D11Buffer           *s_ib;
@@ -66,7 +67,26 @@ static ID3D11RasterizerState  *s_rs;
 static ID3D11DepthStencilState *s_ds_off;
 static ID3D11PixelShader      *s_ps;
 
+/* The pixel shaders' constants (PS b0). The layout is NV2APSConstants
+ * (d3d8_combiners.h) plus the per-stage texture-coordinate scale and mode. */
+typedef struct {
+    float    c0[8][4], c1[8][4], fc0[4], fc1[4], fog_color[4];
+    float    alpha_ref;
+    uint32_t alpha_func, alpha_test_enable, fog_enable;
+    uint32_t alpha_only[4];
+    float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear) */
+    uint32_t tex_mode[4];       /* stage texture-shader mode, 0 = none */
+} PsConsts;
+
+#define PS_CB_DECL \
+    "cbuffer CombinerCB : register(b0) {\n" \
+    "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n" \
+    "    float alpha_ref; uint alpha_func; uint alpha_test_enable; uint fog_enable;\n" \
+    "    uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n" \
+    "};\n"
+
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
+static uint64_t s_tex_uploads, s_tex_rehash;
 
 /* ---- render targets: one per guest surface ------------------------------ */
 
@@ -175,23 +195,57 @@ static ID3D11Buffer *make_buffer(UINT size, UINT bind)
     "    float4 oB1  : TEXCOORD5;\n" \
     "};\n"
 
+/* Batches without register combiners: the CPU path's MODULATE, oD0 * T0
+ * when stage 0 is on, then the alpha test (D3DCMP numbering, on the 8-bit
+ * values the way the CPU compares them). */
 static const char s_ps_src[] =
     VS_OUT_DECL
-    "float4 main(VS_OUT i) : SV_Target { return i.oD0; }\n";
+    PS_CB_DECL
+    "Texture2D tex0 : register(t0);\n"
+    "SamplerState samp0 : register(s0);\n"
+    "float4 main(VS_OUT i) : SV_Target {\n"
+    "    float4 c = i.oD0;\n"
+    "    if (tex_mode.x == 4u) {\n"
+    "        c *= saturate(i.oT0);\n"
+    "    } else if (tex_mode.x != 0u) {\n"
+    "        float2 uv = i.oT0.xy;\n"
+    "        if (tex_mode.x == 1u && i.oT0.w != 0.0 && i.oT0.w != 1.0) uv /= i.oT0.w;\n"
+    "        c *= tex0.Sample(samp0, uv * tex_scale[0].xy);\n"
+    "    }\n"
+    "    if (alpha_test_enable != 0u) {\n"
+    "        uint a = (uint)(saturate(c.a) * 255.0 + 0.5), r = (uint)(alpha_ref * 255.0 + 0.5);\n"
+    "        bool ok = true;\n"
+    "        if      (alpha_func == 1u) ok = false;\n"
+    "        else if (alpha_func == 2u) ok = a <  r;\n"
+    "        else if (alpha_func == 3u) ok = a == r;\n"
+    "        else if (alpha_func == 4u) ok = a <= r;\n"
+    "        else if (alpha_func == 5u) ok = a >  r;\n"
+    "        else if (alpha_func == 6u) ok = a != r;\n"
+    "        else if (alpha_func == 7u) ok = a >= r;\n"
+    "        if (!ok) discard;\n"
+    "    }\n"
+    "    return c;\n"
+    "}\n";
 
 /* Batches without a vertex program: attribute 0 is already in surface pixels
- * (x, y, z, rhw); 3 is the diffuse colour, 9 the first texture coordinate. */
+ * (x, y, z, rhw); 3 and 4 are the diffuse and specular colours, 9..12 the
+ * texture coordinates. */
 static const char s_vs_passthrough_src[] =
     "cbuffer VSH_Viewport : register(b2) { float4 vp_scale; float4 vp_off; };\n"
-    "struct VS_IN { float4 v0 : ATTR0; float4 v3 : ATTR3; float4 v9 : ATTR9; };\n"
+    "struct VS_IN { float4 v0 : ATTR0; float4 v3 : ATTR3; float4 v4 : ATTR4;\n"
+    "               float4 v9 : ATTR9; float4 v10 : ATTR10; float4 v11 : ATTR11;\n"
+    "               float4 v12 : ATTR12; };\n"
     VS_OUT_DECL
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o = (VS_OUT)0;\n"
     "    o.oPos = float4(i.v0.xy * vp_scale.xy + vp_off.xy,\n"
     "                    saturate(i.v0.z * vp_scale.z), 1.0);\n"
-    "    o.oD0 = i.v3; o.oD1 = float4(0,0,0,1); o.oT0 = i.v9;\n"
+    "    o.oD0 = i.v3; o.oD1 = i.v4;\n"
+    "    o.oT0 = i.v9; o.oT1 = i.v10; o.oT2 = i.v11; o.oT3 = i.v12;\n"
     "    return o;\n"
     "}\n";
+
+static void create_black_texture(void);
 
 static int init(void)
 {
@@ -257,11 +311,12 @@ static int init(void)
 
     s_cb_consts = make_buffer(NV2A_VSH_CONSTANTS * 16, D3D11_BIND_CONSTANT_BUFFER);
     s_cb_vp     = make_buffer(32, D3D11_BIND_CONSTANT_BUFFER);
+    s_cb_ps     = make_buffer(sizeof(PsConsts), D3D11_BIND_CONSTANT_BUFFER);
     s_vb_size   = 8u << 20;
     s_vb        = make_buffer(s_vb_size, D3D11_BIND_VERTEX_BUFFER);
     s_ib_size   = 1u << 20;
     s_ib        = make_buffer(s_ib_size, D3D11_BIND_INDEX_BUFFER);
-    if (!s_cb_consts || !s_cb_vp || !s_vb || !s_ib) {
+    if (!s_cb_consts || !s_cb_vp || !s_cb_ps || !s_vb || !s_ib) {
         fprintf(stderr, LOGP "buffer creation failed\n");
         return 0;
     }
@@ -293,6 +348,7 @@ static int init(void)
         ID3D10Blob_Release(code);
     }
 
+    create_black_texture();
     fprintf(stderr, LOGP "device up: feature level 0x%X, swap chain 640x480\n",
             (unsigned)fl);
     s_failed = 0;
@@ -586,7 +642,7 @@ static VsEntry *vertex_shader(int program)
         snprintf(name, sizeof name, "nv2a_vsh_%08X", hash);
     } else {
         src = s_vs_passthrough_src;
-        e->inputs = (1u << 0) | (1u << 3) | (1u << 9);
+        e->inputs = (1u << 0) | (1u << 3) | (1u << 4) | (0xFu << 9);
         snprintf(name, sizeof name, "nv2a_vsh_passthrough");
     }
     if (!compile(name, src, "vs_5_0", &code))
@@ -681,6 +737,469 @@ static ID3D11BlendState *blend_state(void)
         s_blend[s_blend_n++].bs = bs;
     }
     return bs;
+}
+
+/* ---- textures -------------------------------------------------------------
+ *
+ * Four stages, decoded from the texture registers the title last wrote, the
+ * way the CPU path's vsh_build_stages does: offset, format, size (from the
+ * format word for swizzled and DXT, from IMAGE_RECT for linear), pitch,
+ * wrap modes, enable, and a texture-shader mode from SET_SHADER_STAGE_PROGRAM.
+ *
+ * Each texture is decoded to A8R8G8B8 on the CPU -- the same per-format
+ * arithmetic as the CPU sampler, so both paths see the same texels -- and
+ * uploaded as B8G8R8A8_UNORM (the same bytes). Cache key and invalidation
+ * follow nv2a_pb_state.h: offset + format + width + height + pitch; on a new
+ * flip generation the whole texture is hashed again and re-uploaded if it
+ * changed (the letterboxed movie changes only in the middle).
+ *
+ * ponytail: point sampling (the CPU path's nearest texel); no mipmaps; DXT is
+ * decoded rather than uploaded as BC1-3; a texture rewritten between two
+ * batches of one flip is not seen. */
+
+typedef struct {
+    uint32_t offset, color, width, height, pitch, addr_u, addr_v;
+    int      valid;
+    int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
+} Stage;
+
+static Stage s_stage[4];
+
+#define TEX_MAX_TEXELS (2048u * 2048u)
+#define TEX_CACHE 64
+typedef struct {
+    uint32_t offset, color, width, height, pitch;
+    uint32_t gen, used;
+    uint64_t hash;
+    int      live;
+    ID3D11Texture2D          *tex;
+    ID3D11ShaderResourceView *srv;
+} TexEntry;
+
+static TexEntry  s_tc[TEX_CACHE];
+static uint32_t  s_tc_clock;
+static uint32_t *s_texels;
+static size_t    s_texels_cap;
+static ID3D11ShaderResourceView *s_black_srv;   /* undecodable: (0,0,0,1) */
+
+static int tex_size_from_format(uint32_t fmt)
+{
+    return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
+}
+
+static void build_stages(void)
+{
+    const uint32_t *regs = nv2a_pb_tex_regs();
+    const uint8_t  *sets = nv2a_pb_tex_regs_set();
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    int n;
+
+    for (n = 0; n < 4; n++) {
+        const uint32_t *r = &regs[(0x40u * n) / 4];
+        const uint8_t  *set = &sets[(0x40u * n) / 4];
+        Stage *t = &s_stage[n];
+        uint32_t fmt = r[0x04 / 4], ctl0 = r[0x0C / 4];
+        int on = (ctl0 >> 30) & 1;
+        int mode;
+
+        memset(t, 0, sizeof *t);
+        t->offset = r[0] ? nv2a_pb_dma_resolve(r[0]) : 0;
+        t->color = (fmt >> 8) & 0xFF;
+        if (tex_size_from_format(t->color)) {
+            t->width  = 1u << ((fmt >> 20) & 0xF);
+            t->height = 1u << ((fmt >> 24) & 0xF);
+        } else {
+            t->width  = r[0x1C / 4] >> 16;
+            t->height = r[0x1C / 4] & 0xFFFF;
+        }
+        t->pitch  = r[0x10 / 4] >> 16;
+        t->addr_u =  r[0x08 / 4]       & 0xF;
+        t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
+        t->valid = t->offset && t->width && t->height
+                && (tex_size_from_format(t->color) || t->pitch);
+        if (n == 0 && !set[0x0C / 4])
+            on = 1;                        /* never configured: as the CPU path */
+        if (v->shader_set)
+            mode = (int)((v->shader_prog >> (5 * n)) & 0x1F);
+        else
+            mode = n == 0 ? 1 : 0;
+        if (mode != 4 && (!on || !t->valid))
+            mode = 0;
+        t->mode = mode;
+    }
+}
+
+/* The linear format with the same texel encoding as a swizzled one. */
+static uint32_t linear_twin(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x00: return 0x13;
+    case 0x02: return 0x10;
+    case 0x03: return 0x1C;
+    case 0x04: return 0x1D;
+    case 0x05: return 0x11;
+    case 0x06: return 0x12;
+    case 0x07: return 0x1E;
+    case 0x19: return 0x1F;
+    default:   return fmt;
+    }
+}
+
+static uint32_t texel_bytes(uint32_t lin)
+{
+    switch (lin) {
+    case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
+    case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25: return 2;
+    case 0x13: case 0x1F: return 1;
+    default: return 0;
+    }
+}
+
+/* Bytes of guest memory the texture occupies; 0 if it cannot be decoded. */
+static uint32_t tex_extent(const Stage *t)
+{
+    uint32_t bb = d3d8_format_dxt_block_bytes(t->color), tb;
+    if (!t->valid || (uint64_t)t->width * t->height > TEX_MAX_TEXELS)
+        return 0;
+    if (bb)
+        return ((t->width + 3u) / 4u) * ((t->height + 3u) / 4u) * bb;
+    if (d3d8_format_is_swizzled(t->color)) {
+        tb = texel_bytes(linear_twin(t->color));
+        return tb ? t->width * t->height * tb : 0;
+    }
+    tb = texel_bytes(t->color);
+    if (!tb || !t->pitch)
+        return 0;
+    return t->pitch * (t->height - 1u) + t->width * tb;
+}
+
+static uint64_t tex_hash(const uint8_t *p, uint32_t n)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    uint64_t l[4] = { h, h ^ 1u, h ^ 2u, h ^ 3u };
+    uint32_t i;
+    for (i = 0; i + 32 <= n; i += 32) {
+        uint64_t w[4];
+        memcpy(w, p + i, 32);
+        l[0] = (l[0] ^ w[0]) * 0x100000001B3ull;
+        l[1] = (l[1] ^ w[1]) * 0x100000001B3ull;
+        l[2] = (l[2] ^ w[2]) * 0x100000001B3ull;
+        l[3] = (l[3] ^ w[3]) * 0x100000001B3ull;
+    }
+    for (; i < n; i++)
+        l[0] = (l[0] ^ p[i]) * 0x100000001B3ull;
+    return (l[0] ^ (l[1] << 1) ^ (l[2] << 2) ^ (l[3] << 3)) * 0x100000001B3ull;
+}
+
+static uint8_t clamp255(int x) { return (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x); }
+
+/* One texel as A8R8G8B8, from texel index u of the row at p (linear
+ * formats; for swizzled ones p is the image base and u the Morton index). */
+static uint32_t decode_texel(uint32_t fmt, const uint8_t *p, uint32_t u)
+{
+    uint32_t t;
+    switch (fmt) {
+    case 0x12: return ((const uint32_t *)p)[u];
+    case 0x1E: return ((const uint32_t *)p)[u] | 0xFF000000u;
+    case 0x3F:
+        t = ((const uint32_t *)p)[u];
+        return (t & 0xFF00FF00u) | ((t & 0xFF) << 16) | ((t >> 16) & 0xFF);
+    case 0x40:
+        t = ((const uint32_t *)p)[u];
+        return ((t & 0xFFu) << 24) | (((t >> 8) & 0xFFu) << 16)
+             | (((t >> 16) & 0xFFu) << 8) | ((t >> 24) & 0xFFu);
+    case 0x41:
+        t = ((const uint32_t *)p)[u];
+        return ((t & 0xFFu) << 24) | (t >> 8);
+    case 0x10:
+        t = ((const uint16_t *)p)[u];
+        return ((t & 0x8000u) ? 0xFF000000u : 0u)
+             | (d3d8_expand_channel((t >> 10) & 0x1F, 5) << 16)
+             | (d3d8_expand_channel((t >> 5) & 0x1F, 5) << 8)
+             |  d3d8_expand_channel(t & 0x1F, 5);
+    case 0x1C:
+        t = ((const uint16_t *)p)[u];
+        return 0xFF000000u
+             | (d3d8_expand_channel((t >> 10) & 0x1F, 5) << 16)
+             | (d3d8_expand_channel((t >> 5) & 0x1F, 5) << 8)
+             |  d3d8_expand_channel(t & 0x1F, 5);
+    case 0x11:
+        t = ((const uint16_t *)p)[u];
+        return 0xFF000000u
+             | (d3d8_expand_channel((t >> 11) & 0x1F, 5) << 16)
+             | (d3d8_expand_channel((t >> 5) & 0x3F, 6) << 8)
+             |  d3d8_expand_channel(t & 0x1F, 5);
+    case 0x1D:
+        t = ((const uint16_t *)p)[u];
+        return (d3d8_expand_channel((t >> 12) & 0xF, 4) << 24)
+             | (d3d8_expand_channel((t >> 8) & 0xF, 4) << 16)
+             | (d3d8_expand_channel((t >> 4) & 0xF, 4) << 8)
+             |  d3d8_expand_channel(t & 0xF, 4);
+    case 0x13:
+        t = p[u];
+        return 0xFF000000u | (t << 16) | (t << 8) | t;
+    case 0x1F:
+        return ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
+    case 0x24:                              /* YUY2 */
+    case 0x25: {                            /* UYVY */
+        uint32_t yoff = (fmt == 0x24) ? 0u : 1u;
+        const uint8_t *g = p + (size_t)(u & ~1u) * 2;
+        int c  = (int)g[(u & 1u) ? 2 + yoff : yoff] - 16;
+        int cu = (int)g[1 - yoff] - 128;
+        int cv = (int)g[3 - yoff] - 128;
+        return 0xFF000000u
+             | ((uint32_t)clamp255((298 * c + 409 * cv + 128) >> 8) << 16)
+             | ((uint32_t)clamp255((298 * c - 100 * cu - 208 * cv + 128) >> 8) << 8)
+             |  (uint32_t)clamp255((298 * c + 516 * cu + 128) >> 8);
+    }
+    default:
+        return 0;
+    }
+}
+
+/* The whole texture into s_texels (width x height, A8R8G8B8). */
+static int decode_texture(const Stage *t)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset() + t->offset;
+    size_t n = (size_t)t->width * t->height;
+    uint32_t x, y, fmt = t->color;
+
+    if (n > s_texels_cap) {
+        uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
+        if (!p)
+            return 0;
+        s_texels = p;
+        s_texels_cap = n;
+    }
+    if (d3d8_format_dxt_block_bytes(fmt)) {
+        for (y = 0; y < t->height; y++)
+            for (x = 0; x < t->width; x++) {
+                uint32_t argb = 0;
+                d3d8_dxt_decode_texel(mem, fmt, x, y, t->width, &argb);
+                s_texels[(size_t)y * t->width + x] = argb;
+            }
+        return 1;
+    }
+    if (d3d8_format_is_swizzled(fmt)) {
+        uint32_t mx, my;
+        fmt = linear_twin(fmt);
+        xbox_swizzle_masks(t->width, t->height, &mx, &my);
+        for (y = 0; y < t->height; y++) {
+            uint32_t oy = swizzle_deposit(y, my);
+            for (x = 0; x < t->width; x++)
+                s_texels[(size_t)y * t->width + x] =
+                    decode_texel(fmt, mem, swizzle_deposit(x, mx) | oy);
+        }
+        return 1;
+    }
+    for (y = 0; y < t->height; y++) {
+        const uint8_t *row = mem + (size_t)y * t->pitch;
+        for (x = 0; x < t->width; x++)
+            s_texels[(size_t)y * t->width + x] = decode_texel(fmt, row, x);
+    }
+    return 1;
+}
+
+static int tex_upload(TexEntry *e, const Stage *t)
+{
+    if (!decode_texture(t))
+        return 0;
+    if (!e->tex) {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = t->width;
+        td.Height = t->height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &e->tex)))
+            return 0;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(
+                    s_dev, (ID3D11Resource *)e->tex, NULL, &e->srv))) {
+            ID3D11Texture2D_Release(e->tex);
+            e->tex = NULL;
+            return 0;
+        }
+    }
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0,
+                                          NULL, s_texels, t->width * 4, 0);
+    s_tex_uploads++;
+    return 1;
+}
+
+static void tex_free(TexEntry *e)
+{
+    if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+    if (e->tex) ID3D11Texture2D_Release(e->tex);
+    memset(e, 0, sizeof *e);
+}
+
+/* The view for a stage's texture, decoded and uploaded if it is new or its
+ * bytes changed since it was last checked (once per flip). */
+static ID3D11ShaderResourceView *tex_bind(const Stage *t)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bytes = tex_extent(t), i;
+    TexEntry *e = NULL, *victim = &s_tc[0];
+
+    if (!bytes)
+        return s_black_srv;
+    for (i = 0; i < TEX_CACHE; i++) {
+        TexEntry *c = &s_tc[i];
+        if (c->live && c->offset == t->offset && c->color == t->color
+                && c->width == t->width && c->height == t->height
+                && c->pitch == t->pitch) {
+            e = c;
+            break;
+        }
+        if (!c->live || (victim->live && c->used < victim->used))
+            victim = c;
+    }
+    if (e) {
+        if (e->gen != g->flips) {
+            uint64_t h = tex_hash(mem + t->offset, bytes);
+            s_tex_rehash++;
+            e->gen = g->flips;
+            if (h != e->hash) {
+                e->hash = h;
+                if (!tex_upload(e, t))
+                    return s_black_srv;
+            }
+        }
+    } else {
+        e = victim;
+        tex_free(e);
+        e->offset = t->offset;
+        e->color = t->color;
+        e->width = t->width;
+        e->height = t->height;
+        e->pitch = t->pitch;
+        e->gen = g->flips;
+        e->hash = tex_hash(mem + t->offset, bytes);
+        if (!tex_upload(e, t)) {
+            tex_free(e);
+            return s_black_srv;
+        }
+        e->live = 1;
+    }
+    e->used = ++s_tc_clock;
+    return e->srv;
+}
+
+/* NV2A wrap modes: 1 wrap, 2 mirror, 3 clamp to edge, 4 border, 5 clamp. */
+static D3D11_TEXTURE_ADDRESS_MODE address_mode(uint32_t m)
+{
+    switch (m) {
+    case 1:  return D3D11_TEXTURE_ADDRESS_WRAP;
+    case 2:  return D3D11_TEXTURE_ADDRESS_MIRROR;
+    default: return D3D11_TEXTURE_ADDRESS_CLAMP;
+    }
+}
+
+static ID3D11SamplerState *sampler(uint32_t u, uint32_t v)
+{
+    static ID3D11SamplerState *cache[16][16];
+    D3D11_SAMPLER_DESC sd;
+    u &= 0xF;
+    v &= 0xF;
+    if (cache[u][v])
+        return cache[u][v];
+    memset(&sd, 0, sizeof sd);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = address_mode(u);
+    sd.AddressV = address_mode(v);
+    sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    ID3D11Device_CreateSamplerState(s_dev, &sd, &cache[u][v]);
+    return cache[u][v];
+}
+
+static void create_black_texture(void)
+{
+    static const uint32_t black = 0xFF000000u;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd;
+    ID3D11Texture2D *t = NULL;
+    memset(&td, 0, sizeof td);
+    td.Width = td.Height = 1;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    sd.pSysMem = &black;
+    sd.SysMemPitch = 4;
+    sd.SysMemSlicePitch = 4;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &t))) {
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL,
+                                              &s_black_srv);
+        ID3D11Texture2D_Release(t);
+    }
+}
+
+/* ---- pixel stage --------------------------------------------------------- */
+
+static void argb_to_float4(uint32_t c, float o[4])
+{
+    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
+    o[1] = (float)((c >> 8) & 0xFF) / 255.0f;
+    o[2] = (float)(c & 0xFF) / 255.0f;
+    o[3] = (float)(c >> 24) / 255.0f;
+}
+
+/* Stages, textures, samplers and PS constants for the batch about to be
+ * drawn. Returns the pixel shader to use. */
+static ID3D11PixelShader *setup_pixel(void)
+{
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    ID3D11ShaderResourceView *srv[4];
+    ID3D11SamplerState *smp[4];
+    D3D11_MAPPED_SUBRESOURCE m;
+    PsConsts pc;
+    int n;
+
+    build_stages();
+    memset(&pc, 0, sizeof pc);
+    for (n = 0; n < 4; n++) {
+        const Stage *t = &s_stage[n];
+        int scaled = tex_size_from_format(t->color);
+        pc.tex_mode[n] = (uint32_t)t->mode;
+        pc.tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;
+        pc.tex_scale[n][1] = scaled || !t->height ? 1.0f : 1.0f / (float)t->height;
+        srv[n] = (t->mode && t->mode != 4) ? tex_bind(t) : s_black_srv;
+        smp[n] = sampler(t->addr_u, t->addr_v);
+    }
+    for (n = 0; n < 8; n++) {
+        argb_to_float4(v->rc_f0[n], pc.c0[n]);
+        argb_to_float4(v->rc_f1[n], pc.c1[n]);
+    }
+    argb_to_float4(v->rc_sf[0], pc.fc0);
+    argb_to_float4(v->rc_sf[1], pc.fc1);
+    argb_to_float4(v->fog_color, pc.fog_color);
+    {   /* the CPU path reads the fog colour register as RGBA, alpha 1 */
+        float t = pc.fog_color[0];
+        pc.fog_color[0] = pc.fog_color[2];
+        pc.fog_color[2] = t;
+        pc.fog_color[3] = 1.0f;
+    }
+    pc.alpha_ref = (float)v->atest_ref / 255.0f;
+    pc.alpha_test_enable = v->atest_enable ? 1u : 0u;
+    pc.alpha_func = (v->atest_func >= 0x200 && v->atest_func <= 0x207)
+                  ? v->atest_func - 0x200 + 1 : 8;          /* GL -> D3DCMP */
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_ps, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, &pc, sizeof pc);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_ps, 0);
+    }
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_ps);
+    return s_ps;
 }
 
 /* ---- draw ------------------------------------------------------------------ */
@@ -809,7 +1328,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, topo);
         ID3D11DeviceContext_VSSetShader(s_ctx, vs->vs, NULL, 0);
         ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 3, cbs);
-        ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(s_ctx, setup_pixel(), NULL, 0);
         ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
     }
     s_drawn = rt;
@@ -910,11 +1429,14 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
      * render target anyway. */
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (walker said 0x%08X),"
-                " %llu clears, %llu draws, %llu skipped\n",
+                " %llu clears, %llu draws, %llu skipped, %llu texture uploads,"
+                " %llu rehashes\n",
                 (unsigned long long)s_presents,
                 s_drawn ? s_drawn->offset : 0, surface_offset,
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
-                (unsigned long long)s_draws_skipped);
+                (unsigned long long)s_draws_skipped,
+                (unsigned long long)s_tex_uploads,
+                (unsigned long long)s_tex_rehash);
 }
 
 /* ---- registration ---------------------------------------------------------- */
