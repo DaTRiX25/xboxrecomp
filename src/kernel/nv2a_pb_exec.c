@@ -422,14 +422,12 @@ static void note_unhandled(uint32_t method, uint32_t param)
     }
 }
 
-/* Read attribute `a` of vertex `index` as floats. Only the float and the
- * normalised-byte types appear in practice; anything else returns 0 so a
- * caller sees a degenerate vertex rather than reading past the array. */
+/* Read attribute `a` of vertex `index` as floats; 0, and (0,0,0,1), for a
+ * type with no decoder or a vertex past the array. */
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
-    uint32_t i;
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
@@ -450,49 +448,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         p = mem + a->offset + (size_t)index * a->stride;
     }
 
-    switch (a->type) {
-    case 0:                                  /* D3DCOLOR */
-        /* A DWORD 0xAARRGGBB, so little-endian bytes are B,G,R,A -- not the
-         * component order of every other format here. Returned as R,G,B,A so
-         * callers need not know which format the title chose. */
-        out[0] = (float)p[2] / 255.0f;
-        out[1] = (float)p[1] / 255.0f;
-        out[2] = (float)p[0] / 255.0f;
-        out[3] = (float)p[3] / 255.0f;
-        return 1;
-    case 2:                                  /* float */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = ((const float *)p)[i];
-        return 1;
-    case 4:                                  /* unsigned byte, normalised */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = (float)p[i] / 255.0f;
-        return 1;
-    /* The packed types 3D models use: positions and normals in shorts, or a
-     * normal squeezed into one dword. Decoded the way xemu hands them to GL. */
-    case 1:                                  /* S1: signed short, normalised */
-        for (i = 0; i < a->size && i < 4; i++) {
-            float f = (float)((const int16_t *)p)[i] / 32767.0f;
-            out[i] = f < -1.0f ? -1.0f : f;
-        }
-        return 1;
-    case 5:                                  /* S32K: signed short, as is */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = (float)((const int16_t *)p)[i];
-        return 1;
-    case 6: {                                /* CMP: 11:11:10 signed, normalised */
-        uint32_t w = *(const uint32_t *)p;
-        int32_t x = (int32_t)(w << 21) >> 21;
-        int32_t y = (int32_t)(w << 10) >> 21;
-        int32_t z = (int32_t)w >> 22;
-        out[0] = (float)x / 1023.0f;
-        out[1] = (float)y / 1023.0f;
-        out[2] = (float)z / 511.0f;
-        return 1;
-    }
-    default:
-        return 0;
-    }
+    return nv2a_vtx_decode(a->type, a->size, p, out);
 }
 
 static uint32_t surface_bpp(void)
@@ -2032,16 +1988,9 @@ static int vsh_batch_active(void)
  * Returns the program's length in slots. */
 static uint32_t vsh_note_program(void)
 {
-    uint32_t h = 2166136261u, len = 0, pc, k;
+    uint32_t len, pc, h = nv2a_vsh_program_hash(&s_vsh, &len);
     int i;
 
-    for (pc = s_vsh.start; pc < NV2A_VSH_SLOTS; pc++) {
-        for (k = 0; k < 4; k++)
-            h = (h ^ s_vsh.prog[pc][k]) * 16777619u;
-        len++;
-        if (s_vsh.prog[pc][3] & 1u)
-            break;
-    }
     for (i = 0; i < s_vsh_prog_count; i++)
         if (s_vsh_progs[i].hash == h && s_vsh_progs[i].start == s_vsh.start) {
             s_vsh_progs[i].batches++;

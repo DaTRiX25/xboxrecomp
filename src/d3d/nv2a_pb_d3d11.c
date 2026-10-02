@@ -689,7 +689,6 @@ static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
                  uint32_t index, float out[4])
 {
     const uint8_t *p;
-    uint32_t i;
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
@@ -704,52 +703,7 @@ static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
         p = (const uint8_t *)xbox_GetMemoryOffset() + a->offset
           + (size_t)index * a->stride;
     }
-    switch (a->type) {
-    case NV2A_VTX_D3DCOLOR:
-        out[0] = (float)p[2] / 255.0f;
-        out[1] = (float)p[1] / 255.0f;
-        out[2] = (float)p[0] / 255.0f;
-        out[3] = (float)p[3] / 255.0f;
-        return 1;
-    case NV2A_VTX_FLOAT:
-        for (i = 0; i < a->size && i < 4; i++)
-            memcpy(&out[i], p + 4 * i, 4);
-        return 1;
-    case NV2A_VTX_UBYTE:
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = (float)p[i] / 255.0f;
-        return 1;
-    case NV2A_VTX_S1:
-        for (i = 0; i < a->size && i < 4; i++) {
-            int16_t s;
-            float f;
-            memcpy(&s, p + 2 * i, 2);
-            f = (float)s / 32767.0f;
-            out[i] = f < -1.0f ? -1.0f : f;
-        }
-        return 1;
-    case NV2A_VTX_S32K:
-        for (i = 0; i < a->size && i < 4; i++) {
-            int16_t s;
-            memcpy(&s, p + 2 * i, 2);
-            out[i] = (float)s;
-        }
-        return 1;
-    case NV2A_VTX_CMP: {
-        uint32_t w;
-        int32_t x, y, z;
-        memcpy(&w, p, 4);
-        x = (int32_t)(w << 21) >> 21;
-        y = (int32_t)(w << 10) >> 21;
-        z = (int32_t)w >> 22;
-        out[0] = (float)x / 1023.0f;
-        out[1] = (float)y / 1023.0f;
-        out[2] = (float)z / 511.0f;
-        return 1;
-    }
-    default:
-        return 0;
-    }
+    return nv2a_vtx_decode(a->type, a->size, p, out);
 }
 
 /* The DXGI format a stream can be read in as it is, so its bytes are copied
@@ -857,59 +811,11 @@ static void vb_end(void)
 static uint32_t convert_indices(const struct nv2a_pb_draw *d, uint32_t base,
                                 uint32_t *out, D3D11_PRIMITIVE_TOPOLOGY *topo)
 {
-    const uint16_t *v = d->idx;
-    uint32_t n = d->idx_count, k = 0, i;
-
-#define PUT(x) (out[k++] = (uint32_t)(x) - base)
-    switch (d->prim) {
-    case NV_PRIM_POINTS:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
-        for (i = 0; i < n; i++) PUT(v[i]);
-        break;
-    case NV_PRIM_LINES:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
-        for (i = 0; i + 1 < n; i += 2) { PUT(v[i]); PUT(v[i + 1]); }
-        break;
-    case NV_PRIM_LINE_LOOP:
-    case NV_PRIM_LINE_STRIP:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
-        for (i = 0; i + 1 < n; i++) { PUT(v[i]); PUT(v[i + 1]); }
-        if (d->prim == NV_PRIM_LINE_LOOP && n > 2) { PUT(v[n - 1]); PUT(v[0]); }
-        break;
-    case NV_PRIM_TRIANGLES:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        for (i = 0; i + 2 < n; i += 3) { PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 2]); }
-        break;
-    case NV_PRIM_TRIANGLE_STRIP:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        for (i = 0; i + 2 < n; i++) {
-            if (i & 1) { PUT(v[i + 1]); PUT(v[i]); PUT(v[i + 2]); }
-            else       { PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 2]); }
-        }
-        break;
-    case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_POLYGON:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        for (i = 1; i + 1 < n; i++) { PUT(v[0]); PUT(v[i]); PUT(v[i + 1]); }
-        break;
-    case NV_PRIM_QUADS:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        for (i = 0; i + 3 < n; i += 4) {
-            PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 2]);
-            PUT(v[i]); PUT(v[i + 2]); PUT(v[i + 3]);
-        }
-        break;
-    case NV_PRIM_QUAD_STRIP:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        for (i = 0; i + 3 < n; i += 2) {
-            PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 3]);
-            PUT(v[i]); PUT(v[i + 3]); PUT(v[i + 2]);
-        }
-        break;
-    default:
-        return 0;
-    }
-#undef PUT
+    enum nv2a_topology t;
+    uint32_t k = nv2a_prim_to_list(d->prim, d->idx, d->idx_count, base, out, &t);
+    *topo = t == NV2A_TOPO_POINTS ? D3D11_PRIMITIVE_TOPOLOGY_POINTLIST
+          : t == NV2A_TOPO_LINES  ? D3D11_PRIMITIVE_TOPOLOGY_LINELIST
+          :                         D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     return k;
 }
 
@@ -917,15 +823,7 @@ static uint32_t convert_indices(const struct nv2a_pb_draw *d, uint32_t base,
 
 static uint32_t program_hash(const struct nv2a_pb_vsh *v)
 {
-    uint32_t h = 2166136261u, pc, k;
-    for (pc = v->start; pc < NV2A_VSH_SLOTS; pc++) {
-        for (k = 0; k < 4; k++) {
-            h ^= v->prog[pc][k];
-            h *= 16777619u;
-        }
-        if (v->prog[pc][3] & 1u)      /* FINAL */
-            break;
-    }
+    uint32_t h = nv2a_vsh_program_hash(v, NULL);
     return h ? h : 1;
 }
 

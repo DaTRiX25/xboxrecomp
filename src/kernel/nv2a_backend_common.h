@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "../d3d/d3d8_swizzle.h"
+#include "nv2a_pb_state.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -301,6 +302,102 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
                        int shader_set, uint32_t shader_prog,
                        nv2a_dma_resolve_fn resolve, unsigned flags,
                        struct nv2a_stage *t);
+
+/* ------------------------------------------------------------------------ */
+/* Vertex attributes                                                         */
+/* ------------------------------------------------------------------------ */
+
+/* SET_VERTEX_DATA_ARRAY_FORMAT type codes (d3d8_vsh.h has the same values as
+ * NV2A_VTX_*, behind <d3d11.h>). */
+#define NV2A_VT_D3DCOLOR 0u
+#define NV2A_VT_S1       1u     /* signed short, normalised */
+#define NV2A_VT_FLOAT    2u
+#define NV2A_VT_UBYTE    4u     /* unsigned byte, normalised */
+#define NV2A_VT_S32K     5u     /* signed short, as is */
+#define NV2A_VT_CMP      6u     /* 11:11:10 signed, normalised */
+
+/* One attribute of `size` components of `type` at p as float4, missing
+ * components (0,0,0,1). Returns 0 for a type with no decoder (out is then
+ * (0,0,0,1)). Decoded the way xemu hands them to GL. */
+static inline int nv2a_vtx_decode(uint32_t type, uint32_t size,
+                                  const uint8_t *p, float out[4])
+{
+    uint32_t i;
+
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    switch (type) {
+    case NV2A_VT_D3DCOLOR:
+        /* A DWORD 0xAARRGGBB, so little-endian bytes are B,G,R,A -- not the
+         * component order of every other format here. Returned as R,G,B,A. */
+        out[0] = (float)p[2] / 255.0f;
+        out[1] = (float)p[1] / 255.0f;
+        out[2] = (float)p[0] / 255.0f;
+        out[3] = (float)p[3] / 255.0f;
+        return 1;
+    case NV2A_VT_FLOAT:
+        for (i = 0; i < size && i < 4; i++)
+            memcpy(&out[i], p + 4 * i, 4);
+        return 1;
+    case NV2A_VT_UBYTE:
+        for (i = 0; i < size && i < 4; i++)
+            out[i] = (float)p[i] / 255.0f;
+        return 1;
+    case NV2A_VT_S1:
+        for (i = 0; i < size && i < 4; i++) {
+            int16_t s;
+            float f;
+            memcpy(&s, p + 2 * i, 2);
+            f = (float)s / 32767.0f;
+            out[i] = f < -1.0f ? -1.0f : f;
+        }
+        return 1;
+    case NV2A_VT_S32K:
+        for (i = 0; i < size && i < 4; i++) {
+            int16_t s;
+            memcpy(&s, p + 2 * i, 2);
+            out[i] = (float)s;
+        }
+        return 1;
+    case NV2A_VT_CMP: {
+        uint32_t w;
+        int32_t x, y, z;
+        memcpy(&w, p, 4);
+        x = (int32_t)(w << 21) >> 21;
+        y = (int32_t)(w << 10) >> 21;
+        z = (int32_t)w >> 22;
+        out[0] = (float)x / 1023.0f;
+        out[1] = (float)y / 1023.0f;
+        out[2] = (float)z / 511.0f;
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Primitives and programs                                                   */
+/* ------------------------------------------------------------------------ */
+
+enum nv2a_topology {
+    NV2A_TOPO_NONE = 0,
+    NV2A_TOPO_POINTS,
+    NV2A_TOPO_LINES,
+    NV2A_TOPO_TRIANGLES
+};
+
+/* Point, line and triangle lists from any NV097 primitive (NV_PRIM_*):
+ * the n indices at v, each rebased by -base, into out (room for 3 * n).
+ * Returns the index count and sets *topo; 0 and NV2A_TOPO_NONE for an
+ * unknown primitive. Strips keep their winding, loops close. */
+uint32_t nv2a_prim_to_list(uint32_t prim, const uint16_t *v, uint32_t n,
+                           uint32_t base, uint32_t *out,
+                           enum nv2a_topology *topo);
+
+/* FNV-1a over the vertex program's slots, from v->start through the slot
+ * with the FINAL bit (or the end). *len, if given, gets the slot count. */
+uint32_t nv2a_vsh_program_hash(const struct nv2a_pb_vsh *v, uint32_t *len);
 
 #ifdef __cplusplus
 }

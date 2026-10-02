@@ -166,3 +166,78 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
         mode = 0;
     t->mode = mode;
 }
+
+uint32_t nv2a_prim_to_list(uint32_t prim, const uint16_t *v, uint32_t n,
+                           uint32_t base, uint32_t *out,
+                           enum nv2a_topology *topo)
+{
+    uint32_t k = 0, i;
+
+#define PUT(x) (out[k++] = (uint32_t)(x) - base)
+    switch (prim) {
+    case NV_PRIM_POINTS:
+        *topo = NV2A_TOPO_POINTS;
+        for (i = 0; i < n; i++) PUT(v[i]);
+        break;
+    case NV_PRIM_LINES:
+        *topo = NV2A_TOPO_LINES;
+        for (i = 0; i + 1 < n; i += 2) { PUT(v[i]); PUT(v[i + 1]); }
+        break;
+    case NV_PRIM_LINE_LOOP:
+    case NV_PRIM_LINE_STRIP:
+        *topo = NV2A_TOPO_LINES;
+        for (i = 0; i + 1 < n; i++) { PUT(v[i]); PUT(v[i + 1]); }
+        if (prim == NV_PRIM_LINE_LOOP && n > 2) { PUT(v[n - 1]); PUT(v[0]); }
+        break;
+    case NV_PRIM_TRIANGLES:
+        *topo = NV2A_TOPO_TRIANGLES;
+        for (i = 0; i + 2 < n; i += 3) { PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 2]); }
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        *topo = NV2A_TOPO_TRIANGLES;
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1) { PUT(v[i + 1]); PUT(v[i]); PUT(v[i + 2]); }
+            else       { PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 2]); }
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        *topo = NV2A_TOPO_TRIANGLES;
+        for (i = 1; i + 1 < n; i++) { PUT(v[0]); PUT(v[i]); PUT(v[i + 1]); }
+        break;
+    case NV_PRIM_QUADS:
+        *topo = NV2A_TOPO_TRIANGLES;
+        for (i = 0; i + 3 < n; i += 4) {
+            PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 2]);
+            PUT(v[i]); PUT(v[i + 2]); PUT(v[i + 3]);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        *topo = NV2A_TOPO_TRIANGLES;
+        for (i = 0; i + 3 < n; i += 2) {
+            PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 3]);
+            PUT(v[i]); PUT(v[i + 3]); PUT(v[i + 2]);
+        }
+        break;
+    default:
+        *topo = NV2A_TOPO_NONE;
+        return 0;
+    }
+#undef PUT
+    return k;
+}
+
+uint32_t nv2a_vsh_program_hash(const struct nv2a_pb_vsh *v, uint32_t *len)
+{
+    uint32_t h = 2166136261u, n = 0, pc, k;
+    for (pc = v->start; pc < NV2A_VSH_SLOTS; pc++) {
+        for (k = 0; k < 4; k++)
+            h = (h ^ v->prog[pc][k]) * 16777619u;
+        n++;
+        if (v->prog[pc][3] & 1u)        /* FINAL */
+            break;
+    }
+    if (len)
+        *len = n;
+    return h;
+}
