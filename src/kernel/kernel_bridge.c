@@ -2882,14 +2882,31 @@ static void bridge_NtCreateFile(void)
     {
         extern uint32_t xbox_LastFileError(void);
         uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
+        /* The guest's own path, read from its OBJECT_ATTRIBUTES. The POSIX
+         * path backend prints no [PATH] line, so without this a failed open
+         * on macOS said that something was missing but not what. */
+        char gpath[160] = "?";
+        if (obj_attrs) {
+            uint32_t str = BRIDGE_MEM32(obj_attrs + 4);
+            if (str) {
+                uint32_t len = BRIDGE_MEM16(str), buf = BRIDGE_MEM32(str + 4), k;
+                if (buf) {
+                    if (len >= sizeof gpath) len = sizeof gpath - 1;
+                    for (k = 0; k < len; k++)
+                        gpath[k] = (char)BRIDGE_MEM8(buf + k);
+                    gpath[len] = 0;
+                }
+            }
+        }
         if (g_eax)
-            fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s)\n",
-                    g_eax, _e,
+            fprintf(stderr, "  [FILE] %s (disp %u) -> 0x%08X FAILED (win32 err=%u%s)\n",
+                    gpath, (unsigned)disposition, g_eax, _e,
                     _e == 32u ? " ERROR_SHARING_VIOLATION"
                   : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
                   : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
         else
-            fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
+            fprintf(stderr, "  [FILE] %s (disp %u) -> 0x%08X\n",
+                    gpath, (unsigned)disposition, g_eax);
     }
     fflush(stderr);
 }

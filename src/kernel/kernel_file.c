@@ -1015,6 +1015,29 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
+        case XboxFileAllocationInformation: {
+            /* Reserve space before writing. The Win32 backend has handled this
+             * since Halo's save path needed it; POSIX fell through to
+             * STATUS_NOT_IMPLEMENTED. BLiNX 2 calls it on
+             * z:\lng_us\title_tex_us.tmp as it copies the title-screen
+             * textures into the utility-drive cache after the intro. (That
+             * failure was not what stopped it there -- the D3DX JPEG loader's
+             * setjmp was, see translator._func_has_offset_frame -- but the
+             * call should succeed as it does on Win32.)
+             *
+             * NT semantics: an allocation below the end of file truncates to
+             * it; one above only reserves space and leaves the size alone.
+             * POSIX has no portable reservation, and the caller only needs the
+             * write that follows to succeed, so growing is a no-op. */
+            PXBOX_FILE_END_OF_FILE_INFORMATION info =
+                (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            struct stat st;
+            if (fstat(fd, &st) == 0 && (off_t)info->EndOfFile.QuadPart < st.st_size
+                    && ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
+                return STATUS_UNSUCCESSFUL;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
         case XboxFileDispositionInformation: {
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             /* POSIX: unlinking an open file removes it on last close -- this
