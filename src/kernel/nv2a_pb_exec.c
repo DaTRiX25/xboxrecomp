@@ -1735,6 +1735,12 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 #define NV097_SET_FRONT_FACE_M               0x03A0
 #define NV097_SET_SURFACE_ZETA_OFFSET_M      0x0214
 #define NV097_SET_ZSTENCIL_CLEAR_VALUE_M     0x1D8C
+#define NV097_SET_STENCIL_TEST_ENABLE_M      0x032C
+#define NV097_SET_STENCIL_MASK_M             0x0360   /* write mask */
+#define NV097_SET_STENCIL_FUNC_M             0x0364
+#define NV097_SET_STENCIL_FUNC_REF_M         0x0368
+#define NV097_SET_STENCIL_FUNC_MASK_M        0x036C   /* read mask */
+#define NV097_SET_STENCIL_OP_FAIL_M          0x0370   /* ..ZFAIL 0x374, ZPASS 0x378 */
 #define NV097_SET_VERTEX_DATA2S_M            0x1900   /* + attr*4, 2 shorts */
 #define NV097_SET_VERTEX_DATA4S_M_M          0x1980   /* + attr*8, 4 shorts */
 
@@ -1774,6 +1780,7 @@ static uint64_t s_vsh_ab_batches, s_vsh_ab_diff_batches, s_vsh_ab_diff_px;
 static float s_vsh_last_d0[4];
 static XfVert s_vsh_last_v0;
 static float *s_zbuf;
+static uint8_t *s_sbuf;                 /* stencil, same extent as s_zbuf */
 static uint32_t s_zbuf_w, s_zbuf_h;
 
 static float u2f(uint32_t u) { union { uint32_t u; float f; } v; v.u = u; return v.f; }
@@ -1929,6 +1936,16 @@ static int vsh_method(uint32_t method, uint32_t param)
     case NV097_SET_DEPTH_MASK_M:        s_vsh.depth_mask = param != 0;  return 1;
     case NV097_SET_SURFACE_ZETA_OFFSET_M: s_vsh.zeta_offset = param;    return 1;
     case NV097_SET_ZSTENCIL_CLEAR_VALUE_M: s_vsh.zclear = param;        return 1;
+    case NV097_SET_STENCIL_TEST_ENABLE_M: s_vsh.stencil_enable = param != 0; return 1;
+    case NV097_SET_STENCIL_MASK_M:      s_vsh.stencil_wmask = param & 0xFFu; return 1;
+    case NV097_SET_STENCIL_FUNC_M:      s_vsh.stencil_func = param & 0xFu;   return 1;
+    case NV097_SET_STENCIL_FUNC_REF_M:  s_vsh.stencil_ref = param & 0xFFu;   return 1;
+    case NV097_SET_STENCIL_FUNC_MASK_M: s_vsh.stencil_rmask = param & 0xFFu; return 1;
+    case NV097_SET_STENCIL_OP_FAIL_M:
+    case NV097_SET_STENCIL_OP_FAIL_M + 4:
+    case NV097_SET_STENCIL_OP_FAIL_M + 8:
+        s_vsh.stencil_op[(method - NV097_SET_STENCIL_OP_FAIL_M) / 4] = param;
+        return 1;
     default:
         return 0;
     }
@@ -2154,16 +2171,86 @@ static int vsh_zbuf_ready(void)
     uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h;
     if (!w || !h || w > 4096 || h > 4096)
         return 0;
-    if (w != s_zbuf_w || h != s_zbuf_h || !s_zbuf) {
+    if (w != s_zbuf_w || h != s_zbuf_h || !s_zbuf || !s_sbuf) {
         float *n = (float *)realloc(s_zbuf, (size_t)w * h * sizeof(float));
+        uint8_t *sn;
         uint32_t i;
         if (!n)
             return 0;
         s_zbuf = n;
+        sn = (uint8_t *)realloc(s_sbuf, (size_t)w * h);
+        if (!sn)
+            return 0;
+        s_sbuf = sn;
         s_zbuf_w = w; s_zbuf_h = h;
         for (i = 0; i < w * h; i++)
             s_zbuf[i] = 1.0f;
+        memset(s_sbuf, 0, (size_t)w * h);
     }
+    return 1;
+}
+
+/* The stencil test is live: enabled, and the zeta surface is Z24S8 (a Z16
+ * surface has no stencil, and GL then passes every fragment untouched). */
+static int vsh_stencil_ready(void)
+{
+    return s_vsh.stencil_enable && ((s_gpu.format >> 4) & 0xF) == 2
+        && vsh_zbuf_ready();
+}
+
+static int stencil_pass(uint8_t stored)
+{
+    uint32_t m = s_vsh.stencil_rmask, r = s_vsh.stencil_ref & m, v = stored & m;
+    switch (s_vsh.stencil_func) {
+    case 0: return 0;
+    case 1: return r <  v;
+    case 2: return r == v;
+    case 3: return r <= v;
+    case 4: return r >  v;
+    case 5: return r != v;
+    case 6: return r >= v;
+    default: return 1;
+    }
+}
+
+static void stencil_apply(uint8_t *sp, uint32_t op)
+{
+    uint32_t v = *sp, n;
+    switch (op) {
+    case 0x0000: n = 0; break;
+    case 0x1E01: n = s_vsh.stencil_ref; break;
+    case 0x1E02: n = v < 255u ? v + 1u : 255u; break;
+    case 0x1E03: n = v ? v - 1u : 0u; break;
+    case 0x150A: n = ~v; break;
+    case 0x8507: n = v + 1u; break;
+    case 0x8508: n = v - 1u; break;
+    default: return;                       /* KEEP, and anything unset */
+    }
+    *sp = (uint8_t)((v & ~s_vsh.stencil_wmask) | (n & s_vsh.stencil_wmask));
+}
+
+/* Stencil, then depth, for one fragment before it is shaded, in GL's order:
+ * a stencil failure applies the fail op and skips the depth test, a depth
+ * failure applies the zfail op. 0: shade it. 1: discarded. 2: failed, but the
+ * alpha test runs first (a fragment it kills touches no stencil), so shade
+ * it and apply *op if it survives. */
+static int depth_pass(float z, float stored);
+
+static int zs_early(int use_s, int use_z, float z, const float *zp,
+                    const uint8_t *sp, uint32_t *op)
+{
+    if (use_s && !stencil_pass(*sp))
+        *op = s_vsh.stencil_op[0];
+    else if (use_z && !depth_pass(z, *zp)) {
+        s_vsh.z_rejected++;
+        if (!use_s)
+            return 1;
+        *op = s_vsh.stencil_op[1];
+    } else
+        return 0;
+    if (s_vsh.atest_enable)
+        return 2;
+    stencil_apply((uint8_t *)sp, *op);
     return 1;
 }
 
@@ -2176,7 +2263,11 @@ static void vsh_clear_depth(uint32_t param)
     if (env_cached("RECOMP_VSH_ZLOG") && s_vsh.batches_prog < 1200)
         fprintf(stderr, "  [ZLOG] clear 0x%X colour 0x%X zeta 0x%X zclear 0x%X\n",
                 param, s_gpu.color_offset, s_vsh.zeta_offset, s_vsh.zclear);
-    if (!(param & 1u) || !vsh_zbuf_ready())
+    if (!(param & 3u) || !vsh_zbuf_ready())
+        return;
+    if (param & 2u)                        /* stencil: the value's low byte */
+        memset(s_sbuf, (int)(s_vsh.zclear & 0xFFu), (size_t)s_zbuf_w * s_zbuf_h);
+    if (!(param & 1u))
         return;
     s_vsh.zclears++;
     s_vsh.zclear_color_off = s_gpu.color_offset;
@@ -2718,7 +2809,7 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     float area, inv_w[3], zscale = 1.0f / vsh_zmax();
-    int minx, maxx, miny, maxy, x, y, use_z, use_rc, n;
+    int minx, maxx, miny, maxy, x, y, use_z, use_s, use_rc, n;
 
     if (bpp != 4 && bpp != 2)
         return;
@@ -2746,6 +2837,7 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
     if (!surface_begin_batch(mem))
         return;
     use_z = s_vsh.depth_enable && vsh_zbuf_ready();
+    use_s = vsh_stencil_ready();
     use_rc = vsh_rc_active();
 
     minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
@@ -2771,8 +2863,9 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
             float w2 = (a->x - c->x) * (py - c->y) - (a->y - c->y) * (px - c->x);
             float la, lb, lc, pa, pb, pc, ps, col[4], z = 0.0f;
             float *zp = NULL;
-            uint32_t argb;
-            int k;
+            uint8_t *sp = NULL;
+            uint32_t argb, zs_op = 0;
+            int k, zs = 0;
 
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
                || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
@@ -2783,11 +2876,12 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
             if (use_z) {
                 z = (la * a->z + lb * b->z + lc * c->z) * zscale;
                 zp = &s_zbuf[(size_t)y * s_zbuf_w + (size_t)x];
-                if (!depth_pass(z, *zp)) {
-                    s_vsh.z_rejected++;
-                    continue;
-                }
             }
+            if (use_s)
+                sp = &s_sbuf[(size_t)y * s_zbuf_w + (size_t)x];
+            if ((use_z || use_s)
+                    && (zs = zs_early(use_s, use_z, z, zp, sp, &zs_op)) == 1)
+                continue;
 
             /* Perspective-correct weights. */
             pa = la * inv_w[0]; pb = lb * inv_w[1]; pc = lc * inv_w[2];
@@ -2830,6 +2924,12 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
                 s_vsh.a_rejected++;
                 continue;
             }
+            if (zs == 2) {                 /* failed stencil or depth */
+                stencil_apply(sp, zs_op);
+                continue;
+            }
+            if (use_s)
+                stencil_apply(sp, s_vsh.stencil_op[2]);
             if (use_z && s_vsh.depth_mask)
                 *zp = z;
             argb = ((uint32_t)(clamp01(col[3]) * 255.0f + 0.5f) << 24)
@@ -3499,7 +3599,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     float area, inv_w[3], zscale = 1.0f / vsh_zmax();
-    int minx, maxx, miny, maxy, x, y, use_z, use_rc, n, unit_w;
+    int minx, maxx, miny, maxy, x, y, use_z, use_s, use_rc, n, unit_w;
     float e0dx, e0dy, e1dx, e1dy, e2dx, e2dy;
     float r[16][4];
 
@@ -3527,6 +3627,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
     if (!surface_begin_batch(mem))
         return;
     use_z = s_vsh.depth_enable && vsh_zbuf_ready();
+    use_s = vsh_stencil_ready();
     use_rc = vsh_rc_active();
 
     minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
@@ -3585,8 +3686,9 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
             float w2 = e2dx * p2 - e2dy * (px - c->x);
             float la, lb, lc, pa, pb, pc, ps, col[4], z = 0.0f;
             float *zp = NULL;
-            uint32_t argb;
-            int k;
+            uint8_t *sp = NULL;
+            uint32_t argb, zs_op = 0;
+            int k, zs = 0;
 
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
                || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
@@ -3596,11 +3698,12 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
             if (use_z) {
                 z = (la * a->z + lb * b->z + lc * c->z) * zscale;
                 zp = &s_zbuf[(size_t)y * s_zbuf_w + (size_t)x];
-                if (!depth_pass(z, *zp)) {
-                    s_vsh.z_rejected++;
-                    continue;
-                }
             }
+            if (use_s)
+                sp = &s_sbuf[(size_t)y * s_zbuf_w + (size_t)x];
+            if ((use_z || use_s)
+                    && (zs = zs_early(use_s, use_z, z, zp, sp, &zs_op)) == 1)
+                continue;
 
             if (unit_w) {
                 pa = la; pb = lb; pc = lc;           /* x * (1/1) == x */
@@ -3649,6 +3752,12 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                 s_vsh.a_rejected++;
                 continue;
             }
+            if (zs == 2) {                 /* failed stencil or depth */
+                stencil_apply(sp, zs_op);
+                continue;
+            }
+            if (use_s)
+                stencil_apply(sp, s_vsh.stencil_op[2]);
             if (use_z && s_vsh.depth_mask)
                 *zp = z;
             argb = ((uint32_t)(clamp01(col[3]) * 255.0f + 0.5f) << 24)
@@ -4280,11 +4389,12 @@ static void raster_batch_fast_ab(void)
 {
     static uint8_t *save, *ref;
     static float *zsave, *zref;
-    static size_t cap, zcap;
+    static uint8_t *ssave, *sref;
+    static size_t cap, zcap, scap;
     static struct nv2a_pb_gpu gpu0, gpu_ref;
     static struct nv2a_pb_vsh vsh0, vsh_ref;
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-    size_t size = (size_t)(s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch, zn = 0, k;
+    size_t size = (size_t)(s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch, zn = 0, sn = 0, k;
     uint32_t bpp = surface_bpp(), bad_px = 0, first = 0;
     int dumps = s_drawn_dumps, zbad, cbad;
 
@@ -4306,8 +4416,17 @@ static void raster_batch_fast_ab(void)
         zcap = zsave && zref ? zn : 0;
         if (!zcap) { raster_batch_vsh_one(); return; }
     }
+    if (vsh_stencil_ready())
+        sn = (size_t)s_zbuf_w * s_zbuf_h;
+    if (sn > scap) {
+        ssave = (uint8_t *)realloc(ssave, sn);
+        sref  = (uint8_t *)realloc(sref, sn);
+        scap = ssave && sref ? sn : 0;
+        if (!scap) { raster_batch_vsh_one(); return; }
+    }
     memcpy(save, s_surface, size);
     if (zn) memcpy(zsave, s_zbuf, zn * sizeof(float));
+    if (sn) memcpy(ssave, s_sbuf, sn);
     gpu0 = s_gpu; vsh0 = s_vsh;
 
     /* reference */
@@ -4319,11 +4438,13 @@ static void raster_batch_fast_ab(void)
     surface_begin_batch(mem);
     memcpy(ref, s_surface, size);
     if (zn) memcpy(zref, s_zbuf, zn * sizeof(float));
+    if (sn) memcpy(sref, s_sbuf, sn);
     gpu_ref = s_gpu; vsh_ref = s_vsh;
 
     /* fast, from the same start */
     memcpy(s_surface, save, size);
     if (zn) memcpy(s_zbuf, zsave, zn * sizeof(float));
+    if (sn) memcpy(s_sbuf, ssave, sn);
     s_gpu = gpu0; s_vsh = vsh0;
     s_fast_force = 1;
     raster_batch_vsh_one();
@@ -4336,7 +4457,8 @@ static void raster_batch_fast_ab(void)
             if (memcmp(ref + k, s_surface + k, bpp)) {
                 if (!bad_px++) first = (uint32_t)k;
             }
-    zbad = zn && memcmp(zref, s_zbuf, zn * sizeof(float));
+    zbad = (zn && memcmp(zref, s_zbuf, zn * sizeof(float)))
+        || (sn && memcmp(sref, s_sbuf, sn));   /* "depth" covers stencil */
     cbad = gpu_ref.pixels != s_gpu.pixels || gpu_ref.pixel_max != s_gpu.pixel_max
         || gpu_ref.tris_drawn != s_gpu.tris_drawn
         || gpu_ref.tris_skipped_offscreen != s_gpu.tris_skipped_offscreen

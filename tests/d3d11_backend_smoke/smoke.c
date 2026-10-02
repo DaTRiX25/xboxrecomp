@@ -7,7 +7,7 @@
  * XDK does it (color_offset moves to the other buffer before FLIP_STALL).
  * Then textured quads (a swizzled checker, a linear YUY2 ramp) and a quad
  * through four register-combiner stages with the title's final combiner,
- * and three overlapping quads with depth tests.
+ * three overlapping quads with depth tests, and a stencil mask.
  * With RECOMP_PB_BACKEND=d3d11 that reaches ClearRenderTargetView, a draw
  * and Present in src/d3d/nv2a_pb_d3d11.c.
  *
@@ -152,7 +152,7 @@ int main(int argc, char **argv)
         M(0x0214, 0x02400000u);                /* SURFACE_ZETA_OFFSET     */
         M(0x1D90, clear);                      /* COLOR_CLEAR_VALUE       */
         M(0x1D8C, 0xFFFFFF00u);                /* ZSTENCIL_CLEAR_VALUE: far */
-        M(0x1D94, 0xF1);                       /* CLEAR_SURFACE: colour + Z */
+        M(0x1D94, 0xF3);                       /* CLEAR_SURFACE: colour, Z, stencil 0 */
 
         for (a = 0; a < 16; a++)               /* VERTEX_DATA_ARRAY_FORMAT */
             M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
@@ -272,6 +272,43 @@ int main(int argc, char **argv)
         vertex_z(470.0f, 420.0f, 8388608.0f, 0xFF2040FFu);
         M(0x17FC, 0);
         M(0x030C, 0);                          /* depth test off */
+
+        /* Stencil: a stencil-only quad (colour writes off) marks y 200..300
+         * with 1, then a band x 20..75, y 150..370, drawn EQUAL 1 in yellow
+         * and again NOTEQUAL 1 in cyan: yellow only over the mark, cyan
+         * around it. */
+        M(0x032C, 1);                          /* STENCIL_TEST_ENABLE */
+        M(0x0360, 0xFF);                       /* STENCIL_MASK (write) */
+        M(0x036C, 0xFF);                       /* STENCIL_FUNC_MASK */
+        M(0x0368, 1);                          /* STENCIL_FUNC_REF */
+        M(0x0364, 0x207);                      /* STENCIL_FUNC: ALWAYS */
+        M(0x0370, 0x1E00);                     /* OP_FAIL: KEEP */
+        M(0x0374, 0x1E00);                     /* OP_ZFAIL: KEEP */
+        M(0x0378, 0x1E01);                     /* OP_ZPASS: REPLACE */
+        M(0x0358, 0);                          /* COLOR_MASK: none */
+        M(0x17FC, 8);
+        vertex(20.0f, 200.0f, 0xFFFFFFFFu);
+        vertex(75.0f, 200.0f, 0xFFFFFFFFu);
+        vertex(75.0f, 300.0f, 0xFFFFFFFFu);
+        vertex(20.0f, 300.0f, 0xFFFFFFFFu);
+        M(0x17FC, 0);
+        M(0x0358, 0x01010101u);                /* COLOR_MASK: all */
+        M(0x0378, 0x1E00);                     /* OP_ZPASS: KEEP */
+        M(0x0364, 0x202);                      /* STENCIL_FUNC: EQUAL */
+        M(0x17FC, 8);
+        vertex(20.0f, 150.0f, 0xFFFFFF00u);
+        vertex(75.0f, 150.0f, 0xFFFFFF00u);
+        vertex(75.0f, 370.0f, 0xFFFFFF00u);
+        vertex(20.0f, 370.0f, 0xFFFFFF00u);
+        M(0x17FC, 0);
+        M(0x0364, 0x205);                      /* STENCIL_FUNC: NOTEQUAL */
+        M(0x17FC, 8);
+        vertex(20.0f, 150.0f, 0xFF00FFFFu);
+        vertex(75.0f, 150.0f, 0xFF00FFFFu);
+        vertex(75.0f, 370.0f, 0xFF00FFFFu);
+        vertex(20.0f, 370.0f, 0xFF00FFFFu);
+        M(0x17FC, 0);
+        M(0x032C, 0);                          /* stencil test off */
         M(0x1E70, 1);                          /* stage 0 2D again */
 
         /* Render to texture. The top-left inset samples the offscreen

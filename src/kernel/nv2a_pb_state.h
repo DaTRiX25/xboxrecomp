@@ -166,6 +166,14 @@ struct nv2a_pb_vsh {
      * 0x804 LINEAR_ABS, 0x2601 LINEAR); fog_param is SET_FOG_PARAMS. */
     uint32_t fog_mode, fog_gen, spec_enable, light_ctl;
     float    fog_param[3];
+    /* Stencil, as xemu's CONTROL_1/2 hold it: func is the low nibble of
+     * SET_STENCIL_FUNC (0 NEVER .. 7 ALWAYS), ref and the masks are 8 bits,
+     * the ops are the raw GL codes (0x1E00 KEEP, 0 ZERO, 0x1E01 REPLACE,
+     * 0x1E02/3 INCR/DECR_SAT, 0x150A INVERT, 0x8507/8 INCR/DECR wrap) for
+     * fail, zfail, zpass. Only a Z24S8 zeta surface has a stencil buffer. */
+    int      stencil_enable;
+    uint32_t stencil_func, stencil_ref, stencil_rmask, stencil_wmask;
+    uint32_t stencil_op[3];
     /* survey */
     uint32_t prog_dwords, prog_loads, prog_starts, const_dwords, const_loads;
     uint32_t mode_sets, ff_matrix_dwords, vp_dwords;
