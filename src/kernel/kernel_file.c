@@ -115,6 +115,80 @@ static DWORD xbox_share_to_win32(ULONG Share)
     return result;
 }
 
+/* FATX overwrite semantics (Win32 side; the POSIX backend below has the
+ * same rule and the long story, at s_overwrite_pending).
+ *
+ * An overwrite open (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF) of an
+ * existing file sets its size to 0 on FATX, but FATX keeps no valid-data
+ * length, so a later SetEndOfFile that grows the file brings back the bytes
+ * already on disk. BLiNX 2's z: texture cache depends on it: it writes x.tmp,
+ * reopens it with CREATE_ALWAYS, only sets the end of file to the true size,
+ * and renames it to x.ipk. CREATE_ALWAYS / TRUNCATE_EXISTING on NTFS (and
+ * Wine's ftruncate) zero-fill on the regrow, so every cache file came out as
+ * zeros of the right length.
+ *
+ * So an overwrite of an existing non-empty file opens it with OPEN_EXISTING
+ * and marks the handle pending. If the first thing done with it is setting
+ * the end of file, that is a plain SetEndOfFile to the new size, which keeps
+ * the bytes below it. Anything else (read, write, size query, allocation,
+ * close) first truncates to 0, the normal overwrite. A position query does
+ * not settle: XAPI SetEndOfFile makes one before it sets the end of file. */
+#define FATX_PENDING_MAX 64
+static HANDLE s_overwrite_pending[FATX_PENDING_MAX];
+static SRWLOCK s_overwrite_lock = SRWLOCK_INIT;
+
+static int disposition_overwrites(ULONG disposition)
+{
+    return disposition == XBOX_FILE_SUPERSEDE
+        || disposition == XBOX_FILE_OVERWRITE
+        || disposition == XBOX_FILE_OVERWRITE_IF;
+}
+
+/* Mark h pending. Returns 0 if the table is full. */
+static int overwrite_mark(HANDLE h)
+{
+    int i, ok = 0;
+    AcquireSRWLockExclusive(&s_overwrite_lock);
+    for (i = 0; i < FATX_PENDING_MAX; i++)
+        if (!s_overwrite_pending[i]) { s_overwrite_pending[i] = h; ok = 1; break; }
+    ReleaseSRWLockExclusive(&s_overwrite_lock);
+    return ok;
+}
+
+/* Take the pending mark without truncating. Returns 1 if h was pending. */
+static int overwrite_take(HANDLE h)
+{
+    int i, was = 0;
+    if (!h || h == INVALID_HANDLE_VALUE)
+        return 0;
+    AcquireSRWLockExclusive(&s_overwrite_lock);
+    for (i = 0; i < FATX_PENDING_MAX; i++)
+        if (s_overwrite_pending[i] == h) { s_overwrite_pending[i] = NULL; was = 1; break; }
+    ReleaseSRWLockExclusive(&s_overwrite_lock);
+    return was;
+}
+
+/* Truncate to 0, keeping the file pointer where it was. */
+static void truncate_to_zero(HANDLE h)
+{
+    LARGE_INTEGER cur, zero;
+    zero.QuadPart = 0;
+    if (!SetFilePointerEx(h, zero, &cur, FILE_CURRENT))
+        cur.QuadPart = 0;
+    SetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+    if (!SetEndOfFile(h))
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                 "overwrite: truncate failed err=%u", GetLastError());
+    SetFilePointerEx(h, cur, NULL, FILE_BEGIN);
+}
+
+/* Finish a pending overwrite: truncate to 0. */
+static void overwrite_settle(HANDLE h)
+{
+    if (overwrite_take(h))
+        truncate_to_zero(h);
+}
+
 /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
 static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
                                WCHAR* win_path, DWORD buf_size)
@@ -190,9 +264,28 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
-        h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL,
-            xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+        DWORD access = xbox_access_to_win32(DesiredAccess);
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        /* An overwrite of an existing non-empty file is deferred (see
+         * s_overwrite_pending). It needs write access to settle later. */
+        int defer = disposition_overwrites(CreateDisposition)
+                 && (access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA))
+                 && GetFileAttributesExW(win_path, GetFileExInfoStandard, &fad)
+                 && !(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                 && (fad.nFileSizeHigh || fad.nFileSizeLow);
+        h = INVALID_HANDLE_VALUE;
+        if (defer) {
+            h = CreateFileW(win_path, access, xbox_share_to_win32(ShareAccess),
+                NULL, OPEN_EXISTING, flags_and_attrs, NULL);
+            if (h != INVALID_HANDLE_VALUE && !overwrite_mark(h))
+                truncate_to_zero(h);        /* no slot to defer in */
+            else if (h != INVALID_HANDLE_VALUE)
+                XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: overwrite of %S deferred", win_path);
+        }
+        if (h == INVALID_HANDLE_VALUE)      /* not deferred, or it vanished */
+            h = CreateFileW(win_path, access,
+                xbox_share_to_win32(ShareAccess), NULL,
+                xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
     }
 
     if (h == INVALID_HANDLE_VALUE) {
@@ -243,6 +336,7 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
+    overwrite_settle(FileHandle);
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
@@ -283,6 +377,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
+    overwrite_settle(FileHandle);
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
@@ -310,6 +405,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        overwrite_settle(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -334,6 +430,11 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+
+    /* Not for a position query: XAPI SetEndOfFile makes one before it
+     * sets the end of file, and a pending overwrite must survive it. */
+    if (FileInformationClass != XboxFilePositionInformation)
+        overwrite_settle(FileHandle);
 
     switch (FileInformationClass) {
         case XboxFileBasicInformation: {
@@ -428,6 +529,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             LARGE_INTEGER cur, zero = {0};
+            /* A pending overwrite ends here: SetEndOfFile to the new size
+             * keeps the old bytes below it (see s_overwrite_pending). */
+            overwrite_take(FileHandle);
             SetFilePointerEx(FileHandle, zero, &cur, FILE_CURRENT);
             SetFilePointerEx(FileHandle, info->EndOfFile, NULL, FILE_BEGIN);
             if (!SetEndOfFile(FileHandle)) {
@@ -455,6 +559,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_END_OF_FILE_INFORMATION info =
                 (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             FILE_ALLOCATION_INFO fai;
+            overwrite_settle(FileHandle);
             fai.AllocationSize = info->EndOfFile;
             if (!SetFileInformationByHandle(FileHandle, FileAllocationInfo,
                                             &fai, sizeof(fai))) {
