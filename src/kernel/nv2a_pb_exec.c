@@ -577,8 +577,12 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  * clip gives it, as the draws and clears that used it saw it. The size wanted
  * is the display's: that of the surface at the address AvSetDisplayMode
  * scans out (the largest, if the title used it at more than one size), or,
- * with no display mode yet, of the largest surface seen. Of the surfaces that
- * size, the one drawn into most recently since the last flip wins; if none
+ * with no display mode yet, of the largest surface seen; and the pitch is
+ * the display's too, once there is a display mode. A run of draws with the
+ * clip at 640x480 but offset and pitch still those of the 320x240 target
+ * (BLiNX 2 @stage1, the odd frame) is 640x480 but nothing the display could
+ * scan out. Of the surfaces that size, the one drawn into most recently
+ * since the last flip wins; if none
  * was, the one cleared most recently; if none was either, the frame on
  * screen stays. Nothing carries over from one flip to the next, so a stray
  * flip with an odd target bound decides that flip and no other. */
@@ -675,6 +679,7 @@ static void present_pick(void)
         for (i = 0; i < PRESENT_MAX; i++) {
             uint64_t when = pass == 0 ? s_psurf[i].last_draw : s_psurf[i].last_clear;
             if (s_psurf[i].offset && s_psurf[i].w == tw && s_psurf[i].h == th
+                    && (!disp_pitch || s_psurf[i].pitch == disp_pitch)
                     && when > top) {
                 top = when;
                 best = i;
