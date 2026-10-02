@@ -228,6 +228,32 @@ static uint32_t s_sema_last_va, s_sema_last_value;
 uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_sema_releases; }
 uint32_t nv2a_pb_exec_semaphore_last_va(void) { return s_sema_last_va; }
 
+/* getenv, read once per name.
+ *
+ * The walker asked the environment for its debug switches on every method,
+ * batch and triangle. getenv is a linear scan of the environment -- under
+ * Wine a locked, case-insensitive one over a Proton environment of a hundred
+ * and more variables -- and at ~100,000 methods a frame that scan was most of
+ * the walker's time. The answer cannot change while the walker runs (nothing
+ * sets these after startup), so it is looked up once. Keyed by the address of
+ * the name, so a call site costs a few pointer compares. Ack thread only. */
+static const char *env_cached(const char *name)
+{
+    static struct { const char *name, *value; } cache[48];
+    static int n;
+    int i;
+
+    for (i = 0; i < n; i++)
+        if (cache[i].name == name)
+            return cache[i].value;
+    if (n < (int)(sizeof cache / sizeof cache[0])) {
+        cache[n].name = name;
+        cache[n].value = getenv(name);
+        return cache[n++].value;
+    }
+    return getenv(name);
+}
+
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
  * them in. */
@@ -338,16 +364,33 @@ static void note_texture_use(void)
     }
 }
 
+/* s_unhandled's slot for each method, plus one (0: not seen yet). Methods
+ * are dword offsets below 0x2000, so method / 4 indexes it; the table itself
+ * keeps first-seen order, which is what the report ranks from. A linear
+ * search here ran for every unhandled method the title sends, tens of
+ * thousands a frame. */
+static uint16_t s_unhandled_slot[0x2000 / 4];
+
 static void note_unhandled(uint32_t method, uint32_t param)
 {
-    int i;
+    int fits = method < 0x2000 && !(method & 3), i;
 
     s_gpu.unhandled_total++;
-    for (i = 0; i < s_unhandled_count; i++) {
-        if (s_unhandled[i].method == method) {
+    if (fits) {
+        i = (int)s_unhandled_slot[method >> 2] - 1;
+        if (i >= 0) {
             s_unhandled[i].count++;
             s_unhandled[i].last_param = param;
             return;
+        }
+    } else {
+        /* An incrementing run carried past 0x1FFC: rare, searched. */
+        for (i = 0; i < s_unhandled_count; i++) {
+            if (s_unhandled[i].method == method) {
+                s_unhandled[i].count++;
+                s_unhandled[i].last_param = param;
+                return;
+            }
         }
     }
     if (s_unhandled_count < PB_EXEC_MAX_UNHANDLED) {
@@ -355,6 +398,8 @@ static void note_unhandled(uint32_t method, uint32_t param)
         s_unhandled[s_unhandled_count].count = 1;
         s_unhandled[s_unhandled_count].last_param = param;
         s_unhandled_count++;
+        if (fits)
+            s_unhandled_slot[method >> 2] = (uint16_t)s_unhandled_count;
     }
 }
 
@@ -817,7 +862,7 @@ static void clear_surface(uint32_t param)
      * zero.
      *
      * ponytail: bring-up aid, not a feature. It costs one branch per clear. */
-    if (getenv("RECOMP_RASTER_TEST")) {
+    if (env_cached("RECOMP_RASTER_TEST")) {
         static int announced;
         /* Every clear, not once: the title clears each frame and double-buffers,
          * so a triangle drawn a single time is erased before anyone sees it. */
@@ -1965,7 +2010,7 @@ static uint32_t vsh_note_program(void)
     s_vsh_progs[s_vsh_prog_count].batches = 1;
     s_vsh_prog_count++;
 
-    if (getenv("RECOMP_VSH_TRACE")) {
+    if (env_cached("RECOMP_VSH_TRACE")) {
         char buf[160];
         fprintf(stderr, "  [VSH] program #%d hash %08X start %u len %u"
                         " (cxt_write %d)\n",
@@ -2128,7 +2173,7 @@ static void vsh_clear_depth(uint32_t param)
     uint32_t i;
 
     s_vsh.clears_seen++;
-    if (getenv("RECOMP_VSH_ZLOG") && s_vsh.batches_prog < 1200)
+    if (env_cached("RECOMP_VSH_ZLOG") && s_vsh.batches_prog < 1200)
         fprintf(stderr, "  [ZLOG] clear 0x%X colour 0x%X zeta 0x%X zclear 0x%X\n",
                 param, s_gpu.color_offset, s_vsh.zeta_offset, s_vsh.zclear);
     if (!(param & 1u) || !vsh_zbuf_ready())
@@ -2196,6 +2241,25 @@ static struct {
     uint64_t total, xform, setup, tex;   /* ns since the last flip line */
     uint32_t yuv_batches;                /* batches sampling a YUY2/UYVY stage 0 */
 } s_rt;
+
+/* Walker timing (RECOMP_FLIP_LOG, the [PB-PERF] line): host time spent in
+ * nv2a_pb_scan (the walk, decode and every backend hook it calls) and, inside
+ * that, in the backend's on_draw, per flip. nv2a_pb_scan.c brackets each scan
+ * with nv2a_pb_perf_scan_begin/end; the line is printed and reset at the flip,
+ * which arrives inside a scan, so the open scan is counted up to that point. */
+static struct {
+    uint64_t scan, draw, scan_t0, flip_t0;
+    uint32_t methods, batches;
+} s_perf;
+
+uint64_t nv2a_pb_now_ns(void) { return rt_now(); }
+void nv2a_pb_perf_scan_begin(void) { s_perf.scan_t0 = rt_now(); }
+void nv2a_pb_perf_scan_end(void)
+{
+    uint64_t now = rt_now();
+    s_perf.scan += now - s_perf.scan_t0;
+    s_perf.scan_t0 = now;
+}
 
 /* ---- Texture stages and register combiners ----------------------------
  *
@@ -2670,7 +2734,7 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
          * clockwise triangle faces the viewer. */
         int cw = area > 0.0f;
         int front = (s_vsh.front_face == 0x900) ? cw : !cw;
-        if (getenv("RECOMP_PB_CULL_FLIP"))
+        if (env_cached("RECOMP_PB_CULL_FLIP"))
             front = !front;
         if ((s_vsh.cull_face == 0x405 && !front)
          || (s_vsh.cull_face == 0x404 && front)
@@ -3451,7 +3515,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
     if (s_vsh.cull_enable) {
         int cw = area > 0.0f;
         int front = (s_vsh.front_face == 0x900) ? cw : !cw;
-        if (getenv("RECOMP_PB_CULL_FLIP"))
+        if (env_cached("RECOMP_PB_CULL_FLIP"))
             front = !front;
         if ((s_vsh.cull_face == 0x405 && !front)
          || (s_vsh.cull_face == 0x404 && front)
@@ -3819,7 +3883,7 @@ static void clip_tri(const XfVert *a, const XfVert *b, const XfVert *c,
         n = m;
         { ClipVert *t = src; src = dst; dst = t; }
     }
-    if (getenv("RECOMP_CLIP_TRACE")) {
+    if (env_cached("RECOMP_CLIP_TRACE")) {
         static int shown;
         /* Skip the triangles a program put wholly at the screen origin; they
          * have no area either way and drown out the rest. */
@@ -4053,14 +4117,14 @@ static void raster_batch_vsh_one(void)
             vsh_transform(s_gpu.idx[i], &xv[i]);
         s_rt.xform += rt_now() - t0;
     }
-    if (getenv("RECOMP_VSH_ZLOG") && s_vsh.batches_prog < 1200 && n)
+    if (env_cached("RECOMP_VSH_ZLOG") && s_vsh.batches_prog < 1200 && n)
         fprintf(stderr, "  [ZLOG] batch %u colour 0x%X depth %d func 0x%X mask %d"
                         " poly %d %g %g | v0 z %g w %g tex 0x%X fmt %02X\n",
                 s_vsh.batches_prog, s_gpu.color_offset, s_vsh.depth_enable,
                 s_vsh.depth_func, s_vsh.depth_mask, s_vsh.poly_offset,
                 s_vsh.poly_factor, s_vsh.poly_bias, xv[0].z, xv[0].w,
                 s_gpu.tex.offset, s_gpu.tex.color);
-    if (plen > 12 && getenv("RECOMP_VSH_TRACE")) {
+    if (plen > 12 && env_cached("RECOMP_VSH_TRACE")) {
         static int shown3d;
         if (shown3d++ < 6) {
             float v[NV2A_VSH_INPUTS][4];
@@ -4156,7 +4220,7 @@ static void raster_batch_vsh_one(void)
     if (textured)
         s_vsh.tris_textured += s_gpu.tris_drawn - before;
 
-    if (getenv("RECOMP_VSH_TRACE")) {
+    if (env_cached("RECOMP_VSH_TRACE")) {
         static int shown;
         if (shown < 24 && n) {
             shown++;
@@ -4680,7 +4744,7 @@ static int s_wt_nsurf;
 static void white_note_surface(void)
 {
     int i;
-    if (!getenv("RECOMP_WHITE_DUMP"))
+    if (!env_cached("RECOMP_WHITE_DUMP"))
         return;
     for (i = 0; i < s_wt_nsurf; i++)
         if (s_wt_surf[i].off == s_gpu.color_offset)
@@ -4773,6 +4837,10 @@ static const struct nv2a_pb_backend s_cpu_backend = {
 };
 static const struct nv2a_pb_backend *s_backend = &s_cpu_backend;
 
+/* RECOMP_PB_BACKEND=null: the walker and its decode, drawing nothing. Times
+ * the platform-independent part of a frame on its own (the [PB-PERF] line). */
+static const struct nv2a_pb_backend s_null_backend = { NULL, NULL, NULL, NULL };
+
 void nv2a_pb_set_backend(const struct nv2a_pb_backend *backend)
 {
     s_backend = backend ? backend : &s_cpu_backend;
@@ -4820,6 +4888,7 @@ static void draw_primitive(void)
     }
 
     if (s_backend->on_draw) {
+        uint64_t t0 = rt_now();
         struct nv2a_pb_draw d;
         d.prim         = s_gpu.prim;
         d.attr         = s_gpu.attr;
@@ -4830,9 +4899,11 @@ static void draw_primitive(void)
         d.inline_bytes = s_gpu.inline_count * 4;
         d.program      = vsh_batch_active();
         s_backend->on_draw(&d);
+        s_perf.draw += rt_now() - t0;
     }
+    s_perf.batches++;
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (env_cached("RECOMP_PB_EXEC_VERBOSE")) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -5110,11 +5181,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             nv2a_pb_d3d11_register_from_env();
         }
 #endif
+        {
+            const char *b = getenv("RECOMP_PB_BACKEND");
+            if (b && !strcmp(b, "null")) {
+                nv2a_pb_set_backend(&s_null_backend);
+                fprintf(stderr, "  [GPU] RECOMP_PB_BACKEND=null: walker only, nothing drawn\n");
+            }
+        }
     }
+    s_perf.methods++;
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
-     * the values are visible. */
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+     * the values are visible. Read once: this runs for every method. */
+    static int verbose = -1;
+    if (verbose < 0)
+        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    if (verbose) {
         static int shown[8];
         int slot = -1;
         switch (method) {
@@ -5303,7 +5385,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         *(volatile uint32_t *)(mem + va) = param;
         s_sema_last_va = va;
         s_sema_last_value = param;
-        if (s_sema_releases++ == 0 || getenv("RECOMP_PB_SEMA_TRACE")) {
+        if (s_sema_releases++ == 0 || env_cached("RECOMP_PB_SEMA_TRACE")) {
             static unsigned shown;
             if (shown++ < 16) {
                 fprintf(stderr, "  [GPU] semaphore release 0x%08X -> 0x%08X"
@@ -5405,13 +5487,27 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 prev_b = b; prev_t = s_gpu.batches_textured;
                 prev_px = s_gpu.pixels; prev_zr = s_vsh.z_rejected;
                 memset(&s_rt, 0, sizeof s_rt);
+                {
+                    uint64_t now = rt_now();
+                    uint64_t scan = s_perf.scan + (now - s_perf.scan_t0);
+                    fprintf(stderr, "[PB-PERF] flip %u wall %.2f ms walk %.2f ms"
+                            " (draw %.2f, decode %.2f) methods %u batches %u\n",
+                            s_gpu.flips,
+                            s_perf.flip_t0 ? (now - s_perf.flip_t0) / 1e6 : 0.0,
+                            scan / 1e6, s_perf.draw / 1e6,
+                            (double)(int64_t)(scan - s_perf.draw) / 1e6,
+                            s_perf.methods, s_perf.batches);
+                    s_perf.scan = s_perf.draw = 0;
+                    s_perf.methods = s_perf.batches = 0;
+                    s_perf.scan_t0 = s_perf.flip_t0 = now;
+                }
             }
         }
         /* The first few always, so a log says whether flips happen at all
          * and which surface each one put on screen; more with VERBOSE. */
         {
             static unsigned n;
-            unsigned limit = getenv("RECOMP_PB_EXEC_VERBOSE") ? 8u : 4u;
+            unsigned limit = env_cached("RECOMP_PB_EXEC_VERBOSE") ? 8u : 4u;
             if (n++ < limit) {
                 uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                    : s_gpu.color_offset;
