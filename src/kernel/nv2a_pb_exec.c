@@ -1425,6 +1425,9 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 #define NV097_SET_COMBINER_COLOR_OCW_M      0x1E40
 #define NV097_SET_COMBINER_CONTROL_M        0x1E60
 #define NV097_SET_SHADER_STAGE_PROGRAM_M    0x1E70
+#define NV097_SET_POLY_OFFSET_FILL_ENABLE_M 0x0338
+#define NV097_SET_POLYGON_OFFSET_SCALE_FACTOR_M 0x0384
+#define NV097_SET_POLYGON_OFFSET_BIAS_M     0x0388
 
 typedef struct {
     float x, y, z, w;           /* screen pixels, depth units, clip w */
@@ -1451,6 +1454,8 @@ static struct {
     uint32_t shader_prog, fog_color;
     int      rc_set, shader_set, fog_enable, atest_enable;
     uint32_t atest_func, atest_ref;
+    int      poly_offset;
+    float    poly_factor, poly_bias;
     /* survey */
     uint32_t prog_dwords, prog_loads, prog_starts, const_dwords, const_loads;
     uint32_t mode_sets, ff_matrix_dwords, vp_dwords;
@@ -1458,6 +1463,7 @@ static struct {
     uint32_t tris, tris_culled, tris_clipped, tris_textured;
     uint64_t z_rejected, a_rejected;
     uint32_t clears_seen, zclears;
+    uint32_t zclear_color_off, zclear_zeta_off, zclear_batch;
     uint32_t batches_rc, batches_norc, stage_mode_seen[4][32];
     uint32_t fmt_seen[NV_VERTEX_ATTRS][8];  /* per slot: batches by type */
     int      disabled;
@@ -1558,6 +1564,9 @@ static int vsh_method(uint32_t method, uint32_t param)
     case NV097_SET_ALPHA_TEST_ENABLE_M: s_vsh.atest_enable = param != 0; return 1;
     case NV097_SET_ALPHA_FUNC_M:        s_vsh.atest_func = param;       return 1;
     case NV097_SET_ALPHA_REF_M:         s_vsh.atest_ref = param & 0xFF; return 1;
+    case NV097_SET_POLY_OFFSET_FILL_ENABLE_M: s_vsh.poly_offset = param != 0; return 1;
+    case NV097_SET_POLYGON_OFFSET_SCALE_FACTOR_M: s_vsh.poly_factor = u2f(param); return 1;
+    case NV097_SET_POLYGON_OFFSET_BIAS_M: s_vsh.poly_bias = u2f(param); return 1;
     case NV097_SET_TRANSFORM_EXECUTION_MODE_M:
         s_vsh.mode = param;
         s_vsh.mode_sets++;
@@ -1776,9 +1785,15 @@ static void vsh_clear_depth(uint32_t param)
     uint32_t i;
 
     s_vsh.clears_seen++;
+    if (getenv("RECOMP_VSH_ZLOG") && s_vsh.batches_prog < 1200)
+        fprintf(stderr, "  [ZLOG] clear 0x%X colour 0x%X zeta 0x%X zclear 0x%X\n",
+                param, s_gpu.color_offset, s_vsh.zeta_offset, s_vsh.zclear);
     if (!(param & 1u) || !vsh_zbuf_ready())
         return;
     s_vsh.zclears++;
+    s_vsh.zclear_color_off = s_gpu.color_offset;
+    s_vsh.zclear_zeta_off = s_vsh.zeta_offset;
+    s_vsh.zclear_batch = s_vsh.batches_prog;
     z = ((s_gpu.format >> 4) & 0xF) == 1
       ? (float)(s_vsh.zclear & 0xFFFFu) / 65535.0f
       : (float)(s_vsh.zclear >> 8) / 16777215.0f;
@@ -2217,6 +2232,13 @@ static void raster_batch_vsh(void)
 
     for (i = 0; i < n; i++)
         vsh_transform(s_gpu.idx[i], &xv[i]);
+    if (getenv("RECOMP_VSH_ZLOG") && s_vsh.batches_prog < 1200 && n)
+        fprintf(stderr, "  [ZLOG] batch %u colour 0x%X depth %d func 0x%X mask %d"
+                        " poly %d %g %g | v0 z %g w %g tex 0x%X fmt %02X\n",
+                s_vsh.batches_prog, s_gpu.color_offset, s_vsh.depth_enable,
+                s_vsh.depth_func, s_vsh.depth_mask, s_vsh.poly_offset,
+                s_vsh.poly_factor, s_vsh.poly_bias, xv[0].z, xv[0].w,
+                s_gpu.tex.offset, s_gpu.tex.color);
     if (n)
         memcpy(s_vsh_last_d0, xv[0].d0, sizeof s_vsh_last_d0), s_vsh_last_v0 = xv[0];
 
@@ -2476,7 +2498,8 @@ static void raster_batch_ab(void)
             fprintf(stderr, "  [VSH-AB] batch %llu prim %u n %u: %u px differ"
                             " (max %u); d0 %.2f %.2f %.2f %.2f tex %08X fmt %02X"
                             " %ux%u blend %u %X/%X | z %.4g w %.4g zrej %llu"
-                            " t0 %.3f %.3f\n",
+                            " t0 %.3f %.3f | colour 0x%X zeta 0x%X; last Z clear"
+                            " colour 0x%X zeta 0x%X %u batches ago\n",
                     (unsigned long long)s_vsh_ab_batches, s_gpu.prim,
                     s_gpu.idx_count, diff, maxd,
                     s_vsh_last_d0[0], s_vsh_last_d0[1], s_vsh_last_d0[2],
@@ -2485,7 +2508,9 @@ static void raster_batch_ab(void)
                     s_gpu.blend_sfactor, s_gpu.blend_dfactor,
                     s_vsh_last_v0.z, s_vsh_last_v0.w,
                     (unsigned long long)(s_vsh.z_rejected - zrej0),
-                    s_vsh_last_v0.t[0][0], s_vsh_last_v0.t[0][1]);
+                    s_vsh_last_v0.t[0][0], s_vsh_last_v0.t[0][1],
+                    s_gpu.color_offset, s_vsh.zeta_offset, s_vsh.zclear_color_off,
+                    s_vsh.zclear_zeta_off, s_vsh.batches_prog - s_vsh.zclear_batch);
     }
 }
 
