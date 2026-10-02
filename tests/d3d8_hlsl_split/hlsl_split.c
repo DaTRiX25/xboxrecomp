@@ -26,8 +26,8 @@
 #define NPROG 400
 #define NCOMB 400
 #define NCASE (2 * NPROG + NCOMB)
-#define EXPECTED_HASH 0xfd6a6e89u      /* all cases, one FNV-1a */
-#define EXPECTED_CHARS 7285284u
+#define EXPECTED_HASH 0x2dabfbb4u      /* all cases, one FNV-1a */
+#define EXPECTED_CHARS 7284684u        /* re-recorded: alpha OCW mux [14], map [17:15] */
 
 #include "expected.h"   /* s_expect[NCASE], or HLSL_NO_EXPECT */
 

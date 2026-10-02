@@ -48,14 +48,19 @@ static void parse_rgb_output(uint32_t dword, NV2ACombinerOutput *output)
     output->ab_blue_to_alpha = (dword >> 19) & 1;
 }
 
-/** Alpha output word: the same destinations, mux [12], mapping [15:13]. */
+/** Alpha output word: the RGB word's layout -- destinations, mux [14],
+ * mapping [17:15] -- with no dot products or blue-to-alpha. The XDK builds
+ * both with the one PS_COMBINEROUTPUTS macro, flags << 12, as xemu's psh.c
+ * reads them. BLiNX 2's shadow resolve (aocw 00020800: tex0.a + tex0.a,
+ * times 4) shows bit 17 is the mapping's: read as [15:13] the x4 was lost
+ * and a one-layer shadow came out 1/10 as dark as on xemu. */
 static void parse_alpha_output(uint32_t dword, NV2ACombinerOutput *output)
 {
     output->cd_dst     = (NV2ACombinerRegister)((dword >>  0) & 0xF);
     output->ab_dst     = (NV2ACombinerRegister)((dword >>  4) & 0xF);
     output->sum_dst    = (NV2ACombinerRegister)((dword >>  8) & 0xF);
-    output->mux_sum    = (dword >> 12) & 1;
-    output->output_map = (NV2AOutputMapping)((dword >> 13) & 0x7);
+    output->mux_sum    = (dword >> 14) & 1;
+    output->output_map = (NV2AOutputMapping)((dword >> 15) & 0x7);
 }
 
 /* ================================================================
