@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "d3d8_swizzle.h"
+#include "../kernel/nv2a_pb_state.h"
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 
@@ -77,6 +78,28 @@ static void vertex_z(float x, float y, float z, uint32_t argb)
 #define PAL_GUEST (TEX_GUEST + 0x9000u)
 #define MIP_GUEST (TEX_GUEST + 0xA000u)  /* 32x32 A8R8G8B8, 6 levels */
 #define TEX_LOG2  6                            /* 64x64 */
+/* Two 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
+ * the first free 64 KB below 16 MB. */
+static uint32_t s_report_guest;
+#define REPORT_GUEST s_report_guest
+
+/* Visibility test: CLEAR_REPORT_VALUE, ZPASS count on, a quad, count off,
+ * GET_REPORT into report k. D3D sets the status to 0xFFFFFFFF first. */
+static void vis_test(int k, float x0, float y0, float x1, float y1, float z)
+{
+    volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)(REPORT_GUEST + 16u * k);
+    r[3] = 0xFFFFFFFFu;
+    M(0x17C8, 1);                          /* CLEAR_REPORT_VALUE */
+    M(0x17CC, 1);                          /* ZPASS_PIXEL_COUNT_ENABLE */
+    M(0x17FC, 8);
+    vertex_z(x0, y0, z, 0xFFFFFFFFu);
+    vertex_z(x1, y0, z, 0xFFFFFFFFu);
+    vertex_z(x1, y1, z, 0xFFFFFFFFu);
+    vertex_z(x0, y1, z, 0xFFFFFFFFu);
+    M(0x17FC, 0);
+    M(0x17CC, 0);
+    M(0x17D0, (1u << 24) | (REPORT_GUEST + 16u * k));   /* GET_REPORT */
+}
 
 /* A swizzled A8R8G8B8 texture: 8x8-texel checker, orange and blue, with a
  * white top row and a green left column so orientation shows. */
@@ -150,6 +173,40 @@ int main(int argc, char **argv)
     if (!getenv("RECOMP_PB_BACKEND"))
         _putenv("RECOMP_PB_BACKEND=d3d11");
     fprintf(stderr, "[backend-smoke] %d frames\n", frames);
+    int have_reports = 0;
+    {
+        /* The first free 64 KB below 16 MB (Wine has most of it in use). */
+        uintptr_t ra = 0x00010000u;
+        MEMORY_BASIC_INFORMATION mi;
+        while (ra < 0x01000000u && !have_reports
+                && VirtualQuery((void *)ra, &mi, sizeof mi)) {
+            uintptr_t lo = ((uintptr_t)mi.BaseAddress + 0xFFFFu) & ~(uintptr_t)0xFFFFu;
+            uintptr_t hi = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+            if (mi.State == MEM_FREE && hi >= lo + 0x10000u && lo + 0x10000u <= 0x01000000u
+                    && VirtualAlloc((void *)lo, 0x1000, MEM_RESERVE | MEM_COMMIT,
+                                    PAGE_READWRITE)) {
+                s_report_guest = (uint32_t)lo;
+                have_reports = 1;
+            }
+            ra = hi;
+        }
+    }
+    if (!have_reports) {
+        /* ... or a static or heap block that happens to sit there. */
+        static uint8_t st[64];
+        uint8_t *h = (uint8_t *)malloc(64);
+        uintptr_t c = (uintptr_t)st < 0x01000000u ? (uintptr_t)st
+                    : h && (uintptr_t)h < 0x01000000u ? (uintptr_t)h : 0;
+        fprintf(stderr, "[backend-smoke] static %p heap %p\n", (void *)st, (void *)h);
+        if (c) {
+            s_report_guest = (uint32_t)((c + 15u) & ~(uintptr_t)15u);
+            have_reports = 1;
+        }
+    }
+    if (have_reports)
+        fprintf(stderr, "[backend-smoke] reports at 0x%08X\n", s_report_guest);
+    else
+        fprintf(stderr, "[backend-smoke] no report memory below 16 MB\n");
     if (!make_texture())
         fprintf(stderr, "[backend-smoke] no texture memory at 0x%08X\n", TEX_GUEST);
 
@@ -285,6 +342,36 @@ int main(int argc, char **argv)
         vertex_z(600.0f, 420.0f, 8388608.0f, 0xFF2040FFu);
         vertex_z(470.0f, 420.0f, 8388608.0f, 0xFF2040FFu);
         M(0x17FC, 0);
+        /* Two visibility tests, colour writes off: a 100x60 quad at z 0.75
+         * wholly behind the green one (count 0) and a 10x10 one at z 0.5 in
+         * the open (count 100). The reports arrive a little later: the
+         * previous frame's are printed at the top of the next. */
+        if (have_reports) {
+            volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)REPORT_GUEST;
+            /* Spin on the status as a title would, ticking on_poll the way
+             * the ack thread does, at most 100 ms. */
+            if (f > 0) {
+                const struct nv2a_pb_backend *b = nv2a_pb_get_backend();
+                DWORD t0 = GetTickCount();
+                int spins = 0;
+                while ((r[3] || r[7]) && GetTickCount() - t0 < 100) {
+                    if (b->on_poll)
+                        b->on_poll();
+                    spins++;
+                }
+                if (f < 4 || f == frames - 1 || r[3] || r[7]
+                        || r[2] != 0 || r[6] != 100)
+                    fprintf(stderr, "[backend-smoke] frame %d visibility: occluded"
+                            " count %u status 0x%08X, open count %u status 0x%08X"
+                            " (%d polls, %lu ms)\n", f - 1, r[2], r[3], r[6], r[7],
+                            spins, GetTickCount() - t0);
+            }
+            M(0x0358, 0);                      /* COLOR_MASK: none */
+            M(0x0354, 0x201);                  /* DEPTH_FUNC: LESS */
+            vis_test(0, 450.0f, 380.0f, 550.0f, 440.0f, 12582912.0f);
+            vis_test(1, 300.0f, 300.0f, 310.0f, 310.0f, 8388608.0f);
+            M(0x0358, 0x01010101u);
+        }
         M(0x030C, 0);                          /* depth test off */
 
         /* Stencil: a stencil-only quad (colour writes off) marks y 200..300
