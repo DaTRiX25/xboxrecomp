@@ -1096,6 +1096,11 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
 void xbox_log_thread_role(const char *role, uint32_t routine);
 unsigned long xbox_log_ms(void);
 
+/* Called after every NtCreateFile with the guest's path and the NTSTATUS, when
+ * set. The title-side code that wants to react to a file open (a scripted
+ * pad waiting for a movie, say) installs it before the game starts. */
+extern void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
+
 #ifdef __cplusplus
 }
 #endif

@@ -3327,6 +3327,8 @@ static void bridge_RtlInitAnsiString(void)
 }
 
 /* ── NtCreateFile (ordinal 190, 9 args = 36 bytes) ─────── */
+void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
+
 static void bridge_NtCreateFile(void)
 {
     uint32_t handle_va   = STACK_ARG(0);  /* PHANDLE */
@@ -3418,6 +3420,8 @@ static void bridge_NtCreateFile(void)
         else
             fprintf(stderr, "  [FILE] %s (disp %u) -> 0x%08X\n",
                     gpath, (unsigned)disposition, g_eax);
+        if (xbox_FileOpenHook)              /* e.g. a scripted pad waiting on a movie */
+            xbox_FileOpenHook(gpath, g_eax);
     }
     fflush(stderr);
 }
