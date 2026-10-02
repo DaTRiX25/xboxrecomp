@@ -128,6 +128,11 @@ struct nv2a_pb_gpu {
     /* SET_BLEND_COLOR: the CONSTANT_COLOR/ALPHA factors' colour, packed
      * ARGB as the method carries it (xemu: NV_PGRAPH_BLENDCOLOR). */
     uint32_t blend_color, blend_color_writes;
+    /* SET_BLEND_EQUATION, the raw GL code (0x8006 FUNC_ADD, 0x800A
+     * FUNC_SUBTRACT, 0x800B FUNC_REVERSE_SUBTRACT, 0x8007 MIN, 0x8008 MAX,
+     * 0xF005 REVERSE_SUBTRACT_SIGNED, 0xF006 ADD_SIGNED). 0, never written,
+     * is ADD, the reset state. */
+    uint32_t blend_equation;
     /* SET_COLOR_MASK, inverted: the ARGB bits a draw leaves alone. 0 (the
      * reset state) writes every channel; 0xFFFFFFFF writes none, as for a
      * stencil- or depth-only pass. */
@@ -167,6 +172,9 @@ struct nv2a_pb_vsh {
     uint32_t atest_func, atest_ref;
     int      poly_offset;
     float    poly_factor, poly_bias;
+    /* SET_CONTROL0: bit 16 Z_PERSPECTIVE_ENABLE (w-buffered depth), bit 12
+     * Z_FORMAT float, bit 0 STENCIL_WRITE_ENABLE. */
+    uint32_t control0;
     /* Fog and specular, as xemu's vsh.c turns them into vtxFog and vtxD1.
      * fog_mode and fog_gen are the raw SET_FOG_MODE / SET_FOG_GEN_MODE
      * parameters (0x800 EXP, 0x801 EXP2, 0x802 EXP_ABS, 0x803 EXP2_ABS,

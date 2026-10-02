@@ -120,7 +120,8 @@ static ID3D11Buffer           *s_vb;            /* ring of float4 streams */
 static UINT                    s_vb_size, s_vb_pos;
 static ID3D11Buffer           *s_ib;
 static UINT                    s_ib_size, s_ib_pos;
-static ID3D11RasterizerState  *s_rs;
+/* Rasteriser states: [cull][front CCW], cull 0 none, 1 back, 2 front. */
+static ID3D11RasterizerState  *s_rs[3][2];
 static ID3D11DepthStencilState *s_ds_off;
 static ID3D11PixelShader      *s_ps;
 
@@ -206,7 +207,7 @@ static VsEntry s_vs[VS_MAX];
 
 #define BLEND_MAX 32
 typedef struct {
-    uint32_t          key[4];
+    uint32_t          key[5];
     ID3D11BlendState *bs;
 } BlendEntry;
 static BlendEntry s_blend[BLEND_MAX];
@@ -411,7 +412,7 @@ static int init(void)
         D3D11_RASTERIZER_DESC rd;
         memset(&rd, 0, sizeof rd);
         rd.FillMode = D3D11_FILL_SOLID;
-        rd.CullMode = D3D11_CULL_NONE;
+        int c, f;
         /* The vertex programs hand D3D11 real clip-space positions (see the
          * oPos epilogue in d3d8_vsh.c: the title's divide by w is undone, w
          * kept), so the rasteriser clips triangles with vertices behind the
@@ -419,7 +420,18 @@ static int init(void)
          * path has to. Depth clipping stays on for that; NV2A depth runs
          * 0..zmax, which vp_scale.z maps onto D3D's 0..1. */
         rd.DepthClipEnable = TRUE;
-        ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs);
+        /* Culling as the CPU path does it (nv2a_pb_exec.c), from
+         * SET_CULL_FACE_ENABLE / CULL_FACE / FRONT_FACE: rasterizer_state().
+         * The vertex program's pixels map onto the target unflipped (y down
+         * on both), so a triangle clockwise as displayed is clockwise to
+         * D3D11 too. */
+        for (c = 0; c < 3; c++)
+            for (f = 0; f < 2; f++) {
+                rd.CullMode = c == 0 ? D3D11_CULL_NONE
+                            : c == 1 ? D3D11_CULL_BACK : D3D11_CULL_FRONT;
+                rd.FrontCounterClockwise = f;
+                ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs[c][f]);
+            }
     }
     {
         D3D11_DEPTH_STENCIL_DESC dd;
@@ -937,7 +949,53 @@ static ID3D11InputLayout *input_layout(VsEntry *e, const uint8_t fmt[16])
     return e->lay[k].il;
 }
 
+/* ---- rasteriser state ----------------------------------------------------- */
+
+/* The state for the pgraph cull setting: CULL_FACE 0x404 FRONT, 0x405 BACK,
+ * 0x408 FRONT_AND_BACK; FRONT_FACE 0x900 CW, 0x901 CCW. *all is set when the
+ * draw culls every triangle (FRONT_AND_BACK), which D3D11 cannot express.
+ * BLiNX 2's character shadows need it: each body part's shadow volume is
+ * drawn twice into destination alpha, back faces (CULL_FRONT) added and
+ * front faces (CULL_BACK) reverse-subtracted, which leaves alpha only where
+ * the floor lies inside a volume. With no culling both passes cover the
+ * whole volume and its screen footprint comes out as one dark wedge. */
+static ID3D11RasterizerState *rasterizer_state(int *all)
+{
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    static int off = -1;
+    int c = 0, f = v->front_face != 0x900;
+
+    static int flip = -1;
+    if (off < 0)
+        off = getenv("RECOMP_D3D11_NO_CULL") != NULL;  /* A/B: cull nothing */
+    if (flip < 0)
+        flip = getenv("RECOMP_D3D11_CULL_FLIP") != NULL;  /* A/B: other winding */
+    f ^= flip;
+    *all = 0;
+    if (v->cull_enable && !off) {
+        if (v->cull_face == 0x405)      c = 1;
+        else if (v->cull_face == 0x404) c = 2;
+        else if (v->cull_face == 0x408) *all = 1;
+    }
+    return s_rs[c][f];
+}
+
 /* ---- blending -------------------------------------------------------------- */
+
+/* SET_BLEND_EQUATION as a D3D11 blend op. The signed variants (0xF005
+ * REVERSE_SUBTRACT_SIGNED, 0xF006 ADD_SIGNED) have no D3D11 form and fall
+ * back to their unsigned ones. */
+static D3D11_BLEND_OP blend_op(uint32_t eq)
+{
+    switch (eq) {
+    case 0x800A: return D3D11_BLEND_OP_SUBTRACT;
+    case 0x800B:
+    case 0xF005: return D3D11_BLEND_OP_REV_SUBTRACT;
+    case 0x8007: return D3D11_BLEND_OP_MIN;
+    case 0x8008: return D3D11_BLEND_OP_MAX;
+    default:     return D3D11_BLEND_OP_ADD;
+    }
+}
 
 static D3D11_BLEND blend_factor(uint32_t gl, int alpha)
 {
@@ -960,7 +1018,7 @@ static D3D11_BLEND blend_factor(uint32_t gl, int alpha)
 static ID3D11BlendState *blend_state(void)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
-    uint32_t key[4];
+    uint32_t key[5];
     D3D11_BLEND_DESC bd;
     ID3D11BlendState *bs = NULL;
     int i;
@@ -969,6 +1027,7 @@ static ID3D11BlendState *blend_state(void)
     key[1] = key[0] ? g->blend_sfactor : 0;
     key[2] = key[0] ? g->blend_dfactor : 0;
     key[3] = g->color_keep;             /* SET_COLOR_MASK, inverted */
+    key[4] = key[0] ? (uint32_t)blend_op(g->blend_equation) : 0;
     for (i = 0; i < s_blend_n; i++)
         if (!memcmp(s_blend[i].key, key, sizeof key))
             return s_blend[i].bs;
@@ -976,10 +1035,10 @@ static ID3D11BlendState *blend_state(void)
     bd.RenderTarget[0].BlendEnable = key[0];
     bd.RenderTarget[0].SrcBlend = blend_factor(key[1], 0);
     bd.RenderTarget[0].DestBlend = blend_factor(key[2], 0);
-    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].BlendOp = key[0] ? (D3D11_BLEND_OP)key[4] : D3D11_BLEND_OP_ADD;
     bd.RenderTarget[0].SrcBlendAlpha = blend_factor(key[1], 1);
     bd.RenderTarget[0].DestBlendAlpha = blend_factor(key[2], 1);
-    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].BlendOpAlpha = bd.RenderTarget[0].BlendOp;
     bd.RenderTarget[0].RenderTargetWriteMask = (UINT8)(
         ((key[3] & 0x00FF0000u) ? 0 : D3D11_COLOR_WRITE_ENABLE_RED)
       | ((key[3] & 0x0000FF00u) ? 0 : D3D11_COLOR_WRITE_ENABLE_GREEN)
@@ -1987,11 +2046,14 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
 
     *px = *py = -1;
     fprintf(stderr, "[D3D11-WHITE] batch prim %u n %u prog %08X start %u | rc %d ctl %08X"
-            " shader %08X | depth %d func 0x%X mask %d | blend %d 0x%X 0x%X | atest %d"
+            " shader %08X | depth %d func 0x%X mask %d | blend %d 0x%X 0x%X eq 0x%X"
+            " | cull %d 0x%X front 0x%X | ctl0 %08X poly %d %g %g | atest %d"
             " 0x%X %u | surface 0x%08X %ux%u | fog en %d colour %08X\n",
             d->prim, d->idx_count, vs->hash, v->start, s_last_rc_on, v->rc_ctl,
             v->shader_prog, v->depth_enable, v->depth_func, v->depth_mask,
-            g->blend_enable, g->blend_sfactor, g->blend_dfactor, v->atest_enable,
+            g->blend_enable, g->blend_sfactor, g->blend_dfactor, g->blend_equation,
+            v->cull_enable, v->cull_face, v->front_face, v->control0,
+            v->poly_offset, v->poly_factor, v->poly_bias, v->atest_enable,
             v->atest_func, v->atest_ref, rt->offset, rt->w, rt->h, v->fog_enable,
             v->fog_color);
     for (k = 0; k < 4; k++) {
@@ -2022,8 +2084,47 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
     fprintf(stderr, "[D3D11-WHITE]  c58 %g %g %g %g c59 %g %g %g %g\n",
             v->c[58][0], v->c[58][1], v->c[58][2], v->c[58][3],
             v->c[59][0], v->c[59][1], v->c[59][2], v->c[59][3]);
+    {   /* RECOMP_D3D11_PX_CONSTS=a-b,c,...: those vertex constants too */
+        const char *e = getenv("RECOMP_D3D11_PX_CONSTS");
+        while (e && *e) {
+            char *end;
+            long lo = strtol(e, &end, 10), hi = lo, c;
+            if (end == e)
+                break;
+            if (*end == '-')
+                hi = strtol(end + 1, &end, 10);
+            for (c = lo; c <= hi && c >= 0 && c < NV2A_VSH_CONSTANTS; c++)
+                fprintf(stderr, "[D3D11-WHITE]  c%ld %g %g %g %g\n", c,
+                        v->c[c][0], v->c[c][1], v->c[c][2], v->c[c][3]);
+            e = *end == ',' ? end + 1 : NULL;
+        }
+    }
 
     have_so = trace_stream_out(vs, topo, so);
+    {   /* RECOMP_D3D11_PX_VERTS=1: the program's first 16 slots and every
+         * vertex's screen position, for working a draw out by hand */
+        static int all = -1;
+        if (all < 0)
+            all = getenv("RECOMP_D3D11_PX_VERTS") != NULL;
+        for (k = 0; all && k < 16; k++)
+            fprintf(stderr, "[D3D11-P] %d %08X %08X %08X %08X\n", k,
+                    v->prog[v->start + k][0], v->prog[v->start + k][1],
+                    v->prog[v->start + k][2], v->prog[v->start + k][3]);
+        for (k = 0; all && (uint32_t)k < d->idx_count; k++) {
+            float in[NV2A_VSH_INPUTS][4];
+            Nv2aVshOut o;
+            memset(in, 0, sizeof in);
+            for (i = 0; i < NV2A_VSH_INPUTS && i < NV2A_VS_MAX_INPUTS; i++) {
+                const VertexAttr *a = &d->attr[i];
+                if (!(a->size && a->stride) || !fetch(d, a, d->idx[k], in[i]))
+                    memcpy(in[i], v->inl[i], 16);
+            }
+            nv2a_vsh_run((const uint32_t (*)[4])v->prog, v->start,
+                         (float (*)[4])v->c, 0, (const float (*)[4])in, &o);
+            fprintf(stderr, "[D3D11-V] %u %g %g %g %g\n", d->idx[k],
+                    o.o[0][0], o.o[0][1], o.o[0][2], o.o[0][3]);
+        }
+    }
     for (k = 0; k < 3 && (uint32_t)k < d->idx_count; k++) {
         float in[NV2A_VSH_INPUTS][4];
         Nv2aVshOut o;
@@ -2082,6 +2183,7 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
             uint32_t h = 2166136261u;
             const char *c;
             for (c = hlsl; *c; c++) { h ^= (uint8_t)*c; h *= 16777619u; }
+            fprintf(stderr, "[D3D11-WHITE]  combiner %08X\n", h);
             trace_print_hlsl_once(h, "combiner", hlsl);
         }
     }
@@ -2091,6 +2193,9 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
                     v->rc_f0[k], v->rc_f1[k], k == 7 ? "\n" : "");
         fprintf(stderr, "[D3D11-WHITE]  final cw %08X %08X, sf %08X %08X\n",
                 v->rc_fcw0, v->rc_fcw1, v->rc_sf[0], v->rc_sf[1]);
+        for (k = 0; k < (int)(v->rc_ctl & 0xFF) && k < 8; k++)
+            fprintf(stderr, "[D3D11-WHITE]  stage %d icw %08X ocw %08X aicw %08X aocw %08X\n",
+                    k, v->rc_cicw[k], v->rc_cocw[k], v->rc_aicw[k], v->rc_aocw[k]);
     }
     if (*px >= 0)
         fprintf(stderr, "[D3D11-WHITE]  px (%d,%d) before %08X\n", *px, *py,
@@ -2347,6 +2452,8 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     UINT strides[NV2A_VS_MAX_INPUTS], offs[NV2A_VS_MAX_INPUTS];
     RenderTarget *rt;
     VsEntry *vs;
+    ID3D11RasterizerState *rs;
+    int cull_all;
     uint8_t fmts[16];
     uint32_t lo = 0xFFFF, hi = 0, count, nidx, i, k;
     void *p;
@@ -2365,7 +2472,9 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     }
     count = hi - lo + 1;
     nidx = convert_indices(d, lo, idx, &topo);
-    if (!nidx) {
+    rs = rasterizer_state(&cull_all);
+    if (!nidx || (cull_all && (topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+                                || topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP))) {
         s_draws_skipped++;
         return;
     }
@@ -2549,9 +2658,9 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
                 s_sc.vp = vp;
             }
-            if (!sc || s_sc.rs != s_rs) {
-                ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
-                s_sc.rs = s_rs;
+            if (!sc || s_sc.rs != rs) {
+                ID3D11DeviceContext_RSSetState(s_ctx, rs);
+                s_sc.rs = rs;
             }
             if (!sc || s_sc.il != il) {
                 ID3D11DeviceContext_IASetInputLayout(s_ctx, il);

@@ -146,6 +146,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_BLEND_FUNC_SFACTOR      0x0344
 #define NV097_SET_BLEND_FUNC_DFACTOR      0x0348
 #define NV097_SET_BLEND_COLOR             0x034C
+#define NV097_SET_BLEND_EQUATION          0x0350
 #define NV_BLEND_SRC_ALPHA                0x0302
 #define NV_BLEND_ONE_MINUS_SRC_ALPHA      0x0303
 
@@ -1288,6 +1289,21 @@ static uint32_t blend_factor(uint32_t f, uint32_t src, uint32_t dst, uint32_t sh
                                 s_gpu.blend_color, sh);
 }
 
+/* SET_BLEND_EQUATION folded to what the blender does: 0 ADD (also the
+ * reset value 0 and 0xF006 ADD_SIGNED, done unsigned), 1 SUBTRACT
+ * (src - dst), 2 REVERSE_SUBTRACT (dst - src; also 0xF005, its signed
+ * variant), 3 MIN, 4 MAX. MIN and MAX ignore the factors, as in GL. */
+static int blend_eq(void)
+{
+    switch (s_gpu.blend_equation) {
+    case 0x800A: return 1;
+    case 0x800B: case 0xF005: return 2;
+    case 0x8007: return 3;
+    case 0x8008: return 4;
+    default:     return 0;
+    }
+}
+
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *row;
@@ -1321,7 +1337,7 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
      * but skipping it keeps the full-screen quads -- which are drawn with
      * blending enabled and alpha 255 -- on exactly the path they were on
      * before, so this cannot change what they produce. */
-    if (s_gpu.blend_enable
+    if (s_gpu.blend_enable && blend_eq() == 0
         && s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
         && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA
         && (argb >> 24) != 0xFF) {
@@ -1346,14 +1362,18 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
             argb = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     } else if (s_gpu.blend_enable
-               && !(s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
-                    && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA)
+               && (blend_eq() != 0
+                   || !(s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
+                        && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA))
                && blend_known(s_gpu.blend_sfactor)
                && blend_known(s_gpu.blend_dfactor)) {
-        /* Every other GL factor pair, with the ADD equation. Additive glows
-         * (SRC_ALPHA, ONE) are what the title's loading screen uses, and an
-         * opaque write turns each one into a black square. */
+        /* Every other GL factor pair, and any pair with an equation other
+         * than ADD. Additive glows (SRC_ALPHA, ONE) are what the title's
+         * loading screen uses, and an opaque write turns each one into a
+         * black square. The character shadows reverse-subtract front faces
+         * of their shadow volumes from destination alpha. */
         uint32_t dst = 0, out = 0, sh;
+        int eq = blend_eq();
         if (bpp == 4) {
             dst = ((const uint32_t *)row)[x];
         } else if (bpp == 2) {
@@ -1363,9 +1383,16 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         }
         for (sh = 0; sh <= 24; sh += 8) {
             uint32_t sc = (argb >> sh) & 0xFF, dc = (dst >> sh) & 0xFF;
-            uint32_t v = (sc * blend_factor(s_gpu.blend_sfactor, argb, dst, sh)
-                        + dc * blend_factor(s_gpu.blend_dfactor, argb, dst, sh)
-                        + 127u) / 255u;
+            uint32_t s_ = (sc * blend_factor(s_gpu.blend_sfactor, argb, dst, sh) + 127u) / 255u;
+            uint32_t d_ = (dc * blend_factor(s_gpu.blend_dfactor, argb, dst, sh) + 127u) / 255u;
+            uint32_t v;
+            if (eq == 1)      v = s_ > d_ ? s_ - d_ : 0;
+            else if (eq == 2) v = d_ > s_ ? d_ - s_ : 0;
+            else if (eq == 3) v = sc < dc ? sc : dc;
+            else if (eq == 4) v = sc > dc ? sc : dc;
+            else              v = (sc * blend_factor(s_gpu.blend_sfactor, argb, dst, sh)
+                                 + dc * blend_factor(s_gpu.blend_dfactor, argb, dst, sh)
+                                 + 127u) / 255u;
             out |= (v > 255u ? 255u : v) << sh;
         }
         argb = out;
@@ -1685,6 +1712,7 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 #define NV097_SET_COMPOSITE_MATRIX_M         0x0680
 #define NV097_SET_PROJECTION_MATRIX_M        0x0440
 #define NV097_SET_CULL_FACE_ENABLE_M         0x0308
+#define NV097_SET_CONTROL0_M                 0x0290
 #define NV097_SET_DEPTH_TEST_ENABLE_M        0x030C
 #define NV097_SET_DEPTH_FUNC_M               0x0354
 #define NV097_SET_DEPTH_MASK_M               0x035C
@@ -1886,6 +1914,7 @@ static int vsh_method(uint32_t method, uint32_t param)
         s_vsh.const_loads++;
         return 1;
     case NV097_SET_CULL_FACE_ENABLE_M:  s_vsh.cull_enable = param != 0; return 1;
+    case NV097_SET_CONTROL0_M:          s_vsh.control0 = param;         return 1;
     case NV097_SET_CULL_FACE_M:         s_vsh.cull_face = param;        return 1;
     case NV097_SET_FRONT_FACE_M:        s_vsh.front_face = param;       return 1;
     case NV097_SET_DEPTH_TEST_ENABLE_M: s_vsh.depth_enable = param != 0; return 1;
@@ -2572,10 +2601,11 @@ static void rc_eval(float r[16][4], float out[4])
         /* alpha */
         aab = rc_in_a(r, aicw >> 24) * rc_in_a(r, aicw >> 16);
         acd = rc_in_a(r, aicw >>  8) * rc_in_a(r, aicw);
-        asum = (aocw & (1u << 12)) ? (sel ? acd : aab) : aab + acd;
-        if ((aocw >> 4) & 0xF) nr[(aocw >> 4) & 0xF][3] = rc_op(aab,  (aocw >> 13) & 7);
-        if ( aocw       & 0xF) nr[ aocw       & 0xF][3] = rc_op(acd,  (aocw >> 13) & 7);
-        if ((aocw >> 8) & 0xF) nr[(aocw >> 8) & 0xF][3] = rc_op(asum, (aocw >> 13) & 7);
+        /* the alpha word is laid out as the RGB one: mux [14], mapping [17:15] */
+        asum = (aocw & (1u << 14)) ? (sel ? acd : aab) : aab + acd;
+        if ((aocw >> 4) & 0xF) nr[(aocw >> 4) & 0xF][3] = rc_op(aab,  (aocw >> 15) & 7);
+        if ( aocw       & 0xF) nr[ aocw       & 0xF][3] = rc_op(acd,  (aocw >> 15) & 7);
+        if ((aocw >> 8) & 0xF) nr[(aocw >> 8) & 0xF][3] = rc_op(asum, (aocw >> 15) & 7);
 
         /* blue to alpha overrides the alpha portion's write */
         if ((ocw & (1u << 19)) && ((ocw >> 4) & 0xF)) nr[(ocw >> 4) & 0xF][3] = ab[2];
@@ -3188,8 +3218,8 @@ static void rc_plan_build(void)
         p->sum    = (uint8_t)((ocw >> 8) & 0xF);
         p->b2a_ab = (uint8_t)(((ocw >> 19) & 1) && p->ab);
         p->b2a_cd = (uint8_t)(((ocw >> 18) & 1) && p->cd);
-        p->amux   = (uint8_t)((aocw >> 12) & 1);
-        p->aop    = (uint8_t)((aocw >> 13) & 7);
+        p->amux   = (uint8_t)((aocw >> 14) & 1);   /* as the RGB word */
+        p->aop    = (uint8_t)((aocw >> 15) & 7);
         p->aab    = (uint8_t)((aocw >> 4) & 0xF);
         p->acd    = (uint8_t)( aocw       & 0xF);
         p->asum   = (uint8_t)((aocw >> 8) & 0xF);
@@ -5277,6 +5307,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_BLEND_COLOR:
         s_gpu.blend_color = param;
         s_gpu.blend_color_writes++;
+        break;
+    case NV097_SET_BLEND_EQUATION:
+        s_gpu.blend_equation = param;
         break;
     case NV097_SET_COLOR_MASK:
         /* One enable bit per channel (xemu pgraph.c): B bit 0, G bit 8,
