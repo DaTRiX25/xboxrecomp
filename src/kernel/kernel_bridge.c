@@ -454,8 +454,41 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
 struct bridge_thread_start {
     recomp_func_t fn;
-    uint32_t ctx1, ctx2, stack_top, routine, obj_va;
+    uint32_t ctx1, ctx2, stack_top, routine, obj_va, tls_size;
 };
+
+/* Lay out a thread's TLS the way the Xbox kernel does.
+ *
+ * PsCreateSystemThreadEx takes a TlsDataSize, and the kernel carves that many
+ * bytes off the top of the new thread's stack: KTHREAD.TlsData (+0x28) points
+ * at them and NtTib.StackBase, fs:[4], is the address just past them. XAPI's
+ * entry point stores -(TlsDataSize/4) as the image's TLS index, so
+ * [fs:[4] + index*4] and [[fs:[0x28]]+0x28] are the same dword -- the thread
+ * startup writes it through the second, the CRT reads it through the first.
+ *
+ * The loader cannot know that size: it is computed at run time from the TLS
+ * directory in .rdata, and BLiNX 2's header copy of that directory is all
+ * zeros. The loader therefore built a 4-byte block, fs:[4] sat 4 bytes past
+ * it, and the CRT read its per-thread pointer from 0x90 bytes below the block
+ * -- zeros on most threads (so the CRT's exit path cleared guest address 0xC)
+ * and, on stage loader #7, the tail of a texture someone else had allocated
+ * next to that thread's TIB, which faulted at sub_002D8294+0x1F0.
+ *
+ * `kthread` is the object fs:[0x28] names for this thread; `top` is where the
+ * block ends. Returns the new fs:[4], 0 when there was nothing to do. */
+static uint32_t bridge_layout_tls(uint32_t kthread, uint32_t top,
+                                  uint32_t tls_size)
+{
+    uint32_t data;
+
+    if (!kthread || !top || !tls_size || (tls_size & 3) || tls_size > 0x10000)
+        return 0;
+    data = (top - tls_size) & ~0xFu;
+    memset(XBOX_TO_NATIVE(data), 0, top - data);
+    BRIDGE_MEM32(kthread + 0x28) = data;              /* KTHREAD.TlsData */
+    BRIDGE_MEM32(g_fs_base + 0x04) = data + tls_size; /* NtTib.StackBase */
+    return data + tls_size;
+}
 
 /* Name the calling thread for the OS, because under Wine GetCurrentThreadId is
  * the Windows tid and top -H shows the Linux one; the name is what joins them.
@@ -740,6 +773,14 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
         else
             fprintf(stderr, "  [KERNEL] worker thread has no TIB of its own;"
                             " it shares the main thread's\n");
+        /* The thread object stands in for the KTHREAD, so fs:[0x28] names it
+         * and its TlsData is this thread's own, at the top of its stack. */
+        if (tib && s->obj_va && s->tls_size) {
+            uint32_t top = (s->stack_top + 16) & ~0xFu;
+            BRIDGE_MEM32(tib + 0x28) = s->obj_va;
+            if (bridge_layout_tls(s->obj_va, top, s->tls_size))
+                g_esp = ((top - s->tls_size) & ~0xFu) - 16;
+        }
     }
     free(s);
 
@@ -760,7 +801,8 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
                                   uint32_t ctx2, uint32_t stack_top,
-                                  uint32_t routine, uint32_t obj_va)
+                                  uint32_t routine, uint32_t obj_va,
+                                  uint32_t tls_size)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
@@ -769,6 +811,7 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
     s->routine = routine;
     s->obj_va = obj_va;
+    s->tls_size = tls_size;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) free(s);
@@ -785,13 +828,14 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
  * of the host thread handle, which is what KeWaitForSingleObject waits on. */
 static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
                                         uint32_t ctx2, uint32_t stack_top,
-                                        uint32_t routine, uint32_t handle_va)
+                                        uint32_t routine, uint32_t handle_va,
+                                        uint32_t tls_size)
 {
     uint32_t obj = thobj_alloc();
     HANDLE th, shadow = NULL;
 
     thobj_ref(obj);
-    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, routine, obj);
+    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, routine, obj, tls_size);
     if (!th) {
         thobj_unref(obj);   /* the thread's own: it never ran */
     } else {
@@ -825,6 +869,7 @@ void xbox_SetThreadMode(int mode) { g_thread_mode = mode; }
 static void bridge_PsCreateSystemThreadEx(void)
 {
     uint32_t xbox_handle_ptr = STACK_ARG(0);
+    uint32_t tls_size        = STACK_ARG(3);
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
     uint32_t start_routine   = STACK_ARG(9);
@@ -861,6 +906,19 @@ static void bridge_PsCreateSystemThreadEx(void)
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
                 xbox_log_thread_role("guest-main", start_routine);
+                /* Its TLS too: the stack is already in use, so the block
+                 * comes from the heap, and the main TIB's fs:[0x28] object
+                 * gets the TlsData pointer (see bridge_layout_tls). */
+                if (tls_size) {
+                    uint32_t blk = xbox_HeapAlloc((tls_size + 0xFu) & ~0xFu, 16);
+                    uint32_t fs4 = blk ? bridge_layout_tls(
+                        BRIDGE_MEM32(g_fs_base + 0x28),
+                        blk + ((tls_size + 0xFu) & ~0xFu), tls_size) : 0;
+                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: %u-byte"
+                            " TLS at 0x%08X, fs:[4] = 0x%08X\n", tls_size,
+                            fs4 ? fs4 - tls_size : 0, fs4);
+                    fflush(stderr);
+                }
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
@@ -911,7 +969,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, start_routine,
-                                              xbox_handle_ptr);
+                                              xbox_handle_ptr, tls_size);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -8192,7 +8250,7 @@ static void bridge_PsCreateSystemThread(void)
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, start_routine,
-                                              xbox_handle_ptr);
+                                              xbox_handle_ptr, 0);
                 }
             }
         } else {
