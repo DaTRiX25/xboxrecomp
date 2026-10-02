@@ -78,7 +78,7 @@ static void vertex_z(float x, float y, float z, uint32_t argb)
 #define PAL_GUEST (TEX_GUEST + 0x9000u)
 #define MIP_GUEST (TEX_GUEST + 0xA000u)  /* 32x32 A8R8G8B8, 6 levels */
 #define TEX_LOG2  6                            /* 64x64 */
-/* Two 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
+/* Three 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
  * the first free 64 KB below 16 MB. */
 static uint32_t s_report_guest;
 #define REPORT_GUEST s_report_guest
@@ -354,22 +354,33 @@ int main(int argc, char **argv)
                 const struct nv2a_pb_backend *b = nv2a_pb_get_backend();
                 DWORD t0 = GetTickCount();
                 int spins = 0;
-                while ((r[3] || r[7]) && GetTickCount() - t0 < 100) {
+                uint32_t reuse_first = 0xFFFFFFFFu;
+                while ((r[3] || r[7] || r[11]) && GetTickCount() - t0 < 100) {
                     if (b->on_poll)
                         b->on_poll();
+                    if (reuse_first == 0xFFFFFFFFu && !r[11])
+                        reuse_first = r[10];   /* the first count seen done */
                     spins++;
                 }
-                if (f < 4 || f == frames - 1 || r[3] || r[7]
-                        || r[2] != 0 || r[6] != 100)
+                if (reuse_first == 0xFFFFFFFFu && !r[11])
+                    reuse_first = r[10];
+                if (f < 4 || f == frames - 1 || r[3] || r[7] || r[11]
+                        || r[2] != 0 || r[6] != 100 || reuse_first != 0)
                     fprintf(stderr, "[backend-smoke] frame %d visibility: occluded"
-                            " count %u status 0x%08X, open count %u status 0x%08X"
+                            " count %u status 0x%08X, open count %u status 0x%08X,"
+                            " reused slot first count %u (want 0) status 0x%08X"
                             " (%d polls, %lu ms)\n", f - 1, r[2], r[3], r[6], r[7],
-                            spins, GetTickCount() - t0);
+                            reuse_first, r[11], spins, GetTickCount() - t0);
             }
             M(0x0358, 0);                      /* COLOR_MASK: none */
             M(0x0354, 0x201);                  /* DEPTH_FUNC: LESS */
             vis_test(0, 450.0f, 380.0f, 550.0f, 440.0f, 12582912.0f);
             vis_test(1, 300.0f, 300.0f, 310.0f, 310.0f, 8388608.0f);
+            /* A reused slot, as the XDK recycles them: an open test (100)
+             * then, with the first still pending, an occluded one (0) into
+             * the same report. Only the second may ever show. */
+            vis_test(2, 300.0f, 300.0f, 310.0f, 310.0f, 8388608.0f);
+            vis_test(2, 450.0f, 380.0f, 550.0f, 440.0f, 12582912.0f);
             M(0x0358, 0x01010101u);
         }
         M(0x030C, 0);                          /* depth test off */

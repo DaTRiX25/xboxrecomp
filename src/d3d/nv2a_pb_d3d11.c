@@ -2,8 +2,8 @@
  * A D3D11 backend for the pushbuffer executor (struct nv2a_pb_backend).
  *
  * The executor (src/kernel/nv2a_pb_exec.c) decodes the title's pushbuffer into
- * the state in nv2a_pb_state.h and calls four hooks; this file answers them
- * with D3D11 instead of the CPU rasteriser:
+ * the state in nv2a_pb_state.h and calls the hooks of struct nv2a_pb_backend;
+ * this file answers them with D3D11 instead of the CPU rasteriser:
  *
  *   on_clear  -> ClearRenderTargetView on the surface at color_offset
  *   on_draw   -> the batch's vertex program, translated to HLSL by d3d8_vsh.c
@@ -3101,7 +3101,7 @@ static void dump_frame(void)
  * only those: if none of them was drawn or cleared, the frame on screen
  * stays. With no render target at the named surface yet (the first flips),
  * the largest candidates go first, then the rest. */
-static uint64_t s_occ_reports, s_occ_late, s_occ_vis, s_occ_sync_us;
+static uint64_t s_occ_reports, s_occ_late, s_occ_vis, s_occ_sync_us, s_occ_super;
 static int      s_occ_npend;
 static void     occ_poll(UINT flags);
 
@@ -3160,14 +3160,14 @@ static void flip_log(uint32_t surface_offset)
     static int on = -1;
     static uint64_t p_draws, p_prog, p_tex, p_rtt, p_clears, p_up, p_chg,
                     p_re, p_vn, p_ve, p_skip, p_self, p_mip,
-                    p_occ, p_occ_vis, p_occ_us;
+                    p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super;
     if (on < 0)
         on = getenv("RECOMP_FLIP_LOG") != NULL;
     if (!on)
         return;
     fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu (self %llu)"
             " skipped %llu clears %llu uploads %llu (mip %llu) changed %llu rehash %llu"
-            " vb %llu/%llu bytes occ %llu (visible %llu, pending %d, late %llu, sync %llu us)"
+            " vb %llu/%llu bytes occ %llu (visible %llu, pending %d, late %llu, superseded %llu, sync %llu us)"
             " present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
             (unsigned long long)(s_draws - p_draws),
@@ -3185,7 +3185,8 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_vb_expanded - p_ve),
             (unsigned long long)(s_occ_reports - p_occ),
             (unsigned long long)(s_occ_vis - p_occ_vis), s_occ_npend,
-            (unsigned long long)s_occ_late,
+            (unsigned long long)(s_occ_late - p_occ_late),
+            (unsigned long long)(s_occ_super - p_occ_super),
             (unsigned long long)(s_occ_sync_us - p_occ_us),
             s_drawn ? s_drawn->offset : 0, surface_offset);
     p_draws = s_draws; p_prog = s_draws_prog; p_tex = s_draws_tex;
@@ -3194,6 +3195,7 @@ static void flip_log(uint32_t surface_offset)
     p_vn = s_vb_native; p_ve = s_vb_expanded; p_self = s_self_copies;
     p_mip = s_tex_mip_uploads;
     p_occ = s_occ_reports; p_occ_vis = s_occ_vis; p_occ_us = s_occ_sync_us;
+    p_occ_late = s_occ_late; p_occ_super = s_occ_super;
 }
 
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
@@ -3267,7 +3269,13 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
  * for the result at GET_REPORT instead (the stall the flip log's "occ"
  * shows), =fixed leaves reports to the walker (RECOMP_ZPASS_FIXED, every
  * test visible). A report still pending after 250 ms, or one with too many
- * stretches, completes as visible (0x10000). */
+ * stretches, completes as visible (0x10000).
+ *
+ * Reused reports: the XDK recycles its report slots, so a GET_REPORT can name
+ * a va that still has a report pending. The new one supersedes it: the old
+ * queries go back to the pool unread and nothing is written for the old
+ * test, so its late completion cannot land over the title's reset status or
+ * the new count. */
 #define OCC_SEG     8       /* stretches per report */
 #define OCC_PENDING 128
 #define OCC_POOL    (OCC_PENDING * 2 + OCC_SEG)
@@ -3445,6 +3453,18 @@ static int d3d11_on_report(uint32_t va)
     occ_poll(D3D11_ASYNC_GETDATA_DONOTFLUSH);
     if (s_occ_npend >= OCC_PENDING)
         occ_poll(0);
+    /* Supersede a report still pending at this va (see above). */
+    for (i = 0; i < s_occ_npend; i++)
+        if (s_occ_pend[i].va == va) {
+            int k;
+            for (k = 0; k < s_occ_pend[i].n; k++)
+                occ_put(s_occ_pend[i].q[k]);
+            memmove(&s_occ_pend[i], &s_occ_pend[i + 1],
+                    (size_t)(s_occ_npend - i - 1) * sizeof s_occ_pend[0]);
+            s_occ_npend--;
+            s_occ_super++;
+            break;              /* at most one: each push supersedes */
+        }
     if (s_occ_npend >= OCC_PENDING) {
         /* Still full: the oldest is answered as visible. */
         s_occ_late++;

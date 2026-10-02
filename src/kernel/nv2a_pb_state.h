@@ -4,8 +4,10 @@
  * nv2a_pb_exec.c walks the title's pushbuffer and decodes it into the structs
  * below: surfaces, vertex arrays, the batch being built, texture registers,
  * the transform program and its constants, combiners and depth state. Drawing
- * is a separate concern. A backend gets four events (clear, depth clear, draw,
- * flip) and reads whatever else it needs from this state, read-only.
+ * is a separate concern. A backend gets events (clear, depth clear, draw,
+ * flip, and optionally the visibility-test ones: zpass enable, report clear,
+ * report, idle poll) and reads whatever else it needs from this state,
+ * read-only.
  *
  * The default backend is the CPU rasteriser in nv2a_pb_exec.c. A GPU backend
  * (D3D11 first, see analysis/reviews/spike-render-perf-2026-10-01.md in cat/)
