@@ -3270,10 +3270,12 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
  * for the result at GET_REPORT instead (the stall the flip log's "occ"
  * shows), =fixed leaves reports to the walker (RECOMP_ZPASS_FIXED, every
  * test visible). A report still pending after 250 ms, or one with too many
- * stretches, completes as visible (0x10000).
+ * stretches, completes as visible (0x10000); the flip log's "visible"
+ * (s_occ_vis) counts those fallbacks too.
  *
  * Reused reports: the XDK recycles its report slots, so a GET_REPORT can name
- * a va that still has a report pending. The new one supersedes it: the old
+ * a va that still has a report pending. The new one supersedes it, before
+ * anything is polled: the old
  * queries go back to the pool unread and nothing is written for the old
  * test, so its late completion cannot land over the title's reset status or
  * the new count. */
@@ -3451,10 +3453,8 @@ static int d3d11_on_report(uint32_t va)
     if (occ_mode() == 2 || !init())
         return 0;
     occ_end();
-    occ_poll(D3D11_ASYNC_GETDATA_DONOTFLUSH);
-    if (s_occ_npend >= OCC_PENDING)
-        occ_poll(0);
-    /* Supersede a report still pending at this va (see above). */
+    /* Supersede a report still pending at this va (see above) before any
+     * poll: a poll here could finish the old one over the title's reset. */
     for (i = 0; i < s_occ_npend; i++)
         if (s_occ_pend[i].va == va) {
             int k;
@@ -3466,6 +3466,9 @@ static int d3d11_on_report(uint32_t va)
             s_occ_super++;
             break;              /* at most one: each push supersedes */
         }
+    occ_poll(D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (s_occ_npend >= OCC_PENDING)
+        occ_poll(0);
     if (s_occ_npend >= OCC_PENDING) {
         /* Still full: the oldest is answered as visible. */
         s_occ_late++;
@@ -3473,6 +3476,8 @@ static int d3d11_on_report(uint32_t va)
         memmove(&s_occ_pend[0], &s_occ_pend[1],
                 (size_t)(--s_occ_npend) * sizeof s_occ_pend[0]);
     }
+    /* Pending until done, whatever the title left in the status. */
+    ((volatile uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va))[3] = 0xFFFFFFFFu;
     p = &s_occ_pend[s_occ_npend++];
     p->va = va;
     p->n = s_occ_nseg;

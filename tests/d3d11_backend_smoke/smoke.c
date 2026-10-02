@@ -78,26 +78,30 @@ static void vertex_z(float x, float y, float z, uint32_t argb)
 #define PAL_GUEST (TEX_GUEST + 0x9000u)
 #define MIP_GUEST (TEX_GUEST + 0xA000u)  /* 32x32 A8R8G8B8, 6 levels */
 #define TEX_LOG2  6                            /* 64x64 */
-/* Three 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
+/* Four 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
  * the first free 64 KB below 16 MB. */
 static uint32_t s_report_guest;
+static int      s_vis_failures;
 #define REPORT_GUEST s_report_guest
 
 /* Visibility test: CLEAR_REPORT_VALUE, ZPASS count on, a quad, count off,
- * GET_REPORT into report k. D3D sets the status to 0xFFFFFFFF first. */
+ * GET_REPORT into report k. EndVisibilityTest sets the status to 0xFFFFFFFF
+ * just before it sends GET_REPORT, as D3D does. */
 static void vis_test(int k, float x0, float y0, float x1, float y1, float z)
 {
     volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)(REPORT_GUEST + 16u * k);
-    r[3] = 0xFFFFFFFFu;
     M(0x17C8, 1);                          /* CLEAR_REPORT_VALUE */
     M(0x17CC, 1);                          /* ZPASS_PIXEL_COUNT_ENABLE */
-    M(0x17FC, 8);
-    vertex_z(x0, y0, z, 0xFFFFFFFFu);
-    vertex_z(x1, y0, z, 0xFFFFFFFFu);
-    vertex_z(x1, y1, z, 0xFFFFFFFFu);
-    vertex_z(x0, y1, z, 0xFFFFFFFFu);
-    M(0x17FC, 0);
+    if (x1 > x0) {                         /* else an empty test: count 0 */
+        M(0x17FC, 8);
+        vertex_z(x0, y0, z, 0xFFFFFFFFu);
+        vertex_z(x1, y0, z, 0xFFFFFFFFu);
+        vertex_z(x1, y1, z, 0xFFFFFFFFu);
+        vertex_z(x0, y1, z, 0xFFFFFFFFu);
+        M(0x17FC, 0);
+    }
     M(0x17CC, 0);
+    r[3] = 0xFFFFFFFFu;
     M(0x17D0, (1u << 24) | (REPORT_GUEST + 16u * k));   /* GET_REPORT */
 }
 
@@ -193,8 +197,8 @@ int main(int argc, char **argv)
     }
     if (!have_reports) {
         /* ... or a static or heap block that happens to sit there. */
-        static uint8_t st[64];
-        uint8_t *h = (uint8_t *)malloc(64);
+        static uint8_t st[128];
+        uint8_t *h = (uint8_t *)malloc(128);
         uintptr_t c = (uintptr_t)st < 0x01000000u ? (uintptr_t)st
                     : h && (uintptr_t)h < 0x01000000u ? (uintptr_t)h : 0;
         fprintf(stderr, "[backend-smoke] static %p heap %p\n", (void *)st, (void *)h);
@@ -214,6 +218,21 @@ int main(int argc, char **argv)
         float t = (float)(f % 120) / 120.0f;
         float x = 80.0f + 320.0f * t, y = 120.0f;
         uint32_t clear = 0xFF000000u | ((uint32_t)(255 * t) << 16) | 0x30u;
+        uint32_t cross_early = 0xFFFFFFFFu;
+
+        /* Cross-frame reuse of report 3: the last frame pushed an open test
+         * (100) into it and did not wait. Before this frame draws anything
+         * (a batch polls), push an empty test (0) into it: no batch between
+         * the old report and the new GET_REPORT, so the old one is still
+         * pending there, and ready. A poll at GET_REPORT ahead of the
+         * supersede would finish it over the reset: done, with 100, right
+         * here. */
+        if (have_reports && f > 0) {
+            volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)REPORT_GUEST;
+            vis_test(3, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+            if (!r[15])
+                cross_early = r[14];
+        }
 
         M(0x0200, 640u << 16);                 /* SURFACE_CLIP_HORIZONTAL */
         M(0x0204, 480u << 16);                 /* SURFACE_CLIP_VERTICAL   */
@@ -354,23 +373,34 @@ int main(int argc, char **argv)
                 const struct nv2a_pb_backend *b = nv2a_pb_get_backend();
                 DWORD t0 = GetTickCount();
                 int spins = 0;
-                uint32_t reuse_first = 0xFFFFFFFFu;
-                while ((r[3] || r[7] || r[11]) && GetTickCount() - t0 < 100) {
+                uint32_t reuse_first = 0xFFFFFFFFu, cross_first = cross_early;
+                int bad;
+                while ((r[3] || r[7] || r[11] || r[15]) && GetTickCount() - t0 < 100) {
                     if (b->on_poll)
                         b->on_poll();
                     if (reuse_first == 0xFFFFFFFFu && !r[11])
                         reuse_first = r[10];   /* the first count seen done */
+                    if (cross_first == 0xFFFFFFFFu && !r[15])
+                        cross_first = r[14];
                     spins++;
                 }
                 if (reuse_first == 0xFFFFFFFFu && !r[11])
                     reuse_first = r[10];
-                if (f < 4 || f == frames - 1 || r[3] || r[7] || r[11]
-                        || r[2] != 0 || r[6] != 100 || reuse_first != 0)
-                    fprintf(stderr, "[backend-smoke] frame %d visibility: occluded"
+                if (cross_first == 0xFFFFFFFFu && !r[15])
+                    cross_first = r[14];
+                bad = r[3] || r[7] || r[11] || r[15] || r[2] != 0 || r[6] != 100
+                   || reuse_first != 0 || cross_first != 0;
+                if (bad)
+                    s_vis_failures++;
+                if (f < 4 || f == frames - 1 || bad)
+                    fprintf(stderr, "[backend-smoke] frame %d visibility%s: occluded"
                             " count %u status 0x%08X, open count %u status 0x%08X,"
-                            " reused slot first count %u (want 0) status 0x%08X"
-                            " (%d polls, %lu ms)\n", f - 1, r[2], r[3], r[6], r[7],
-                            reuse_first, r[11], spins, GetTickCount() - t0);
+                            " reused slot first count %u status 0x%08X, cross-frame"
+                            " reuse first count %u%s status 0x%08X (want 0, 100, 0, 0)"
+                            " (%d polls, %lu ms)\n", f - 1, bad ? " FAIL" : "",
+                            r[2], r[3], r[6], r[7], reuse_first, r[11], cross_first,
+                            cross_early != 0xFFFFFFFFu ? " (done at push)" : "",
+                            r[15], spins, GetTickCount() - t0);
             }
             M(0x0358, 0);                      /* COLOR_MASK: none */
             M(0x0354, 0x201);                  /* DEPTH_FUNC: LESS */
@@ -381,6 +411,8 @@ int main(int argc, char **argv)
              * the same report. Only the second may ever show. */
             vis_test(2, 300.0f, 300.0f, 310.0f, 310.0f, 8388608.0f);
             vis_test(2, 450.0f, 380.0f, 550.0f, 440.0f, 12582912.0f);
+            /* Report 3: an open test, not waited for (see the frame top). */
+            vis_test(3, 300.0f, 300.0f, 310.0f, 310.0f, 8388608.0f);
             M(0x0358, 0x01010101u);
         }
         M(0x030C, 0);                          /* depth test off */
@@ -570,6 +602,11 @@ int main(int argc, char **argv)
         M(0x0210, f == 0 ? OFFSCREEN : buf[(f + 1) & 1]);
         M(0x0130, 0);                          /* FLIP_STALL */
         Sleep(16);
+    }
+    if (s_vis_failures) {
+        fprintf(stderr, "[backend-smoke] FAIL: %d frames with a wrong visibility"
+                " result\n", s_vis_failures);
+        return 1;
     }
     fprintf(stderr, "[backend-smoke] done\n");
     return 0;
