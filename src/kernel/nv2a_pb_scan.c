@@ -25,6 +25,11 @@
  * does the same and keeps one return address, and a return goes back to it.
  * So a ring wrap is the title's own jump back to the start, and a segment
  * with a jump in it goes on after it to PUT.
+ *
+ * Anything else is a word the walk is out of step on, and it stops there
+ * rather than guess: an unknown word, a call inside a call, or a word or
+ * target outside the contiguous window (a parameter misread as a jump can
+ * point anywhere in 256 MB, and only 64 MB is mapped).
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -32,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "nv2a_pb_state.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -202,11 +208,23 @@ void nv2a_pb_poll(void)
         b->on_poll();
 }
 
+/* A method header's parameters can go past PUT: the title may submit
+ * the header and some of its data now and the rest with the next PUT. So
+ * the method in progress outlives one walk. */
+static uint32_t s_left, s_subch, s_method;
+static int s_noninc;
+
+static int pb_in_window(uint32_t va)
+{
+    return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;
+}
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t va = start_va, base = start_va & 0xF0000000u, ret_va = 0;
+    uint32_t va = start_va, ret_va = 0;
     uint32_t words = 0, jumps = 0, unknown = 0;
+    const char *why = NULL;
     int in_call = 0;
 
     if (s_exec_enabled < 0)
@@ -220,21 +238,42 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
     /* Bounded at 4 MB of words, a sane single-frame amount: GET that never
      * reaches PUT is a stream this walk is out of step with. */
-    while (va != end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+    while (va != end_va) {
+        uint32_t w, tgt;
+
+        if (words >= 0x100000u) { why = "word limit"; break; }
+        if (!pb_in_window(va)) { why = "outside the contiguous window"; break; }
+        w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
+        if (s_left) {                         /* a parameter */
+            note(s_subch, s_method);
+            /* Same walk, two consumers: the survey counts, the executor
+             * acts. Keeping them on one decode means they can never
+             * disagree about what the stream said. */
+            if (s_exec_enabled)
+                nv2a_pb_exec_method(s_subch, s_method, w);
+            if (!s_noninc)
+                s_method += 4;
+            s_left--;
+            continue;
+        }
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
             jumps++;
-            va = base | (((w & 3u) == 1u ? w & ~3u : w & 0x1FFFFFFCu) & 0x0FFFFFFFu);
+            tgt = (w & 3u) == 1u ? w & ~3u : w & 0x1FFFFFFCu;
+            if (tgt >= XBOX_CONTIG_SIZE) { why = "jump outside the window"; break; }
+            va = XBOX_CONTIG_BASE | tgt;
             continue;
         }
         if ((w & 3u) == 2u) {                 /* call */
             jumps++;
+            tgt = w & ~3u;
+            if (in_call) { why = "call inside a call"; break; }
+            if (tgt >= XBOX_CONTIG_SIZE) { why = "call outside the window"; break; }
             ret_va = va;
             in_call = 1;
-            va = base | (w & 0x0FFFFFFCu);
+            va = XBOX_CONTIG_BASE | tgt;
             continue;
         }
         if ((w & 0xFFFF0003u) == 0x00020000u) {   /* return */
@@ -243,33 +282,24 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             in_call = 0;
             continue;
         }
-        if ((w & 0x00030003u) == 0u) {
-            uint32_t count  = (w >> 18) & 0x7FFu;
-            uint32_t subch  = (w >> 13) & 7u;
-            uint32_t method =  w & 0x1FFCu;
-            int noninc = (w & 0xE0000000u) == 0x40000000u;
-
-            for (uint32_t i = 0; i < count && va != end_va; i++) {
-                uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
-                /* Same walk, two consumers: the survey counts, the executor
-                 * acts. Keeping them on one decode means they can never
-                 * disagree about what the stream said. */
-                if (s_exec_enabled)
-                    nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
-                va += 4;
-                words++;
-            }
+        if ((w & 0xE0030003u) == 0u || (w & 0xE0030003u) == 0x40000000u) {
+            s_left   = (w >> 18) & 0x7FFu;
+            s_subch  = (w >> 13) & 7u;
+            s_method =  w & 0x1FFCu;
+            s_noninc = (w & 0xE0000000u) == 0x40000000u;
             continue;
         }
         unknown++;
+        why = "unknown word";
+        break;
     }
-    if (va != end_va) {
+    if (why) {
         static unsigned said;
+        s_left = 0;                 /* out of step: drop the method in progress */
         if (said++ < 8)
             fprintf(stderr, "[PB] walk 0x%08X -> 0x%08X stopped at 0x%08X after"
-                    " %u words without reaching PUT\n", start_va, end_va, va, words);
+                    " %u words without reaching PUT (%s)\n",
+                    start_va, end_va, va, words, why);
     }
 
     if (s_exec_enabled)

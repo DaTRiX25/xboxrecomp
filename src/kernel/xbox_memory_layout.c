@@ -1371,6 +1371,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static DWORD  last_put_ms;
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            /* The title wrote its commands before PUT: acquire, so the walk
+             * reads them and not older data (arm64 reorders loads). */
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
             if (put != g_scanned_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
@@ -1429,6 +1432,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     volatile uint32_t *get =
                         (volatile uint32_t *)((char *)regs
                                               + NV2A_USER_DMA_GET);
+                    /* Release: the title may reuse the buffer once it sees
+                     * GET, so every read of it must be done first. */
+                    __atomic_thread_fence(__ATOMIC_RELEASE);
                     *get = put;
                 }
                 pgraph_fence_tick(regs);
@@ -1515,6 +1521,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             (void)put0;
             for (;;) {
                 uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+                __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* as at the scan */
                 if (put != g_scanned_put) {
                     last_active = now;
                     break;              /* new work: tick now */
