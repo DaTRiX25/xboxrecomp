@@ -6040,8 +6040,13 @@ void nv2a_pb_exec_report(void)
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
     vsh_report();
     /* One picture per report rather than per clear: a title clears hundreds of
-     * times a second and nobody wants that many files. */
-    dump_surface_bmp();
+     * times a second and nobody wants that many files. The last flip's
+     * surface, once there is one: mid-frame, the current target is as likely
+     * an offscreen one. */
+    if (s_present.offset)
+        dump_present_bmp();
+    else
+        dump_surface_bmp();
 
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one
