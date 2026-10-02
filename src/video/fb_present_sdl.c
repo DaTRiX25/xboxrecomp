@@ -103,7 +103,6 @@ static void present_copy(uint32_t fb_va, uint32_t pitch);
 /* Called by the backend at each flip, on the nv2a-ack thread. */
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
-
     if (!s_running || !fb_va || !pitch)
         return;
     __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
