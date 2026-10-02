@@ -200,6 +200,18 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
 
+/* GPU completion fences. D3D names a semaphore DMA object once, points the
+ * semaphore at a word inside it once, and from then on asks the back end to
+ * write the fence value it has just submitted -- BLiNX 2 sends the first two
+ * once and the release ~3 times a frame. The title's fence wait spins on that
+ * word, so writing it HERE, when the executor reaches it in the stream, is
+ * what makes the fence mean "the GPU got this far". The old answer, mirroring
+ * "submitted" into "completed" from the ack thread (xbox_Nv2aMirrorFence),
+ * said the work was done before anything had read it. */
+#define NV097_SET_CONTEXT_DMA_SEMAPHORE   0x01A4
+#define NV097_SET_SEMAPHORE_OFFSET        0x1D6C
+#define NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
+
 /* One vertex attribute stream, as the title describes it. Attribute 0 is
  * position; the rest are colours, texture coordinates and so on. */
 typedef struct {
@@ -267,7 +279,18 @@ static struct {
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
     Texture  tex;
+    uint32_t sema_dma, sema_offset;     /* SET_CONTEXT_DMA_SEMAPHORE / _OFFSET */
+    int      sema_offset_set;           /* offset 0 is a real address (0x80000000) */
 } s_gpu;
+
+/* Releases written, and where the last one landed. fence_mirrors_tick reads
+ * them to decide whether its mirror is still needed; both run on the NV2A ack
+ * thread, which is also the thread that drives this executor. */
+static uint32_t s_sema_releases;
+static uint32_t s_sema_last_va, s_sema_last_value;
+
+uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_sema_releases; }
+uint32_t nv2a_pb_exec_semaphore_last_va(void) { return s_sema_last_va; }
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -1819,6 +1842,52 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         record_tex_reg(method, param);
         break;
 
+    case NV097_SET_CONTEXT_DMA_SEMAPHORE:
+        s_gpu.sema_dma = param;
+        return;
+
+    case NV097_SET_SEMAPHORE_OFFSET:
+        s_gpu.sema_offset = param;
+        s_gpu.sema_offset_set = 1;
+        return;
+
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE: {
+        /* The semaphore offset is a DMA-object offset like every other one
+         * here, so it goes through the same resolution. The DMA object's own
+         * base is not read (no RAMHT/PRAMIN walk yet); for XDK D3D it covers
+         * physical memory from 0, which is what dma_resolve assumes, and the
+         * first release is logged so a title where that is false says so. */
+        uint32_t va = dma_resolve(s_gpu.sema_offset);
+        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+
+        if (!s_gpu.sema_offset_set) {
+            /* No offset yet: nowhere honest to write. */
+            note_unhandled(method, param);
+            return;
+        }
+        if (surface_hits_image(va, 4)) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [GPU] REFUSING semaphore release to 0x%08X"
+                        " (offset 0x%08X): inside the loaded image\n",
+                        va, s_gpu.sema_offset);
+            return;
+        }
+        *(volatile uint32_t *)(mem + va) = param;
+        s_sema_last_va = va;
+        s_sema_last_value = param;
+        if (s_sema_releases++ == 0 || getenv("RECOMP_PB_SEMA_TRACE")) {
+            static unsigned shown;
+            if (shown++ < 16) {
+                fprintf(stderr, "  [GPU] semaphore release 0x%08X -> 0x%08X"
+                        " (dma 0x%08X offset 0x%08X)\n", param, va,
+                        s_gpu.sema_dma, s_gpu.sema_offset);
+                fflush(stderr);
+            }
+        }
+        return;
+    }
+
     case NV097_SET_FLIP_READ:
         s_gpu.flip_read = param;
         return;
@@ -2118,6 +2187,8 @@ void nv2a_pb_exec_report(void)
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one
      * of them means the rasteriser is broken. */
+    fprintf(stderr, "[GPU] semaphore: %u releases, last 0x%08X at 0x%08X\n",
+            s_sema_releases, s_sema_last_value, s_sema_last_va);
     fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
     fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
                     " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",

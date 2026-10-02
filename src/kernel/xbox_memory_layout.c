@@ -1006,8 +1006,29 @@ static void frame_counters_tick(void)
     }
 }
 
+/* Set with RECOMP_PB_EXEC: the executor is consuming the pushbuffer, so it
+ * can write the fence itself when it reaches the release (nv2a_pb_exec.c). */
+static int s_pb_exec = 0;
+
+extern uint32_t nv2a_pb_exec_semaphore_releases(void);
+extern uint32_t nv2a_pb_exec_semaphore_last_va(void);
+
+/* Mirror "submitted" into "completed" -- now only the fallback.
+ *
+ * With the executor running, the title's fence word is written by
+ * NV097_BACK_END_WRITE_SEMAPHORE_RELEASE at the point the executor consumes
+ * it, which is the only honest moment. This tick runs at the top of the ack
+ * loop, before the scan, so mirroring here as well would report work as done
+ * before it had been read -- the same race the DMA_GET comment below
+ * describes. So a mirror steps aside once the executor has released a
+ * semaphore onto that same word, and keeps going otherwise: with RECOMP_PB_EXEC
+ * off, before the first release, or if the title's semaphore points somewhere
+ * else (said once, because that means the DMA-object base is not what the
+ * executor assumes). */
 static void fence_mirrors_tick(void)
 {
+    uint32_t releases = s_pb_exec ? nv2a_pb_exec_semaphore_releases() : 0;
+
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -1022,6 +1043,24 @@ static void fence_mirrors_tick(void)
                                          + g_memory_offset);
         if (!fence_readable(get_ptr, 4))
             continue;
+        if (releases) {
+            static int said[XBOX_MAX_FENCE_MIRRORS];
+            uint32_t sema = nv2a_pb_exec_semaphore_last_va();
+            int same = sema == get_ptr
+                    || sema == (XBOX_CONTIG_BASE | (get_ptr & 0x0FFFFFFFu));
+            if (!said[i]) {
+                said[i] = 1;
+                fprintf(stderr, "  NV2A fence mirror: device 0x%08X fence word "
+                        "0x%08X %s (semaphore releases land at 0x%08X)\n",
+                        g_fence_mirrors[i].device_ptr_va, get_ptr,
+                        same ? "now written by the executor; mirror off"
+                             : "NOT the semaphore target; mirror stays on",
+                        sema);
+                fflush(stderr);
+            }
+            if (same)
+                continue;
+        }
         {
             volatile uint32_t *fence =
                 (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
@@ -2593,6 +2632,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         g_nv2a_memory = layout_commit_at((LPVOID)nv2a_native, XBOX_NV2A_SIZE);
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
+        s_pb_exec = getenv("RECOMP_PB_EXEC") != NULL;
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;
