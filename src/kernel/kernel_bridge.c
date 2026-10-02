@@ -2437,6 +2437,59 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* The vblank acknowledgement, done when the guest gives it.
+ *
+ * PMC_INTR_0 and PCRTC_INTR_0 are write-1-to-clear. BLiNX 2's DPC reads
+ * PMC_INTR_0 to see what is pending, acks with PCRTC_INTR_0 = 1, and then
+ * spins (0x002EA590) until PMC_INTR_0 shows PCRTC clear. Against plain RAM
+ * only the nv2a-ack thread cleared that bit, once per pass. At Sleep(0) that
+ * was immediate. At Sleep(1), with the push-buffer executor making each pass
+ * take milliseconds, every vblank held the timer thread for the rest of a
+ * pass: 35-43% of a core under Proton, 6.5% on macOS.
+ *
+ * So after a claimed ISR, PCRTC_INTR_0's vblank bit is taken down (the ISR
+ * has read it) and PMC's is left up for the DPC. This thread then waits for
+ * the DPC's ack write, the bit coming back, and clears both. It blocks on an
+ * event between vblanks, and gives up after 2 ms if no ack comes. */
+static HANDLE g_vbl_ack_event;
+
+static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
+{
+    (void)unused;
+    xbox_log_thread_role("vblank-ack", 0);
+    for (;;) {
+        ULONGLONG until;
+
+        WaitForSingleObject(g_vbl_ack_event, INFINITE);
+        until = GetTickCount64() + 2;
+        while (GetTickCount64() <= until) {
+            if (BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &
+                NV2A_PCRTC_INTR_VBLANK) {
+                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &=
+                    ~NV2A_PCRTC_INTR_VBLANK;
+                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) &=
+                    ~NV2A_PMC_INTR_PCRTC;
+                break;
+            }
+            SwitchToThread();
+        }
+    }
+    return 0;
+}
+
+static void kernel_vblank_arm_ack(void)
+{
+    if (!g_vbl_ack_event) {
+        g_vbl_ack_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!g_vbl_ack_event)
+            return;
+        CloseHandle(CreateThread(NULL, 0, kernel_vblank_ack_thread, NULL, 0,
+                                 NULL));
+    }
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &= ~NV2A_PCRTC_INTR_VBLANK;
+    SetEvent(g_vbl_ack_event);
+}
+
 /* Vblank N is due at t0 + N * 1000 / 60 ms: an absolute schedule, so the
  * rate is 60 Hz however coarse the caller's tick. It used to be "now + 16"
  * checked on a 10 ms tick, which fired every 20 ms -- 50 Hz -- and the movie's
@@ -2497,6 +2550,9 @@ static long kernel_vblank_tick(void)
     {
         static unsigned n;
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
+
+        if (claimed > 0)
+            kernel_vblank_arm_ack();
         if (n++ < 3)
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
