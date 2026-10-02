@@ -940,6 +940,7 @@ static ID3D11BlendState *blend_state(void)
 
 typedef struct {
     uint32_t offset, color, width, height, pitch, addr_u, addr_v;
+    uint32_t palette, pal_len;  /* P8: resolved palette address, entries */
     int      valid;
     int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
 } Stage;
@@ -949,7 +950,7 @@ static Stage s_stage[4];
 #define TEX_MAX_TEXELS (2048u * 2048u)
 #define TEX_CACHE 512   /* a demo frame binds ~100; 64 thrashed */
 typedef struct {
-    uint32_t offset, color, width, height, pitch;
+    uint32_t offset, color, width, height, pitch, palette;
     uint32_t gen, used;
     uint64_t hash;
     int      live;
@@ -961,7 +962,10 @@ static TexEntry  s_tc[TEX_CACHE];
 static uint32_t  s_tc_clock;
 static uint32_t *s_texels;
 static size_t    s_texels_cap;
-static ID3D11ShaderResourceView *s_black_srv;   /* undecodable: (0,0,0,1) */
+static ID3D11ShaderResourceView *s_black_srv;   /* too large: (0,0,0,1) */
+static ID3D11ShaderResourceView *s_magenta_srv; /* format not decoded */
+static const uint32_t *s_pal;                   /* P8 palette, while decoding */
+static uint32_t        s_pal_len;
 
 static int tex_size_from_format(uint32_t fmt)
 {
@@ -998,16 +1002,41 @@ static void build_stages(void)
         t->pitch  = tex_size_from_format(t->color) ? 0 : r[0x10 / 4] >> 16;
         t->addr_u =  r[0x08 / 4]       & 0xF;
         t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
+        /* P8: SET_TEXTURE_PALETTE (0x1B20): offset in bits 6-31, length
+         * 256 >> bits 2-3, entries A8R8G8B8. */
+        if (t->color == 0x0B) {
+            uint32_t pal = r[0x20 / 4];
+            t->palette = (pal & ~0x3Fu) ? nv2a_pb_dma_resolve(pal & ~0x3Fu) : 0;
+            t->pal_len = 256u >> ((pal >> 2) & 3u);
+        }
         t->valid = t->offset && t->width && t->height
-                && (tex_size_from_format(t->color) || t->pitch);
+                && (tex_size_from_format(t->color) || t->pitch)
+                && (t->color != 0x0B || t->palette);
         if (n == 0 && !set[0x0C / 4])
             on = 1;                        /* never configured: as the CPU path */
         if (v->shader_set)
             mode = (int)((v->shader_prog >> (5 * n)) & 0x1F);
         else
             mode = n == 0 ? 1 : 0;
+        if (mode && mode != 4 && (!on || !t->valid)) {
+            /* The program asks for a texture this stage cannot give: it
+             * reads 0 now. Said once per stage, mode and format, since a
+             * world drawn in flat vertex colour starts exactly here. */
+            static uint8_t said[4][32][32];
+            uint8_t bit = (uint8_t)(1u << (t->color & 7));
+            if (!(said[n][mode & 31][(t->color >> 3) & 31] & bit)) {
+                said[n][mode & 31][(t->color >> 3) & 31] |= bit;
+                fprintf(stderr, LOGP "\x1b[1;35mstage %d: mode %d with no texture"
+                        " (enabled %d, offset 0x%08X, format 0x%02X, %ux%u, pitch %u)"
+                        "\x1b[0m\n", n, mode, on, t->offset, t->color,
+                        t->width, t->height, t->pitch);
+            }
+        }
         if (mode != 4 && (!on || !t->valid))
             mode = 0;
+        if (mode == 5)
+            mode = 0;   /* CLIP_PLANE: no texture, the register reads 0
+                         * (ponytail: its per-pixel discard is not done) */
         t->mode = mode;
     }
 }
@@ -1024,7 +1053,16 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x06: return 0x12;
     case 0x07: return 0x1E;
     case 0x19: return 0x1F;
-    default:   return fmt;
+    case 0x01: return 0x1B;     /* AY8 */
+    case 0x1A: return 0x20;     /* A8Y8 */
+    case 0x27: return 0x37;     /* R6G5B5 */
+    case 0x32: return 0x35;     /* Y16 */
+    case 0x38: return 0x3D;     /* R5G5B5A1 */
+    case 0x39: return 0x3E;     /* R4G4B4A4 */
+    case 0x3A: return 0x3F;     /* A8B8G8R8 */
+    case 0x3B: return 0x40;     /* B8G8R8A8 */
+    case 0x3C: return 0x41;     /* R8G8B8A8 */
+    default:   return fmt;      /* already linear, P8, or not decoded */
     }
 }
 
@@ -1032,8 +1070,9 @@ static uint32_t texel_bytes(uint32_t lin)
 {
     switch (lin) {
     case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
-    case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25: return 2;
-    case 0x13: case 0x1F: return 1;
+    case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25:
+    case 0x20: case 0x37: case 0x35: case 0x3D: case 0x3E: return 2;
+    case 0x13: case 0x1F: case 0x1B: case 0x0B: return 1;
     default: return 0;
     }
 }
@@ -1123,6 +1162,35 @@ static uint32_t decode_texel(uint32_t fmt, const uint8_t *p, uint32_t u)
         return 0xFF000000u | (t << 16) | (t << 8) | t;
     case 0x1F:
         return ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
+    case 0x1B:                              /* AY8: Y in all four */
+        return (uint32_t)p[u] * 0x01010101u;
+    case 0x20:                              /* A8Y8: Y low byte, A high */
+        t = ((const uint16_t *)p)[u];
+        return ((t >> 8) << 24) | (t & 0xFFu) * 0x010101u;
+    case 0x35:                              /* Y16: top byte */
+        t = ((const uint16_t *)p)[u] >> 8;
+        return 0xFF000000u | t * 0x010101u;
+    case 0x37:                              /* R6G5B5 */
+        t = ((const uint16_t *)p)[u];
+        return 0xFF000000u
+             | (d3d8_expand_channel((t >> 10) & 0x3F, 6) << 16)
+             | (d3d8_expand_channel((t >> 5) & 0x1F, 5) << 8)
+             |  d3d8_expand_channel(t & 0x1F, 5);
+    case 0x3D:                              /* R5G5B5A1 */
+        t = ((const uint16_t *)p)[u];
+        return ((t & 1u) ? 0xFF000000u : 0u)
+             | (d3d8_expand_channel((t >> 11) & 0x1F, 5) << 16)
+             | (d3d8_expand_channel((t >> 6) & 0x1F, 5) << 8)
+             |  d3d8_expand_channel((t >> 1) & 0x1F, 5);
+    case 0x3E:                              /* R4G4B4A4 */
+        t = ((const uint16_t *)p)[u];
+        return (d3d8_expand_channel(t & 0xF, 4) << 24)
+             | (d3d8_expand_channel((t >> 12) & 0xF, 4) << 16)
+             | (d3d8_expand_channel((t >> 8) & 0xF, 4) << 8)
+             |  d3d8_expand_channel((t >> 4) & 0xF, 4);
+    case 0x0B:                              /* P8, through the palette */
+        t = p[u];
+        return t < s_pal_len ? s_pal[t] : 0xFFFF00FFu;
     case 0x24:                              /* YUY2 */
     case 0x25: {                            /* UYVY */
         uint32_t yoff = (fmt == 0x24) ? 0u : 1u;
@@ -1162,6 +1230,11 @@ static int decode_texture(const Stage *t)
                 s_texels[(size_t)y * t->width + x] = argb;
             }
         return 1;
+    }
+    if (fmt == 0x0B) {
+        s_pal = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset()
+                                   + t->palette);
+        s_pal_len = t->pal_len;
     }
     if (d3d8_format_is_swizzled(fmt)) {
         uint32_t mx, my;
@@ -1220,6 +1293,16 @@ static void tex_free(TexEntry *e)
     memset(e, 0, sizeof *e);
 }
 
+/* The texels' hash, and for P8 the palette's folded in: a palette swap is a
+ * new texture. */
+static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
+{
+    uint64_t h = tex_hash(mem + t->offset, bytes);
+    if (t->color == 0x0B)
+        h ^= tex_hash(mem + t->palette, t->pal_len * 4u) * 31u;
+    return h;
+}
+
 /* The view for a stage's texture, decoded and uploaded if it is new or its
  * bytes changed since it was last checked (once per flip). */
 static ID3D11ShaderResourceView *tex_bind(const Stage *t)
@@ -1229,13 +1312,25 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
     uint32_t bytes = tex_extent(t), i;
     TexEntry *e = NULL, *victim = &s_tc[0];
 
-    if (!bytes)
-        return s_black_srv;
+    if (!bytes) {
+        /* A format with no decoder is magenta, and said once, loudly: white
+         * or black passes for a texture that decoded to that. */
+        static uint8_t said[256];
+        if ((uint64_t)t->width * t->height > TEX_MAX_TEXELS)
+            return s_black_srv;
+        if (!said[t->color & 0xFF]) {
+            said[t->color & 0xFF] = 1;
+            fprintf(stderr, LOGP "\x1b[1;35mtexture format 0x%02X (%ux%u at"
+                    " 0x%08X) not decoded: drawn magenta\x1b[0m\n",
+                    t->color, t->width, t->height, t->offset);
+        }
+        return s_magenta_srv ? s_magenta_srv : s_black_srv;
+    }
     for (i = 0; i < TEX_CACHE; i++) {
         TexEntry *c = &s_tc[i];
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
-                && c->pitch == t->pitch) {
+                && c->pitch == t->pitch && c->palette == t->palette) {
             e = c;
             break;
         }
@@ -1244,7 +1339,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
     }
     if (e) {
         if (e->gen != g->flips) {
-            uint64_t h = tex_hash(mem + t->offset, bytes);
+            uint64_t h = tex_hash_pal(mem, t, bytes);
             s_tex_rehash++;
             e->gen = g->flips;
             if (h != e->hash) {
@@ -1262,8 +1357,9 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         e->width = t->width;
         e->height = t->height;
         e->pitch = t->pitch;
+        e->palette = t->palette;
         e->gen = g->flips;
-        e->hash = tex_hash(mem + t->offset, bytes);
+        e->hash = tex_hash_pal(mem, t, bytes);
         if (!tex_upload(e, t)) {
             tex_free(e);
             return s_black_srv;
@@ -1303,9 +1399,33 @@ static ID3D11SamplerState *sampler(uint32_t u, uint32_t v)
     return cache[u][v];
 }
 
+static ID3D11ShaderResourceView *solid_texture(uint32_t argb)
+{
+    ID3D11ShaderResourceView *v = NULL;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd;
+    ID3D11Texture2D *t = NULL;
+    memset(&td, 0, sizeof td);
+    td.Width = td.Height = 1;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    sd.pSysMem = &argb;
+    sd.SysMemPitch = 4;
+    sd.SysMemSlicePitch = 4;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &t))) {
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL, &v);
+        ID3D11Texture2D_Release(t);
+    }
+    return v;
+}
+
 static void create_black_texture(void)
 {
     static const uint32_t black = 0xFF000000u;
+    s_magenta_srv = solid_texture(0xFFFF00FFu);
     D3D11_TEXTURE2D_DESC td;
     D3D11_SUBRESOURCE_DATA sd;
     ID3D11Texture2D *t = NULL;
