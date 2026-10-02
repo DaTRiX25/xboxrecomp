@@ -96,15 +96,22 @@ static uint64_t s_tex_uploads, s_tex_rehash;
 #define RT_MAX 8
 typedef struct {
     uint32_t                offset;     /* color_offset, as the title set it */
+    uint32_t                addr;       /* ... resolved to a guest address */
     UINT                    w, h;
     ID3D11Texture2D        *tex;
     ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;      /* for render-to-texture, made lazily */
     uint64_t                last_use;
+    uint64_t                last_draw, last_clear;  /* s_seq at the last one */
+    int                     flipped;    /* the walker named it at a flip */
 } RenderTarget;
 
 static RenderTarget s_rt[RT_MAX];
-static RenderTarget *s_drawn;   /* what the next flip presents */
+static RenderTarget *s_drawn;   /* what the last flip presented */
+static RenderTarget *s_cur;     /* the target of the batch being drawn */
 static uint64_t      s_tick;
+static uint64_t      s_seq, s_flip_seq;  /* draw/clear order; s_seq at the last flip */
+static uint64_t      s_rtt_binds;        /* textures served from a render target */
 
 /* ---- shaders --------------------------------------------------------------- */
 
@@ -389,6 +396,8 @@ static RenderTarget *surface(void)
         free_rt = lru;
         if (s_drawn == free_rt)
             s_drawn = NULL;
+        if (free_rt->srv)
+            ID3D11ShaderResourceView_Release(free_rt->srv);
         ID3D11RenderTargetView_Release(free_rt->rtv);
         ID3D11Texture2D_Release(free_rt->tex);
         memset(free_rt, 0, sizeof *free_rt);
@@ -414,6 +423,7 @@ static RenderTarget *surface(void)
         }
     }
     free_rt->offset = g->color_offset;
+    free_rt->addr = nv2a_pb_dma_resolve(g->color_offset);
     free_rt->w = w;
     free_rt->h = h;
     free_rt->last_use = s_tick;
@@ -554,9 +564,7 @@ static void d3d11_on_clear(uint32_t param)
     c[2] = (float)(g->clear_color & 0xFF) / 255.0f;
     c[3] = (float)(g->clear_color >> 24) / 255.0f;
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
-    /* A clear is drawing too: the flip presents this surface. (The CPU
-     * backend records this in drawn_offset; other backends cannot.) */
-    s_drawn = rt;
+    rt->last_clear = ++s_seq;
     s_clears++;
 }
 
@@ -1348,6 +1356,30 @@ static void argb_to_float4(uint32_t c, float o[4])
     o[3] = (float)(c >> 24) / 255.0f;
 }
 
+/* Render to texture: a stage whose texture lies where a surface this backend
+ * renders into starts samples that surface. The guest's copy of those bytes
+ * is stale (nothing here writes guest memory), so decoding it would show
+ * whatever was there before -- or nothing at all. A 32-bit texture at the
+ * surface's address only, and never the surface being drawn into. */
+static RenderTarget *rt_texture(const Stage *t)
+{
+    int i;
+
+    if (!t->offset || d3d8_format_dxt_block_bytes(t->color)
+            || texel_bytes(linear_twin(t->color)) != 4)
+        return NULL;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->tex || rt->addr != t->offset || rt == s_cur)
+            continue;
+        if (!rt->srv && FAILED(ID3D11Device_CreateShaderResourceView(
+                    s_dev, (ID3D11Resource *)rt->tex, NULL, &rt->srv)))
+            return NULL;
+        return rt;
+    }
+    return NULL;
+}
+
 /* Stages, textures, samplers and PS constants for the batch about to be
  * drawn. Returns the pixel shader to use. */
 static ID3D11PixelShader *setup_pixel(void)
@@ -1364,10 +1396,21 @@ static ID3D11PixelShader *setup_pixel(void)
     for (n = 0; n < 4; n++) {
         const Stage *t = &s_stage[n];
         int scaled = tex_size_from_format(t->color);
+        RenderTarget *src = (t->mode && t->mode != 4) ? rt_texture(t) : NULL;
         pc.tex_mode[n] = (uint32_t)t->mode;
         pc.tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;
         pc.tex_scale[n][1] = scaled || !t->height ? 1.0f : 1.0f / (float)t->height;
-        srv[n] = (t->mode && t->mode != 4) ? tex_bind(t) : s_black_srv;
+        if (src) {
+            /* Linear coordinates are texels of the surface as drawn. */
+            if (!scaled) {
+                pc.tex_scale[n][0] = 1.0f / (float)src->w;
+                pc.tex_scale[n][1] = 1.0f / (float)src->h;
+            }
+            srv[n] = src->srv;
+            s_rtt_binds++;
+        } else {
+            srv[n] = (t->mode && t->mode != 4) ? tex_bind(t) : s_black_srv;
+        }
         smp[n] = sampler(t->addr_u, t->addr_v);
     }
     for (n = 0; n < 8; n++) {
@@ -1553,10 +1596,12 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, topo);
         ID3D11DeviceContext_VSSetShader(s_ctx, vs->vs, NULL, 0);
         ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 3, cbs);
+        s_cur = rt;
         ID3D11DeviceContext_PSSetShader(s_ctx, setup_pixel(), NULL, 0);
         ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
     }
-    s_drawn = rt;
+    rt->last_draw = ++s_seq;
+    s_cur = NULL;
     s_draws++;
 }
 
@@ -1625,6 +1670,53 @@ static void dump_frame(void)
     ID3D11Texture2D_Release(st);
 }
 
+/* The surface a flip puts on screen.
+ *
+ * The walker hands over drawn_offset, else color_offset. drawn_offset is the
+ * CPU backend's bookkeeping, so here it is color_offset: by FLIP_STALL the
+ * XDK has already pointed that at the next back buffer. And the last surface
+ * drawn into is not the answer either -- a title renders glow, shadow and
+ * reflection targets too, sometimes last.
+ *
+ * What is used instead: the swap-chain buffers are the surfaces the walker
+ * names at flips (both of them, after two), plus anything as large as the
+ * largest surface (for the first flip, before the second buffer has been
+ * named). Of those, the one drawn into most recently since the last flip;
+ * if none was, the one cleared most recently; if none was either, the
+ * frame on screen stays. */
+static RenderTarget *present_target(uint32_t surface_offset)
+{
+    RenderTarget *best = NULL;
+    UINT max_area = 0;
+    int i, pass;
+
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->tex)
+            continue;
+        if (surface_offset && rt->offset == surface_offset)
+            rt->flipped = 1;
+        if (rt->w * rt->h > max_area)
+            max_area = rt->w * rt->h;
+    }
+    for (pass = 0; pass < 2 && !best; pass++) {
+        uint64_t top = s_flip_seq;
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            uint64_t when;
+            if (!rt->tex || !(rt->flipped || rt->w * rt->h == max_area))
+                continue;
+            when = pass == 0 ? rt->last_draw : rt->last_clear;
+            if (when > top) {
+                top = when;
+                best = rt;
+            }
+        }
+    }
+    s_flip_seq = s_seq;
+    return best ? best : s_drawn;
+}
+
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     HRESULT hr;
@@ -1632,6 +1724,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (!init())
         return;
     pump();
+    s_drawn = present_target(surface_offset);
     if (s_drawn) {
         if (s_drawn->w == s_back_w && s_drawn->h == s_back_h) {
             ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_back,
@@ -1660,7 +1753,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (walker said 0x%08X),"
                 " %llu clears, %llu draws, %llu skipped, %llu texture uploads,"
                 " %llu rehashes, %llu combiner shaders, %llu zclears,"
-                " %llu depth-tested draws\n",
+                " %llu depth-tested draws, %llu render-target textures\n",
                 (unsigned long long)s_presents,
                 s_drawn ? s_drawn->offset : 0, surface_offset,
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
@@ -1668,7 +1761,8 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_tex_uploads,
                 (unsigned long long)s_tex_rehash,
                 (unsigned long long)s_rc_compiles,
-                (unsigned long long)s_zclears, (unsigned long long)s_draws_z);
+                (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
+                (unsigned long long)s_rtt_binds);
 }
 
 /* ---- registration ---------------------------------------------------------- */
