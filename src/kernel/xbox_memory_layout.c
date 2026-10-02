@@ -2012,6 +2012,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * VirtualFree releases just the slice about to be used, so each view
          * replaces our own reservation rather than racing for free space. */
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        /* Stop below the contiguous window: at 128 MB the span would
+         * otherwise run to 0xE8000000 and hold 0x80000000 against it. */
+        if (g_span_size > XBOX_CONTIG_BASE)
+            g_span_size = XBOX_CONTIG_BASE;
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
