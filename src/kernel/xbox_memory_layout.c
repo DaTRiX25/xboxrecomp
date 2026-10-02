@@ -1393,32 +1393,23 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
                     /* The pushbuffer is a ring, so PUT coming back below
-                     * where it was is a wrap, not a rewind. Scanning only
-                     * forward segments dropped everything written across
-                     * the seam -- one whole submission each time round.
+                     * where it was is a wrap, not a rewind. The walk follows
+                     * the title's own jump back to the start (nv2a_pb_scan
+                     * goes from GET to PUT through jumps), so one call covers
+                     * a wrap too.
                      *
-                     * The ring's bounds are not published anywhere this
-                     * code can read, so they are learned: the lowest and
-                     * highest PUT seen bracket it. That is approximate on
-                     * the first lap and exact afterwards, and scanning a
-                     * little short of the true end costs the same commands
-                     * that were being lost anyway. */
-                    static uint32_t put_lo, put_hi;
-                    if (!put_lo || put < put_lo) put_lo = put;
-                    if (put > put_hi) put_hi = put;
-                    if (g_scanned_put && put > g_scanned_put) {
+                     * It used to scan to the highest PUT seen and then from
+                     * the lowest, guessing the ring's bounds. Each lap ends
+                     * at a different place, so that dropped the tail of a
+                     * lap that ended past the guess, and ran old words from
+                     * an earlier lap when it ended short of it. In BLiNX 2
+                     * those old words wrote -9999 into c26, which the title
+                     * never leaves there; whether it happened went with
+                     * timing. */
+                    if (g_scanned_put && put != g_scanned_put) {
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (g_scanned_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (g_scanned_put && put < g_scanned_put) {
-                        if (put_hi > g_scanned_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (g_scanned_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
+                        if (put < g_scanned_put && getenv("RECOMP_PB_WRAP_TRACE")) {
                             static unsigned wraps;
                             if (wraps++ < 8)
                                 fprintf(stderr, "  [NV2A] pushbuffer wrapped "
