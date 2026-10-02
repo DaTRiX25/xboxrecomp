@@ -1102,7 +1102,7 @@ static ID3D11BlendState *blend_state(void)
 /* The factor D3D11_BLEND_BLEND_FACTOR reads: SET_BLEND_COLOR, unpacked
  * from ARGB to RGBA. D3D11 has no CONSTANT_ALPHA, so when only the
  * _ALPHA factors are in use the alpha is replicated into all four; a
- * draw mixing _COLOR and _ALPHA keeps the colour (not seen so far). With
+ * draw mixing _COLOR and _ALPHA keeps the colour (logged once). With
  * no constant factor the default (1,1,1,1) is used, so a colour the title
  * sets without using it does not rebind the blend state. Returns whether a
  * constant factor is in use. */
@@ -1118,6 +1118,13 @@ static int blend_color(float bf[4])
         return 0;
     }
     bf[3] = (float)(c >> 24) / 255.0f;
+    if (col && alp) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, LOGP "blend: CONSTANT_COLOR and CONSTANT_ALPHA mixed"
+                    " (sfactor 0x%04X dfactor 0x%04X); the _ALPHA side uses the"
+                    " colour\n", s, d);
+    }
     if (col) {
         bf[0] = (float)((c >> 16) & 0xFF) / 255.0f;
         bf[1] = (float)((c >>  8) & 0xFF) / 255.0f;
@@ -2711,7 +2718,14 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
     /* back to the real draw's state; the state-call filter's view of it
      * stays true for everything restored here */
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, dsv);
-    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_sc.bs, s_sc.bf, 0xFFFFFFFF);
+    {
+        /* Recomputed, not s_sc.bs/.bf: setup_pixel can evict a shader
+         * after the blend bind, and sc_on() then resets s_sc to 0xFF. The
+         * pgraph state is unchanged since the draw, so these are the same. */
+        float bf[4];
+        blend_color(bf);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(), bf, 0xFFFFFFFF);
+    }
     ID3D11DeviceContext_PSSetShader(s_ctx, s_sc.ps, NULL, 0);
     s_state_gen++;              /* and the next draw rebinds everything */
 
