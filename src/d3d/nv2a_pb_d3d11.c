@@ -944,6 +944,7 @@ struct Stage {
     uint32_t offset, color, width, height, pitch, addr_u, addr_v;
     uint32_t palette, pal_len;  /* P8: resolved palette address, entries */
     int      valid;
+    int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
     int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
 };
 
@@ -1037,6 +1038,7 @@ static void build_stages(void)
                         t->width, t->height, t->pitch);
             }
         }
+        t->on = on;
         if (mode != 4 && (!on || !t->valid))
             mode = 0;
         if (mode == 5)
@@ -1539,9 +1541,58 @@ static void argb_to_float4(uint32_t c, float o[4])
  * is stale (nothing here writes guest memory), so decoding it would show
  * whatever was there before -- or nothing at all. A 32-bit texture at the
  * surface's address only, and never the surface being drawn into. */
+/* The surface being drawn into, sampled by the same batch (a full-screen
+ * post pass reading the frame so far). D3D11 cannot bind one texture as both
+ * target and resource, and the guest memory under it is empty -- the frame
+ * lives on the GPU -- so the batch gets a copy taken just before it draws.
+ * The CPU path reads the same thing: the surface memory as drawn so far. */
+static RenderTarget     s_self;         /* tex/srv/w/h of the copy */
+static uint64_t         s_self_copies;
+
+static RenderTarget *rt_self_copy(RenderTarget *rt)
+{
+    if (s_self.tex && (s_self.w != rt->w || s_self.h != rt->h)) {
+        if (s_self.srv) ID3D11ShaderResourceView_Release(s_self.srv);
+        ID3D11Texture2D_Release(s_self.tex);
+        s_self.tex = NULL;
+        s_self.srv = NULL;
+    }
+    if (!s_self.tex) {
+        D3D11_TEXTURE2D_DESC td;
+        ID3D11Texture2D_GetDesc(rt->tex, &td);
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_self.tex)))
+            return NULL;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(
+                    s_dev, (ID3D11Resource *)s_self.tex, NULL, &s_self.srv))) {
+            ID3D11Texture2D_Release(s_self.tex);
+            s_self.tex = NULL;
+            return NULL;
+        }
+        s_self.w = rt->w;
+        s_self.h = rt->h;
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_self.tex,
+                                     (ID3D11Resource *)rt->tex);
+    s_self.offset = rt->offset;
+    s_self.addr = rt->addr;
+    s_self.last_draw = rt->last_draw;
+    s_self.last_clear = rt->last_clear;
+    s_self_copies++;
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "surface 0x%08X sampled while drawn into:"
+                    " bound as a copy\n", rt->offset);
+    }
+    return &s_self;
+}
+
 static RenderTarget *rt_texture(const Stage *t)
 {
     static int off = -1;
+    RenderTarget *self = NULL;
     int i;
 
     if (off < 0)
@@ -1553,14 +1604,19 @@ static RenderTarget *rt_texture(const Stage *t)
         return NULL;
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
-        if (!rt->tex || rt->addr != t->offset || rt == s_cur)
+        /* Low 27 bits: the same memory through either window. */
+        if (!rt->tex || ((rt->addr ^ t->offset) & 0x07FFFFFFu))
             continue;
+        if (rt == s_cur) {
+            self = rt;
+            continue;
+        }
         if (!rt->srv && FAILED(ID3D11Device_CreateShaderResourceView(
                     s_dev, (ID3D11Resource *)rt->tex, NULL, &rt->srv)))
             return NULL;
         return rt;
     }
-    return NULL;
+    return self ? rt_self_copy(self) : NULL;
 }
 
 /* The combiner state of the batch being drawn (for the trace), and whether
@@ -1640,7 +1696,8 @@ static ID3D11PixelShader *setup_pixel(void)
         s_stage_rt[n] = src;
         s_stage_src[n] = !t->mode ? "none" : t->mode == 4 ? "passthru" : "cache";
         if (src) {
-            s_stage_src[n] = "render-target";
+            s_stage_src[n] = src == &s_self ? "render-target(self copy)"
+                                            : "render-target";
             /* Linear coordinates are texels of the surface as drawn. */
             if (!scaled) {
                 pc.tex_scale[n][0] = 1.0f / (float)src->w;
@@ -1754,7 +1811,7 @@ static int trace_pick(const struct nv2a_pb_draw *d)
     if (by_tex) {
         int hit = 0;
         for (n = 0; n < 4; n++)
-            if (s_stage[n].mode && ((s_stage[n].offset ^ texoff) & 0x07FFFFFFu) == 0)
+            if (s_stage[n].offset && ((s_stage[n].offset ^ texoff) & 0x07FFFFFFu) == 0)
                 hit = 1;
         if (!hit)
             return 0;
@@ -1894,8 +1951,8 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
             v->fog_color);
     for (k = 0; k < 4; k++) {
         const Stage *t = &s_stage[k];
-        fprintf(stderr, "[D3D11-WHITE]  tex%d mode %d fmt %02X %ux%u off %08X pitch %u"
-                " addr %u/%u pal %08X src %s", k, t->mode, t->color, t->width,
+        fprintf(stderr, "[D3D11-WHITE]  tex%d mode %d on %d fmt %02X %ux%u off %08X pitch %u"
+                " addr %u/%u pal %08X src %s", k, t->mode, t->on, t->color, t->width,
                 t->height, t->offset, t->pitch, t->addr_u, t->addr_v, t->palette,
                 s_stage_src[k] ? s_stage_src[k] : "?");
         if (s_stage_rt[k])
@@ -2321,12 +2378,12 @@ static void flip_log(uint32_t surface_offset)
 {
     static int on = -1;
     static uint64_t p_draws, p_prog, p_tex, p_rtt, p_clears, p_up, p_chg,
-                    p_re, p_vn, p_ve, p_skip;
+                    p_re, p_vn, p_ve, p_skip, p_self;
     if (on < 0)
         on = getenv("RECOMP_FLIP_LOG") != NULL;
     if (!on)
         return;
-    fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu"
+    fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu (self %llu)"
             " skipped %llu clears %llu uploads %llu changed %llu rehash %llu"
             " vb %llu/%llu bytes present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
@@ -2334,6 +2391,7 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_draws_prog - p_prog),
             (unsigned long long)(s_draws_tex - p_tex),
             (unsigned long long)(s_rtt_binds - p_rtt),
+            (unsigned long long)(s_self_copies - p_self),
             (unsigned long long)(s_draws_skipped - p_skip),
             (unsigned long long)(s_clears - p_clears),
             (unsigned long long)(s_tex_uploads - p_up),
@@ -2345,7 +2403,7 @@ static void flip_log(uint32_t surface_offset)
     p_draws = s_draws; p_prog = s_draws_prog; p_tex = s_draws_tex;
     p_rtt = s_rtt_binds; p_skip = s_draws_skipped; p_clears = s_clears;
     p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
-    p_vn = s_vb_native; p_ve = s_vb_expanded;
+    p_vn = s_vb_native; p_ve = s_vb_expanded; p_self = s_self_copies;
 }
 
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)

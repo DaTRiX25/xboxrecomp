@@ -346,6 +346,26 @@ int main(int argc, char **argv)
             M(0x17FC, 0);
             M(0x1E94, 0);                      /* fixed function again */
         }
+        /* A post pass reading the surface it draws into (linear A8R8G8B8 at
+         * the colour offset, texel coordinates): a quarter-size copy of the
+         * frame so far, bottom right. Bound straight from guest memory, it
+         * is black. */
+        M(0x1B00, buf[f & 1]);
+        M(0x1B04, (0x12u << 8) | (1u << 4) | (2u << 0));
+        M(0x1B08, 0x00000303u);
+        M(0x1B0C, 0x40000000u);
+        M(0x1B10, (640u * 4u) << 16);
+        M(0x1B1C, (640u << 16) | 480u);
+        M(0x1760 + 4 * 9, 0x22u);
+        M(0x17FC, 8);
+        {
+            static const float uv[4][2] = {{0, 0}, {640, 0}, {640, 480}, {0, 480}};
+            vertex_uv(460.0f, 360.0f, 0xFFFFFFFFu, uv[0]);
+            vertex_uv(620.0f, 360.0f, 0xFFFFFFFFu, uv[1]);
+            vertex_uv(620.0f, 480.0f, 0xFFFFFFFFu, uv[2]);
+            vertex_uv(460.0f, 480.0f, 0xFFFFFFFFu, uv[3]);
+        }
+        M(0x17FC, 0);
         M(0x1760 + 4 * 9, 0x02u);
         M(0x1B0C, 0);
 
