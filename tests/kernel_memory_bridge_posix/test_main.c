@@ -61,11 +61,11 @@ enum { ORD_MMALLOC = 165, ORD_MMALLOCEX = 166, ORD_MMFREE = 171,
        ORD_NTCREATE = 190, ORD_NTFREE = 199, ORD_NTSETINFO = 226,
        ORD_KEWAIT = 159, ORD_NTDUP = 197, ORD_NTWAIT = 233, ORD_OBREF = 246,
        ORD_OBDEREF = 250, ORD_PSCREATE = 255, ORD_PSTERM = 258,
-       ORD_NTWRITE = 236 };
+       ORD_NTWRITE = 236, ORD_NTQUERYINFO = 211 };
 static const uint32_t ORDS[] = { ORD_MMALLOC, ORD_MMALLOCEX, ORD_MMFREE,
     ORD_MMQUERYSIZE, ORD_NTALLOC, ORD_NTCLOSE, ORD_NTCREATE, ORD_NTFREE,
     ORD_NTSETINFO, ORD_KEWAIT, ORD_NTDUP, ORD_NTWAIT, ORD_OBREF, ORD_OBDEREF,
-    ORD_PSCREATE, ORD_PSTERM, ORD_NTWRITE };
+    ORD_PSCREATE, ORD_PSTERM, ORD_NTWRITE, ORD_NTQUERYINFO };
 #define NORDS (sizeof ORDS / sizeof ORDS[0])
 
 static uint32_t g_thunks, g_stack, g_scratch;
@@ -350,8 +350,10 @@ static void test_overwrite(const char *cache)
     CALL(ORD_NTWRITE, h, 0, 0, 0, ios, buf, 1024, 0);
     CALL(ORD_NTCLOSE, h);
 
-    /* second CREATE_ALWAYS, then trim to the true size */
+    /* second CREATE_ALWAYS, then trim to the true size; XAPI SetEndOfFile
+     * queries the position first */
     h = create("z:\\o.tmp");
+    CALL(ORD_NTQUERYINFO, h, ios, g_scratch + 0x400, 8, 14 /* Position */);
     set_eof(h, 700);
     CALL(ORD_NTCLOSE, h);
     n = host_file(cache, "o.tmp", got, sizeof got);

@@ -1060,8 +1060,10 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
         return STATUS_INVALID_HANDLE;
 
     struct stat st;
-    overwrite_settle(fd);
     if (FileInformationClass != XboxFilePositionInformation) {
+        /* Not for a position query: XAPI SetEndOfFile makes one before it
+         * sets the end of file, and a pending overwrite must survive it. */
+        overwrite_settle(fd);
         if (fstat(fd, &st) != 0)
             return STATUS_UNSUCCESSFUL;
     }
