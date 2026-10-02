@@ -267,3 +267,65 @@ int nv2a_blend_constant(int enable, uint32_t sfactor, uint32_t dfactor,
     }
     return 1;
 }
+
+void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
+                         const struct nv2a_stage st[4],
+                         struct nv2a_ps_consts *pc)
+{
+    int n;
+
+    memset(pc, 0, sizeof *pc);
+    for (n = 0; n < 4; n++) {
+        const struct nv2a_stage *t = &st[n];
+        int scaled = nv2a_tex_size_from_format(t->color);
+        pc->tex_mode[n] = (uint32_t)t->mode;
+        pc->tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;
+        pc->tex_scale[n][1] = scaled || !t->height ? 1.0f : 1.0f / (float)t->height;
+    }
+    for (n = 0; n < 8; n++) {
+        nv2a_argb_to_float4(v->rc_f0[n], pc->c0[n]);
+        nv2a_argb_to_float4(v->rc_f1[n], pc->c1[n]);
+    }
+    nv2a_argb_to_float4(v->rc_sf[0], pc->fc0);
+    nv2a_argb_to_float4(v->rc_sf[1], pc->fc1);
+    nv2a_argb_to_float4(v->fog_color, pc->fog_color);
+    {   /* the CPU path reads the fog colour register as RGBA, alpha 1 */
+        float t = pc->fog_color[0];
+        pc->fog_color[0] = pc->fog_color[2];
+        pc->fog_color[2] = t;
+        pc->fog_color[3] = 1.0f;
+    }
+    pc->alpha_ref = (float)v->atest_ref / 255.0f;
+    pc->alpha_test_enable = v->atest_enable ? 1u : 0u;
+    pc->alpha_func = nv2a_cmp_from_gl(v->atest_func) + 1;
+}
+
+void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
+                         uint32_t w, uint32_t h, struct nv2a_vp_consts *o)
+{
+    uint32_t func, abs_, edge_one;
+
+    o->c[0] = 2.0f / (float)w;
+    o->c[1] = -2.0f / (float)h;
+    o->c[2] = 1.0f / nv2a_zmax(surface_format);
+    o->c[3] = 0.0f;
+    o->c[4] = -1.0f;
+    o->c[5] = 1.0f;
+    o->c[6] = 0.0f;
+    o->c[7] = 0.0f;
+    /* Fog and specular, as the CPU path's vsh_fog_factor and vsh_transform
+     * apply them (xemu vsh.c). */
+    o->c[8] = v->fog_param[0];
+    o->c[9] = v->fog_param[1];
+    o->c[10] = v->fog_param[2];
+    o->c[11] = 0.0f;
+    memset(o->u, 0, sizeof o->u);
+    if (nv2a_fog_mode(v->fog_mode, &func, &abs_, &edge_one)) {
+        o->u[1] = func;
+        o->u[2] = abs_;
+        o->u[3] = edge_one;
+        o->u[0] = v->fog_enable ? 1u : 0u;
+    }
+    o->u[4] = v->spec_enable ? 1u : 0u;
+    o->u[5] = (v->light_ctl >> 17) & 1u;
+}

@@ -2049,36 +2049,8 @@ static void vsh_inputs(uint32_t index, float v[NV2A_VSH_INPUTS][4])
  * the final combiner's FOG alpha then leaves the colour alone. */
 static float vsh_fog_factor(float d)
 {
-    float p0 = s_vsh.fog_param[0], p1 = s_vsh.fog_param[1], f;
-    int abs_ = 0;
-
-    if (!s_vsh.fog_enable)
-        return 1.0f;
-    if (isinf(d))
-        return (s_vsh.fog_mode == 0x2601 || s_vsh.fog_mode == 0x804
-                || s_vsh.fog_mode == 0x800) ? 1.0f : 0.0f;
-    switch (s_vsh.fog_mode) {
-    case 0x804: abs_ = 1; /* fallthrough */          /* LINEAR_ABS */
-    case 0x2601:                                     /* LINEAR */
-        f = p0 + d * p1 - 1.0f;
-        break;
-    case 0x802: abs_ = 1; /* fallthrough */          /* EXP_ABS */
-    case 0x800:                                      /* EXP */
-        f = p0 + exp2f(d * p1 * 16.0f) - 1.5f;
-        break;
-    case 0x803: abs_ = 1; /* fallthrough */          /* EXP2_ABS */
-    case 0x801:                                      /* EXP2 */
-        f = p0 + exp2f(-d * d * p1 * p1 * 32.0f) - 1.5f;
-        break;
-    default:
-        return 1.0f;
-    }
-    if (abs_)
-        f = fabsf(f);
-    if (isnan(f))
-        return (s_vsh.fog_mode == 0x2601 || s_vsh.fog_mode == 0x804
-                || s_vsh.fog_mode == 0x800) ? 1.0f : 0.0f;
-    return f;
+    return nv2a_fog_factor(s_vsh.fog_enable, s_vsh.fog_mode,
+                           s_vsh.fog_param[0], s_vsh.fog_param[1], d);
 }
 
 static void vsh_transform(uint32_t index, XfVert *xv)
@@ -2511,10 +2483,7 @@ static void vsh_build_stages(void)
 
 static void rc_unpack(uint32_t c, float o[4])
 {
-    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
-    o[1] = (float)((c >>  8) & 0xFF) / 255.0f;
-    o[2] = (float)( c        & 0xFF) / 255.0f;
-    o[3] = (float)( c >> 24        ) / 255.0f;
+    nv2a_argb_to_float4(c, o);
 }
 
 static float rc_map(float x, uint32_t map)

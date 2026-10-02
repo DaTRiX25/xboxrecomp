@@ -124,16 +124,9 @@ static ID3D11RasterizerState  *s_rs;
 static ID3D11DepthStencilState *s_ds_off;
 static ID3D11PixelShader      *s_ps;
 
-/* The pixel shaders' constants (PS b0). The layout is NV2APSConstants
- * (d3d8_combiners.h) plus the per-stage texture-coordinate scale and mode. */
-typedef struct {
-    float    c0[8][4], c1[8][4], fc0[4], fc1[4], fog_color[4];
-    float    alpha_ref;
-    uint32_t alpha_func, alpha_test_enable, fog_enable;
-    uint32_t alpha_only[4];
-    float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear) */
-    uint32_t tex_mode[4];       /* stage texture-shader mode, 0 = none */
-} PsConsts;
+/* The pixel shaders' constants (PS b0): struct nv2a_ps_consts, whose
+ * layout PS_CB_DECL must match. */
+typedef struct nv2a_ps_consts PsConsts;
 
 #define PS_CB_DECL \
     "cbuffer CombinerCB : register(b0) {\n" \
@@ -1532,14 +1525,6 @@ static ID3D11PixelShader *combiner_ps(const NV2ACombinerState *st)
     return e->bad ? NULL : e->ps;
 }
 
-static void argb_to_float4(uint32_t c, float o[4])
-{
-    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
-    o[1] = (float)((c >> 8) & 0xFF) / 255.0f;
-    o[2] = (float)(c & 0xFF) / 255.0f;
-    o[3] = (float)(c >> 24) / 255.0f;
-}
-
 /* Render to texture: a stage whose texture lies where a surface this backend
  * renders into starts samples that surface. The guest's copy of those bytes
  * is stale (nothing here writes guest memory), so decoding it would show
@@ -1698,14 +1683,11 @@ static ID3D11PixelShader *setup_pixel(void)
     int n, textured = 0;
 
     build_stages();
-    memset(&pc, 0, sizeof pc);
+    nv2a_ps_consts_fill(v, s_stage, &pc);
     for (n = 0; n < 4; n++) {
         const Stage *t = &s_stage[n];
         int scaled = nv2a_tex_size_from_format(t->color);
         RenderTarget *src = (t->mode && t->mode != 4) ? rt_texture(t) : NULL;
-        pc.tex_mode[n] = (uint32_t)t->mode;
-        pc.tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;
-        pc.tex_scale[n][1] = scaled || !t->height ? 1.0f : 1.0f / (float)t->height;
         s_stage_rt[n] = src;
         s_stage_src[n] = !t->mode ? "none" : t->mode == 4 ? "passthru" : "cache";
         if (src) {
@@ -1729,22 +1711,6 @@ static ID3D11PixelShader *setup_pixel(void)
         }
         smp[n] = sampler(t);
     }
-    for (n = 0; n < 8; n++) {
-        argb_to_float4(v->rc_f0[n], pc.c0[n]);
-        argb_to_float4(v->rc_f1[n], pc.c1[n]);
-    }
-    argb_to_float4(v->rc_sf[0], pc.fc0);
-    argb_to_float4(v->rc_sf[1], pc.fc1);
-    argb_to_float4(v->fog_color, pc.fog_color);
-    {   /* the CPU path reads the fog colour register as RGBA, alpha 1 */
-        float t = pc.fog_color[0];
-        pc.fog_color[0] = pc.fog_color[2];
-        pc.fog_color[2] = t;
-        pc.fog_color[3] = 1.0f;
-    }
-    pc.alpha_ref = (float)v->atest_ref / 255.0f;
-    pc.alpha_test_enable = v->atest_enable ? 1u : 0u;
-    pc.alpha_func = nv2a_cmp_from_gl(v->atest_func) + 1;   /* GL -> D3DCMP */
     if (memo_on() && s_cb_ps_ok && !memcmp(&s_cb_ps_shadow, &pc, sizeof pc)) {
         /* the buffer already holds these bytes */
     } else if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_ps, 0,
@@ -2492,40 +2458,11 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         static uint8_t vp_shadow[80];
         static int consts_ok, vp_ok;
         D3D11_MAPPED_SUBRESOURCE m;
-        float zmax = nv2a_zmax(g->format);
-        float c[12];
-        uint32_t u[8];
+        struct nv2a_vp_consts vc;
         uint8_t vp[80];
-        c[0] = 2.0f / (float)rt->w;
-        c[1] = -2.0f / (float)rt->h;
-        c[2] = 1.0f / zmax;
-        c[3] = 0.0f;
-        c[4] = -1.0f;
-        c[5] = 1.0f;
-        c[6] = 0.0f;
-        c[7] = 0.0f;
-        /* Fog and specular, as the CPU path's vsh_fog_factor and
-         * vsh_transform apply them (xemu vsh.c). */
-        c[8] = v->fog_param[0];
-        c[9] = v->fog_param[1];
-        c[10] = v->fog_param[2];
-        c[11] = 0.0f;
-        memset(u, 0, sizeof u);
-        switch (v->fog_mode) {
-        case 0x2601: u[1] = 0; u[2] = 0; u[3] = 1; break;   /* LINEAR */
-        case 0x0804: u[1] = 0; u[2] = 1; u[3] = 1; break;   /* LINEAR_ABS */
-        case 0x0800: u[1] = 1; u[2] = 0; u[3] = 1; break;   /* EXP */
-        case 0x0802: u[1] = 1; u[2] = 1; u[3] = 0; break;   /* EXP_ABS */
-        case 0x0801: u[1] = 2; u[2] = 0; u[3] = 0; break;   /* EXP2 */
-        case 0x0803: u[1] = 2; u[2] = 1; u[3] = 0; break;   /* EXP2_ABS */
-        default: break;                                     /* not set: no fog */
-        }
-        u[0] = (v->fog_enable && (v->fog_mode == 0x2601
-                || (v->fog_mode >= 0x800 && v->fog_mode <= 0x804))) ? 1u : 0u;
-        u[4] = v->spec_enable ? 1u : 0u;
-        u[5] = (v->light_ctl >> 17) & 1u;
-        memcpy(vp, c, sizeof c);
-        memcpy(vp + sizeof c, u, sizeof u);
+        nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, &vc);
+        memcpy(vp, vc.c, sizeof vc.c);
+        memcpy(vp + sizeof vc.c, vc.u, sizeof vc.u);
         if (!d->program
                 || (memo_on() && consts_ok && !memcmp(consts_shadow, v->c, sizeof v->c))) {
             /* the buffer already holds these bytes */

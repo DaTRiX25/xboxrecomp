@@ -15,6 +15,7 @@
 #ifndef NV2A_BACKEND_COMMON_H
 #define NV2A_BACKEND_COMMON_H
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -576,6 +577,99 @@ static inline uint32_t nv2a_blend_factor_u8(uint32_t bf, uint32_t src,
  * use, (1,1,1,1) and 0 is returned. */
 int nv2a_blend_constant(int enable, uint32_t sfactor, uint32_t dfactor,
                         uint32_t color, float bf[4], int *mixed);
+
+/* ------------------------------------------------------------------------ */
+/* Fog                                                                       */
+/* ------------------------------------------------------------------------ */
+
+/* SET_FOG_MODE, decoded: func 0 linear, 1 exp, 2 exp2; abs_ for the _ABS
+ * forms; edge_one when an infinite or NaN fog distance gives 1 (LINEAR,
+ * LINEAR_ABS, EXP) rather than 0. Returns 0 for a mode that is not set. */
+static inline int nv2a_fog_mode(uint32_t mode, uint32_t *func, uint32_t *abs_,
+                                uint32_t *edge_one)
+{
+    switch (mode) {
+    case 0x2601: *func = 0; *abs_ = 0; *edge_one = 1; return 1;  /* LINEAR */
+    case 0x0804: *func = 0; *abs_ = 1; *edge_one = 1; return 1;  /* LINEAR_ABS */
+    case 0x0800: *func = 1; *abs_ = 0; *edge_one = 1; return 1;  /* EXP */
+    case 0x0802: *func = 1; *abs_ = 1; *edge_one = 0; return 1;  /* EXP_ABS */
+    case 0x0801: *func = 2; *abs_ = 0; *edge_one = 0; return 1;  /* EXP2 */
+    case 0x0803: *func = 2; *abs_ = 1; *edge_one = 0; return 1;  /* EXP2_ABS */
+    default:     *func = 0; *abs_ = 0; *edge_one = 0; return 0;
+    }
+}
+
+/* The fog factor for fog distance d (xemu vsh.c), with SET_FOG_PARAMS p0,
+ * p1; 1 when fog is off or the mode is not set. */
+static inline float nv2a_fog_factor(int enable, uint32_t mode, float p0,
+                                    float p1, float d)
+{
+    uint32_t func, abs_, edge_one;
+    int known;
+    float f;
+
+    if (!enable)
+        return 1.0f;
+    known = nv2a_fog_mode(mode, &func, &abs_, &edge_one);
+    if (isinf(d))
+        return edge_one ? 1.0f : 0.0f;
+    if (!known)
+        return 1.0f;
+    if (func == 0)
+        f = p0 + d * p1 - 1.0f;
+    else if (func == 1)
+        f = p0 + exp2f(d * p1 * 16.0f) - 1.5f;
+    else
+        f = p0 + exp2f(-d * d * p1 * p1 * 32.0f) - 1.5f;
+    if (abs_)
+        f = fabsf(f);
+    if (isnan(f))
+        return edge_one ? 1.0f : 0.0f;
+    return f;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Shader constants                                                          */
+/* ------------------------------------------------------------------------ */
+
+static inline void nv2a_argb_to_float4(uint32_t c, float o[4])
+{
+    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
+    o[1] = (float)((c >> 8) & 0xFF) / 255.0f;
+    o[2] = (float)(c & 0xFF) / 255.0f;
+    o[3] = (float)(c >> 24) / 255.0f;
+}
+
+/* The pixel shaders' constants: NV2APSConstants (d3d8_combiners.h) plus the
+ * per-stage texture-coordinate scale and mode. The layout is the shader's
+ * constant buffer (PS_CB_DECL in nv2a_pb_d3d11.c), so it is fixed. */
+struct nv2a_ps_consts {
+    float    c0[8][4], c1[8][4], fc0[4], fc1[4], fog_color[4];
+    float    alpha_ref;
+    uint32_t alpha_func;        /* D3DCMP numbering: 1 NEVER .. 8 ALWAYS */
+    uint32_t alpha_test_enable, fog_enable;
+    uint32_t alpha_only[4];
+    float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear) */
+    uint32_t tex_mode[4];       /* stage texture-shader mode, 0 = none */
+};
+
+/* Fill pc from the combiner registers and the four stages. A stage that
+ * samples a render target instead of guest memory has its linear scale set
+ * by the caller (1/target size). */
+void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
+                         const struct nv2a_stage st[4],
+                         struct nv2a_ps_consts *pc);
+
+/* The vertex stage's viewport and fog constants: c = 2/w, -2/h, 1/zmax, 0,
+ * -1, 1, 0, 0, fog params 0..2, 0; u = fog on, fog func, fog abs, fog
+ * edge-one, specular on, light_ctl bit 17 (separate specular), 0, 0. */
+struct nv2a_vp_consts {
+    float    c[12];
+    uint32_t u[8];
+};
+
+void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
+                         uint32_t w, uint32_t h, struct nv2a_vp_consts *o);
 
 #ifdef __cplusplus
 }
