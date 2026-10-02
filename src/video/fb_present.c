@@ -357,6 +357,8 @@ void xbox_FramebufferWindowStart(void)
 }
 
 #else
+/* Not built on POSIX (see CMakeLists.txt): fb_present_sdl.c is the window
+ * there. Kept so the file still compiles anywhere on its own. */
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}

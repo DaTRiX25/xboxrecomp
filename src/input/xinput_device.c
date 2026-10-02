@@ -254,6 +254,22 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 #include <SDL.h>
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
+
+/* Set by the window (src/video/fb_present_sdl.c) when the process main thread
+ * runs the SDL event loop. Its SDL_PumpEvents already updates the
+ * controllers, so this side only reads them: one event loop, not two threads
+ * racing to pump. */
+static volatile int g_main_pump;
+void xbox_InputSetMainPump(int on) { g_main_pump = on; }
+
+/* Whether a controller is open, i.e. whether SDL may still be in use here. */
+int xbox_InputAnyOpen(void)
+{
+    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_pads[i])
+            return 1;
+    return 0;
+}
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
@@ -290,7 +306,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         return ERROR_DEVICE_NOT_CONNECTED;
     }
 
-    SDL_GameControllerUpdate();
+    if (!g_main_pump)
+        SDL_GameControllerUpdate();
     g_controller_connected[dwPort] = TRUE;
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
