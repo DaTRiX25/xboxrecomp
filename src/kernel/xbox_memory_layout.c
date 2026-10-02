@@ -1192,6 +1192,7 @@ static void framebuffer_probe_tick(void)
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
+    xbox_log_thread_role("nv2a-ack", 0);
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
@@ -1333,15 +1334,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * by time and by GPU progress (Proton's fence was seen
                  * advancing ~100x slower than macOS's). */
                 if (s_nv2a_trace) {
-                    static DWORD t0;
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     uint32_t fv = 0;
                     int have_fence = fence_completed(&fv);
-                    if (!t0)
-                        t0 = now_ms ? now_ms : 1;
                     fprintf(stderr, "  [NV2A] %8lu ms  DMA_PUT = 0x%08X  DMA_GET = "
-                            "0x%08X  fence ", (unsigned long)(now_ms - t0),
+                            "0x%08X  fence ", xbox_log_ms(),
                             put, g);
                     if (have_fence)
                         fprintf(stderr, "0x%08X", fv);
@@ -2108,6 +2106,7 @@ void xbox_PeekSample(const char *label)
 
 static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 {
+    xbox_log_thread_role("watchdog", 0);
     const uint8_t *mem;
     uint32_t esp, i;
 

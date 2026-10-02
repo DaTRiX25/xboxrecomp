@@ -29,6 +29,9 @@
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
  * to 32 bits and sign-extended it into a `struct bridge_thread_start *`. Every
@@ -451,8 +454,69 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
 struct bridge_thread_start {
     recomp_func_t fn;
-    uint32_t ctx1, ctx2, stack_top;
+    uint32_t ctx1, ctx2, stack_top, routine;
 };
+
+/* Name the calling thread for the OS, because under Wine GetCurrentThreadId is
+ * the Windows tid and top -H shows the Linux one; the name is what joins them.
+ * 15 characters is the Linux comm limit. */
+static void thread_set_os_name(const char *name)
+{
+#ifdef _WIN32
+    typedef HRESULT (WINAPI *set_desc_fn)(HANDLE, PCWSTR);
+    static set_desc_fn set_desc;
+    static int resolved;
+    WCHAR w[16];
+    int i;
+
+    if (!resolved) {
+        HMODULE m = GetModuleHandleA("kernelbase.dll");
+        if (!m) m = GetModuleHandleA("kernel32.dll");
+        if (m) set_desc = (set_desc_fn)(void *)GetProcAddress(m, "SetThreadDescription");
+        resolved = 1;
+    }
+    if (!set_desc)
+        return;
+    for (i = 0; name[i] && i < 15; i++)
+        w[i] = (WCHAR)name[i];
+    w[i] = 0;
+    set_desc(GetCurrentThread(), w);
+#elif defined(__APPLE__)
+    pthread_setname_np(name);
+#else
+    pthread_setname_np(pthread_self(), name);
+#endif
+}
+
+void xbox_log_thread_role(const char *role, uint32_t routine)
+{
+    char os[16];
+
+    /* Workers are told apart by the low 16 bits of their routine. */
+    if (routine && !strcmp(role, "guest-worker"))
+        snprintf(os, sizeof os, "guest-w-%04X", (unsigned)(routine & 0xFFFF));
+    else
+        snprintf(os, sizeof os, "%.15s", role);
+    thread_set_os_name(os);
+    if (routine)
+        fprintf(stderr, "[THREAD] tid=%lu role=%s routine=0x%08X\n",
+                (unsigned long)GetCurrentThreadId(), role, routine);
+    else
+        fprintf(stderr, "[THREAD] tid=%lu role=%s\n",
+                (unsigned long)GetCurrentThreadId(), role);
+    fflush(stderr);
+}
+
+/* Milliseconds since the first call (GetTickCount, monotonic). */
+unsigned long xbox_log_ms(void)
+{
+    static DWORD t0;
+    DWORD now = GetTickCount();
+
+    if (!t0)
+        t0 = now ? now : 1;
+    return (unsigned long)(now - t0);
+}
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 
@@ -472,6 +536,8 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+
+    xbox_log_thread_role("guest-worker", s->routine);
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
@@ -504,13 +570,15 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 }
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top)
+                                  uint32_t ctx2, uint32_t stack_top,
+                                  uint32_t routine)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->routine = routine;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) free(s);
@@ -574,6 +642,7 @@ static void bridge_PsCreateSystemThreadEx(void)
         if (fn) {
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
+                xbox_log_thread_role("guest-main", start_routine);
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
@@ -623,7 +692,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top, start_routine);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -2322,6 +2391,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     int slot = xbox_worker_stack_alloc();
 
     (void)unused;
+    xbox_log_thread_role("kernel-timer", 0);
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
                         "timer DPCs will not run\n");
@@ -7540,6 +7610,7 @@ static void bridge_PsCreateSystemThread(void)
             fn = recomp_lookup_manual(start_routine);
         if (fn) {
             if (is_first_call) {
+                xbox_log_thread_role("guest-main", start_routine);
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
@@ -7559,7 +7630,7 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top, start_routine);
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }

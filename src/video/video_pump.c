@@ -55,8 +55,11 @@ static HWND vp_create_window(void)
                            NULL, NULL, GetModuleHandleA(NULL), NULL);
 }
 
+extern void xbox_log_thread_role(const char *role, uint32_t routine);
+
 static DWORD WINAPI vp_thread(LPVOID unused)
 {
+    xbox_log_thread_role("vp-pump", 0);
     IDirect3D8 *d3d;
     IDirect3DDevice8 *dev = NULL;
     D3DPRESENT_PARAMETERS pp;

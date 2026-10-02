@@ -1080,6 +1080,12 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
 #define XBOX_LOG_THUNK   "THUNK"
 #define XBOX_LOG_PATH    "PATH"
 
+/* One "[THREAD] tid=.. role=.." line per host thread, so a tid in top -H or
+ * Process Explorer maps to a role. routine is the guest start address, or 0.
+ * xbox_log_ms is the ms clock shared by the [NV2A] and [GPU] flip lines. */
+void xbox_log_thread_role(const char *role, uint32_t routine);
+unsigned long xbox_log_ms(void);
+
 #ifdef __cplusplus
 }
 #endif

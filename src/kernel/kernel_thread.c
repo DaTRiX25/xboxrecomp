@@ -31,6 +31,8 @@ static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
 {
     XBOX_THREAD_START_INFO info = *(XBOX_THREAD_START_INFO*)lpParameter;
 
+    xbox_log_thread_role("xbox-thread", 0);
+
     /* Free the start info before calling the routine - the routine may
      * never return (calling PsTerminateSystemThread instead) */
     HeapFree(GetProcessHeap(), 0, lpParameter);

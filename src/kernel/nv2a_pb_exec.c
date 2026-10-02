@@ -1937,6 +1937,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
             }
         }
+        /* RECOMP_FLIP_LOG=1: every flip, with the batches drawn since the last. */
+        {
+            static int on = -1;
+            static uint32_t prev_b, prev_t;
+            if (on < 0)
+                on = getenv("RECOMP_FLIP_LOG") != NULL;
+            if (on) {
+                uint32_t b = s_gpu.batches_textured + s_gpu.batches_no_uv
+                           + s_gpu.batches_no_tex;
+                uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                                   : s_gpu.color_offset;
+                fprintf(stderr, "[GPU] flip %u %lu ms fence 0x%08X batches %u"
+                        " tex %u presents 0x%08X\n", s_gpu.flips,
+                        xbox_log_ms(), s_sema_last_value, b - prev_b,
+                        s_gpu.batches_textured - prev_t, done);
+                prev_b = b; prev_t = s_gpu.batches_textured;
+            }
+        }
         /* The first few always, so a log says whether flips happen at all
          * and which surface each one put on screen; more with VERBOSE. */
         {

@@ -234,8 +234,11 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+extern void xbox_log_thread_role(const char *role, uint32_t routine);
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
+    xbox_log_thread_role("fb-present", 0);
     HWND hwnd;
     HDC hdc;
     BITMAPINFO bi;
