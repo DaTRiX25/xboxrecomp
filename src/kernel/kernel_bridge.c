@@ -1384,6 +1384,7 @@ static void bridge_NtCreateEvent(void)
 
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
+static HANDLE ke_event_shadow(uint32_t guest_va);
 static HANDLE bridge_resolve_handle(uint32_t token);
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
@@ -1397,7 +1398,7 @@ static void bridge_KeSetEvent(void)
     (void)increment;
     (void)wait;
 
-    h = ke_shadow_lookup(guest_va);
+    h = ke_event_shadow(guest_va);
     if (!h)
         h = bridge_resolve_handle(guest_va);
     if (!h)
@@ -1418,7 +1419,7 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
 
-    h = ke_shadow_lookup(object);
+    h = ke_event_shadow(object);
     if (!h)
         h = bridge_resolve_handle(object);
     if (!h)
@@ -5948,6 +5949,61 @@ static void ke_shadow_remove(uint32_t guest_va)
     LeaveCriticalSection(&g_ke_shadow_cs);
 }
 
+/* The host event for a guest KEVENT, shadowing it on first use.
+ *
+ * KeInitializeEvent is where a shadow is normally made, but nothing obliges
+ * a title to call it: a KEVENT is a 16-byte DISPATCHER_HEADER, and the D3D8
+ * library in BLiNX 2 builds the one its vblank DPC signals (guest 0x002F3D7C,
+ * in .bss) inline. Every Ke* event export then missed the table and fell
+ * back to XBOX_TO_NATIVE, handing the host a guest pointer as an event handle:
+ * on POSIX SetEvent dereferences it and the DPC faults.
+ *
+ * The header says everything a shadow needs -- Type 0 is a notification
+ * (manual-reset) event, Type 1 a synchronization (auto-reset) one, and
+ * SignalState at +4 is the current state -- so the shadow is created from it.
+ * Anything else (a mutant, semaphore, timer, thread, or unmapped memory) is
+ * not an event and gets NULL, leaving the caller's existing fallback alone.
+ * Lookup and insert happen under one lock so two threads meeting the same
+ * event at once share one host object. */
+static HANDLE ke_event_shadow(uint32_t guest_va)
+{
+    HANDLE h = ke_shadow_lookup(guest_va);
+    uint8_t type;
+    uint32_t i, free_slot = KE_SHADOW_SIZE;
+
+    if (h || !bridge_va_mapped(guest_va, 16))
+        return h;
+    type = BRIDGE_MEM8(guest_va);
+    if (type > 1)
+        return NULL;
+
+    EnterCriticalSection(&g_ke_shadow_cs);
+    for (i = 0; i < KE_SHADOW_SIZE; i++) {
+        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
+            h = g_ke_shadow[i].host_handle;
+            break;
+        }
+        if (!g_ke_shadow[i].in_use && free_slot == KE_SHADOW_SIZE)
+            free_slot = i;
+    }
+    if (!h && free_slot < KE_SHADOW_SIZE) {
+        h = CreateEventW(NULL, type == 0, BRIDGE_MEM32(guest_va + 4) != 0,
+                         NULL);
+        if (h) {
+            g_ke_shadow[free_slot].in_use      = 1;
+            g_ke_shadow[free_slot].guest_va    = guest_va;
+            g_ke_shadow[free_slot].host_handle = h;
+            fprintf(stderr, "  [KERNEL] KEVENT 0x%08X shadowed on first use "
+                    "(%s, %s)\n", guest_va,
+                    type ? "synchronization" : "notification",
+                    BRIDGE_MEM32(guest_va + 4) ? "signalled" : "clear");
+            fflush(stderr);
+        }
+    }
+    LeaveCriticalSection(&g_ke_shadow_cs);
+    return h;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Data Exports (102, 120, 154, 240, 245, 249)
  *
@@ -6706,7 +6762,7 @@ static void bridge_KePulseEvent(void)
     (void)increment;
     (void)wait;
 
-    h = ke_shadow_lookup(guest_va);
+    h = ke_event_shadow(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
@@ -6764,7 +6820,7 @@ static void bridge_KeResetEvent(void)
     uint32_t guest_va = STACK_ARG(0);
     HANDLE h;
 
-    h = ke_shadow_lookup(guest_va);
+    h = ke_event_shadow(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
@@ -6996,7 +7052,7 @@ static void bridge_KeSetEventBoostPriority(void)
 
     (void)increment;
 
-    h = ke_shadow_lookup(guest_va);
+    h = ke_event_shadow(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
