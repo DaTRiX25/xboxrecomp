@@ -1863,6 +1863,12 @@ static int               s_last_rc_on;
  *   t0 .. t3    stage n's texture at its coordinates (alpha forced to 1)
  *   tc0 .. tc3  stage n's coordinates as colour (frac of s, t)
  * Unknown values draw white. */
+/* RECOMP_D3D11_DEBUG_PS_SKIP_POST=1: batches that look like post passes --
+ * depth test off, at most 8 vertices (a full-screen quad or two) -- keep
+ * their real shader, so a glow or blur drawn over the scene does not
+ * cover what the debug shader shows. Set per batch by on_draw. */
+static int s_dbg_post;
+
 static ID3D11PixelShader *debug_ps(void)
 {
     static int tried;
@@ -2032,7 +2038,7 @@ static ID3D11PixelShader *setup_pixel(void)
             memo.ps_ok = 0;
         }
         s_last_rc_on = 1;
-        if ((ps = debug_ps()) != NULL)
+        if (!s_dbg_post && (ps = debug_ps()) != NULL)
             return ps;
         /* A compile since may have evicted the entry remembered. */
         if (hit && memo.ps_ok && memo.compiles == s_rc_compiles) {
@@ -2051,7 +2057,7 @@ static ID3D11PixelShader *setup_pixel(void)
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
         s_last_rc_on = 0;
     {
-        ID3D11PixelShader *ps = debug_ps();
+        ID3D11PixelShader *ps = s_dbg_post ? NULL : debug_ps();
         if (ps)
             return ps;
     }
@@ -2831,7 +2837,12 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         }
         s_cur = rt;
         {
-            ID3D11PixelShader *ps = setup_pixel();
+            static int skip_post = -1;
+            ID3D11PixelShader *ps;
+            if (skip_post < 0)
+                skip_post = getenv("RECOMP_D3D11_DEBUG_PS_SKIP_POST") != NULL;
+            s_dbg_post = skip_post && !v->depth_enable && d->idx_count <= 8;
+            ps = setup_pixel();
             /* setup_pixel may have compiled (and evicted) a shader */
             if (!sc_on() || s_sc.ps != ps) {
                 ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
