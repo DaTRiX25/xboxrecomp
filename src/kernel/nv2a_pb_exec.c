@@ -1416,8 +1416,22 @@ static int vsh_enabled(void)
 }
 
 /* The transform-unit methods. Returns 1 if `method` was one of them. */
+/* RECOMP_WHITE_TRACE: state the executor does not otherwise keep, recorded
+ * for the per-batch trace only. */
+static uint32_t s_wt_spec = ~0u, s_wt_fogmode = ~0u, s_wt_foggen = ~0u, s_wt_light = ~0u;
+static float s_wt_fogp[3];
+
 static int vsh_method(uint32_t method, uint32_t param)
 {
+    switch (method) {
+    case 0x03B8: s_wt_spec = param; break;          /* SET_SPECULAR_ENABLE */
+    case 0x029C: s_wt_fogmode = param; break;       /* SET_FOG_MODE */
+    case 0x02A0: s_wt_foggen = param; break;        /* SET_FOG_GEN_MODE */
+    case 0x0314: s_wt_light = param; break;         /* SET_LIGHTING_ENABLE */
+    case 0x09C0: case 0x09C4: case 0x09C8:          /* SET_FOG_PARAMS */
+        s_wt_fogp[(method - 0x09C0) / 4] = u2f(param); break;
+    default: break;
+    }
     if (method >= NV097_SET_TRANSFORM_PROGRAM_M
             && method < NV097_SET_TRANSFORM_PROGRAM_M + 0x80) {
         uint32_t comp = ((method - NV097_SET_TRANSFORM_PROGRAM_M) / 4) & 3;
@@ -1914,6 +1928,8 @@ static float rc_op(float x, uint32_t op)
 
 static float clamp01(float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; }
 
+static int s_rc_trace;                  /* RECOMP_WHITE_TRACE, one pixel */
+
 /* General combiners then the final combiner, on r[] (register-code indexed);
  * the result is written to out[4] as r,g,b,a. */
 static void rc_eval(float r[16][4], float out[4])
@@ -1975,6 +1991,14 @@ static void rc_eval(float r[16][4], float out[4])
         if ((ocw & (1u << 19)) && ((ocw >> 4) & 0xF)) nr[(ocw >> 4) & 0xF][3] = ab[2];
         if ((ocw & (1u << 18)) && (ocw & 0xF))        nr[ocw & 0xF][3] = cd[2];
         memcpy(r, nr, sizeof nr);
+        if (s_rc_trace)
+            fprintf(stderr, "  [WHITE]   stage %u icw %08X ocw %08X aicw %08X aocw %08X"
+                            " c0 %08X c1 %08X | r0 %.3f %.3f %.3f %.3f  r1 %.3f %.3f %.3f %.3f"
+                            "  t3 %.3f %.3f %.3f %.3f\n", s, icw, ocw, aicw, aocw,
+                    s_vsh.rc_f0[uniq0 ? s : 0], s_vsh.rc_f1[uniq1 ? s : 0],
+                    r[12][0], r[12][1], r[12][2], r[12][3],
+                    r[13][0], r[13][1], r[13][2], r[13][3],
+                    r[11][0], r[11][1], r[11][2], r[11][3]);
     }
 
     /* Final combiner: unsigned inputs, A*B + (1-A)*C + D, alpha from G. */
@@ -2009,6 +2033,14 @@ static void rc_eval(float r[16][4], float out[4])
         for (k = 0; k < 3; k++)
             out[k] = clamp01(A[k] * B[k] + (1.0f - A[k]) * C[k] + D[k]);
         out[3] = G;
+        if (s_rc_trace)
+            fprintf(stderr, "  [WHITE]   final cw0 %08X cw1 %08X sf %08X %08X | A %.3f %.3f %.3f"
+                            " B %.3f %.3f %.3f C %.3f %.3f %.3f D %.3f %.3f %.3f G %.3f"
+                            " | fog %.3f %.3f %.3f %.3f v1 %.3f %.3f %.3f -> %.3f %.3f %.3f %.3f\n",
+                    c0, c1, s_vsh.rc_sf[0], s_vsh.rc_sf[1], A[0], A[1], A[2], B[0], B[1], B[2],
+                    C[0], C[1], C[2], D[0], D[1], D[2], G,
+                    r[3][0], r[3][1], r[3][2], r[3][3], r[5][0], r[5][1], r[5][2],
+                    out[0], out[1], out[2], out[3]);
     }
 }
 
@@ -3010,6 +3042,109 @@ static void fast_batch_setup(void)
 
 #define NV097_SET_TEXTURE_CONTROL0_M 0x1B0C
 
+/* RECOMP_WHITE_TRACE=N: for the first N large textured program batches
+ * (RECOMP_WHITE_MIN vertices, default 300), the vertex program's outputs for
+ * three vertices, then one pixel (the first triangle's centroid) through the
+ * texture stages, every combiner stage and the final combiner. */
+static void white_note_surface(void);
+
+static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
+{
+    static int shown = -1, min_n;
+    uint32_t i, t;
+    int k, st;
+
+    if (shown < 0) {
+        const char *e = getenv("RECOMP_WHITE_TRACE"), *m = getenv("RECOMP_WHITE_MIN");
+        shown = e ? atoi(e) : 0;
+        min_n = m ? atoi(m) : 300;
+    }
+    if (shown <= 0 || n < (uint32_t)min_n || plen <= 12)
+        return;
+    shown--;
+    fprintf(stderr, "[WHITE] batch prim %u n %u prog start %u len %u | spec %d light %d"
+                    " fog en %d mode 0x%X gen %u params %g %g %g colour %08X | rc %d ctl %08X"
+                    " shader %08X | stage fmt %02X %02X %02X %02X mode %d %d %d %d\n",
+            s_gpu.prim, n, s_vsh.start, plen, (int)s_wt_spec, (int)s_wt_light,
+            s_vsh.fog_enable, s_wt_fogmode, s_wt_foggen, s_wt_fogp[0], s_wt_fogp[1],
+            s_wt_fogp[2], s_vsh.fog_color, vsh_rc_active(), s_vsh.rc_ctl, s_vsh.shader_prog,
+            s_stage_tex[0].color, s_stage_tex[1].color, s_stage_tex[2].color,
+            s_stage_tex[3].color, s_stage_mode[0], s_stage_mode[1], s_stage_mode[2],
+            s_stage_mode[3]);
+    {
+        char buf[160];
+        uint32_t pc;
+        for (pc = s_vsh.start; pc < s_vsh.start + plen && pc < NV2A_VSH_SLOTS; pc++)
+            fprintf(stderr, "[WHITE]   vsh %3u: %s\n", pc,
+                    nv2a_vsh_disasm(s_vsh.prog[pc], buf, sizeof buf));
+    }
+    fprintf(stderr, "[WHITE]  c58 %g %g %g %g c59 %g %g %g %g vp_scale %g %g %g %g vp_off %g %g %g %g\n",
+            s_vsh.c[58][0], s_vsh.c[58][1], s_vsh.c[58][2], s_vsh.c[58][3],
+            s_vsh.c[59][0], s_vsh.c[59][1], s_vsh.c[59][2], s_vsh.c[59][3],
+            s_vsh.vp_scale[0], s_vsh.vp_scale[1], s_vsh.vp_scale[2], s_vsh.vp_scale[3],
+            s_vsh.vp_off[0], s_vsh.vp_off[1], s_vsh.vp_off[2], s_vsh.vp_off[3]);
+    for (i = 0; i < 3 && i < n; i++) {
+        float v[NV2A_VSH_INPUTS][4];
+        Nv2aVshOut o;
+        vsh_inputs(s_gpu.idx[i], v);
+        nv2a_vsh_run((const uint32_t (*)[4])s_vsh.prog, s_vsh.start, s_vsh.c, 0,
+                     (const float (*)[4])v, &o);
+        fprintf(stderr, "[WHITE]  vert %u:", i);
+        for (k = 0; k < 16; k++)
+            if (s_gpu.attr[k].size)
+                fprintf(stderr, " v%d(%g %g %g %g)", k, v[k][0], v[k][1], v[k][2], v[k][3]);
+        fprintf(stderr, "\n[WHITE]   pos %g %g %g %g D0 %g %g %g %g D1 %g %g %g %g Fog %g %g %g %g\n",
+                o.o[0][0], o.o[0][1], o.o[0][2], o.o[0][3],
+                o.o[3][0], o.o[3][1], o.o[3][2], o.o[3][3],
+                o.o[4][0], o.o[4][1], o.o[4][2], o.o[4][3],
+                o.o[5][0], o.o[5][1], o.o[5][2], o.o[5][3]);
+        for (t = 0; t < 4; t++)
+            fprintf(stderr, "[WHITE]   T%u %g %g %g %g\n", t, o.o[9 + t][0], o.o[9 + t][1],
+                    o.o[9 + t][2], o.o[9 + t][3]);
+    }
+    for (st = 0; st < 4; st++)
+        fprintf(stderr, "[WHITE]  tex%d off %08X %ux%u fmt %02X pitch %u addr %u/%u mode %d\n",
+                st, s_stage_tex[st].offset, s_stage_tex[st].width, s_stage_tex[st].height,
+                s_stage_tex[st].color, s_stage_tex[st].pitch, s_stage_tex[st].addr_u,
+                s_stage_tex[st].addr_v, s_stage_mode[st]);
+    /* One pixel: the first visible triangle's centroid. */
+    for (i = 0; i + 2 < n; i++) {
+        const XfVert *a = &xv[i], *b = &xv[i + 1], *c = &xv[i + 2];
+        float r[16][4], col[4], pa, pb, pc, ps;
+        if (!a->ok || !b->ok || !c->ok)
+            continue;
+        pa = 1.0f / a->w; pb = 1.0f / b->w; pc = 1.0f / c->w;
+        ps = pa + pb + pc; pa /= ps; pb /= ps; pc /= ps;
+        memset(r, 0, sizeof r);
+        for (k = 0; k < 4; k++) {
+            r[4][k] = pa * a->d0[k] + pb * b->d0[k] + pc * c->d0[k];
+            r[5][k] = pa * a->d1[k] + pb * b->d1[k] + pc * c->d1[k];
+        }
+        rc_unpack(s_vsh.fog_color, r[3]);
+        { float t_ = r[3][0]; r[3][0] = r[3][2]; r[3][2] = t_; }
+        r[3][3] = 1.0f;
+        for (st = 0; st < 4; st++) {
+            float tc[4];
+            if (!s_stage_mode[st])
+                continue;
+            for (k = 0; k < 4; k++)
+                tc[k] = pa * a->t[st][k] + pb * b->t[st][k] + pc * c->t[st][k];
+            stage_sample(st, tc, r[8 + st]);
+            fprintf(stderr, "[WHITE]  px (%.1f,%.1f) tc%d %g %g %g %g -> texel %.3f %.3f %.3f %.3f\n",
+                    (a->x + b->x + c->x) / 3, (a->y + b->y + c->y) / 3, st,
+                    tc[0], tc[1], tc[2], tc[3], r[8 + st][0], r[8 + st][1],
+                    r[8 + st][2], r[8 + st][3]);
+        }
+        r[12][3] = r[8][3];
+        fprintf(stderr, "[WHITE]  v0 %.3f %.3f %.3f %.3f v1 %.3f %.3f %.3f %.3f\n",
+                r[4][0], r[4][1], r[4][2], r[4][3], r[5][0], r[5][1], r[5][2], r[5][3]);
+        s_rc_trace = 1;
+        rc_eval(r, col);
+        s_rc_trace = 0;
+        break;
+    }
+}
+
 static void raster_batch_vsh_one(void)
 {
     static XfVert xv[NV_MAX_INDICES];
@@ -3077,6 +3212,9 @@ static void raster_batch_vsh_one(void)
         s_rt.setup += rt_now() - t0;
     }
 
+    white_trace_batch(xv, n, plen);
+    if (plen > 12)
+        white_note_surface();
 #define RASTER_TRI(p, q, r_, t) (fast ? raster_tri_xf_fast(p, q, r_, t) \
                                     : raster_tri_xf(p, q, r_, t))
     switch (s_gpu.prim) {
@@ -3598,9 +3736,95 @@ static void cpu_on_draw(const struct nv2a_pb_draw *draw)
 /* Hand the window a copy of the frame just finished. Copying here, rather
  * than letting the window read guest memory on its own clock, is what stops
  * it showing a surface the rasteriser is still writing. */
+/* RECOMP_WHITE_DUMP=<prefix>: debug only. Every RECOMP_WHITE_EVERY-th flip
+ * (default 30), every colour surface a 3D batch drew into since the last
+ * flip, as <prefix>f<flip>_<surface>.bmp. Independent of which surface the
+ * flip presents. */
+#define WT_SURF 4
+static struct { uint32_t off, pitch, cx, cy, cw, ch, bpp; } s_wt_surf[WT_SURF];
+static int s_wt_nsurf;
+
+static void white_note_surface(void)
+{
+    int i;
+    if (!getenv("RECOMP_WHITE_DUMP"))
+        return;
+    for (i = 0; i < s_wt_nsurf; i++)
+        if (s_wt_surf[i].off == s_gpu.color_offset)
+            return;
+    if (s_wt_nsurf >= WT_SURF || !s_gpu.clip_w)
+        return;
+    s_wt_surf[s_wt_nsurf].off = s_gpu.color_offset;
+    s_wt_surf[s_wt_nsurf].pitch = s_gpu.pitch;
+    s_wt_surf[s_wt_nsurf].cx = s_gpu.clip_x;
+    s_wt_surf[s_wt_nsurf].cy = s_gpu.clip_y;
+    s_wt_surf[s_wt_nsurf].cw = s_gpu.clip_w;
+    s_wt_surf[s_wt_nsurf].ch = s_gpu.clip_h;
+    s_wt_surf[s_wt_nsurf].bpp = surface_bpp();
+    s_wt_nsurf++;
+}
+
+static void white_dump_surfaces(void)
+{
+    const char *pre = getenv("RECOMP_WHITE_DUMP"), *ev = getenv("RECOMP_WHITE_EVERY");
+    static uint32_t flip;
+    uint32_t every = ev ? (uint32_t)atoi(ev) : 30;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    int i;
+
+    if (!pre)
+        return;
+    flip++;
+    if (every && flip % every == 0) {
+        for (i = 0; i < s_wt_nsurf; i++) {
+            uint32_t w = s_wt_surf[i].cw, h = s_wt_surf[i].ch, bpp = s_wt_surf[i].bpp;
+            uint32_t x, y, row_bytes = w * 3, pad = (4 - (row_bytes & 3)) & 3;
+            uint32_t filesz = 54 + (row_bytes + pad) * h;
+            uint8_t hdr[54];
+            char path[512];
+            FILE *f;
+            if (bpp != 4 && bpp != 2)
+                continue;
+            snprintf(path, sizeof path, "%sf%05u_%08X.bmp", pre, flip, s_wt_surf[i].off);
+            f = fopen(path, "wb");
+            if (!f)
+                continue;
+            memset(hdr, 0, sizeof hdr);
+            hdr[0] = 'B'; hdr[1] = 'M';
+            memcpy(hdr + 2, &filesz, 4);
+            hdr[10] = 54; hdr[14] = 40;
+            memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &h, 4);
+            hdr[26] = 1; hdr[28] = 24;
+            fwrite(hdr, 1, sizeof hdr, f);
+            for (y = h; y-- > 0; ) {
+                const uint8_t *row = mem + dma_resolve(s_wt_surf[i].off)
+                                   + (size_t)(s_wt_surf[i].cy + y) * s_wt_surf[i].pitch;
+                for (x = 0; x < w; x++) {
+                    uint8_t bgr[3];
+                    if (bpp == 4) {
+                        uint32_t v = ((const uint32_t *)row)[s_wt_surf[i].cx + x];
+                        bgr[0] = (uint8_t)v; bgr[1] = (uint8_t)(v >> 8); bgr[2] = (uint8_t)(v >> 16);
+                    } else {
+                        uint16_t v = ((const uint16_t *)row)[s_wt_surf[i].cx + x];
+                        bgr[0] = (uint8_t)((v & 0x1F) << 3);
+                        bgr[1] = (uint8_t)(((v >> 5) & 0x3F) << 2);
+                        bgr[2] = (uint8_t)(((v >> 11) & 0x1F) << 3);
+                    }
+                    fwrite(bgr, 1, 3, f);
+                }
+                if (pad) { static const uint8_t z[3]; fwrite(z, 1, pad, f); }
+            }
+            fclose(f);
+        }
+    }
+    s_wt_nsurf = 0;
+}
+
 static void cpu_on_flip(uint32_t surface, uint32_t pitch)
 {
     extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
+
+    white_dump_surfaces();
 
     if (!pitch || !surface)
         return;
