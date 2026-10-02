@@ -3932,6 +3932,39 @@ static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
                     k, s_gpu.attr[k].type, s_gpu.attr[k].size, s_gpu.attr[k].stride,
                     s_gpu.attr[k].offset, s_gpu.inline_active, s_vsh.inl[k][0], s_vsh.inl[k][1],
                     s_vsh.inl[k][2], s_vsh.inl[k][3]);
+    if (getenv("RECOMP_WHITE_RAW") && !s_gpu.inline_active && s_gpu.attr[0].offset) {
+        /* RECOMP_WHITE_RAW=1: the raw bytes of the batch's first vertices. */
+        const uint8_t *mem_ = (const uint8_t *)xbox_GetMemoryOffset();
+        uint32_t vi, b_, st_ = s_gpu.attr[0].stride;
+        for (vi = 0; vi < n && vi < 4 && st_; vi++) {
+            fprintf(stderr, "[WHITE]  raw idx %u @%08X:", s_gpu.idx[vi],
+                    s_gpu.attr[0].offset + s_gpu.idx[vi] * st_);
+            for (b_ = 0; b_ < st_ && b_ < 64; b_++)
+                fprintf(stderr, " %02X", mem_[s_gpu.attr[0].offset + s_gpu.idx[vi] * st_ + b_]);
+            fprintf(stderr, "\n");
+        }
+        {
+            static const uint32_t ms[] = { 0x358, 0x35C, 0x32C, 0x360, 0x364,
+                0x368, 0x36C, 0x370, 0x374, 0x1D84, 0x1D7C, 0x1D78, 0x300, 0x304 };
+            uint32_t mi;
+            int ui;
+            fprintf(stderr, "[WHITE]  unhandled state:");
+            for (mi = 0; mi < sizeof ms / sizeof ms[0]; mi++)
+                for (ui = 0; ui < s_unhandled_count; ui++)
+                    if (s_unhandled[ui].method == ms[mi])
+                        fprintf(stderr, " %X=%08X", ms[mi], s_unhandled[ui].last_param);
+            fprintf(stderr, "\n");
+        }
+        if (s_stage_tex[0].width <= 16 && s_stage_tex[0].height <= 16) {
+            uint32_t tx, ty, tv;
+            for (ty = 0; ty < s_stage_tex[0].height; ty++) {
+                fprintf(stderr, "[WHITE]  tex0 row %2u:", ty);
+                for (tx = 0; tx < s_stage_tex[0].width; tx++)
+                    fprintf(stderr, " %08X", sample_tex(&s_stage_tex[0], tx, ty, &tv) ? tv : 0xDEADu);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     fprintf(stderr, "[WHITE]  c58 %g %g %g %g c59 %g %g %g %g vp_scale %g %g %g %g vp_off %g %g %g %g\n",
             s_vsh.c[58][0], s_vsh.c[58][1], s_vsh.c[58][2], s_vsh.c[58][3],
             s_vsh.c[59][0], s_vsh.c[59][1], s_vsh.c[59][2], s_vsh.c[59][3],
