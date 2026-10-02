@@ -1093,9 +1093,18 @@ static ID3D11BlendState *blend_state(void)
     if (FAILED(ID3D11Device_CreateBlendState(s_dev, &bd, &bs)))
         return NULL;
     if (s_blend_n < BLEND_MAX) {
-        memcpy(s_blend[s_blend_n].key, key, sizeof key);
-        s_blend[s_blend_n++].bs = bs;
+        i = s_blend_n++;
+    } else {
+        /* Full: replace one round robin, as the sampler cache does. A
+         * released state's address can come back, so the bound-state
+         * filter starts over. */
+        static unsigned next;
+        i = (int)(next++ % BLEND_MAX);
+        ID3D11BlendState_Release(s_blend[i].bs);
+        s_state_gen++;
     }
+    memcpy(s_blend[i].key, key, sizeof key);
+    s_blend[i].bs = bs;
     return bs;
 }
 
@@ -1120,10 +1129,12 @@ static int blend_color(float bf[4])
     bf[3] = (float)(c >> 24) / 255.0f;
     if (col && alp) {
         static int warned;
-        if (!warned++)
+        if (!warned) {
+            warned = 1;
             fprintf(stderr, LOGP "blend: CONSTANT_COLOR and CONSTANT_ALPHA mixed"
                     " (sfactor 0x%04X dfactor 0x%04X); the _ALPHA side uses the"
                     " colour\n", s, d);
+        }
     }
     if (col) {
         bf[0] = (float)((c >> 16) & 0xFF) / 255.0f;
