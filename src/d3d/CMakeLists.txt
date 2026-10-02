@@ -17,6 +17,9 @@ if(WIN32)
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
+    # D3DCompile under the host's d3dcompiler_47 (Wine's, under Proton).
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3dcompile_smoke
+                     ${CMAKE_CURRENT_BINARY_DIR}/d3dcompile_smoke)
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c
