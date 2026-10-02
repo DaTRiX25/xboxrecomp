@@ -1092,16 +1092,25 @@ static ID3D11BlendState *blend_state(void)
     if (FAILED(ID3D11Device_CreateBlendState(s_dev, &bd, &bs)))
         return NULL;
     if (s_blend_n < BLEND_MAX) {
-        memcpy(s_blend[s_blend_n].key, key, sizeof key);
-        s_blend[s_blend_n++].bs = bs;
+        i = s_blend_n++;
+    } else {
+        /* Full: replace one round robin, as the sampler cache does. A
+         * released state's address can come back, so the bound-state
+         * filter starts over. */
+        static unsigned next;
+        i = (int)(next++ % BLEND_MAX);
+        ID3D11BlendState_Release(s_blend[i].bs);
+        s_state_gen++;
     }
+    memcpy(s_blend[i].key, key, sizeof key);
+    s_blend[i].bs = bs;
     return bs;
 }
 
 /* The factor D3D11_BLEND_BLEND_FACTOR reads: SET_BLEND_COLOR, unpacked
  * from ARGB to RGBA. D3D11 has no CONSTANT_ALPHA, so when only the
  * _ALPHA factors are in use the alpha is replicated into all four; a
- * draw mixing _COLOR and _ALPHA keeps the colour (not seen so far). With
+ * draw mixing _COLOR and _ALPHA keeps the colour (logged once). With
  * no constant factor the default (1,1,1,1) is used, so a colour the title
  * sets without using it does not rebind the blend state. Returns whether a
  * constant factor is in use. */
@@ -1117,6 +1126,15 @@ static int blend_color(float bf[4])
         return 0;
     }
     bf[3] = (float)(c >> 24) / 255.0f;
+    if (col && alp) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, LOGP "blend: CONSTANT_COLOR and CONSTANT_ALPHA mixed"
+                    " (sfactor 0x%04X dfactor 0x%04X); the _ALPHA side uses the"
+                    " colour\n", s, d);
+        }
+    }
     if (col) {
         bf[0] = (float)((c >> 16) & 0xFF) / 255.0f;
         bf[1] = (float)((c >>  8) & 0xFF) / 255.0f;
@@ -2710,7 +2728,14 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
     /* back to the real draw's state; the state-call filter's view of it
      * stays true for everything restored here */
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, dsv);
-    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_sc.bs, s_sc.bf, 0xFFFFFFFF);
+    {
+        /* Recomputed, not s_sc.bs/.bf: setup_pixel can evict a shader
+         * after the blend bind, and sc_on() then resets s_sc to 0xFF. The
+         * pgraph state is unchanged since the draw, so these are the same. */
+        float bf[4];
+        blend_color(bf);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(), bf, 0xFFFFFFFF);
+    }
     ID3D11DeviceContext_PSSetShader(s_ctx, s_sc.ps, NULL, 0);
     s_state_gen++;              /* and the next draw rebinds everything */
 
@@ -3259,10 +3284,12 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
  * for the result at GET_REPORT instead (the stall the flip log's "occ"
  * shows), =fixed leaves reports to the walker (RECOMP_ZPASS_FIXED, every
  * test visible). A report still pending after 250 ms, or one with too many
- * stretches, completes as visible (0x10000).
+ * stretches, completes as visible (0x10000); the flip log's "visible"
+ * (s_occ_vis) counts those fallbacks too.
  *
  * Reused reports: the XDK recycles its report slots, so a GET_REPORT can name
- * a va that still has a report pending. The new one supersedes it: the old
+ * a va that still has a report pending. The new one supersedes it, before
+ * anything is polled: the old
  * queries go back to the pool unread and nothing is written for the old
  * test, so its late completion cannot land over the title's reset status or
  * the new count. */
@@ -3440,10 +3467,8 @@ static int d3d11_on_report(uint32_t va)
     if (occ_mode() == 2 || !init())
         return 0;
     occ_end();
-    occ_poll(D3D11_ASYNC_GETDATA_DONOTFLUSH);
-    if (s_occ_npend >= OCC_PENDING)
-        occ_poll(0);
-    /* Supersede a report still pending at this va (see above). */
+    /* Supersede a report still pending at this va (see above) before any
+     * poll: a poll here could finish the old one over the title's reset. */
     for (i = 0; i < s_occ_npend; i++)
         if (s_occ_pend[i].va == va) {
             int k;
@@ -3455,6 +3480,9 @@ static int d3d11_on_report(uint32_t va)
             s_occ_super++;
             break;              /* at most one: each push supersedes */
         }
+    occ_poll(D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (s_occ_npend >= OCC_PENDING)
+        occ_poll(0);
     if (s_occ_npend >= OCC_PENDING) {
         /* Still full: the oldest is answered as visible. */
         s_occ_late++;
@@ -3462,6 +3490,8 @@ static int d3d11_on_report(uint32_t va)
         memmove(&s_occ_pend[0], &s_occ_pend[1],
                 (size_t)(--s_occ_npend) * sizeof s_occ_pend[0]);
     }
+    /* Pending until done, whatever the title left in the status. */
+    ((volatile uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va))[3] = 0xFFFFFFFFu;
     p = &s_occ_pend[s_occ_npend++];
     p->va = va;
     p->n = s_occ_nseg;
