@@ -3828,7 +3828,7 @@ uint32_t xbox_ContiguousInUseBytes(void)
 }
 
 
-uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+static uint32_t heap_alloc_unlocked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -3938,7 +3938,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
  * forward is asking about the block that contains it. Returns 0 for an address
  * this heap never handed out, which is what "not one of mine" has to look like.
  */
-uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+static uint32_t heap_block_size_unlocked(uint32_t xbox_va)
 {
     int i;
 
@@ -3954,7 +3954,7 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
     return 0;
 }
 
-void xbox_HeapFree(uint32_t xbox_va)
+static void heap_free_unlocked(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
 
@@ -3995,6 +3995,88 @@ void xbox_HeapFree(uint32_t xbox_va)
             g_heap_blocks[i].addr = 0;
         }
         return;
+    }
+}
+
+/* The heap is shared by every guest thread, and nothing serialised it. Two
+ * threads allocating at once could both take the same free block (both see
+ * free, both clear it, both return its address), and a free racing an alloc
+ * could coalesce a block out from under it. Worker threads take their stacks
+ * and TIBs from here (xbox_AllocThreadStack, xbox_AllocThreadTib) while the
+ * title's other threads allocate, so the window is real even where no crash
+ * has yet been traced to it. */
+static volatile LONG s_heap_lock;
+
+static void heap_lock(void)
+{
+    while (InterlockedCompareExchange(&s_heap_lock, 1, 0) != 0)
+        SwitchToThread();
+}
+
+static void heap_unlock(void)
+{
+    InterlockedExchange(&s_heap_lock, 0);
+}
+
+/* RECOMP_HEAP_TRACE=<va>: log every allocation and free of the block that
+ * holds that guest address, with the guest return address of the caller.
+ * For "who else owns this memory" questions; off unless set. */
+static uint32_t heap_trace_va(void)
+{
+    static int init;
+    static uint32_t va;
+    if (!init) {
+        const char *e = getenv("RECOMP_HEAP_TRACE");
+        va = e ? (uint32_t)strtoul(e, NULL, 0) : 0;
+        init = 1;
+    }
+    return va;
+}
+
+static uint32_t heap_trace_caller(void)
+{
+    if (g_esp < 0x1000)
+        return 0;
+    return *(uint32_t *)((uintptr_t)g_esp + g_memory_offset);
+}
+
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r, t = heap_trace_va();
+    heap_lock();
+    r = heap_alloc_unlocked(size, alignment);
+    heap_unlock();
+    if (t && r && t >= r && t < r + (size < 16 ? 16 : size)) {
+        fprintf(stderr, "  [HEAP-TRACE] alloc 0x%08X size %u align %u"
+                " (caller 0x%08X, esp 0x%08X)\n",
+                r, size, alignment, heap_trace_caller(), g_esp);
+        fflush(stderr);
+    }
+    return r;
+}
+
+uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+{
+    uint32_t r;
+    heap_lock();
+    r = heap_block_size_unlocked(xbox_va);
+    heap_unlock();
+    return r;
+}
+
+void xbox_HeapFree(uint32_t xbox_va)
+{
+    uint32_t t = heap_trace_va(), sz = 0;
+    heap_lock();
+    if (t)
+        sz = heap_block_size_unlocked(xbox_va);
+    heap_free_unlocked(xbox_va);
+    heap_unlock();
+    if (t && xbox_va && t >= xbox_va && t < xbox_va + sz) {
+        fprintf(stderr, "  [HEAP-TRACE] free 0x%08X size %u"
+                " (caller 0x%08X, esp 0x%08X)\n",
+                xbox_va, sz, heap_trace_caller(), g_esp);
+        fflush(stderr);
     }
 }
 

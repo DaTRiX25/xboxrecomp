@@ -811,6 +811,59 @@ static int posix_open_flags(ACCESS_MASK access, ULONG disposition)
     return rw | extra;
 }
 
+/* FATX overwrite semantics.
+ *
+ * An overwrite open (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF) of an
+ * existing file sets its size to 0 on FATX, but FATX keeps no valid-data
+ * length: growing the file again with SetEndOfFile, without writing, brings
+ * back the bytes already on disk. BLiNX 2 relies on this when it builds the
+ * utility-drive texture cache (sub_001B8140 / sub_001B8240):
+ *
+ *   CreateFile(x.tmp, CREATE_ALWAYS, NO_BUFFERING|OVERLAPPED)
+ *   SetEndOfFile(size rounded up to 512); WriteFile(all of it); CloseHandle
+ *   CreateFile(x.tmp, CREATE_ALWAYS)      <- the second overwrite
+ *   SetEndOfFile(true size); CloseHandle; rename x.tmp -> x.ipk
+ *
+ * The second open only trims the sector padding. With O_TRUNC the host
+ * filesystem zero-fills on the regrow, so every cache file came out as zeros
+ * of the right length, and the game later loaded zero textures from them.
+ *
+ * So an overwrite of an existing non-empty file is opened without O_TRUNC
+ * and marked pending. If the first thing done with the handle is setting
+ * the end of file, that is a plain ftruncate to the new size, which keeps
+ * the old bytes below it as FATX does. Anything else (read, write, size
+ * query, allocation, close) first truncates to 0, which is the normal
+ * overwrite. The table is indexed by host fd. */
+#define FATX_PENDING_MAX 4096
+static volatile unsigned char s_overwrite_pending[FATX_PENDING_MAX];
+
+static int disposition_overwrites(ULONG disposition)
+{
+    return disposition == XBOX_FILE_SUPERSEDE
+        || disposition == XBOX_FILE_OVERWRITE
+        || disposition == XBOX_FILE_OVERWRITE_IF;
+}
+
+/* Finish a pending overwrite: truncate to 0. */
+static void overwrite_settle(int fd)
+{
+    if (fd >= 0 && fd < FATX_PENDING_MAX && s_overwrite_pending[fd]) {
+        s_overwrite_pending[fd] = 0;
+        if (ftruncate(fd, 0) != 0) { /* nothing more to do */ }
+    }
+}
+
+/* Take the pending mark without truncating (end-of-file set). Returns 1 if
+ * the handle was pending. */
+static int overwrite_take(int fd)
+{
+    if (fd >= 0 && fd < FATX_PENDING_MAX && s_overwrite_pending[fd]) {
+        s_overwrite_pending[fd] = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static void unix_to_filetime(time_t sec, long nsec, LARGE_INTEGER* out)
 {
     /* 100-ns ticks since 1601-01-01 */
@@ -867,7 +920,19 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             mkdir(host_path, 0755);   /* EEXIST is fine */
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
-        fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
+        int flags = posix_open_flags(DesiredAccess, CreateDisposition);
+        struct stat st;
+        int defer = disposition_overwrites(CreateDisposition)
+                 && stat(host_path, &st) == 0 && S_ISREG(st.st_mode)
+                 && st.st_size > 0;
+        if (defer)
+            flags &= ~O_TRUNC;
+        fd = open(host_path, flags, 0644);
+            if (fd >= 0 && fd < FATX_PENDING_MAX)
+            s_overwrite_pending[fd] = (unsigned char)defer;
+        else if (fd >= 0 && defer && ftruncate(fd, 0) != 0) {
+            /* no slot to defer in: truncate now */
+        }
     }
 
     if (fd < 0) {
@@ -904,6 +969,7 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_INVALID_HANDLE;
     }
 
+    overwrite_settle(fd);
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
@@ -940,6 +1006,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
         return STATUS_INVALID_HANDLE;
     }
 
+    overwrite_settle(fd);
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
@@ -961,6 +1028,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        overwrite_settle(w32_handle_fd(Handle));
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -993,6 +1061,9 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
 
     struct stat st;
     if (FileInformationClass != XboxFilePositionInformation) {
+        /* Not for a position query: XAPI SetEndOfFile makes one before it
+         * sets the end of file, and a pending overwrite must survive it. */
+        overwrite_settle(fd);
         if (fstat(fd, &st) != 0)
             return STATUS_UNSUCCESSFUL;
     }
@@ -1071,6 +1142,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         }
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            /* A pending overwrite ends here: ftruncate to the new size keeps
+             * the old bytes below it (see s_overwrite_pending). */
+            overwrite_take(fd);
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
@@ -1093,6 +1167,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_END_OF_FILE_INFORMATION info =
                 (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             struct stat st;
+            overwrite_settle(fd);
             if (fstat(fd, &st) == 0 && (off_t)info->EndOfFile.QuadPart < st.st_size
                     && ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
