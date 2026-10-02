@@ -78,6 +78,40 @@ static int memo_on(void)
     }
     return s_memo;
 }
+
+/* The pipeline state last bound, so a batch binding the same again skips
+ * the call. Only state this file alone sets and nothing unbinds behind it;
+ * SRVs (which the runtime nulls on a render-target hazard), the vertex and
+ * index buffers (new offsets every batch) and the output merger's targets
+ * and depth state are always set. Releasing a shader or input layout bumps
+ * s_state_gen, since a new object can come back at a released one's
+ * address. All 0xFF is "nothing known". */
+static uint32_t s_state_gen;
+static struct {
+    uint32_t                  gen;
+    ID3D11BlendState         *bs;
+    ID3D11RasterizerState    *rs;
+    ID3D11InputLayout        *il;
+    D3D11_PRIMITIVE_TOPOLOGY  topo;
+    ID3D11VertexShader       *vs;
+    ID3D11PixelShader        *ps;
+    ID3D11Buffer             *vs_cb[3], *ps_cb;
+    ID3D11SamplerState       *smp[4];
+    D3D11_VIEWPORT            vp;
+} s_sc;
+static int s_sc_init;
+
+static int sc_on(void)
+{
+    if (!memo_on())
+        return 0;
+    if (!s_sc_init || s_sc.gen != s_state_gen) {
+        memset(&s_sc, 0xFF, sizeof s_sc);
+        s_sc.gen = s_state_gen;
+        s_sc_init = 1;
+    }
+    return 1;
+}
 static ID3D11Buffer           *s_vb;            /* ring of float4 streams */
 static UINT                    s_vb_size, s_vb_pos;
 static ID3D11Buffer           *s_ib;
@@ -708,6 +742,61 @@ static void *ring_map(ID3D11Buffer *b, UINT size, UINT *pos, UINT need,
     return (uint8_t *)m.pData + at;
 }
 
+/* A batch's vertex streams, written through one Map of s_vb: vb_begin
+ * reserves an upper bound for all of them, vb_alloc hands out 16-aligned
+ * pieces of it, vb_end unmaps and gives back what was not used. Without a
+ * reservation (memos off, or the bound too large) each piece is its own
+ * ring_map, as before. One mapping also means a wrap's DISCARD cannot land
+ * between two streams of the same batch. */
+static uint8_t *s_vbm_base;
+static UINT     s_vbm_at, s_vbm_used, s_vbm_cap;
+
+static void vb_begin(UINT bound)
+{
+    s_vbm_base = NULL;
+    if (!memo_on() || !bound || bound > s_vb_size / 4)
+        return;
+    s_vbm_base = (uint8_t *)ring_map(s_vb, s_vb_size, &s_vb_pos, bound, 16);
+    if (s_vbm_base) {
+        s_vbm_at = s_vb_pos - bound;
+        s_vbm_used = 0;
+        s_vbm_cap = bound;
+    }
+}
+
+static void *vb_alloc(UINT bytes, UINT *off)
+{
+    void *p;
+    if (s_vbm_base) {
+        UINT o = (s_vbm_used + 15u) & ~15u;
+        if (o + bytes > s_vbm_cap)
+            return NULL;
+        s_vbm_used = o + bytes;
+        *off = s_vbm_at + o;
+        return s_vbm_base + o;
+    }
+    p = ring_map(s_vb, s_vb_size, &s_vb_pos, bytes, 16);
+    if (p)
+        *off = s_vb_pos - bytes;
+    return p;
+}
+
+/* After each piece is written: unmapped now unless it is part of a batch. */
+static void vb_written(void)
+{
+    if (!s_vbm_base)
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+}
+
+static void vb_end(void)
+{
+    if (s_vbm_base) {
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+        s_vb_pos = s_vbm_at + s_vbm_used;
+        s_vbm_base = NULL;
+    }
+}
+
 /* Triangle, line and point lists from any NV097 primitive. Returns the
  * index count (into out, rebased by -base) and the topology. */
 static uint32_t convert_indices(const struct nv2a_pb_draw *d, uint32_t base,
@@ -878,8 +967,10 @@ static ID3D11InputLayout *input_layout(VsEntry *e, const uint8_t fmt[16])
         return NULL;
     k = e->lay_next;
     e->lay_next = (k + 1) % 8;
-    if (e->lay[k].il)
+    if (e->lay[k].il) {
         ID3D11InputLayout_Release(e->lay[k].il);
+        s_state_gen++;
+    }
     e->lay[k].il = NULL;
     memcpy(e->lay[k].fmt, fmt, 16);
     if (FAILED(ID3D11Device_CreateInputLayout(
@@ -999,8 +1090,20 @@ typedef struct {
 
 static TexEntry  s_tc[TEX_CACHE];
 static uint32_t  s_tc_clock;
-static TexEntry *s_tc_recent[4];   /* last hits, checked before the scan */
-static uint32_t  s_tc_recent_next;
+/* Key hash -> entry + 1, checked before the scan. A live entry with a key
+ * is the only one (one is made only when the scan finds none), so a hint
+ * that matches is the entry the scan would find; a stale or colliding one
+ * just falls through to it. */
+#define TC_HINTS 2048
+static uint16_t  s_tc_hint[TC_HINTS];
+
+static uint32_t tc_slot(const Stage *t)
+{
+    uint32_t h = t->offset * 0x9E3779B1u;
+    h ^= (t->color + (t->width << 8) + (t->height << 20)) * 0x85EBCA77u;
+    h ^= (t->pitch ^ t->palette) * 0xC2B2AE3Du;
+    return (h >> 16) & (TC_HINTS - 1);
+}
 static uint32_t *s_texels;
 static size_t    s_texels_cap;
 static ID3D11ShaderResourceView *s_black_srv;   /* too large: (0,0,0,1) */
@@ -1358,6 +1461,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bytes = tex_extent(t), i;
     TexEntry *e = NULL, *victim = &s_tc[0];
+    uint32_t slot;
 
     if (!bytes) {
         /* A format with no decoder is magenta, and said once, loudly: white
@@ -1373,16 +1477,13 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         }
         return s_magenta_srv ? s_magenta_srv : s_black_srv;
     }
-    if (memo_on()) {
-        for (i = 0; i < 4; i++) {
-            TexEntry *c = s_tc_recent[i];
-            if (c && c->live && c->offset == t->offset && c->color == t->color
-                    && c->width == t->width && c->height == t->height
-                    && c->pitch == t->pitch && c->palette == t->palette) {
-                e = c;
-                break;
-            }
-        }
+    slot = tc_slot(t);
+    if (memo_on() && s_tc_hint[slot]) {
+        TexEntry *c = &s_tc[s_tc_hint[slot] - 1];
+        if (c->live && c->offset == t->offset && c->color == t->color
+                && c->width == t->width && c->height == t->height
+                && c->pitch == t->pitch && c->palette == t->palette)
+            e = c;
     }
     for (i = 0; !e && i < TEX_CACHE; i++) {
         TexEntry *c = &s_tc[i];
@@ -1425,9 +1526,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         e->live = 1;
     }
     e->used = ++s_tc_clock;
-    if (s_tc_recent[0] != e && s_tc_recent[1] != e
-            && s_tc_recent[2] != e && s_tc_recent[3] != e)
-        s_tc_recent[s_tc_recent_next++ & 3] = e;
+    s_tc_hint[slot] = (uint16_t)(e - s_tc + 1);
     return e->srv;
 }
 
@@ -1581,7 +1680,10 @@ static ID3D11PixelShader *combiner_ps(const NV2ACombinerState *st)
     }
     if (!e) {
         e = lru;
-        if (e->ps) ID3D11PixelShader_Release(e->ps);
+        if (e->ps) {
+            ID3D11PixelShader_Release(e->ps);
+            s_state_gen++;
+        }
     }
     memset(e, 0, sizeof *e);
     s_rc_last = e;
@@ -1826,8 +1928,14 @@ static ID3D11PixelShader *setup_pixel(void)
         s_cb_ps_ok = 1;
     }
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
-    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_ps);
+    if (!sc_on() || memcmp(s_sc.smp, smp, sizeof smp)) {
+        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
+        memcpy(s_sc.smp, smp, sizeof smp);
+    }
+    if (!sc_on() || s_sc.ps_cb != s_cb_ps) {
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_ps);
+        s_sc.ps_cb = s_cb_ps;
+    }
     if (textured)
         s_draws_tex++;
 
@@ -2219,10 +2327,21 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     memset(strides, 0, sizeof strides);
     memset(offs, 0, sizeof offs);
     memset(fmts, 0, sizeof fmts);
+    {   /* the most the streams below can take, each 16-aligned */
+        uint64_t bound = 0;
+        for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
+            const VertexAttr *a = &d->attr[i];
+            if (!(vs->inputs & (1u << i)))
+                continue;
+            bound += (a->size && a->stride)
+                   ? (uint64_t)count * (a->stride > 16 ? a->stride : 16) + 48 : 32;
+        }
+        vb_begin(bound <= 0xFFFFFFFFu ? (UINT)bound : 0);
+    }
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
         const VertexAttr *a = &d->attr[i];
         int on = a->size && a->stride;
-        UINT bytes = on ? count * 16u : 16u, esz;
+        UINT bytes = on ? count * 16u : 16u, esz, at;
         float *f;
 
         if (!(vs->inputs & (1u << i)) || fmts[i])
@@ -2249,18 +2368,19 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             bytes = (count - 1u) * a->stride + (hi_end - lo_off);
             if (!d->inline_data
                     || (size_t)lo_off + (size_t)lo * a->stride + bytes <= d->inline_bytes) {
-                uint8_t *dst = (uint8_t *)ring_map(s_vb, s_vb_size, &s_vb_pos, bytes, 16);
+                uint8_t *dst = (uint8_t *)vb_alloc(bytes, &at);
                 if (!dst) {
+                    vb_end();
                     s_draws_skipped++;
                     return;
                 }
                 memcpy(dst, base + lo_off + (size_t)lo * a->stride, bytes);
-                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+                vb_written();
                 for (j = i; j < NV2A_VS_MAX_INPUTS; j++) {
                     if (!(group & (1u << j)))
                         continue;
                     fmts[j] = (uint8_t)native_format(&d->attr[j], &esz);
-                    offs[j] = s_vb_pos - bytes + (d->attr[j].offset - lo_off);
+                    offs[j] = at + (d->attr[j].offset - lo_off);
                     strides[j] = a->stride;
                     vbs[j] = s_vb;
                 }
@@ -2270,12 +2390,13 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             bytes = count * 16u;
         }
         fmts[i] = (uint8_t)DXGI_FORMAT_R32G32B32A32_FLOAT;
-        f = (float *)ring_map(s_vb, s_vb_size, &s_vb_pos, bytes, 16);
+        f = (float *)vb_alloc(bytes, &at);
         if (!f) {
+            vb_end();
             s_draws_skipped++;
             return;
         }
-        offs[i] = s_vb_pos - bytes;
+        offs[i] = at;
         if (on) {
             for (k = 0; k < count; k++) {
                 if (!fetch(d, a, lo + k, f + 4 * k))
@@ -2287,9 +2408,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             strides[i] = 0;
         }
         s_vb_expanded += bytes;
-        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+        vb_written();
         vbs[i] = s_vb;
     }
+    vb_end();
     p = ring_map(s_ib, s_ib_size, &s_ib_pos, nidx * 4u, 4);
     if (!p) {
         s_draws_skipped++;
@@ -2385,19 +2507,52 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         }
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, dsv);
         ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, 0);
-        ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(), NULL, 0xFFFFFFFF);
-        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
-        ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
-        ID3D11DeviceContext_IASetInputLayout(s_ctx, input_layout(vs, fmts));
-        ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, NV2A_VS_MAX_INPUTS,
-                                               vbs, strides, offs);
-        ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT,
-                                             s_ib_pos - nidx * 4u);
-        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, topo);
-        ID3D11DeviceContext_VSSetShader(s_ctx, vs->vs, NULL, 0);
-        ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 3, cbs);
+        {
+            ID3D11BlendState *bs = blend_state();
+            ID3D11InputLayout *il = input_layout(vs, fmts);
+            int sc = sc_on();
+            if (!sc || s_sc.bs != bs) {
+                ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, NULL, 0xFFFFFFFF);
+                s_sc.bs = bs;
+            }
+            if (!sc || memcmp(&s_sc.vp, &vp, sizeof vp)) {
+                ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+                s_sc.vp = vp;
+            }
+            if (!sc || s_sc.rs != s_rs) {
+                ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+                s_sc.rs = s_rs;
+            }
+            if (!sc || s_sc.il != il) {
+                ID3D11DeviceContext_IASetInputLayout(s_ctx, il);
+                s_sc.il = il;
+            }
+            ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, NV2A_VS_MAX_INPUTS,
+                                                   vbs, strides, offs);
+            ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT,
+                                                 s_ib_pos - nidx * 4u);
+            if (!sc || s_sc.topo != topo) {
+                ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, topo);
+                s_sc.topo = topo;
+            }
+            if (!sc || s_sc.vs != vs->vs) {
+                ID3D11DeviceContext_VSSetShader(s_ctx, vs->vs, NULL, 0);
+                s_sc.vs = vs->vs;
+            }
+            if (!sc || memcmp(s_sc.vs_cb, cbs, sizeof cbs)) {
+                ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 3, cbs);
+                memcpy(s_sc.vs_cb, cbs, sizeof cbs);
+            }
+        }
         s_cur = rt;
-        ID3D11DeviceContext_PSSetShader(s_ctx, setup_pixel(), NULL, 0);
+        {
+            ID3D11PixelShader *ps = setup_pixel();
+            /* setup_pixel may have compiled (and evicted) a shader */
+            if (!sc_on() || s_sc.ps != ps) {
+                ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
+                s_sc.ps = ps;
+            }
+        }
         if (trace_pick(d)) {
             int px, py;
             trace_batch(d, vs, rt, fmts, strides, offs, topo, &px, &py);
