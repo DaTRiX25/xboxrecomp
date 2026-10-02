@@ -844,6 +844,8 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
          * backing view happened to contain shows up later as structures that
          * are "allocated" but full of garbage. */
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+        /* Keep the arena from handing the same pages to someone else. */
+        xbox_ContiguousClaim(xbox_va, size);
 
         if (KERNEL_LOG_ON_HALF()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
@@ -856,7 +858,13 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     }
 
     if (align < 4096) align = 4096;
-    xbox_va = xbox_ContiguousAlloc(size, align);
+    /* Lowest/highest are physical and inclusive; the window maps physical P
+     * at XBOX_CONTIG_BASE + P, so the arena can honour them directly. */
+    if (high < low) {
+        g_eax = 0;
+        return;
+    }
+    xbox_va = xbox_ContiguousAllocEx(size, align, low, high);
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
@@ -873,7 +881,13 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+
+    /* Back to the arena it came from. This used to call xbox_HeapFree, which
+     * never matches a window address, so nothing contiguous was ever
+     * reclaimed. The heap is still tried for an address the arena does not
+     * own, which is harmless: it ignores what it never handed out. */
+    if (!xbox_ContiguousFree(addr))
+        xbox_HeapFree(addr);
     g_eax = 0;
 }
 
@@ -4138,7 +4152,11 @@ static void bridge_MmLockUnlockBufferPages(void)
  */
 static void bridge_MmQueryAllocationSize(void)
 {
-    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
+    /* Contiguous blocks live in their own arena now; ask it first. */
+    uint32_t va = STACK_ARG(0);
+    uint32_t n = xbox_ContiguousBlockSize(va);
+
+    g_eax = n ? n : xbox_HeapBlockSize(va);
 }
 
 /* ── NtCreateMutant (ordinal 192, 3 args) */

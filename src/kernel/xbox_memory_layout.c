@@ -3561,7 +3561,7 @@ void xbox_FreeThreadStack(uint32_t stack_top)
         g_thread_stacks_used--;
 }
 
-/* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
+/* Page allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
  *
  * MmAllocateContiguousMemory hands back physical memory, and on Xbox physical
  * page P is visible at 0x80000000 + P. Drivers rely on that being an exact
@@ -3573,43 +3573,251 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * allocates its pushbuffer, which put the buffer at 0x15782000 and left the
  * engine comparing 0x857844C0 against it forever.
  *
- * Grows up from the base; XBOX_GPU_INSTANCE_DEFAULT is carved off the top by
- * the GPU-instance bridge, so the two do not meet until the window is full.
- * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
- * title allocates once. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+ * This was a bump allocator on the theory that contiguous blocks are
+ * framebuffers and pushbuffers, allocated once. They are also every texture
+ * and vertex buffer a D3D title creates, and those come and go with the scene:
+ * BLiNX 2 frees and reallocates them as each texture pack loads, and with
+ * nothing reclaimed the 64 MB window ran out at about 119 s, while stage 1-1
+ * loaded. MmFreeContiguousMemory meanwhile passed the address to
+ * xbox_HeapFree, which never matched it.
+ *
+ * Now a first-fit page allocator: one byte of state per 4 KB page, plus the
+ * length of each allocation at its first page. 16,384 pages, so a linear scan
+ * is cheap next to the memset every allocation already does. Honours the
+ * alignment and the physical [lowest, highest] range of
+ * MmAllocateContiguousMemoryEx. XBOX_GPU_INSTANCE_DEFAULT stays carved off the
+ * top for the GPU-instance bridge.
+ *
+ * Locked: textures are created from loader threads as well as the main one. */
+#define CONTIG_PAGE       4096u
+#define CONTIG_PAGES      (XBOX_CONTIG_SIZE / CONTIG_PAGE)
+#define CONTIG_USABLE     ((XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT) / CONTIG_PAGE)
 
-uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+static uint8_t  g_contig_used[CONTIG_PAGES];   /* 1 = page belongs to a block */
+static uint32_t g_contig_len[CONTIG_PAGES];    /* pages, at a block's first page */
+static uint32_t g_contig_pages_in_use;
+static uint32_t g_contig_high;                 /* high-water mark, bytes */
+static uint32_t g_contig_first_free;           /* no free page below this */
+static uint32_t g_contig_allocs, g_contig_frees;
+static uint32_t g_contig_peak_pages;
+static DWORD    g_contig_t0;
+static volatile LONG g_contig_lock;
+
+static void contig_lock(void)
 {
-    uint32_t result;
+    while (InterlockedCompareExchange(&g_contig_lock, 1, 0) != 0)
+        SwitchToThread();
+}
 
-    if (alignment < 4096) alignment = 4096;
-    result = (g_contig_next + alignment - 1) & ~(alignment - 1);
+static void contig_unlock(void)
+{
+    InterlockedExchange(&g_contig_lock, 0);
+}
 
-    /* Leave the top of the window for GPU instance memory. */
-    if ((uint64_t)result + size >
-            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
-                - XBOX_GPU_INSTANCE_DEFAULT) {
-        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
-                size, g_contig_next - XBOX_CONTIG_BASE,
-                (unsigned)XBOX_CONTIG_SIZE);
-        fflush(stderr);
-        return 0;
+/* Usage over time, at most a line per 2 MB of movement or per 1024 calls --
+ * enough to see the arena breathe without a line per texture. Lock held. */
+static void contig_report(const char *what, uint32_t va, uint32_t pages)
+{
+    static uint32_t last_pages, ops;
+    uint32_t delta = g_contig_pages_in_use > last_pages
+                   ? g_contig_pages_in_use - last_pages
+                   : last_pages - g_contig_pages_in_use;
+
+    if (!g_contig_t0)
+        g_contig_t0 = GetTickCount();
+    if (++ops > 16 && delta < 512 && (ops & 1023) != 0)
+        return;
+    last_pages = g_contig_pages_in_use;
+    fprintf(stderr, "  [CONTIG] t=%.1fs %s 0x%08X %u KB: in use %u KB, "
+            "peak %u KB, high-water %u KB (allocs=%u frees=%u)\n",
+            (GetTickCount() - g_contig_t0) / 1000.0, what, va,
+            pages * (CONTIG_PAGE / 1024),
+            g_contig_pages_in_use * (CONTIG_PAGE / 1024),
+            g_contig_peak_pages * (CONTIG_PAGE / 1024),
+            g_contig_high / 1024, g_contig_allocs, g_contig_frees);
+    fflush(stderr);
+}
+
+static void contig_take(uint32_t first, uint32_t n)
+{
+    uint32_t end = (first + n) * CONTIG_PAGE;
+
+    memset(&g_contig_used[first], 1, n);
+    g_contig_len[first] = n;
+    g_contig_pages_in_use += n;
+    if (g_contig_pages_in_use > g_contig_peak_pages)
+        g_contig_peak_pages = g_contig_pages_in_use;
+    if (end > g_contig_high)
+        g_contig_high = end;
+    while (g_contig_first_free < CONTIG_PAGES
+           && g_contig_used[g_contig_first_free])
+        g_contig_first_free++;
+}
+
+uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
+                                uint32_t phys_lo, uint32_t phys_hi)
+{
+    uint32_t n, align_pages, lo_page, limit, p, q, result = 0;
+
+    if (alignment < CONTIG_PAGE) alignment = CONTIG_PAGE;
+    if (alignment & (alignment - 1)) {            /* round up to a power of 2 */
+        uint32_t a = CONTIG_PAGE;
+        while (a && a < alignment) a <<= 1;
+        alignment = a ? a : 0x80000000u;
     }
+    if (size == 0) size = 1;
+    n = (uint32_t)(((uint64_t)size + CONTIG_PAGE - 1) / CONTIG_PAGE);
+    align_pages = alignment / CONTIG_PAGE;
 
-    g_contig_next = result + size;
-    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    /* Physical range -> page range. Highest is inclusive. */
+    lo_page = (uint32_t)(((uint64_t)phys_lo + CONTIG_PAGE - 1) / CONTIG_PAGE);
+    limit = (uint32_t)(((uint64_t)phys_hi + 1) / CONTIG_PAGE);
+    if (limit > CONTIG_USABLE) limit = CONTIG_USABLE;
+
+    contig_lock();
+    if (lo_page < g_contig_first_free) lo_page = g_contig_first_free;
+    p = (lo_page + align_pages - 1) & ~(align_pages - 1);
+    while ((uint64_t)p + n <= limit) {
+        for (q = p; q < p + n && !g_contig_used[q]; q++)
+            ;
+        if (q == p + n) {
+            contig_take(p, n);
+            result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
+            break;
+        }
+        /* Skip the used run that stopped us, then realign. */
+        while (q < limit && g_contig_used[q]) q++;
+        p = (q + align_pages - 1) & ~(align_pages - 1);
+    }
+    if (result) {
+        g_contig_allocs++;
+        contig_report("alloc", result, n);
+    } else {
+        uint32_t best = 0, run = 0;
+        for (q = 0; q < CONTIG_USABLE; q++) {
+            run = g_contig_used[q] ? 0 : run + 1;
+            if (run > best) best = run;
+        }
+        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, align %u, "
+                "phys 0x%08X..0x%08X; %u of %u KB in use, largest free run "
+                "%u KB)\n", size, alignment, phys_lo, phys_hi,
+                g_contig_pages_in_use * (CONTIG_PAGE / 1024),
+                (unsigned)(CONTIG_USABLE * (CONTIG_PAGE / 1024)),
+                best * (CONTIG_PAGE / 1024));
+        fflush(stderr);
+    }
+    contig_unlock();
+
+    if (result)
+        memset((void *)((uintptr_t)result + g_memory_offset), 0,
+               (size_t)n * CONTIG_PAGE);
     return result;
 }
 
-/* How much of the window has been handed out.
+uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+{
+    return xbox_ContiguousAllocEx(size, alignment, 0, 0xFFFFFFFFu);
+}
+
+/* A block the caller placed itself (MmAllocateContiguousMemoryEx with a range
+ * exactly one allocation wide). Recorded so nothing else is handed the same
+ * pages and so the matching free releases them; pages already in use are
+ * left alone, since the caller has been given them regardless. */
+void xbox_ContiguousClaim(uint32_t va, uint32_t size)
+{
+    uint32_t first, n, q;
+
+    if (va < XBOX_CONTIG_BASE || size == 0)
+        return;
+    first = (va - XBOX_CONTIG_BASE) / CONTIG_PAGE;
+    n = (uint32_t)(((uint64_t)(va & (CONTIG_PAGE - 1)) + size + CONTIG_PAGE - 1)
+                   / CONTIG_PAGE);
+    if ((uint64_t)first + n > CONTIG_PAGES)
+        return;
+    contig_lock();
+    for (q = first; q < first + n && !g_contig_used[q]; q++)
+        ;
+    if (q == first + n) {
+        contig_take(first, n);
+        g_contig_allocs++;
+        contig_report("claim", XBOX_CONTIG_BASE + first * CONTIG_PAGE, n);
+    }
+    contig_unlock();
+}
+
+/* Release a block. Returns 1 if va is the start of one, 0 if this arena never
+ * handed it out -- the caller decides whether that is someone else's. */
+int xbox_ContiguousFree(uint32_t va)
+{
+    static int warned;
+    uint32_t first, n;
+
+    if (va < XBOX_CONTIG_BASE
+            || (uint64_t)va >= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return 0;
+    first = (va - XBOX_CONTIG_BASE) / CONTIG_PAGE;
+
+    contig_lock();
+    n = (va & (CONTIG_PAGE - 1)) ? 0 : g_contig_len[first];
+    if (!n) {
+        contig_unlock();
+        if (warned++ < 8) {
+            fprintf(stderr, "  [CONTIG] free of 0x%08X: not the start of a "
+                    "block, ignored\n", va);
+            fflush(stderr);
+        }
+        return 0;
+    }
+    memset(&g_contig_used[first], 0, n);
+    g_contig_len[first] = 0;
+    g_contig_pages_in_use -= n;
+    if (first < g_contig_first_free)
+        g_contig_first_free = first;
+    g_contig_frees++;
+    contig_report("free", va, n);
+    contig_unlock();
+    return 1;
+}
+
+/* Bytes from va to the end of the block containing it, or 0 if va is not in
+ * an allocated block -- the same convention as xbox_HeapBlockSize, and for
+ * the same caller, MmQueryAllocationSize. */
+uint32_t xbox_ContiguousBlockSize(uint32_t va)
+{
+    uint32_t page, first, result = 0;
+
+    if (va < XBOX_CONTIG_BASE
+            || (uint64_t)va >= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return 0;
+    page = (va - XBOX_CONTIG_BASE) / CONTIG_PAGE;
+    contig_lock();
+    if (g_contig_used[page]) {
+        first = page;
+        while (first > 0 && !g_contig_len[first])
+            first--;
+        result = XBOX_CONTIG_BASE + (first + g_contig_len[first]) * CONTIG_PAGE
+               - va;
+    }
+    contig_unlock();
+    return result;
+}
+
+/* High-water mark of the window: everything below it was, at some point,
+ * memory a MmAllocateContiguousMemory call returned.
  *
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
- * a surface offset is physical, and only the window makes it addressable. */
+ * a surface offset is physical, and only the window makes it addressable.
+ * Never decreases, so a freed-and-reused texture stays addressable. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
-    return g_contig_next - XBOX_CONTIG_BASE;
+    return g_contig_high;
+}
+
+/* Bytes in use right now. */
+uint32_t xbox_ContiguousInUseBytes(void)
+{
+    return g_contig_pages_in_use * CONTIG_PAGE;
 }
 
 
