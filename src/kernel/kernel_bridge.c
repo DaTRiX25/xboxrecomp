@@ -2437,24 +2437,59 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
-static void kernel_vblank_tick(void)
+/* Vblank N is due at t0 + N * 1000 / 60 ms: an absolute schedule, so the
+ * rate is 60 Hz however coarse the caller's tick. It used to be "now + 16"
+ * checked on a 10 ms tick, which fired every 20 ms -- 50 Hz -- and the movie's
+ * frame limiter counts these. A host that falls more than 100 ms behind
+ * (a debugger stop, a stalled timer thread) restarts the schedule instead of
+ * firing a burst.
+ *
+ * Returns the milliseconds until the next one is due (10 when disabled), so
+ * the timer thread can sleep exactly that long. */
+static long kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    static long long t0;
+    static unsigned long long count;
+    long long now, due;
+    long wait;
 
     if (enabled < 0)
         enabled = getenv("RECOMP_VBLANK") != NULL;
     if (!enabled)
-        return;
+        return 10;
 
     now = (long long)GetTickCount64();
-    if (now < next_ms)
-        return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    if (!t0)
+        t0 = now;
+    due = t0 + (long long)(count * 1000ull / 60ull);
+    if (now < due)
+        return (long)(due - now);
+    if (now - due > 100) {
+        t0 = now;
+        count = 0;
+    }
+    count++;
+    {
+        /* One line per 600 vblanks: should read ~10000 ms. */
+        static unsigned long long total;
+        static long long last_ms;
+
+        if (++total % 600 == 0) {
+            fprintf(stderr, "  [NV2A] vblank %llu: last 600 in %lld ms\n",
+                    total, last_ms ? now - last_ms : 0);
+            fflush(stderr);
+            last_ms = now;
+        } else if (total == 1) {
+            last_ms = now;
+        }
+    }
+    wait = (long)(t0 + (long long)(count * 1000ull / 60ull) - now);
+    if (wait < 1)
+        wait = 1;
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
-        return;
+        return wait;
 
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
@@ -2468,6 +2503,7 @@ static void kernel_vblank_tick(void)
                     claimed ? "claimed it" : "declined it");
         fflush(stderr);
     }
+    return wait;
 }
 
 /* Run whatever is queued. Called from the timer thread, which has the guest
@@ -2717,6 +2753,7 @@ static int g_timer_started;
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
+    long wait = 10;
 
     (void)unused;
     xbox_log_thread_role("kernel-timer", 0);
@@ -2742,12 +2779,29 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+#ifdef _WIN32
+    /* Sleep(1) is 15.6 ms on native Windows without this, which would make
+     * the vblank schedule below run at 32 Hz. Wine needs nothing. */
+    {
+        typedef unsigned (WINAPI *tbp_fn)(unsigned);
+        HMODULE winmm = LoadLibraryA("winmm.dll");
+        tbp_fn tbp = winmm ? (tbp_fn)(void *)GetProcAddress(winmm,
+                                                           "timeBeginPeriod")
+                           : NULL;
+        if (tbp)
+            tbp(1);
+    }
+#endif
+
     for (;;) {
         long long now;
         int i;
 
-        Sleep(10);
-        kernel_vblank_tick();  /* the GPU's frame clock */
+        /* Until the next vblank, at most the 10 ms timer tick. */
+        Sleep((DWORD)(wait < 1 ? 1 : wait));
+        wait = kernel_vblank_tick();  /* the GPU's frame clock */
+        if (wait > 10)
+            wait = 10;
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
