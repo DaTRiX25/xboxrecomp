@@ -256,6 +256,12 @@ typedef struct NV2ACombinerState {
 
     /* --- Final combiner flags (second word, [7:0]) --- */
     DWORD final_flags; /* 0x20 invert V1, 0x40 invert R0, 0x80 clamp V1+R0 */
+
+    /* 1: the pixel shader's input also carries the vertex fog factor (FOG,
+     * after TEXCOORD3, as d3d8_vsh.c's VS_OUT has it) and the FOG register's
+     * alpha is that factor (xemu psh.c: vec4(fogColor.rgb, clamp(vtxFog))).
+     * 0: FOG is the constant fog colour, as before. */
+    int fog_input;
 } NV2ACombinerState;
 
 /* ================================================================

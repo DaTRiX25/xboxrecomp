@@ -61,7 +61,7 @@ static UINT                    s_back_w, s_back_h;
 static compile_fn              s_compile;
 
 static ID3D11Buffer           *s_cb_consts;     /* b1: c[192]            */
-static ID3D11Buffer           *s_cb_vp;         /* b2: vp_scale, vp_off  */
+static ID3D11Buffer           *s_cb_vp;         /* b2: viewport, fog, specular */
 static ID3D11Buffer           *s_cb_ps;         /* PS b0: PsConsts       */
 static ID3D11Buffer           *s_vb;            /* ring of float4 streams */
 static UINT                    s_vb_size, s_vb_pos;
@@ -138,7 +138,7 @@ static VsEntry s_vs[VS_MAX];
 
 #define BLEND_MAX 32
 typedef struct {
-    uint32_t          key[3];
+    uint32_t          key[4];
     ID3D11BlendState *bs;
 } BlendEntry;
 static BlendEntry s_blend[BLEND_MAX];
@@ -259,7 +259,7 @@ static const char s_vs_passthrough_src[] =
     "    VS_OUT o = (VS_OUT)0;\n"
     "    o.oPos = float4(i.v0.xy * vp_scale.xy + vp_off.xy,\n"
     "                    saturate(i.v0.z * vp_scale.z), 1.0);\n"
-    "    o.oD0 = i.v3; o.oD1 = i.v4;\n"
+    "    o.oD0 = i.v3; o.oD1 = i.v4; o.oFog = 1.0;\n"
     "    o.oT0 = i.v9; o.oT1 = i.v10; o.oT2 = i.v11; o.oT3 = i.v12;\n"
     "    return o;\n"
     "}\n";
@@ -329,7 +329,7 @@ static int init(void)
     s_back_h = 480;
 
     s_cb_consts = make_buffer(NV2A_VSH_CONSTANTS * 16, D3D11_BIND_CONSTANT_BUFFER);
-    s_cb_vp     = make_buffer(32, D3D11_BIND_CONSTANT_BUFFER);
+    s_cb_vp     = make_buffer(80, D3D11_BIND_CONSTANT_BUFFER);
     s_cb_ps     = make_buffer(sizeof(PsConsts), D3D11_BIND_CONSTANT_BUFFER);
     s_vb_size   = 8u << 20;
     s_vb        = make_buffer(s_vb_size, D3D11_BIND_VERTEX_BUFFER);
@@ -889,7 +889,7 @@ static D3D11_BLEND blend_factor(uint32_t gl, int alpha)
 static ID3D11BlendState *blend_state(void)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
-    uint32_t key[3];
+    uint32_t key[4];
     D3D11_BLEND_DESC bd;
     ID3D11BlendState *bs = NULL;
     int i;
@@ -897,6 +897,7 @@ static ID3D11BlendState *blend_state(void)
     key[0] = g->blend_enable ? 1 : 0;
     key[1] = key[0] ? g->blend_sfactor : 0;
     key[2] = key[0] ? g->blend_dfactor : 0;
+    key[3] = g->color_keep;             /* SET_COLOR_MASK, inverted */
     for (i = 0; i < s_blend_n; i++)
         if (!memcmp(s_blend[i].key, key, sizeof key))
             return s_blend[i].bs;
@@ -908,7 +909,11 @@ static ID3D11BlendState *blend_state(void)
     bd.RenderTarget[0].SrcBlendAlpha = blend_factor(key[1], 1);
     bd.RenderTarget[0].DestBlendAlpha = blend_factor(key[2], 1);
     bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    bd.RenderTarget[0].RenderTargetWriteMask = (UINT8)(
+        ((key[3] & 0x00FF0000u) ? 0 : D3D11_COLOR_WRITE_ENABLE_RED)
+      | ((key[3] & 0x0000FF00u) ? 0 : D3D11_COLOR_WRITE_ENABLE_GREEN)
+      | ((key[3] & 0x000000FFu) ? 0 : D3D11_COLOR_WRITE_ENABLE_BLUE)
+      | ((key[3] & 0xFF000000u) ? 0 : D3D11_COLOR_WRITE_ENABLE_ALPHA));
     if (!key[0]) {
         bd.RenderTarget[0].SrcBlend = bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
         bd.RenderTarget[0].DestBlend = bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
@@ -1065,6 +1070,7 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x01: return 0x1B;     /* AY8 */
     case 0x1A: return 0x20;     /* A8Y8 */
     case 0x27: return 0x37;     /* R6G5B5 */
+    case 0x28: return 0x17;     /* G8B8 */
     case 0x32: return 0x35;     /* Y16 */
     case 0x38: return 0x3D;     /* R5G5B5A1 */
     case 0x39: return 0x3E;     /* R4G4B4A4 */
@@ -1080,7 +1086,7 @@ static uint32_t texel_bytes(uint32_t lin)
     switch (lin) {
     case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
     case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25:
-    case 0x20: case 0x37: case 0x35: case 0x3D: case 0x3E: return 2;
+    case 0x20: case 0x37: case 0x35: case 0x3D: case 0x3E: case 0x17: return 2;
     case 0x13: case 0x1F: case 0x1B: case 0x0B: return 1;
     default: return 0;
     }
@@ -1176,6 +1182,9 @@ static uint32_t decode_texel(uint32_t fmt, const uint8_t *p, uint32_t u)
     case 0x20:                              /* A8Y8: Y low byte, A high */
         t = ((const uint16_t *)p)[u];
         return ((t >> 8) << 24) | (t & 0xFFu) * 0x010101u;
+    case 0x17:                              /* G8B8: xemu RG8, swizzle (R,G,R,G) */
+        t = ((const uint16_t *)p)[u];
+        return ((t >> 8) << 24) | ((t & 0xFFu) << 16) | ((t >> 8) << 8) | (t & 0xFFu);
     case 0x35:                              /* Y16: top byte */
         t = ((const uint16_t *)p)[u] >> 8;
         return 0xFF000000u | t * 0x010101u;
@@ -1783,6 +1792,7 @@ static ID3D11PixelShader *setup_pixel(void)
         d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw,
                                  v->rc_aocw, v->rc_ctl, v->rc_fcw0,
                                  v->rc_fcw1, modes, &st);
+        st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
         s_last_rc = st;
         s_last_rc_on = 1;
         if ((ps = debug_ps()) != NULL)
@@ -2213,7 +2223,8 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 s_ctx, (ID3D11Resource *)s_cb_vp, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &m))) {
             float zmax = ((g->format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
-            float c[8];
+            float c[12];
+            uint32_t u[8];
             c[0] = 2.0f / (float)rt->w;
             c[1] = -2.0f / (float)rt->h;
             c[2] = 1.0f / zmax;
@@ -2222,7 +2233,28 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             c[5] = 1.0f;
             c[6] = 0.0f;
             c[7] = 0.0f;
+            /* Fog and specular, as the CPU path's vsh_fog_factor and
+             * vsh_transform apply them (xemu vsh.c). */
+            c[8] = v->fog_param[0];
+            c[9] = v->fog_param[1];
+            c[10] = v->fog_param[2];
+            c[11] = 0.0f;
+            memset(u, 0, sizeof u);
+            switch (v->fog_mode) {
+            case 0x2601: u[1] = 0; u[2] = 0; u[3] = 1; break;   /* LINEAR */
+            case 0x0804: u[1] = 0; u[2] = 1; u[3] = 1; break;   /* LINEAR_ABS */
+            case 0x0800: u[1] = 1; u[2] = 0; u[3] = 1; break;   /* EXP */
+            case 0x0802: u[1] = 1; u[2] = 1; u[3] = 0; break;   /* EXP_ABS */
+            case 0x0801: u[1] = 2; u[2] = 0; u[3] = 0; break;   /* EXP2 */
+            case 0x0803: u[1] = 2; u[2] = 1; u[3] = 0; break;   /* EXP2_ABS */
+            default: break;                                     /* not set: no fog */
+            }
+            u[0] = (v->fog_enable && (v->fog_mode == 0x2601
+                    || (v->fog_mode >= 0x800 && v->fog_mode <= 0x804))) ? 1u : 0u;
+            u[4] = v->spec_enable ? 1u : 0u;
+            u[5] = (v->light_ctl >> 17) & 1u;
             memcpy(m.pData, c, sizeof c);
+            memcpy((uint8_t *)m.pData + sizeof c, u, sizeof u);
             ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_vp, 0);
         }
     }

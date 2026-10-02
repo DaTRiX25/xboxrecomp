@@ -121,6 +121,10 @@ struct nv2a_pb_gpu {
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
+    /* SET_COLOR_MASK, inverted: the ARGB bits a draw leaves alone. 0 (the
+     * reset state) writes every channel; 0xFFFFFFFF writes none, as for a
+     * stencil- or depth-only pass. */
+    uint32_t color_keep;
     Texture  tex;
     uint32_t sema_dma, sema_offset;     /* SET_CONTEXT_DMA_SEMAPHORE / _OFFSET */
     int      sema_offset_set;           /* offset 0 is a real address (0x80000000) */
@@ -131,6 +135,7 @@ typedef struct {
     float x, y, z, w;           /* screen pixels, depth units, clip w */
     float d0[4], d1[4];
     float t[4][4];              /* oT0..oT3 */
+    float fog;                  /* fog factor (FOG register alpha), unclamped */
     int   ok;
 } XfVert;
 
@@ -155,6 +160,12 @@ struct nv2a_pb_vsh {
     uint32_t atest_func, atest_ref;
     int      poly_offset;
     float    poly_factor, poly_bias;
+    /* Fog and specular, as xemu's vsh.c turns them into vtxFog and vtxD1.
+     * fog_mode and fog_gen are the raw SET_FOG_MODE / SET_FOG_GEN_MODE
+     * parameters (0x800 EXP, 0x801 EXP2, 0x802 EXP_ABS, 0x803 EXP2_ABS,
+     * 0x804 LINEAR_ABS, 0x2601 LINEAR); fog_param is SET_FOG_PARAMS. */
+    uint32_t fog_mode, fog_gen, spec_enable, light_ctl;
+    float    fog_param[3];
     /* survey */
     uint32_t prog_dwords, prog_loads, prog_starts, const_dwords, const_loads;
     uint32_t mode_sets, ff_matrix_dwords, vp_dwords;

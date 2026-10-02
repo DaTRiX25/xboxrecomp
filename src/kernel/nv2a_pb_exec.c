@@ -202,6 +202,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define IMM_VERTEX_DWORDS 7
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
+#define NV097_SET_COLOR_MASK              0x0358
 
 /* GPU completion fences. D3D names a semaphore DMA object once, points the
  * semaphore at a word inside it once, and from then on asks the back end to
@@ -940,6 +941,7 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x01: return 0x1B;                /* AY8       -> LIN_AY8       */
     case 0x1A: return 0x20;                /* A8Y8      -> LIN_A8Y8      */
     case 0x27: return 0x37;                /* R6G5B5    -> LIN_R6G5B5    */
+    case 0x28: return 0x17;                /* G8B8      -> LIN_G8B8      */
     case 0x32: return 0x35;                /* Y16       -> LIN_Y16       */
     case 0x38: return 0x3D;                /* R5G5B5A1  -> LIN_R5G5B5A1  */
     case 0x39: return 0x3E;                /* R4G4B4A4  -> LIN_R4G4B4A4  */
@@ -1080,6 +1082,14 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
     case 0x20: {                                    /* LIN_A8Y8: Y low, A high */
         uint32_t t = ((const uint16_t *)p)[u];
         *argb = ((t >> 8) << 24) | (t & 0xFFu) * 0x010101u;
+        return 1;
+    }
+    case 0x17: {                                    /* LIN_G8B8 (and V8U8) */
+        /* xemu's table loads it as GL_RG8 (low byte red, high byte green)
+         * and swizzles to (R, G, R, G): so B and R are the low byte, G and
+         * A the high one. A bump-map stage reads it back from b and g. */
+        uint32_t t = ((const uint16_t *)p)[u], lo = t & 0xFFu, hi = t >> 8;
+        *argb = (hi << 24) | (lo << 16) | (hi << 8) | lo;
         return 1;
     }
     case 0x35: {                                    /* LIN_Y16: top byte */
@@ -1295,6 +1305,8 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     } else {
         row = s_surface + (size_t)y * s_gpu.pitch;
     }
+    if (s_gpu.color_keep == 0xFFFFFFFFu)
+        return;                            /* SET_COLOR_MASK: no channel written */
     s_gpu.pixels++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
@@ -1358,11 +1370,22 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     }
 
     if (bpp == 4) {
+        uint32_t keep = s_gpu.color_keep;
+        if (keep)
+            argb = (argb & ~keep) | (((const uint32_t *)row)[x] & keep);
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {
-        ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
-                                        | ((argb >> 5) & 0x07E0)
-                                        | ((argb >> 3) & 0x001F));
+        uint16_t v = (uint16_t)(((argb >> 8) & 0xF800)
+                              | ((argb >> 5) & 0x07E0)
+                              | ((argb >> 3) & 0x001F));
+        uint32_t keep = s_gpu.color_keep;
+        if (keep & 0x00FFFFFFu) {
+            uint16_t k = (uint16_t)(((keep & 0x00FF0000u) ? 0xF800u : 0)
+                                  | ((keep & 0x0000FF00u) ? 0x07E0u : 0)
+                                  | ((keep & 0x000000FFu) ? 0x001Fu : 0));
+            v = (uint16_t)((v & ~k) | (((const uint16_t *)row)[x] & k));
+        }
+        ((uint16_t *)row)[x] = v;
     }
 }
 
@@ -1723,18 +1746,18 @@ static int vsh_enabled(void)
 /* The transform-unit methods. Returns 1 if `method` was one of them. */
 /* RECOMP_WHITE_TRACE: state the executor does not otherwise keep, recorded
  * for the per-batch trace only. */
-static uint32_t s_wt_spec = ~0u, s_wt_fogmode = ~0u, s_wt_foggen = ~0u, s_wt_light = ~0u;
-static float s_wt_fogp[3];
+static uint32_t s_wt_light = ~0u;
 
 static int vsh_method(uint32_t method, uint32_t param)
 {
     switch (method) {
-    case 0x03B8: s_wt_spec = param; break;          /* SET_SPECULAR_ENABLE */
-    case 0x029C: s_wt_fogmode = param; break;       /* SET_FOG_MODE */
-    case 0x02A0: s_wt_foggen = param; break;        /* SET_FOG_GEN_MODE */
+    case 0x03B8: s_vsh.spec_enable = param != 0; return 1;  /* SET_SPECULAR_ENABLE */
+    case 0x0294: s_vsh.light_ctl = param; return 1;         /* SET_LIGHT_CONTROL */
+    case 0x029C: s_vsh.fog_mode = param; return 1;          /* SET_FOG_MODE */
+    case 0x02A0: s_vsh.fog_gen = param; return 1;           /* SET_FOG_GEN_MODE */
     case 0x0314: s_wt_light = param; break;         /* SET_LIGHTING_ENABLE */
     case 0x09C0: case 0x09C4: case 0x09C8:          /* SET_FOG_PARAMS */
-        s_wt_fogp[(method - 0x09C0) / 4] = u2f(param); break;
+        s_vsh.fog_param[(method - 0x09C0) / 4] = u2f(param); return 1;
     default: break;
     }
     if (method >= NV097_SET_TRANSFORM_PROGRAM_M
@@ -1993,6 +2016,45 @@ static void vsh_inputs(uint32_t index, float v[NV2A_VSH_INPUTS][4])
     }
 }
 
+/* The fog factor for one vertex, from the program's oFog.x: xemu vsh.c,
+ * including its offsets (fogParam.x is 1.5 for the EXP modes and the factor
+ * comes out of exp2 shifted by it). A program-mode batch takes the fog
+ * distance from oFog.x whatever SET_FOG_GEN_MODE says. Disabled fog is 1:
+ * the final combiner's FOG alpha then leaves the colour alone. */
+static float vsh_fog_factor(float d)
+{
+    float p0 = s_vsh.fog_param[0], p1 = s_vsh.fog_param[1], f;
+    int abs_ = 0;
+
+    if (!s_vsh.fog_enable)
+        return 1.0f;
+    if (isinf(d))
+        return (s_vsh.fog_mode == 0x2601 || s_vsh.fog_mode == 0x804
+                || s_vsh.fog_mode == 0x800) ? 1.0f : 0.0f;
+    switch (s_vsh.fog_mode) {
+    case 0x804: abs_ = 1; /* fallthrough */          /* LINEAR_ABS */
+    case 0x2601:                                     /* LINEAR */
+        f = p0 + d * p1 - 1.0f;
+        break;
+    case 0x802: abs_ = 1; /* fallthrough */          /* EXP_ABS */
+    case 0x800:                                      /* EXP */
+        f = p0 + exp2f(d * p1 * 16.0f) - 1.5f;
+        break;
+    case 0x803: abs_ = 1; /* fallthrough */          /* EXP2_ABS */
+    case 0x801:                                      /* EXP2 */
+        f = p0 + exp2f(-d * d * p1 * p1 * 32.0f) - 1.5f;
+        break;
+    default:
+        return 1.0f;
+    }
+    if (abs_)
+        f = fabsf(f);
+    if (isnan(f))
+        return (s_vsh.fog_mode == 0x2601 || s_vsh.fog_mode == 0x804
+                || s_vsh.fog_mode == 0x800) ? 1.0f : 0.0f;
+    return f;
+}
+
 static void vsh_transform(uint32_t index, XfVert *xv)
 {
     float v[NV2A_VSH_INPUTS][4];
@@ -2015,6 +2077,16 @@ static void vsh_transform(uint32_t index, XfVert *xv)
         for (t = 0; t < 4; t++)
             xv->t[t][k] = o.o[NV2A_VSH_O_T0 + t][k];
     }
+    /* What xemu's vsh.c does after the program: vtxD1 is (0, 0, 0, 1) unless
+     * specular is enabled, and then its alpha is 1 unless SET_LIGHT_CONTROL
+     * asks for ALPHA_FROM_MATERIAL_SPECULAR (bit 17). */
+    if (!s_vsh.spec_enable) {
+        xv->d1[0] = xv->d1[1] = xv->d1[2] = 0.0f;
+        xv->d1[3] = 1.0f;
+    } else if (!(s_vsh.light_ctl & (1u << 17))) {
+        xv->d1[3] = 1.0f;
+    }
+    xv->fog = vsh_fog_factor(o.o[NV2A_VSH_O_FOG][0]);
     /* ok means usable: the program finished and the position is finite. A
      * vertex behind the eye (w <= 0) or far outside the surface is usable --
      * clip_tri cuts the triangle down to the part that is in front. */
@@ -2669,7 +2741,8 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
                     r[5][k] = pa * a->d1[k] + pb * b->d1[k] + pc * c->d1[k];
                 rc_unpack(s_vsh.fog_color, r[3]);
                 { float t_ = r[3][0]; r[3][0] = r[3][2]; r[3][2] = t_; } /* RGBA */
-                r[3][3] = 1.0f;
+                r[3][3] = s_vsh.fog_enable
+                        ? clamp01(pa * a->fog + pb * b->fog + pc * c->fog) : 1.0f;
                 for (n = 0; n < 4; n++) {
                     if (!s_stage_mode[n])
                         continue;
@@ -2805,7 +2878,7 @@ static uint32_t tc_texel_bytes(uint32_t lin)
     switch (lin) {
     case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
     case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25:
-    case 0x20: case 0x35: case 0x37: case 0x3D: case 0x3E: return 2;
+    case 0x20: case 0x35: case 0x37: case 0x3D: case 0x3E: case 0x17: return 2;
     case 0x13: case 0x1F: case 0x1B: return 1;    /* not P8: its palette is not in the key */
     default: return 0;
     }
@@ -3008,6 +3081,7 @@ static struct {
     int      v1_inv, r0_inv, sum_clamp;
     float    tmpl[16][4];                /* register file at pixel start */
     uint32_t dirty;                      /* registers reset between pixels */
+    int      fog_var;                    /* FOG alpha varies per pixel */
 } s_rcp;
 
 /* Registers whose value at a stage's input is the same for every pixel. */
@@ -3017,7 +3091,7 @@ static const float *rc_const_reg(uint32_t reg, const float f0[4], const float f1
     if (reg == 0) return s_rcp.tmpl[0];
     if (reg == 1) return f0;
     if (reg == 2) return f1;
-    if (reg == 3 && !(written & (1u << 3))) return s_rcp.tmpl[3];
+    if (reg == 3 && !(written & (1u << 3)) && !s_rcp.fog_var) return s_rcp.tmpl[3];
     return NULL;
 }
 
@@ -3081,6 +3155,7 @@ static void rc_plan_build(void)
     rc_unpack(s_vsh.fog_color, s_rcp.tmpl[3]);
     { float t_ = s_rcp.tmpl[3][0]; s_rcp.tmpl[3][0] = s_rcp.tmpl[3][2]; s_rcp.tmpl[3][2] = t_; }
     s_rcp.tmpl[3][3] = 1.0f;
+    s_rcp.fog_var = s_vsh.fog_enable;
 
     s_rcp.stages = s_vsh.rc_ctl & 0xFF;
     if (s_rcp.stages > 8)
@@ -3485,6 +3560,8 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                 memcpy(r[4], col, sizeof col);
                 for (k = 0; k < 4; k++)
                     r[5][k] = pa * a->d1[k] + pb * b->d1[k] + pc * c->d1[k];
+                if (s_rcp.fog_var)
+                    r[3][3] = clamp01(pa * a->fog + pb * b->fog + pc * c->fog);
                 for (n = 0; n < 4; n++) {
                     if (!s_stage_mode[n])
                         continue;
@@ -3635,6 +3712,7 @@ static void clip_lerp(const ClipVert *a, const ClipVert *b, float t, ClipVert *o
     int k, n;
     if (!(t >= 0.0f)) t = 0.0f;
     if (t > 1.0f)     t = 1.0f;
+    o->v.fog = a->v.fog + t * (b->v.fog - a->v.fog);
     for (k = 0; k < 4; k++) {
         o->h[k] = a->h[k] + t * (b->h[k] - a->h[k]);
         o->v.d0[k] = a->v.d0[k] + t * (b->v.d0[k] - a->v.d0[k]);
@@ -3830,9 +3908,9 @@ static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
     fprintf(stderr, "[WHITE] batch prim %u n %u prog start %u len %u | spec %d light %d"
                     " fog en %d mode 0x%X gen %u params %g %g %g colour %08X | rc %d ctl %08X"
                     " shader %08X | stage fmt %02X %02X %02X %02X mode %d %d %d %d\n",
-            s_gpu.prim, n, s_vsh.start, plen, (int)s_wt_spec, (int)s_wt_light,
-            s_vsh.fog_enable, s_wt_fogmode, s_wt_foggen, s_wt_fogp[0], s_wt_fogp[1],
-            s_wt_fogp[2], s_vsh.fog_color, vsh_rc_active(), s_vsh.rc_ctl, s_vsh.shader_prog,
+            s_gpu.prim, n, s_vsh.start, plen, (int)s_vsh.spec_enable, (int)s_wt_light,
+            s_vsh.fog_enable, s_vsh.fog_mode, s_vsh.fog_gen, s_vsh.fog_param[0],
+            s_vsh.fog_param[1], s_vsh.fog_param[2], s_vsh.fog_color, vsh_rc_active(), s_vsh.rc_ctl, s_vsh.shader_prog,
             s_stage_tex[0].color, s_stage_tex[1].color, s_stage_tex[2].color,
             s_stage_tex[3].color, s_stage_mode[0], s_stage_mode[1], s_stage_mode[2],
             s_stage_mode[3]);
@@ -3854,6 +3932,39 @@ static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
                     k, s_gpu.attr[k].type, s_gpu.attr[k].size, s_gpu.attr[k].stride,
                     s_gpu.attr[k].offset, s_gpu.inline_active, s_vsh.inl[k][0], s_vsh.inl[k][1],
                     s_vsh.inl[k][2], s_vsh.inl[k][3]);
+    if (getenv("RECOMP_WHITE_RAW") && !s_gpu.inline_active && s_gpu.attr[0].offset) {
+        /* RECOMP_WHITE_RAW=1: the raw bytes of the batch's first vertices. */
+        const uint8_t *mem_ = (const uint8_t *)xbox_GetMemoryOffset();
+        uint32_t vi, b_, st_ = s_gpu.attr[0].stride;
+        for (vi = 0; vi < n && vi < 4 && st_; vi++) {
+            fprintf(stderr, "[WHITE]  raw idx %u @%08X:", s_gpu.idx[vi],
+                    s_gpu.attr[0].offset + s_gpu.idx[vi] * st_);
+            for (b_ = 0; b_ < st_ && b_ < 64; b_++)
+                fprintf(stderr, " %02X", mem_[s_gpu.attr[0].offset + s_gpu.idx[vi] * st_ + b_]);
+            fprintf(stderr, "\n");
+        }
+        {
+            static const uint32_t ms[] = { 0x358, 0x35C, 0x32C, 0x360, 0x364,
+                0x368, 0x36C, 0x370, 0x374, 0x1D84, 0x1D7C, 0x1D78, 0x300, 0x304 };
+            uint32_t mi;
+            int ui;
+            fprintf(stderr, "[WHITE]  unhandled state:");
+            for (mi = 0; mi < sizeof ms / sizeof ms[0]; mi++)
+                for (ui = 0; ui < s_unhandled_count; ui++)
+                    if (s_unhandled[ui].method == ms[mi])
+                        fprintf(stderr, " %X=%08X", ms[mi], s_unhandled[ui].last_param);
+            fprintf(stderr, "\n");
+        }
+        if (s_stage_tex[0].width <= 16 && s_stage_tex[0].height <= 16) {
+            uint32_t tx, ty, tv;
+            for (ty = 0; ty < s_stage_tex[0].height; ty++) {
+                fprintf(stderr, "[WHITE]  tex0 row %2u:", ty);
+                for (tx = 0; tx < s_stage_tex[0].width; tx++)
+                    fprintf(stderr, " %08X", sample_tex(&s_stage_tex[0], tx, ty, &tv) ? tv : 0xDEADu);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     fprintf(stderr, "[WHITE]  c58 %g %g %g %g c59 %g %g %g %g vp_scale %g %g %g %g vp_off %g %g %g %g\n",
             s_vsh.c[58][0], s_vsh.c[58][1], s_vsh.c[58][2], s_vsh.c[58][3],
             s_vsh.c[59][0], s_vsh.c[59][1], s_vsh.c[59][2], s_vsh.c[59][3],
@@ -3898,7 +4009,8 @@ static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
         }
         rc_unpack(s_vsh.fog_color, r[3]);
         { float t_ = r[3][0]; r[3][0] = r[3][2]; r[3][2] = t_; }
-        r[3][3] = 1.0f;
+        r[3][3] = s_vsh.fog_enable
+                ? clamp01(pa * a->fog + pb * b->fog + pc * c->fog) : 1.0f;
         for (st = 0; st < 4; st++) {
             float tc[4];
             if (!s_stage_mode[st])
@@ -5076,6 +5188,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_BLEND_FUNC_DFACTOR:
         s_gpu.blend_dfactor = param;
+        break;
+    case NV097_SET_COLOR_MASK:
+        /* One enable bit per channel (xemu pgraph.c): B bit 0, G bit 8,
+         * R bit 16, A bit 24. BLiNX 2 draws a stencil-only quad round the
+         * player with all four off; written anyway it is a white square. */
+        s_gpu.color_keep = ((param & (1u << 24)) ? 0 : 0xFF000000u)
+                         | ((param & (1u << 16)) ? 0 : 0x00FF0000u)
+                         | ((param & (1u <<  8)) ? 0 : 0x0000FF00u)
+                         | ((param & (1u <<  0)) ? 0 : 0x000000FFu);
         break;
     case NV097_CLEAR_SURFACE:
         if (s_backend->on_zclear)
