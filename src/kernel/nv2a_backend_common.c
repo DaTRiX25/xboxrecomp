@@ -131,13 +131,9 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
     t->addr_u =  r[0x08 / 4]       & 0xF;
     t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
     t->filter = r[0x14 / 4];
-    /* P8: SET_TEXTURE_PALETTE (0x1B20): offset in bits 6-31, length
-     * 256 >> bits 2-3, entries A8R8G8B8. */
-    if (t->color == NV2A_TEX_P8) {
-        uint32_t pal = r[0x20 / 4];
-        t->palette = (pal & ~0x3Fu) ? resolve(pal & ~0x3Fu) : 0;
-        t->pal_len = 256u >> ((pal >> 2) & 3u);
-    }
+    /* P8: SET_TEXTURE_PALETTE (0x1B20). */
+    if (t->color == NV2A_TEX_P8)
+        nv2a_tex_palette_decode(r[0x20 / 4], resolve, &t->palette, &t->pal_len);
     t->levels = 1;
     if (from_fmt && (flags & NV2A_STAGE_MIPS)) {
         /* As xemu's pgraph_get_texture_shape: the format's count, no more

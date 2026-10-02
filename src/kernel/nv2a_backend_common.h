@@ -294,6 +294,17 @@ struct nv2a_stage {
 
 typedef uint32_t (*nv2a_dma_resolve_fn)(uint32_t offset);
 
+/* SET_TEXTURE_PALETTE (0x1B20 + 0x40 * stage): DMA offset in bits 6-31,
+ * length 256 >> bits 2-3 entries of A8R8G8B8. *pal is the resolved guest
+ * address, 0 for none. */
+static inline void nv2a_tex_palette_decode(uint32_t reg,
+                                           nv2a_dma_resolve_fn resolve,
+                                           uint32_t *pal, uint32_t *len)
+{
+    *pal = (reg & ~0x3Fu) ? resolve(reg & ~0x3Fu) : 0;
+    *len = 256u >> ((reg >> 2) & 3u);
+}
+
 /* Stage n from its 16 registers r (SET_TEXTURE_OFFSET 0x1B00 + 0x40 * n
  * onwards) and their written flags, with the shader-stage program
  * (shader_set false: stage 0 2D, the rest off). mode is the program's mode,

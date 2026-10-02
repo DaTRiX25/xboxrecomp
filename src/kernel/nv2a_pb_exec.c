@@ -301,6 +301,9 @@ static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
     s_tex_set[(method - NV_TEX_FIRST) / 4] = 1;
+    if (method == 0x1B20u)              /* stage 0 SET_TEXTURE_PALETTE */
+        nv2a_tex_palette_decode(param, dma_resolve, &s_gpu.tex.palette,
+                                &s_gpu.tex.pal_len);
     /* A pitch is a linear texture's property. A swizzled one has no rows and
      * so no pitch, and requiring one here refused every swizzled texture --
      * which is nearly all of them, since swizzled is the Xbox default. That
@@ -1132,19 +1135,6 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
 
 static uint64_t s_tex_fail[256];        /* texels refused, by format code */
 
-/* SET_TEXTURE_PALETTE (0x1B20 + 0x40 * stage): the DMA offset in bits 6-31,
- * the length in bits 2-3 as 256 >> n entries of A8R8G8B8. Only P8 reads it. */
-static int tex_stage_of(const Texture *t);
-static const uint32_t *tex_palette(const Texture *t, uint32_t *len)
-{
-    uint32_t r = s_tex_reg[(0x1B20u - NV_TEX_FIRST + 0x40u * (uint32_t)tex_stage_of(t)) / 4];
-    uint32_t off = r & ~0x3Fu;
-    *len = 256u >> ((r >> 2) & 3);
-    if (!off)
-        return NULL;
-    return (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset() + dma_resolve(off));
-}
-
 static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -1172,11 +1162,11 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
         p = mem + t->offset + (size_t)v * t->pitch;
     }
 
-    if (fmt == NV2A_TEX_P8) {
-        uint32_t len;
-        const uint32_t *pal = tex_palette(t, &len);
-        return nv2a_tex_decode_texel(fmt, p, u, pal, len, argb);
-    }
+    if (fmt == NV2A_TEX_P8)
+        return nv2a_tex_decode_texel(fmt, p, u,
+                                     t->palette ? (const uint32_t *)(mem + t->palette)
+                                                : NULL,
+                                     t->pal_len, argb);
     if (nv2a_tex_decode_texel(fmt, p, u, NULL, 0, argb))
         return 1;
     /* Magenta, so an undecoded format shows up as itself rather than as the
@@ -1187,12 +1177,6 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
                         " sampling magenta\n", t->color);
     *argb = NV2A_TEX_MAGENTA;
     return 1;
-}
-
-static Texture s_stage_tex[4];          /* defined with the stage state below */
-static int tex_stage_of(const Texture *t)
-{
-    return (t >= s_stage_tex && t < s_stage_tex + 4) ? (int)(t - s_stage_tex) : 0;
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
@@ -2471,6 +2455,8 @@ static void vsh_build_stages(void)
         t->color  = st.color;
         t->addr_u = st.addr_u;
         t->addr_v = st.addr_v;
+        t->palette = st.palette;
+        t->pal_len = st.pal_len;
         t->valid  = st.valid;
         s_vsh.stage_mode_seen[n][st.raw_mode]++;
         s_stage_mode[n] = st.mode;
