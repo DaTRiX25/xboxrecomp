@@ -937,11 +937,33 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
-    default:   return fmt;                 /* already linear, or unhandled */
+    case 0x01: return 0x1B;                /* AY8       -> LIN_AY8       */
+    case 0x1A: return 0x20;                /* A8Y8      -> LIN_A8Y8      */
+    case 0x27: return 0x37;                /* R6G5B5    -> LIN_R6G5B5    */
+    case 0x32: return 0x35;                /* Y16       -> LIN_Y16       */
+    case 0x38: return 0x3D;                /* R5G5B5A1  -> LIN_R5G5B5A1  */
+    case 0x39: return 0x3E;                /* R4G4B4A4  -> LIN_R4G4B4A4  */
+    case 0x3A: return 0x3F;                /* A8B8G8R8  -> LIN_A8B8G8R8  */
+    case 0x3B: return 0x40;                /* B8G8R8A8  -> LIN_B8G8R8A8  */
+    case 0x3C: return 0x41;                /* R8G8B8A8  -> LIN_R8G8B8A8  */
+    default:   return fmt;                 /* already linear, P8, or unhandled */
     }
 }
 
 static uint64_t s_tex_fail[256];        /* texels refused, by format code */
+
+/* SET_TEXTURE_PALETTE (0x1B20 + 0x40 * stage): the DMA offset in bits 6-31,
+ * the length in bits 2-3 as 256 >> n entries of A8R8G8B8. Only P8 reads it. */
+static int tex_stage_of(const Texture *t);
+static const uint32_t *tex_palette(const Texture *t, uint32_t *len)
+{
+    uint32_t r = s_tex_reg[(0x1B20u - NV_TEX_FIRST + 0x40u * (uint32_t)tex_stage_of(t)) / 4];
+    uint32_t off = r & ~0x3Fu;
+    *len = 256u >> ((r >> 2) & 3);
+    if (!off)
+        return NULL;
+    return (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset() + dma_resolve(off));
+}
 
 static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
 {
@@ -1044,6 +1066,51 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
     case 0x1F:                                      /* LIN_A8 */
         *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
         return 1;
+    case 0x1B:                                      /* LIN_AY8: Y in all four */
+        *argb = (uint32_t)p[u] * 0x01010101u;
+        return 1;
+    case 0x0B: {                                    /* P8, through the palette */
+        uint32_t len, i = p[u];
+        const uint32_t *pal = tex_palette(t, &len);
+        *argb = (pal && i < len) ? pal[i] : 0xFFFF00FFu;
+        return 1;
+    }
+
+    /* 16-bit, the rest of the D3D8 set. */
+    case 0x20: {                                    /* LIN_A8Y8: Y low, A high */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = ((t >> 8) << 24) | (t & 0xFFu) * 0x010101u;
+        return 1;
+    }
+    case 0x35: {                                    /* LIN_Y16: top byte */
+        uint32_t t = ((const uint16_t *)p)[u] >> 8;
+        *argb = 0xFF000000u | t * 0x010101u;
+        return 1;
+    }
+    case 0x37: {                                    /* LIN_R6G5B5 */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = 0xFF000000u
+              | (expand((t >> 10) & 0x3F, 6) << 16)
+              | (expand((t >>  5) & 0x1F, 5) <<  8)
+              |  expand( t        & 0x1F, 5);
+        return 1;
+    }
+    case 0x3D: {                                    /* LIN_R5G5B5A1 */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = ((t & 1u) ? 0xFF000000u : 0u)
+              | (expand((t >> 11) & 0x1F, 5) << 16)
+              | (expand((t >>  6) & 0x1F, 5) <<  8)
+              |  expand((t >>  1) & 0x1F, 5);
+        return 1;
+    }
+    case 0x3E: {                                    /* LIN_R4G4B4A4 */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = (expand( t        & 0x0F, 4) << 24)
+              | (expand((t >> 12) & 0x0F, 4) << 16)
+              | (expand((t >>  8) & 0x0F, 4) <<  8)
+              |  expand((t >>  4) & 0x0F, 4);
+        return 1;
+    }
 
     /* 4:2:2 packed YUV, two texels per four bytes.
      *
@@ -1077,9 +1144,21 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
     }
 
     default:
-        s_tex_fail[t->color & 0xFF]++;
-        return 0;
+        /* Magenta, so an undecoded format shows up as itself rather than as
+         * the vertex colour (which made BLiNX 2's P8 and G8B8 surfaces look
+         * like plain white boxes). Logged once per format. */
+        if (!s_tex_fail[t->color & 0xFF]++)
+            fprintf(stderr, "  [GPU] texture format 0x%02X has no decoder;"
+                            " sampling magenta\n", t->color);
+        *argb = 0xFFFF00FFu;
+        return 1;
     }
+}
+
+static Texture s_stage_tex[4];          /* defined with the stage state below */
+static int tex_stage_of(const Texture *t)
+{
+    return (t >= s_stage_tex && t < s_stage_tex + 4) ? (int)(t - s_stage_tex) : 0;
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
@@ -2663,8 +2742,9 @@ static uint32_t tc_texel_bytes(uint32_t lin)
 {
     switch (lin) {
     case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
-    case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25: return 2;
-    case 0x13: case 0x1F: return 1;
+    case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25:
+    case 0x20: case 0x35: case 0x37: case 0x3D: case 0x3E: return 2;
+    case 0x13: case 0x1F: case 0x1B: return 1;    /* not P8: its palette is not in the key */
     default: return 0;
     }
 }
