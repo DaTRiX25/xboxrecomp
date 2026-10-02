@@ -597,16 +597,23 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  *
  *  - Only surfaces the display could scan out set the size: the pitch test
  *    applies to the size scan too, and a surface not drawn or cleared for
- *    PRESENT_STALE_FLIPS flips takes no part at all. Otherwise an entry left
- *    from an earlier, larger display mode at a reused address pins the size
- *    for the rest of the run, no surface of that size is ever drawn again,
- *    and the screen freezes on the last pick before the mode change.
+ *    PRESENT_STALE_FLIPS flips is stale. At the display address the largest
+ *    fresh surface sets the size; when only stale ones sit there, the
+ *    largest of those still does, so no candidate qualifies and the screen
+ *    stays (a pause screen, or a smaller surface drawn elsewhere while the
+ *    back buffers idle, cannot take over). Only when nothing at all sits at
+ *    the display address does the largest fresh surface anywhere set it.
+ *    Without the staleness test an entry left from an earlier, larger display
+ *    mode at a reused address would pin the size for the rest of the run, no
+ *    surface of that size is ever drawn again, and the screen freezes on the
+ *    last pick before the mode change.
  *
  *  - Field rendering (D3DPRESENTFLAG_FIELD): half-height back buffers at
- *    twice the display's pitch. When no surface has the display's own pitch,
- *    a surface at twice it qualifies instead, with a warning the first time.
- *    The runtime does not interleave fields anywhere, so such a pick shows
- *    one field; it beats presenting the buffer about to be drawn. */
+ *    twice the display's pitch. When no surface this run has had the
+ *    display's own pitch (stale or evicted ones included: s_pitch_seen
+ *    latches it), a surface at twice it qualifies instead, with a warning the
+ *    first time. The runtime does not interleave fields anywhere, so such a
+ *    pick shows one field; it beats presenting the buffer about to be drawn. */
 #define PRESENT_MAX 16
 #define PRESENT_STALE_FLIPS 120u
 static struct {
@@ -679,42 +686,72 @@ static void present_note(int clear)
         s_psurf[e].last_draw = s_psurf_seq;
 }
 
-/* Whether s_psurf[i] may be presented: in use, recent, and (with a display
- * mode) at the pitch `want` -- the display's, or twice it for fields. */
-static int present_ok(int i, uint32_t want)
+/* Whether s_psurf[i] is in use and (with a display mode) at the pitch
+ * `want` -- the display's, or twice it for fields. */
+static int present_pitch_ok(int i, uint32_t want)
 {
-    return s_psurf[i].offset
-        && s_gpu.flips - s_psurf[i].last_flip <= PRESENT_STALE_FLIPS
-        && (!want || s_psurf[i].pitch == want);
+    return s_psurf[i].offset && (!want || s_psurf[i].pitch == want);
+}
+
+/* Drawn or cleared within the last PRESENT_STALE_FLIPS flips. */
+static int present_fresh(int i)
+{
+    return s_gpu.flips - s_psurf[i].last_flip <= PRESENT_STALE_FLIPS;
 }
 
 /* At FLIP_STALL: pick what it presents, into s_present. */
 static void present_pick(void)
 {
     static int warned_field;
+    static uint32_t s_pitch_seen;        /* a display pitch some surface had */
     uint32_t disp_pitch = 0, disp = xbox_GetDisplayFramebuffer(&disp_pitch);
     uint32_t tw = 0, th = 0, want = disp_pitch;
-    uint64_t area = 0;
-    int i, pass, tier, best = -1;
+    uint64_t area = 0, stale_area = 0;
+    uint32_t stale_w = 0, stale_h = 0;
+    int i, pass, at_disp, best = -1;
 
-    /* Size: the largest presentable surface at the display address (pass 0),
-     * else the largest presentable one (pass 1). Tier 1 retries at the field
-     * pitch when nothing has the display's. */
-    for (tier = 0; tier < (disp_pitch ? 2 : 1) && !area; tier++) {
-        want = disp_pitch << tier;
-        for (pass = 0; pass < 2 && !area; pass++)
-            for (i = 0; i < PRESENT_MAX; i++) {
-                uint64_t a = (uint64_t)s_psurf[i].w * s_psurf[i].h;
-                if (a <= area || !present_ok(i, want))
-                    continue;
-                if (pass == 0 && (!disp || (dma_resolve(s_psurf[i].offset)
-                                            & 0x0FFFFFFFu)
-                                           != (disp & 0x0FFFFFFFu)))
-                    continue;
+    /* Field pitch only if no surface this run has had the display's own. */
+    for (i = 0; i < PRESENT_MAX && disp_pitch && s_pitch_seen != disp_pitch; i++)
+        if (s_psurf[i].offset && s_psurf[i].pitch == disp_pitch)
+            s_pitch_seen = disp_pitch;
+    if (disp_pitch && s_pitch_seen != disp_pitch)
+        want = disp_pitch << 1;
+
+    /* Size, pass 0: the largest fresh surface at the display address, else
+     * the largest stale one there (which leaves no candidate). */
+    for (i = 0; disp && i < PRESENT_MAX; i++) {
+        uint64_t a = (uint64_t)s_psurf[i].w * s_psurf[i].h;
+        if (!present_pitch_ok(i, want)
+                || (dma_resolve(s_psurf[i].offset) & 0x0FFFFFFFu)
+                   != (disp & 0x0FFFFFFFu))
+            continue;
+        if (present_fresh(i)) {
+            if (a > area) {
                 area = a;
                 tw = s_psurf[i].w;
                 th = s_psurf[i].h;
             }
+        } else if (a > stale_area) {
+            stale_area = a;
+            stale_w = s_psurf[i].w;
+            stale_h = s_psurf[i].h;
+        }
+    }
+    at_disp = area || stale_area;
+    if (!area && stale_area) {
+        area = stale_area;
+        tw = stale_w;
+        th = stale_h;
+    }
+    /* Pass 1, only with nothing at the display address: the largest fresh
+     * surface anywhere. */
+    for (i = 0; !at_disp && i < PRESENT_MAX; i++) {
+        uint64_t a = (uint64_t)s_psurf[i].w * s_psurf[i].h;
+        if (a > area && present_pitch_ok(i, want) && present_fresh(i)) {
+            area = a;
+            tw = s_psurf[i].w;
+            th = s_psurf[i].h;
+        }
     }
     if (area && disp_pitch && want != disp_pitch && !warned_field) {
         warned_field = 1;
@@ -729,7 +766,7 @@ static void present_pick(void)
         for (i = 0; i < PRESENT_MAX; i++) {
             uint64_t when = pass == 0 ? s_psurf[i].last_draw : s_psurf[i].last_clear;
             if (s_psurf[i].w == tw && s_psurf[i].h == th
-                    && present_ok(i, want) && when > top) {
+                    && present_pitch_ok(i, want) && when > top) {
                 top = when;
                 best = i;
             }
