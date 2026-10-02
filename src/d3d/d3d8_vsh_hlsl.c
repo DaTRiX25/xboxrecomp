@@ -319,35 +319,6 @@ static int emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
     return 1;
 }
 
-/**
- * Map NV2A input register index to a D3D11 input semantic.
- *
- * Xbox NV2A vertex shader input registers map to vertex attributes:
- *   v0  = Position
- *   v1  = Blend weight
- *   v2  = Normal
- *   v3  = Diffuse color
- *   v4  = Specular color
- *   v5  = Fog coordinate
- *   v6  = Point size / back diffuse
- *   v7  = Back specular
- *   v8  = Texture coord 0
- *   v9  = Texture coord 1
- *   v10 = Texture coord 2
- *   v11 = Texture coord 3
- *   v12-v15 = Additional attributes
- *
- * We use generic ATTR semantics so the input layout can match any
- * vertex buffer format at bind time.
- */
-static const char *input_semantic_name(int reg_index)
-{
-    /* All inputs use the generic TEXCOORD semantic with unique indices
-     * to avoid mismatches. The input layout will map them correctly. */
-    (void)reg_index;
-    return "ATTR";
-}
-
 int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
                             char *buf, int bufsize)
 {

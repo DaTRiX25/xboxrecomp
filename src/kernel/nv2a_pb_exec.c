@@ -301,6 +301,7 @@ static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
     s_tex_set[(method - NV_TEX_FIRST) / 4] = 1;
+    /* Resolved on write, not at sample time, as SET_TEXTURE_OFFSET is. */
     if (method == 0x1B20u)              /* stage 0 SET_TEXTURE_PALETTE */
         nv2a_tex_palette_decode(param, dma_resolve, &s_gpu.tex.palette,
                                 &s_gpu.tex.pal_len);
