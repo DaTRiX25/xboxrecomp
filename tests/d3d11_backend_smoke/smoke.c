@@ -6,7 +6,8 @@
  * position in pixels + D3DCOLOR), then the flip, double-buffered the way the
  * XDK does it (color_offset moves to the other buffer before FLIP_STALL).
  * Then textured quads (a swizzled checker, a linear YUY2 ramp) and a quad
- * through four register-combiner stages with the title's final combiner.
+ * through four register-combiner stages with the title's final combiner,
+ * and three overlapping quads with depth tests.
  * With RECOMP_PB_BACKEND=d3d11 that reaches ClearRenderTargetView, a draw
  * and Present in src/d3d/nv2a_pb_d3d11.c.
  *
@@ -55,6 +56,16 @@ static void vertex_uv(float x, float y, uint32_t argb, const float *uv)
 static void vertex(float x, float y, uint32_t argb)
 {
     vertex_uv(x, y, argb, NULL);
+}
+
+/* An untextured vertex at depth z, in depth units (0..2^24-1 for Z24S8). */
+static void vertex_z(float x, float y, float z, uint32_t argb)
+{
+    M(0x1818, f2u(x));
+    M(0x1818, f2u(y));
+    M(0x1818, f2u(z));
+    M(0x1818, f2u(1.0f));
+    M(0x1818, argb);
 }
 
 /* Guest memory for the texture: the runtime's memory offset is 0 here, so a
@@ -122,8 +133,10 @@ int main(int argc, char **argv)
         M(0x0208, 0x00000128u);                /* SURFACE_FORMAT          */
         M(0x020C, 640u * 4u);                  /* SURFACE_PITCH           */
         M(0x0210, buf[f & 1]);                 /* SURFACE_COLOR_OFFSET    */
+        M(0x0214, 0x02400000u);                /* SURFACE_ZETA_OFFSET     */
         M(0x1D90, clear);                      /* COLOR_CLEAR_VALUE       */
-        M(0x1D94, 0xF0);                       /* CLEAR_SURFACE: colour   */
+        M(0x1D8C, 0xFFFFFF00u);                /* ZSTENCIL_CLEAR_VALUE: far */
+        M(0x1D94, 0xF1);                       /* CLEAR_SURFACE: colour + Z */
 
         for (a = 0; a < 16; a++)               /* VERTEX_DATA_ARRAY_FORMAT */
             M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
@@ -215,6 +228,35 @@ int main(int argc, char **argv)
 
         M(0x1760 + 4 * 9, 0x02u);              /* attr9 off again */
         M(0x1B0C, 0);                          /* stage 0 off */
+
+        /* Depth: LESS with writes on. The near green quad goes first, then
+         * a far red one overlapping it, which must stay behind: green wins
+         * where they overlap. Then a blue quad between them in depth with
+         * writes off and GREATER: it shows only over the green one. */
+        M(0x1E70, 0);                          /* no texture stages */
+        M(0x030C, 1);                          /* DEPTH_TEST_ENABLE */
+        M(0x0354, 0x201);                      /* DEPTH_FUNC: LESS */
+        M(0x035C, 1);                          /* DEPTH_MASK: write */
+        M(0x17FC, 8);
+        vertex_z(440.0f, 370.0f, 4194304.0f, 0xFF00C000u);   /* z 0.25 */
+        vertex_z(560.0f, 370.0f, 4194304.0f, 0xFF00C000u);
+        vertex_z(560.0f, 450.0f, 4194304.0f, 0xFF00C000u);
+        vertex_z(440.0f, 450.0f, 4194304.0f, 0xFF00C000u);
+        vertex_z(500.0f, 390.0f, 12582912.0f, 0xFFE00000u);  /* z 0.75 */
+        vertex_z(620.0f, 390.0f, 12582912.0f, 0xFFE00000u);
+        vertex_z(620.0f, 470.0f, 12582912.0f, 0xFFE00000u);
+        vertex_z(500.0f, 470.0f, 12582912.0f, 0xFFE00000u);
+        M(0x17FC, 0);
+        M(0x0354, 0x204);                      /* DEPTH_FUNC: GREATER */
+        M(0x035C, 0);                          /* no writes */
+        M(0x17FC, 8);
+        vertex_z(470.0f, 380.0f, 8388608.0f, 0xFF2040FFu);   /* z 0.5 */
+        vertex_z(600.0f, 380.0f, 8388608.0f, 0xFF2040FFu);
+        vertex_z(600.0f, 420.0f, 8388608.0f, 0xFF2040FFu);
+        vertex_z(470.0f, 420.0f, 8388608.0f, 0xFF2040FFu);
+        M(0x17FC, 0);
+        M(0x030C, 0);                          /* depth test off */
+        M(0x1E70, 1);                          /* stage 0 2D again */
 
         M(0x0210, buf[(f + 1) & 1]);           /* next buffer, as the XDK does */
         M(0x0130, 0);                          /* FLIP_STALL */

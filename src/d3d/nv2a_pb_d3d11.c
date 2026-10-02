@@ -13,7 +13,9 @@
  *
  * Opt-in: RECOMP_PB_BACKEND=d3d11 (see nv2a_pb_d3d11_register_from_env).
  *
- * Not yet: depth, the clear rectangle (whole surface), 16-bit surfaces, guest readback of
+ * Depth: a D32_FLOAT buffer per zeta offset, cleared by on_zclear.
+ *
+ * Not yet: stencil, the clear rectangle (whole surface), 16-bit surfaces, guest readback of
  * the rendered surface (the title never sees D3D11's pixels).
  *
  * Everything runs on the NV2A ack thread: the device, the window and its
@@ -326,9 +328,13 @@ static int init(void)
         memset(&rd, 0, sizeof rd);
         rd.FillMode = D3D11_FILL_SOLID;
         rd.CullMode = D3D11_CULL_NONE;
-        /* No depth buffer yet, and NV2A depth is not clipped the way D3D's
-         * is: keep everything the title sends. */
-        rd.DepthClipEnable = FALSE;
+        /* The vertex programs hand D3D11 real clip-space positions (see the
+         * oPos epilogue in d3d8_vsh.c: the title's divide by w is undone, w
+         * kept), so the rasteriser clips triangles with vertices behind the
+         * eye against the near plane instead of dropping them, as the CPU
+         * path has to. Depth clipping stays on for that; NV2A depth runs
+         * 0..zmax, which vp_scale.z maps onto D3D's 0..1. */
+        rd.DepthClipEnable = TRUE;
         ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs);
     }
     {
@@ -414,6 +420,122 @@ static RenderTarget *surface(void)
     fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target\n",
             g->color_offset, w, h);
     return free_rt;
+}
+
+/* ---- depth ------------------------------------------------------------------ */
+
+/* One depth buffer per zeta offset and surface size, D32_FLOAT so the test
+ * compares the same normalised z (depth units / zmax) the CPU path stores in
+ * its float buffer. Stencil is not emulated. */
+#define DT_MAX 4
+typedef struct {
+    uint32_t                zeta;
+    UINT                    w, h;
+    ID3D11Texture2D        *tex;
+    ID3D11DepthStencilView *dsv;
+    uint64_t                last_use;
+} DepthTarget;
+
+static DepthTarget s_dt[DT_MAX];
+static ID3D11DepthStencilState *s_dss[8][2];   /* [func - 0x200][write] */
+static uint64_t s_zclears, s_draws_z;
+
+static DepthTarget *depth_target(UINT w, UINT h)
+{
+    uint32_t zeta = nv2a_pb_vsh_state()->zeta_offset;
+    DepthTarget *e = NULL, *lru = &s_dt[0];
+    D3D11_TEXTURE2D_DESC td;
+    int i;
+
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *d = &s_dt[i];
+        if (d->tex && d->zeta == zeta && d->w == w && d->h == h) {
+            d->last_use = s_tick;
+            return d;
+        }
+        if (!d->tex && !e)
+            e = d;
+        if (d->last_use < lru->last_use)
+            lru = d;
+    }
+    if (!e) {
+        e = lru;
+        ID3D11DepthStencilView_Release(e->dsv);
+        ID3D11Texture2D_Release(e->tex);
+        memset(e, 0, sizeof *e);
+    }
+    memset(&td, 0, sizeof td);
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_D32_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &e->tex)))
+        return NULL;
+    if (FAILED(ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)e->tex,
+                                                   NULL, &e->dsv))) {
+        ID3D11Texture2D_Release(e->tex);
+        e->tex = NULL;
+        return NULL;
+    }
+    /* The CPU path starts its buffer at the far plane. */
+    ID3D11DeviceContext_ClearDepthStencilView(s_ctx, e->dsv, D3D11_CLEAR_DEPTH,
+                                              1.0f, 0);
+    e->zeta = zeta;
+    e->w = w;
+    e->h = h;
+    e->last_use = s_tick;
+    fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer\n", zeta, w, h);
+    return e;
+}
+
+/* SET_DEPTH_FUNC takes GL's codes, 0x200 NEVER .. 0x207 ALWAYS, in the order
+ * D3D11_COMPARISON_* numbers them from 1. Anything else tests as ALWAYS, as
+ * on the CPU. */
+static ID3D11DepthStencilState *depth_state(uint32_t func, int write)
+{
+    uint32_t f = (func >= 0x200 && func <= 0x207) ? func - 0x200 : 7;
+    ID3D11DepthStencilState **slot = &s_dss[f][write ? 1 : 0];
+    if (!*slot) {
+        D3D11_DEPTH_STENCIL_DESC dd;
+        memset(&dd, 0, sizeof dd);
+        dd.DepthEnable = TRUE;
+        dd.DepthWriteMask = write ? D3D11_DEPTH_WRITE_MASK_ALL
+                                  : D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.DepthFunc = (D3D11_COMPARISON_FUNC)(f + 1);
+        if (FAILED(ID3D11Device_CreateDepthStencilState(s_dev, &dd, slot)))
+            return s_ds_off;
+    }
+    return *slot;
+}
+
+/* CLEAR_SURFACE with the Z bit: the clear value scaled as the CPU path
+ * scales it, by the zeta format's range. */
+static void d3d11_on_zclear(uint32_t param)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    RenderTarget *rt;
+    DepthTarget *dt;
+    float z;
+
+    if (!(param & 1u) || !init())
+        return;
+    rt = surface();
+    if (!rt)
+        return;
+    dt = depth_target(rt->w, rt->h);
+    if (!dt)
+        return;
+    z = ((g->format >> 4) & 0xF) == 1
+      ? (float)(v->zclear & 0xFFFFu) / 65535.0f
+      : (float)(v->zclear >> 8) / 16777215.0f;
+    ID3D11DeviceContext_ClearDepthStencilView(s_ctx, dt->dsv, D3D11_CLEAR_DEPTH,
+                                              z, 0);
+    s_zclears++;
 }
 
 static void d3d11_on_clear(uint32_t param)
@@ -1408,8 +1530,18 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         cbs[0] = NULL;
         cbs[1] = s_cb_consts;
         cbs[2] = s_cb_vp;
-        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, NULL);
-        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+        ID3D11DepthStencilView *dsv = NULL;
+        ID3D11DepthStencilState *dss = s_ds_off;
+        if (v->depth_enable) {
+            DepthTarget *dt = depth_target(rt->w, rt->h);
+            if (dt) {
+                dsv = dt->dsv;
+                dss = depth_state(v->depth_func, v->depth_mask);
+                s_draws_z++;
+            }
+        }
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, dsv);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, 0);
         ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(), NULL, 0xFFFFFFFF);
         ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
         ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
@@ -1431,7 +1563,9 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 /* ---- flip ------------------------------------------------------------------ */
 
 /* RECOMP_D3D11_DUMP=<prefix>: every 60th presented frame as <prefix>NNNN.bmp,
- * read back from the swap chain's buffer. Proof of what reached the screen. */
+ * read back from the swap chain's buffer. Proof of what reached the screen.
+ * The prefix is prepended to the file name as is; one ending in / or \ is a
+ * directory, and the files in it are named frame_NNNN.bmp. */
 static void dump_frame(void)
 {
     static const char *prefix;
@@ -1460,7 +1594,9 @@ static void dump_frame(void)
                                      (ID3D11Resource *)s_back);
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
                                           D3D11_MAP_READ, 0, &m))) {
-        snprintf(path, sizeof path, "%s%04u.bmp", prefix,
+        size_t n = strlen(prefix);
+        int dir = n && (prefix[n - 1] == '/' || prefix[n - 1] == '\\');
+        snprintf(path, sizeof path, "%s%s%04u.bmp", prefix, dir ? "frame_" : "",
                  (unsigned)(s_presents / 60));
         f = fopen(path, "wb");
         if (f) {
@@ -1523,21 +1659,23 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (walker said 0x%08X),"
                 " %llu clears, %llu draws, %llu skipped, %llu texture uploads,"
-                " %llu rehashes, %llu combiner shaders\n",
+                " %llu rehashes, %llu combiner shaders, %llu zclears,"
+                " %llu depth-tested draws\n",
                 (unsigned long long)s_presents,
                 s_drawn ? s_drawn->offset : 0, surface_offset,
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
                 (unsigned long long)s_draws_skipped,
                 (unsigned long long)s_tex_uploads,
                 (unsigned long long)s_tex_rehash,
-                (unsigned long long)s_rc_compiles);
+                (unsigned long long)s_rc_compiles,
+                (unsigned long long)s_zclears, (unsigned long long)s_draws_z);
 }
 
 /* ---- registration ---------------------------------------------------------- */
 
 static const struct nv2a_pb_backend s_d3d11_backend = {
     d3d11_on_clear,
-    NULL,               /* on_zclear: no depth buffer yet */
+    d3d11_on_zclear,
     d3d11_on_draw,
     d3d11_on_flip,
 };
