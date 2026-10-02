@@ -53,7 +53,7 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
  *
  * The shader evaluates the combiners the way nv2a_pb_exec.c's rc_eval does
  * on the CPU, operation for operation. Its input struct matches the vertex
- * shader output of d3d8_vsh.c (SV_POSITION, COLOR0, COLOR1, TEXCOORD0-3);
+ * shader output of d3d8_vsh_hlsl.c (SV_POSITION, COLOR0, COLOR1, TEXCOORD0-3);
  * its constants are NV2APSConstants at b0; stage n samples tN with sN.
  *
  * @param state   The combiner configuration
