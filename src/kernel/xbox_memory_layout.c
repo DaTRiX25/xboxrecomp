@@ -3762,6 +3762,26 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 #define CONTIG_PAGES      (XBOX_CONTIG_SIZE / CONTIG_PAGE)
 #define CONTIG_USABLE     ((XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT) / CONTIG_PAGE)
 
+/* The last megabyte below 16 MB is kept for requests that must sit there.
+ *
+ * Some buffers have to be below 16 MB because the GPU addresses them with a
+ * 24-bit offset. XDK D3D's EndVisibilityTest allocates its report pages with
+ * MmAllocateContiguousMemoryEx(0x1000, 0, 0xFFFFFF, ...), the first time each
+ * page of 256 tests is used. The console kernel fills contiguous memory from
+ * the top, so low memory is still free when that call comes. This arena fills
+ * it from the bottom, so by stage 1-1 of BLiNX 2 the low 16 MB was full (26 MB
+ * in use, all of it starting at 0). Every report-page call failed, 700 to 1,900
+ * times a run, EndVisibilityTest returned E_OUTOFMEMORY, and
+ * GetVisibilityTestResult read its results through a NULL page.
+ *
+ * Allocating from the top would match the console, but it would move every
+ * surface and buffer this toolkit's logs and tools name by address (BLiNX 2's
+ * back buffers at 0x00104000/0x00230000, for one). Keeping one megabyte back
+ * changes nothing that is placed below 15 MB. A request whose range ends
+ * below 16 MB can use the reserve; any other request skips it. */
+#define CONTIG_LOW_RESERVE_START ((15u << 20) / CONTIG_PAGE)
+#define CONTIG_LOW_RESERVE_END   ((16u << 20) / CONTIG_PAGE)
+
 static uint8_t  g_contig_used[CONTIG_PAGES];   /* 1 = page belongs to a block */
 static uint32_t g_contig_len[CONTIG_PAGES];    /* pages, at a block's first page */
 static uint32_t g_contig_pages_in_use;
@@ -3847,6 +3867,12 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
     if (lo_page < g_contig_first_free) lo_page = g_contig_first_free;
     p = (lo_page + align_pages - 1) & ~(align_pages - 1);
     while ((uint64_t)p + n <= limit) {
+        /* A request free to go above 16 MB steps over the low reserve. */
+        if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
+                && p + n > CONTIG_LOW_RESERVE_START) {
+            p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
+            continue;
+        }
         for (q = p; q < p + n && !g_contig_used[q]; q++)
             ;
         if (q == p + n) {

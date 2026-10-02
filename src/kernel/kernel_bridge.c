@@ -1141,6 +1141,20 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     }
     xbox_va = xbox_ContiguousAllocEx(size, align, low, high);
 
+    /* A refusal is the title's problem only if it says who asked: the guest
+     * return address and the stack above it (the XDK wrapper's callers). */
+    if (!xbox_va) {
+        static int n;
+        if (n++ < 8) {
+            int k;
+            fprintf(stderr, "  [CONTIG] refused: caller 0x%08X size=%u low=0x%08X "
+                    "high=0x%08X align=%u prot=0x%X stack:", g_xbox_kernel_caller,
+                    size, low, high, align, prot);
+            for (k = 5; k < 40; k++)
+                fprintf(stderr, " %08X", STACK_ARG(k));
+            fprintf(stderr, "\n");
+        }
+    }
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
                 size, align, xbox_va);
