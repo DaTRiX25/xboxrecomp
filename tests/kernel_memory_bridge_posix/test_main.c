@@ -60,11 +60,12 @@ enum { ORD_MMALLOC = 165, ORD_MMALLOCEX = 166, ORD_MMFREE = 171,
        ORD_MMQUERYSIZE = 180, ORD_NTALLOC = 184, ORD_NTCLOSE = 187,
        ORD_NTCREATE = 190, ORD_NTFREE = 199, ORD_NTSETINFO = 226,
        ORD_KEWAIT = 159, ORD_NTDUP = 197, ORD_NTWAIT = 233, ORD_OBREF = 246,
-       ORD_OBDEREF = 250, ORD_PSCREATE = 255, ORD_PSTERM = 258 };
+       ORD_OBDEREF = 250, ORD_PSCREATE = 255, ORD_PSTERM = 258,
+       ORD_NTWRITE = 236 };
 static const uint32_t ORDS[] = { ORD_MMALLOC, ORD_MMALLOCEX, ORD_MMFREE,
     ORD_MMQUERYSIZE, ORD_NTALLOC, ORD_NTCLOSE, ORD_NTCREATE, ORD_NTFREE,
     ORD_NTSETINFO, ORD_KEWAIT, ORD_NTDUP, ORD_NTWAIT, ORD_OBREF, ORD_OBDEREF,
-    ORD_PSCREATE, ORD_PSTERM };
+    ORD_PSCREATE, ORD_PSTERM, ORD_NTWRITE };
 #define NORDS (sizeof ORDS / sizeof ORDS[0])
 
 static uint32_t g_thunks, g_stack, g_scratch;
@@ -313,6 +314,66 @@ static void test_rename(const char *cache)
     CALL(ORD_NTCLOSE, h2);
 }
 
+/* ---- FATX overwrite: regrowing after an overwrite keeps the data ------ */
+static uint32_t set_eof(uint32_t h, uint32_t size)
+{
+    uint32_t info = g_scratch + 0x400, ios = g_scratch + 0x18;
+    G32(info) = size; G32(info + 4) = 0;
+    return CALL(ORD_NTSETINFO, h, ios, info, 8, 20 /* EndOfFile */);
+}
+
+static long host_file(const char *dir, const char *name, unsigned char *buf,
+                      size_t cap)
+{
+    char p[512];
+    FILE *f;
+    long n;
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    f = fopen(p, "rb");
+    if (!f) return -1;
+    n = (long)fread(buf, 1, cap, f);
+    fclose(f);
+    return n;
+}
+
+static void test_overwrite(const char *cache)
+{
+    unsigned char got[2048];
+    uint32_t h, i, buf = g_scratch + 0x800, ios = g_scratch + 0x18;
+    long n;
+    int same = 1;
+
+    printf("FATX overwrite (the texture-cache copy, sub_001B8140/sub_001B8240)\n");
+    for (i = 0; i < 1024; i++) G8(buf + i) = (uint8_t)(i * 7 + 1);
+    h = create("z:\\o.tmp");
+    set_eof(h, 1024);
+    CALL(ORD_NTWRITE, h, 0, 0, 0, ios, buf, 1024, 0);
+    CALL(ORD_NTCLOSE, h);
+
+    /* second CREATE_ALWAYS, then trim to the true size */
+    h = create("z:\\o.tmp");
+    set_eof(h, 700);
+    CALL(ORD_NTCLOSE, h);
+    n = host_file(cache, "o.tmp", got, sizeof got);
+    for (i = 0; n == 700 && i < 700; i++)
+        if (got[i] != (unsigned char)(i * 7 + 1)) same = 0;
+    check(n == 700, "overwrite + end-of-file trims to 700 bytes", NULL);
+    check(n == 700 && same, "the bytes below the new end survive", NULL);
+
+    /* an overwrite followed by a write is a plain truncate */
+    h = create("z:\\o.tmp");
+    CALL(ORD_NTWRITE, h, 0, 0, 0, ios, buf, 4, 0);
+    CALL(ORD_NTCLOSE, h);
+    check(host_file(cache, "o.tmp", got, sizeof got) == 4,
+          "overwrite + 4-byte write leaves 4 bytes", NULL);
+
+    /* an overwrite that is just closed leaves an empty file */
+    h = create("z:\\o.tmp");
+    CALL(ORD_NTCLOSE, h);
+    check(host_file(cache, "o.tmp", got, sizeof got) == 0,
+          "overwrite + close leaves 0 bytes", NULL);
+}
+
 /* ---- thread handles lead to guest thread objects -------------------- */
 static uint32_t spawn(uint32_t routine, uint32_t handle_va)
 {
@@ -435,6 +496,7 @@ int main(int argc, char **argv)
     test_virtual_memory();
     test_contiguous();
     test_rename(cache);
+    test_overwrite(cache);
     test_threads();
 
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmpl);

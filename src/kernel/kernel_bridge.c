@@ -959,7 +959,7 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE)
-            CloseHandle(h);
+            xbox_NtClose(h);   /* finishes a pending file overwrite first */
     }
     g_eax = 0; /* STATUS_SUCCESS */
 }
