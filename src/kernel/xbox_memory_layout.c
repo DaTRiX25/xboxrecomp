@@ -1745,11 +1745,194 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
     }
 #else
     /* The non-Windows VEH shim never fires and EXCEPTION_POINTERS is
-     * opaque there, so there is nothing to decode. */
+     * opaque there, so there is nothing to decode. POSIX arms its own
+     * signal handler below and reports from it. */
     (void)ep;
+    (void)watch_report;
+    (void)s_watch_stepping;
 #endif
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+#if !defined(_WIN32)
+/* POSIX: no single-step from a signal handler on arm64, so the trap is
+ * "fault, unprotect, re-protect later". The fault names the writer: lifted
+ * calls are native calls, so the host stack at the fault is the guest call
+ * chain (sub_XXXXXXXX frames). A helper thread re-protects the page a moment
+ * later and prints which watched dwords changed in that window. A write by
+ * another thread inside the window is seen in the diff but not attributed.
+ *
+ * RECOMP_WATCH_LEN=<bytes> (default 4, clamped to the host page) widens the range,
+ * so the fields of one heap object can be watched at once. Writes through
+ * the contiguous-window alias go to a different host mapping and are not
+ * trapped. */
+#include <signal.h>
+#include <sys/mman.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <time.h>
+
+static uint32_t g_watch_len = 4;
+static uintptr_t g_watch_hpage, g_watch_hsize;   /* host page (16 KB on arm64 Darwin) */
+static uint32_t g_watch_snap[4096];
+static volatile int g_watch_open;     /* page is RW, re-protect pending */
+static struct sigaction g_watch_prev_bus, g_watch_prev_segv;
+
+static void watch_sym(void *pc, const char *tag, int n)
+{
+    Dl_info di;
+    if (pc && dladdr(pc, &di) && di.dli_sname)
+        fprintf(stderr, "         %s%-2d %s+0x%lX\n", tag, n, di.dli_sname,
+                (unsigned long)((uintptr_t)pc - (uintptr_t)di.dli_saddr));
+    else
+        fprintf(stderr, "         %s%-2d %p\n", tag, n, pc);
+}
+
+static void watch_posix_stack(void *ucv)
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uintptr_t fp = (uintptr_t)uc->uc_mcontext->__ss.__fp;
+    uintptr_t prev = 0;
+    int n = 0, reps = 0, depth = 0;
+    watch_sym((void *)(uintptr_t)uc->uc_mcontext->__ss.__pc, "#", n++);
+    watch_sym((void *)(uintptr_t)uc->uc_mcontext->__ss.__lr, "#", n++);
+    /* RECOMP_WATCH_DEPTH frames (default 14); identical consecutive return
+     * addresses (recursion) are folded into one line with a count. */
+    {
+        const char *dv = getenv("RECOMP_WATCH_DEPTH");
+        depth = dv && *dv ? atoi(dv) : 14;
+    }
+    while (n < depth && fp && (fp & 7) == 0) {
+        uintptr_t next = ((const uintptr_t *)fp)[0];
+        uintptr_t ret = ((const uintptr_t *)fp)[1];
+        if (ret && ret == prev) {
+            reps++;
+        } else if (ret) {
+            if (reps)
+                fprintf(stderr, "            (previous frame x%d more)\n",
+                        reps);
+            reps = 0;
+            watch_sym((void *)ret, "#", n++);
+            prev = ret;
+        }
+        if (next <= fp)
+            break;
+        fp = next;
+    }
+    if (reps)
+        fprintf(stderr, "            (previous frame x%d more)\n", reps);
+#else
+    (void)ucv;
+    fprintf(stderr, "         (host stack not available on this host)\n");
+#endif
+}
+
+static void watch_posix_handler(int sig, siginfo_t *si, void *ucv)
+{
+    uintptr_t fault = (uintptr_t)si->si_addr;
+    uintptr_t page = g_watch_hpage;
+    struct sigaction *prev;
+
+    if (g_watch_page && fault >= page && fault < page + g_watch_hsize) {
+        uintptr_t lo = (uintptr_t)g_memory_offset + g_watch_va;
+        if (fault >= lo && fault < lo + g_watch_len) {
+            fprintf(stderr, "[WATCH] write to %08X (+0x%X) esp=%08X\n",
+                    (uint32_t)(fault - (uintptr_t)g_memory_offset),
+                    (unsigned)(fault - lo), g_esp);
+            watch_posix_stack(ucv);
+            fflush(stderr);
+        }
+        mprotect((void *)g_watch_hpage, g_watch_hsize, PROT_READ | PROT_WRITE);
+        g_watch_open = 1;
+        return;   /* re-executes the store, now allowed */
+    }
+
+    prev = sig == SIGBUS ? &g_watch_prev_bus : &g_watch_prev_segv;
+    if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction) {
+            prev->sa_sigaction(sig, si, ucv);
+            return;
+        }
+    } else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+        prev->sa_handler(sig);
+        return;
+    }
+    signal(sig, SIG_DFL);   /* returning re-faults and dies by the signal */
+}
+
+static void watch_posix_diff(void)
+{
+    const uint32_t *cur = (const uint32_t *)((const uint8_t *)g_memory_offset
+                                             + g_watch_va);
+    uint32_t i, n = (g_watch_len + 3) / 4;
+    for (i = 0; i < n; i++) {
+        if (cur[i] != g_watch_snap[i]) {
+            fprintf(stderr, "[WATCH] [%08X] %08X -> %08X\n",
+                    g_watch_va + i * 4, g_watch_snap[i], cur[i]);
+            g_watch_snap[i] = cur[i];
+        }
+    }
+    fflush(stderr);
+}
+
+static void *watch_posix_reprotect(void *unused)
+{
+    struct timespec ts = { 0, 200 * 1000 };   /* 200 us window */
+    (void)unused;
+    for (;;) {
+        nanosleep(&ts, NULL);
+        if (!g_watch_open)
+            continue;
+        mprotect((void *)g_watch_hpage, g_watch_hsize, PROT_READ);
+        g_watch_open = 0;
+        watch_posix_diff();
+    }
+    return NULL;
+}
+
+static int watch_posix_arm(void)
+{
+    struct sigaction sa;
+    pthread_t th;
+    const char *len = getenv("RECOMP_WATCH_LEN");
+    uint32_t room;
+
+    g_watch_hsize = (uintptr_t)sysconf(_SC_PAGESIZE);
+    g_watch_hpage = ((uintptr_t)g_memory_offset + g_watch_va)
+                    & ~(g_watch_hsize - 1);
+    room = (uint32_t)(g_watch_hpage + g_watch_hsize
+                      - ((uintptr_t)g_memory_offset + g_watch_va));
+    if (room > sizeof g_watch_snap)
+        room = sizeof g_watch_snap;
+    if (len && *len)
+        g_watch_len = (uint32_t)strtoul(len, NULL, 0);
+    if (!g_watch_len)
+        g_watch_len = 4;
+    if (g_watch_len > room)
+        g_watch_len = room;
+    memcpy(g_watch_snap, (const uint8_t *)g_memory_offset + g_watch_va,
+           (g_watch_len + 3) & ~3u);
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = watch_posix_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGBUS, &sa, &g_watch_prev_bus) != 0
+            || sigaction(SIGSEGV, &sa, &g_watch_prev_segv) != 0)
+        return 0;
+    if (pthread_create(&th, NULL, watch_posix_reprotect, NULL) != 0)
+        return 0;
+    pthread_detach(th);
+    if (mprotect((void *)g_watch_hpage, g_watch_hsize, PROT_READ) != 0)
+        return 0;
+    fprintf(stderr, "  WATCH: writes to %u bytes at 0x%08X are trapped "
+                    "(POSIX, current %08X)\n", g_watch_len, g_watch_va,
+            g_watch_last);
+    fflush(stderr);
+    return 1;
+}
+#endif /* !_WIN32 */
 
 /* The target, which may be reached through pointers that do not exist yet.
  *
@@ -1845,6 +2028,16 @@ static int watch_arm(uint32_t va)
     /* The page holding the guest dword, in host terms. */
     g_watch_page = (void *)(((uintptr_t)((const uint8_t *)g_memory_offset
                                          + g_watch_va)) & ~(uintptr_t)4095);
+#if !defined(_WIN32)
+    (void)old;
+    if (!watch_posix_arm()) {
+        g_watch_page = NULL;
+        fprintf(stderr, "  WATCH: cannot trap 0x%08X; not armed\n",
+                g_watch_va);
+        return 0;
+    }
+    return 1;
+#endif
     g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
     if (!g_watch_veh
             || !VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old)) {
