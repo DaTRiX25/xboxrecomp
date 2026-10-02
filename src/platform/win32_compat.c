@@ -1618,10 +1618,12 @@ static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
     static volatile LONG map_counter = 0;
+    /* The pid keeps two instances apart: with a bare counter, both open
+     * "/xbox_map_1" and the second O_EXCL loses. macOS caps the name at 31. */
     char shm_name[32];
     LONG seq = InterlockedIncrement(&map_counter);
     const char *base = name ? name : "xbox_map";
-    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
+    snprintf(shm_name, sizeof(shm_name), "/%.12s_%d_%ld", base, (int)getpid(), seq);
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
