@@ -7,7 +7,8 @@
  * XDK does it (color_offset moves to the other buffer before FLIP_STALL).
  * Then textured quads (a swizzled checker, a linear YUY2 ramp) and a quad
  * through four register-combiner stages with the title's final combiner,
- * three overlapping quads with depth tests, and a stencil mask.
+ * three overlapping quads with depth tests, and a stencil mask, and a
+ * mipmapped texture drawn at three sizes.
  * With RECOMP_PB_BACKEND=d3d11 that reaches ClearRenderTargetView, a draw
  * and Present in src/d3d/nv2a_pb_d3d11.c.
  *
@@ -74,6 +75,7 @@ static void vertex_z(float x, float y, float z, uint32_t argb)
 #define OFFSCREEN 0x01800000u   /* a 320x240 render target */
 #define P8_GUEST  (TEX_GUEST + 0x8000u)
 #define PAL_GUEST (TEX_GUEST + 0x9000u)
+#define MIP_GUEST (TEX_GUEST + 0xA000u)  /* 32x32 A8R8G8B8, 6 levels */
 #define TEX_LOG2  6                            /* 64x64 */
 
 /* A swizzled A8R8G8B8 texture: 8x8-texel checker, orange and blue, with a
@@ -119,6 +121,18 @@ static int make_texture(void)
         for (y = 0; y < 16; y++)
             for (x = 0; x < 16; x++)
                 i8[swizzle_offset(x, y, 16, 16)] = (uint8_t)(((x >> 2) + (y >> 2)) & 3);
+    }
+    /* A swizzled A8R8G8B8 32x32 with its full chain (6 levels, packed one
+     * after another), each level one colour: red, green, blue, yellow,
+     * cyan, magenta. Drawn minified, a level's colour says which one the
+     * sampler picked. */
+    {
+        static const uint32_t lc[6] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu,
+                                       0xFFFFFF00u, 0xFF00FFFFu, 0xFFFF00FFu};
+        uint32_t *m = (uint32_t *)(uintptr_t)MIP_GUEST, l, d;
+        for (l = 0, d = 32; l < 6; l++, d /= 2)
+            for (x = 0; x < d * d; x++)
+                *m++ = lc[l];
     }
     return 1;
 }
@@ -386,6 +400,31 @@ int main(int argc, char **argv)
             vertex_uv(300.0f, 190.0f, 0xFFFFFFFFu, uv[3]);
             M(0x17FC, 0);
             M(0x1E94, 0);                      /* fixed function again */
+        }
+        /* The mipmapped texture with MIN nearest-level (TEXTURE_FILTER MIN 3)
+         * at 32, 16 and 8 pixels: red (level 0), green (1), blue (2). With
+         * RECOMP_D3D11_NO_MIPS=1 all three are red. CONTROL0 allows levels
+         * 0..5 (MAX_LOD_CLAMP 5). */
+        {
+            static const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+            static const float px[3][2] = {{220, 150}, {260, 150}, {284, 150}};
+            int k;
+            M(0x1B00, MIP_GUEST);
+            M(0x1B04, (0x06u << 8) | (6u << 16) | (5u << 20) | (5u << 24)
+                      | (1u << 4) | (2u << 0));
+            M(0x1B08, 0x00000303u);
+            M(0x1B0C, 0x40000000u | (5u << 6));
+            M(0x1B14, 0x01030000u);
+            for (k = 0; k < 3; k++) {
+                float d = (float)(32 >> k), x0 = px[k][0], y0 = px[k][1];
+                M(0x17FC, 8);
+                vertex_uv(x0,     y0,     0xFFFFFFFFu, uv[0]);
+                vertex_uv(x0 + d, y0,     0xFFFFFFFFu, uv[1]);
+                vertex_uv(x0 + d, y0 + d, 0xFFFFFFFFu, uv[2]);
+                vertex_uv(x0,     y0 + d, 0xFFFFFFFFu, uv[3]);
+                M(0x17FC, 0);
+            }
+            M(0x1B14, 0x01010000u);
         }
         /* A post pass reading the surface it draws into (linear A8R8G8B8 at
          * the colour offset, texel coordinates): a quarter-size copy of the

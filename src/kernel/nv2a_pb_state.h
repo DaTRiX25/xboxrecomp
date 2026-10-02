@@ -17,8 +17,11 @@
  *
  * Texture caches (one per backend: ARGB buffers for the CPU path, textures for
  * a GPU one) use the same key and invalidation policy, so the two agree on
- * when a texture is stale. Key: offset + format + width + height + pitch.
- * Invalidation: a per-flip generation, plus a hash of the whole texture. A
+ * when a texture is stale. Key: offset + format + width + height + pitch,
+ * plus the mip level count for a backend that uploads more than level 0
+ * (the CPU path samples level 0, so its count is always 1). Invalidation: a
+ * per-flip generation, plus a hash of the whole texture, every uploaded
+ * level included. A
  * first/last-page fingerprint is not enough: the letterboxed movie texture is
  * black at both ends, so it changes only in the middle.
  */

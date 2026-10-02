@@ -141,6 +141,7 @@ typedef struct {
 
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
 static uint64_t s_tex_uploads, s_tex_rehash, s_tex_changed;
+static uint64_t s_tex_mip_uploads;   /* uploads with more than one level */
 static uint64_t s_vb_native, s_vb_expanded;  /* vertex bytes copied / made */
 static uint64_t s_draws_prog, s_draws_tex;   /* with a vertex program / a texture */
 
@@ -1110,14 +1111,24 @@ static ID3D11BlendState *blend_state(void)
  * flip generation the whole texture is hashed again and re-uploaded if it
  * changed (the letterboxed movie changes only in the middle).
  *
- * ponytail: point sampling (the CPU path's nearest texel); no mipmaps; DXT is
- * decoded rather than uploaded as BC1-3; a texture rewritten between two
- * batches of one flip is not seen. */
+ * Mipmaps: a swizzled or DXT texture brings the levels SET_TEXTURE_FORMAT
+ * counts (clamped as xemu does: to CONTROL0's MAX_LOD_CLAMP + 1 and to the
+ * level that reaches 1x1), packed one after another, each swizzled or
+ * block-compressed at its own size (DXT levels round up to whole 4x4
+ * blocks). The level count is part of the cache key and every level is in
+ * the hash. Linear textures have one level. RECOMP_D3D11_NO_MIPS=1 uploads
+ * level 0 only, for A/B.
+ *
+ * ponytail: DXT is decoded rather than uploaded as BC1-3; a texture
+ * rewritten between two batches of one flip is not seen; cube maps and 3D
+ * textures are face/slice 0 only. */
 
 struct Stage {
     uint32_t offset, color, width, height, pitch, addr_u, addr_v;
     uint32_t palette, pal_len;  /* P8: resolved palette address, entries */
     uint32_t filter;            /* SET_TEXTURE_FILTER as written */
+    uint32_t levels;            /* mip levels uploaded (1 for linear)    */
+    uint32_t lod_min, lod_max;  /* CONTROL0 LOD clamps, within levels    */
     int      valid;
     int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
     int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
@@ -1131,7 +1142,7 @@ static RenderTarget *s_stage_rt[4];
 #define TEX_MAX_TEXELS (2048u * 2048u)
 #define TEX_CACHE 512   /* a demo frame binds ~100; 64 thrashed */
 typedef struct {
-    uint32_t offset, color, width, height, pitch, palette;
+    uint32_t offset, color, width, height, pitch, palette, levels;
     uint32_t gen, used;
     uint64_t hash;
     int      live;
@@ -1152,7 +1163,7 @@ static uint32_t tc_slot(const Stage *t)
 {
     uint32_t h = t->offset * 0x9E3779B1u;
     h ^= (t->color + (t->width << 8) + (t->height << 20)) * 0x85EBCA77u;
-    h ^= (t->pitch ^ t->palette) * 0xC2B2AE3Du;
+    h ^= (t->pitch ^ t->palette ^ (t->levels << 27)) * 0xC2B2AE3Du;
     return (h >> 16) & (TC_HINTS - 1);
 }
 static uint32_t *s_texels;
@@ -1165,6 +1176,14 @@ static uint32_t        s_pal_len;
 static int tex_size_from_format(uint32_t fmt)
 {
     return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
+}
+
+static int no_mips(void)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("RECOMP_D3D11_NO_MIPS") != NULL;
+    return off;
 }
 
 static void build_stages(void)
@@ -1204,6 +1223,20 @@ static void build_stages(void)
             uint32_t pal = r[0x20 / 4];
             t->palette = (pal & ~0x3Fu) ? nv2a_pb_dma_resolve(pal & ~0x3Fu) : 0;
             t->pal_len = 256u >> ((pal >> 2) & 3u);
+        }
+        t->levels = 1;
+        if (tex_size_from_format(t->color) && !no_mips()) {
+            /* As xemu's pgraph_get_texture_shape: the format's count, no
+             * more than MAX_LOD_CLAMP + 1, none smaller than 1x1. The
+             * clamps are whole levels (xemu reads the 12-bit fields as is). */
+            uint32_t lu = (fmt >> 20) & 0xF, lv = (fmt >> 24) & 0xF;
+            uint32_t lmax = (ctl0 >> 6) & 0xFFF, lmin = (ctl0 >> 18) & 0xFFF;
+            uint32_t lv_n = (fmt >> 16) & 0xF;
+            if (lv_n > lmax + 1u) lv_n = lmax + 1u;
+            if (lv_n > (lu > lv ? lu : lv) + 1u) lv_n = (lu > lv ? lu : lv) + 1u;
+            t->levels = lv_n ? lv_n : 1u;
+            t->lod_min = lmin < t->levels - 1u ? lmin : t->levels - 1u;
+            t->lod_max = lmax < t->levels - 1u ? lmax : t->levels - 1u;
         }
         t->valid = t->offset && t->width && t->height
                 && (tex_size_from_format(t->color) || t->pitch)
@@ -1278,14 +1311,19 @@ static uint32_t texel_bytes(uint32_t lin)
 /* Bytes of guest memory the texture occupies; 0 if it cannot be decoded. */
 static uint32_t tex_extent(const Stage *t)
 {
-    uint32_t bb = d3d8_format_dxt_block_bytes(t->color), tb;
+    uint32_t bb = d3d8_format_dxt_block_bytes(t->color), tb, l, w, h, n = 0;
     if (!t->valid || (uint64_t)t->width * t->height > TEX_MAX_TEXELS)
         return 0;
-    if (bb)
-        return ((t->width + 3u) / 4u) * ((t->height + 3u) / 4u) * bb;
-    if (d3d8_format_is_swizzled(t->color)) {
-        tb = texel_bytes(linear_twin(t->color));
-        return tb ? t->width * t->height * tb : 0;
+    if (bb || d3d8_format_is_swizzled(t->color)) {
+        tb = bb ? 0 : texel_bytes(linear_twin(t->color));
+        if (!bb && !tb)
+            return 0;
+        for (l = 0, w = t->width, h = t->height; l < t->levels; l++) {
+            n += bb ? ((w + 3u) / 4u) * ((h + 3u) / 4u) * bb : w * h * tb;
+            w = w > 1 ? w / 2 : 1;
+            h = h > 1 ? h / 2 : 1;
+        }
+        return n;
     }
     tb = texel_bytes(t->color);
     if (!tb || !t->pitch)
@@ -1409,11 +1447,56 @@ static uint32_t decode_texel(uint32_t fmt, const uint8_t *p, uint32_t u)
     }
 }
 
-/* The whole texture into s_texels (width x height, A8R8G8B8). */
+/* Level l's size: halved per level, never below 1. */
+static uint32_t level_dim(uint32_t d, uint32_t l)
+{
+    d >>= l;
+    return d ? d : 1u;
+}
+
+/* Texels in levels 0..levels-1, the size s_texels needs. */
+static size_t tex_texels(const Stage *t)
+{
+    size_t n = 0;
+    uint32_t l;
+    for (l = 0; l < t->levels; l++)
+        n += (size_t)level_dim(t->width, l) * level_dim(t->height, l);
+    return n;
+}
+
+/* One swizzled or DXT level of w x h at mem into out (A8R8G8B8); returns
+ * the guest bytes it took, which is where the next level starts. */
+static uint32_t decode_level(const uint8_t *mem, uint32_t fmt, uint32_t w,
+                             uint32_t h, uint32_t *out)
+{
+    uint32_t x, y, bb = d3d8_format_dxt_block_bytes(fmt);
+    if (bb) {
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++) {
+                uint32_t argb = 0;
+                d3d8_dxt_decode_texel(mem, fmt, x, y, w, &argb);
+                out[(size_t)y * w + x] = argb;
+            }
+        return ((w + 3u) / 4u) * ((h + 3u) / 4u) * bb;
+    } else {
+        uint32_t mx, my, lin = linear_twin(fmt);
+        xbox_swizzle_masks(w, h, &mx, &my);
+        for (y = 0; y < h; y++) {
+            uint32_t oy = swizzle_deposit(y, my);
+            for (x = 0; x < w; x++)
+                out[(size_t)y * w + x] =
+                    decode_texel(lin, mem, swizzle_deposit(x, mx) | oy);
+        }
+        return w * h * texel_bytes(lin);
+    }
+}
+
+/* The whole texture into s_texels (A8R8G8B8): level 0 (width x height),
+ * then each further level packed after it. */
 static int decode_texture(const Stage *t)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset() + t->offset;
-    size_t n = (size_t)t->width * t->height;
+    size_t n = tex_texels(t);
     uint32_t x, y, fmt = t->color;
 
     if (n > s_texels_cap) {
@@ -1423,29 +1506,17 @@ static int decode_texture(const Stage *t)
         s_texels = p;
         s_texels_cap = n;
     }
-    if (d3d8_format_dxt_block_bytes(fmt)) {
-        for (y = 0; y < t->height; y++)
-            for (x = 0; x < t->width; x++) {
-                uint32_t argb = 0;
-                d3d8_dxt_decode_texel(mem, fmt, x, y, t->width, &argb);
-                s_texels[(size_t)y * t->width + x] = argb;
-            }
-        return 1;
-    }
     if (fmt == 0x0B) {
         s_pal = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset()
                                    + t->palette);
         s_pal_len = t->pal_len;
     }
-    if (d3d8_format_is_swizzled(fmt)) {
-        uint32_t mx, my;
-        fmt = linear_twin(fmt);
-        xbox_swizzle_masks(t->width, t->height, &mx, &my);
-        for (y = 0; y < t->height; y++) {
-            uint32_t oy = swizzle_deposit(y, my);
-            for (x = 0; x < t->width; x++)
-                s_texels[(size_t)y * t->width + x] =
-                    decode_texel(fmt, mem, swizzle_deposit(x, mx) | oy);
+    if (tex_size_from_format(fmt)) {
+        uint32_t *out = s_texels, l;
+        for (l = 0; l < t->levels; l++) {
+            uint32_t w = level_dim(t->width, l), h = level_dim(t->height, l);
+            mem += decode_level(mem, fmt, w, h, out);
+            out += (size_t)w * h;
         }
         return 1;
     }
@@ -1459,6 +1530,8 @@ static int decode_texture(const Stage *t)
 
 static int tex_upload(TexEntry *e, const Stage *t)
 {
+    const uint32_t *src;
+    uint32_t l;
     if (!decode_texture(t))
         return 0;
     if (!e->tex) {
@@ -1466,7 +1539,7 @@ static int tex_upload(TexEntry *e, const Stage *t)
         memset(&td, 0, sizeof td);
         td.Width = t->width;
         td.Height = t->height;
-        td.MipLevels = 1;
+        td.MipLevels = t->levels;
         td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
@@ -1481,9 +1554,15 @@ static int tex_upload(TexEntry *e, const Stage *t)
             return 0;
         }
     }
-    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0,
-                                          NULL, s_texels, t->width * 4, 0);
+    for (l = 0, src = s_texels; l < t->levels; l++) {
+        uint32_t w = level_dim(t->width, l), h = level_dim(t->height, l);
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex,
+                                              l, NULL, src, w * 4, 0);
+        src += (size_t)w * h;
+    }
     s_tex_uploads++;
+    if (t->levels > 1)
+        s_tex_mip_uploads++;
     return 1;
 }
 
@@ -1533,14 +1612,16 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         TexEntry *c = &s_tc[s_tc_hint[slot] - 1];
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
-                && c->pitch == t->pitch && c->palette == t->palette)
+                && c->pitch == t->pitch && c->palette == t->palette
+                && c->levels == t->levels)
             e = c;
     }
     for (i = 0; !e && i < TEX_CACHE; i++) {
         TexEntry *c = &s_tc[i];
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
-                && c->pitch == t->pitch && c->palette == t->palette) {
+                && c->pitch == t->pitch && c->palette == t->palette
+                && c->levels == t->levels) {
             e = c;
             break;
         }
@@ -1568,6 +1649,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         e->height = t->height;
         e->pitch = t->pitch;
         e->palette = t->palette;
+        e->levels = t->levels;
         e->gen = g->flips;
         e->hash = tex_hash_pal(mem, t, bytes);
         if (!tex_upload(e, t)) {
@@ -1591,12 +1673,13 @@ static D3D11_TEXTURE_ADDRESS_MODE address_mode(uint32_t m)
     }
 }
 
-/* SET_TEXTURE_FILTER: MIN in bits 16-21 (1 nearest, 2 linear, 3-6 the
- * mipmapped ones, odd = nearest within a level, 7 convolution), MAG in bits
- * 24-27 (1 nearest, 2 linear, 4 convolution). Only level 0 is uploaded, so
- * a mipmapped MIN filters within level 0 the way its base filter does, and
- * convolution is taken as linear. RECOMP_D3D11_POINT=1 forces nearest for
- * every stage (the CPU path's sampling) to compare. */
+/* SET_TEXTURE_FILTER: LOD bias in bits 0-12 (signed, 8 fraction bits), MIN
+ * in bits 16-21, MAG in bits 24-27. MIN: 1 nearest and 2 linear on level 0,
+ * 3/4 nearest/linear within the nearest level, 5/6 nearest/linear blended
+ * between two levels, 7 convolution on level 0 (taken as linear). MAG: 1
+ * nearest, 2 linear, 4 convolution (linear). The LOD range is CONTROL0's
+ * clamps, as xemu's sampler: 0..0 when MIN does not mipmap. RECOMP_D3D11_POINT=1
+ * forces nearest texels (the CPU path's sampling) for every stage. */
 static int filter_linear(uint32_t f, int mag)
 {
     uint32_t m = mag ? (f >> 24) & 0xF : (f >> 16) & 0x3F;
@@ -1605,32 +1688,87 @@ static int filter_linear(uint32_t f, int mag)
     return m == 2 || m == 4 || m == 6 || m == 7;
 }
 
-static ID3D11SamplerState *sampler(uint32_t u, uint32_t v, uint32_t filter)
+/* 0: level 0 only, 1: nearest level, 2: blend two levels. */
+static int filter_mip(uint32_t f)
 {
-    static ID3D11SamplerState *cache[16][16][2][2];
+    uint32_t m = (f >> 16) & 0x3F;
+    return m == 3 || m == 4 ? 1 : m == 5 || m == 6 ? 2 : 0;
+}
+
+static float lod_bias(uint32_t f)
+{
+    int b = (int)(f & 0x1FFFu);
+    if (b & 0x1000)
+        b -= 0x2000;
+    return (float)b / 256.0f;
+}
+
+#define SMP_MAX 256
+static struct { uint64_t key; ID3D11SamplerState *s; } s_smp[SMP_MAX];
+static int s_smp_n;
+static int s_smp_last[4];   /* per stage: the entry it got last */
+
+static ID3D11SamplerState *sampler(const Stage *t)
+{
     static int point = -1;
+    static ID3D11SamplerState *fallback;
     D3D11_SAMPLER_DESC sd;
-    int mn, mg;
+    uint32_t u = t->addr_u & 0xF, v = t->addr_v & 0xF;
+    int mn, mg, mip, i;
+    uint64_t key;
+    ID3D11SamplerState *st = NULL;
+
     if (point < 0)
         point = getenv("RECOMP_D3D11_POINT") != NULL;
-    u &= 0xF;
-    v &= 0xF;
-    mn = !point && filter_linear(filter, 0);
-    mg = !point && filter_linear(filter, 1);
-    if (cache[u][v][mn][mg])
-        return cache[u][v][mn][mg];
+    mn = !point && filter_linear(t->filter, 0);
+    mg = !point && filter_linear(t->filter, 1);
+    mip = t->levels > 1 ? filter_mip(t->filter) : 0;
+    key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9
+        | (uint64_t)mip << 10;
+    if (mip)
+        key |= (uint64_t)(t->filter & 0x1FFFu) << 12
+             | (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
+    if (s_smp_last[t - s_stage] < s_smp_n
+            && s_smp[s_smp_last[t - s_stage]].key == key)
+        return s_smp[s_smp_last[t - s_stage]].s;
+    for (i = 0; i < s_smp_n; i++)
+        if (s_smp[i].key == key) {
+            s_smp_last[t - s_stage] = i;
+            return s_smp[i].s;
+        }
     memset(&sd, 0, sizeof sd);
-    sd.Filter = mn ? (mg ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
-                         : D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT)
-                   : (mg ? D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT
-                         : D3D11_FILTER_MIN_MAG_MIP_POINT);
+    sd.Filter = (D3D11_FILTER)((mn ? 0x10 : 0) | (mg ? 0x4 : 0)
+                               | (mip == 2 ? 0x1 : 0));
     sd.AddressU = address_mode(u);
     sd.AddressV = address_mode(v);
     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    sd.MaxLOD = D3D11_FLOAT32_MAX;
-    ID3D11Device_CreateSamplerState(s_dev, &sd, &cache[u][v][mn][mg]);
-    return cache[u][v][mn][mg];
+    sd.MipLODBias = mip ? lod_bias(t->filter) : 0.0f;
+    if (sd.MipLODBias > 15.99f) sd.MipLODBias = 15.99f;
+    if (sd.MipLODBias < -16.0f) sd.MipLODBias = -16.0f;
+    sd.MinLOD = mip ? (float)t->lod_min : 0.0f;
+    sd.MaxLOD = mip ? (float)t->lod_max : 0.0f;
+    ID3D11Device_CreateSamplerState(s_dev, &sd, &st);
+    if (!st)
+        return fallback;
+    if (s_smp_n < SMP_MAX) {
+        i = s_smp_n++;
+    } else {
+        /* Full: replace one round robin. A released state's address can
+         * come back, so the bound-state filter starts over. */
+        static int next;
+        i = next++ % SMP_MAX;
+        if (s_smp[i].s == fallback)
+            fallback = NULL;
+        ID3D11SamplerState_Release(s_smp[i].s);
+        s_state_gen++;
+    }
+    s_smp[i].key = key;
+    s_smp[i].s = st;
+    s_smp_last[t - s_stage] = i;
+    if (!fallback)
+        fallback = st;
+    return st;
 }
 
 static ID3D11ShaderResourceView *solid_texture(uint32_t argb)
@@ -1956,7 +2094,7 @@ static ID3D11PixelShader *setup_pixel(void)
         } else {
             srv[n] = s_black_srv;
         }
-        smp[n] = sampler(t->addr_u, t->addr_v, t->filter);
+        smp[n] = sampler(t);
     }
     for (n = 0; n < 8; n++) {
         argb_to_float4(v->rc_f0[n], pc.c0[n]);
@@ -3017,13 +3155,13 @@ static void flip_log(uint32_t surface_offset)
 {
     static int on = -1;
     static uint64_t p_draws, p_prog, p_tex, p_rtt, p_clears, p_up, p_chg,
-                    p_re, p_vn, p_ve, p_skip, p_self;
+                    p_re, p_vn, p_ve, p_skip, p_self, p_mip;
     if (on < 0)
         on = getenv("RECOMP_FLIP_LOG") != NULL;
     if (!on)
         return;
     fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu (self %llu)"
-            " skipped %llu clears %llu uploads %llu changed %llu rehash %llu"
+            " skipped %llu clears %llu uploads %llu (mip %llu) changed %llu rehash %llu"
             " vb %llu/%llu bytes present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
             (unsigned long long)(s_draws - p_draws),
@@ -3034,6 +3172,7 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_draws_skipped - p_skip),
             (unsigned long long)(s_clears - p_clears),
             (unsigned long long)(s_tex_uploads - p_up),
+            (unsigned long long)(s_tex_mip_uploads - p_mip),
             (unsigned long long)(s_tex_changed - p_chg),
             (unsigned long long)(s_tex_rehash - p_re),
             (unsigned long long)(s_vb_native - p_vn),
@@ -3043,6 +3182,7 @@ static void flip_log(uint32_t surface_offset)
     p_rtt = s_rtt_binds; p_skip = s_draws_skipped; p_clears = s_clears;
     p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
     p_vn = s_vb_native; p_ve = s_vb_expanded; p_self = s_self_copies;
+    p_mip = s_tex_mip_uploads;
 }
 
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
