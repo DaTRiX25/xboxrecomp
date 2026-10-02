@@ -585,10 +585,33 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  * since the last flip wins; if none
  * was, the one cleared most recently; if none was either, the frame on
  * screen stays. Nothing carries over from one flip to the next, so a stray
- * flip with an odd target bound decides that flip and no other. */
+ * flip with an odd target bound decides that flip and no other.
+ *
+ * Three guards on that rule:
+ *
+ *  - The display address and a surface's offset are compared as physical
+ *    addresses (low 28 bits). AvSetDisplayMode resolves the address it is
+ *    given by its own rule (kernel_bridge.c: XBOX_CONTIG_BASE + fb whenever
+ *    fb is below 64 MB), dma_resolve by another (the bare offset above the
+ *    arena), and the two must not have to agree for the pick to work.
+ *
+ *  - Only surfaces the display could scan out set the size: the pitch test
+ *    applies to the size scan too, and a surface not drawn or cleared for
+ *    PRESENT_STALE_FLIPS flips takes no part at all. Otherwise an entry left
+ *    from an earlier, larger display mode at a reused address pins the size
+ *    for the rest of the run, no surface of that size is ever drawn again,
+ *    and the screen freezes on the last pick before the mode change.
+ *
+ *  - Field rendering (D3DPRESENTFLAG_FIELD): half-height back buffers at
+ *    twice the display's pitch. When no surface has the display's own pitch,
+ *    a surface at twice it qualifies instead, with a warning the first time.
+ *    The runtime does not interleave fields anywhere, so such a pick shows
+ *    one field; it beats presenting the buffer about to be drawn. */
 #define PRESENT_MAX 16
+#define PRESENT_STALE_FLIPS 120u
 static struct {
     uint32_t offset, w, h, pitch, format;
+    uint32_t last_flip;                  /* s_gpu.flips at its last use */
     uint64_t last_use, last_draw, last_clear;
 } s_psurf[PRESENT_MAX];
 static uint64_t s_psurf_seq, s_psurf_flip_seq;
@@ -628,6 +651,7 @@ static void present_note(int clear)
     }
     s_psurf[e].pitch = s_gpu.pitch;
     s_psurf[e].format = s_gpu.format;
+    s_psurf[e].last_flip = s_gpu.flips;
     s_psurf[e].last_use = ++s_psurf_seq;
     if (s_ptrace_on < 0)
         s_ptrace_on = getenv("RECOMP_PRESENT_TRACE") != NULL;
@@ -655,32 +679,57 @@ static void present_note(int clear)
         s_psurf[e].last_draw = s_psurf_seq;
 }
 
+/* Whether s_psurf[i] may be presented: in use, recent, and (with a display
+ * mode) at the pitch `want` -- the display's, or twice it for fields. */
+static int present_ok(int i, uint32_t want)
+{
+    return s_psurf[i].offset
+        && s_gpu.flips - s_psurf[i].last_flip <= PRESENT_STALE_FLIPS
+        && (!want || s_psurf[i].pitch == want);
+}
+
 /* At FLIP_STALL: pick what it presents, into s_present. */
 static void present_pick(void)
 {
+    static int warned_field;
     uint32_t disp_pitch = 0, disp = xbox_GetDisplayFramebuffer(&disp_pitch);
-    uint32_t tw = 0, th = 0;
+    uint32_t tw = 0, th = 0, want = disp_pitch;
     uint64_t area = 0;
-    int i, pass, best = -1;
+    int i, pass, tier, best = -1;
 
-    for (pass = 0; pass < 2 && !area; pass++)
-        for (i = 0; i < PRESENT_MAX; i++) {
-            uint64_t a = (uint64_t)s_psurf[i].w * s_psurf[i].h;
-            if (!s_psurf[i].offset || a <= area)
-                continue;
-            if (pass == 0 && (!disp || dma_resolve(s_psurf[i].offset) != disp))
-                continue;
-            area = a;
-            tw = s_psurf[i].w;
-            th = s_psurf[i].h;
-        }
-    for (pass = 0; pass < 2 && best < 0; pass++) {
+    /* Size: the largest presentable surface at the display address (pass 0),
+     * else the largest presentable one (pass 1). Tier 1 retries at the field
+     * pitch when nothing has the display's. */
+    for (tier = 0; tier < (disp_pitch ? 2 : 1) && !area; tier++) {
+        want = disp_pitch << tier;
+        for (pass = 0; pass < 2 && !area; pass++)
+            for (i = 0; i < PRESENT_MAX; i++) {
+                uint64_t a = (uint64_t)s_psurf[i].w * s_psurf[i].h;
+                if (a <= area || !present_ok(i, want))
+                    continue;
+                if (pass == 0 && (!disp || (dma_resolve(s_psurf[i].offset)
+                                            & 0x0FFFFFFFu)
+                                           != (disp & 0x0FFFFFFFu)))
+                    continue;
+                area = a;
+                tw = s_psurf[i].w;
+                th = s_psurf[i].h;
+            }
+    }
+    if (area && disp_pitch && want != disp_pitch && !warned_field) {
+        warned_field = 1;
+        fprintf(stderr, "  [GPU] present: no surface has the display pitch %u;"
+                " presenting %ux%u at pitch %u (field rendering?) -- one field"
+                " only, fields are not interleaved\n", disp_pitch, tw, th, want);
+    }
+    /* Of that size and pitch: the newest draw since the last flip, else the
+     * newest clear. */
+    for (pass = 0; pass < 2 && area && best < 0; pass++) {
         uint64_t top = s_psurf_flip_seq;
         for (i = 0; i < PRESENT_MAX; i++) {
             uint64_t when = pass == 0 ? s_psurf[i].last_draw : s_psurf[i].last_clear;
-            if (s_psurf[i].offset && s_psurf[i].w == tw && s_psurf[i].h == th
-                    && (!disp_pitch || s_psurf[i].pitch == disp_pitch)
-                    && when > top) {
+            if (s_psurf[i].w == tw && s_psurf[i].h == th
+                    && present_ok(i, want) && when > top) {
                 top = when;
                 best = i;
             }
@@ -703,11 +752,13 @@ static void present_pick(void)
         s_ptrace_n = 0;
     }
     if (best >= 0) {
-        s_present.offset = s_psurf[best].offset;
-        s_present.w      = s_psurf[best].w;
-        s_present.h      = s_psurf[best].h;
-        s_present.pitch  = s_psurf[best].pitch;
-        s_present.format = s_psurf[best].format;
+        /* One assignment, so the pick is never half old, half new (see the
+         * thread contract in nv2a_pb_state.h). */
+        struct nv2a_pb_present pick = {
+            s_psurf[best].offset, s_psurf[best].w, s_psurf[best].h,
+            s_psurf[best].pitch, s_psurf[best].format,
+        };
+        s_present = pick;
     }
     s_psurf_flip_seq = s_psurf_seq;
 }

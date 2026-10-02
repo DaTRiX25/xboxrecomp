@@ -9,7 +9,8 @@
  *   on_draw   -> the batch's vertex program, translated to HLSL by d3d8_vsh.c
  *                and compiled with D3DCompile (Wine's d3dcompiler_47 under
  *                Proton), or a pass-through for pre-transformed batches
- *   on_flip   -> copy the surface last drawn into the swap chain, Present
+ *   on_flip   -> copy the surface the walker picked for this flip
+ *                (nv2a_pb_present_state) into the swap chain, Present
  *
  * Opt-in: RECOMP_PB_BACKEND=d3d11 (see nv2a_pb_d3d11_register_from_env).
  *

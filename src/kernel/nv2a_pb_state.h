@@ -215,7 +215,13 @@ uint32_t nv2a_pb_dma_resolve(uint32_t offset);
  * most recently; else the previous choice stays. A surface is a colour offset
  * plus the size its clip gave it (clip_x + clip_w by clip_y + clip_h) when it
  * was drawn, with the pitch and format it had then. offset is 0 until the
- * first pick. Valid inside on_flip and after it. */
+ * first pick. Valid inside on_flip and after it.
+ *
+ * Walker thread only: present_pick writes it on the NV2A ack thread, and
+ * every reader (the backends' on_flip, nv2a_pb_exec_report) runs there too.
+ * There is no lock. The pick is stored with a single struct assignment, but
+ * that is not atomic: a reader on another thread (a separate presenter, say)
+ * needs a generation counter or a lock added here first. */
 struct nv2a_pb_present {
     uint32_t offset;      /* DMA offset, as SET_SURFACE_COLOR_OFFSET set it */
     uint32_t w, h;
