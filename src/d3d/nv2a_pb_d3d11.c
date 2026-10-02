@@ -89,22 +89,31 @@ typedef struct {
     "};\n"
 
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
-static uint64_t s_tex_uploads, s_tex_rehash;
+static uint64_t s_tex_uploads, s_tex_rehash, s_tex_changed;
+static uint64_t s_vb_native, s_vb_expanded;  /* vertex bytes copied / made */
+static uint64_t s_draws_prog, s_draws_tex;   /* with a vertex program / a texture */
 
 /* ---- render targets: one per guest surface ------------------------------ */
 
 #define RT_MAX 8
 typedef struct {
     uint32_t                offset;     /* color_offset, as the title set it */
+    uint32_t                addr;       /* ... resolved to a guest address */
     UINT                    w, h;
     ID3D11Texture2D        *tex;
     ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;      /* for render-to-texture, made lazily */
     uint64_t                last_use;
+    uint64_t                last_draw, last_clear;  /* s_seq at the last one */
+    int                     flipped;    /* the walker named it at a flip */
 } RenderTarget;
 
 static RenderTarget s_rt[RT_MAX];
-static RenderTarget *s_drawn;   /* what the next flip presents */
+static RenderTarget *s_drawn;   /* what the last flip presented */
+static RenderTarget *s_cur;     /* the target of the batch being drawn */
 static uint64_t      s_tick;
+static uint64_t      s_seq, s_flip_seq;  /* draw/clear order; s_seq at the last flip */
+static uint64_t      s_rtt_binds;        /* textures served from a render target */
 
 /* ---- shaders --------------------------------------------------------------- */
 
@@ -115,7 +124,12 @@ typedef struct {
     int                 bad;      /* failed to compile: skip its batches */
     uint16_t            inputs;   /* ATTR slots the shader reads */
     ID3D11VertexShader *vs;
-    ID3D11InputLayout  *layout;
+    ID3DBlob           *code;     /* for input layouts made later */
+    struct {
+        uint8_t            fmt[16];  /* DXGI_FORMAT per ATTR slot, 0 unread */
+        ID3D11InputLayout *il;
+    } lay[8];                     /* one per combination of stream formats */
+    int                 lay_next;
 } VsEntry;
 
 static VsEntry s_vs[VS_MAX];
@@ -389,6 +403,8 @@ static RenderTarget *surface(void)
         free_rt = lru;
         if (s_drawn == free_rt)
             s_drawn = NULL;
+        if (free_rt->srv)
+            ID3D11ShaderResourceView_Release(free_rt->srv);
         ID3D11RenderTargetView_Release(free_rt->rtv);
         ID3D11Texture2D_Release(free_rt->tex);
         memset(free_rt, 0, sizeof *free_rt);
@@ -414,6 +430,7 @@ static RenderTarget *surface(void)
         }
     }
     free_rt->offset = g->color_offset;
+    free_rt->addr = nv2a_pb_dma_resolve(g->color_offset);
     free_rt->w = w;
     free_rt->h = h;
     free_rt->last_use = s_tick;
@@ -554,9 +571,7 @@ static void d3d11_on_clear(uint32_t param)
     c[2] = (float)(g->clear_color & 0xFF) / 255.0f;
     c[3] = (float)(g->clear_color >> 24) / 255.0f;
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
-    /* A clear is drawing too: the flip presents this surface. (The CPU
-     * backend records this in drawn_offset; other backends cannot.) */
-    s_drawn = rt;
+    rt->last_clear = ++s_seq;
     s_clears++;
 }
 
@@ -628,6 +643,32 @@ static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
     }
     default:
         return 0;
+    }
+}
+
+/* The DXGI format a stream can be read in as it is, so its bytes are copied
+ * rather than expanded to float4 (the shader's float4 input gets the same
+ * values fetch() would make, missing components (0,0,0,1)). 0 for the types
+ * and sizes that have none: S32K (integers read as floats), CMP, and
+ * three-component bytes and shorts. *bytes: the size of one element. */
+static DXGI_FORMAT native_format(const VertexAttr *a, UINT *bytes)
+{
+    static const DXGI_FORMAT f32[5] = {0, DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32B32A32_FLOAT};
+    static const DXGI_FORMAT u8[5] = {0, DXGI_FORMAT_R8_UNORM,
+        DXGI_FORMAT_R8G8_UNORM, 0, DXGI_FORMAT_R8G8B8A8_UNORM};
+    static const DXGI_FORMAT s16[5] = {0, DXGI_FORMAT_R16_SNORM,
+        DXGI_FORMAT_R16G16_SNORM, 0, DXGI_FORMAT_R16G16B16A16_SNORM};
+
+    if (a->size < 1 || a->size > 4)
+        return 0;
+    switch (a->type) {
+    case NV2A_VTX_D3DCOLOR: *bytes = 4;           return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case NV2A_VTX_FLOAT:    *bytes = 4 * a->size; return f32[a->size];
+    case NV2A_VTX_UBYTE:    *bytes = a->size;     return u8[a->size];
+    case NV2A_VTX_S1:       *bytes = 2 * a->size; return s16[a->size];
+    default:                return 0;
     }
 }
 
@@ -733,12 +774,11 @@ static VsEntry *vertex_shader(int program)
     static char hlsl[65536];
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     uint32_t hash = program ? program_hash(v) : 0;
-    D3D11_INPUT_ELEMENT_DESC el[NV2A_VS_MAX_INPUTS];
     VsEntry *e = NULL;
     ID3DBlob *code = NULL;
     const char *src;
     char name[32];
-    int i, n;
+    int i;
 
     for (i = 0; i < VS_MAX; i++) {
         if (s_vs[i].used && s_vs[i].hash == hash)
@@ -776,32 +816,50 @@ static VsEntry *vertex_shader(int program)
         ID3D10Blob_Release(code);
         return NULL;
     }
-    /* Every stream is uploaded as float4 for now, one input slot each. The
-     * native formats (d3d8_vsh_nv2a_input_layout) would save the expansion;
-     * that is the next step once the picture is right. */
+    e->code = code;     /* input layouts come per draw: input_layout() */
+    fprintf(stderr, LOGP "compiled %s (inputs 0x%04X)\n", name, e->inputs);
+    e->bad = 0;
+    return e;
+}
+
+/* The input layout for a shader and the formats its streams arrive in this
+ * batch (one input slot per ATTR), made the first time that pair is seen.
+ * NULL if the shader reads nothing. */
+static ID3D11InputLayout *input_layout(VsEntry *e, const uint8_t fmt[16])
+{
+    D3D11_INPUT_ELEMENT_DESC el[NV2A_VS_MAX_INPUTS];
+    int i, n, k;
+
+    for (k = 0; k < 8; k++)
+        if (e->lay[k].il && !memcmp(e->lay[k].fmt, fmt, 16))
+            return e->lay[k].il;
     for (i = 0, n = 0; i < NV2A_VS_MAX_INPUTS; i++) {
         if (!(e->inputs & (1u << i)))
             continue;
         memset(&el[n], 0, sizeof el[n]);
         el[n].SemanticName = "ATTR";
         el[n].SemanticIndex = (UINT)i;
-        el[n].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        el[n].Format = (DXGI_FORMAT)fmt[i];
         el[n].InputSlot = (UINT)i;
         el[n].AlignedByteOffset = 0;
         el[n].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
         n++;
     }
-    if (n && FAILED(ID3D11Device_CreateInputLayout(
-                s_dev, el, (UINT)n, ID3D10Blob_GetBufferPointer(code),
-                ID3D10Blob_GetBufferSize(code), &e->layout))) {
-        fprintf(stderr, LOGP "%s: CreateInputLayout failed\n", name);
-        ID3D10Blob_Release(code);
+    if (!n)
         return NULL;
+    k = e->lay_next;
+    e->lay_next = (k + 1) % 8;
+    if (e->lay[k].il)
+        ID3D11InputLayout_Release(e->lay[k].il);
+    e->lay[k].il = NULL;
+    memcpy(e->lay[k].fmt, fmt, 16);
+    if (FAILED(ID3D11Device_CreateInputLayout(
+                s_dev, el, (UINT)n, ID3D10Blob_GetBufferPointer(e->code),
+                ID3D10Blob_GetBufferSize(e->code), &e->lay[k].il))) {
+        fprintf(stderr, LOGP "vs %08X: CreateInputLayout failed\n", e->hash);
+        e->lay[k].il = NULL;
     }
-    ID3D10Blob_Release(code);
-    fprintf(stderr, LOGP "compiled %s (inputs 0x%04X)\n", name, e->inputs);
-    e->bad = 0;
-    return e;
+    return e->lay[k].il;
 }
 
 /* ---- blending -------------------------------------------------------------- */
@@ -889,7 +947,7 @@ typedef struct {
 static Stage s_stage[4];
 
 #define TEX_MAX_TEXELS (2048u * 2048u)
-#define TEX_CACHE 64
+#define TEX_CACHE 512   /* a demo frame binds ~100; 64 thrashed */
 typedef struct {
     uint32_t offset, color, width, height, pitch;
     uint32_t gen, used;
@@ -935,7 +993,9 @@ static void build_stages(void)
             t->width  = r[0x1C / 4] >> 16;
             t->height = r[0x1C / 4] & 0xFFFF;
         }
-        t->pitch  = r[0x10 / 4] >> 16;
+        /* CONTROL1's pitch means nothing to a swizzled or DXT texture,
+         * and left in the cache key a stale one splits it in two. */
+        t->pitch  = tex_size_from_format(t->color) ? 0 : r[0x10 / 4] >> 16;
         t->addr_u =  r[0x08 / 4]       & 0xF;
         t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
         t->valid = t->offset && t->width && t->height
@@ -1189,6 +1249,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
             e->gen = g->flips;
             if (h != e->hash) {
                 e->hash = h;
+                s_tex_changed++;
                 if (!tex_upload(e, t))
                     return s_black_srv;
             }
@@ -1348,6 +1409,30 @@ static void argb_to_float4(uint32_t c, float o[4])
     o[3] = (float)(c >> 24) / 255.0f;
 }
 
+/* Render to texture: a stage whose texture lies where a surface this backend
+ * renders into starts samples that surface. The guest's copy of those bytes
+ * is stale (nothing here writes guest memory), so decoding it would show
+ * whatever was there before -- or nothing at all. A 32-bit texture at the
+ * surface's address only, and never the surface being drawn into. */
+static RenderTarget *rt_texture(const Stage *t)
+{
+    int i;
+
+    if (!t->offset || d3d8_format_dxt_block_bytes(t->color)
+            || texel_bytes(linear_twin(t->color)) != 4)
+        return NULL;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->tex || rt->addr != t->offset || rt == s_cur)
+            continue;
+        if (!rt->srv && FAILED(ID3D11Device_CreateShaderResourceView(
+                    s_dev, (ID3D11Resource *)rt->tex, NULL, &rt->srv)))
+            return NULL;
+        return rt;
+    }
+    return NULL;
+}
+
 /* Stages, textures, samplers and PS constants for the batch about to be
  * drawn. Returns the pixel shader to use. */
 static ID3D11PixelShader *setup_pixel(void)
@@ -1357,17 +1442,32 @@ static ID3D11PixelShader *setup_pixel(void)
     ID3D11SamplerState *smp[4];
     D3D11_MAPPED_SUBRESOURCE m;
     PsConsts pc;
-    int n;
+    int n, textured = 0;
 
     build_stages();
     memset(&pc, 0, sizeof pc);
     for (n = 0; n < 4; n++) {
         const Stage *t = &s_stage[n];
         int scaled = tex_size_from_format(t->color);
+        RenderTarget *src = (t->mode && t->mode != 4) ? rt_texture(t) : NULL;
         pc.tex_mode[n] = (uint32_t)t->mode;
         pc.tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;
         pc.tex_scale[n][1] = scaled || !t->height ? 1.0f : 1.0f / (float)t->height;
-        srv[n] = (t->mode && t->mode != 4) ? tex_bind(t) : s_black_srv;
+        if (src) {
+            /* Linear coordinates are texels of the surface as drawn. */
+            if (!scaled) {
+                pc.tex_scale[n][0] = 1.0f / (float)src->w;
+                pc.tex_scale[n][1] = 1.0f / (float)src->h;
+            }
+            srv[n] = src->srv;
+            s_rtt_binds++;
+            textured = 1;
+        } else if (t->mode && t->mode != 4) {
+            srv[n] = tex_bind(t);
+            textured = 1;
+        } else {
+            srv[n] = s_black_srv;
+        }
         smp[n] = sampler(t->addr_u, t->addr_v);
     }
     for (n = 0; n < 8; n++) {
@@ -1395,6 +1495,8 @@ static ID3D11PixelShader *setup_pixel(void)
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_ps);
+    if (textured)
+        s_draws_tex++;
 
     if (v->rc_set && (v->rc_ctl & 0xFF)) {
         NV2ACombinerState st;
@@ -1429,6 +1531,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     UINT strides[NV2A_VS_MAX_INPUTS], offs[NV2A_VS_MAX_INPUTS];
     RenderTarget *rt;
     VsEntry *vs;
+    uint8_t fmts[16];
     uint32_t lo = 0xFFFF, hi = 0, count, nidx, i, k;
     void *p;
 
@@ -1451,19 +1554,67 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         return;
     }
 
-    /* Streams: each one the shader reads, as float4 per vertex lo..hi, or one
-     * float4 at stride 0 (the current SET_VERTEX_DATA value) if disabled. */
+    /* Streams: each one the shader reads. One in a format the input
+     * assembler reads natively is copied as it is: vertices lo..hi of its
+     * buffer in one block, shared by every stream interleaved in it (same
+     * stride, within one stride of each other), bound at their own offsets.
+     * The rest go as float4 per vertex, or one float4 at stride 0 (the
+     * current SET_VERTEX_DATA value) if disabled. */
     memset(vbs, 0, sizeof vbs);
     memset(strides, 0, sizeof strides);
     memset(offs, 0, sizeof offs);
+    memset(fmts, 0, sizeof fmts);
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
         const VertexAttr *a = &d->attr[i];
         int on = a->size && a->stride;
-        UINT bytes = on ? count * 16u : 16u;
+        UINT bytes = on ? count * 16u : 16u, esz;
         float *f;
 
-        if (!(vs->inputs & (1u << i)))
+        if (!(vs->inputs & (1u << i)) || fmts[i])
             continue;
+        if (on && (d->inline_data || a->offset) && !(a->stride & 3)
+                && native_format(a, &esz)) {
+            uint32_t lo_off = a->offset, hi_end = a->offset + esz, group = 0, j;
+            const uint8_t *base = d->inline_data
+                ? (const uint8_t *)d->inline_buf
+                : (const uint8_t *)xbox_GetMemoryOffset();
+            for (j = i; j < NV2A_VS_MAX_INPUTS; j++) {
+                const VertexAttr *b = &d->attr[j];
+                UINT bsz;
+                if (!(vs->inputs & (1u << j)) || fmts[j] || !b->size
+                        || b->stride != a->stride || !native_format(b, &bsz)
+                        || (!d->inline_data && !b->offset)
+                        || (b->offset > a->offset ? b->offset - a->offset
+                                                  : a->offset - b->offset) >= a->stride)
+                    continue;
+                group |= 1u << j;
+                if (b->offset < lo_off) lo_off = b->offset;
+                if (b->offset + bsz > hi_end) hi_end = b->offset + bsz;
+            }
+            bytes = (count - 1u) * a->stride + (hi_end - lo_off);
+            if (!d->inline_data
+                    || (size_t)lo_off + (size_t)lo * a->stride + bytes <= d->inline_bytes) {
+                uint8_t *dst = (uint8_t *)ring_map(s_vb, s_vb_size, &s_vb_pos, bytes, 16);
+                if (!dst) {
+                    s_draws_skipped++;
+                    return;
+                }
+                memcpy(dst, base + lo_off + (size_t)lo * a->stride, bytes);
+                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+                for (j = i; j < NV2A_VS_MAX_INPUTS; j++) {
+                    if (!(group & (1u << j)))
+                        continue;
+                    fmts[j] = (uint8_t)native_format(&d->attr[j], &esz);
+                    offs[j] = s_vb_pos - bytes + (d->attr[j].offset - lo_off);
+                    strides[j] = a->stride;
+                    vbs[j] = s_vb;
+                }
+                s_vb_native += bytes;
+                continue;
+            }
+            bytes = count * 16u;
+        }
+        fmts[i] = (uint8_t)DXGI_FORMAT_R32G32B32A32_FLOAT;
         f = (float *)ring_map(s_vb, s_vb_size, &s_vb_pos, bytes, 16);
         if (!f) {
             s_draws_skipped++;
@@ -1480,6 +1631,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             memcpy(f, v->inl[i], 16);
             strides[i] = 0;
         }
+        s_vb_expanded += bytes;
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
         vbs[i] = s_vb;
     }
@@ -1545,7 +1697,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(), NULL, 0xFFFFFFFF);
         ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
         ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
-        ID3D11DeviceContext_IASetInputLayout(s_ctx, vs->layout);
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, input_layout(vs, fmts));
         ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, NV2A_VS_MAX_INPUTS,
                                                vbs, strides, offs);
         ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT,
@@ -1553,11 +1705,15 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, topo);
         ID3D11DeviceContext_VSSetShader(s_ctx, vs->vs, NULL, 0);
         ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 3, cbs);
+        s_cur = rt;
         ID3D11DeviceContext_PSSetShader(s_ctx, setup_pixel(), NULL, 0);
         ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
     }
-    s_drawn = rt;
+    rt->last_draw = ++s_seq;
+    s_cur = NULL;
     s_draws++;
+    if (d->program)
+        s_draws_prog++;
 }
 
 /* ---- flip ------------------------------------------------------------------ */
@@ -1625,6 +1781,90 @@ static void dump_frame(void)
     ID3D11Texture2D_Release(st);
 }
 
+/* The surface a flip puts on screen.
+ *
+ * The walker hands over drawn_offset, else color_offset. drawn_offset is the
+ * CPU backend's bookkeeping, so here it is color_offset: by FLIP_STALL the
+ * XDK has already pointed that at the next back buffer. And the last surface
+ * drawn into is not the answer either -- a title renders glow, shadow and
+ * reflection targets too, sometimes last.
+ *
+ * What is used instead: the swap-chain buffers are the surfaces the walker
+ * names at flips (both of them, after two), plus anything as large as the
+ * largest surface (for the first flip, before the second buffer has been
+ * named). Of those, the one drawn into most recently since the last flip;
+ * if none was, the one cleared most recently; if none was either, the
+ * frame on screen stays. */
+static RenderTarget *present_target(uint32_t surface_offset)
+{
+    RenderTarget *best = NULL;
+    UINT max_area = 0;
+    int i, pass;
+
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->tex)
+            continue;
+        if (surface_offset && rt->offset == surface_offset)
+            rt->flipped = 1;
+        if (rt->w * rt->h > max_area)
+            max_area = rt->w * rt->h;
+    }
+    for (pass = 0; pass < 2 && !best; pass++) {
+        uint64_t top = s_flip_seq;
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            uint64_t when;
+            if (!rt->tex || !(rt->flipped || rt->w * rt->h == max_area))
+                continue;
+            when = pass == 0 ? rt->last_draw : rt->last_clear;
+            if (when > top) {
+                top = when;
+                best = rt;
+            }
+        }
+    }
+    s_flip_seq = s_seq;
+    return best ? best : s_drawn;
+}
+
+/* RECOMP_FLIP_LOG: a line per flip, just before the walker's "[GPU] flip"
+ * one, with what this backend did since the last. The walker's own "batches"
+ * counts the CPU rasteriser's batches, so under this backend it reads 0;
+ * "batches" here is the same quantity for D3D11 (3D frames have them, movie
+ * frames do not); "vb" is vertex bytes copied as they are / expanded to
+ * float4; the flip number is this backend's present count. */
+static void flip_log(uint32_t surface_offset)
+{
+    static int on = -1;
+    static uint64_t p_draws, p_prog, p_tex, p_rtt, p_clears, p_up, p_chg,
+                    p_re, p_vn, p_ve, p_skip;
+    if (on < 0)
+        on = getenv("RECOMP_FLIP_LOG") != NULL;
+    if (!on)
+        return;
+    fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu"
+            " skipped %llu clears %llu uploads %llu changed %llu rehash %llu"
+            " vb %llu/%llu bytes present 0x%08X walker 0x%08X\n",
+            (unsigned long long)s_presents,
+            (unsigned long long)(s_draws - p_draws),
+            (unsigned long long)(s_draws_prog - p_prog),
+            (unsigned long long)(s_draws_tex - p_tex),
+            (unsigned long long)(s_rtt_binds - p_rtt),
+            (unsigned long long)(s_draws_skipped - p_skip),
+            (unsigned long long)(s_clears - p_clears),
+            (unsigned long long)(s_tex_uploads - p_up),
+            (unsigned long long)(s_tex_changed - p_chg),
+            (unsigned long long)(s_tex_rehash - p_re),
+            (unsigned long long)(s_vb_native - p_vn),
+            (unsigned long long)(s_vb_expanded - p_ve),
+            s_drawn ? s_drawn->offset : 0, surface_offset);
+    p_draws = s_draws; p_prog = s_draws_prog; p_tex = s_draws_tex;
+    p_rtt = s_rtt_binds; p_skip = s_draws_skipped; p_clears = s_clears;
+    p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
+    p_vn = s_vb_native; p_ve = s_vb_expanded;
+}
+
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     HRESULT hr;
@@ -1632,6 +1872,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (!init())
         return;
     pump();
+    s_drawn = present_target(surface_offset);
     if (s_drawn) {
         if (s_drawn->w == s_back_w && s_drawn->h == s_back_h) {
             ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_back,
@@ -1656,11 +1897,12 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own
      * render target anyway. */
+    flip_log(surface_offset);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (walker said 0x%08X),"
                 " %llu clears, %llu draws, %llu skipped, %llu texture uploads,"
                 " %llu rehashes, %llu combiner shaders, %llu zclears,"
-                " %llu depth-tested draws\n",
+                " %llu depth-tested draws, %llu render-target textures\n",
                 (unsigned long long)s_presents,
                 s_drawn ? s_drawn->offset : 0, surface_offset,
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
@@ -1668,7 +1910,8 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_tex_uploads,
                 (unsigned long long)s_tex_rehash,
                 (unsigned long long)s_rc_compiles,
-                (unsigned long long)s_zclears, (unsigned long long)s_draws_z);
+                (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
+                (unsigned long long)s_rtt_binds);
 }
 
 /* ---- registration ---------------------------------------------------------- */

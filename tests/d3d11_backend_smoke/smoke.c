@@ -71,6 +71,7 @@ static void vertex_z(float x, float y, float z, uint32_t argb)
 /* Guest memory for the texture: the runtime's memory offset is 0 here, so a
  * guest address is a host address, and it has to fit in 32 bits. */
 #define TEX_GUEST 0x10000000u
+#define OFFSCREEN 0x01800000u   /* a 320x240 render target */
 #define TEX_LOG2  6                            /* 64x64 */
 
 /* A swizzled A8R8G8B8 texture: 8x8-texel checker, orange and blue, with a
@@ -257,6 +258,46 @@ int main(int argc, char **argv)
         M(0x17FC, 0);
         M(0x030C, 0);                          /* depth test off */
         M(0x1E70, 1);                          /* stage 0 2D again */
+
+        /* Render to texture. The top-left inset samples the offscreen
+         * surface (as a linear A8R8G8B8 texture at its address, texel
+         * coordinates) that the previous frame drew below: a backend that
+         * decodes guest memory instead shows whatever is there. */
+        M(0x1B00, OFFSCREEN);
+        M(0x1B04, (0x12u << 8) | (1u << 4) | (2u << 0)); /* LU_IMAGE_A8R8G8B8 */
+        M(0x1B08, 0x00000303u);
+        M(0x1B0C, 0x40000000u);
+        M(0x1B10, (320u * 4u) << 16);
+        M(0x1B1C, (320u << 16) | 240u);
+        M(0x1760 + 4 * 9, 0x22u);
+        M(0x17FC, 8);
+        {
+            static const float uv[4][2] = {{0, 0}, {320, 0}, {320, 240}, {0, 240}};
+            vertex_uv(20.0f,  20.0f,  0xFFFFFFFFu, uv[0]);
+            vertex_uv(180.0f, 20.0f,  0xFFFFFFFFu, uv[1]);
+            vertex_uv(180.0f, 140.0f, 0xFFFFFFFFu, uv[2]);
+            vertex_uv(20.0f,  140.0f, 0xFFFFFFFFu, uv[3]);
+        }
+        M(0x17FC, 0);
+        M(0x1760 + 4 * 9, 0x02u);
+        M(0x1B0C, 0);
+
+        /* ... and the offscreen surface itself, drawn last in the frame the
+         * way a title renders a glow or shadow target: the flip must still
+         * present the 640x480 back buffer, not this. A dark teal clear with
+         * an orange quad sliding across it. */
+        M(0x0200, 320u << 16);
+        M(0x0204, 240u << 16);
+        M(0x020C, 320u * 4u);
+        M(0x0210, OFFSCREEN);
+        M(0x1D90, 0xFF004040u);
+        M(0x1D94, 0xF0);                       /* colour only */
+        M(0x17FC, 8);
+        vertex(20.0f + 200.0f * t, 60.0f,  0xFFFF8000u);
+        vertex(120.0f + 200.0f * t, 60.0f, 0xFFFF8000u);
+        vertex(120.0f + 200.0f * t, 180.0f, 0xFFFF8000u);
+        vertex(20.0f + 200.0f * t, 180.0f, 0xFFFF8000u);
+        M(0x17FC, 0);
 
         M(0x0210, buf[(f + 1) & 1]);           /* next buffer, as the XDK does */
         M(0x0130, 0);                          /* FLIP_STALL */
