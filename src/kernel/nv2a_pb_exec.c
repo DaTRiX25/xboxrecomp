@@ -5011,6 +5011,10 @@ static void get_report(uint32_t param)
         note_unhandled(NV097_GET_REPORT, param);
         return;
     }
+    if (!fixed_set && s_backend->on_report && s_backend->on_report(va)) {
+        s_reports++;                       /* the backend completes it */
+        return;
+    }
     value = (fixed_set || s_backend != &s_cpu_backend) ? fixed : s_zpass_count;
     s_reports++;
     s_reports_zero += value == 0;
@@ -5558,9 +5562,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;                            /* covers physical memory from 0 */
     case NV097_CLEAR_REPORT_VALUE:
         s_zpass_count = 0;
+        if (s_backend->on_zpass_clear)
+            s_backend->on_zpass_clear();
         return;
     case NV097_SET_ZPASS_PIXEL_COUNT_ENABLE:
         s_zpass_enable = param != 0;
+        if (s_backend->on_zpass)
+            s_backend->on_zpass(s_zpass_enable);
         return;
     case NV097_GET_REPORT:
         get_report(param);

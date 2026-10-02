@@ -4,8 +4,10 @@
  * nv2a_pb_exec.c walks the title's pushbuffer and decodes it into the structs
  * below: surfaces, vertex arrays, the batch being built, texture registers,
  * the transform program and its constants, combiners and depth state. Drawing
- * is a separate concern. A backend gets four events (clear, depth clear, draw,
- * flip) and reads whatever else it needs from this state, read-only.
+ * is a separate concern. A backend gets events (clear, depth clear, draw,
+ * flip, and optionally the visibility-test ones: zpass enable, report clear,
+ * report, idle poll) and reads whatever else it needs from this state,
+ * read-only.
  *
  * The default backend is the CPU rasteriser in nv2a_pb_exec.c. A GPU backend
  * (D3D11 first, see analysis/reviews/spike-render-perf-2026-10-01.md in cat/)
@@ -243,6 +245,20 @@ struct nv2a_pb_backend {
     void (*on_zclear)(uint32_t param);
     void (*on_draw)(const struct nv2a_pb_draw *draw);
     void (*on_flip)(uint32_t surface, uint32_t pitch);
+
+    /* Visibility tests (optional, NULL to leave them to the walker, which
+     * counts fragments on the CPU path and reports RECOMP_ZPASS_FIXED for a
+     * backend without these). on_zpass: SET_ZPASS_PIXEL_COUNT_ENABLE;
+     * on_zpass_clear: CLEAR_REPORT_VALUE. on_report: GET_REPORT for the
+     * 16-byte report at guest address va; returning 1 means the backend
+     * writes it -- {timestamp, count, status 0} -- now or later, and until it
+     * does the status keeps the 0xFFFFFFFF D3D put there (TESTINCOMPLETE).
+     * on_poll: called on the ack thread every pass of its loop, pushbuffer
+     * or not, so a report can complete while the title spins on it. */
+    void (*on_zpass)(int enable);
+    void (*on_zpass_clear)(void);
+    int  (*on_report)(uint32_t va);
+    void (*on_poll)(void);
 };
 
 /* Route the executor's events to `backend`. NULL restores the CPU rasteriser.

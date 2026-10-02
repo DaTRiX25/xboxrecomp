@@ -2,8 +2,8 @@
  * A D3D11 backend for the pushbuffer executor (struct nv2a_pb_backend).
  *
  * The executor (src/kernel/nv2a_pb_exec.c) decodes the title's pushbuffer into
- * the state in nv2a_pb_state.h and calls four hooks; this file answers them
- * with D3D11 instead of the CPU rasteriser:
+ * the state in nv2a_pb_state.h and calls the hooks of struct nv2a_pb_backend;
+ * this file answers them with D3D11 instead of the CPU rasteriser:
  *
  *   on_clear  -> ClearRenderTargetView on the surface at color_offset
  *   on_draw   -> the batch's vertex program, translated to HLSL by d3d8_vsh.c
@@ -3135,6 +3135,10 @@ static void dump_frame(void)
  * only those: if none of them was drawn or cleared, the frame on screen
  * stays. With no render target at the named surface yet (the first flips),
  * the largest candidates go first, then the rest. */
+static uint64_t s_occ_reports, s_occ_late, s_occ_vis, s_occ_sync_us, s_occ_super;
+static int      s_occ_npend;
+static void     occ_poll(UINT flags);
+
 static RenderTarget *present_target(uint32_t surface_offset)
 {
     RenderTarget *best = NULL, *named = NULL;
@@ -3189,14 +3193,16 @@ static void flip_log(uint32_t surface_offset)
 {
     static int on = -1;
     static uint64_t p_draws, p_prog, p_tex, p_rtt, p_clears, p_up, p_chg,
-                    p_re, p_vn, p_ve, p_skip, p_self, p_mip;
+                    p_re, p_vn, p_ve, p_skip, p_self, p_mip,
+                    p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super;
     if (on < 0)
         on = getenv("RECOMP_FLIP_LOG") != NULL;
     if (!on)
         return;
     fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu (self %llu)"
             " skipped %llu clears %llu uploads %llu (mip %llu) changed %llu rehash %llu"
-            " vb %llu/%llu bytes present 0x%08X walker 0x%08X\n",
+            " vb %llu/%llu bytes occ %llu (visible %llu, pending %d, late %llu, superseded %llu, sync %llu us)"
+            " present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
             (unsigned long long)(s_draws - p_draws),
             (unsigned long long)(s_draws_prog - p_prog),
@@ -3211,12 +3217,19 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_tex_rehash - p_re),
             (unsigned long long)(s_vb_native - p_vn),
             (unsigned long long)(s_vb_expanded - p_ve),
+            (unsigned long long)(s_occ_reports - p_occ),
+            (unsigned long long)(s_occ_vis - p_occ_vis), s_occ_npend,
+            (unsigned long long)(s_occ_late - p_occ_late),
+            (unsigned long long)(s_occ_super - p_occ_super),
+            (unsigned long long)(s_occ_sync_us - p_occ_us),
             s_drawn ? s_drawn->offset : 0, surface_offset);
     p_draws = s_draws; p_prog = s_draws_prog; p_tex = s_draws_tex;
     p_rtt = s_rtt_binds; p_skip = s_draws_skipped; p_clears = s_clears;
     p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
     p_vn = s_vb_native; p_ve = s_vb_expanded; p_self = s_self_copies;
     p_mip = s_tex_mip_uploads;
+    p_occ = s_occ_reports; p_occ_vis = s_occ_vis; p_occ_us = s_occ_sync_us;
+    p_occ_late = s_occ_late; p_occ_super = s_occ_super;
 }
 
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
@@ -3226,6 +3239,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (!init())
         return;
     pump();
+    occ_poll(D3D11_ASYNC_GETDATA_DONOTFLUSH);
     s_drawn = present_target(surface_offset);
     if (s_drawn) {
         if (s_drawn->w == s_back_w && s_drawn->h == s_back_h) {
@@ -3276,11 +3290,268 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
 
 /* ---- registration ---------------------------------------------------------- */
 
+/* ---- Visibility tests: D3D11 occlusion queries ----------------------
+ *
+ * BeginVisibilityTest is CLEAR_REPORT_VALUE + SET_ZPASS_PIXEL_COUNT_ENABLE(1),
+ * EndVisibilityTest is ENABLE(0) + GET_REPORT. Each stretch with counting on
+ * is one D3D11_QUERY_OCCLUSION (begun at enable, or at a clear while
+ * enabled; ended at disable or the report), and a report sums the stretches
+ * since the last clear. The count is samples passing depth and stencil with
+ * the pixel shader's alpha-test discard applied, the GPU's version of the
+ * CPU path's put_pixel count.
+ *
+ * Latency: a report is not completed at GET_REPORT. Its queries go on a
+ * pending list, polled (GetData without a flush) at every batch and flip
+ * and, with a flush, on the ack thread's idle tick (on_poll), so a title
+ * spinning on the result still gets one. Until then the status keeps D3D's
+ * 0xFFFFFFFF, which GetVisibilityTestResult reads as D3DERR_TESTINCOMPLETE.
+ * When done, count then status 0 are written. RECOMP_D3D11_OCC=sync waits
+ * for the result at GET_REPORT instead (the stall the flip log's "occ"
+ * shows), =fixed leaves reports to the walker (RECOMP_ZPASS_FIXED, every
+ * test visible). A report still pending after 250 ms, or one with too many
+ * stretches, completes as visible (0x10000).
+ *
+ * Reused reports: the XDK recycles its report slots, so a GET_REPORT can name
+ * a va that still has a report pending. The new one supersedes it: the old
+ * queries go back to the pool unread and nothing is written for the old
+ * test, so its late completion cannot land over the title's reset status or
+ * the new count. */
+#define OCC_SEG     8       /* stretches per report */
+#define OCC_PENDING 128
+#define OCC_POOL    (OCC_PENDING * 2 + OCC_SEG)
+typedef struct {
+    uint32_t     va;
+    int          n, overflow;
+    uint64_t     t0;
+    ID3D11Query *q[OCC_SEG];
+} OccReport;
+static ID3D11Query *s_occ_pool[OCC_POOL];
+static int          s_occ_pool_n, s_occ_made;
+static ID3D11Query *s_occ_seg[OCC_SEG];      /* since the last clear */
+static int          s_occ_nseg, s_occ_open, s_occ_en, s_occ_ovf;
+static OccReport    s_occ_pend[OCC_PENDING];
+static int          s_occ_mode = -1;         /* 0 defer, 1 sync, 2 fixed */
+
+static int occ_mode(void)
+{
+    if (s_occ_mode < 0) {
+        const char *e = getenv("RECOMP_D3D11_OCC");
+        s_occ_mode = !e ? 0 : !_stricmp(e, "sync") ? 1 : !_stricmp(e, "fixed") ? 2 : 0;
+    }
+    return s_occ_mode;
+}
+
+static uint64_t occ_now_us(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)(c.QuadPart * 1000000.0 / (double)f.QuadPart);
+}
+
+static ID3D11Query *occ_get(void)
+{
+    ID3D11Query *q = NULL;
+    D3D11_QUERY_DESC qd;
+    if (s_occ_pool_n)
+        return s_occ_pool[--s_occ_pool_n];
+    if (s_occ_made >= OCC_POOL)
+        return NULL;
+    qd.Query = D3D11_QUERY_OCCLUSION;
+    qd.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &q)))
+        return NULL;
+    s_occ_made++;
+    return q;
+}
+
+static void occ_put(ID3D11Query *q)
+{
+    if (q && s_occ_pool_n < OCC_POOL)
+        s_occ_pool[s_occ_pool_n++] = q;
+    else if (q)
+        ID3D11Query_Release(q);
+}
+
+static void occ_begin(void)
+{
+    ID3D11Query *q;
+    if (s_occ_open)
+        return;
+    if (s_occ_nseg >= OCC_SEG || !(q = occ_get())) {
+        s_occ_ovf = 1;
+        return;
+    }
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)q);
+    s_occ_seg[s_occ_nseg++] = q;
+    s_occ_open = 1;
+}
+
+static void occ_end(void)
+{
+    if (!s_occ_open)
+        return;
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_occ_seg[s_occ_nseg - 1]);
+    s_occ_open = 0;
+}
+
+static void occ_write(uint32_t va, uint32_t count)
+{
+    volatile uint32_t *r = (volatile uint32_t *)
+        ((uint8_t *)xbox_GetMemoryOffset() + va);
+    r[0] = 0;                              /* timestamp */
+    r[1] = 0;
+    r[2] = count;
+    MemoryBarrier();                       /* the count before the status */
+    r[3] = 0;                              /* status: done */
+}
+
+/* 1 when every query of the report has its result (summed into *count). */
+static int occ_ready(OccReport *p, UINT flags, uint32_t *count)
+{
+    uint64_t sum = 0;
+    int i;
+    for (i = 0; i < p->n; i++) {
+        UINT64 v = 0;
+        if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)p->q[i],
+                                        &v, sizeof v, flags) != S_OK)
+            return 0;
+        sum += v;
+    }
+    *count = sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sum;
+    return 1;
+}
+
+static void occ_finish(OccReport *p, uint32_t count)
+{
+    int i;
+    occ_write(p->va, count);
+    s_occ_vis += count != 0;
+    for (i = 0; i < p->n; i++)
+        occ_put(p->q[i]);
+    p->n = 0;
+}
+
+static void occ_poll(UINT flags)
+{
+    uint64_t now;
+    int i, j;
+    if (!s_occ_npend)
+        return;
+    now = occ_now_us();
+    for (i = j = 0; i < s_occ_npend; i++) {
+        OccReport *p = &s_occ_pend[i];
+        uint32_t count;
+        if (p->overflow) {
+            occ_finish(p, 0x10000u);
+        } else if (occ_ready(p, flags, &count)) {
+            occ_finish(p, count);
+        } else if (now - p->t0 > 250000u) {
+            s_occ_late++;
+            occ_finish(p, 0x10000u);
+        } else {
+            s_occ_pend[j++] = *p;
+        }
+    }
+    s_occ_npend = j;
+}
+
+static void d3d11_on_zpass(int enable)
+{
+    if (occ_mode() == 2 || !init())
+        return;
+    s_occ_en = enable;
+    if (enable)
+        occ_begin();
+    else
+        occ_end();
+}
+
+static void d3d11_on_zpass_clear(void)
+{
+    int i;
+    if (occ_mode() == 2 || !init())
+        return;
+    occ_end();
+    for (i = 0; i < s_occ_nseg; i++)
+        occ_put(s_occ_seg[i]);   /* ended; Begin on reuse drops the result */
+    s_occ_nseg = 0;
+    s_occ_ovf = 0;
+    if (s_occ_en)
+        occ_begin();
+}
+
+static int d3d11_on_report(uint32_t va)
+{
+    OccReport *p;
+    int i;
+    if (occ_mode() == 2 || !init())
+        return 0;
+    occ_end();
+    occ_poll(D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (s_occ_npend >= OCC_PENDING)
+        occ_poll(0);
+    /* Supersede a report still pending at this va (see above). */
+    for (i = 0; i < s_occ_npend; i++)
+        if (s_occ_pend[i].va == va) {
+            int k;
+            for (k = 0; k < s_occ_pend[i].n; k++)
+                occ_put(s_occ_pend[i].q[k]);
+            memmove(&s_occ_pend[i], &s_occ_pend[i + 1],
+                    (size_t)(s_occ_npend - i - 1) * sizeof s_occ_pend[0]);
+            s_occ_npend--;
+            s_occ_super++;
+            break;              /* at most one: each push supersedes */
+        }
+    if (s_occ_npend >= OCC_PENDING) {
+        /* Still full: the oldest is answered as visible. */
+        s_occ_late++;
+        occ_finish(&s_occ_pend[0], 0x10000u);
+        memmove(&s_occ_pend[0], &s_occ_pend[1],
+                (size_t)(--s_occ_npend) * sizeof s_occ_pend[0]);
+    }
+    p = &s_occ_pend[s_occ_npend++];
+    p->va = va;
+    p->n = s_occ_nseg;
+    p->overflow = s_occ_ovf;
+    p->t0 = occ_now_us();
+    for (i = 0; i < s_occ_nseg; i++)
+        p->q[i] = s_occ_seg[i];
+    /* The report owns them now; a report with no clear before the next one
+     * counts from here (the XDK always clears first). */
+    s_occ_nseg = 0;
+    s_occ_ovf = 0;
+    s_occ_reports++;
+    if (occ_mode() == 1) {
+        uint64_t t = occ_now_us();
+        uint32_t count;
+        while (!occ_ready(p, 0, &count) && occ_now_us() - t < 250000u)
+            ;
+        s_occ_sync_us += occ_now_us() - t;
+        occ_poll(0);
+    }
+    if (s_occ_en)
+        occ_begin();
+    return 1;
+}
+
+static void d3d11_on_poll(void)
+{
+    if (s_occ_npend && s_dev)
+        occ_poll(0);
+}
+
 static const struct nv2a_pb_backend s_d3d11_backend = {
     d3d11_on_clear,
     d3d11_on_zclear,
     d3d11_on_draw,
     d3d11_on_flip,
+    d3d11_on_zpass,
+    d3d11_on_zpass_clear,
+    d3d11_on_report,
+    d3d11_on_poll,
 };
 
 const struct nv2a_pb_backend *nv2a_pb_d3d11_backend(void)

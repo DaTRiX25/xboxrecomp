@@ -1347,6 +1347,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         counter_mirrors_tick();
         frame_counters_tick();
         framebuffer_probe_tick();
+        {
+            extern void nv2a_pb_poll(void);
+            nv2a_pb_poll();                /* deferred GPU reports */
+        }
 
         /* Which framebuffer the display would be scanning out.
          *
