@@ -108,11 +108,9 @@ struct nv2a_pb_gpu {
     uint32_t   draws, verts, nonzero_draws;
     float      min_x, max_x, min_y, max_y;
     uint32_t color_offset, color_base, pitch, format;
-    /* The surface the last batch actually drew into. A double-buffered title
-     * has already pointed color_offset at the next buffer and cleared it by
-     * the time the flip arrives, so dumping the current one dumps the frame
-     * that has not been drawn yet -- which is how a correctly rendered
-     * sequence came out as 12 black BMPs. */
+    /* The surface the CPU rasteriser last drew or cleared into. What a flip
+     * presents is nv2a_pb_present_state(), not this: the last surface drawn
+     * can be an offscreen target. */
     uint32_t drawn_offset;
     uint64_t pixels;
     uint32_t pixel_max;   /* brightest value any pixel write carried */
@@ -211,6 +209,20 @@ const uint8_t  *nv2a_pb_tex_regs_set(void);   /* 1 where the title wrote one */
  * array and texture offsets in the state above are already resolved. */
 uint32_t nv2a_pb_dma_resolve(uint32_t offset);
 
+/* The colour surface a flip presents, as the walker picks it at FLIP_STALL
+ * (nv2a_pb_exec.c, present_pick): of the surfaces the size of the display's,
+ * the one drawn into most recently since the last flip, else the one cleared
+ * most recently; else the previous choice stays. A surface is a colour offset
+ * plus the size its clip gave it (clip_x + clip_w by clip_y + clip_h) when it
+ * was drawn, with the pitch and format it had then. offset is 0 until the
+ * first pick. Valid inside on_flip and after it. */
+struct nv2a_pb_present {
+    uint32_t offset;      /* DMA offset, as SET_SURFACE_COLOR_OFFSET set it */
+    uint32_t w, h;
+    uint32_t pitch, format;
+};
+const struct nv2a_pb_present *nv2a_pb_present_state(void);
+
 /* One batch, at SET_BEGIN_END(0).
  *
  * attr[i].offset is a guest address, unless `inline_data` is set: then the
@@ -234,12 +246,12 @@ struct nv2a_pb_draw {
  *
  * on_clear / on_zclear: NV097_CLEAR_SURFACE, with its parameter (colour mask
  *   0xF0, Z bit 0x1, stencil 0x2). Both run for every clear, zclear first, and
- *   each decides from `param` whether it has anything to do. The CPU on_clear
- *   also sets drawn_offset, the surface the next flip presents.
+ *   each decides from `param` whether it has anything to do.
  * on_draw: one batch; see struct nv2a_pb_draw.
  * on_flip: NV097_FLIP_STALL. `surface` is the DMA offset of the finished frame
- *   (drawn_offset, else color_offset; 0 if none), `pitch` its row pitch. The
- *   walker has already completed the flip for the guest. */
+ *   and `pitch` its row pitch: nv2a_pb_present_state() (else, before its first
+ *   pick, drawn_offset or color_offset; 0 if none). The walker has already
+ *   completed the flip for the guest. */
 struct nv2a_pb_backend {
     void (*on_clear)(uint32_t param);
     void (*on_zclear)(uint32_t param);
