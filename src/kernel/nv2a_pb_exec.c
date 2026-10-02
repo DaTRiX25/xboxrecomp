@@ -5872,9 +5872,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     uint64_t scan = s_perf.scan + (now - s_perf.scan_t0);
                     uint32_t kicks = xbox_Nv2aKickStats(&kwait);
                     extern uint32_t nv2a_pb_scan_stops(void);
+                    static uint32_t prev_stops;
+                    uint32_t stops = nv2a_pb_scan_stops();
                     /* decode is walk minus draw minus present; kicks are the
                      * title's KickOff flushes acknowledged since the last
-                     * flip, kickwait how long it spun on them in all. */
+                     * flip, kickwait how long it spun on them in all, and
+                     * stops the walks that stopped short of PUT since then
+                     * (the lifetime total is in the [PB] report). */
                     fprintf(stderr, "[PB-PERF] flip %u wall %.2f ms walk %.2f ms"
                             " (draw %.2f, decode %.2f) methods %u batches %u"
                             " present %.2f kicks %u kickwait %.2f stops %u\n",
@@ -5884,7 +5888,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                             (double)(int64_t)(scan - s_perf.draw - s_perf.flip) / 1e6,
                             s_perf.methods, s_perf.batches,
                             s_perf.flip / 1e6, kicks, kwait / 1e6,
-                            nv2a_pb_scan_stops());
+                            stops - prev_stops);
+                    prev_stops = stops;
                     s_perf.scan = s_perf.draw = s_perf.flip = 0;
                     s_perf.methods = s_perf.batches = 0;
                     s_perf.scan_t0 = s_perf.flip_t0 = now;

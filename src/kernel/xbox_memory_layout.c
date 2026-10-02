@@ -1012,7 +1012,7 @@ static void frame_counters_tick(void)
 static int s_pb_exec = 0;
 
 extern uint32_t nv2a_pb_exec_semaphore_releases(void);
-extern uint32_t nv2a_pb_scan_stops(void);
+extern uint32_t nv2a_pb_scan_catchups(void);
 extern uint32_t nv2a_pb_exec_semaphore_last_va(void);
 
 /* Mirror "submitted" into "completed" -- now only the fallback.
@@ -1032,13 +1032,15 @@ static void fence_mirrors_tick(void)
     uint32_t releases = s_pb_exec ? nv2a_pb_exec_semaphore_releases() : 0;
     /* A walk that stopped short of PUT never runs the rest of its segment,
      * and a semaphore release there would leave the title's next fence wait
-     * spinning for ever. So after a stop the mirror does its write once even
-     * where the executor owns the fence: everything submitted counts as
-     * done, and the title goes on. */
-    static uint32_t last_stops;
-    uint32_t stops = nv2a_pb_scan_stops();
-    int caught_up = stops != last_stops;
-    last_stops = stops;
+     * spinning for ever. The walker runs the release itself when it can find
+     * it; when it cannot (the rest wraps or is unreadable) it asks for a
+     * catch-up, and the mirror then does its write once even where the
+     * executor owns the fence: everything submitted counts as done, and the
+     * title goes on. */
+    static uint32_t last_catchups, missed;
+    uint32_t catchups = nv2a_pb_scan_catchups();
+    int caught_up = catchups != last_catchups, wrote = 0;
+    last_catchups = catchups;
 
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
@@ -1071,6 +1073,8 @@ static void fence_mirrors_tick(void)
             }
             if (same && !caught_up)
                 continue;
+            if (same)
+                wrote = 1;
         }
         {
             volatile uint32_t *fence =
@@ -1080,7 +1084,20 @@ static void fence_mirrors_tick(void)
                                        + g_memory_offset);
             if (*fence != put)
                 *fence = put;
+            if (wrote == 1) {
+                static unsigned said;
+                wrote = 2;
+                if (said++ < 8)
+                    fprintf(stderr, "  NV2A fence caught up to 0x%08X\n", put);
+            }
         }
+    }
+    if (caught_up && wrote != 2) {
+        static unsigned said;
+        missed++;
+        if (said++ < 8)
+            fprintf(stderr, "  NV2A fence catch-up missed (%u so far): no fence"
+                    " mirror the executor owns\n", missed);
     }
 }
 
