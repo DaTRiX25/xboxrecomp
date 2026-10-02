@@ -73,9 +73,9 @@ typedef enum NV2ACombinerRegister {
     NV2A_REG_T3         = 11,  /* Texture 3 sample result */
     NV2A_REG_R0         = 12,  /* Temporary register 0 (also SPARE0) */
     NV2A_REG_R1         = 13,  /* Temporary register 1 (also SPARE1) */
-    /* Final combiner only: */
-    NV2A_REG_EF_PROD    = 14,  /* E*F product (final combiner) */
-    NV2A_REG_V1R0_SUM   = 15,  /* V1+R0 sum (final combiner) */
+    /* Final combiner only (xemu psh.c, and the CPU path in nv2a_pb_exec.c): */
+    NV2A_REG_V1R0_SUM   = 14,  /* V1+R0 sum (final combiner) */
+    NV2A_REG_EF_PROD    = 15,  /* E*F product (final combiner) */
     NV2A_REG_COUNT       = 16,
 } NV2ACombinerRegister;
 
@@ -125,19 +125,23 @@ typedef enum NV2AOutputMapping {
     NV2A_OUT_SHIFTLEFT_1        = 2,  /* x * 2 */
     NV2A_OUT_SHIFTLEFT_1_BIAS   = 3,  /* (x - 0.5) * 2 */
     NV2A_OUT_SHIFTLEFT_2        = 4,  /* x * 4 */
-    NV2A_OUT_SHIFTRIGHT_1       = 5,  /* x / 2 */
-    NV2A_OUT_COUNT              = 6,
+    /* 5 is not a mapping; it is treated as identity */
+    NV2A_OUT_SHIFTRIGHT_1       = 6,  /* x / 2 */
+    NV2A_OUT_COUNT              = 7,
 } NV2AOutputMapping;
 
 /**
- * Texture addressing modes per stage.
- * Encoded in the pixel shader DWORD token.
+ * Texture-shader mode per stage: the hardware's SET_SHADER_STAGE_PROGRAM
+ * field, which is also the XDK's PS_TEXTUREMODES value. Modes above 4 (dot
+ * products, bump mapping, ...) are sampled as 2D at (s, t), as the CPU path
+ * does.
  */
 typedef enum NV2ATextureMode {
-    NV2A_TEXMODE_2D      = 0,  /* Standard 2D texture */
-    NV2A_TEXMODE_3D      = 1,  /* 3D / volume texture */
-    NV2A_TEXMODE_CUBEMAP = 2,  /* Cube map */
-    NV2A_TEXMODE_NONE    = 3,  /* No texture bound */
+    NV2A_TEXMODE_NONE     = 0,  /* No texture: the stage reads zero */
+    NV2A_TEXMODE_2D       = 1,  /* PROJECT2D */
+    NV2A_TEXMODE_3D       = 2,  /* PROJECT3D: volume texture */
+    NV2A_TEXMODE_CUBEMAP  = 3,  /* Cube map */
+    NV2A_TEXMODE_PASSTHRU = 4,  /* The coordinate itself, clamped */
 } NV2ATextureMode;
 
 /* ================================================================
@@ -149,8 +153,14 @@ typedef enum NV2ATextureMode {
  *
  * Packed in hardware as 8 bits:
  *   [3:0] register   - which register to read (NV2ACombinerRegister)
- *   [4]   alpha_rep   - 0: use full RGBA, 1: replicate alpha to all channels
- *   [7:5] mapping    - input mapping mode (NV2AInputMapping)
+ *   [4]   alpha_rep  - 1: the alpha channel. 0: RGB in an RGB portion, and
+ *                      BLUE in an alpha portion.
+ *   [7:5] mapping    - input mapping mode (NV2AInputMapping). In the final
+ *                      combiner only bit 5 counts: invert.
+ *
+ * An input word holds four of them, A in the top byte: A [31:24], B [23:16],
+ * C [15:8], D [7:0] (and E [31:24], F [23:16], G [15:8] in the final
+ * combiner's second word, with its flags in [7:0]).
  */
 typedef struct NV2ACombinerInput {
     NV2ACombinerRegister reg;       /* Source register */
@@ -161,15 +171,18 @@ typedef struct NV2ACombinerInput {
 /**
  * Output configuration for one channel (RGB or alpha) of a stage.
  *
- * Packed in hardware output word:
- *   [3:0]  ab_dst       - destination register for AB product
- *   [7:4]  cd_dst       - destination register for CD product
- *   [11:8] sum_dst      - destination register for AB+CD sum
- *   [12]   cd_dot       - 1: CD uses dot product instead of multiply
- *   [13]   ab_dot       - 1: AB uses dot product instead of multiply
- *   [14]   mux_sum      - 1: mux instead of sum (R0.a selects AB or CD)
+ * RGB output word (NV097_SET_COMBINER_COLOR_OCW):
+ *   [3:0]   cd_dst      - destination register for CD product
+ *   [7:4]   ab_dst      - destination register for AB product
+ *   [11:8]  sum_dst     - destination register for AB+CD sum
+ *   [12]    cd_dot      - 1: CD uses dot product instead of multiply
+ *   [13]    ab_dot      - 1: AB uses dot product instead of multiply
+ *   [14]    mux_sum     - 1: mux instead of sum (R0.a selects AB or CD)
  *   [17:15] output_map  - output scale/bias (NV2AOutputMapping)
- *   [18]   ab_cd_mux    - unused alias, same as mux_sum
+ *   [18]    cd_blue_to_alpha, [19] ab_blue_to_alpha
+ *
+ * Alpha output word (NV097_SET_COMBINER_ALPHA_OCW): the same destinations,
+ * then [12] mux_sum and [15:13] output_map; no dot products.
  *
  * The "dot product" flag means AB = dot3(A, B) instead of A * B
  * component-wise. This is the key to bump mapping on NV2A.
@@ -182,6 +195,8 @@ typedef struct NV2ACombinerOutput {
     int                  cd_dot;     /* 1 = dot product for CD */
     int                  mux_sum;    /* 1 = mux(R0.a, AB, CD) instead of AB+CD */
     NV2AOutputMapping    output_map; /* Scale/bias applied to results */
+    int                  ab_blue_to_alpha; /* RGB only: AB's blue -> its dst alpha */
+    int                  cd_blue_to_alpha;
 } NV2ACombinerOutput;
 
 /* ================================================================
@@ -194,24 +209,28 @@ typedef struct NV2ACombinerOutput {
 /** Maximum texture stages. */
 #define NV2A_MAX_TEXTURES 4
 
+/** One general combiner stage. */
+typedef struct NV2ACombinerStage {
+    /* Four inputs per channel: A, B, C, D */
+    NV2ACombinerInput  rgb_input[4];
+    NV2ACombinerInput  alpha_input[4];
+    NV2ACombinerOutput rgb_output;
+    NV2ACombinerOutput alpha_output;
+} NV2ACombinerStage;
+
 /**
  * Complete NV2A register combiner configuration.
  *
  * This holds everything needed to generate an equivalent HLSL pixel
  * shader. Games set this up via SetPixelShader (DWORD token) or by
- * individually setting the D3DRS_PS* render states.
+ * individually setting the D3DRS_PS* render states; the pushbuffer
+ * executor's path builds it from the registers (d3d8_combiners_from_regs).
  */
 typedef struct NV2ACombinerState {
     /* --- General combiner stages --- */
-    int num_stages;  /* Active stage count (1-8) */
+    int num_stages;  /* Active stage count (0-8) */
 
-    struct {
-        /* Four inputs per channel: A, B, C, D */
-        NV2ACombinerInput  rgb_input[4];
-        NV2ACombinerInput  alpha_input[4];
-        NV2ACombinerOutput rgb_output;
-        NV2ACombinerOutput alpha_output;
-    } stages[NV2A_MAX_COMBINER_STAGES];
+    NV2ACombinerStage stages[NV2A_MAX_COMBINER_STAGES];
 
     /* --- Final combiner --- */
     NV2ACombinerInput final_input[7]; /* A, B, C, D, E, F, G */
@@ -229,6 +248,14 @@ typedef struct NV2ACombinerState {
 
     /* --- Flags --- */
     DWORD flags;     /* Dot mapping and other flags from token bits 24-31 */
+
+    /* --- Control (NV097_SET_COMBINER_CONTROL / D3DRS_PSCOMBINERCOUNT) --- */
+    int uniq_c0;     /* [12]: stage s reads C0[s], else C0[0] */
+    int uniq_c1;     /* [16]: likewise C1 */
+    int mux_msb;     /* [8]: mux selects on R0.a's top bit, else its LSB */
+
+    /* --- Final combiner flags (second word, [7:0]) --- */
+    DWORD final_flags; /* 0x20 invert V1, 0x40 invert R0, 0x80 clamp V1+R0 */
 } NV2ACombinerState;
 
 /* ================================================================
@@ -249,6 +276,8 @@ typedef struct NV2APSConstants {
     UINT  alpha_test_enable;                /* 0 or 1 */
     UINT  fog_enable;                       /* 0 or 1 */
     UINT  alpha_only[NV2A_MAX_TEXTURES];     /* A8 sampling uses white RGB */
+    float tex_scale[NV2A_MAX_TEXTURES][4];  /* xy: texcoord multiplier */
+    UINT  tex_mode[NV2A_MAX_TEXTURES];         /* NV2ATextureMode per stage */
 } NV2APSConstants;
 
 /* ================================================================
@@ -295,7 +324,26 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
                                        NV2ACombinerState *state);
 
 /**
+ * Build combiner state from the NV2A's own registers, as the pushbuffer
+ * executor records them (struct nv2a_pb_vsh in nv2a_pb_state.h):
+ * SET_COMBINER_COLOR_ICW/ALPHA_ICW/COLOR_OCW/ALPHA_OCW per stage,
+ * SET_COMBINER_CONTROL, SET_COMBINER_SPECULAR_FOG_CW0/CW1, and the stage
+ * modes packed 5 bits per stage as in SET_SHADER_STAGE_PROGRAM.
+ * Constants are not part of the state (they go in the constant buffer), so
+ * the state can key a shader cache.
+ */
+void d3d8_combiners_from_regs(const uint32_t cicw[8], const uint32_t aicw[8],
+                              const uint32_t cocw[8], const uint32_t aocw[8],
+                              uint32_t control, uint32_t fcw0, uint32_t fcw1,
+                              uint32_t stage_modes, NV2ACombinerState *state);
+
+/**
  * Generate HLSL pixel shader source from combiner state.
+ *
+ * The shader evaluates the combiners the way nv2a_pb_exec.c's rc_eval does
+ * on the CPU, operation for operation. Its input struct matches the vertex
+ * shader output of d3d8_vsh.c (SV_POSITION, COLOR0, COLOR1, TEXCOORD0-3);
+ * its constants are NV2APSConstants at b0; stage n samples tN with sN.
  *
  * @param state   The combiner configuration
  * @param buf     Output buffer for HLSL source

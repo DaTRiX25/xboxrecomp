@@ -5,6 +5,8 @@
  * surface, a colour clear, one pre-transformed quad as INLINE_ARRAY (float4
  * position in pixels + D3DCOLOR), then the flip, double-buffered the way the
  * XDK does it (color_offset moves to the other buffer before FLIP_STALL).
+ * Then textured quads (a swizzled checker, a linear YUY2 ramp) and a quad
+ * through four register-combiner stages with the title's final combiner.
  * With RECOMP_PB_BACKEND=d3d11 that reaches ClearRenderTargetView, a draw
  * and Present in src/d3d/nv2a_pb_d3d11.c.
  *
@@ -166,6 +168,51 @@ int main(int argc, char **argv)
             vertex_uv(440.0f, 350.0f, 0xFFFFFFFFu, uv[3]);
         }
         M(0x17FC, 0);
+
+        /* Register combiners: the title's control word and final combiner
+         * (ctl 0x11104 and fcw 0x130C0300/0x00001C80 from the title-screen
+         * capture: four stages, mux on R0.a's MSB, per-stage constants,
+         * final = fog.a * R0 + (1 - fog.a) * fog, alpha R0.a, V1+R0 clamped)
+         * with four stages of our own that exercise them:
+         *   0: R0 = T0 * V0 (rgb and alpha)
+         *   1: R1 = mux(R0 * 1, C0[1] * 1): R0.a >= 0.5 picks C0[1]
+         *   2: R0 = R1 * C1[2], output x2 (C1[2] = 0.5 so the colour holds)
+         *   3: R0 = R0 * 1
+         * The quad's diffuse alpha goes 0 -> 1 left to right, so the left
+         * half shows the checker and the right half magenta. */
+        M(0x1B00, TEX_GUEST);
+        M(0x1B04, (0x06u << 8) | (TEX_LOG2 << 20) | (TEX_LOG2 << 24)
+                  | (1u << 4) | (2u << 0));
+        M(0x1B08, 0x00000101u);
+        M(0x1E70, 1);                          /* SHADER_STAGE_PROGRAM: T0 2D */
+        {
+            static const uint32_t cicw[4] = {0x08040000u, 0x0C200120u, 0x0D020000u, 0x0C200000u};
+            static const uint32_t cocw[4] = {0x000000C0u, 0x00004D00u, 0x000100C0u, 0x000000C0u};
+            static const uint32_t aicw[4] = {0x18140000u, 0x1C200000u, 0x1D200000u, 0x1C200000u};
+            static const uint32_t aocw[4] = {0x000000C0u, 0x00000D00u, 0x000000C0u, 0x000000C0u};
+            static const float uv[4][2] = {{0, 0}, {4, 0}, {4, 1}, {0, 1}};
+            int s;
+            for (s = 0; s < 4; s++) {
+                M(0x0AC0 + 4 * s, cicw[s]);    /* COMBINER_COLOR_ICW */
+                M(0x1E40 + 4 * s, cocw[s]);    /* COMBINER_COLOR_OCW */
+                M(0x0260 + 4 * s, aicw[s]);    /* COMBINER_ALPHA_ICW */
+                M(0x0AA0 + 4 * s, aocw[s]);    /* COMBINER_ALPHA_OCW */
+                M(0x0A60 + 4 * s, s == 1 ? 0xFFFF00FFu : 0xFF000000u); /* FACTOR0 */
+                M(0x0A80 + 4 * s, s == 2 ? 0x80808080u : 0xFF000000u); /* FACTOR1 */
+            }
+            M(0x02A8, 0xFF203040u);            /* FOG_COLOR */
+            M(0x0288, 0x130C0300u);            /* SPECULAR_FOG_CW0 */
+            M(0x028C, 0x00001C80u);            /* SPECULAR_FOG_CW1 */
+            M(0x1E60, 0x00011104u);            /* COMBINER_CONTROL */
+            M(0x17FC, 8);
+            vertex_uv(20.0f,  380.0f, 0x00FFFFFFu, uv[0]);
+            vertex_uv(420.0f, 380.0f, 0xFFFFFFFFu, uv[1]);
+            vertex_uv(420.0f, 470.0f, 0xFFFFFFFFu, uv[2]);
+            vertex_uv(20.0f,  470.0f, 0x00FFFFFFu, uv[3]);
+            M(0x17FC, 0);
+            M(0x1E60, 0);                      /* combiners off: 0 stages */
+        }
+
         M(0x1760 + 4 * 9, 0x02u);              /* attr9 off again */
         M(0x1B0C, 0);                          /* stage 0 off */
 
