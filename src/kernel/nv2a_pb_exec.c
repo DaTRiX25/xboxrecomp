@@ -225,6 +225,32 @@ static struct nv2a_pb_gpu s_gpu;
 static uint32_t s_sema_releases;
 static uint32_t s_sema_last_va, s_sema_last_value;
 
+/* Visibility tests: D3DDevice_BeginVisibilityTest / EndVisibilityTest, which
+ * are NV2A pixel-count reports. Begin sends CLEAR_REPORT_VALUE and
+ * SET_ZPASS_PIXEL_COUNT_ENABLE(1). End sends ZPASS_PIXEL_COUNT_ENABLE(0) and
+ * GET_REPORT(type 1 << 24 | offset): the GPU then writes a 16-byte report at
+ * that offset in the report DMA object, {timestamp (8), count (4), status
+ * (4)}. D3D writes 0xFFFFFFFF to the status first, and
+ * GetVisibilityTestResult returns D3DERR_TESTINCOMPLETE until it changes.
+ *
+ * With no GET_REPORT the status never changed, so every test stayed
+ * incomplete. BLiNX 2 decides from these tests whether to draw the player
+ * character, and Stick was not drawn at all on either backend.
+ *
+ * The count is xemu's: fragments that pass the depth, stencil and alpha
+ * tests while counting is enabled. The CPU rasteriser counts them
+ * (put_pixel). A backend that draws on a GPU cannot report a count to the
+ * walker yet, so its tests report every test as visible (RECOMP_ZPASS_FIXED,
+ * default 0x10000), the same as a GL occlusion query that saw the whole
+ * object. The report DMA object is not read: XDK D3D's covers physical memory
+ * from 0, the same assumption the semaphore makes. */
+#define NV097_SET_CONTEXT_DMA_REPORT        0x01A8
+#define NV097_CLEAR_REPORT_VALUE            0x17C8
+#define NV097_SET_ZPASS_PIXEL_COUNT_ENABLE  0x17CC
+#define NV097_GET_REPORT                    0x17D0
+static uint32_t s_zpass_count;           /* since the last CLEAR_REPORT_VALUE */
+static int      s_zpass_enable;
+static uint32_t s_reports, s_reports_zero;
 uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_sema_releases; }
 uint32_t nv2a_pb_exec_semaphore_last_va(void) { return s_sema_last_va; }
 
@@ -1350,6 +1376,7 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     } else {
         row = s_surface + (size_t)y * s_gpu.pitch;
     }
+    s_zpass_count += (uint32_t)s_zpass_enable;   /* passed every test */
     if (s_gpu.color_keep == 0xFFFFFFFFu)
         return;                            /* SET_COLOR_MASK: no channel written */
     s_gpu.pixels++;
@@ -4393,6 +4420,7 @@ static void raster_batch_fast_ab(void)
     static size_t cap, zcap, scap;
     static struct nv2a_pb_gpu gpu0, gpu_ref;
     static struct nv2a_pb_vsh vsh0, vsh_ref;
+    uint32_t zpass0, zpass_ref;
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     size_t size = (size_t)(s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch, zn = 0, sn = 0, k;
     uint32_t bpp = surface_bpp(), bad_px = 0, first = 0;
@@ -4427,7 +4455,7 @@ static void raster_batch_fast_ab(void)
     memcpy(save, s_surface, size);
     if (zn) memcpy(zsave, s_zbuf, zn * sizeof(float));
     if (sn) memcpy(ssave, s_sbuf, sn);
-    gpu0 = s_gpu; vsh0 = s_vsh;
+    gpu0 = s_gpu; vsh0 = s_vsh; zpass0 = s_zpass_count;
 
     /* reference */
     s_fast_force = 0;
@@ -4439,13 +4467,13 @@ static void raster_batch_fast_ab(void)
     memcpy(ref, s_surface, size);
     if (zn) memcpy(zref, s_zbuf, zn * sizeof(float));
     if (sn) memcpy(sref, s_sbuf, sn);
-    gpu_ref = s_gpu; vsh_ref = s_vsh;
+    gpu_ref = s_gpu; vsh_ref = s_vsh; zpass_ref = s_zpass_count;
 
     /* fast, from the same start */
     memcpy(s_surface, save, size);
     if (zn) memcpy(s_zbuf, zsave, zn * sizeof(float));
     if (sn) memcpy(s_sbuf, ssave, sn);
-    s_gpu = gpu0; s_vsh = vsh0;
+    s_gpu = gpu0; s_vsh = vsh0; s_zpass_count = zpass0;
     s_fast_force = 1;
     raster_batch_vsh_one();
     s_fast_force = -1;
@@ -4465,7 +4493,8 @@ static void raster_batch_fast_ab(void)
         || vsh_ref.tris != s_vsh.tris || vsh_ref.tris_culled != s_vsh.tris_culled
         || vsh_ref.tris_clipped != s_vsh.tris_clipped
         || vsh_ref.z_rejected != s_vsh.z_rejected
-        || vsh_ref.a_rejected != s_vsh.a_rejected;
+        || vsh_ref.a_rejected != s_vsh.a_rejected
+        || zpass_ref != s_zpass_count;
     if (bad_px || zbad || cbad) {
         s_fab_bad++;
         s_fab_bad_px += bad_px;
@@ -4958,6 +4987,35 @@ static const struct nv2a_pb_backend s_cpu_backend = {
     cpu_on_flip,                         /* on_flip   */
 };
 static const struct nv2a_pb_backend *s_backend = &s_cpu_backend;
+
+static void get_report(uint32_t param)
+{
+    static int fixed_set = -1;
+    static uint32_t fixed = 0x10000;
+    uint32_t va = dma_resolve(param & 0x00FFFFFFu), value;
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+
+    if (fixed_set < 0) {
+        const char *e = getenv("RECOMP_ZPASS_FIXED");
+        fixed_set = e != NULL;
+        if (e)
+            fixed = (uint32_t)strtoul(e, NULL, 0);
+    }
+    if ((param >> 24) != 1 || surface_hits_image(va, 16)) {
+        note_unhandled(NV097_GET_REPORT, param);
+        return;
+    }
+    value = (fixed_set || s_backend != &s_cpu_backend) ? fixed : s_zpass_count;
+    s_reports++;
+    s_reports_zero += value == 0;
+    if (env_cached("RECOMP_ZPASS_TRACE") && s_reports <= 64)
+        fprintf(stderr, "  [GPU] GET_REPORT 0x%08X -> 0x%08X count %u\n",
+                param, va, value);
+    *(volatile uint32_t *)(mem + va + 0) = 0;          /* timestamp */
+    *(volatile uint32_t *)(mem + va + 4) = 0;
+    *(volatile uint32_t *)(mem + va + 8) = value;
+    *(volatile uint32_t *)(mem + va + 12) = 0;         /* status: done */
+}
 
 /* RECOMP_PB_BACKEND=null: the walker and its decode, drawing nothing. Times
  * the platform-independent part of a frame on its own (the [PB-PERF] line). */
@@ -5486,6 +5544,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         record_tex_reg(method, param);
         break;
 
+    case NV097_SET_CONTEXT_DMA_REPORT:
+        return;                            /* covers physical memory from 0 */
+    case NV097_CLEAR_REPORT_VALUE:
+        s_zpass_count = 0;
+        return;
+    case NV097_SET_ZPASS_PIXEL_COUNT_ENABLE:
+        s_zpass_enable = param != 0;
+        return;
+    case NV097_GET_REPORT:
+        get_report(param);
+        return;
+
     case NV097_SET_CONTEXT_DMA_SEMAPHORE:
         s_gpu.sema_dma = param;
         return;
@@ -5898,6 +5968,9 @@ void nv2a_pb_exec_report(void)
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
             s_gpu.clip_x, s_gpu.clip_y, s_gpu.clears,
             s_gpu.unhandled_total, s_unhandled_count);
+    if (s_reports)
+        fprintf(stderr, "[GPU] visibility reports %u (%u with count 0)\n",
+                s_reports, s_reports_zero);
     fprintf(stderr, "[GPU] draws %u (%u with coordinates), %u indices;"
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
