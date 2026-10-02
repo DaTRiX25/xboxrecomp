@@ -34,6 +34,7 @@
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
+#include "nv2a_vsh_cpu.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -470,6 +471,28 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         for (i = 0; i < a->size && i < 4; i++)
             out[i] = (float)p[i] / 255.0f;
         return 1;
+    /* The packed types 3D models use: positions and normals in shorts, or a
+     * normal squeezed into one dword. Decoded the way xemu hands them to GL. */
+    case 1:                                  /* S1: signed short, normalised */
+        for (i = 0; i < a->size && i < 4; i++) {
+            float f = (float)((const int16_t *)p)[i] / 32767.0f;
+            out[i] = f < -1.0f ? -1.0f : f;
+        }
+        return 1;
+    case 5:                                  /* S32K: signed short, as is */
+        for (i = 0; i < a->size && i < 4; i++)
+            out[i] = (float)((const int16_t *)p)[i];
+        return 1;
+    case 6: {                                /* CMP: 11:11:10 signed, normalised */
+        uint32_t w = *(const uint32_t *)p;
+        int32_t x = (int32_t)(w << 21) >> 21;
+        int32_t y = (int32_t)(w << 10) >> 21;
+        int32_t z = (int32_t)w >> 22;
+        out[0] = (float)x / 1023.0f;
+        out[1] = (float)y / 1023.0f;
+        out[2] = (float)z / 511.0f;
+        return 1;
+    }
     default:
         return 0;
     }
@@ -773,31 +796,31 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
-static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
     uint32_t fmt;
 
-    if (!s_gpu.tex.valid)
+    if (!t->valid)
         return 0;
-    u = wrap_coord(u, s_gpu.tex.width,  s_gpu.tex.addr_u);
-    v = wrap_coord(v, s_gpu.tex.height, s_gpu.tex.addr_v);
+    u = wrap_coord(u, t->width,  t->addr_u);
+    v = wrap_coord(v, t->height, t->addr_v);
 
-    fmt = s_gpu.tex.color;
+    fmt = t->color;
     if (d3d8_format_dxt_block_bytes(fmt))
-        return d3d8_dxt_decode_texel(mem + s_gpu.tex.offset, fmt, u, v,
-                                     s_gpu.tex.width, argb);
+        return d3d8_dxt_decode_texel(mem + t->offset, fmt, u, v,
+                                     t->width, argb);
     if (d3d8_format_is_swizzled(fmt)) {
         /* Morton order: a texel's index is interleaved from x and y instead of
          * v*pitch + u, so index from the base of the image. The switch below
          * casts to each format's own width, which makes that index a texel
          * index for every one of them. */
         fmt = linear_twin(fmt);
-        p = mem + s_gpu.tex.offset;
-        u = swizzle_offset(u, v, s_gpu.tex.width, s_gpu.tex.height);
+        p = mem + t->offset;
+        u = swizzle_offset(u, v, t->width, t->height);
     } else {
-        p = mem + s_gpu.tex.offset + (size_t)v * s_gpu.tex.pitch;
+        p = mem + t->offset + (size_t)v * t->pitch;
     }
 
     switch (fmt) {
@@ -909,6 +932,11 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
     default:
         return 0;
     }
+}
+
+static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+{
+    return sample_tex(&s_gpu.tex, u, v, argb);
 }
 
 /* Write a bound texture out as a BMP, through the sampler rather than around it.
@@ -1333,6 +1361,1134 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
                     textured ? (const float (*)[2])uv : NULL);
 }
 
+/* ── Vertex programs ─────────────────────────────────────────────────────
+ *
+ * The title-stage geometry is drawn through NV2A vertex programs: attribute 0
+ * is object space and only the program knows where it lands. So the executor
+ * keeps the transform unit's state -- 136 program slots, 192 constants, the
+ * execution mode and the inline attribute values -- and runs the program per
+ * vertex on the CPU (nv2a_vsh_cpu.c). XDK D3D appends a viewport epilogue to
+ * every program, so oPos arrives already in surface pixels with the clip-space
+ * w beside it, which is everything the rasteriser needs.
+ *
+ * A batch takes this path when SET_TRANSFORM_EXECUTION_MODE says PROGRAM.
+ * Fixed-function mode keeps the old screen-space path: this title never sends
+ * a fixed-function matrix (no SET_MODEL_VIEW/COMPOSITE_MATRIX in its stream),
+ * so there is nothing to synthesise yet, and the report says if that changes.
+ *
+ * RECOMP_PB_VSH=0 turns the path off, which is the A/B switch for comparing
+ * dumps against the old executor.
+ *
+ * Texture stages 0..3 and the register combiners are evaluated per pixel (see
+ * rc_eval); RECOMP_PB_RC=0 falls back to stage 0 modulated by oD0.
+ *
+ * ponytail: triangles with any w <= 0 are dropped rather than clipped
+ * against the near plane. Depth is a private float buffer, not the title's
+ * zeta surface, which nothing else here reads.
+ */
+#define NV097_SET_TRANSFORM_PROGRAM_M        0x0B00   /* +0..0x7C */
+#define NV097_SET_TRANSFORM_CONSTANT_M       0x0B80   /* +0..0x7C */
+#define NV097_SET_TRANSFORM_EXECUTION_MODE_M 0x1E94
+#define NV097_SET_TRANSFORM_PROGRAM_CXT_WRITE_EN_M 0x1E98
+#define NV097_SET_TRANSFORM_PROGRAM_LOAD_M   0x1E9C
+#define NV097_SET_TRANSFORM_PROGRAM_START_M  0x1EA0
+#define NV097_SET_TRANSFORM_CONSTANT_LOAD_M  0x1EA4
+#define NV097_SET_VIEWPORT_OFFSET_M          0x0A20
+#define NV097_SET_VIEWPORT_SCALE_M           0x0AF0
+#define NV097_SET_MODEL_VIEW_MATRIX_M        0x0480
+#define NV097_SET_COMPOSITE_MATRIX_M         0x0680
+#define NV097_SET_PROJECTION_MATRIX_M        0x0440
+#define NV097_SET_CULL_FACE_ENABLE_M         0x0308
+#define NV097_SET_DEPTH_TEST_ENABLE_M        0x030C
+#define NV097_SET_DEPTH_FUNC_M               0x0354
+#define NV097_SET_DEPTH_MASK_M               0x035C
+#define NV097_SET_CULL_FACE_M                0x039C
+#define NV097_SET_FRONT_FACE_M               0x03A0
+#define NV097_SET_SURFACE_ZETA_OFFSET_M      0x0214
+#define NV097_SET_ZSTENCIL_CLEAR_VALUE_M     0x1D8C
+#define NV097_SET_VERTEX_DATA2S_M            0x1900   /* + attr*4, 2 shorts */
+#define NV097_SET_VERTEX_DATA4S_M_M          0x1980   /* + attr*8, 4 shorts */
+
+#define NV097_SET_COMBINER_ALPHA_ICW_M      0x0260   /* +stage*4 */
+#define NV097_SET_COMBINER_SPECULAR_FOG_CW0_M 0x0288
+#define NV097_SET_COMBINER_SPECULAR_FOG_CW1_M 0x028C
+#define NV097_SET_FOG_ENABLE_M              0x02A4
+#define NV097_SET_FOG_COLOR_M               0x02A8
+#define NV097_SET_ALPHA_TEST_ENABLE_M       0x0300
+#define NV097_SET_ALPHA_FUNC_M              0x033C
+#define NV097_SET_ALPHA_REF_M               0x0340
+#define NV097_SET_COMBINER_FACTOR0_M        0x0A60
+#define NV097_SET_COMBINER_FACTOR1_M        0x0A80
+#define NV097_SET_COMBINER_ALPHA_OCW_M      0x0AA0
+#define NV097_SET_COMBINER_COLOR_ICW_M      0x0AC0
+#define NV097_SET_SPECULAR_FOG_FACTOR_M     0x1E20   /* +0, +4 */
+#define NV097_SET_COMBINER_COLOR_OCW_M      0x1E40
+#define NV097_SET_COMBINER_CONTROL_M        0x1E60
+#define NV097_SET_SHADER_STAGE_PROGRAM_M    0x1E70
+
+typedef struct {
+    float x, y, z, w;           /* screen pixels, depth units, clip w */
+    float d0[4], d1[4];
+    float t[4][4];              /* oT0..oT3 */
+    int   ok;
+} XfVert;
+
+static struct {
+    uint32_t prog[NV2A_VSH_SLOTS][4];
+    uint32_t load, start;
+    float    c[NV2A_VSH_CONSTANTS][4];
+    uint32_t cload;
+    uint32_t mode;
+    int      cxt_write;
+    float    vp_off[4], vp_scale[4];
+    float    inl[NV_VERTEX_ATTRS][4];   /* SET_VERTEX_DATA* current values */
+    int      cull_enable, depth_enable, depth_mask;
+    uint32_t cull_face, front_face, depth_func;
+    uint32_t zeta_offset, zclear;
+    /* Register combiners and the texture shader, as last programmed. */
+    uint32_t rc_cicw[8], rc_aicw[8], rc_cocw[8], rc_aocw[8];
+    uint32_t rc_f0[8], rc_f1[8], rc_ctl, rc_fcw0, rc_fcw1, rc_sf[2];
+    uint32_t shader_prog, fog_color;
+    int      rc_set, shader_set, fog_enable, atest_enable;
+    uint32_t atest_func, atest_ref;
+    /* survey */
+    uint32_t prog_dwords, prog_loads, prog_starts, const_dwords, const_loads;
+    uint32_t mode_sets, ff_matrix_dwords, vp_dwords;
+    uint32_t batches_prog, batches_fixed, verts_run, verts_bad;
+    uint32_t tris, tris_culled, tris_clipped, tris_textured;
+    uint64_t z_rejected, a_rejected;
+    uint32_t clears_seen, zclears;
+    uint32_t batches_rc, batches_norc, stage_mode_seen[4][32];
+    uint32_t fmt_seen[NV_VERTEX_ATTRS][8];  /* per slot: batches by type */
+    int      disabled;
+} s_vsh;
+
+/* Distinct programs, by hash of the slots from START to FINAL. */
+#define VSH_MAX_PROGS 64
+static struct { uint32_t hash, start, len, batches; } s_vsh_progs[VSH_MAX_PROGS];
+static int s_vsh_prog_count;
+
+static uint64_t s_vsh_ab_batches, s_vsh_ab_diff_batches, s_vsh_ab_diff_px;
+static float s_vsh_last_d0[4];
+static XfVert s_vsh_last_v0;
+static float *s_zbuf;
+static uint32_t s_zbuf_w, s_zbuf_h;
+
+static float u2f(uint32_t u) { union { uint32_t u; float f; } v; v.u = u; return v.f; }
+
+static int vsh_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_VSH");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* The transform-unit methods. Returns 1 if `method` was one of them. */
+static int vsh_method(uint32_t method, uint32_t param)
+{
+    if (method >= NV097_SET_TRANSFORM_PROGRAM_M
+            && method < NV097_SET_TRANSFORM_PROGRAM_M + 0x80) {
+        uint32_t comp = ((method - NV097_SET_TRANSFORM_PROGRAM_M) / 4) & 3;
+        if (s_vsh.load < NV2A_VSH_SLOTS)
+            s_vsh.prog[s_vsh.load][comp] = param;
+        if (comp == 3)
+            s_vsh.load++;
+        s_vsh.prog_dwords++;
+        return 1;
+    }
+    if (method >= NV097_SET_TRANSFORM_CONSTANT_M
+            && method < NV097_SET_TRANSFORM_CONSTANT_M + 0x80) {
+        uint32_t comp = ((method - NV097_SET_TRANSFORM_CONSTANT_M) / 4) & 3;
+        if (s_vsh.cload < NV2A_VSH_CONSTANTS)
+            s_vsh.c[s_vsh.cload][comp] = u2f(param);
+        if (comp == 3)
+            s_vsh.cload++;
+        s_vsh.const_dwords++;
+        return 1;
+    }
+    if (method >= NV097_SET_VIEWPORT_OFFSET_M && method < NV097_SET_VIEWPORT_OFFSET_M + 16) {
+        s_vsh.vp_off[(method - NV097_SET_VIEWPORT_OFFSET_M) / 4] = u2f(param);
+        s_vsh.vp_dwords++;
+        return 1;
+    }
+    if (method >= NV097_SET_VIEWPORT_SCALE_M && method < NV097_SET_VIEWPORT_SCALE_M + 16) {
+        s_vsh.vp_scale[(method - NV097_SET_VIEWPORT_SCALE_M) / 4] = u2f(param);
+        s_vsh.vp_dwords++;
+        return 1;
+    }
+    /* Fixed-function matrices: counted, not used -- see the block comment. */
+    if ((method >= NV097_SET_PROJECTION_MATRIX_M && method < NV097_SET_PROJECTION_MATRIX_M + 0x40)
+     || (method >= NV097_SET_MODEL_VIEW_MATRIX_M && method < NV097_SET_MODEL_VIEW_MATRIX_M + 0x100)
+     || (method >= NV097_SET_COMPOSITE_MATRIX_M && method < NV097_SET_COMPOSITE_MATRIX_M + 0x40)) {
+        s_vsh.ff_matrix_dwords++;
+        note_unhandled(method, param);
+        return 1;
+    }
+    if (method >= NV097_SET_COMBINER_ALPHA_ICW_M && method < NV097_SET_COMBINER_ALPHA_ICW_M + 32) {
+        s_vsh.rc_aicw[(method - NV097_SET_COMBINER_ALPHA_ICW_M) / 4] = param; return 1;
+    }
+    if (method >= NV097_SET_COMBINER_FACTOR0_M && method < NV097_SET_COMBINER_FACTOR0_M + 32) {
+        s_vsh.rc_f0[(method - NV097_SET_COMBINER_FACTOR0_M) / 4] = param; return 1;
+    }
+    if (method >= NV097_SET_COMBINER_FACTOR1_M && method < NV097_SET_COMBINER_FACTOR1_M + 32) {
+        s_vsh.rc_f1[(method - NV097_SET_COMBINER_FACTOR1_M) / 4] = param; return 1;
+    }
+    if (method >= NV097_SET_COMBINER_ALPHA_OCW_M && method < NV097_SET_COMBINER_ALPHA_OCW_M + 32) {
+        s_vsh.rc_aocw[(method - NV097_SET_COMBINER_ALPHA_OCW_M) / 4] = param; return 1;
+    }
+    if (method >= NV097_SET_COMBINER_COLOR_ICW_M && method < NV097_SET_COMBINER_COLOR_ICW_M + 32) {
+        s_vsh.rc_cicw[(method - NV097_SET_COMBINER_COLOR_ICW_M) / 4] = param; return 1;
+    }
+    if (method >= NV097_SET_COMBINER_COLOR_OCW_M && method < NV097_SET_COMBINER_COLOR_OCW_M + 32) {
+        s_vsh.rc_cocw[(method - NV097_SET_COMBINER_COLOR_OCW_M) / 4] = param; return 1;
+    }
+    switch (method) {
+    case NV097_SET_COMBINER_CONTROL_M:  s_vsh.rc_ctl = param; s_vsh.rc_set = 1; return 1;
+    case NV097_SET_COMBINER_SPECULAR_FOG_CW0_M: s_vsh.rc_fcw0 = param; return 1;
+    case NV097_SET_COMBINER_SPECULAR_FOG_CW1_M: s_vsh.rc_fcw1 = param; return 1;
+    case NV097_SET_SPECULAR_FOG_FACTOR_M:     s_vsh.rc_sf[0] = param; return 1;
+    case NV097_SET_SPECULAR_FOG_FACTOR_M + 4: s_vsh.rc_sf[1] = param; return 1;
+    case NV097_SET_SHADER_STAGE_PROGRAM_M:
+        s_vsh.shader_prog = param; s_vsh.shader_set = 1; return 1;
+    case NV097_SET_FOG_ENABLE_M:        s_vsh.fog_enable = param != 0;  return 1;
+    case NV097_SET_FOG_COLOR_M:         s_vsh.fog_color = param;        return 1;
+    case NV097_SET_ALPHA_TEST_ENABLE_M: s_vsh.atest_enable = param != 0; return 1;
+    case NV097_SET_ALPHA_FUNC_M:        s_vsh.atest_func = param;       return 1;
+    case NV097_SET_ALPHA_REF_M:         s_vsh.atest_ref = param & 0xFF; return 1;
+    case NV097_SET_TRANSFORM_EXECUTION_MODE_M:
+        s_vsh.mode = param;
+        s_vsh.mode_sets++;
+        return 1;
+    case NV097_SET_TRANSFORM_PROGRAM_CXT_WRITE_EN_M:
+        s_vsh.cxt_write = param != 0;
+        return 1;
+    case NV097_SET_TRANSFORM_PROGRAM_LOAD_M:
+        s_vsh.load = param;
+        s_vsh.prog_loads++;
+        return 1;
+    case NV097_SET_TRANSFORM_PROGRAM_START_M:
+        s_vsh.start = param;
+        s_vsh.prog_starts++;
+        return 1;
+    case NV097_SET_TRANSFORM_CONSTANT_LOAD_M:
+        s_vsh.cload = param;
+        s_vsh.const_loads++;
+        return 1;
+    case NV097_SET_CULL_FACE_ENABLE_M:  s_vsh.cull_enable = param != 0; return 1;
+    case NV097_SET_CULL_FACE_M:         s_vsh.cull_face = param;        return 1;
+    case NV097_SET_FRONT_FACE_M:        s_vsh.front_face = param;       return 1;
+    case NV097_SET_DEPTH_TEST_ENABLE_M: s_vsh.depth_enable = param != 0; return 1;
+    case NV097_SET_DEPTH_FUNC_M:        s_vsh.depth_func = param;       return 1;
+    case NV097_SET_DEPTH_MASK_M:        s_vsh.depth_mask = param != 0;  return 1;
+    case NV097_SET_SURFACE_ZETA_OFFSET_M: s_vsh.zeta_offset = param;    return 1;
+    case NV097_SET_ZSTENCIL_CLEAR_VALUE_M: s_vsh.zclear = param;        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Inline attribute values, the inputs a program reads for any attribute with
+ * no array behind it. Called for every SET_VERTEX_DATA* write, alongside the
+ * immediate-mode bookkeeping that already consumes some of them. */
+static void vsh_inline_attr(uint32_t method, uint32_t param)
+{
+    if (method >= NV097_SET_VERTEX_DATA2F_M
+            && method < NV097_SET_VERTEX_DATA2F_M + NV_VERTEX_ATTRS * 8) {
+        uint32_t off = method - NV097_SET_VERTEX_DATA2F_M, a = off / 8;
+        s_vsh.inl[a][(off % 8) / 4] = u2f(param);
+        s_vsh.inl[a][2] = 0.0f; s_vsh.inl[a][3] = 1.0f;
+    } else if (method >= NV097_SET_VERTEX_DATA4F_M
+            && method < NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16) {
+        uint32_t off = method - NV097_SET_VERTEX_DATA4F_M;
+        s_vsh.inl[off / 16][(off % 16) / 4] = u2f(param);
+    } else if (method >= NV097_SET_VERTEX_DATA4UB
+            && method < NV097_SET_VERTEX_DATA4UB + NV_VERTEX_ATTRS * 4) {
+        float *d = s_vsh.inl[(method - NV097_SET_VERTEX_DATA4UB) / 4];
+        /* Same byte order as a D3DCOLOR array element: B,G,R,A from the
+         * bottom, returned as R,G,B,A (see fetch_attr). */
+        d[0] = (float)((param >> 16) & 0xFF) / 255.0f;
+        d[1] = (float)((param >>  8) & 0xFF) / 255.0f;
+        d[2] = (float)( param        & 0xFF) / 255.0f;
+        d[3] = (float)( param >> 24        ) / 255.0f;
+    } else if (method >= NV097_SET_VERTEX_DATA2S_M
+            && method < NV097_SET_VERTEX_DATA2S_M + NV_VERTEX_ATTRS * 4) {
+        float *d = s_vsh.inl[(method - NV097_SET_VERTEX_DATA2S_M) / 4];
+        d[0] = (float)(int16_t)(param & 0xFFFF);
+        d[1] = (float)(int16_t)(param >> 16);
+        d[2] = 0.0f; d[3] = 1.0f;
+    } else if (method >= NV097_SET_VERTEX_DATA4S_M_M
+            && method < NV097_SET_VERTEX_DATA4S_M_M + NV_VERTEX_ATTRS * 8) {
+        uint32_t off = method - NV097_SET_VERTEX_DATA4S_M_M;
+        float *d = s_vsh.inl[off / 8];
+        uint32_t k = ((off % 8) / 4) * 2;
+        d[k]     = (float)(int16_t)(param & 0xFFFF);
+        d[k + 1] = (float)(int16_t)(param >> 16);
+    } else if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
+        s_vsh.inl[0][(method - NV097_SET_VERTEX4F) / 4] = u2f(param);
+    } else if (method >= NV097_SET_VERTEX3F && method < NV097_SET_VERTEX3F + 12) {
+        s_vsh.inl[0][(method - NV097_SET_VERTEX3F) / 4] = u2f(param);
+        s_vsh.inl[0][3] = 1.0f;
+    }
+}
+
+static int vsh_batch_active(void)
+{
+    return vsh_enabled() && (s_vsh.mode & 3u) == 2u;
+}
+
+/* Track the program a batch runs, for the report and for RECOMP_VSH_TRACE. */
+static void vsh_note_program(void)
+{
+    uint32_t h = 2166136261u, len = 0, pc, k;
+    int i;
+
+    for (pc = s_vsh.start; pc < NV2A_VSH_SLOTS; pc++) {
+        for (k = 0; k < 4; k++)
+            h = (h ^ s_vsh.prog[pc][k]) * 16777619u;
+        len++;
+        if (s_vsh.prog[pc][3] & 1u)
+            break;
+    }
+    for (i = 0; i < s_vsh_prog_count; i++)
+        if (s_vsh_progs[i].hash == h && s_vsh_progs[i].start == s_vsh.start) {
+            s_vsh_progs[i].batches++;
+            return;
+        }
+    if (s_vsh_prog_count >= VSH_MAX_PROGS)
+        return;
+    s_vsh_progs[s_vsh_prog_count].hash = h;
+    s_vsh_progs[s_vsh_prog_count].start = s_vsh.start;
+    s_vsh_progs[s_vsh_prog_count].len = len;
+    s_vsh_progs[s_vsh_prog_count].batches = 1;
+    s_vsh_prog_count++;
+
+    if (getenv("RECOMP_VSH_TRACE")) {
+        char buf[160];
+        fprintf(stderr, "  [VSH] program #%d hash %08X start %u len %u"
+                        " (cxt_write %d)\n",
+                s_vsh_prog_count - 1, h, s_vsh.start, len, s_vsh.cxt_write);
+        for (pc = s_vsh.start; pc < s_vsh.start + len && pc < NV2A_VSH_SLOTS; pc++)
+            fprintf(stderr, "  [VSH]   %3u: %08X %08X %08X  %s\n", pc,
+                    s_vsh.prog[pc][1], s_vsh.prog[pc][2], s_vsh.prog[pc][3],
+                    nv2a_vsh_disasm(s_vsh.prog[pc], buf, sizeof buf));
+    }
+    /* Program memory, constants and the attribute table, raw, so the
+     * interpreter can be run offline against exactly what the title sent. */
+    {
+        const char *pre = getenv("RECOMP_VSH_DUMP");
+        if (pre) {
+            char path[512];
+            FILE *f;
+            snprintf(path, sizeof path, "%s%02d_%08X.bin", pre,
+                     s_vsh_prog_count - 1, h);
+            f = fopen(path, "wb");
+            if (f) {
+                fwrite(&s_vsh.start, 4, 1, f);
+                fwrite(s_vsh.prog, sizeof s_vsh.prog, 1, f);
+                fwrite(s_vsh.c, sizeof s_vsh.c, 1, f);
+                fwrite(s_vsh.inl, sizeof s_vsh.inl, 1, f);
+                fclose(f);
+            }
+        }
+    }
+}
+
+/* Gather v0..v15 for one vertex: array data where the title enabled an array,
+ * the inline value everywhere else. */
+static void vsh_inputs(uint32_t index, float v[NV2A_VSH_INPUTS][4])
+{
+    uint32_t a;
+
+    for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+        const VertexAttr *at = &s_gpu.attr[a];
+        if (at->size && at->stride
+                && (s_gpu.inline_active || at->offset)
+                && fetch_attr(at, index, v[a])) {
+            /* An array of fewer than four components fills the rest with
+             * (0, 0, 1) like every other vertex fetch. */
+            continue;
+        }
+        memcpy(v[a], s_vsh.inl[a], sizeof v[a]);
+    }
+}
+
+static void vsh_transform(uint32_t index, XfVert *xv)
+{
+    float v[NV2A_VSH_INPUTS][4];
+    Nv2aVshOut o;
+    int k;
+
+    vsh_inputs(index, v);
+    nv2a_vsh_run((const uint32_t (*)[4])s_vsh.prog, s_vsh.start, s_vsh.c,
+                 s_vsh.cxt_write, (const float (*)[4])v, &o);
+    s_vsh.verts_run++;
+    xv->x = o.o[NV2A_VSH_O_POS][0];
+    xv->y = o.o[NV2A_VSH_O_POS][1];
+    xv->z = o.o[NV2A_VSH_O_POS][2];
+    xv->w = o.o[NV2A_VSH_O_POS][3];
+    for (k = 0; k < 4; k++) {
+        float c = o.o[NV2A_VSH_O_D0][k], s = o.o[NV2A_VSH_O_D1][k];
+        int t;
+        xv->d0[k] = c < 0.0f ? 0.0f : c > 1.0f ? 1.0f : c;
+        xv->d1[k] = s < 0.0f ? 0.0f : s > 1.0f ? 1.0f : s;
+        for (t = 0; t < 4; t++)
+            xv->t[t][k] = o.o[NV2A_VSH_O_T0 + t][k];
+    }
+    xv->ok = o.ok && isfinite(xv->x) && isfinite(xv->y) && isfinite(xv->z)
+          && xv->w > 0.0f
+          && fabsf(xv->x) < 1.0e6f && fabsf(xv->y) < 1.0e6f;
+    if (!xv->ok)
+        s_vsh.verts_bad++;
+}
+
+/* Depth buffer: one float per pixel of the clip rectangle's extent, in [0,1].
+ * A colour clear that also names Z resets it (see vsh_clear_depth). */
+static float vsh_zmax(void)
+{
+    /* SET_SURFACE_FORMAT zeta field: 1 = Z16, 2 = Z24S8. */
+    return ((s_gpu.format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
+}
+
+static int vsh_zbuf_ready(void)
+{
+    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h;
+    if (!w || !h || w > 4096 || h > 4096)
+        return 0;
+    if (w != s_zbuf_w || h != s_zbuf_h || !s_zbuf) {
+        float *n = (float *)realloc(s_zbuf, (size_t)w * h * sizeof(float));
+        uint32_t i;
+        if (!n)
+            return 0;
+        s_zbuf = n;
+        s_zbuf_w = w; s_zbuf_h = h;
+        for (i = 0; i < w * h; i++)
+            s_zbuf[i] = 1.0f;
+    }
+    return 1;
+}
+
+static void vsh_clear_depth(uint32_t param)
+{
+    float z;
+    uint32_t i;
+
+    s_vsh.clears_seen++;
+    if (!(param & 1u) || !vsh_zbuf_ready())
+        return;
+    s_vsh.zclears++;
+    z = ((s_gpu.format >> 4) & 0xF) == 1
+      ? (float)(s_vsh.zclear & 0xFFFFu) / 65535.0f
+      : (float)(s_vsh.zclear >> 8) / 16777215.0f;
+    for (i = 0; i < s_zbuf_w * s_zbuf_h; i++)
+        s_zbuf[i] = z;
+}
+
+static int depth_pass(float z, float stored)
+{
+    switch (s_vsh.depth_func) {
+    case 0x200: return 0;
+    case 0x201: return z <  stored;
+    case 0x202: return z == stored;
+    case 0x203: return z <= stored;
+    case 0x204: return z >  stored;
+    case 0x205: return z != stored;
+    case 0x206: return z >= stored;
+    default:    return 1;                  /* ALWAYS, and anything unset */
+    }
+}
+
+static int wrap_signed(int c, uint32_t size, uint32_t mode)
+{
+    if (!size)
+        return 0;
+    if (mode == 1) {                       /* wrap */
+        int m = c % (int)size;
+        return m < 0 ? m + (int)size : m;
+    }
+    if (c < 0) return 0;
+    return c >= (int)size ? (int)size - 1 : c;
+}
+
+/* ---- Texture stages and register combiners ----------------------------
+ *
+ * Per batch, each of the four stages is decoded from the texture registers
+ * the title last wrote (s_tex_reg), and given a texture-shader mode from
+ * SET_SHADER_STAGE_PROGRAM. Per pixel, the stages are sampled into T0..T3 and
+ * the general combiners then the final combiner run on them, after xemu's
+ * psh.c. That is what decides whether a texel is modulated by oD0, added to
+ * it, ignored, or used only for its alpha -- which a fixed MODULATE got wrong
+ * for every intro batch whose oD0 is zero.
+ *
+ * ponytail: point sampling, 2D only. Cube, 3D, dot-product and bump-map
+ * shader modes sample as plain 2D at (s, t); the report counts them. Fog is
+ * fog colour with factor 1 (no fog). */
+static Texture s_stage_tex[4];
+static int     s_stage_mode[4];         /* 0 none, 1 2D, 4 pass-through, other */
+static float   s_stage_scale[4][2];     /* normalised -> texels */
+
+static void vsh_build_stages(void)
+{
+    int n;
+    for (n = 0; n < 4; n++) {
+        const uint32_t *r = &s_tex_reg[(0x40u * n) / 4];
+        const uint8_t  *set = &s_tex_set[(0x40u * n) / 4];
+        Texture *t = &s_stage_tex[n];
+        uint32_t fmt = r[0x04 / 4], ctl0 = r[0x0C / 4];
+        int on = (ctl0 >> 30) & 1;
+        int mode;
+
+        memset(t, 0, sizeof *t);
+        t->offset = r[0] ? dma_resolve(r[0]) : 0;
+        t->color = (fmt >> 8) & 0xFF;
+        if (tex_size_from_format(t->color)) {
+            t->width  = 1u << ((fmt >> 20) & 0xF);
+            t->height = 1u << ((fmt >> 24) & 0xF);
+        } else {
+            t->width  = r[0x1C / 4] >> 16;
+            t->height = r[0x1C / 4] & 0xFFFF;
+        }
+        t->pitch  = r[0x10 / 4] >> 16;
+        t->addr_u =  r[0x08 / 4]       & 0xF;
+        t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
+        t->valid = t->offset && t->width && t->height
+                && (tex_size_from_format(t->color) || t->pitch);
+        if (n == 0 && !set[0x0C / 4])
+            on = 1;                        /* never configured: as before */
+        if (s_vsh.shader_set)
+            mode = (int)((s_vsh.shader_prog >> (5 * n)) & 0x1F);
+        else
+            mode = n == 0 ? 1 : 0;
+        s_vsh.stage_mode_seen[n][mode]++;
+        if (mode != 4 && (!on || !t->valid))
+            mode = 0;
+        s_stage_mode[n] = mode;
+        s_stage_scale[n][0] = tex_size_from_format(t->color) ? (float)t->width : 1.0f;
+        s_stage_scale[n][1] = tex_size_from_format(t->color) ? (float)t->height : 1.0f;
+    }
+}
+
+static void rc_unpack(uint32_t c, float o[4])
+{
+    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
+    o[1] = (float)((c >>  8) & 0xFF) / 255.0f;
+    o[2] = (float)( c        & 0xFF) / 255.0f;
+    o[3] = (float)( c >> 24        ) / 255.0f;
+}
+
+static float rc_map(float x, uint32_t map)
+{
+    switch (map) {
+    case 0: return x < 0.0f ? 0.0f : x;                     /* unsigned */
+    case 1: return 1.0f - (x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x);
+    case 2: return 2.0f * (x < 0.0f ? 0.0f : x) - 1.0f;     /* expand */
+    case 3: return 1.0f - 2.0f * (x < 0.0f ? 0.0f : x);
+    case 4: return (x < 0.0f ? 0.0f : x) - 0.5f;            /* half bias */
+    case 5: return 0.5f - (x < 0.0f ? 0.0f : x);
+    case 6: return x;                                       /* signed */
+    default: return -x;
+    }
+}
+
+static void rc_in_rgb(float r[16][4], uint32_t b, float v[3])
+{
+    const float *s = r[b & 0xF];
+    uint32_t map = (b >> 5) & 7;
+    int k;
+    for (k = 0; k < 3; k++)
+        v[k] = rc_map((b & 0x10) ? s[3] : s[k], map);
+}
+
+static float rc_in_a(float r[16][4], uint32_t b)
+{
+    const float *s = r[b & 0xF];
+    return rc_map((b & 0x10) ? s[3] : s[2], (b >> 5) & 7);
+}
+
+static float rc_op(float x, uint32_t op)
+{
+    switch (op) {
+    case 1: x -= 0.5f; break;
+    case 2: x *= 2.0f; break;
+    case 3: x = (x - 0.5f) * 2.0f; break;
+    case 4: x *= 4.0f; break;
+    case 6: x *= 0.5f; break;
+    default: break;
+    }
+    return x < -1.0f ? -1.0f : x > 1.0f ? 1.0f : x;
+}
+
+static float clamp01(float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; }
+
+/* General combiners then the final combiner, on r[] (register-code indexed);
+ * the result is written to out[4] as r,g,b,a. */
+static void rc_eval(float r[16][4], float out[4])
+{
+    uint32_t stages = s_vsh.rc_ctl & 0xFF, s;
+    int mux_msb = (s_vsh.rc_ctl >> 8) & 1;
+    int uniq0 = (s_vsh.rc_ctl >> 12) & 1, uniq1 = (s_vsh.rc_ctl >> 16) & 1;
+    float nr[16][4], A[3], B[3], C[3], D[3], E[3], F[3];
+    int k;
+
+    if (stages > 8)
+        stages = 8;
+    for (s = 0; s < stages; s++) {
+        uint32_t icw = s_vsh.rc_cicw[s], ocw = s_vsh.rc_cocw[s];
+        uint32_t aicw = s_vsh.rc_aicw[s], aocw = s_vsh.rc_aocw[s];
+        float ab[3], cd[3], sum[3], aab, acd, asum;
+        int sel;
+
+        rc_unpack(s_vsh.rc_f0[uniq0 ? s : 0], r[1]);
+        rc_unpack(s_vsh.rc_f1[uniq1 ? s : 0], r[2]);
+        memcpy(nr, r, sizeof nr);
+        sel = mux_msb ? r[12][3] >= 0.5f
+                      : (((uint32_t)(clamp01(r[12][3]) * 255.0f + 0.5f)) & 1u);
+
+        /* colour */
+        rc_in_rgb(r, icw >> 24, A); rc_in_rgb(r, icw >> 16, B);
+        rc_in_rgb(r, icw >>  8, C); rc_in_rgb(r, icw,       D);
+        if (ocw & (1u << 13)) {
+            float d = A[0]*B[0] + A[1]*B[1] + A[2]*B[2];
+            ab[0] = ab[1] = ab[2] = d;
+        } else {
+            for (k = 0; k < 3; k++) ab[k] = A[k] * B[k];
+        }
+        if (ocw & (1u << 12)) {
+            float d = C[0]*D[0] + C[1]*D[1] + C[2]*D[2];
+            cd[0] = cd[1] = cd[2] = d;
+        } else {
+            for (k = 0; k < 3; k++) cd[k] = C[k] * D[k];
+        }
+        for (k = 0; k < 3; k++) {
+            sum[k] = (ocw & (1u << 14)) ? (sel ? cd[k] : ab[k]) : ab[k] + cd[k];
+            ab[k]  = rc_op(ab[k],  (ocw >> 15) & 7);
+            cd[k]  = rc_op(cd[k],  (ocw >> 15) & 7);
+            sum[k] = rc_op(sum[k], (ocw >> 15) & 7);
+        }
+        if ((ocw >> 4) & 0xF) memcpy(nr[(ocw >> 4) & 0xF], ab, sizeof ab);
+        if ( ocw       & 0xF) memcpy(nr[ ocw       & 0xF], cd, sizeof cd);
+        if ((ocw >> 8) & 0xF) memcpy(nr[(ocw >> 8) & 0xF], sum, sizeof sum);
+
+        /* alpha */
+        aab = rc_in_a(r, aicw >> 24) * rc_in_a(r, aicw >> 16);
+        acd = rc_in_a(r, aicw >>  8) * rc_in_a(r, aicw);
+        asum = (aocw & (1u << 12)) ? (sel ? acd : aab) : aab + acd;
+        if ((aocw >> 4) & 0xF) nr[(aocw >> 4) & 0xF][3] = rc_op(aab,  (aocw >> 13) & 7);
+        if ( aocw       & 0xF) nr[ aocw       & 0xF][3] = rc_op(acd,  (aocw >> 13) & 7);
+        if ((aocw >> 8) & 0xF) nr[(aocw >> 8) & 0xF][3] = rc_op(asum, (aocw >> 13) & 7);
+
+        /* blue to alpha overrides the alpha portion's write */
+        if ((ocw & (1u << 19)) && ((ocw >> 4) & 0xF)) nr[(ocw >> 4) & 0xF][3] = ab[2];
+        if ((ocw & (1u << 18)) && (ocw & 0xF))        nr[ocw & 0xF][3] = cd[2];
+        memcpy(r, nr, sizeof nr);
+    }
+
+    /* Final combiner: unsigned inputs, A*B + (1-A)*C + D, alpha from G. */
+    {
+        uint32_t c0 = s_vsh.rc_fcw0, c1 = s_vsh.rc_fcw1;
+        float v1[3], r0[3], G;
+        rc_unpack(s_vsh.rc_sf[0], r[1]);
+        rc_unpack(s_vsh.rc_sf[1], r[2]);
+#define FC_IN(b, v) do { const float *s_ = r[(b) & 0xF]; int k_; \
+        for (k_ = 0; k_ < 3; k_++) { float x_ = clamp01(((b) & 0x10) ? s_[3] : s_[k_]); \
+            (v)[k_] = ((b) & 0x20) ? 1.0f - x_ : x_; } } while (0)
+        FC_IN(c1 >> 24, E);
+        FC_IN(c1 >> 16, F);
+        for (k = 0; k < 3; k++) {
+            v1[k] = clamp01(r[5][k]);  if (c1 & 0x20) v1[k] = 1.0f - v1[k];
+            r0[k] = clamp01(r[12][k]); if (c1 & 0x40) r0[k] = 1.0f - r0[k];
+            r[14][k] = v1[k] + r0[k];
+            if (c1 & 0x80) r[14][k] = clamp01(r[14][k]);
+            r[15][k] = E[k] * F[k];
+        }
+        r[14][3] = r[15][3] = 0.0f;
+        FC_IN(c0 >> 24, A); FC_IN(c0 >> 16, B);
+        FC_IN(c0 >>  8, C); FC_IN(c0,       D);
+        {
+            uint32_t g = c1 >> 8;
+            const float *sg = r[g & 0xF];
+            G = clamp01((g & 0x10) ? sg[3] : sg[2]);
+            if (g & 0x20) G = 1.0f - G;
+        }
+#undef FC_IN
+        for (k = 0; k < 3; k++)
+            out[k] = clamp01(A[k] * B[k] + (1.0f - A[k]) * C[k] + D[k]);
+        out[3] = G;
+    }
+}
+
+static int vsh_rc_active(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_RC");
+        on = !(e && e[0] == '0');
+    }
+    return on && s_vsh.rc_set && (s_vsh.rc_ctl & 0xFF);
+}
+
+static int alpha_test_pass(float a)
+{
+    uint32_t v = (uint32_t)(clamp01(a) * 255.0f + 0.5f), ref = s_vsh.atest_ref;
+    switch (s_vsh.atest_func) {
+    case 0x200: return 0;
+    case 0x201: return v <  ref;
+    case 0x202: return v == ref;
+    case 0x203: return v <= ref;
+    case 0x204: return v >  ref;
+    case 0x205: return v != ref;
+    case 0x206: return v >= ref;
+    default:    return 1;
+    }
+}
+
+static void stage_sample(int n, const float tc[4], float o[4])
+{
+    int mode = s_stage_mode[n];
+    uint32_t texel;
+    float s, t;
+    int iu, iv;
+
+    if (mode == 0) { o[0] = o[1] = o[2] = o[3] = 0.0f; return; }
+    if (mode == 4) {                       /* pass-through: the coordinate */
+        int k;
+        for (k = 0; k < 4; k++) o[k] = clamp01(tc[k]);
+        return;
+    }
+    s = tc[0]; t = tc[1];
+    if (mode == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {   /* 2D projective */
+        s /= tc[3]; t /= tc[3];
+    }
+    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), s_stage_tex[n].width,  s_stage_tex[n].addr_u);
+    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), s_stage_tex[n].height, s_stage_tex[n].addr_v);
+    if (sample_tex(&s_stage_tex[n], (uint32_t)iu, (uint32_t)iv, &texel))
+        rc_unpack(texel, o);
+    else
+        o[0] = o[1] = o[2] = 0.0f, o[3] = 1.0f;
+}
+
+static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
+                          int textured)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = surface_bpp();
+    float area, inv_w[3], zscale = 1.0f / vsh_zmax();
+    int minx, maxx, miny, maxy, x, y, use_z, use_rc, n;
+
+    if (bpp != 4 && bpp != 2)
+        return;
+    if (!a->ok || !b->ok || !c->ok) {
+        s_vsh.tris_clipped++;
+        return;
+    }
+    area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
+    if (area == 0.0f)
+        return;
+    if (s_vsh.cull_enable) {
+        /* area > 0 is clockwise as displayed (y down). FRONT_FACE CW means a
+         * clockwise triangle faces the viewer. */
+        int cw = area > 0.0f;
+        int front = (s_vsh.front_face == 0x900) ? cw : !cw;
+        if (getenv("RECOMP_PB_CULL_FLIP"))
+            front = !front;
+        if ((s_vsh.cull_face == 0x405 && !front)
+         || (s_vsh.cull_face == 0x404 && front)
+         || s_vsh.cull_face == 0x408) {
+            s_vsh.tris_culled++;
+            return;
+        }
+    }
+    if (!surface_begin_batch(mem))
+        return;
+    use_z = s_vsh.depth_enable && vsh_zbuf_ready();
+    use_rc = vsh_rc_active();
+
+    minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
+    maxx = (int)ceilf (fmaxf(a->x, fmaxf(b->x, c->x)));
+    miny = (int)floorf(fminf(a->y, fminf(b->y, c->y)));
+    maxy = (int)ceilf (fmaxf(a->y, fmaxf(b->y, c->y)));
+    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
+    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
+    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
+    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (minx >= maxx || miny >= maxy) {
+        s_gpu.tris_skipped_offscreen++;
+        return;
+    }
+
+    inv_w[0] = 1.0f / a->w; inv_w[1] = 1.0f / b->w; inv_w[2] = 1.0f / c->w;
+
+    for (y = miny; y < maxy; y++) {
+        for (x = minx; x < maxx; x++) {
+            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            float w0 = (b->x - a->x) * (py - a->y) - (b->y - a->y) * (px - a->x);
+            float w1 = (c->x - b->x) * (py - b->y) - (c->y - b->y) * (px - b->x);
+            float w2 = (a->x - c->x) * (py - c->y) - (a->y - c->y) * (px - c->x);
+            float la, lb, lc, pa, pb, pc, ps, col[4], z = 0.0f;
+            float *zp = NULL;
+            uint32_t argb;
+            int k;
+
+            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
+               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                continue;
+            /* w1 is opposite a, w2 opposite b, w0 opposite c. */
+            la = w1 / area; lb = w2 / area; lc = w0 / area;
+
+            if (use_z) {
+                z = (la * a->z + lb * b->z + lc * c->z) * zscale;
+                zp = &s_zbuf[(size_t)y * s_zbuf_w + (size_t)x];
+                if (!depth_pass(z, *zp)) {
+                    s_vsh.z_rejected++;
+                    continue;
+                }
+            }
+
+            /* Perspective-correct weights. */
+            pa = la * inv_w[0]; pb = lb * inv_w[1]; pc = lc * inv_w[2];
+            ps = pa + pb + pc;
+            if (ps != 0.0f) { pa /= ps; pb /= ps; pc /= ps; }
+
+            for (k = 0; k < 4; k++)
+                col[k] = pa * a->d0[k] + pb * b->d0[k] + pc * c->d0[k];
+
+            if (use_rc) {
+                float r[16][4], tc[4];
+                memset(r, 0, sizeof r);
+                memcpy(r[4], col, sizeof col);
+                for (k = 0; k < 4; k++)
+                    r[5][k] = pa * a->d1[k] + pb * b->d1[k] + pc * c->d1[k];
+                rc_unpack(s_vsh.fog_color, r[3]);
+                { float t_ = r[3][0]; r[3][0] = r[3][2]; r[3][2] = t_; } /* RGBA */
+                r[3][3] = 1.0f;
+                for (n = 0; n < 4; n++) {
+                    if (!s_stage_mode[n])
+                        continue;
+                    for (k = 0; k < 4; k++)
+                        tc[k] = pa * a->t[n][k] + pb * b->t[n][k] + pc * c->t[n][k];
+                    stage_sample(n, tc, r[8 + n]);
+                }
+                r[12][3] = r[8][3];
+                rc_eval(r, col);
+            } else if (textured) {
+                float tc[4], tx[4];
+                for (k = 0; k < 4; k++)
+                    tc[k] = pa * a->t[0][k] + pb * b->t[0][k] + pc * c->t[0][k];
+                if (s_stage_mode[0]) {
+                    stage_sample(0, tc, tx);
+                    for (k = 0; k < 4; k++)
+                        col[k] *= tx[k];
+                }
+            }
+            if (s_vsh.atest_enable && !alpha_test_pass(col[3])) {
+                s_vsh.a_rejected++;
+                continue;
+            }
+            if (use_z && s_vsh.depth_mask)
+                *zp = z;
+            argb = ((uint32_t)(clamp01(col[3]) * 255.0f + 0.5f) << 24)
+                 | ((uint32_t)(clamp01(col[0]) * 255.0f + 0.5f) << 16)
+                 | ((uint32_t)(clamp01(col[1]) * 255.0f + 0.5f) <<  8)
+                 |  (uint32_t)(clamp01(col[2]) * 255.0f + 0.5f);
+            put_pixel(mem, bpp, x, y, argb);
+        }
+    }
+    s_vsh.tris++;
+    s_gpu.tris_drawn++;
+    s_gpu.drawn_offset = s_gpu.color_offset;
+}
+
+#define NV097_SET_TEXTURE_CONTROL0_M 0x1B0C
+
+static void raster_batch_vsh(void)
+{
+    static XfVert xv[NV_MAX_INDICES];
+    uint32_t i, n = s_gpu.idx_count, a;
+    uint32_t before = s_gpu.tris_drawn;
+    int textured;
+
+    s_vsh.batches_prog++;
+    vsh_note_program();
+    for (a = 0; a < NV_VERTEX_ATTRS; a++)
+        if (s_gpu.attr[a].size)
+            s_vsh.fmt_seen[a][s_gpu.attr[a].type & 7]++;
+
+    for (i = 0; i < n; i++)
+        vsh_transform(s_gpu.idx[i], &xv[i]);
+    if (n)
+        memcpy(s_vsh_last_d0, xv[0].d0, sizeof s_vsh_last_d0), s_vsh_last_v0 = xv[0];
+
+    {
+        uint32_t ctl0 = s_tex_reg[(NV097_SET_TEXTURE_CONTROL0_M - NV_TEX_FIRST) / 4];
+        int stage_on = !s_tex_set[(NV097_SET_TEXTURE_CONTROL0_M - NV_TEX_FIRST) / 4]
+                    || (ctl0 & (1u << 30));
+        textured = stage_on && s_gpu.tex.valid;
+        vsh_build_stages();
+        if (vsh_rc_active()) s_vsh.batches_rc++; else s_vsh.batches_norc++;
+        if (textured) {
+            s_gpu.batches_textured++;
+            note_texture_use();
+        } else {
+            s_gpu.batches_no_tex++;
+        }
+    }
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3)
+            raster_tri_xf(&xv[i], &xv[i+1], &xv[i+2], textured);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        /* Odd triangles of a strip are wound the other way; swap two of them
+         * back so culling sees one winding for the whole strip. */
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1)
+                raster_tri_xf(&xv[i+1], &xv[i], &xv[i+2], textured);
+            else
+                raster_tri_xf(&xv[i], &xv[i+1], &xv[i+2], textured);
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++)
+            raster_tri_xf(&xv[0], &xv[i], &xv[i+1], textured);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            raster_tri_xf(&xv[i], &xv[i+1], &xv[i+2], textured);
+            raster_tri_xf(&xv[i], &xv[i+2], &xv[i+3], textured);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            raster_tri_xf(&xv[i], &xv[i+1], &xv[i+3], textured);
+            raster_tri_xf(&xv[i], &xv[i+3], &xv[i+2], textured);
+        }
+        break;
+    default:
+        break;
+    }
+    if (textured)
+        s_vsh.tris_textured += s_gpu.tris_drawn - before;
+
+    if (getenv("RECOMP_VSH_TRACE")) {
+        static int shown;
+        if (shown < 24 && n) {
+            shown++;
+            fprintf(stderr, "  [VSH] batch prim %u n %u start %u tex %d:"
+                            " v0 -> (%.1f, %.1f, %.4g, w %.4g) d0 %.2f %.2f %.2f %.2f"
+                            " t0 %.3f %.3f ok %d\n",
+                    s_gpu.prim, n, s_vsh.start, textured,
+                    xv[0].x, xv[0].y, xv[0].z, xv[0].w,
+                    xv[0].d0[0], xv[0].d0[1], xv[0].d0[2], xv[0].d0[3],
+                    xv[0].t[0][0], xv[0].t[0][1], xv[0].ok);
+        }
+    }
+
+    if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW) {
+        s_drawn_dumps++;
+        dump_surface_bmp();
+    }
+}
+
+static void vsh_report(void)
+{
+    int i;
+    uint32_t a, t;
+
+    fprintf(stderr, "[VSH] mode 0x%X (set %u) | program: %u dwords, %u loads,"
+                    " %u starts, start %u | constants: %u dwords, %u loads |"
+                    " viewport %u dwords, ff-matrix %u dwords\n",
+            s_vsh.mode, s_vsh.mode_sets, s_vsh.prog_dwords, s_vsh.prog_loads,
+            s_vsh.prog_starts, s_vsh.start, s_vsh.const_dwords,
+            s_vsh.const_loads, s_vsh.vp_dwords, s_vsh.ff_matrix_dwords);
+    fprintf(stderr, "[VSH] batches: %u program, %u fixed-function; %u vertices"
+                    " run (%u unusable); %u tris drawn (%u textured), %u culled,"
+                    " %u dropped for w<=0/overflow, %llu pixels depth-rejected%s\n",
+            s_vsh.batches_prog, s_vsh.batches_fixed, s_vsh.verts_run,
+            s_vsh.verts_bad, s_vsh.tris, s_vsh.tris_textured, s_vsh.tris_culled,
+            s_vsh.tris_clipped, (unsigned long long)s_vsh.z_rejected,
+            vsh_enabled() ? "" : "  [RECOMP_PB_VSH=0: path off]");
+    fprintf(stderr, "[VSH] viewport offset %.2f %.2f %.2f %.2f scale %.2f %.2f"
+                    " %.2f %.2f | c58 %.2f %.2f %.2f c59 %.2f %.2f %.2f |"
+                    " cull %d face 0x%X front 0x%X | depth %d func 0x%X mask %d"
+                    " | surface fmt 0x%X zeta 0x%X, %u clears (%u with Z)\n",
+            s_vsh.vp_off[0], s_vsh.vp_off[1], s_vsh.vp_off[2], s_vsh.vp_off[3],
+            s_vsh.vp_scale[0], s_vsh.vp_scale[1], s_vsh.vp_scale[2], s_vsh.vp_scale[3],
+            s_vsh.c[58][0], s_vsh.c[58][1], s_vsh.c[58][2],
+            s_vsh.c[59][0], s_vsh.c[59][1], s_vsh.c[59][2],
+            s_vsh.cull_enable, s_vsh.cull_face, s_vsh.front_face,
+            s_vsh.depth_enable, s_vsh.depth_func, s_vsh.depth_mask,
+            s_gpu.format, s_vsh.zeta_offset, s_vsh.clears_seen, s_vsh.zclears);
+    for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+        int any = 0;
+        for (t = 0; t < 8; t++) any |= s_vsh.fmt_seen[a][t] != 0;
+        if (!any) continue;
+        fprintf(stderr, "[VSH]   v%-2u batches by type:", a);
+        for (t = 0; t < 8; t++)
+            if (s_vsh.fmt_seen[a][t])
+                fprintf(stderr, " %s=%u",
+                        t == 0 ? "ub_d3d" : t == 1 ? "s1" : t == 2 ? "f"
+                        : t == 4 ? "ub_ogl" : t == 5 ? "s32k" : t == 6 ? "cmp" : "?",
+                        s_vsh.fmt_seen[a][t]);
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "[VSH] combiners: %u batches evaluated, %u fixed MODULATE%s;"
+                    " ctl 0x%X fcw 0x%08X/0x%08X; alpha test %d func 0x%X ref %u"
+                    " (%llu px rejected); fog %d\n",
+            s_vsh.batches_rc, s_vsh.batches_norc,
+            getenv("RECOMP_PB_RC") && getenv("RECOMP_PB_RC")[0] == '0'
+                ? " [RECOMP_PB_RC=0]" : "",
+            s_vsh.rc_ctl, s_vsh.rc_fcw0, s_vsh.rc_fcw1, s_vsh.atest_enable,
+            s_vsh.atest_func, s_vsh.atest_ref,
+            (unsigned long long)s_vsh.a_rejected, s_vsh.fog_enable);
+    for (a = 0; a < 4; a++) {
+        fprintf(stderr, "[VSH]   stage %u shader modes (batches):", a);
+        for (t = 0; t < 32; t++)
+            if (s_vsh.stage_mode_seen[a][t])
+                fprintf(stderr, " %u=%u", t, s_vsh.stage_mode_seen[a][t]);
+        fprintf(stderr, "\n");
+    }
+    if (s_vsh_ab_batches)
+        fprintf(stderr, "[VSH] A/B vs screen-space path: %llu batches, %llu differ,"
+                        " %llu px differ\n",
+                (unsigned long long)s_vsh_ab_batches,
+                (unsigned long long)s_vsh_ab_diff_batches,
+                (unsigned long long)s_vsh_ab_diff_px);
+    for (i = 0; i < s_vsh_prog_count; i++)
+        fprintf(stderr, "[VSH]   program %08X start %u len %u: %u batches\n",
+                s_vsh_progs[i].hash, s_vsh_progs[i].start, s_vsh_progs[i].len,
+                s_vsh_progs[i].batches);
+}
+
+/* RECOMP_PB_VSH_AB=1: draw every program-mode batch twice, the old
+ * screen-space way and through the vertex program, keep the program result,
+ * and count the pixels where the two disagree. This is the before/after check
+ * on the intro, made per batch inside one run so movie timing cannot move it. */
+static int s_vsh_ab_inner;
+
+static void raster_batch(void);
+
+static void ab_write_bmp(const char *path, const uint8_t *surf, uint32_t bpp)
+{
+    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h, x, y;
+    uint32_t row = w * 3, pad = (4 - (row & 3)) & 3, fsz = 54 + (row + pad) * h;
+    uint8_t hdr[54] = {0}, px[3], z[3] = {0};
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return;
+    hdr[0] = 'B'; hdr[1] = 'M'; memcpy(hdr + 2, &fsz, 4); hdr[10] = 54;
+    hdr[14] = 40; memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &h, 4);
+    hdr[26] = 1; hdr[28] = 24;
+    fwrite(hdr, 1, 54, f);
+    for (y = h; y-- > 0; ) {
+        const uint8_t *r = surf + (size_t)y * s_gpu.pitch;
+        for (x = 0; x < w; x++) {
+            if (bpp == 4) {
+                px[0] = r[x*4]; px[1] = r[x*4+1]; px[2] = r[x*4+2];
+            } else {
+                uint16_t t = ((const uint16_t *)r)[x];
+                px[0] = (uint8_t)((t & 0x1F) << 3);
+                px[1] = (uint8_t)(((t >> 5) & 0x3F) << 2);
+                px[2] = (uint8_t)((t >> 11) << 3);
+            }
+            fwrite(px, 1, 3, f);
+        }
+        fwrite(z, 1, pad, f);
+    }
+    fclose(f);
+}
+
+static void raster_batch_ab(void)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    static uint8_t *save, *old;
+    static size_t cap;
+    size_t size = (size_t)(s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch, k;
+    uint32_t bpp = surface_bpp(), diff = 0, maxd = 0;
+    int dumps = s_drawn_dumps;
+    uint64_t zrej0;
+
+    if (!size || !surface_begin_batch(mem) || (bpp != 4 && bpp != 2)) {
+        raster_batch_vsh();
+        return;
+    }
+    if (size > cap) {
+        save = (uint8_t *)realloc(save, size);
+        old  = (uint8_t *)realloc(old, size);
+        cap = save && old ? size : 0;
+        if (!cap) { raster_batch_vsh(); return; }
+    }
+    memcpy(save, s_surface, size);
+    s_vsh_ab_inner = 1;
+    s_drawn_dumps = FB_DUMP_AFTER_DRAW;
+    raster_batch();                        /* old path */
+    s_drawn_dumps = dumps;
+    s_vsh_ab_inner = 0;
+    surface_begin_batch(mem);
+    memcpy(old, s_surface, size);
+    memcpy(s_surface, save, size);
+    zrej0 = s_vsh.z_rejected;
+    raster_batch_vsh();
+    surface_begin_batch(mem);
+    for (k = 0; k + bpp <= size; k += bpp) {
+        uint32_t d = 0, c;
+        for (c = 0; c < (bpp == 4 ? 3u : 2u); c++) {
+            int e = (int)s_surface[k + c] - (int)old[k + c];
+            if (e < 0) e = -e;
+            if ((uint32_t)e > d) d = (uint32_t)e;
+        }
+        if (d > 2) diff++;
+        if (d > maxd) maxd = d;
+    }
+    s_vsh_ab_batches++;
+    if (diff) {
+        /* RECOMP_PB_VSH_AB_DUMP=<prefix>: both versions of the first
+         * differing batch per texture, as <prefix>NNN_old/new.bmp. */
+        const char *pre = getenv("RECOMP_PB_VSH_AB_DUMP");
+        static uint32_t seen[16];
+        static int nseen;
+        int j, have = 0;
+        for (j = 0; j < nseen; j++) have |= seen[j] == s_gpu.tex.offset;
+        static int zdumps;
+        int zd = pre && s_vsh.z_rejected != zrej0 && zdumps < 4;
+        zdumps += zd;
+        if ((pre && !have && nseen < 16) || zd) {
+            char path[512];
+            if (!have && nseen < 16)
+                seen[nseen++] = s_gpu.tex.offset;
+            snprintf(path, sizeof path, "%s%03llu_old.bmp", pre,
+                     (unsigned long long)s_vsh_ab_batches);
+            ab_write_bmp(path, old, bpp);
+            snprintf(path, sizeof path, "%s%03llu_new.bmp", pre,
+                     (unsigned long long)s_vsh_ab_batches);
+            ab_write_bmp(path, s_surface, bpp);
+        }
+        s_vsh_ab_diff_batches++;
+        s_vsh_ab_diff_px += diff;
+        static int zshown;
+        int zlog = s_vsh.z_rejected != zrej0 && zshown < 24;
+        zshown += zlog;
+        if (s_vsh_ab_diff_batches <= 16 || s_vsh_ab_diff_batches % 64 == 0 || zlog
+                || (pre && !have && nseen <= 16 && seen[nseen - 1] == s_gpu.tex.offset))
+            fprintf(stderr, "  [VSH-AB] batch %llu prim %u n %u: %u px differ"
+                            " (max %u); d0 %.2f %.2f %.2f %.2f tex %08X fmt %02X"
+                            " %ux%u blend %u %X/%X | z %.4g w %.4g zrej %llu"
+                            " t0 %.3f %.3f\n",
+                    (unsigned long long)s_vsh_ab_batches, s_gpu.prim,
+                    s_gpu.idx_count, diff, maxd,
+                    s_vsh_last_d0[0], s_vsh_last_d0[1], s_vsh_last_d0[2],
+                    s_vsh_last_d0[3], s_gpu.tex.offset, s_gpu.tex.color,
+                    s_gpu.tex.width, s_gpu.tex.height, s_gpu.blend_enable,
+                    s_gpu.blend_sfactor, s_gpu.blend_dfactor,
+                    s_vsh_last_v0.z, s_vsh_last_v0.w,
+                    (unsigned long long)(s_vsh.z_rejected - zrej0),
+                    s_vsh_last_v0.t[0][0], s_vsh_last_v0.t[0][1]);
+    }
+}
+
 static void raster_batch(void)
 {
     uint32_t i;
@@ -1340,6 +2496,18 @@ static void raster_batch(void)
 
     if (s_gpu.idx_count < 3)
         return;
+    if (!s_vsh_ab_inner && vsh_batch_active()) {
+        static int ab = -1;
+        if (ab < 0)
+            ab = getenv("RECOMP_PB_VSH_AB") != NULL;
+        if (ab)
+            raster_batch_ab();
+        else
+            raster_batch_vsh();
+        return;
+    }
+    if ((s_vsh.mode & 3u) != 2u)
+        s_vsh.batches_fixed++;
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         return;
@@ -1750,6 +2918,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         note_unhandled(method, param);
         return;
     }
+    if (vsh_method(method, param))
+        return;
     switch (method) {
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;
@@ -1781,6 +2951,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.blend_dfactor = param;
         break;
     case NV097_CLEAR_SURFACE:
+        vsh_clear_depth(param);
         clear_surface(param);
         break;
 
@@ -2026,7 +3197,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             a->type   =  param        & 0x0F;
             a->size   = (param >> 4)  & 0x0F;
             a->stride = (param >> 8)  & 0xFF;
-        } else if (!imm_vertex_method(method, param)) {
+        } else if (vsh_inline_attr(method, param), !imm_vertex_method(method, param)) {
             note_unhandled(method, param);
         }
         break;
@@ -2210,6 +3381,7 @@ void nv2a_pb_exec_report(void)
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
+    vsh_report();
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
     dump_surface_bmp();
