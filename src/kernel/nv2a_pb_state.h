@@ -62,6 +62,7 @@ typedef struct {
     uint32_t pitch;                     /* bytes per row, from CONTROL1  */
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
+    uint32_t palette, pal_len;          /* P8: guest palette (0 none), entries */
     int      valid;
 } Texture;
 

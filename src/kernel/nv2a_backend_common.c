@@ -131,13 +131,9 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
     t->addr_u =  r[0x08 / 4]       & 0xF;
     t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
     t->filter = r[0x14 / 4];
-    /* P8: SET_TEXTURE_PALETTE (0x1B20): offset in bits 6-31, length
-     * 256 >> bits 2-3, entries A8R8G8B8. */
-    if (t->color == NV2A_TEX_P8) {
-        uint32_t pal = r[0x20 / 4];
-        t->palette = (pal & ~0x3Fu) ? resolve(pal & ~0x3Fu) : 0;
-        t->pal_len = 256u >> ((pal >> 2) & 3u);
-    }
+    /* P8: SET_TEXTURE_PALETTE (0x1B20). */
+    if (t->color == NV2A_TEX_P8)
+        nv2a_tex_palette_decode(r[0x20 / 4], resolve, &t->palette, &t->pal_len);
     t->levels = 1;
     if (from_fmt && (flags & NV2A_STAGE_MIPS)) {
         /* As xemu's pgraph_get_texture_shape: the format's count, no more
@@ -338,8 +334,10 @@ void nv2a_report_write(uint8_t *mem, uint32_t va, uint32_t count)
     r[0] = 0;                              /* timestamp */
     r[1] = 0;
     r[2] = count;
-    atomic_thread_fence(memory_order_seq_cst);  /* the count before the status */
-    r[3] = 0;                              /* status: done */
+    /* status: done, as a release store, so the count (and the rest of the
+     * report) is visible before it on any host, arm64 included. */
+    atomic_store_explicit((_Atomic uint32_t *)(mem + va + 12), 0u,
+                          memory_order_release);
 }
 
 void nv2a_report_set_pending(uint8_t *mem, uint32_t va)

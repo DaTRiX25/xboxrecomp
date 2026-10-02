@@ -11,4 +11,11 @@ if(WIN32)
                           d3d11 dxgi dxguid)
     target_include_directories(d3d11_backend_smoke PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/../../src/d3d)
+    # Needs a D3D11 device: under ctest, a Proton wrapper as
+    # CMAKE_CROSSCOMPILING_EMULATOR. Run in both visibility modes.
+    enable_testing()
+    add_test(NAME d3d11_backend_smoke COMMAND d3d11_backend_smoke)
+    add_test(NAME d3d11_backend_smoke_occ_sync COMMAND d3d11_backend_smoke)
+    set_tests_properties(d3d11_backend_smoke_occ_sync PROPERTIES
+                         ENVIRONMENT RECOMP_D3D11_OCC=sync)
 endif()

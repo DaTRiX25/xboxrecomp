@@ -45,6 +45,7 @@
 #include <windows.h>
 
 #include "d3d8_combiners_parse.h"
+#include "d3d8_hlsl.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -114,23 +115,6 @@ void d3d8_combiners_parse_token(DWORD token, const DWORD *rs,
  */
 void d3d8_combiners_from_render_states(const DWORD *rs,
                                        NV2ACombinerState *state);
-
-/**
- * Generate HLSL pixel shader source from combiner state.
- *
- * The shader evaluates the combiners the way nv2a_pb_exec.c's rc_eval does
- * on the CPU, operation for operation. Its input struct matches the vertex
- * shader output of d3d8_vsh.c (SV_POSITION, COLOR0, COLOR1, TEXCOORD0-3);
- * its constants are NV2APSConstants at b0; stage n samples tN with sN.
- *
- * @param state   The combiner configuration
- * @param buf     Output buffer for HLSL source
- * @param bufsize Size of output buffer in bytes
- * @return        Number of characters written (excluding null terminator),
- *                or -1 on error
- */
-int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
-                                 char *buf, int bufsize);
 
 /**
  * Get or create a compiled pixel shader for the given combiner state.

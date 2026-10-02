@@ -5,13 +5,15 @@
  * instruction marked final) through d3d8_vsh_parse and
  * d3d8_vsh_generate_hlsl_ex (both flag settings), and NCOMB pseudo-random
  * combiner register sets through d3d8_combiners_from_regs and
- * d3d8_combiners_generate_hlsl. Every output (text, or the -1 of an
- * overflow) goes into one FNV-1a hash, compared with EXPECTED_HASH, which
- * was recorded from the toolkit before the parsers moved to their own,
- * API-free files. With HLSL_DUMP=<path> the text is also written out, so
- * two builds can be diffed directly.
+ * d3d8_combiners_generate_hlsl. Each case's output (text, or the -1 of an
+ * overflow) is hashed (FNV-1a) and compared with its entry in expected.h,
+ * recorded from the toolkit before the parsers moved to their own, API-free
+ * files (5d3d0f3; the full dumps of that and the split are byte-identical).
+ * A mismatch names the case; HLSL_DUMP=<path> writes all the text, so two
+ * builds can be diffed directly. After an intended emitter change,
+ * HLSL_EXPECT_OUT=<path> writes a new expected.h.
  *
- * Only API present on both sides of the split is used.
+ * Only the API-free headers are used, so this builds and runs on every host.
  */
 
 #include <stdint.h>
@@ -19,13 +21,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "d3d8_vsh.h"
-#include "d3d8_combiners.h"
+#include "d3d8_hlsl.h"
 
 #define NPROG 400
 #define NCOMB 400
-#define EXPECTED_HASH 0xfd6a6e89u
+#define NCASE (2 * NPROG + NCOMB)
+#define EXPECTED_HASH 0xfd6a6e89u      /* all cases, one FNV-1a */
 #define EXPECTED_CHARS 7285284u
+
+#include "expected.h"   /* s_expect[NCASE], or HLSL_NO_EXPECT */
 
 static uint32_t s_seed = 0x2f6b1d3u;
 static uint32_t rnd(void)
@@ -37,18 +41,52 @@ static uint32_t rnd(void)
 static uint32_t s_hash = 0x811c9dc5u;
 static unsigned long s_chars;
 static FILE *s_dump;
+static uint32_t s_case[NCASE];
+static int s_ncase;
+static int s_bad;
 
 static void absorb(const char *what, int idx, const char *text, int n)
 {
     char head[64];
+    uint32_t h = 0x811c9dc5u;
     int i, hn = snprintf(head, sizeof head, "// %s %d: %d\n", what, idx, n);
-    for (i = 0; i < hn; i++) { s_hash ^= (uint8_t)head[i]; s_hash *= 0x01000193u; }
+    for (i = 0; i < hn; i++) {
+        s_hash ^= (uint8_t)head[i]; s_hash *= 0x01000193u;
+        h ^= (uint8_t)head[i]; h *= 0x01000193u;
+    }
     if (s_dump) fputs(head, s_dump);
-    if (n <= 0)
-        return;
-    for (i = 0; i < n; i++) { s_hash ^= (uint8_t)text[i]; s_hash *= 0x01000193u; }
-    s_chars += (unsigned long)n;
-    if (s_dump) { fwrite(text, 1, (size_t)n, s_dump); fputc('\n', s_dump); }
+    for (i = 0; i < n; i++) {
+        s_hash ^= (uint8_t)text[i]; s_hash *= 0x01000193u;
+        h ^= (uint8_t)text[i]; h *= 0x01000193u;
+    }
+    if (n > 0) {
+        s_chars += (unsigned long)n;
+        if (s_dump) { fwrite(text, 1, (size_t)n, s_dump); fputc('\n', s_dump); }
+    }
+#ifndef HLSL_NO_EXPECT
+    if (h != s_expect[s_ncase] && ++s_bad <= 20)
+        printf("FAIL: %s %d differs (%d chars, hash %08x, expected %08x)\n",
+               what, idx, n, h, s_expect[s_ncase]);
+#endif
+    s_case[s_ncase++] = h;
+}
+
+static int write_expect(const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    int i;
+    if (!f)
+        return 0;
+    fprintf(f, "/* Per-case FNV-1a of d3d8_hlsl_split's output: %d vsh, %d vsh"
+               " screen-space,\n * %d combiner sets, in run order. Written by"
+               " HLSL_EXPECT_OUT. */\n", NPROG, NPROG, NCOMB);
+    fprintf(f, "static const uint32_t s_expect[%d] = {\n", NCASE);
+    for (i = 0; i < NCASE; i++)
+        fprintf(f, "%s0x%08xu,%s", i % 6 ? " " : "    ", s_case[i],
+                i % 6 == 5 || i == NCASE - 1 ? "\n" : "");
+    fprintf(f, "};\n");
+    fclose(f);
+    return 1;
 }
 
 int main(void)
@@ -71,7 +109,7 @@ int main(void)
         for (k = 0; k < len; k++)
             prog[k * 4 + 3] &= ~1u;
         prog[fin * 4 + 3] |= 1u;
-        d3d8_vsh_parse((const void *)prog, len, &parsed);
+        d3d8_vsh_parse(prog, len, &parsed);
         n = d3d8_vsh_generate_hlsl_ex(&parsed, 0, buf, (int)sizeof buf);
         absorb("vsh", i, buf, n);
         n = d3d8_vsh_generate_hlsl_ex(&parsed, NV2A_VSH_HLSL_SCREEN_SPACE,
@@ -99,6 +137,22 @@ int main(void)
         fclose(s_dump);
     printf("hlsl_split: %d programs, %d combiner sets, %lu chars, hash %08x\n",
            NPROG, NCOMB, s_chars, s_hash);
+    if (getenv("HLSL_EXPECT_OUT")) {
+        if (!write_expect(getenv("HLSL_EXPECT_OUT"))) {
+            fprintf(stderr, "cannot write %s\n", getenv("HLSL_EXPECT_OUT"));
+            return 2;
+        }
+        printf("wrote %s\n", getenv("HLSL_EXPECT_OUT"));
+    }
+#ifdef HLSL_NO_EXPECT
+    printf("FAIL: no expected.h table\n");
+    return 1;
+#endif
+    if (s_bad) {
+        printf("FAIL: %d of %d cases differ (HLSL_DUMP=<file> writes the text)\n",
+               s_bad, NCASE);
+        return 1;
+    }
     if (s_hash != EXPECTED_HASH || s_chars != EXPECTED_CHARS) {
         printf("FAIL: expected %lu chars, hash %08x\n",
                (unsigned long)EXPECTED_CHARS, EXPECTED_HASH);
