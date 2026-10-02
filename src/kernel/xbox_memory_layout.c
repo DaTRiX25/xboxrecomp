@@ -1377,7 +1377,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        /* Sleep, don't yield. Sleep(0) is sched_yield on macOS and under
+         * Wine, and it returns at once when a core is free, so this loop
+         * held a whole core (99% in top on both). A 1 ms tick bounds how
+         * long a guest poller waits for an ack. On macOS it also doubled the
+         * executor's flip rate (20 -> 41 per s, RECOMP_PB_EXEC=1), with the
+         * thread at ~14%. A native Windows host needs timeBeginPeriod(1)
+         * for this, as the kernel timer's Sleep(10) already does. */
+        Sleep(1);
     }
     return 0;
 }
