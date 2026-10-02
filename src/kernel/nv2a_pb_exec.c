@@ -35,6 +35,7 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_cpu.h"
+#include "nv2a_pb_state.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -213,76 +214,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_SEMAPHORE_OFFSET        0x1D6C
 #define NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
 
-/* One vertex attribute stream, as the title describes it. Attribute 0 is
- * position; the rest are colours, texture coordinates and so on. */
-typedef struct {
-    uint32_t offset;      /* guest address of element 0 */
-    uint32_t type;        /* NV097 data type nibble */
-    uint32_t size;        /* components per element */
-    uint32_t stride;      /* bytes between elements */
-} VertexAttr;
-
-#define NV_VERTEX_ATTRS 16
-#define NV_MAX_INDICES  4096
-#define NV_MAX_INLINE   4096            /* dwords of INLINE_ARRAY per batch */
-
-/* Texture stage 0, decoded from what the title programmed.
- *
- * Only stage 0: it is the only one the dashboard configures, and a stage
- * nothing writes to is a stage nothing can be sampled from. The rest arrive
- * as unhandled methods and are counted as such, which is how the next title
- * that needs them will say so. */
-typedef struct {
-    uint32_t offset;                    /* guest address of texel (0,0)  */
-    uint32_t width, height;             /* from IMAGE_RECT               */
-    uint32_t pitch;                     /* bytes per row, from CONTROL1  */
-    uint32_t color;                     /* NV097 colour-format code      */
-    uint32_t addr_u, addr_v;            /* wrap mode per axis            */
-    int      valid;
-} Texture;
-
-static struct {
-    VertexAttr attr[NV_VERTEX_ATTRS];
-    uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
-    uint16_t   idx[NV_MAX_INDICES];
-    uint32_t   idx_count;
-    /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
-     * instead of into a buffer the title points at. Same vertex format, a
-     * different place to read them from. */
-    uint32_t   inline_buf[NV_MAX_INLINE];
-    uint32_t   inline_count;
-    /* Current values of the immediate-mode attributes, and how many complete
-     * vertices they have produced in this batch. */
-    float      imm_pos[4];
-    uint32_t   imm_diffuse;
-    float      imm_tex[2];
-    uint32_t   imm_count;
-    int        inline_active;
-    uint32_t   draws, verts, nonzero_draws;
-    float      min_x, max_x, min_y, max_y;
-    uint32_t color_offset, color_base, pitch, format;
-    /* The surface the last batch actually drew into. A double-buffered title
-     * has already pointed color_offset at the next buffer and cleared it by
-     * the time the flip arrives, so dumping the current one dumps the frame
-     * that has not been drawn yet -- which is how a correctly rendered
-     * sequence came out as 12 black BMPs. */
-    uint32_t drawn_offset;
-    uint64_t pixels;
-    uint32_t pixel_max;   /* brightest value any pixel write carried */
-    uint32_t clip_x, clip_w, clip_y, clip_h;
-    uint32_t clear_color;
-    uint32_t clears, unhandled_total;
-    uint32_t flip_read, flip_write, flip_modulo, flips;
-    uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
-    /* Why a batch came out flat. "Untextured" has two causes that look
-     * identical on screen and want opposite fixes: the batch carried no
-     * texture coordinates, or it did and the stage was not usable. */
-    uint32_t batches_textured, batches_no_uv, batches_no_tex;
-    uint32_t blend_enable, blend_sfactor, blend_dfactor;
-    Texture  tex;
-    uint32_t sema_dma, sema_offset;     /* SET_CONTEXT_DMA_SEMAPHORE / _OFFSET */
-    int      sema_offset_set;           /* offset 0 is a real address (0x80000000) */
-} s_gpu;
+/* VertexAttr, Texture and the decoded state's layout: nv2a_pb_state.h. */
+static struct nv2a_pb_gpu s_gpu;
 
 /* Releases written, and where the last one landed. fence_mirrors_tick reads
  * them to decide whether its mirror is still needed; both run on the NV2A ack
@@ -304,10 +237,8 @@ static int s_unhandled_count;
 /* Every texture-stage register, as the title last set it.
  * Texturing is not implemented yet; knowing which formats and sizes a title
  * actually programs is what decides which ones are worth implementing. */
-#define NV_TEX_FIRST 0x1B00
-#define NV_TEX_LAST  0x1BFC
-static uint32_t s_tex_reg[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
-static uint8_t  s_tex_set[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
+static uint32_t s_tex_reg[NV_TEX_REGS];
+static uint8_t  s_tex_set[NV_TEX_REGS];
 
 /* Formats whose dimensions come from the format word and whose coordinates
  * arrive normalised, rather than from a pitch and SET_TEXTURE_IMAGE_RECT with
@@ -1353,27 +1284,7 @@ static int batch_is_screen_space(void)
     return 1;
 }
 
-/* NV097 primitive types.
- *
- * These are the operand of SET_BEGIN_END, where 0 is END and the list starts
- * at 1. They were each one too low, so every title's geometry was decomposed
- * as the primitive below the one it asked for -- a strip as a fan, a fan as
- * quads, and TRIANGLES, the one case whose vertex count must be a multiple
- * of three, as a strip.
- *
- * The vertex order says which numbering is right without taking a table on
- * trust: a strip arrives in Z order and a fan in cyclic order, and they only
- * line up with the primitive under this one. */
-#define NV_PRIM_POINTS         1
-#define NV_PRIM_LINES          2
-#define NV_PRIM_LINE_LOOP      3
-#define NV_PRIM_LINE_STRIP     4
-#define NV_PRIM_TRIANGLES      5
-#define NV_PRIM_TRIANGLE_STRIP 6
-#define NV_PRIM_TRIANGLE_FAN   7
-#define NV_PRIM_QUADS          8
-#define NV_PRIM_QUAD_STRIP     9
-#define NV_PRIM_POLYGON        10
+/* NV_PRIM_*: nv2a_pb_state.h. */
 
 /* How many post-draw captures to keep: enough to see whether the geometry
  * is stable from frame to frame, few enough not to fill a directory. */
@@ -1473,45 +1384,8 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 #define NV097_SET_POLYGON_OFFSET_SCALE_FACTOR_M 0x0384
 #define NV097_SET_POLYGON_OFFSET_BIAS_M     0x0388
 
-typedef struct {
-    float x, y, z, w;           /* screen pixels, depth units, clip w */
-    float d0[4], d1[4];
-    float t[4][4];              /* oT0..oT3 */
-    int   ok;
-} XfVert;
-
-static struct {
-    uint32_t prog[NV2A_VSH_SLOTS][4];
-    uint32_t load, start;
-    float    c[NV2A_VSH_CONSTANTS][4];
-    uint32_t cload;
-    uint32_t mode;
-    int      cxt_write;
-    float    vp_off[4], vp_scale[4];
-    float    inl[NV_VERTEX_ATTRS][4];   /* SET_VERTEX_DATA* current values */
-    int      cull_enable, depth_enable, depth_mask;
-    uint32_t cull_face, front_face, depth_func;
-    uint32_t zeta_offset, zclear;
-    /* Register combiners and the texture shader, as last programmed. */
-    uint32_t rc_cicw[8], rc_aicw[8], rc_cocw[8], rc_aocw[8];
-    uint32_t rc_f0[8], rc_f1[8], rc_ctl, rc_fcw0, rc_fcw1, rc_sf[2];
-    uint32_t shader_prog, fog_color;
-    int      rc_set, shader_set, fog_enable, atest_enable;
-    uint32_t atest_func, atest_ref;
-    int      poly_offset;
-    float    poly_factor, poly_bias;
-    /* survey */
-    uint32_t prog_dwords, prog_loads, prog_starts, const_dwords, const_loads;
-    uint32_t mode_sets, ff_matrix_dwords, vp_dwords;
-    uint32_t batches_prog, batches_fixed, verts_run, verts_bad;
-    uint32_t tris, tris_culled, tris_clipped, tris_textured;
-    uint64_t z_rejected, a_rejected;
-    uint32_t clears_seen, zclears, batches_3d, dumps_3d;
-    uint32_t zclear_color_off, zclear_zeta_off, zclear_batch;
-    uint32_t batches_rc, batches_norc, stage_mode_seen[4][32];
-    uint32_t fmt_seen[NV_VERTEX_ATTRS][8];  /* per slot: batches by type */
-    int      disabled;
-} s_vsh;
+/* XfVert and the s_vsh layout: nv2a_pb_state.h. */
+static struct nv2a_pb_vsh s_vsh;
 
 /* Distinct programs, by hash of the slots from START to FINAL. */
 #define VSH_MAX_PROGS 64
@@ -2686,6 +2560,51 @@ static void raster_batch(void)
     }
 }
 
+/* ── Backend hooks (nv2a_pb_state.h) ─────────────────────────────────────
+ *
+ * The walker decodes; a backend draws. The CPU rasteriser below is the
+ * default and reads s_gpu directly, so its on_draw ignores the descriptor. */
+static void cpu_on_draw(const struct nv2a_pb_draw *draw)
+{
+    (void)draw;
+    raster_batch();
+}
+
+/* Hand the window a copy of the frame just finished. Copying here, rather
+ * than letting the window read guest memory on its own clock, is what stops
+ * it showing a surface the rasteriser is still writing. */
+static void cpu_on_flip(uint32_t surface, uint32_t pitch)
+{
+    extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
+
+    if (!pitch || !surface)
+        return;
+    xbox_FramebufferWindowSet(dma_resolve(surface), pitch);
+    xbox_FramebufferWindowPresent(dma_resolve(surface), pitch);
+}
+
+static const struct nv2a_pb_backend s_cpu_backend = {
+    clear_surface,                       /* on_clear  */
+    vsh_clear_depth,                     /* on_zclear */
+    cpu_on_draw,                         /* on_draw   */
+    cpu_on_flip,                         /* on_flip   */
+};
+static const struct nv2a_pb_backend *s_backend = &s_cpu_backend;
+
+void nv2a_pb_set_backend(const struct nv2a_pb_backend *backend)
+{
+    s_backend = backend ? backend : &s_cpu_backend;
+}
+
+const struct nv2a_pb_backend *nv2a_pb_get_backend(void) { return s_backend; }
+const struct nv2a_pb_backend *nv2a_pb_cpu_backend(void) { return &s_cpu_backend; }
+
+const struct nv2a_pb_gpu *nv2a_pb_gpu_state(void) { return &s_gpu; }
+const struct nv2a_pb_vsh *nv2a_pb_vsh_state(void) { return &s_vsh; }
+const uint32_t *nv2a_pb_tex_regs(void)            { return s_tex_reg; }
+const uint8_t  *nv2a_pb_tex_regs_set(void)        { return s_tex_set; }
+uint32_t nv2a_pb_dma_resolve(uint32_t offset)     { return dma_resolve(offset); }
+
 /* What a batch actually contains. Before anything can be rasterised, the
  * question is what space attribute 0 arrives in: a title running a vertex
  * program hands over object-space positions that mean nothing without running
@@ -2718,7 +2637,18 @@ static void draw_primitive(void)
         }
     }
 
-    raster_batch();
+    if (s_backend->on_draw) {
+        struct nv2a_pb_draw d;
+        d.prim         = s_gpu.prim;
+        d.attr         = s_gpu.attr;
+        d.idx          = s_gpu.idx;
+        d.idx_count    = s_gpu.idx_count;
+        d.inline_data  = s_gpu.inline_active;
+        d.inline_buf   = s_gpu.inline_buf;
+        d.inline_bytes = s_gpu.inline_count * 4;
+        d.program      = vsh_batch_active();
+        s_backend->on_draw(&d);
+    }
 
     if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
         static int shown;
@@ -3051,8 +2981,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.blend_dfactor = param;
         break;
     case NV097_CLEAR_SURFACE:
-        vsh_clear_depth(param);
-        clear_surface(param);
+        if (s_backend->on_zclear)
+            s_backend->on_zclear(param);
+        if (s_backend->on_clear)
+            s_backend->on_clear(param);
         break;
 
     case NV097_SET_BEGIN_END:
@@ -3191,23 +3123,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
-        /* Hand the window a copy of the frame just finished.
-         *
-         * The buffer the title has finished is the one the last batch drew
-         * into, which is what drawn_offset holds and why it exists: by the
-         * flip, color_offset has already moved to the next buffer. Copying
-         * here, rather than letting the window read guest memory on its own
-         * clock, is what stops it showing a surface the rasteriser is still
-         * writing. */
-        if (s_gpu.pitch) {
-            extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
-            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
-                                               : s_gpu.color_offset;
-            if (done) {
-                xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
-                xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
-            }
-        }
+        /* Present the frame just finished. The buffer the title has
+         * finished is the one the last batch drew into, which is what
+         * drawn_offset holds and why it exists: by the flip, color_offset has
+         * already moved to the next buffer. */
+        if (s_backend->on_flip)
+            s_backend->on_flip(s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                                  : s_gpu.color_offset,
+                               s_gpu.pitch);
         /* RECOMP_FLIP_LOG=1: every flip, with the batches drawn since the last. */
         {
             static int on = -1;
