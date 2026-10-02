@@ -190,7 +190,7 @@ void nv2a_pb_scan_report(void)
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
     fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised,"
-                    " %u stopped (%u fence releases salvaged, %u catch-ups)"
+                    " %u stopped (%u with a fence release salvaged, %u catch-ups)"
                     " -- %d distinct (subchannel, method) pairs\n",
             s_tot_segments, s_tot_words, s_tot_jumps, s_tot_unknown,
             s_tot_stops, s_tot_salvaged, s_catchups, s_seen_count);
@@ -227,15 +227,24 @@ static int pb_in_window(uint32_t va)
 uint32_t nv2a_pb_scan_catchups(void) { return s_catchups; }
 
 /* The XDK writes a fence as the pair (BACK_END_WRITE_SEMAPHORE_RELEASE,
- * count 1, subchannel 0) and its value. Run the largest value found in
+ * count 1, subchannel 0) and its value. Run the last such release found in
  * [from, to): releasing that one marks all the earlier ones done too, and
  * none beyond PUT. Mirroring the submitted count would also pass fences
  * the title has not yet handed over, and a resource it is still using
- * could then be freed. Returns how the fence was handled, for the log. */
+ * could then be freed.
+ *
+ * The pair can also be data: ARRAY_ELEMENT16 indices 7536, 4 read as
+ * 0x00041D70. A value taken from data could jump the fence far ahead,
+ * which would turn fences off for the rest of the run. So a candidate
+ * counts only if it looks like the next fence: odd (the XDK's fence values
+ * are), after the last release, and at most 128 past it. Returns how the
+ * fence was handled, for the log. */
+extern uint32_t nv2a_pb_exec_semaphore_last_value(void);
+extern uint32_t nv2a_pb_exec_semaphore_releases(void);
 static const char *stop_salvage(const uint8_t *mem, uint32_t from, uint32_t to,
                                 uint32_t *value)
 {
-    uint32_t va, best = 0;
+    uint32_t va, last, rel;
     int found = 0;
 
     if (!s_exec_enabled)
@@ -244,19 +253,24 @@ static const char *stop_salvage(const uint8_t *mem, uint32_t from, uint32_t to,
         s_catchups++;
         return "span wraps or is unreadable; fence catch-up requested";
     }
+    last = nv2a_pb_exec_semaphore_last_value();
     for (va = from; va + 4 < to; va += 4) {
         if (*(const uint32_t *)(mem + va) == 0x00041D70u) {
             uint32_t v = *(const uint32_t *)(mem + va + 4);
-            if (!found || (int32_t)(v - best) > 0)
-                best = v;
-            found = 1;
+            if ((v & 1u) && (int32_t)(v - last) > 0 && v - last <= 128u) {
+                last = v;
+                found = 1;
+            }
         }
     }
     if (!found)
         return "no fence release in the rest";
-    nv2a_pb_exec_method(0, 0x1D70u, best);
+    rel = nv2a_pb_exec_semaphore_releases();
+    nv2a_pb_exec_method(0, 0x1D70u, last);
+    *value = last;
+    if (nv2a_pb_exec_semaphore_releases() == rel)
+        return "fence release found but refused by the executor";
     s_tot_salvaged++;
-    *value = best;
     return "fence release salvaged";
 }
 
