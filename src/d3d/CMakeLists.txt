@@ -29,6 +29,9 @@ if(WIN32)
     # D3DCompile under the host's d3dcompiler_47 (Wine's, under Proton).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3dcompile_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3dcompile_smoke)
+    # The HLSL the parse -> generate pipeline emits, against a recorded hash.
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_hlsl_split
+                     ${CMAKE_CURRENT_BINARY_DIR}/d3d8_hlsl_split)
     # The pushbuffer executor's D3D11 backend, driven by a synthetic stream.
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d11_backend_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d11_backend_smoke)
