@@ -450,10 +450,11 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             const NV2ACombinerInput *in;
             k = order[i];
             if (k < 0) {
+                /* COMPLEMENT_V1 0x40, COMPLEMENT_R0 0x20 (xemu psh_regs.h). */
                 EMIT("        float3 fv1 = %ssaturate(x5.rgb);\n",
-                     (state->final_flags & 0x20) ? "1.0 - " : "");
-                EMIT("        float3 fr0 = %ssaturate(x12.rgb);\n",
                      (state->final_flags & 0x40) ? "1.0 - " : "");
+                EMIT("        float3 fr0 = %ssaturate(x12.rgb);\n",
+                     (state->final_flags & 0x20) ? "1.0 - " : "");
                 EMIT("        x14 = float4(%s(fv1 + fr0), 0.0);\n",
                      (state->final_flags & 0x80) ? "saturate" : "");
                 EMIT("        x15 = float4(E * F, 0.0);\n");

@@ -1385,6 +1385,10 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 #define NV097_SET_POLYGON_OFFSET_SCALE_FACTOR_M 0x0384
 #define NV097_SET_POLYGON_OFFSET_BIAS_M     0x0388
 
+/* Transform-context rows (xemu nv2a_regs.h NV_IGRAPH_XF_XFCTX_*). */
+#define XF_VPSCL 0x3A
+#define XF_VPOFF 0x3B
+
 /* XfVert and the s_vsh layout: nv2a_pb_state.h. */
 static struct nv2a_pb_vsh s_vsh;
 
@@ -1434,23 +1438,48 @@ static int vsh_method(uint32_t method, uint32_t param)
         s_vsh.const_dwords++;
         return 1;
     }
+    /* The viewport, matrix, plane and eye methods are not separate registers:
+     * they write the transform context, which is the same memory as the
+     * program constants (xemu pgraph.c, NV_IGRAPH_XF_XFCTX_*). In particular
+     * SET_VIEWPORT_SCALE/OFFSET land in c[58]/c[59], the two constants the
+     * XDK epilogue reads; dropping them turned every world vertex into (0,0). */
     if (method >= NV097_SET_VIEWPORT_OFFSET_M && method < NV097_SET_VIEWPORT_OFFSET_M + 16) {
-        s_vsh.vp_off[(method - NV097_SET_VIEWPORT_OFFSET_M) / 4] = u2f(param);
+        uint32_t k = (method - NV097_SET_VIEWPORT_OFFSET_M) / 4;
+        s_vsh.vp_off[k] = u2f(param);
+        s_vsh.c[XF_VPOFF][k] = u2f(param);
         s_vsh.vp_dwords++;
         return 1;
     }
     if (method >= NV097_SET_VIEWPORT_SCALE_M && method < NV097_SET_VIEWPORT_SCALE_M + 16) {
-        s_vsh.vp_scale[(method - NV097_SET_VIEWPORT_SCALE_M) / 4] = u2f(param);
+        uint32_t k = (method - NV097_SET_VIEWPORT_SCALE_M) / 4;
+        s_vsh.vp_scale[k] = u2f(param);
+        s_vsh.c[XF_VPSCL][k] = u2f(param);
         s_vsh.vp_dwords++;
         return 1;
     }
-    /* Fixed-function matrices: counted, not used -- see the block comment. */
-    if ((method >= NV097_SET_PROJECTION_MATRIX_M && method < NV097_SET_PROJECTION_MATRIX_M + 0x40)
-     || (method >= NV097_SET_MODEL_VIEW_MATRIX_M && method < NV097_SET_MODEL_VIEW_MATRIX_M + 0x100)
-     || (method >= NV097_SET_COMPOSITE_MATRIX_M && method < NV097_SET_COMPOSITE_MATRIX_M + 0x40)) {
-        s_vsh.ff_matrix_dwords++;
-        note_unhandled(method, param);
-        return 1;
+    {
+        /* method base, bytes, first context row, rows per 16-dword block */
+        static const struct { uint32_t base, bytes, row, stride; } xf[] = {
+            { 0x0680, 0x040, 0x00, 0 },   /* COMPOSITE_MATRIX         CMAT0 */
+            { 0x0440, 0x040, 0x04, 0 },   /* PROJECTION_MATRIX        PMAT0 */
+            { 0x0480, 0x100, 0x08, 8 },   /* MODEL_VIEW_MATRIX[4]     MMAT0 */
+            { 0x0580, 0x100, 0x0C, 8 },   /* INVERSE_MODEL_VIEW[4]    IMMAT0 */
+            { 0x09D0, 0x010, 0x39, 0 },   /* FOG_PLANE                FOG */
+            { 0x0A50, 0x010, 0x38, 0 },   /* EYE_POSITION             EYEP */
+            { 0x0840, 0x100, 0x40, 8 },   /* TEXGEN_PLANE_S..Q[4]     TG0MAT */
+            { 0x06C0, 0x100, 0x44, 8 },   /* TEXTURE_MATRIX[4]        T0MAT */
+        };
+        uint32_t i;
+        for (i = 0; i < sizeof xf / sizeof xf[0]; i++) {
+            if (method >= xf[i].base && method < xf[i].base + xf[i].bytes) {
+                uint32_t slot = (method - xf[i].base) / 4;
+                uint32_t row = xf[i].row + (slot / 16) * xf[i].stride + (slot % 16) / 4;
+                s_vsh.c[row][slot % 4] = u2f(param);
+                if (i < 4)
+                    s_vsh.ff_matrix_dwords++;
+                return 1;
+            }
+        }
     }
     if (method >= NV097_SET_COMBINER_ALPHA_ICW_M && method < NV097_SET_COMBINER_ALPHA_ICW_M + 32) {
         s_vsh.rc_aicw[(method - NV097_SET_COMBINER_ALPHA_ICW_M) / 4] = param; return 1;
@@ -1960,8 +1989,9 @@ static void rc_eval(float r[16][4], float out[4])
         FC_IN(c1 >> 24, E);
         FC_IN(c1 >> 16, F);
         for (k = 0; k < 3; k++) {
-            v1[k] = clamp01(r[5][k]);  if (c1 & 0x20) v1[k] = 1.0f - v1[k];
-            r0[k] = clamp01(r[12][k]); if (c1 & 0x40) r0[k] = 1.0f - r0[k];
+            /* COMPLEMENT_V1 is 0x40, COMPLEMENT_R0 0x20 (xemu psh_regs.h). */
+            v1[k] = clamp01(r[5][k]);  if (c1 & 0x40) v1[k] = 1.0f - v1[k];
+            r0[k] = clamp01(r[12][k]); if (c1 & 0x20) r0[k] = 1.0f - r0[k];
             r[14][k] = v1[k] + r0[k];
             if (c1 & 0x80) r[14][k] = clamp01(r[14][k]);
             r[15][k] = E[k] * F[k];
@@ -2580,8 +2610,8 @@ static void rc_plan_build(void)
         s_rcp.b = fc_dec_in((c0 >> 16) & 0xFF, sf0, sf1, written, 0);
         s_rcp.c = fc_dec_in((c0 >> 8) & 0xFF, sf0, sf1, written, 0);
         s_rcp.d = fc_dec_in( c0       & 0xFF, sf0, sf1, written, 0);
-        s_rcp.v1_inv = (c1 & 0x20) != 0;
-        s_rcp.r0_inv = (c1 & 0x40) != 0;
+        s_rcp.v1_inv = (c1 & 0x40) != 0;
+        s_rcp.r0_inv = (c1 & 0x20) != 0;
         s_rcp.sum_clamp = (c1 & 0x80) != 0;
     }
 }
