@@ -13,7 +13,7 @@
  * builds can be diffed directly. After an intended emitter change,
  * HLSL_EXPECT_OUT=<path> writes a new expected.h.
  *
- * Only API present on both sides of the split is used.
+ * Only the API-free headers are used, so this builds and runs on every host.
  */
 
 #include <stdint.h>
@@ -21,8 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "d3d8_vsh.h"
-#include "d3d8_combiners.h"
+#include "d3d8_hlsl.h"
 
 #define NPROG 400
 #define NCOMB 400
@@ -74,7 +73,7 @@ static void absorb(const char *what, int idx, const char *text, int n)
 
 static int write_expect(const char *path)
 {
-    FILE *f = fopen(path, "w");
+    FILE *f = fopen(path, "wb");
     int i;
     if (!f)
         return 0;
