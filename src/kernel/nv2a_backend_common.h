@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "../d3d/d3d8_swizzle.h"
+#include "../d3d/d3d8_vsh_parse.h"
 #include "nv2a_pb_state.h"
 
 #ifdef __cplusplus
@@ -319,14 +320,7 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
 /* Vertex attributes                                                         */
 /* ------------------------------------------------------------------------ */
 
-/* SET_VERTEX_DATA_ARRAY_FORMAT type codes (d3d8_vsh.h has the same values as
- * NV2A_VTX_*, behind <d3d11.h>). */
-#define NV2A_VT_D3DCOLOR 0u
-#define NV2A_VT_S1       1u     /* signed short, normalised */
-#define NV2A_VT_FLOAT    2u
-#define NV2A_VT_UBYTE    4u     /* unsigned byte, normalised */
-#define NV2A_VT_S32K     5u     /* signed short, as is */
-#define NV2A_VT_CMP      6u     /* 11:11:10 signed, normalised */
+/* SET_VERTEX_DATA_ARRAY_FORMAT type codes: NV2A_VTX_* (d3d8_vsh_parse.h). */
 
 /* One attribute of `size` components of `type` at p as float4, missing
  * components (0,0,0,1). Returns 0 for a type with no decoder (out is then
@@ -339,7 +333,7 @@ static inline int nv2a_vtx_decode(uint32_t type, uint32_t size,
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
     switch (type) {
-    case NV2A_VT_D3DCOLOR:
+    case NV2A_VTX_D3DCOLOR:
         /* A DWORD 0xAARRGGBB, so little-endian bytes are B,G,R,A -- not the
          * component order of every other format here. Returned as R,G,B,A. */
         out[0] = (float)p[2] / 255.0f;
@@ -347,15 +341,15 @@ static inline int nv2a_vtx_decode(uint32_t type, uint32_t size,
         out[2] = (float)p[0] / 255.0f;
         out[3] = (float)p[3] / 255.0f;
         return 1;
-    case NV2A_VT_FLOAT:
+    case NV2A_VTX_FLOAT:
         for (i = 0; i < size && i < 4; i++)
             memcpy(&out[i], p + 4 * i, 4);
         return 1;
-    case NV2A_VT_UBYTE:
+    case NV2A_VTX_UBYTE:
         for (i = 0; i < size && i < 4; i++)
             out[i] = (float)p[i] / 255.0f;
         return 1;
-    case NV2A_VT_S1:
+    case NV2A_VTX_S1:
         for (i = 0; i < size && i < 4; i++) {
             int16_t s;
             float f;
@@ -364,14 +358,14 @@ static inline int nv2a_vtx_decode(uint32_t type, uint32_t size,
             out[i] = f < -1.0f ? -1.0f : f;
         }
         return 1;
-    case NV2A_VT_S32K:
+    case NV2A_VTX_S32K:
         for (i = 0; i < size && i < 4; i++) {
             int16_t s;
             memcpy(&s, p + 2 * i, 2);
             out[i] = (float)s;
         }
         return 1;
-    case NV2A_VT_CMP: {
+    case NV2A_VTX_CMP: {
         uint32_t w;
         int32_t x, y, z;
         memcpy(&w, p, 4);
@@ -651,13 +645,14 @@ static inline void nv2a_argb_to_float4(uint32_t c, float o[4])
     o[3] = (float)(c >> 24) / 255.0f;
 }
 
-/* The pixel shaders' constants: NV2APSConstants (d3d8_combiners.h) plus the
- * per-stage texture-coordinate scale and mode. The layout is the shader's
- * constant buffer (PS_CB_DECL in nv2a_pb_d3d11.c), so it is fixed. */
+/* The combiner pixel shader's constants. This layout is the shader ABI any
+ * emitter (HLSL now, MSL later) must honour: the same layout as
+ * NV2APSConstants in d3d8_combiners.h, which nv2a_pb_d3d11.c checks field by
+ * field with _Static_assert, and the cbuffer PS_CB_DECL declares there. */
 struct nv2a_ps_consts {
     float    c0[8][4], c1[8][4], fc0[4], fc1[4], fog_color[4];
     float    alpha_ref;
-    uint32_t alpha_func;        /* D3DCMP numbering: 1 NEVER .. 8 ALWAYS */
+    uint32_t alpha_func;        /* enum nv2a_cmp + 1: 1 NEVER .. 8 ALWAYS */
     uint32_t alpha_test_enable, fog_enable;
     uint32_t alpha_only[4];
     float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear) */

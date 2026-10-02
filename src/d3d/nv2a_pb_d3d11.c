@@ -128,6 +128,27 @@ static ID3D11PixelShader      *s_ps;
  * layout PS_CB_DECL must match. */
 typedef struct nv2a_ps_consts PsConsts;
 
+/* PsConsts and the legacy path's NV2APSConstants are one shader ABI. */
+#define PS_ABI_SAME(a, b) \
+    _Static_assert(offsetof(PsConsts, a) == offsetof(NV2APSConstants, b) \
+                   && sizeof(((PsConsts *)0)->a) \
+                      == sizeof(((NV2APSConstants *)0)->b), #a " != " #b)
+PS_ABI_SAME(c0, c0);
+PS_ABI_SAME(c1, c1);
+PS_ABI_SAME(fc0, final_c0);
+PS_ABI_SAME(fc1, final_c1);
+PS_ABI_SAME(fog_color, fog_color);
+PS_ABI_SAME(alpha_ref, alpha_ref);
+PS_ABI_SAME(alpha_func, alpha_func);
+PS_ABI_SAME(alpha_test_enable, alpha_test_enable);
+PS_ABI_SAME(fog_enable, fog_enable);
+PS_ABI_SAME(alpha_only, alpha_only);
+PS_ABI_SAME(tex_scale, tex_scale);
+PS_ABI_SAME(tex_mode, tex_mode);
+_Static_assert(sizeof(PsConsts) == sizeof(NV2APSConstants),
+               "PsConsts and NV2APSConstants differ in size");
+#undef PS_ABI_SAME
+
 #define PS_CB_DECL \
     "cbuffer CombinerCB : register(b0) {\n" \
     "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n" \
