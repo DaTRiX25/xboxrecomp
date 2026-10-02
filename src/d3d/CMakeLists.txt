@@ -11,12 +11,23 @@ if(WIN32)
         d3d8_states.c
         d3d8_combiners.c
         d3d8_vsh.c
+        nv2a_pb_d3d11.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
+    # nv2a_pb_d3d11.c: the pushbuffer executor's state (nv2a_pb_state.h) and
+    # guest memory (xbox_memory_layout.h) live with the kernel.
+    target_include_directories(xbox_d3d8 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
+    # D3DCompile under the host's d3dcompiler_47 (Wine's, under Proton).
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3dcompile_smoke
+                     ${CMAKE_CURRENT_BINARY_DIR}/d3dcompile_smoke)
+    # The pushbuffer executor's D3D11 backend, driven by a synthetic stream.
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d11_backend_smoke
+                     ${CMAKE_CURRENT_BINARY_DIR}/d3d11_backend_smoke)
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c
