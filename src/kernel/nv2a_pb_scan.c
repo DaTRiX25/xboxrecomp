@@ -62,6 +62,8 @@ uint32_t nv2a_pb_scan_stops(void) { return s_tot_stops; }
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+extern uint32_t nv2a_pb_exec_semaphore_last_value(void);
+extern uint32_t nv2a_pb_exec_semaphore_releases(void);
 extern void nv2a_pb_perf_scan_begin(void);
 extern void nv2a_pb_perf_scan_end(void);
 static int s_exec_enabled = -1;
@@ -221,7 +223,8 @@ static int pb_in_window(uint32_t va)
 
 /* The words from a stop to PUT are never executed, and they may hold the
  * semaphore release the title's next fence wait spins on. stop_salvage
- * looks for it; when it cannot, it asks for a catch-up instead, and the
+ * runs that release itself. When it cannot search the span, or finds
+ * releases there but none it trusts, it asks for a catch-up instead: the
  * fence mirror then writes the title's submitted count once
  * (fence_mirrors_tick). */
 uint32_t nv2a_pb_scan_catchups(void) { return s_catchups; }
@@ -239,13 +242,11 @@ uint32_t nv2a_pb_scan_catchups(void) { return s_catchups; }
  * counts only if it looks like the next fence: odd (the XDK's fence values
  * are), after the last release, and at most 128 past it. Returns how the
  * fence was handled, for the log. */
-extern uint32_t nv2a_pb_exec_semaphore_last_value(void);
-extern uint32_t nv2a_pb_exec_semaphore_releases(void);
 static const char *stop_salvage(const uint8_t *mem, uint32_t from, uint32_t to,
                                 uint32_t *value)
 {
     uint32_t va, last, rel;
-    int found = 0;
+    int found = 0, seen = 0;
 
     if (!s_exec_enabled)
         return "not executing";
@@ -257,11 +258,19 @@ static const char *stop_salvage(const uint8_t *mem, uint32_t from, uint32_t to,
     for (va = from; va + 4 < to; va += 4) {
         if (*(const uint32_t *)(mem + va) == 0x00041D70u) {
             uint32_t v = *(const uint32_t *)(mem + va + 4);
+            seen++;
             if ((v & 1u) && (int32_t)(v - last) > 0 && v - last <= 128u) {
                 last = v;
                 found = 1;
             }
         }
+    }
+    if (!found && seen) {
+        /* Data, or a real release the check turned down (an even value,
+         * or one far past a stale last value): not running it could leave
+         * the title waiting for ever, so fall back to the mirror. */
+        s_catchups++;
+        return "release(s) in the rest but none plausible; catch-up requested";
     }
     if (!found)
         return "no fence release in the rest";
