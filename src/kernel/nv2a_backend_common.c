@@ -102,3 +102,67 @@ void nv2a_tex_decode(const uint8_t *mem, uint32_t fmt, uint32_t w, uint32_t h,
         }
     }
 }
+
+void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
+                       int shader_set, uint32_t shader_prog,
+                       nv2a_dma_resolve_fn resolve, unsigned flags,
+                       struct nv2a_stage *t)
+{
+    uint32_t fmt = r[0x04 / 4], ctl0 = r[0x0C / 4];
+    int on = (ctl0 >> 30) & 1, mode, from_fmt;
+
+    memset(t, 0, sizeof *t);
+    t->offset = r[0] ? resolve(r[0]) : 0;
+    t->color = (fmt >> 8) & 0xFF;
+    from_fmt = nv2a_tex_size_from_format(t->color);
+    if (from_fmt) {
+        t->width  = 1u << ((fmt >> 20) & 0xF);
+        t->height = 1u << ((fmt >> 24) & 0xF);
+    } else {
+        t->width  = r[0x1C / 4] >> 16;
+        t->height = r[0x1C / 4] & 0xFFFF;
+    }
+    /* CONTROL1's pitch means nothing to a swizzled or DXT texture, and
+     * left in a cache key a stale one splits it in two. */
+    t->pitch  = (from_fmt && (flags & NV2A_STAGE_PITCH_LINEAR))
+              ? 0 : r[0x10 / 4] >> 16;
+    t->addr_u =  r[0x08 / 4]       & 0xF;
+    t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
+    t->filter = r[0x14 / 4];
+    /* P8: SET_TEXTURE_PALETTE (0x1B20): offset in bits 6-31, length
+     * 256 >> bits 2-3, entries A8R8G8B8. */
+    if (t->color == NV2A_TEX_P8) {
+        uint32_t pal = r[0x20 / 4];
+        t->palette = (pal & ~0x3Fu) ? resolve(pal & ~0x3Fu) : 0;
+        t->pal_len = 256u >> ((pal >> 2) & 3u);
+    }
+    t->levels = 1;
+    if (from_fmt && (flags & NV2A_STAGE_MIPS)) {
+        /* As xemu's pgraph_get_texture_shape: the format's count, no more
+         * than MAX_LOD_CLAMP + 1, none smaller than 1x1. The clamps are
+         * whole levels (xemu reads the 12-bit fields as is). */
+        uint32_t lu = (fmt >> 20) & 0xF, lv = (fmt >> 24) & 0xF;
+        uint32_t lmax = (ctl0 >> 6) & 0xFFF, lmin = (ctl0 >> 18) & 0xFFF;
+        uint32_t lv_n = (fmt >> 16) & 0xF;
+        if (lv_n > lmax + 1u) lv_n = lmax + 1u;
+        if (lv_n > (lu > lv ? lu : lv) + 1u) lv_n = (lu > lv ? lu : lv) + 1u;
+        t->levels = lv_n ? lv_n : 1u;
+        t->lod_min = lmin < t->levels - 1u ? lmin : t->levels - 1u;
+        t->lod_max = lmax < t->levels - 1u ? lmax : t->levels - 1u;
+    }
+    t->valid = t->offset && t->width && t->height
+            && (from_fmt || t->pitch)
+            && (!(flags & NV2A_STAGE_P8_PALETTE)
+                || t->color != NV2A_TEX_P8 || t->palette);
+    if (n == 0 && !set[0x0C / 4])
+        on = 1;                         /* never configured: counts as on */
+    if (shader_set)
+        mode = (int)((shader_prog >> (5 * n)) & 0x1F);
+    else
+        mode = n == 0 ? 1 : 0;
+    t->raw_mode = mode;
+    t->on = on;
+    if (mode != 4 && (!on || !t->valid))
+        mode = 0;
+    t->mode = mode;
+}

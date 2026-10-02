@@ -2575,41 +2575,28 @@ static void vsh_build_stages(void)
     int n;
     for (n = 0; n < 4; n++) {
         const uint32_t *r = &s_tex_reg[(0x40u * n) / 4];
-        const uint8_t  *set = &s_tex_set[(0x40u * n) / 4];
         Texture *t = &s_stage_tex[n];
-        uint32_t fmt = r[0x04 / 4], ctl0 = r[0x0C / 4];
-        int on = (ctl0 >> 30) & 1;
-        int mode;
+        struct nv2a_stage st;
+        int from_fmt;
 
+        nv2a_stage_decode(n, r, &s_tex_set[(0x40u * n) / 4], s_vsh.shader_set,
+                          s_vsh.shader_prog, dma_resolve, 0, &st);
         memset(t, 0, sizeof *t);
-        t->offset = r[0] ? dma_resolve(r[0]) : 0;
-        t->color = (fmt >> 8) & 0xFF;
-        if (nv2a_tex_size_from_format(t->color)) {
-            t->width  = 1u << ((fmt >> 20) & 0xF);
-            t->height = 1u << ((fmt >> 24) & 0xF);
-        } else {
-            t->width  = r[0x1C / 4] >> 16;
-            t->height = r[0x1C / 4] & 0xFFFF;
-        }
-        t->pitch  = r[0x10 / 4] >> 16;
-        t->addr_u =  r[0x08 / 4]       & 0xF;
-        t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
-        t->valid = t->offset && t->width && t->height
-                && (nv2a_tex_size_from_format(t->color) || t->pitch);
-        if (n == 0 && !set[0x0C / 4])
-            on = 1;                        /* never configured: as before */
-        if (s_vsh.shader_set)
-            mode = (int)((s_vsh.shader_prog >> (5 * n)) & 0x1F);
-        else
-            mode = n == 0 ? 1 : 0;
-        s_vsh.stage_mode_seen[n][mode]++;
-        if (mode != 4 && (!on || !t->valid))
-            mode = 0;
-        s_stage_mode[n] = mode;
-        if (mode != 0 && mode != 4)
-            tex_log_note(n, t, fmt, r[0x10 / 4], r[0x1C / 4]);
-        s_stage_scale[n][0] = nv2a_tex_size_from_format(t->color) ? (float)t->width : 1.0f;
-        s_stage_scale[n][1] = nv2a_tex_size_from_format(t->color) ? (float)t->height : 1.0f;
+        t->offset = st.offset;
+        t->width  = st.width;
+        t->height = st.height;
+        t->pitch  = st.pitch;
+        t->color  = st.color;
+        t->addr_u = st.addr_u;
+        t->addr_v = st.addr_v;
+        t->valid  = st.valid;
+        s_vsh.stage_mode_seen[n][st.raw_mode]++;
+        s_stage_mode[n] = st.mode;
+        if (st.mode != 0 && st.mode != 4)
+            tex_log_note(n, t, r[0x04 / 4], r[0x10 / 4], r[0x1C / 4]);
+        from_fmt = nv2a_tex_size_from_format(t->color);
+        s_stage_scale[n][0] = from_fmt ? (float)t->width : 1.0f;
+        s_stage_scale[n][1] = from_fmt ? (float)t->height : 1.0f;
     }
 }
 

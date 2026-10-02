@@ -268,6 +268,40 @@ void nv2a_tex_decode(const uint8_t *mem, uint32_t fmt, uint32_t w, uint32_t h,
                      uint32_t pitch, uint32_t levels, const uint32_t *pal,
                      uint32_t pal_len, uint32_t *out);
 
+/* ------------------------------------------------------------------------ */
+/* Texture stages                                                            */
+/* ------------------------------------------------------------------------ */
+
+/* One texture stage as the registers program it. */
+struct nv2a_stage {
+    uint32_t offset, color, width, height, pitch, addr_u, addr_v;
+    uint32_t palette, pal_len;  /* P8: resolved palette address, entries */
+    uint32_t filter;            /* SET_TEXTURE_FILTER as written */
+    uint32_t levels;            /* mip levels (1 for linear, or without
+                                 * NV2A_STAGE_MIPS) */
+    uint32_t lod_min, lod_max;  /* CONTROL0 LOD clamps, within levels    */
+    int      valid;
+    int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
+    int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
+    int      raw_mode;  /* the shader program's mode before the gating */
+};
+
+#define NV2A_STAGE_MIPS        1u   /* count mip levels as xemu does */
+#define NV2A_STAGE_P8_PALETTE  2u   /* P8 is valid only with a palette */
+#define NV2A_STAGE_PITCH_LINEAR 4u  /* pitch 0 for a swizzled or DXT texture */
+
+typedef uint32_t (*nv2a_dma_resolve_fn)(uint32_t offset);
+
+/* Stage n from its 16 registers r (SET_TEXTURE_OFFSET 0x1B00 + 0x40 * n
+ * onwards) and their written flags, with the shader-stage program
+ * (shader_set false: stage 0 2D, the rest off). mode is the program's mode,
+ * 0 where it asks for a texture the stage cannot give (disabled or
+ * invalid; pass-through, 4, needs none). */
+void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
+                       int shader_set, uint32_t shader_prog,
+                       nv2a_dma_resolve_fn resolve, unsigned flags,
+                       struct nv2a_stage *t);
+
 #ifdef __cplusplus
 }
 #endif

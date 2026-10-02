@@ -163,7 +163,7 @@ typedef struct {
     uint64_t                last_draw, last_clear;  /* s_seq at the last one */
 } RenderTarget;
 
-typedef struct Stage Stage;
+typedef struct nv2a_stage Stage;
 static RenderTarget s_rt[RT_MAX];
 static RenderTarget *s_drawn;   /* what the last flip presented */
 static RenderTarget *s_cur;     /* the target of the batch being drawn */
@@ -1173,17 +1173,6 @@ static int blend_color(float bf[4])
  * rewritten between two batches of one flip is not seen; cube maps and 3D
  * textures are face/slice 0 only. */
 
-struct Stage {
-    uint32_t offset, color, width, height, pitch, addr_u, addr_v;
-    uint32_t palette, pal_len;  /* P8: resolved palette address, entries */
-    uint32_t filter;            /* SET_TEXTURE_FILTER as written */
-    uint32_t levels;            /* mip levels uploaded (1 for linear)    */
-    uint32_t lod_min, lod_max;  /* CONTROL0 LOD clamps, within levels    */
-    int      valid;
-    int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
-    int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
-};
-
 static Stage s_stage[4];
 /* What each stage's SRV came from, for the batch trace. */
 static const char   *s_stage_src[4];
@@ -1237,60 +1226,15 @@ static void build_stages(void)
     int n;
 
     for (n = 0; n < 4; n++) {
-        const uint32_t *r = &regs[(0x40u * n) / 4];
-        const uint8_t  *set = &sets[(0x40u * n) / 4];
         Stage *t = &s_stage[n];
-        uint32_t fmt = r[0x04 / 4], ctl0 = r[0x0C / 4];
-        int on = (ctl0 >> 30) & 1;
         int mode;
 
-        memset(t, 0, sizeof *t);
-        t->offset = r[0] ? nv2a_pb_dma_resolve(r[0]) : 0;
-        t->color = (fmt >> 8) & 0xFF;
-        if (nv2a_tex_size_from_format(t->color)) {
-            t->width  = 1u << ((fmt >> 20) & 0xF);
-            t->height = 1u << ((fmt >> 24) & 0xF);
-        } else {
-            t->width  = r[0x1C / 4] >> 16;
-            t->height = r[0x1C / 4] & 0xFFFF;
-        }
-        /* CONTROL1's pitch means nothing to a swizzled or DXT texture,
-         * and left in the cache key a stale one splits it in two. */
-        t->pitch  = nv2a_tex_size_from_format(t->color) ? 0 : r[0x10 / 4] >> 16;
-        t->addr_u =  r[0x08 / 4]       & 0xF;
-        t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
-        t->filter = r[0x14 / 4];
-        /* P8: SET_TEXTURE_PALETTE (0x1B20): offset in bits 6-31, length
-         * 256 >> bits 2-3, entries A8R8G8B8. */
-        if (t->color == 0x0B) {
-            uint32_t pal = r[0x20 / 4];
-            t->palette = (pal & ~0x3Fu) ? nv2a_pb_dma_resolve(pal & ~0x3Fu) : 0;
-            t->pal_len = 256u >> ((pal >> 2) & 3u);
-        }
-        t->levels = 1;
-        if (nv2a_tex_size_from_format(t->color) && !no_mips()) {
-            /* As xemu's pgraph_get_texture_shape: the format's count, no
-             * more than MAX_LOD_CLAMP + 1, none smaller than 1x1. The
-             * clamps are whole levels (xemu reads the 12-bit fields as is). */
-            uint32_t lu = (fmt >> 20) & 0xF, lv = (fmt >> 24) & 0xF;
-            uint32_t lmax = (ctl0 >> 6) & 0xFFF, lmin = (ctl0 >> 18) & 0xFFF;
-            uint32_t lv_n = (fmt >> 16) & 0xF;
-            if (lv_n > lmax + 1u) lv_n = lmax + 1u;
-            if (lv_n > (lu > lv ? lu : lv) + 1u) lv_n = (lu > lv ? lu : lv) + 1u;
-            t->levels = lv_n ? lv_n : 1u;
-            t->lod_min = lmin < t->levels - 1u ? lmin : t->levels - 1u;
-            t->lod_max = lmax < t->levels - 1u ? lmax : t->levels - 1u;
-        }
-        t->valid = t->offset && t->width && t->height
-                && (nv2a_tex_size_from_format(t->color) || t->pitch)
-                && (t->color != 0x0B || t->palette);
-        if (n == 0 && !set[0x0C / 4])
-            on = 1;                        /* never configured: as the CPU path */
-        if (v->shader_set)
-            mode = (int)((v->shader_prog >> (5 * n)) & 0x1F);
-        else
-            mode = n == 0 ? 1 : 0;
-        if (mode && mode != 4 && (!on || !t->valid)) {
+        nv2a_stage_decode(n, &regs[(0x40u * n) / 4], &sets[(0x40u * n) / 4],
+                          v->shader_set, v->shader_prog, nv2a_pb_dma_resolve,
+                          NV2A_STAGE_P8_PALETTE | NV2A_STAGE_PITCH_LINEAR
+                          | (no_mips() ? 0u : NV2A_STAGE_MIPS), t);
+        mode = t->raw_mode;
+        if (mode && mode != 4 && (!t->on || !t->valid)) {
             /* The program asks for a texture this stage cannot give: it
              * reads 0 now. Said once per stage, mode and format, since a
              * world drawn in flat vertex colour starts exactly here. */
@@ -1300,17 +1244,13 @@ static void build_stages(void)
                 said[n][mode & 31][(t->color >> 3) & 31] |= bit;
                 fprintf(stderr, LOGP "\x1b[1;35mstage %d: mode %d with no texture"
                         " (enabled %d, offset 0x%08X, format 0x%02X, %ux%u, pitch %u)"
-                        "\x1b[0m\n", n, mode, on, t->offset, t->color,
+                        "\x1b[0m\n", n, mode, t->on, t->offset, t->color,
                         t->width, t->height, t->pitch);
             }
         }
-        t->on = on;
-        if (mode != 4 && (!on || !t->valid))
-            mode = 0;
-        if (mode == 5)
-            mode = 0;   /* CLIP_PLANE: no texture, the register reads 0
-                         * (ponytail: its per-pixel discard is not done) */
-        t->mode = mode;
+        if (t->mode == 5)
+            t->mode = 0;    /* CLIP_PLANE: no texture, the register reads 0
+                             * (ponytail: its per-pixel discard is not done) */
     }
 }
 
