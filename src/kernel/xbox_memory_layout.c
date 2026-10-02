@@ -1173,6 +1173,18 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch)
     return s_fb_va;
 }
 
+static uint32_t s_display_mode_gen;
+
+void xbox_DisplayModeBump(void)
+{
+    __atomic_fetch_add(&s_display_mode_gen, 1, __ATOMIC_RELEASE);
+}
+
+uint32_t xbox_DisplayModeGeneration(void)
+{
+    return __atomic_load_n(&s_display_mode_gen, __ATOMIC_ACQUIRE);
+}
+
 static void framebuffer_probe_tick(void)
 {
     static DWORD last_ms;

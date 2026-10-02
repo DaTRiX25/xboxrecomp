@@ -609,10 +609,11 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  *    last pick before the mode change.
  *
  *  - Field rendering (D3DPRESENTFLAG_FIELD): half-height back buffers at
- *    twice the display's pitch. When no surface this run has had the
- *    display's own pitch (stale or evicted ones included: s_pitch_seen
- *    latches it), a surface at twice it qualifies instead, with a warning the
- *    first time. The runtime does not interleave fields anywhere, so such a
+ *    twice the display's pitch. When no surface since the last display mode
+ *    set has had the display's own pitch (once seen, s_pitch_seen latches it,
+ *    stale or later evicted; a mode set clears it, since buffers drawn
+ *    before it say nothing about the new mode), a surface at twice it
+ *    qualifies instead, with a warning the first time. The runtime does not interleave fields anywhere, so such a
  *    pick shows one field; it beats presenting the buffer about to be drawn. */
 #define PRESENT_MAX 16
 #define PRESENT_STALE_FLIPS 120u
@@ -704,15 +705,24 @@ static void present_pick(void)
 {
     static int warned_field;
     static uint32_t s_pitch_seen;        /* a display pitch some surface had */
+    static uint32_t s_mode_gen, s_mode_flip;
+    uint32_t gen = xbox_DisplayModeGeneration();
     uint32_t disp_pitch = 0, disp = xbox_GetDisplayFramebuffer(&disp_pitch);
     uint32_t tw = 0, th = 0, want = disp_pitch;
     uint64_t area = 0, stale_area = 0;
     uint32_t stale_w = 0, stale_h = 0;
     int i, pass, at_disp, best = -1;
 
-    /* Field pitch only if no surface this run has had the display's own. */
+    /* Field pitch only if no surface since the last mode set has had the
+     * display's own. */
+    if (gen != s_mode_gen) {
+        s_mode_gen = gen;
+        s_mode_flip = s_gpu.flips;
+        s_pitch_seen = 0;
+    }
     for (i = 0; i < PRESENT_MAX && disp_pitch && s_pitch_seen != disp_pitch; i++)
-        if (s_psurf[i].offset && s_psurf[i].pitch == disp_pitch)
+        if (s_psurf[i].offset && s_psurf[i].pitch == disp_pitch
+                && s_psurf[i].last_flip >= s_mode_flip)
             s_pitch_seen = disp_pitch;
     if (disp_pitch && s_pitch_seen != disp_pitch)
         want = disp_pitch << 1;
@@ -755,9 +765,11 @@ static void present_pick(void)
     }
     if (area && disp_pitch && want != disp_pitch && !warned_field) {
         warned_field = 1;
-        fprintf(stderr, "  [GPU] present: no surface has the display pitch %u;"
-                " presenting %ux%u at pitch %u (field rendering?) -- one field"
-                " only, fields are not interleaved\n", disp_pitch, tw, th, want);
+        fprintf(stderr, "  [GPU] present: no surface since display mode set %u"
+                " (flip %u) has the display pitch %u; presenting %ux%u at pitch"
+                " %u (field rendering?) -- one field only, fields are not"
+                " interleaved\n", s_mode_gen, s_mode_flip, disp_pitch, tw, th,
+                want);
     }
     /* Of that size and pitch: the newest draw since the last flip, else the
      * newest clear. */

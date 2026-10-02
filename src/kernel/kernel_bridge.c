@@ -2226,6 +2226,9 @@ static void bridge_AvSetDisplayMode(void)
          * framebuffer. Resolving once here is the fix; resolving in each
          * caller is how there came to be two of them disagreeing. */
         xbox_SetDisplayFramebuffer(fb_va, pitch);
+        /* After the address and pitch, so a walker that sees the new
+         * generation also sees the new mode (present_pick, N8). */
+        xbox_DisplayModeBump();
     }
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
     g_eax = 0;
