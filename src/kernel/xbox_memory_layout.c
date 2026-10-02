@@ -1095,11 +1095,12 @@ static void fence_mirrors_tick(void)
  * needs. */
 #define NV2A_PGRAPH_FENCE_MIRROR 0x400B10u
 
-static void pgraph_fence_tick(volatile uint32_t *regs)
+/* The completed-fence word of the first fence-mirror device: what the title
+ * reads as "the GPU has finished through here". 0 when there is none yet. */
+static int fence_completed(uint32_t *out)
 {
     for (int i = 0; i < g_fence_mirror_count; i++) {
-        uint32_t dev, get_ptr, v;
-        volatile uint32_t *r;
+        uint32_t dev, get_ptr;
 
         if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
             continue;
@@ -1111,12 +1112,22 @@ static void pgraph_fence_tick(volatile uint32_t *regs)
                                          + g_memory_offset);
         if (!fence_readable(get_ptr, 4))
             continue;
-        v = *(volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
-        r = (volatile uint32_t *)((char *)regs + NV2A_PGRAPH_FENCE_MIRROR);
-        if (((*r ^ (v << 2)) & 0x7Cu) != 0)
-            *r = (*r & ~0x7Cu) | ((v << 2) & 0x7Cu);
-        return;   /* one device drives the GPU */
+        *out = *(volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
+        return 1;   /* one device drives the GPU */
     }
+    return 0;
+}
+
+static void pgraph_fence_tick(volatile uint32_t *regs)
+{
+    uint32_t v;
+    volatile uint32_t *r =
+        (volatile uint32_t *)((char *)regs + NV2A_PGRAPH_FENCE_MIRROR);
+
+    if (!fence_completed(&v))
+        return;
+    if (((*r ^ (v << 2)) & 0x7Cu) != 0)
+        *r = (*r & ~0x7Cu) | ((v << 2) & 0x7Cu);
 }
 
 static int s_nv2a_trace = 0;
@@ -1317,12 +1328,26 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
+                /* Prefixed with ms since the first such line (GetTickCount, monotonic) and suffixed
+                 * with the completed fence, so two hosts' logs can be lined up
+                 * by time and by GPU progress (Proton's fence was seen
+                 * advancing ~100x slower than macOS's). */
                 if (s_nv2a_trace) {
+                    static DWORD t0;
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
-                    fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
-                            "0x%08X%s\n", put, g,
-                            g == put ? "" : "  (GPU behind)");
+                    uint32_t fv = 0;
+                    int have_fence = fence_completed(&fv);
+                    if (!t0)
+                        t0 = now_ms ? now_ms : 1;
+                    fprintf(stderr, "  [NV2A] %8lu ms  DMA_PUT = 0x%08X  DMA_GET = "
+                            "0x%08X  fence ", (unsigned long)(now_ms - t0),
+                            put, g);
+                    if (have_fence)
+                        fprintf(stderr, "0x%08X", fv);
+                    else
+                        fprintf(stderr, "-");
+                    fprintf(stderr, "%s\n", g == put ? "" : "  (GPU behind)");
                 }
                 fflush(stderr);
             }
