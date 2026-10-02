@@ -1056,6 +1056,7 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x01: return 0x1B;     /* AY8 */
     case 0x1A: return 0x20;     /* A8Y8 */
     case 0x27: return 0x37;     /* R6G5B5 */
+    case 0x28: return 0x17;     /* G8B8 */
     case 0x32: return 0x35;     /* Y16 */
     case 0x38: return 0x3D;     /* R5G5B5A1 */
     case 0x39: return 0x3E;     /* R4G4B4A4 */
@@ -1071,7 +1072,7 @@ static uint32_t texel_bytes(uint32_t lin)
     switch (lin) {
     case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
     case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25:
-    case 0x20: case 0x37: case 0x35: case 0x3D: case 0x3E: return 2;
+    case 0x20: case 0x37: case 0x35: case 0x3D: case 0x3E: case 0x17: return 2;
     case 0x13: case 0x1F: case 0x1B: case 0x0B: return 1;
     default: return 0;
     }
@@ -1167,6 +1168,9 @@ static uint32_t decode_texel(uint32_t fmt, const uint8_t *p, uint32_t u)
     case 0x20:                              /* A8Y8: Y low byte, A high */
         t = ((const uint16_t *)p)[u];
         return ((t >> 8) << 24) | (t & 0xFFu) * 0x010101u;
+    case 0x17:                              /* G8B8: xemu RG8, swizzle (R,G,R,G) */
+        t = ((const uint16_t *)p)[u];
+        return ((t >> 8) << 24) | ((t & 0xFFu) << 16) | ((t >> 8) << 8) | (t & 0xFFu);
     case 0x35:                              /* Y16: top byte */
         t = ((const uint16_t *)p)[u] >> 8;
         return 0xFF000000u | t * 0x010101u;

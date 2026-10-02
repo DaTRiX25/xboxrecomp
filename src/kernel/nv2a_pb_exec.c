@@ -940,6 +940,7 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x01: return 0x1B;                /* AY8       -> LIN_AY8       */
     case 0x1A: return 0x20;                /* A8Y8      -> LIN_A8Y8      */
     case 0x27: return 0x37;                /* R6G5B5    -> LIN_R6G5B5    */
+    case 0x28: return 0x17;                /* G8B8      -> LIN_G8B8      */
     case 0x32: return 0x35;                /* Y16       -> LIN_Y16       */
     case 0x38: return 0x3D;                /* R5G5B5A1  -> LIN_R5G5B5A1  */
     case 0x39: return 0x3E;                /* R4G4B4A4  -> LIN_R4G4B4A4  */
@@ -1080,6 +1081,14 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
     case 0x20: {                                    /* LIN_A8Y8: Y low, A high */
         uint32_t t = ((const uint16_t *)p)[u];
         *argb = ((t >> 8) << 24) | (t & 0xFFu) * 0x010101u;
+        return 1;
+    }
+    case 0x17: {                                    /* LIN_G8B8 (and V8U8) */
+        /* xemu's table loads it as GL_RG8 (low byte red, high byte green)
+         * and swizzles to (R, G, R, G): so B and R are the low byte, G and
+         * A the high one. A bump-map stage reads it back from b and g. */
+        uint32_t t = ((const uint16_t *)p)[u], lo = t & 0xFFu, hi = t >> 8;
+        *argb = (hi << 24) | (lo << 16) | (hi << 8) | lo;
         return 1;
     }
     case 0x35: {                                    /* LIN_Y16: top byte */
@@ -2805,7 +2814,7 @@ static uint32_t tc_texel_bytes(uint32_t lin)
     switch (lin) {
     case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
     case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25:
-    case 0x20: case 0x35: case 0x37: case 0x3D: case 0x3E: return 2;
+    case 0x20: case 0x35: case 0x37: case 0x3D: case 0x3E: case 0x17: return 2;
     case 0x13: case 0x1F: case 0x1B: return 1;    /* not P8: its palette is not in the key */
     default: return 0;
     }
