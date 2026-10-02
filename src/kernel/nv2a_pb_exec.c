@@ -589,6 +589,14 @@ static struct {
 static uint64_t s_psurf_seq, s_psurf_flip_seq;
 static struct nv2a_pb_present s_present;
 
+/* RECOMP_PRESENT_TRACE=1: the order this frame used its surfaces in (runs of
+ * draws and clears per surface), printed at a flip whose pick is not the
+ * surface picked two flips before -- a double-buffered title alternates, so
+ * that is the flip worth explaining. */
+#define PTRACE_MAX 48
+static struct { uint32_t offset, w, h, pitch, draws, clears; } s_ptrace[PTRACE_MAX];
+static int s_ptrace_n, s_ptrace_on = -1;
+
 /* A draw (clear = 0) or colour clear (clear = 1) into the current surface. */
 static void present_note(int clear)
 {
@@ -616,6 +624,26 @@ static void present_note(int clear)
     s_psurf[e].pitch = s_gpu.pitch;
     s_psurf[e].format = s_gpu.format;
     s_psurf[e].last_use = ++s_psurf_seq;
+    if (s_ptrace_on < 0)
+        s_ptrace_on = getenv("RECOMP_PRESENT_TRACE") != NULL;
+    if (s_ptrace_on) {
+        int n = s_ptrace_n;
+        if (!n || s_ptrace[n - 1].offset != s_gpu.color_offset
+                || s_ptrace[n - 1].w != w || s_ptrace[n - 1].h != h
+                || s_ptrace[n - 1].pitch != s_gpu.pitch) {
+            if (n == PTRACE_MAX)
+                n = PTRACE_MAX - 1;      /* keep the tail: the end of the frame */
+            else
+                s_ptrace_n++;
+            s_ptrace[n].offset = s_gpu.color_offset;
+            s_ptrace[n].w = w; s_ptrace[n].h = h; s_ptrace[n].pitch = s_gpu.pitch;
+            s_ptrace[n].draws = s_ptrace[n].clears = 0;
+        }
+        if (clear)
+            s_ptrace[s_ptrace_n - 1].clears++;
+        else
+            s_ptrace[s_ptrace_n - 1].draws++;
+    }
     if (clear)
         s_psurf[e].last_clear = s_psurf_seq;
     else
@@ -651,6 +679,22 @@ static void present_pick(void)
                 best = i;
             }
         }
+    }
+    if (s_ptrace_on > 0) {
+        static uint32_t pick[2];
+        uint32_t now = best >= 0 ? s_psurf[best].offset : s_present.offset;
+        if (pick[0] && now != pick[0]) {
+            fprintf(stderr, "[PRESENT] flip %u picks 0x%08X (2 flips ago 0x%08X),"
+                    " display %ux%u at 0x%08X; this frame's surfaces:\n",
+                    s_gpu.flips, now, pick[0], tw, th, disp);
+            for (i = 0; i < s_ptrace_n; i++)
+                fprintf(stderr, "[PRESENT]   0x%08X %ux%u pitch %u: %u draws %u clears\n",
+                        s_ptrace[i].offset, s_ptrace[i].w, s_ptrace[i].h,
+                        s_ptrace[i].pitch, s_ptrace[i].draws, s_ptrace[i].clears);
+        }
+        pick[0] = pick[1];
+        pick[1] = now;
+        s_ptrace_n = 0;
     }
     if (best >= 0) {
         s_present.offset = s_psurf[best].offset;
