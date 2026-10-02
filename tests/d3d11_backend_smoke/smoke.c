@@ -653,8 +653,9 @@ int main(int argc, char **argv)
                 s_vis_late, s_cross_live, frames > 0 ? frames - 1 : 0,
                 s_cross_vacuous);
         if (s_vis_failures || s_vis_late) {
-            fprintf(stderr, "[backend-smoke] FAIL: %d wrong visibility results,"
-                    " %d reports the backend lost\n", s_vis_failures, s_vis_late);
+            fprintf(stderr, "[backend-smoke] FAIL: %d frames with a wrong visibility"
+                    " result, %d frames with a report the backend lost\n",
+                    s_vis_failures, s_vis_late);
             return 1;
         }
         if (deferred && frames > 1 && !s_cross_live) {
