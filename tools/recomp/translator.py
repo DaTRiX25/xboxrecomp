@@ -2926,11 +2926,40 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
+            # A stub skips whatever code really lives at its address, so one
+            # reached at runtime is a likely cause of a silent stall or a wrong
+            # result far downstream. RECOMP_STUB_LOG=1 names each stub the
+            # first time it runs, with the return address on the guest stack
+            # (for a tail jump, that is the caller's caller). Off by default:
+            # the check is one cached getenv per stub per process.
+            stub_lines += [
+                "#include <stdio.h>",
+                "#include <stdlib.h>",
+                "",
+                "static int recomp_stub_log_on(void)",
+                "{",
+                "    static int on = -1;",
+                "    if (on < 0) {",
+                '        const char *e = getenv("RECOMP_STUB_LOG");',
+                "        on = e && *e && *e != '0';",
+                "    }",
+                "    return on;",
+                "}",
+                "",
+                "#define RECOMP_STUB_HIT(va) do { static int _seen; \\",
+                "    if (!_seen && recomp_stub_log_on()) { _seen = 1; \\",
+                '        fprintf(stderr, "[STUB] unresolved 0x%08X reached, " \\',
+                '                "return 0x%08X esp 0x%08X\\n", (unsigned)(va), \\',
+                "                (unsigned)MEM32(g_esp), (unsigned)g_esp); \\",
+                "        fflush(stderr); } } while (0)",
+                "",
+            ]
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ "
+                    f"RECOMP_STUB_HIT(0x{addr:08X}u); g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
