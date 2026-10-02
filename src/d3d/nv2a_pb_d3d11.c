@@ -2335,6 +2335,237 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
 
 /* ---- draw ------------------------------------------------------------------ */
 
+/* ---- pixel probe ------------------------------------------------------------
+ *
+ * RECOMP_D3D11_PX=x,y[;x,y...] (up to 4) with RECOMP_D3D11_PX_FLIPS=a-b
+ * (this backend's present count, the "[D3D11] flip N" number; default 0-0
+ * means the first frame only): every batch drawn in that window that covers
+ * one of the pixels is redrawn twice into eight float targets, with the same
+ * vertex shader, inputs, textures and samplers, depth tested LESS_EQUAL
+ * without writes against the depth the real draw left, and the pixel's
+ * interpolated inputs read back:
+ *   pass A  oD0, oD1, oT0..oT3 as interpolated, SV_Position, fog
+ *   pass B  stage 0..3 texels as the combiner samples them (q divide for
+ *           true 2D stages, tex_scale) and the coordinates it samples at
+ * Lines start "[D3D11-PX]": the colour before and after the real draw, then
+ * the inputs; then the batch's full [D3D11-WHITE] block (stages with mode,
+ * enable, address and filter, attributes, vertex outputs, combiner factors;
+ * the HLSL once per program/combiner).
+ * RECOMP_D3D11_PX_MAX caps the batches printed (default 400). Alpha test and
+ * stencil are not applied to the probe, so "covered" can include a fragment
+ * the real draw discarded: compare before/after. */
+static int s_px_n = -1, s_px_x[4], s_px_y[4], s_px_max;
+static uint64_t s_px_f0, s_px_f1;
+
+static int px_on(void)
+{
+    if (s_px_n < 0) {
+        const char *e = getenv("RECOMP_D3D11_PX"), *f = getenv("RECOMP_D3D11_PX_FLIPS");
+        const char *m = getenv("RECOMP_D3D11_PX_MAX");
+        s_px_n = 0;
+        while (e && *e && s_px_n < 4) {
+            int x, y;
+            if (sscanf(e, "%d,%d", &x, &y) != 2)
+                break;
+            s_px_x[s_px_n] = x;
+            s_px_y[s_px_n] = y;
+            s_px_n++;
+            e = strchr(e, ';');
+            if (e) e++;
+        }
+        if (f) {
+            unsigned long long a = 0, b = 0;
+            int k = sscanf(f, "%llu-%llu", &a, &b);
+            s_px_f0 = a;
+            s_px_f1 = k == 2 ? b : a;
+        }
+        s_px_max = m ? atoi(m) : 400;
+        if (s_px_n)
+            fprintf(stderr, LOGP "RECOMP_D3D11_PX: %d pixel(s), flips %llu-%llu\n",
+                    s_px_n, (unsigned long long)s_px_f0,
+                    (unsigned long long)s_px_f1);
+    }
+    return s_px_n > 0 && s_px_max > 0 && s_presents >= s_px_f0 && s_presents <= s_px_f1;
+}
+
+static ID3D11PixelShader *px_shader(int pass)
+{
+    static ID3D11PixelShader *ps[2];
+    static int tried[2];
+    char src[6144];
+    ID3DBlob *code = NULL;
+
+    if (tried[pass])
+        return ps[pass];
+    tried[pass] = 1;
+    snprintf(src, sizeof src, "%s%s"
+        "Texture2D tex0 : register(t0); Texture2D tex1 : register(t1);\n"
+        "Texture2D tex2 : register(t2); Texture2D tex3 : register(t3);\n"
+        "SamplerState samp0 : register(s0); SamplerState samp1 : register(s1);\n"
+        "SamplerState samp2 : register(s2); SamplerState samp3 : register(s3);\n"
+        "struct PO { float4 o0 : SV_Target0; float4 o1 : SV_Target1;\n"
+        "    float4 o2 : SV_Target2; float4 o3 : SV_Target3; float4 o4 : SV_Target4;\n"
+        "    float4 o5 : SV_Target5; float4 o6 : SV_Target6; float4 o7 : SV_Target7; };\n"
+        "float2 uvof(float4 t, uint n) {\n"
+        "    float2 uv = t.xy;\n"
+        "    if (tex_mode[n] == 1u && t.w != 0.0 && t.w != 1.0) uv /= t.w;\n"
+        "    return uv * tex_scale[n].xy;\n"
+        "}\n"
+        "PO main(VS_OUT i) {\n"
+        "    PO o;\n"
+        "%s"
+        "    return o;\n"
+        "}\n",
+        VS_OUT_DECL, PS_CB_DECL,
+        pass == 0
+        ? "    o.o0 = i.oD0; o.o1 = i.oD1; o.o2 = i.oT0; o.o3 = i.oT1;\n"
+          "    o.o4 = i.oT2; o.o5 = i.oT3; o.o6 = i.oPos;\n"
+          "    o.o7 = float4(i.oFog, 1, 0, 0);\n"
+        : "    float2 u0 = uvof(i.oT0, 0), u1 = uvof(i.oT1, 1);\n"
+          "    float2 u2 = uvof(i.oT2, 2), u3 = uvof(i.oT3, 3);\n"
+          "    o.o0 = tex0.Sample(samp0, u0); o.o1 = tex1.Sample(samp1, u1);\n"
+          "    o.o2 = tex2.Sample(samp2, u2); o.o3 = tex3.Sample(samp3, u3);\n"
+          "    o.o4 = float4(u0, 0, 0); o.o5 = float4(u1, 0, 0);\n"
+          "    o.o6 = float4(u2, 0, 0); o.o7 = float4(u3, 0, 0);\n");
+    if (compile("nv2a_ps_probe", src, "ps_5_0", &code)) {
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                       ID3D10Blob_GetBufferSize(code), NULL, &ps[pass]);
+        ID3D10Blob_Release(code);
+    }
+    if (!ps[pass])
+        fprintf(stderr, LOGP "RECOMP_D3D11_PX: probe shader %d FAILED to build\n", pass);
+    return ps[pass];
+}
+
+static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt,
+                     const uint8_t fmts[16], const UINT strides[16], const UINT offs[16],
+                     D3D11_PRIMITIVE_TOPOLOGY topo, UINT nidx,
+                     ID3D11DepthStencilView *dsv, const uint32_t before[4])
+{
+    static ID3D11Texture2D *tex[8], *st;
+    static ID3D11RenderTargetView *rtv[8];
+    static UINT tw, th;
+    static ID3D11DepthStencilState *dss_le;
+    static const char *names[2][8] = {
+        {"D0", "D1", "T0", "T1", "T2", "T3", "pos", "fog/cover"},
+        {"tex0", "tex1", "tex2", "tex3", "uv0", "uv1", "uv2", "uv3"}};
+    float val[2][4][8][4];
+    const float zero[4] = {0, 0, 0, 0};
+    D3D11_MAPPED_SUBRESOURCE m;
+    int pass, k, n, any = 0;
+
+    if (!px_shader(0) || !px_shader(1))
+        return;
+    if (!tex[0] || tw != rt->w || th != rt->h) {
+        D3D11_TEXTURE2D_DESC td;
+        for (k = 0; k < 8; k++) {
+            if (rtv[k]) ID3D11RenderTargetView_Release(rtv[k]);
+            if (tex[k]) ID3D11Texture2D_Release(tex[k]);
+            rtv[k] = NULL;
+            tex[k] = NULL;
+        }
+        memset(&td, 0, sizeof td);
+        td.Width = rt->w;
+        td.Height = rt->h;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        for (k = 0; k < 8; k++)
+            if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &tex[k]))
+                    || FAILED(ID3D11Device_CreateRenderTargetView(
+                        s_dev, (ID3D11Resource *)tex[k], NULL, &rtv[k])))
+                return;
+        tw = rt->w;
+        th = rt->h;
+    }
+    if (!st) {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = 8;
+        td.Height = 4;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
+            return;
+    }
+    if (!dss_le) {
+        D3D11_DEPTH_STENCIL_DESC dd;
+        memset(&dd, 0, sizeof dd);
+        dd.DepthEnable = TRUE;
+        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+        ID3D11Device_CreateDepthStencilState(s_dev, &dd, &dss_le);
+    }
+
+    for (pass = 0; pass < 2; pass++) {
+        for (k = 0; k < 8; k++)
+            ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rtv[k], zero);
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 8, rtv, dsv);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dsv ? dss_le : s_ds_off, 0);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
+        ID3D11DeviceContext_PSSetShader(s_ctx, px_shader(pass), NULL, 0);
+        ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+        for (n = 0; n < s_px_n; n++) {
+            D3D11_BOX b;
+            if (s_px_x[n] < 0 || s_px_y[n] < 0
+                    || (UINT)s_px_x[n] >= rt->w || (UINT)s_px_y[n] >= rt->h)
+                continue;
+            b.left = (UINT)s_px_x[n]; b.right = b.left + 1;
+            b.top = (UINT)s_px_y[n]; b.bottom = b.top + 1;
+            b.front = 0; b.back = 1;
+            for (k = 0; k < 8; k++)
+                ID3D11DeviceContext_CopySubresourceRegion(
+                    s_ctx, (ID3D11Resource *)st, 0, (UINT)k, (UINT)n, 0,
+                    (ID3D11Resource *)tex[k], 0, &b);
+        }
+        memset(val[pass], 0, sizeof val[pass]);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
+                                              D3D11_MAP_READ, 0, &m))) {
+            for (n = 0; n < s_px_n; n++)
+                memcpy(val[pass][n], (const uint8_t *)m.pData + (size_t)n * m.RowPitch,
+                       sizeof val[pass][n]);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+        }
+    }
+    /* back to the real draw's state; the state-call filter's view of it
+     * stays true for everything restored here */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, dsv);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_sc.bs, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_sc.ps, NULL, 0);
+    s_state_gen++;              /* and the next draw rebinds everything */
+
+    for (n = 0; n < s_px_n; n++) {
+        uint32_t after;
+        if (val[0][n][7][1] != 1.0f)
+            continue;           /* not covered */
+        after = read_pixel(rt, s_px_x[n], s_px_y[n]);
+        if (!any) {
+            s_px_max--;
+            fprintf(stderr, "[D3D11-PX] flip %llu draw %llu surface 0x%08X prog %08X"
+                    " prim %u n %u\n", (unsigned long long)s_presents,
+                    (unsigned long long)s_draws, rt->offset,
+                    d->program ? vs->hash : 0u, d->prim, d->idx_count);
+        }
+        any = 1;
+        fprintf(stderr, "[D3D11-PX]  px (%d,%d) before %08X after %08X\n",
+                s_px_x[n], s_px_y[n], before[n], after);
+        for (pass = 0; pass < 2; pass++)
+            for (k = 0; k < 8; k++)
+                fprintf(stderr, "[D3D11-PX]   %-9s %g %g %g %g\n", names[pass][k],
+                        val[pass][n][k][0], val[pass][n][k][1],
+                        val[pass][n][k][2], val[pass][n][k][3]);
+    }
+    if (any) {
+        int px, py;
+        trace_batch(d, vs, rt, fmts, strides, offs, topo, &px, &py);
+    }
+}
+
 static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 {
     static uint32_t idx[NV_MAX_INDICES * 3];
@@ -2607,7 +2838,14 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 s_sc.ps = ps;
             }
         }
-        if (trace_pick(d)) {
+        if (px_on()) {
+            uint32_t before[4];
+            int n;
+            for (n = 0; n < s_px_n; n++)
+                before[n] = read_pixel(rt, s_px_x[n], s_px_y[n]);
+            ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+            px_probe(d, vs, rt, fmts, strides, offs, topo, nidx, dsv, before);
+        } else if (trace_pick(d)) {
             int px, py;
             trace_batch(d, vs, rt, fmts, strides, offs, topo, &px, &py);
             ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);

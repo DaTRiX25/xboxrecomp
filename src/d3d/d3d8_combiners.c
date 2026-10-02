@@ -390,8 +390,12 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             EMIT("    {\n");
             EMIT("        float2 uv = i.tc%d.xy;\n", i);
             if (m == NV2A_TEXMODE_2D)
-                EMIT("        if (i.tc%d.w != 0.0 && i.tc%d.w != 1.0) uv /= i.tc%d.w;\n",
-                     i, i, i);
+                /* tex_mode (constant buffer) is the stage's real mode: a
+                 * caller that samples other modes as 2D passes them as
+                 * NV2A_TEXMODE_2D here, and only true 2D stages divide by q,
+                 * as the CPU path's stage_sample does. */
+                EMIT("        if (tex_mode[%d] == 1u && i.tc%d.w != 0.0 && i.tc%d.w != 1.0)"
+                     " uv /= i.tc%d.w;\n", i, i, i, i);
             EMIT("        x%d = tex%d.Sample(samp%d, uv * tex_scale[%d].xy);\n",
                  8 + i, i, i, i);
             EMIT("    }\n");
