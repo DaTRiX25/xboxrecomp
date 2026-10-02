@@ -3096,6 +3096,22 @@ typedef char thobj_tag_matches[(BRIDGE_HANDLE_TAG == 0x48000000u &&
                                 BRIDGE_HANDLE_MAX == 16384) ? 1 : -1];
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
 
+/* Every guest thread allocates and frees tokens. Without a lock, two threads
+ * that ask at the same moment can both take the same free slot and get the
+ * same token for different HANDLEs. BLiNX 2 hit that: one token named both a
+ * new loader thread and a file a worker had open. When the worker closed its
+ * file, the thread lost its guest object, and the main thread's
+ * GetExitCodeThread poll never saw the thread end. */
+static volatile LONG s_handle_lock;
+
+static void handle_lock(void)
+{
+    while (InterlockedCompareExchange(&s_handle_lock, 1, 0) != 0)
+        SwitchToThread();
+}
+
+static void handle_unlock(void) { InterlockedExchange(&s_handle_lock, 0); }
+
 /* A token for h. The same HANDLE normally gets the same token. A duplicate
  * must not: on POSIX, DuplicateHandle returns its source pointer with one
  * more reference. If the duplicate shared the source's token, NtClose on
@@ -3104,13 +3120,19 @@ static uint32_t bridge_handle_token_ex(HANDLE h, int fresh)
 {
     int i;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
+    handle_lock();
     for (i = 1; !fresh && i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
+        if (s_handle_table[i] == h) {
+            handle_unlock();
+            return BRIDGE_HANDLE_TAG | (uint32_t)i;
+        }
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
         if (s_handle_table[i] == NULL) {
             s_handle_table[i] = h;
+            handle_unlock();
             return BRIDGE_HANDLE_TAG | (uint32_t)i;
         }
+    handle_unlock();
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
 }
@@ -3167,8 +3189,11 @@ static HANDLE bridge_take_handle(uint32_t token)
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
-            HANDLE h = s_handle_table[i];
+            HANDLE h;
+            handle_lock();
+            h = s_handle_table[i];
             s_handle_table[i] = NULL;
+            handle_unlock();
             return h;
         }
     }
