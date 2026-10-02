@@ -144,6 +144,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_BLEND_ENABLE            0x0304
 #define NV097_SET_BLEND_FUNC_SFACTOR      0x0344
 #define NV097_SET_BLEND_FUNC_DFACTOR      0x0348
+#define NV097_SET_BLEND_COLOR             0x034C
 #define NV_BLEND_SRC_ALPHA                0x0302
 #define NV_BLEND_ONE_MINUS_SRC_ALPHA      0x0303
 
@@ -1338,7 +1339,8 @@ static int surface_begin_batch(const uint8_t *mem)
 
 static int blend_known(uint32_t f)
 {
-    return f == 0 || f == 1 || (f >= 0x300 && f <= 0x307);
+    return f == 0 || f == 1 || (f >= 0x300 && f <= 0x307)
+        || (f >= 0x8001 && f <= 0x8004);
 }
 
 /* A GL blend factor for the channel at bit `sh` of an ARGB word, 0..255. */
@@ -1354,6 +1356,10 @@ static uint32_t blend_factor(uint32_t f, uint32_t src, uint32_t dst, uint32_t sh
     case 0x304: return dst >> 24;                          /* DST_ALPHA */
     case 0x305: return 255 - (dst >> 24);
     case 0x306: return (dst >> sh) & 0xFF;                 /* DST_COLOR */
+    case 0x8001: return (s_gpu.blend_color >> sh) & 0xFF;  /* CONSTANT_COLOR */
+    case 0x8002: return 255 - ((s_gpu.blend_color >> sh) & 0xFF);
+    case 0x8003: return s_gpu.blend_color >> 24;           /* CONSTANT_ALPHA */
+    case 0x8004: return 255 - (s_gpu.blend_color >> 24);
     default:    return 255 - ((dst >> sh) & 0xFF);         /* 0x307 */
     }
 }
@@ -5463,6 +5469,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_BLEND_FUNC_DFACTOR:
         s_gpu.blend_dfactor = param;
+        break;
+    case NV097_SET_BLEND_COLOR:
+        s_gpu.blend_color = param;
+        s_gpu.blend_color_writes++;
         break;
     case NV097_SET_COLOR_MASK:
         /* One enable bit per channel (xemu pgraph.c): B bit 0, G bit 8,
