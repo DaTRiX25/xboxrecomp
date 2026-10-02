@@ -43,6 +43,15 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* Saves. Titles map U: and T: themselves (XapiMapLetterToDirectory) to
+     * E:\UDATA\<title id> and E:\TDATA\<title id>, which are under
+     * Partition1. Without these two rules the Partition1 rule below put every
+     * save in the game dir, shared by all runs and all save dirs: a fresh
+     * XDG_DATA_HOME still saw the last run's save game. Listed first so they
+     * win over Partition1; no trailing separator, the title opens the bare
+     * directories too. */
+    { "\\Device\\Harddisk0\\Partition1\\UDATA", 1, "\\UDATA",  "/UDATA"      },
+    { "\\Device\\Harddisk0\\Partition1\\TDATA", 1, "\\TDATA",  "/TDATA"      },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
