@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
@@ -1747,6 +1748,33 @@ static int wrap_signed(int c, uint32_t size, uint32_t mode)
     return c >= (int)size ? (int)size - 1 : c;
 }
 
+/* ---- Raster timing (RECOMP_FLIP_LOG) ------------------------------------
+ *
+ * Where the CPU rasteriser's time goes, per flip: the whole of raster_batch,
+ * and inside it the vertex transform, per-batch stage and combiner setup, and
+ * texture decode into the RECOMP_PB_FAST cache. What is left is the pixel
+ * loop. Read and reset by the RECOMP_FLIP_LOG line. Timestamps are taken per
+ * batch and per cache tile, never per pixel. */
+#if defined(_WIN32)
+static uint64_t rt_now(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#else
+static uint64_t rt_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
+static struct {
+    uint64_t total, xform, setup, tex;   /* ns since the last flip line */
+    uint32_t yuv_batches;                /* batches sampling a YUY2/UYVY stage 0 */
+} s_rt;
+
 /* ---- Texture stages and register combiners ----------------------------
  *
  * Per batch, each of the four stages is decoded from the texture registers
@@ -2135,14 +2163,829 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
     s_gpu.drawn_offset = s_gpu.color_offset;
 }
 
+/* ---- RECOMP_PB_FAST: the same arithmetic, reordered --------------------
+ *
+ * Three fast paths for raster_tri_xf, on by default; RECOMP_PB_FAST=0 keeps
+ * the reference loop above. Each one moves work out of the pixel loop without
+ * changing a single operation that produces a pixel, so the two paths agree
+ * bit for bit -- RECOMP_PB_FAST_AB=1 checks exactly that, per batch.
+ *
+ *  (a) Decoded-texture cache. A bound texture is decoded to ARGB8888 once, in
+ *      8x8 tiles on first touch, through sample_tex itself (so the decode is
+ *      the reference decode). Key and invalidation follow nv2a_pb_state.h:
+ *      offset + format + width + height + pitch; a new flip generation
+ *      re-fingerprints the texture and drops the tiles if it changed. (The
+ *      shared policy says first and last page; that misses a letterboxed
+ *      movie, see tc_fingerprint, so this hashes every byte.) Texels are widened to floats through a 256-entry table holding
+ *      exactly what rc_unpack computes.
+ *  (b) Combiner setup hoisted. rc_eval re-decodes every input word per pixel
+ *      and copies the 256-byte register file twice per stage. The plan below
+ *      is decoded once per batch; per pixel the registers are evaluated in
+ *      place (every input of a stage is read before any output is written,
+ *      which is what the nr copy guaranteed), and only registers something
+ *      writes are reset between pixels.
+ *  (c) Edge setup per row. Each edge function is monotonic along a row, so the
+ *      columns that can pass the inside test are found per row from an
+ *      estimate refined with the exact per-pixel expression, and the columns
+ *      outside are never visited. Inside, the edge functions are the reference
+ *      expressions with their per-triangle operands hoisted, which leaves the
+ *      rounding where it was. Additive stepping would round differently and is
+ *      deliberately not used. With all three w == 1 (the pretransformed
+ *      passthrough quads) the 1/w weights are skipped, and the normalising
+ *      divide is skipped whenever its divisor is exactly 1.
+ *
+ * ponytail: a texture rewritten between two batches of one flip is not seen
+ * (the policy's known gap); RECOMP_PB_FAST_AB reports it if it ever happens.
+ */
+static int s_fast_force = -1;            /* -1: env; 0/1: A/B override */
+
+static int pb_fast(void)
+{
+    static int on = -1;
+    if (s_fast_force >= 0)
+        return s_fast_force;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_FAST");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static float s_u8f[256];                 /* k / 255.0f, as rc_unpack has it */
+
+static void fast_init_tables(void)
+{
+    static int done;
+    int k;
+    if (done)
+        return;
+    for (k = 0; k < 256; k++)
+        s_u8f[k] = (float)k / 255.0f;
+    done = 1;
+}
+
+static void rc_unpack_fast(uint32_t c, float o[4])
+{
+    o[0] = s_u8f[(c >> 16) & 0xFF];
+    o[1] = s_u8f[(c >>  8) & 0xFF];
+    o[2] = s_u8f[ c        & 0xFF];
+    o[3] = s_u8f[ c >> 24        ];
+}
+
+/* (a) ------------------------------------------------------------------- */
+#define TC_ENTRIES   32
+#define TC_TILE_LOG  3
+#define TC_MAX_TEXELS (2048u * 2048u)
+
+typedef struct {
+    uint32_t offset, color, width, height, pitch;   /* key */
+    uint32_t gen, used;
+    uint64_t fp;
+    uint32_t *texels;
+    uint8_t  *tile_ok;
+    uint32_t tiles_x, tiles_y, cap_texels, cap_tiles;
+    int      live;
+} TexCacheEntry;
+
+static TexCacheEntry  s_tc[TC_ENTRIES];
+static TexCacheEntry *s_stage_tc[4];
+static uint32_t       s_tc_clock;
+static uint64_t       s_tc_tiles_filled, s_tc_refp, s_tc_dropped, s_tc_binds;
+
+/* Bytes per texel of a format sample_tex reads directly, 0 if it does not. */
+static uint32_t tc_texel_bytes(uint32_t lin)
+{
+    switch (lin) {
+    case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
+    case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25: return 2;
+    case 0x13: case 0x1F: return 1;
+    default: return 0;
+    }
+}
+
+/* Bytes the sampler can read for this texture, 0 if it is not cacheable. */
+static uint32_t tc_extent(const Texture *t)
+{
+    uint32_t bb = d3d8_format_dxt_block_bytes(t->color), tb;
+    if (!t->valid || !t->width || !t->height
+            || (uint64_t)t->width * t->height > TC_MAX_TEXELS)
+        return 0;
+    if (bb)
+        return ((t->width + 3u) / 4u) * ((t->height + 3u) / 4u) * bb;
+    if (d3d8_format_is_swizzled(t->color)) {
+        tb = tc_texel_bytes(linear_twin(t->color));
+        return tb ? t->width * t->height * tb : 0;
+    }
+    tb = tc_texel_bytes(t->color);
+    if (!tb || !t->pitch)
+        return 0;
+    return t->pitch * (t->height - 1u) + t->width * tb;
+}
+
+/* FNV-style, four independent lanes so it runs at memory speed. */
+static uint64_t tc_hash(const uint8_t *p, uint32_t n, uint64_t h)
+{
+    uint64_t l[4] = { h, h ^ 1u, h ^ 2u, h ^ 3u };
+    uint32_t i;
+    for (i = 0; i + 32 <= n; i += 32) {
+        uint64_t w[4];
+        memcpy(w, p + i, 32);
+        l[0] = (l[0] ^ w[0]) * 0x100000001B3ull;
+        l[1] = (l[1] ^ w[1]) * 0x100000001B3ull;
+        l[2] = (l[2] ^ w[2]) * 0x100000001B3ull;
+        l[3] = (l[3] ^ w[3]) * 0x100000001B3ull;
+    }
+    for (; i < n; i++)
+        l[0] = (l[0] ^ p[i]) * 0x100000001B3ull;
+    return (l[0] ^ (l[1] << 1) ^ (l[2] << 2) ^ (l[3] << 3)) * 0x100000001B3ull;
+}
+
+/* The texture's bytes, all of them.
+ *
+ * nv2a_pb_state.h's policy fingerprints the first and the last page, and
+ * RECOMP_PB_FAST_AB showed that is not enough for this title: the attract
+ * movie (YUY2, 1024x512 at 0x80FE0000) is letterboxed, so its first and last
+ * pages are black bars that never change while the picture between them
+ * does, and the cache kept showing an old frame. Hashing everything costs
+ * ~0.1 ms per megabyte per flip, and the textures here total about that. */
+static uint64_t tc_fingerprint(const Texture *t, uint32_t bytes)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset() + t->offset;
+    return tc_hash(mem, bytes, 0xCBF29CE484222325ull);
+}
+
+static TexCacheEntry *tc_bind(const Texture *t)
+{
+    uint32_t bytes = tc_extent(t), gen = s_gpu.flips, i, tiles;
+    TexCacheEntry *e = NULL, *victim = &s_tc[0];
+    uint64_t t0;
+
+    if (!bytes)
+        return NULL;
+    t0 = rt_now();
+    s_tc_binds++;
+    for (i = 0; i < TC_ENTRIES; i++) {
+        TexCacheEntry *c = &s_tc[i];
+        if (c->live && c->offset == t->offset && c->color == t->color
+                && c->width == t->width && c->height == t->height
+                && c->pitch == t->pitch) {
+            e = c;
+            break;
+        }
+        if (!c->live || (victim->live && c->used < victim->used))
+            victim = c;
+    }
+    if (e) {
+        if (e->gen != gen) {
+            uint64_t fp = tc_fingerprint(t, bytes);
+            s_tc_refp++;
+            if (fp != e->fp) {
+                memset(e->tile_ok, 0, e->tiles_x * e->tiles_y);
+                e->fp = fp;
+                s_tc_dropped++;
+            }
+            e->gen = gen;
+        }
+    } else {
+        e = victim;
+        tiles = ((t->width + 7u) >> TC_TILE_LOG) * ((t->height + 7u) >> TC_TILE_LOG);
+        if (e->cap_texels < t->width * t->height) {
+            uint32_t *n = (uint32_t *)realloc(e->texels, (size_t)t->width * t->height * 4u);
+            if (!n) { e->live = 0; s_rt.tex += rt_now() - t0; return NULL; }
+            e->texels = n;
+            e->cap_texels = t->width * t->height;
+        }
+        if (e->cap_tiles < tiles) {
+            uint8_t *n = (uint8_t *)realloc(e->tile_ok, tiles);
+            if (!n) { e->live = 0; s_rt.tex += rt_now() - t0; return NULL; }
+            e->tile_ok = n;
+            e->cap_tiles = tiles;
+        }
+        e->offset = t->offset; e->color = t->color;
+        e->width = t->width; e->height = t->height; e->pitch = t->pitch;
+        e->tiles_x = (t->width + 7u) >> TC_TILE_LOG;
+        e->tiles_y = (t->height + 7u) >> TC_TILE_LOG;
+        memset(e->tile_ok, 0, tiles);
+        e->fp = tc_fingerprint(t, bytes);
+        e->gen = gen;
+        e->live = 1;
+    }
+    e->used = ++s_tc_clock;
+    s_rt.tex += rt_now() - t0;
+    return e;
+}
+
+static void tc_fill(TexCacheEntry *e, const Texture *t, uint32_t tile)
+{
+    uint32_t x0 = (tile % e->tiles_x) << TC_TILE_LOG;
+    uint32_t y0 = (tile / e->tiles_x) << TC_TILE_LOG;
+    uint32_t x1 = x0 + 8u < e->width ? x0 + 8u : e->width;
+    uint32_t y1 = y0 + 8u < e->height ? y0 + 8u : e->height;
+    uint32_t x, y;
+    uint64_t t0 = rt_now();
+
+    for (y = y0; y < y1; y++)
+        for (x = x0; x < x1; x++) {
+            uint32_t texel = 0;
+            sample_tex(t, x, y, &texel);   /* cacheable formats always decode */
+            e->texels[(size_t)y * e->width + x] = texel;
+        }
+    e->tile_ok[tile] = 1;
+    s_tc_tiles_filled++;
+    s_rt.tex += rt_now() - t0;
+}
+
+/* stage_sample, reading texels from the cache when the stage has an entry. */
+static void stage_sample_fast(int n, const float tc[4], float o[4])
+{
+    TexCacheEntry *e = s_stage_tc[n];
+    int mode = s_stage_mode[n];
+    float s, t;
+    int iu, iv;
+    uint32_t tile;
+
+    if (!e || mode == 0 || mode == 4) {
+        stage_sample(n, tc, o);
+        return;
+    }
+    s = tc[0]; t = tc[1];
+    if (mode == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {   /* 2D projective */
+        s /= tc[3]; t /= tc[3];
+    }
+    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), s_stage_tex[n].width,  s_stage_tex[n].addr_u);
+    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), s_stage_tex[n].height, s_stage_tex[n].addr_v);
+    tile = ((uint32_t)iv >> TC_TILE_LOG) * e->tiles_x + ((uint32_t)iu >> TC_TILE_LOG);
+    if (!e->tile_ok[tile])
+        tc_fill(e, &s_stage_tex[n], tile);
+    rc_unpack_fast(e->texels[(size_t)iv * e->width + (uint32_t)iu], o);
+}
+
+/* (b) -------------------------------------------------------------------
+ *
+ * Inputs that read a register no pixel can change -- zero, the stage's two
+ * factor constants, fog when nothing writes it -- are mapped once, here, by
+ * the same rc_map, and become constants. The rest dispatch on their mapping
+ * once per input rather than once per component, and the output mapping once
+ * per stage. Values that no output and no sum consumes are not computed. */
+typedef struct {
+    uint8_t reg, alpha, map, cst;
+    float   cv[3];                       /* mapped value when cst */
+} RcIn;
+typedef struct {
+    uint8_t reg, alpha, inv, cst;
+    float   cv[3];
+} FcIn;
+typedef struct {
+    RcIn  rgb[4], a[4];
+    uint8_t ab, cd, sum, dot_ab, dot_cd, mux, op;
+    uint8_t aab, acd, asum, amux, aop, b2a_ab, b2a_cd;
+    uint8_t need_ab, need_cd, need_aab, need_acd, need_sel;
+} RcStage;
+
+static struct {
+    uint32_t stages;
+    int      mux_msb;
+    RcStage  st[8];
+    FcIn     e, f, a, b, c, d, g;
+    int      v1_inv, r0_inv, sum_clamp;
+    float    tmpl[16][4];                /* register file at pixel start */
+    uint32_t dirty;                      /* registers reset between pixels */
+} s_rcp;
+
+/* Registers whose value at a stage's input is the same for every pixel. */
+static const float *rc_const_reg(uint32_t reg, const float f0[4], const float f1[4],
+                                 uint32_t written)
+{
+    if (reg == 0) return s_rcp.tmpl[0];
+    if (reg == 1) return f0;
+    if (reg == 2) return f1;
+    if (reg == 3 && !(written & (1u << 3))) return s_rcp.tmpl[3];
+    return NULL;
+}
+
+static RcIn rc_dec_in(uint32_t b, int alpha_port, const float f0[4],
+                      const float f1[4], uint32_t written)
+{
+    RcIn i;
+    const float *s;
+    int k;
+    memset(&i, 0, sizeof i);
+    i.reg = (uint8_t)(b & 0xF);
+    i.alpha = (uint8_t)((b & 0x10) != 0);
+    i.map = (uint8_t)((b >> 5) & 7);
+    s = rc_const_reg(i.reg, f0, f1, written);
+    if (s) {
+        i.cst = 1;
+        if (alpha_port)
+            i.cv[0] = rc_map(i.alpha ? s[3] : s[2], i.map);
+        else
+            for (k = 0; k < 3; k++)
+                i.cv[k] = rc_map(i.alpha ? s[3] : s[k], i.map);
+    }
+    return i;
+}
+
+static FcIn fc_dec_in(uint32_t b, const float sf0[4], const float sf1[4],
+                      uint32_t written, int g_port)
+{
+    FcIn i;
+    const float *s;
+    int k;
+    memset(&i, 0, sizeof i);
+    i.reg = (uint8_t)(b & 0xF);
+    i.alpha = (uint8_t)((b & 0x10) != 0);
+    i.inv = (uint8_t)((b & 0x20) != 0);
+    s = rc_const_reg(i.reg, sf0, sf1, written);
+    if (s) {
+        i.cst = 1;
+        if (g_port) {
+            float G = clamp01(i.alpha ? s[3] : s[2]);
+            if (i.inv) G = 1.0f - G;
+            i.cv[0] = G;
+        } else {
+            for (k = 0; k < 3; k++) {
+                float x = clamp01(i.alpha ? s[3] : s[k]);
+                i.cv[k] = i.inv ? 1.0f - x : x;
+            }
+        }
+    }
+    return i;
+}
+
+static void rc_plan_build(void)
+{
+    uint32_t s, k, written = 0;
+    int uniq0 = (s_vsh.rc_ctl >> 12) & 1, uniq1 = (s_vsh.rc_ctl >> 16) & 1;
+    float f0[8][4], f1[8][4], sf0[4], sf1[4];
+
+    memset(&s_rcp, 0, sizeof s_rcp);
+    /* What the reference loop builds before sampling: zeros, and fog in r3. */
+    rc_unpack(s_vsh.fog_color, s_rcp.tmpl[3]);
+    { float t_ = s_rcp.tmpl[3][0]; s_rcp.tmpl[3][0] = s_rcp.tmpl[3][2]; s_rcp.tmpl[3][2] = t_; }
+    s_rcp.tmpl[3][3] = 1.0f;
+
+    s_rcp.stages = s_vsh.rc_ctl & 0xFF;
+    if (s_rcp.stages > 8)
+        s_rcp.stages = 8;
+    s_rcp.mux_msb = (s_vsh.rc_ctl >> 8) & 1;
+    /* Everything any stage writes, first, so fog is only folded if it is
+     * never overwritten. */
+    for (s = 0; s < s_rcp.stages; s++) {
+        uint32_t ocw = s_vsh.rc_cocw[s], aocw = s_vsh.rc_aocw[s];
+        written |= (1u << ((ocw >> 4) & 0xF)) | (1u << (ocw & 0xF))
+                 | (1u << ((ocw >> 8) & 0xF)) | (1u << ((aocw >> 4) & 0xF))
+                 | (1u << (aocw & 0xF)) | (1u << ((aocw >> 8) & 0xF));
+        rc_unpack(s_vsh.rc_f0[uniq0 ? s : 0], f0[s]);
+        rc_unpack(s_vsh.rc_f1[uniq1 ? s : 0], f1[s]);
+    }
+    written &= ~1u;
+    s_rcp.dirty = written | (1u << 12) | (1u << 14) | (1u << 15);
+
+    for (s = 0; s < s_rcp.stages; s++) {
+        RcStage *p = &s_rcp.st[s];
+        uint32_t icw = s_vsh.rc_cicw[s], ocw = s_vsh.rc_cocw[s];
+        uint32_t aicw = s_vsh.rc_aicw[s], aocw = s_vsh.rc_aocw[s];
+        for (k = 0; k < 4; k++) {
+            p->rgb[k] = rc_dec_in((icw >> (24 - 8 * k)) & 0xFF, 0, f0[s], f1[s], written);
+            p->a[k]   = rc_dec_in((aicw >> (24 - 8 * k)) & 0xFF, 1, f0[s], f1[s], written);
+        }
+        p->dot_ab = (uint8_t)((ocw >> 13) & 1);
+        p->dot_cd = (uint8_t)((ocw >> 12) & 1);
+        p->mux    = (uint8_t)((ocw >> 14) & 1);
+        p->op     = (uint8_t)((ocw >> 15) & 7);
+        p->ab     = (uint8_t)((ocw >> 4) & 0xF);
+        p->cd     = (uint8_t)( ocw       & 0xF);
+        p->sum    = (uint8_t)((ocw >> 8) & 0xF);
+        p->b2a_ab = (uint8_t)(((ocw >> 19) & 1) && p->ab);
+        p->b2a_cd = (uint8_t)(((ocw >> 18) & 1) && p->cd);
+        p->amux   = (uint8_t)((aocw >> 12) & 1);
+        p->aop    = (uint8_t)((aocw >> 13) & 7);
+        p->aab    = (uint8_t)((aocw >> 4) & 0xF);
+        p->acd    = (uint8_t)( aocw       & 0xF);
+        p->asum   = (uint8_t)((aocw >> 8) & 0xF);
+        p->need_ab  = p->ab || p->sum;
+        p->need_cd  = p->cd || p->sum;
+        p->need_aab = p->aab || p->asum;
+        p->need_acd = p->acd || p->asum;
+        p->need_sel = (p->sum && p->mux) || (p->asum && p->amux);
+    }
+    {
+        uint32_t c0 = s_vsh.rc_fcw0, c1 = s_vsh.rc_fcw1;
+        rc_unpack(s_vsh.rc_sf[0], sf0);
+        rc_unpack(s_vsh.rc_sf[1], sf1);
+        s_rcp.e = fc_dec_in((c1 >> 24) & 0xFF, sf0, sf1, written, 0);
+        s_rcp.f = fc_dec_in((c1 >> 16) & 0xFF, sf0, sf1, written, 0);
+        s_rcp.g = fc_dec_in((c1 >> 8) & 0xFF, sf0, sf1, written, 1);
+        s_rcp.a = fc_dec_in((c0 >> 24) & 0xFF, sf0, sf1, written, 0);
+        s_rcp.b = fc_dec_in((c0 >> 16) & 0xFF, sf0, sf1, written, 0);
+        s_rcp.c = fc_dec_in((c0 >> 8) & 0xFF, sf0, sf1, written, 0);
+        s_rcp.d = fc_dec_in( c0       & 0xFF, sf0, sf1, written, 0);
+        s_rcp.v1_inv = (c1 & 0x20) != 0;
+        s_rcp.r0_inv = (c1 & 0x40) != 0;
+        s_rcp.sum_clamp = (c1 & 0x80) != 0;
+    }
+}
+
+/* rc_map with the mapping known: the switch inside it folds away. */
+#define RC_MAP_ALL(map, X, N, OUT) do { int k_; switch (map) { \
+    case 0: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 0); break; \
+    case 1: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 1); break; \
+    case 2: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 2); break; \
+    case 3: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 3); break; \
+    case 4: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 4); break; \
+    case 5: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 5); break; \
+    case 6: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 6); break; \
+    default: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 7); break; \
+    } } while (0)
+
+static inline const float *rc_in_rgb_fast(float r[16][4], const RcIn *in, float v[3])
+{
+    const float *s;
+    float x[3];
+    if (in->cst)
+        return in->cv;
+    s = r[in->reg];
+    if (in->alpha) x[0] = x[1] = x[2] = s[3];
+    else { x[0] = s[0]; x[1] = s[1]; x[2] = s[2]; }
+    RC_MAP_ALL(in->map, x, 3, v);
+    return v;
+}
+
+static inline float rc_in_a_fast(float r[16][4], const RcIn *in)
+{
+    const float *s;
+    float x, v;
+    if (in->cst)
+        return in->cv[0];
+    s = r[in->reg];
+    x = in->alpha ? s[3] : s[2];
+    RC_MAP_ALL(in->map, &x, 1, &v);
+    return v;
+}
+
+/* rc_op on three values, the output mapping known. */
+static inline void rc_op3(float v[3], uint32_t op)
+{
+    int k;
+    switch (op) {
+    case 1:  for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 1); break;
+    case 2:  for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 2); break;
+    case 3:  for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 3); break;
+    case 4:  for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 4); break;
+    case 6:  for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 6); break;
+    default: for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 0); break;
+    }
+}
+
+static inline const float *fc_in_fast(float r[16][4], const FcIn *in, float v[3])
+{
+    const float *s;
+    int k;
+    if (in->cst)
+        return in->cv;
+    s = r[in->reg];
+    for (k = 0; k < 3; k++) {
+        float x = clamp01(in->alpha ? s[3] : s[k]);
+        v[k] = in->inv ? 1.0f - x : x;
+    }
+    return v;
+}
+
+/* rc_eval, on the plan. The same operations on the same values, in place:
+ * every input of a stage is read before any of its outputs is written. */
+static void rc_eval_fast(float r[16][4], float out[4])
+{
+    float Ab[3], Bb[3], Cb[3], Db[3], Eb[3], Fb[3];
+    const float *A, *B, *C, *D, *E, *F;
+    uint32_t s;
+    int k;
+
+    for (s = 0; s < s_rcp.stages; s++) {
+        const RcStage *p = &s_rcp.st[s];
+        float ab[3], cd[3], sum[3], aab = 0.0f, acd = 0.0f, asum = 0.0f;
+        int sel = 0;
+
+        if (p->need_sel)
+            sel = s_rcp.mux_msb ? r[12][3] >= 0.5f
+                                : (((uint32_t)(clamp01(r[12][3]) * 255.0f + 0.5f)) & 1u);
+        if (p->need_ab) {
+            A = rc_in_rgb_fast(r, &p->rgb[0], Ab);
+            B = rc_in_rgb_fast(r, &p->rgb[1], Bb);
+            if (p->dot_ab) {
+                float d = A[0]*B[0] + A[1]*B[1] + A[2]*B[2];
+                ab[0] = ab[1] = ab[2] = d;
+            } else {
+                for (k = 0; k < 3; k++) ab[k] = A[k] * B[k];
+            }
+        }
+        if (p->need_cd) {
+            C = rc_in_rgb_fast(r, &p->rgb[2], Cb);
+            D = rc_in_rgb_fast(r, &p->rgb[3], Db);
+            if (p->dot_cd) {
+                float d = C[0]*D[0] + C[1]*D[1] + C[2]*D[2];
+                cd[0] = cd[1] = cd[2] = d;
+            } else {
+                for (k = 0; k < 3; k++) cd[k] = C[k] * D[k];
+            }
+        }
+        if (p->sum) {
+            for (k = 0; k < 3; k++)
+                sum[k] = p->mux ? (sel ? cd[k] : ab[k]) : ab[k] + cd[k];
+            rc_op3(sum, p->op);
+        }
+        if (p->ab) rc_op3(ab, p->op);
+        if (p->cd) rc_op3(cd, p->op);
+
+        /* Alpha inputs are read before any output lands. */
+        if (p->need_aab)
+            aab = rc_in_a_fast(r, &p->a[0]) * rc_in_a_fast(r, &p->a[1]);
+        if (p->need_acd)
+            acd = rc_in_a_fast(r, &p->a[2]) * rc_in_a_fast(r, &p->a[3]);
+        if (p->asum)
+            asum = p->amux ? (sel ? acd : aab) : aab + acd;
+
+        if (p->ab)  memcpy(r[p->ab], ab, sizeof ab);
+        if (p->cd)  memcpy(r[p->cd], cd, sizeof cd);
+        if (p->sum) memcpy(r[p->sum], sum, sizeof sum);
+        if (p->aab)  r[p->aab][3]  = rc_op(aab,  p->aop);
+        if (p->acd)  r[p->acd][3]  = rc_op(acd,  p->aop);
+        if (p->asum) r[p->asum][3] = rc_op(asum, p->aop);
+        if (p->b2a_ab) r[p->ab][3] = ab[2];
+        if (p->b2a_cd) r[p->cd][3] = cd[2];
+    }
+
+    {
+        float v1[3], r0[3], G;
+        E = fc_in_fast(r, &s_rcp.e, Eb);
+        F = fc_in_fast(r, &s_rcp.f, Fb);
+        for (k = 0; k < 3; k++) {
+            v1[k] = clamp01(r[5][k]);  if (s_rcp.v1_inv) v1[k] = 1.0f - v1[k];
+            r0[k] = clamp01(r[12][k]); if (s_rcp.r0_inv) r0[k] = 1.0f - r0[k];
+            r[14][k] = v1[k] + r0[k];
+            if (s_rcp.sum_clamp) r[14][k] = clamp01(r[14][k]);
+            r[15][k] = E[k] * F[k];
+        }
+        r[14][3] = r[15][3] = 0.0f;
+        A = fc_in_fast(r, &s_rcp.a, Ab); B = fc_in_fast(r, &s_rcp.b, Bb);
+        C = fc_in_fast(r, &s_rcp.c, Cb); D = fc_in_fast(r, &s_rcp.d, Db);
+        if (s_rcp.g.cst) {
+            G = s_rcp.g.cv[0];
+        } else {
+            const float *sg = r[s_rcp.g.reg];
+            G = clamp01(s_rcp.g.alpha ? sg[3] : sg[2]);
+            if (s_rcp.g.inv) G = 1.0f - G;
+        }
+        for (k = 0; k < 3; k++)
+            out[k] = clamp01(A[k] * B[k] + (1.0f - A[k]) * C[k] + D[k]);
+        out[3] = G;
+    }
+}
+
+/* (c) ------------------------------------------------------------------- */
+
+/* An edge function at column x of a row, exactly as raster_tri_xf has it:
+ * (dx) * (py - vy) - (dy) * (px - vx), with py - vy passed in as `p`. */
+#define EDGE_AT(dx, p, dy, vx, x) ((dx) * (p) - (dy) * (((float)(x) + 0.5f) - (vx)))
+
+/* First column in [lo, hi] at which a predicate that is true on a prefix of
+ * the row turns false (hi if it never does), starting from an estimate. The
+ * walk makes the answer exact whatever the estimate; the estimate only makes
+ * it short. */
+#define PREFIX_END(pred, est, lo, hi, out) do { \
+        int b_ = (est); \
+        if (b_ < (lo)) b_ = (lo); \
+        if (b_ > (hi)) b_ = (hi); \
+        while (b_ > (lo) && !(pred(b_ - 1))) b_--; \
+        while (b_ < (hi) && (pred(b_))) b_++; \
+        (out) = b_; } while (0)
+
+/* Columns of [lo, hi) where one edge is >= 0 (sign > 0) or <= 0 (sign < 0),
+ * as [*a, *b). An edge function is monotonic along a row, so this is one
+ * interval. */
+static void edge_interval(float dx, float p, float dy, float vx, int sign,
+                          int lo, int hi, int *a, int *b)
+{
+    int end, est;
+    double root;
+
+    if (dy == 0.0f) {                     /* constant along the row */
+        float w = EDGE_AT(dx, p, dy, vx, lo);
+        int in = sign > 0 ? w >= 0 : w <= 0;
+        *a = lo; *b = in ? hi : lo;
+        return;
+    }
+    /* w(x) = 0 at px = vx + dx*p/dy. */
+    root = (double)vx + (double)dx * (double)p / (double)dy - 0.5;
+    if (root < (double)lo - 1.0) est = lo;
+    else if (root > (double)hi + 1.0) est = hi;
+    else est = (int)floor(root) + 1;
+
+    /* dy > 0: w falls with x; dy < 0: it rises. */
+    if ((dy > 0.0f) == (sign > 0)) {
+        /* the predicate holds on a prefix */
+#define P_(x) (sign > 0 ? EDGE_AT(dx, p, dy, vx, (x)) >= 0 : EDGE_AT(dx, p, dy, vx, (x)) <= 0)
+        PREFIX_END(P_, est, lo, hi, end);
+        *a = lo; *b = end;
+    } else {
+        /* on a suffix: it ends where its negation's prefix ends */
+#define N_(x) (!P_(x))
+        PREFIX_END(N_, est, lo, hi, end);
+        *a = end; *b = hi;
+#undef N_
+#undef P_
+    }
+}
+
+static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c,
+                               int textured)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = surface_bpp();
+    float area, inv_w[3], zscale = 1.0f / vsh_zmax();
+    int minx, maxx, miny, maxy, x, y, use_z, use_rc, n, unit_w;
+    float e0dx, e0dy, e1dx, e1dy, e2dx, e2dy;
+    float r[16][4];
+
+    if (bpp != 4 && bpp != 2)
+        return;
+    if (!a->ok || !b->ok || !c->ok) {
+        s_vsh.tris_clipped++;
+        return;
+    }
+    area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
+    if (area == 0.0f)
+        return;
+    if (s_vsh.cull_enable) {
+        int cw = area > 0.0f;
+        int front = (s_vsh.front_face == 0x900) ? cw : !cw;
+        if (getenv("RECOMP_PB_CULL_FLIP"))
+            front = !front;
+        if ((s_vsh.cull_face == 0x405 && !front)
+         || (s_vsh.cull_face == 0x404 && front)
+         || s_vsh.cull_face == 0x408) {
+            s_vsh.tris_culled++;
+            return;
+        }
+    }
+    if (!surface_begin_batch(mem))
+        return;
+    use_z = s_vsh.depth_enable && vsh_zbuf_ready();
+    use_rc = vsh_rc_active();
+
+    minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
+    maxx = (int)ceilf (fmaxf(a->x, fmaxf(b->x, c->x)));
+    miny = (int)floorf(fminf(a->y, fminf(b->y, c->y)));
+    maxy = (int)ceilf (fmaxf(a->y, fmaxf(b->y, c->y)));
+    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
+    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
+    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
+    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (minx >= maxx || miny >= maxy) {
+        s_gpu.tris_skipped_offscreen++;
+        return;
+    }
+
+    inv_w[0] = 1.0f / a->w; inv_w[1] = 1.0f / b->w; inv_w[2] = 1.0f / c->w;
+    unit_w = a->w == 1.0f && b->w == 1.0f && c->w == 1.0f;
+    e0dx = b->x - a->x; e0dy = b->y - a->y;
+    e1dx = c->x - b->x; e1dy = c->y - b->y;
+    e2dx = a->x - c->x; e2dy = a->y - c->y;
+    if (use_rc)
+        memcpy(r, s_rcp.tmpl, sizeof r);
+
+    for (y = miny; y < maxy; y++) {
+        float py = (float)y + 0.5f;
+        float p0 = py - a->y, p1 = py - b->y, p2 = py - c->y;
+        int lo, hi, ga, gb, la_, lb_, ia, ib;
+
+        /* Columns where all three are >= 0, and where all three are <= 0. */
+        edge_interval(e0dx, p0, e0dy, a->x, 1, minx, maxx, &ga, &gb);
+        edge_interval(e1dx, p1, e1dy, b->x, 1, ga, gb > ga ? gb : ga, &ia, &ib);
+        ga = ia; gb = ib;
+        if (gb > ga) {
+            edge_interval(e2dx, p2, e2dy, c->x, 1, ga, gb, &ia, &ib);
+            ga = ia; gb = ib;
+        }
+        edge_interval(e0dx, p0, e0dy, a->x, -1, minx, maxx, &la_, &lb_);
+        if (lb_ > la_) {
+            edge_interval(e1dx, p1, e1dy, b->x, -1, la_, lb_, &ia, &ib);
+            la_ = ia; lb_ = ib;
+        }
+        if (lb_ > la_) {
+            edge_interval(e2dx, p2, e2dy, c->x, -1, la_, lb_, &ia, &ib);
+            la_ = ia; lb_ = ib;
+        }
+        if (gb <= ga && lb_ <= la_)
+            continue;
+        if (gb <= ga)        { lo = la_; hi = lb_; }
+        else if (lb_ <= la_) { lo = ga;  hi = gb;  }
+        else { lo = ga < la_ ? ga : la_; hi = gb > lb_ ? gb : lb_; }
+
+        for (x = lo; x < hi; x++) {
+            float px = (float)x + 0.5f;
+            float w0 = e0dx * p0 - e0dy * (px - a->x);
+            float w1 = e1dx * p1 - e1dy * (px - b->x);
+            float w2 = e2dx * p2 - e2dy * (px - c->x);
+            float la, lb, lc, pa, pb, pc, ps, col[4], z = 0.0f;
+            float *zp = NULL;
+            uint32_t argb;
+            int k;
+
+            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
+               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                continue;
+            la = w1 / area; lb = w2 / area; lc = w0 / area;
+
+            if (use_z) {
+                z = (la * a->z + lb * b->z + lc * c->z) * zscale;
+                zp = &s_zbuf[(size_t)y * s_zbuf_w + (size_t)x];
+                if (!depth_pass(z, *zp)) {
+                    s_vsh.z_rejected++;
+                    continue;
+                }
+            }
+
+            if (unit_w) {
+                pa = la; pb = lb; pc = lc;           /* x * (1/1) == x */
+            } else {
+                pa = la * inv_w[0]; pb = lb * inv_w[1]; pc = lc * inv_w[2];
+            }
+            ps = pa + pb + pc;
+            if (ps != 0.0f && ps != 1.0f) { pa /= ps; pb /= ps; pc /= ps; }
+
+            for (k = 0; k < 4; k++)
+                col[k] = pa * a->d0[k] + pb * b->d0[k] + pc * c->d0[k];
+
+            if (use_rc) {
+                float tc[4];
+                uint32_t d = s_rcp.dirty;
+                while (d) {
+                    int reg = __builtin_ctz(d);
+                    memcpy(r[reg], s_rcp.tmpl[reg], sizeof r[reg]);
+                    d &= d - 1;
+                }
+                memcpy(r[4], col, sizeof col);
+                for (k = 0; k < 4; k++)
+                    r[5][k] = pa * a->d1[k] + pb * b->d1[k] + pc * c->d1[k];
+                for (n = 0; n < 4; n++) {
+                    if (!s_stage_mode[n])
+                        continue;
+                    for (k = 0; k < 4; k++)
+                        tc[k] = pa * a->t[n][k] + pb * b->t[n][k] + pc * c->t[n][k];
+                    stage_sample_fast(n, tc, r[8 + n]);
+                }
+                r[12][3] = r[8][3];
+                rc_eval_fast(r, col);
+            } else if (textured) {
+                float tc[4], tx[4];
+                for (k = 0; k < 4; k++)
+                    tc[k] = pa * a->t[0][k] + pb * b->t[0][k] + pc * c->t[0][k];
+                if (s_stage_mode[0]) {
+                    stage_sample_fast(0, tc, tx);
+                    for (k = 0; k < 4; k++)
+                        col[k] *= tx[k];
+                }
+            }
+            if (s_vsh.atest_enable && !alpha_test_pass(col[3])) {
+                s_vsh.a_rejected++;
+                continue;
+            }
+            if (use_z && s_vsh.depth_mask)
+                *zp = z;
+            argb = ((uint32_t)(clamp01(col[3]) * 255.0f + 0.5f) << 24)
+                 | ((uint32_t)(clamp01(col[0]) * 255.0f + 0.5f) << 16)
+                 | ((uint32_t)(clamp01(col[1]) * 255.0f + 0.5f) <<  8)
+                 |  (uint32_t)(clamp01(col[2]) * 255.0f + 0.5f);
+            put_pixel(mem, bpp, x, y, argb);
+        }
+    }
+    s_vsh.tris++;
+    s_gpu.tris_drawn++;
+    s_gpu.drawn_offset = s_gpu.color_offset;
+}
+
+/* Per-batch setup for the fast path: cache entries for the sampled stages and
+ * the combiner plan. */
+static void fast_batch_setup(void)
+{
+    int n;
+    fast_init_tables();
+    for (n = 0; n < 4; n++) {
+        int mode = s_stage_mode[n];
+        s_stage_tc[n] = (mode != 0 && mode != 4) ? tc_bind(&s_stage_tex[n]) : NULL;
+    }
+    if (vsh_rc_active())
+        rc_plan_build();
+}
+
 #define NV097_SET_TEXTURE_CONTROL0_M 0x1B0C
 
-static void raster_batch_vsh(void)
+static void raster_batch_vsh_one(void)
 {
     static XfVert xv[NV_MAX_INDICES];
     uint32_t i, n = s_gpu.idx_count, a;
     uint32_t before = s_gpu.tris_drawn, plen;
-    int textured;
+    int textured, fast = pb_fast();
 
     s_vsh.batches_prog++;
     plen = vsh_note_program();
@@ -2150,8 +2993,12 @@ static void raster_batch_vsh(void)
         if (s_gpu.attr[a].size)
             s_vsh.fmt_seen[a][s_gpu.attr[a].type & 7]++;
 
-    for (i = 0; i < n; i++)
-        vsh_transform(s_gpu.idx[i], &xv[i]);
+    {
+        uint64_t t0 = rt_now();
+        for (i = 0; i < n; i++)
+            vsh_transform(s_gpu.idx[i], &xv[i]);
+        s_rt.xform += rt_now() - t0;
+    }
     if (getenv("RECOMP_VSH_ZLOG") && s_vsh.batches_prog < 1200 && n)
         fprintf(stderr, "  [ZLOG] batch %u colour 0x%X depth %d func 0x%X mask %d"
                         " poly %d %g %g | v0 z %g w %g tex 0x%X fmt %02X\n",
@@ -2183,8 +3030,13 @@ static void raster_batch_vsh(void)
         uint32_t ctl0 = s_tex_reg[(NV097_SET_TEXTURE_CONTROL0_M - NV_TEX_FIRST) / 4];
         int stage_on = !s_tex_set[(NV097_SET_TEXTURE_CONTROL0_M - NV_TEX_FIRST) / 4]
                     || (ctl0 & (1u << 30));
+        uint64_t t0 = rt_now();
         textured = stage_on && s_gpu.tex.valid;
         vsh_build_stages();
+        if (s_stage_mode[0] && (s_stage_tex[0].color == 0x24 || s_stage_tex[0].color == 0x25))
+            s_rt.yuv_batches++;
+        if (fast)
+            fast_batch_setup();
         if (vsh_rc_active()) s_vsh.batches_rc++; else s_vsh.batches_norc++;
         if (textured) {
             s_gpu.batches_textured++;
@@ -2192,43 +3044,47 @@ static void raster_batch_vsh(void)
         } else {
             s_gpu.batches_no_tex++;
         }
+        s_rt.setup += rt_now() - t0;
     }
 
+#define RASTER_TRI(p, q, r_, t) (fast ? raster_tri_xf_fast(p, q, r_, t) \
+                                    : raster_tri_xf(p, q, r_, t))
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
-            raster_tri_xf(&xv[i], &xv[i+1], &xv[i+2], textured);
+            RASTER_TRI(&xv[i], &xv[i+1], &xv[i+2], textured);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
         /* Odd triangles of a strip are wound the other way; swap two of them
          * back so culling sees one winding for the whole strip. */
         for (i = 0; i + 2 < n; i++) {
             if (i & 1)
-                raster_tri_xf(&xv[i+1], &xv[i], &xv[i+2], textured);
+                RASTER_TRI(&xv[i+1], &xv[i], &xv[i+2], textured);
             else
-                raster_tri_xf(&xv[i], &xv[i+1], &xv[i+2], textured);
+                RASTER_TRI(&xv[i], &xv[i+1], &xv[i+2], textured);
         }
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
         for (i = 1; i + 1 < n; i++)
-            raster_tri_xf(&xv[0], &xv[i], &xv[i+1], textured);
+            RASTER_TRI(&xv[0], &xv[i], &xv[i+1], textured);
         break;
     case NV_PRIM_QUADS:
         for (i = 0; i + 3 < n; i += 4) {
-            raster_tri_xf(&xv[i], &xv[i+1], &xv[i+2], textured);
-            raster_tri_xf(&xv[i], &xv[i+2], &xv[i+3], textured);
+            RASTER_TRI(&xv[i], &xv[i+1], &xv[i+2], textured);
+            RASTER_TRI(&xv[i], &xv[i+2], &xv[i+3], textured);
         }
         break;
     case NV_PRIM_QUAD_STRIP:
         for (i = 0; i + 3 < n; i += 2) {
-            raster_tri_xf(&xv[i], &xv[i+1], &xv[i+3], textured);
-            raster_tri_xf(&xv[i], &xv[i+3], &xv[i+2], textured);
+            RASTER_TRI(&xv[i], &xv[i+1], &xv[i+3], textured);
+            RASTER_TRI(&xv[i], &xv[i+3], &xv[i+2], textured);
         }
         break;
     default:
         break;
     }
+#undef RASTER_TRI
     if (textured)
         s_vsh.tris_textured += s_gpu.tris_drawn - before;
 
@@ -2263,6 +3119,141 @@ static void raster_batch_vsh(void)
         }
     }
 }
+
+/* RECOMP_PB_FAST_AB=1: every program-mode batch twice, from the same starting
+ * surface and depth buffer -- the reference loop, then RECOMP_PB_FAST -- and
+ * the two compared byte for byte (colour surface), bit for bit (depth) and
+ * counter for counter. The fast result is kept. Per batch rather than per
+ * frame because runs are not deterministic per flip index.
+ *
+ * ponytail: the texture-use and program tables count each batch twice. */
+static uint64_t s_fab_batches, s_fab_bad, s_fab_bad_px, s_fab_bad_z, s_fab_bad_ctr;
+
+static void fast_ab_summary(const char *why)
+{
+    fprintf(stderr, "[FAST-AB] %s: %llu batches compared, %llu mismatched"
+                    " (%llu px, %llu with depth, %llu with counters);"
+                    " cache %llu binds, %llu refingerprints, %llu dropped,"
+                    " %llu tiles decoded\n", why,
+            (unsigned long long)s_fab_batches, (unsigned long long)s_fab_bad,
+            (unsigned long long)s_fab_bad_px, (unsigned long long)s_fab_bad_z,
+            (unsigned long long)s_fab_bad_ctr, (unsigned long long)s_tc_binds,
+            (unsigned long long)s_tc_refp, (unsigned long long)s_tc_dropped,
+            (unsigned long long)s_tc_tiles_filled);
+}
+
+static void raster_batch_fast_ab(void)
+{
+    static uint8_t *save, *ref;
+    static float *zsave, *zref;
+    static size_t cap, zcap;
+    static struct nv2a_pb_gpu gpu0, gpu_ref;
+    static struct nv2a_pb_vsh vsh0, vsh_ref;
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    size_t size = (size_t)(s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch, zn = 0, k;
+    uint32_t bpp = surface_bpp(), bad_px = 0, first = 0;
+    int dumps = s_drawn_dumps, zbad, cbad;
+
+    if (!size || !surface_begin_batch(mem) || (bpp != 4 && bpp != 2)) {
+        raster_batch_vsh_one();
+        return;
+    }
+    if (size > cap) {
+        save = (uint8_t *)realloc(save, size);
+        ref  = (uint8_t *)realloc(ref, size);
+        cap = save && ref ? size : 0;
+        if (!cap) { raster_batch_vsh_one(); return; }
+    }
+    if (s_vsh.depth_enable && vsh_zbuf_ready())
+        zn = (size_t)s_zbuf_w * s_zbuf_h;
+    if (zn > zcap) {
+        zsave = (float *)realloc(zsave, zn * sizeof(float));
+        zref  = (float *)realloc(zref, zn * sizeof(float));
+        zcap = zsave && zref ? zn : 0;
+        if (!zcap) { raster_batch_vsh_one(); return; }
+    }
+    memcpy(save, s_surface, size);
+    if (zn) memcpy(zsave, s_zbuf, zn * sizeof(float));
+    gpu0 = s_gpu; vsh0 = s_vsh;
+
+    /* reference */
+    s_fast_force = 0;
+    s_drawn_dumps = FB_DUMP_AFTER_DRAW;
+    s_vsh.dumps_3d = 12;
+    raster_batch_vsh_one();
+    s_drawn_dumps = dumps;
+    surface_begin_batch(mem);
+    memcpy(ref, s_surface, size);
+    if (zn) memcpy(zref, s_zbuf, zn * sizeof(float));
+    gpu_ref = s_gpu; vsh_ref = s_vsh;
+
+    /* fast, from the same start */
+    memcpy(s_surface, save, size);
+    if (zn) memcpy(s_zbuf, zsave, zn * sizeof(float));
+    s_gpu = gpu0; s_vsh = vsh0;
+    s_fast_force = 1;
+    raster_batch_vsh_one();
+    s_fast_force = -1;
+    surface_begin_batch(mem);
+
+    s_fab_batches++;
+    if (memcmp(ref, s_surface, size))
+        for (k = 0; k + bpp <= size; k += bpp)
+            if (memcmp(ref + k, s_surface + k, bpp)) {
+                if (!bad_px++) first = (uint32_t)k;
+            }
+    zbad = zn && memcmp(zref, s_zbuf, zn * sizeof(float));
+    cbad = gpu_ref.pixels != s_gpu.pixels || gpu_ref.pixel_max != s_gpu.pixel_max
+        || gpu_ref.tris_drawn != s_gpu.tris_drawn
+        || gpu_ref.tris_skipped_offscreen != s_gpu.tris_skipped_offscreen
+        || vsh_ref.tris != s_vsh.tris || vsh_ref.tris_culled != s_vsh.tris_culled
+        || vsh_ref.tris_clipped != s_vsh.tris_clipped
+        || vsh_ref.z_rejected != s_vsh.z_rejected
+        || vsh_ref.a_rejected != s_vsh.a_rejected;
+    if (bad_px || zbad || cbad) {
+        s_fab_bad++;
+        s_fab_bad_px += bad_px;
+        s_fab_bad_z += zbad != 0;
+        s_fab_bad_ctr += cbad != 0;
+        if (s_fab_bad <= 8) {
+            uint32_t rv = 0, fv = 0;
+            if (bad_px) { memcpy(&rv, ref + first, bpp); memcpy(&fv, s_surface + first, bpp); }
+            fprintf(stderr, "[FAST-AB] MISMATCH batch %llu flip %u prim %u n %u:"
+                            " %u px differ, first (%u, %u) ref 0x%08X fast 0x%08X;"
+                            " depth %s; counters %s (px %llu/%llu zrej %llu/%llu"
+                            " arej %llu/%llu tris %u/%u) | tex %08X fmt %02X %ux%u"
+                            " rc %d ctl 0x%X mode %d,%d,%d,%d\n",
+                    (unsigned long long)s_fab_batches, s_gpu.flips, s_gpu.prim,
+                    s_gpu.idx_count, bad_px,
+                    (uint32_t)((first % s_gpu.pitch) / bpp), (uint32_t)(first / s_gpu.pitch),
+                    rv, fv, zbad ? "DIFFERS" : "same", cbad ? "DIFFER" : "same",
+                    (unsigned long long)gpu_ref.pixels, (unsigned long long)s_gpu.pixels,
+                    (unsigned long long)vsh_ref.z_rejected, (unsigned long long)s_vsh.z_rejected,
+                    (unsigned long long)vsh_ref.a_rejected, (unsigned long long)s_vsh.a_rejected,
+                    vsh_ref.tris, s_vsh.tris,
+                    s_stage_tex[0].offset, s_stage_tex[0].color,
+                    s_stage_tex[0].width, s_stage_tex[0].height,
+                    vsh_rc_active(), s_vsh.rc_ctl,
+                    s_stage_mode[0], s_stage_mode[1], s_stage_mode[2], s_stage_mode[3]);
+        }
+    }
+    if (s_fab_batches % 2000 == 0)
+        fast_ab_summary("running");
+}
+
+static void raster_batch_vsh(void)
+{
+    static int ab = -1;
+    if (ab < 0) {
+        const char *e = getenv("RECOMP_PB_FAST_AB");
+        ab = e && e[0] && e[0] != '0';
+    }
+    if (ab)
+        raster_batch_fast_ab();
+    else
+        raster_batch_vsh_one();
+}
+
 
 static void vsh_report(void)
 {
@@ -2322,6 +3313,8 @@ static void vsh_report(void)
                 fprintf(stderr, " %u=%u", t, s_vsh.stage_mode_seen[a][t]);
         fprintf(stderr, "\n");
     }
+    if (s_fab_batches)
+        fast_ab_summary("total");
     if (s_vsh_ab_batches)
         fprintf(stderr, "[VSH] A/B vs screen-space path: %llu batches, %llu differ,"
                         " %llu px differ\n",
@@ -2566,8 +3559,10 @@ static void raster_batch(void)
  * default and reads s_gpu directly, so its on_draw ignores the descriptor. */
 static void cpu_on_draw(const struct nv2a_pb_draw *draw)
 {
+    uint64_t t0 = rt_now();
     (void)draw;
     raster_batch();
+    s_rt.total += rt_now() - t0;
 }
 
 /* Hand the window a copy of the frame just finished. Copying here, rather
@@ -3135,6 +4130,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         {
             static int on = -1;
             static uint32_t prev_b, prev_t;
+            static uint64_t prev_px, prev_zr;
             if (on < 0)
                 on = getenv("RECOMP_FLIP_LOG") != NULL;
             if (on) {
@@ -3143,10 +4139,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                    : s_gpu.color_offset;
                 fprintf(stderr, "[GPU] flip %u %lu ms fence 0x%08X batches %u"
-                        " tex %u presents 0x%08X\n", s_gpu.flips,
+                        " tex %u presents 0x%08X raster %.3f ms (xf %.3f setup"
+                        " %.3f texdec %.3f px %.3f) yuv %u wr %llu zrej %llu\n",
+                        s_gpu.flips,
                         xbox_log_ms(), s_sema_last_value, b - prev_b,
-                        s_gpu.batches_textured - prev_t, done);
+                        s_gpu.batches_textured - prev_t, done,
+                        s_rt.total / 1e6, s_rt.xform / 1e6, s_rt.setup / 1e6,
+                        s_rt.tex / 1e6,
+                        (double)(int64_t)(s_rt.total - s_rt.xform - s_rt.setup
+                                          - s_rt.tex) / 1e6,
+                        s_rt.yuv_batches,
+                        (unsigned long long)(s_gpu.pixels - prev_px),
+                        (unsigned long long)(s_vsh.z_rejected - prev_zr));
                 prev_b = b; prev_t = s_gpu.batches_textured;
+                prev_px = s_gpu.pixels; prev_zr = s_vsh.z_rejected;
+                memset(&s_rt, 0, sizeof s_rt);
             }
         }
         /* The first few always, so a log says whether flips happen at all
