@@ -136,7 +136,7 @@ static VsEntry s_vs[VS_MAX];
 
 #define BLEND_MAX 32
 typedef struct {
-    uint32_t          key[3];
+    uint32_t          key[4];
     ID3D11BlendState *bs;
 } BlendEntry;
 static BlendEntry s_blend[BLEND_MAX];
@@ -887,7 +887,7 @@ static D3D11_BLEND blend_factor(uint32_t gl, int alpha)
 static ID3D11BlendState *blend_state(void)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
-    uint32_t key[3];
+    uint32_t key[4];
     D3D11_BLEND_DESC bd;
     ID3D11BlendState *bs = NULL;
     int i;
@@ -895,6 +895,7 @@ static ID3D11BlendState *blend_state(void)
     key[0] = g->blend_enable ? 1 : 0;
     key[1] = key[0] ? g->blend_sfactor : 0;
     key[2] = key[0] ? g->blend_dfactor : 0;
+    key[3] = g->color_keep;             /* SET_COLOR_MASK, inverted */
     for (i = 0; i < s_blend_n; i++)
         if (!memcmp(s_blend[i].key, key, sizeof key))
             return s_blend[i].bs;
@@ -906,7 +907,11 @@ static ID3D11BlendState *blend_state(void)
     bd.RenderTarget[0].SrcBlendAlpha = blend_factor(key[1], 1);
     bd.RenderTarget[0].DestBlendAlpha = blend_factor(key[2], 1);
     bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    bd.RenderTarget[0].RenderTargetWriteMask = (UINT8)(
+        ((key[3] & 0x00FF0000u) ? 0 : D3D11_COLOR_WRITE_ENABLE_RED)
+      | ((key[3] & 0x0000FF00u) ? 0 : D3D11_COLOR_WRITE_ENABLE_GREEN)
+      | ((key[3] & 0x000000FFu) ? 0 : D3D11_COLOR_WRITE_ENABLE_BLUE)
+      | ((key[3] & 0xFF000000u) ? 0 : D3D11_COLOR_WRITE_ENABLE_ALPHA));
     if (!key[0]) {
         bd.RenderTarget[0].SrcBlend = bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
         bd.RenderTarget[0].DestBlend = bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;

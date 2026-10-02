@@ -202,6 +202,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define IMM_VERTEX_DWORDS 7
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
+#define NV097_SET_COLOR_MASK              0x0358
 
 /* GPU completion fences. D3D names a semaphore DMA object once, points the
  * semaphore at a word inside it once, and from then on asks the back end to
@@ -1304,6 +1305,8 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     } else {
         row = s_surface + (size_t)y * s_gpu.pitch;
     }
+    if (s_gpu.color_keep == 0xFFFFFFFFu)
+        return;                            /* SET_COLOR_MASK: no channel written */
     s_gpu.pixels++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
@@ -1367,11 +1370,22 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     }
 
     if (bpp == 4) {
+        uint32_t keep = s_gpu.color_keep;
+        if (keep)
+            argb = (argb & ~keep) | (((const uint32_t *)row)[x] & keep);
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {
-        ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
-                                        | ((argb >> 5) & 0x07E0)
-                                        | ((argb >> 3) & 0x001F));
+        uint16_t v = (uint16_t)(((argb >> 8) & 0xF800)
+                              | ((argb >> 5) & 0x07E0)
+                              | ((argb >> 3) & 0x001F));
+        uint32_t keep = s_gpu.color_keep;
+        if (keep & 0x00FFFFFFu) {
+            uint16_t k = (uint16_t)(((keep & 0x00FF0000u) ? 0xF800u : 0)
+                                  | ((keep & 0x0000FF00u) ? 0x07E0u : 0)
+                                  | ((keep & 0x000000FFu) ? 0x001Fu : 0));
+            v = (uint16_t)((v & ~k) | (((const uint16_t *)row)[x] & k));
+        }
+        ((uint16_t *)row)[x] = v;
     }
 }
 
@@ -5141,6 +5155,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_BLEND_FUNC_DFACTOR:
         s_gpu.blend_dfactor = param;
+        break;
+    case NV097_SET_COLOR_MASK:
+        /* One enable bit per channel (xemu pgraph.c): B bit 0, G bit 8,
+         * R bit 16, A bit 24. BLiNX 2 draws a stencil-only quad round the
+         * player with all four off; written anyway it is a white square. */
+        s_gpu.color_keep = ((param & (1u << 24)) ? 0 : 0xFF000000u)
+                         | ((param & (1u << 16)) ? 0 : 0x00FF0000u)
+                         | ((param & (1u <<  8)) ? 0 : 0x0000FF00u)
+                         | ((param & (1u <<  0)) ? 0 : 0x000000FFu);
         break;
     case NV097_CLEAR_SURFACE:
         if (s_backend->on_zclear)

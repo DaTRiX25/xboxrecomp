@@ -121,6 +121,10 @@ struct nv2a_pb_gpu {
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
+    /* SET_COLOR_MASK, inverted: the ARGB bits a draw leaves alone. 0 (the
+     * reset state) writes every channel; 0xFFFFFFFF writes none, as for a
+     * stencil- or depth-only pass. */
+    uint32_t color_keep;
     Texture  tex;
     uint32_t sema_dma, sema_offset;     /* SET_CONTEXT_DMA_SEMAPHORE / _OFFSET */
     int      sema_offset_set;           /* offset 0 is a real address (0x80000000) */
