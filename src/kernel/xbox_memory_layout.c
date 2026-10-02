@@ -1092,6 +1092,12 @@ ptrdiff_t g_xbox_mem_offset = 0;
  * nothing breaks before the title is loaded. */
 uint32_t g_xbox_image_lo = 0;
 uint32_t g_xbox_image_hi = 0;
+
+/* Toolkit region placement (xbox_memory_layout.h). The initial values are the
+ * small-image layout; xbox_MemoryLayoutInit recomputes them from the image. */
+uint32_t g_xbox_region_base = XBOX_REGION_MIN;
+uint32_t g_xbox_stack_base  = XBOX_REGION_MIN + XBOX_REGION_STACK_OFF;
+uint32_t g_xbox_stack_size  = 8u * 1024 * 1024;
 uint32_t g_xbox_code_lo = 0;
 uint32_t g_xbox_code_hi = 0;
 
@@ -1705,6 +1711,8 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+static void xbox_heap_reset_base(void);
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
@@ -1943,8 +1951,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         int sections_short = 0;
         size_t total_bytes = 0;
 
-        if (num_sections > 64) num_sections = 64;  /* sanity cap */
-
         fprintf(stderr, "  XBE sections: %u (headers at file offset 0x%08X)\n",
                 num_sections, sect_headers_off);
 
@@ -2034,6 +2040,47 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     "is truncated or was read short; the title will not run\n",
                     sections_short);
         }
+    }
+
+    /*
+     * Place the toolkit region above the image (xbox_memory_layout.h). Has to
+     * come after the section loop -- that is what sets g_xbox_image_hi -- and
+     * before anything below writes the scratch structures, the stack or the
+     * heap.
+     */
+    {
+        const uint32_t MB = 1024u * 1024u;
+        uint32_t image_end = (g_xbox_image_hi + 0xFFFFu) & ~0xFFFFu;
+        uint32_t region = image_end > XBOX_REGION_MIN ? image_end : XBOX_REGION_MIN;
+        uint32_t stack_base = region + XBOX_REGION_STACK_OFF;
+        uint32_t top = XBOX_HEAP_TOP;
+        uint32_t avail = top > stack_base ? top - stack_base : 0;
+        uint32_t stack_size = 8 * MB;
+
+        if (avail < 2 * MB) {
+            fprintf(stderr,
+                    "  ERROR: the title image ends at 0x%08X; with the toolkit "
+                    "region at 0x%08X that leaves %u KB below the end of RAM "
+                    "(0x%08X), less than the 1 MB stack + 1 MB heap minimum\n",
+                    g_xbox_image_hi, region, avail / 1024, top);
+            return FALSE;
+        }
+        if (avail - stack_size < 16 * MB) {
+            stack_size = avail > 17 * MB ? (avail - 16 * MB) & ~0xFFFFu : 1 * MB;
+            if (stack_size < 1 * MB) stack_size = 1 * MB;
+        }
+
+        g_xbox_region_base = region;
+        g_xbox_stack_base  = stack_base;
+        g_xbox_stack_size  = stack_size;
+        xbox_heap_reset_base();
+
+        fprintf(stderr, "  Toolkit region: 0x%08X (image ends 0x%08X)%s\n",
+                region, g_xbox_image_hi,
+                region != XBOX_REGION_MIN ? " -- moved above the image" : "");
+        if (stack_size != 8 * MB)
+            fprintf(stderr, "  Stack shrunk to %u KB so the heap keeps %u MB\n",
+                    stack_size / 1024, (avail - stack_size) / MB);
     }
 
     /*
@@ -2145,7 +2192,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * only worked while page zero was mapped. Pointing at real zeroed
          * memory says the same thing to the title and survives that page being
          * unmapped, which is what makes a genuine null dereference visible. */
-        #define FAKE_PRCB_VA 0x00761000  /* zeroed KPCR Prcb stand-in */
+        #define FAKE_PRCB_VA (g_xbox_region_base + XBOX_REGION_PRCB_OFF)  /* zeroed KPCR Prcb stand-in */
         memset(XBOX_VA(FAKE_PRCB_VA), 0, 0x400);
         MEM32_INIT(XBOX_FS_BASE + 0x20, FAKE_PRCB_VA);
         #undef FAKE_PRCB_VA
@@ -2153,11 +2200,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         /*
          * fs:[0x28] - Thread local storage / RW engine context.
          * The RW engine reads [fs:[0x28] + 0x28] to get a pointer
-         * to its data area. We allocate a fake structure at 0x00760000
-         * (in the BSS area) and a data buffer at 0x00700000.
+         * to its data area. We allocate a fake structure at region+0x60000
+         * and a data buffer at the region base (0x00760000 / 0x00700000 for
+         * small images).
          */
-        #define FAKE_TLS_VA     0x00760000  /* Fake TLS structure (in BSS) */
-        #define FAKE_RWDATA_VA  0x00700000  /* RW engine data area (in BSS) */
+        #define FAKE_TLS_VA     (g_xbox_region_base + XBOX_REGION_TLS_OFF)  /* Fake TLS structure (in BSS) */
+        #define FAKE_RWDATA_VA  (g_xbox_region_base)  /* RW engine data area (in BSS) */
 
         MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
         /* TLS[0x28] = pointer to RW data area */
@@ -2191,8 +2239,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * Every guest thread therefore shares LastError. Give this a per-thread
          * allocation when a title is observed to care.
          */
-        #define FAKE_TLS_BLOCK_VA  0x00770000  /* image TLS data          */
-        #define FAKE_TLS_THREAD_VA 0x00770200  /* what slot 0 points at   */
+        #define FAKE_TLS_BLOCK_VA  (g_xbox_region_base + XBOX_REGION_TLSBLK_OFF)  /* image TLS data          */
+        #define FAKE_TLS_THREAD_VA (g_xbox_region_base + XBOX_REGION_TLSBLK_OFF + 0x200)  /* what slot 0 points at   */
         {
             DWORD tls_dir_va = *(const DWORD *)(xbe + XBE_TLS_ADDR_OFFSET);
 
@@ -2801,7 +2849,14 @@ ptrdiff_t xbox_GetMemoryOffset(void)
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
  * No free support (bump-only for now).
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
+/* Not a static initializer: the heap base is only known once the image is
+ * loaded (xbox_heap_reset_base, from xbox_MemoryLayoutInit). */
+static uint32_t g_heap_next = 0;
+
+static void xbox_heap_reset_base(void)
+{
+    g_heap_next = XBOX_HEAP_BASE;
+}
 
 static int g_heap_alloc_count = 0;
 
@@ -3017,6 +3072,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     }
 
     /* Align the next pointer */
+    if (!g_heap_next) xbox_heap_reset_base();
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
     if (result + size > XBOX_HEAP_TOP) {

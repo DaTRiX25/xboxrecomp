@@ -237,7 +237,11 @@ void xbox_WatchInit(void);
 /** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
  *  These are kernel exports that are DATA, not functions. The game reads
  *  their thunk entries and dereferences them to access the data. */
-#define XBOX_KERNEL_DATA_BASE   0x00740000
+/* Runtime, not a constant: the toolkit's own guest-side structures (this one,
+ * the fake TIB/TLS data and the main stack) live in a region that starts above
+ * the title image -- see g_xbox_region_base below. 0x00740000 for any image
+ * that ends below 0x00700000. */
+#define XBOX_KERNEL_DATA_BASE   (g_xbox_region_base + XBOX_REGION_KDATA_OFF)
 #define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
 
 /* Offsets within the kernel data area */
@@ -322,7 +326,33 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
-#define XBOX_STACK_SIZE     (8 * 1024 * 1024)
+/* The toolkit region: scratch structures, then the main stack, then the heap.
+ *
+ * These used to be fixed -- scratch at 0x00700000, stack at 0x00780000, heap
+ * at 0x00F80000 -- which is right only while the title's image ends below
+ * 0x00700000. BLiNX 2's 73 sections run to 0x0303AC20, so the stack, the
+ * kernel data exports and the heap all sat inside its .data/BSS and the first
+ * zeroed heap allocation wiped the title's globals.
+ *
+ * xbox_MemoryLayoutInit now places the region at the first 64 KB boundary
+ * above the highest loaded section, never below 0x00700000, so a title that
+ * fit before sees exactly the old addresses. Offsets inside the region are
+ * the old ones relative to 0x00700000. Valid once xbox_MemoryLayoutInit has
+ * loaded the sections; nothing reads them earlier. */
+#define XBOX_REGION_MIN         0x00700000u
+#define XBOX_REGION_KDATA_OFF   0x00040000u  /* kernel data exports */
+#define XBOX_REGION_TLS_OFF     0x00060000u  /* fake TLS structure (fs:[0x28]) */
+#define XBOX_REGION_PRCB_OFF    0x00061000u  /* zeroed KPCR Prcb stand-in */
+#define XBOX_REGION_TLSBLK_OFF  0x00070000u  /* image TLS block */
+#define XBOX_REGION_STACK_OFF   0x00080000u  /* main stack */
+extern uint32_t g_xbox_region_base;
+extern uint32_t g_xbox_stack_base;
+extern uint32_t g_xbox_stack_size;
+
+/* 8 MB, unless that would leave less than 16 MB of heap -- then it shrinks,
+ * to no less than 1 MB (hardware gives the main thread the XBE's stack
+ * commit, typically 64 KB). */
+#define XBOX_STACK_SIZE     g_xbox_stack_size
 
 /** Base VA of the stack area (above last XBE section). */
 /* Where the fake TIB lives -- the linear address fs: is based at.
@@ -360,7 +390,7 @@ typedef union RecompXmm {
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 
-#define XBOX_STACK_BASE     0x00780000
+#define XBOX_STACK_BASE     g_xbox_stack_base
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
@@ -386,7 +416,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * adding it changes nothing for them.
  */
 #define XBOX_WORKER_STACK_SIZE   (256 * 1024)
-#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 */
+#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 for small images */
 #define XBOX_WORKER_STACK_COUNT  16                          /* 4 MB total */
 #define XBOX_WORKER_STACK_END    (XBOX_WORKER_STACK_BASE + \
                                   XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT)
@@ -400,7 +430,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * ================================================================ */
 
 /** Base VA of the dynamic heap area (above stack). */
-#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 */
+#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 for small images */
 
 /** Exclusive top of the dynamic heap: the end of RAM for this run. Runtime,
  *  not a macro, because RAM size is now configurable (retail 64 MB vs devkit
