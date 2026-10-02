@@ -786,13 +786,22 @@ DWORD ResumeThread(HANDLE h)
 
 DWORD SuspendThread(HANDLE h)
 {
-    /* True mid-run suspension is not supported on POSIX; only the
-     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
+    /* POSIX cannot stop another thread at an arbitrary point, so suspending
+     * one only counts, for ResumeThread. A thread suspending *itself* is a
+     * different matter: it is at a known point, and it parks on the same gate
+     * CREATE_SUSPENDED uses until a ResumeThread brings the count to zero.
+     * Worker pools idle that way; returning at once turned BLiNX 2's into a
+     * suspend/check spin of millions of calls a second. */
+    if (h == PSEUDO_CURRENT_THREAD) h = GetCurrentThread();
     w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return (DWORD)-1;
+    if (!o || o == (w32_object *)PSEUDO_CURRENT_THREAD || o->kind != K_THREAD)
+        return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
+    if (o == t_self_obj)
+        while (o->suspend_count > 0)
+            pthread_cond_wait(&o->gate, &o->lock);
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
