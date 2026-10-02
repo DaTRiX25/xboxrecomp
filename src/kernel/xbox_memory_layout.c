@@ -352,6 +352,7 @@ static void ac97_clear_reset_bits(void)
 
 static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 {
+#if defined(_WIN32)
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     DWORD old;
 
@@ -385,6 +386,11 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
+#else
+    /* The non-Windows VEH shim never fires and EXCEPTION_POINTERS is
+     * opaque there, so there is nothing to decode. */
+    (void)ep;
+#endif
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -1376,6 +1382,7 @@ static void watch_report(void)
 
 static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 {
+#if defined(_WIN32)
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     DWORD old;
 
@@ -1403,6 +1410,11 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
+#else
+    /* The non-Windows VEH shim never fires and EXCEPTION_POINTERS is
+     * opaque there, so there is nothing to decode. */
+    (void)ep;
+#endif
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
