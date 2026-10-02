@@ -160,6 +160,10 @@ class FunctionDetector:
         # Seeds that landed inside a function rather than on its start.
         self._pass_seed_aliases()
 
+        # Branches that leave an alias, or jump into the middle of another
+        # function, need an entry at the place they land.
+        self._pass_branch_alias_closure()
+
         self._build_alias_entries()
 
         # Populate call graph
@@ -868,6 +872,89 @@ class FunctionDetector:
         if added:
             print("  conditional-branch orphans recovered as alias entries")
         return added
+
+    def _pass_branch_alias_closure(self, max_rounds: int = 16) -> int:
+        """
+        Give every direct branch that leaves its lifted body somewhere to land.
+
+        The translator lifts each function and each alias as its own C body,
+        covering [start, end). A jmp or jcc whose target is outside that range
+        becomes a tail call to sub_<target>. When nothing starts there, the
+        call goes to an unresolved stub, and the stub behaves like a `ret` that
+        the guest never executed. The native call chain unwinds while the guest
+        stack does not: the frame the function built is leaked, and ebx, esi
+        and edi come back holding whatever was in the frame.
+
+        The passes above miss two shapes:
+
+        - A jcc into the middle of another function. The tail-jump pass only
+          looks at unconditional jumps, and the orphan pass only looks at
+          gaps.
+        - Any branch from an alias body. The other passes test "leaves its
+          function" against the primary bodies. An alias starts partway into
+          its primary, so a branch back to a label before the alias start
+          looks intra-function to them. It still leaves the alias's own
+          lifted body.
+
+        BLiNX 2's display-list interpreter sub_00044900 has both. A lone int3
+        (a switch default) at 0x00044CFA splits it at a CC boundary. The two
+        halves and their aliases then branch into each other's interiors at
+        0x000449B7, 0x00044C20, 0x00044C80, 0x00044CD0, 0x00044DDA and
+        0x00044E72, and all six were stubs. The common path left 0x88 bytes
+        of its frame on the guest stack and returned esi = 0, so the scene
+        walk that called it re-walked the tree from a stale edi until the
+        native stack overflowed.
+
+        Each target found here becomes an alias that runs to the end of the
+        function it lands in, as the tail-jump pass does. New aliases can
+        branch out in turn, so this repeats until nothing new turns up.
+        Targets in gaps are left to the orphan pass, which probes them first.
+        """
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bodies]
+        if not bodies:
+            return 0
+
+        def containing_end(addr: int):
+            j = bisect.bisect_right(starts, addr) - 1
+            if j >= 0 and bodies[j][0] < addr < bodies[j][1]:
+                return bodies[j][1]
+            return None
+
+        ranges = list(bodies) + list(self._alias_entries.items())
+        scanned = set()
+        total = 0
+        for _round in range(max_rounds):
+            new = {}
+            for lo, hi in ranges:
+                if (lo, hi) in scanned:
+                    continue
+                scanned.add((lo, hi))
+                for insn in self.engine.get_instructions_in_range(lo, hi):
+                    if not (insn.is_jump or insn.is_cond_jump):
+                        continue
+                    target = insn.jump_target
+                    if target is None or lo <= target < hi:
+                        continue
+                    if (target in self.functions
+                            or target in self._alias_entries
+                            or target in new):
+                        continue
+                    if target not in self.engine.instructions:
+                        continue
+                    end = containing_end(target)
+                    if end is None:
+                        continue
+                    new[target] = end
+            if not new:
+                break
+            self._alias_entries.update(new)
+            total += len(new)
+            ranges = list(new.items())
+        if total:
+            print(f"  {total} branch target(s) inside other bodies "
+                  f"recovered as alias entries")
+        return total
 
     def _build_alias_entries(self) -> None:
         """
