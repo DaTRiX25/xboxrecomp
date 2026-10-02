@@ -3507,6 +3507,53 @@ static void bridge_NtSetInformationFile(void)
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
     }
+
+    /* FileRenameInformation (10) carries a pointer, so it is unpacked here,
+     * where guest addresses mean something. Guest layout, 16 bytes:
+     *     +0  BOOLEAN       ReplaceIfExists
+     *     +4  HANDLE        RootDirectory
+     *     +8  OBJECT_STRING FileName { u16 Length, u16 Max, char *Buffer }
+     * BLiNX 2 writes each z:\ texture cache as .tmp and renames it to .ipk;
+     * unhandled, every later .ipk open failed with 0xC0000034. */
+    if (infoclass == 10u) {
+        XBOX_OBJECT_ATTRIBUTES oa;
+        XBOX_ANSI_STRING name;
+        static RECOMP_TLS char path[1024];
+        uint32_t root, buf;
+        uint16_t len;
+
+        if (length < 16u) {
+            g_eax = 0xC0000004u;             /* STATUS_INFO_LENGTH_MISMATCH */
+            bridge_write_iostatus(ios_va, (NTSTATUS)g_eax, 0);
+            return;
+        }
+        root = BRIDGE_MEM32(info_va + 4);
+        len  = BRIDGE_MEM16(info_va + 8);
+        buf  = BRIDGE_MEM32(info_va + 12);
+        if (!len || len >= sizeof path || !bridge_va_mapped(buf, len)) {
+            g_eax = (uint32_t)STATUS_OBJECT_NAME_INVALID;
+            bridge_write_iostatus(ios_va, (NTSTATUS)g_eax, 0);
+            return;
+        }
+        memcpy(path, XBOX_TO_NATIVE(buf), len);
+        path[len] = '\0';
+        name.Buffer = path;
+        name.Length = len;
+        name.MaximumLength = (USHORT)(len + 1);
+        /* -3 is the XDK DOS-device namespace, as in bridge_build_oa. */
+        oa.RootDirectory = root && root != 0xFFFFFFFDu
+                         ? bridge_resolve_handle(root) : NULL;
+        oa.ObjectName = &name;
+        oa.Attributes = 0;
+        g_eax = (uint32_t)xbox_RenameFileByHandle(handle, &oa,
+                    (BOOLEAN)(BRIDGE_MEM8(info_va) != 0));
+        if (g_eax)
+            fprintf(stderr, "  [FILE] rename to %s -> 0x%08X FAILED\n",
+                    path, g_eax);
+        bridge_write_iostatus(ios_va, (NTSTATUS)g_eax, 0);
+        return;
+    }
+
     g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);

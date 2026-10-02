@@ -18,6 +18,7 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -720,6 +721,66 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     return STATUS_SUCCESS;
 }
 
+
+/* Rename an open file. See the POSIX version for the cases; this one asks
+ * the handle to do it (FileRenameInfo), which needs DELETE access, and falls
+ * back to MoveFileExW on the path the handle names.
+ * ponytail: untested on a Windows host. */
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
+{
+    WCHAR src[MAX_PATH], dst[MAX_PATH];
+    const char *name = get_xbox_path(NewName);
+    DWORD n;
+
+    if (!name || !*name)
+        return STATUS_INVALID_PARAMETER;
+    n = GetFinalPathNameByHandleW(FileHandle, src, MAX_PATH,
+                                  FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!n || n >= MAX_PATH)
+        return STATUS_INVALID_HANDLE;
+
+    if (!NewName->RootDirectory && !strchr(name, '\\') && !strchr(name, ':')) {
+        WCHAR *slash = wcsrchr(src, L'\\');
+        size_t dir = slash ? (size_t)(slash - src) + 1 : 0;
+        memcpy(dst, src, dir * sizeof(WCHAR));
+        if (!MultiByteToWideChar(CP_ACP, 0, name, -1, dst + dir,
+                                 (int)(MAX_PATH - dir)))
+            return STATUS_OBJECT_NAME_INVALID;
+    } else if (!translate_obj_path(NewName, dst, MAX_PATH)) {
+        return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    {
+        size_t len = wcslen(dst);
+        size_t bytes = sizeof(FILE_RENAME_INFO) + len * sizeof(WCHAR);
+        FILE_RENAME_INFO *fri = (FILE_RENAME_INFO *)calloc(1, bytes);
+        BOOL ok = FALSE;
+        if (fri) {
+            fri->ReplaceIfExists = ReplaceIfExists ? TRUE : FALSE;
+            fri->RootDirectory = NULL;
+            fri->FileNameLength = (DWORD)(len * sizeof(WCHAR));
+            memcpy(fri->FileName, dst, (len + 1) * sizeof(WCHAR));
+            ok = SetFileInformationByHandle(FileHandle, FileRenameInfo, fri,
+                                            (DWORD)bytes);
+            free(fri);
+        }
+        if (!ok)
+            ok = MoveFileExW(src, dst,
+                             ReplaceIfExists ? MOVEFILE_REPLACE_EXISTING : 0);
+        if (!ok) {
+            DWORD e = GetLastError();
+            return e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS
+                 ? STATUS_OBJECT_NAME_COLLISION
+                 : e == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED
+                 : STATUS_UNSUCCESSFUL;
+        }
+    }
+    fprintf(stderr, "  [FILE] rename %S -> %S\n", src, dst);
+    fflush(stderr);
+    return STATUS_SUCCESS;
+}
+
 /* ======================================================================== */
 #else /* !_WIN32 */
 /* ====================  POSIX backend  =================================== */
@@ -1064,6 +1125,77 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
+}
+
+/* Rename an open file (NtSetInformationFile, FileRenameInformation).
+ *
+ * BLiNX 2 builds each utility-drive texture cache as z:\...\name.tmp, then
+ * renames it to name.ipk, and later opens the .ipk. With this class
+ * unimplemented the rename failed, so every .ipk open failed with
+ * STATUS_OBJECT_NAME_NOT_FOUND and the game rebuilt the cache instead.
+ *
+ * The new name is resolved the way NT does:
+ *   RootDirectory set    relative to that directory handle
+ *   bare name, no root   within the file's own directory
+ *   anything else        a full Xbox path, through the path table
+ * POSIX rename() replaces an existing target, so ReplaceIfExists = FALSE is
+ * checked first. The handle keeps working (the fd follows the inode), and its
+ * recorded path is updated so a later delete-on-close removes the new name. */
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
+{
+    char dst[MAX_PATH];
+    const char *src = w32_handle_path(FileHandle);
+    const char *name = get_xbox_path(NewName);
+    struct stat st;
+
+    if (!src)
+        return STATUS_INVALID_HANDLE;
+    if (!name || !*name)
+        return STATUS_INVALID_PARAMETER;
+
+    if (NewName->RootDirectory
+            || (!strchr(name, '\\') && !strchr(name, ':'))) {
+        const char *base = NewName->RootDirectory
+                         ? w32_handle_path(NewName->RootDirectory) : src;
+        const char *slash;
+        size_t dir;
+        char *p;
+
+        if (!base)
+            return STATUS_INVALID_HANDLE;
+        if (NewName->RootDirectory) {
+            dir = strlen(base);
+        } else {
+            slash = strrchr(base, '/');
+            dir = slash ? (size_t)(slash - base) : 0;
+        }
+        if (dir + 1 + strlen(name) >= sizeof dst)
+            return STATUS_OBJECT_NAME_INVALID;
+        memcpy(dst, base, dir);
+        dst[dir] = '/';
+        strcpy(dst + dir + 1, name[0] == '\\' ? name + 1 : name);
+        for (p = dst + dir + 1; *p; p++)
+            if (*p == '\\') *p = '/';
+    } else if (!xbox_translate_path(name, dst, MAX_PATH)) {
+        return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    if (strcmp(src, dst) != 0) {
+        if (!ReplaceIfExists && stat(dst, &st) == 0)
+            return STATUS_OBJECT_NAME_COLLISION;
+        if (rename(src, dst) != 0) {
+            int e = errno;
+            fprintf(stderr, "  [FILE] rename %s -> %s FAILED (%s)\n",
+                    src, dst, strerror(e));
+            fflush(stderr);
+            return errno_to_status(e);
+        }
+    }
+    fprintf(stderr, "  [FILE] rename %s -> %s\n", src, dst);
+    fflush(stderr);
+    w32_handle_set_path(FileHandle, dst);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
