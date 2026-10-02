@@ -3047,6 +3047,26 @@ static void fast_batch_setup(void)
  * three vertices, then one pixel (the first triangle's centroid) through the
  * texture stages, every combiner stage and the final combiner. */
 static void white_note_surface(void);
+static int s_wt_force;                  /* trace this batch regardless */
+
+/* RECOMP_WHITE_PX=x,y: the colour-surface pixel at (x,y), as a guest
+ * pointer, or NULL. Used to find the batch that paints a pixel white. */
+static uint32_t *white_px(void)
+{
+    static int px = -2, py;
+    if (px == -2) {
+        const char *e = getenv("RECOMP_WHITE_PX");
+        px = -1;
+        if (e && sscanf(e, "%d,%d", &px, &py) != 2)
+            px = -1;
+    }
+    if (px < 0 || surface_bpp() != 4 || !s_gpu.color_offset
+            || (uint32_t)px >= s_gpu.clip_x + s_gpu.clip_w
+            || (uint32_t)py >= s_gpu.clip_y + s_gpu.clip_h)
+        return NULL;
+    return (uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + dma_resolve(s_gpu.color_offset)
+                        + (size_t)py * s_gpu.pitch) + px;
+}
 
 static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
 {
@@ -3059,9 +3079,26 @@ static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
         shown = e ? atoi(e) : 0;
         min_n = m ? atoi(m) : 300;
     }
-    if (shown <= 0 || n < (uint32_t)min_n || plen <= 12)
-        return;
-    shown--;
+    if (s_wt_force) {
+        s_wt_force = 0;
+    } else {
+        /* RECOMP_WHITE_TEXOFF=<hex>: instead, batches with a texture at that
+         * address (low 27 bits compared), whatever their size. */
+        const char *to = getenv("RECOMP_WHITE_TEXOFF");
+        if (to) {
+            uint32_t want = (uint32_t)strtoul(to, NULL, 16);
+            int st_, hit = 0;
+            for (st_ = 0; st_ < 4; st_++)
+                if (s_stage_mode[st_] && ((s_stage_tex[st_].offset ^ want) & 0x07FFFFFFu) == 0)
+                    hit = 1;
+            if (shown <= 0 || !hit)
+                return;
+        } else if (shown <= 0 || n < (uint32_t)min_n || plen <= 12) {
+            return;
+        }
+    }
+    if (shown > 0)
+        shown--;
     fprintf(stderr, "[WHITE] batch prim %u n %u prog start %u len %u | spec %d light %d"
                     " fog en %d mode 0x%X gen %u params %g %g %g colour %08X | rc %d ctl %08X"
                     " shader %08X | stage fmt %02X %02X %02X %02X mode %d %d %d %d\n",
@@ -3078,6 +3115,17 @@ static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
             fprintf(stderr, "[WHITE]   vsh %3u: %s\n", pc,
                     nv2a_vsh_disasm(s_vsh.prog[pc], buf, sizeof buf));
     }
+    fprintf(stderr, "[WHITE]  surface 0x%08X fmt 0x%X pitch %u clip %u,%u %ux%u zeta 0x%X depth %d func 0x%X"
+                    " atest %d func 0x%X ref %u blend %d\n",
+            s_gpu.color_offset, s_gpu.format, s_gpu.pitch, s_gpu.clip_x, s_gpu.clip_y,
+            s_gpu.clip_w, s_gpu.clip_h, s_vsh.zeta_offset, s_vsh.depth_enable, s_vsh.depth_func,
+            s_vsh.atest_enable, s_vsh.atest_func, s_vsh.atest_ref, (int)s_gpu.blend_enable);
+    for (k = 0; k < NV_VERTEX_ATTRS; k++)
+        if (s_gpu.attr[k].size || s_gpu.attr[k].stride)
+            fprintf(stderr, "[WHITE]  attr%d type %u size %u stride %u offset 0x%X inline %d inl %g %g %g %g\n",
+                    k, s_gpu.attr[k].type, s_gpu.attr[k].size, s_gpu.attr[k].stride,
+                    s_gpu.attr[k].offset, s_gpu.inline_active, s_vsh.inl[k][0], s_vsh.inl[k][1],
+                    s_vsh.inl[k][2], s_vsh.inl[k][3]);
     fprintf(stderr, "[WHITE]  c58 %g %g %g %g c59 %g %g %g %g vp_scale %g %g %g %g vp_off %g %g %g %g\n",
             s_vsh.c[58][0], s_vsh.c[58][1], s_vsh.c[58][2], s_vsh.c[58][3],
             s_vsh.c[59][0], s_vsh.c[59][1], s_vsh.c[59][2], s_vsh.c[59][3],
@@ -3213,8 +3261,9 @@ static void raster_batch_vsh_one(void)
     }
 
     white_trace_batch(xv, n, plen);
-    if (plen > 12)
-        white_note_surface();
+    white_note_surface();
+    {
+        uint32_t *wp = white_px(), before_px = wp ? *wp : 0;
 #define RASTER_TRI(p, q, r_, t) (fast ? raster_tri_xf_fast(p, q, r_, t) \
                                     : raster_tri_xf(p, q, r_, t))
     switch (s_gpu.prim) {
@@ -3253,6 +3302,17 @@ static void raster_batch_vsh_one(void)
         break;
     }
 #undef RASTER_TRI
+        if (wp && *wp != before_px && (*wp & 0xF0F0F0u) == 0xF0F0F0u
+                && (before_px & 0xF0F0F0u) != 0xF0F0F0u) {
+            static int hits;
+            if (hits++ < 4) {
+                fprintf(stderr, "[WHITE] RECOMP_WHITE_PX: %08X -> %08X by this batch\n",
+                        before_px, *wp);
+                s_wt_force = 1;
+                white_trace_batch(xv, n, plen);
+            }
+        }
+    }
     if (textured)
         s_vsh.tris_textured += s_gpu.tris_drawn - before;
 
@@ -3737,10 +3797,10 @@ static void cpu_on_draw(const struct nv2a_pb_draw *draw)
  * than letting the window read guest memory on its own clock, is what stops
  * it showing a surface the rasteriser is still writing. */
 /* RECOMP_WHITE_DUMP=<prefix>: debug only. Every RECOMP_WHITE_EVERY-th flip
- * (default 30), every colour surface a 3D batch drew into since the last
+ * (default 30), every colour surface a program batch drew into since the last
  * flip, as <prefix>f<flip>_<surface>.bmp. Independent of which surface the
  * flip presents. */
-#define WT_SURF 4
+#define WT_SURF 8
 static struct { uint32_t off, pitch, cx, cy, cw, ch, bpp; } s_wt_surf[WT_SURF];
 static int s_wt_nsurf;
 
