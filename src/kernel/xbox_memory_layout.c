@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#include <time.h>     /* nanosleep, for the KickOff thread */
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
 #endif
@@ -1190,6 +1191,120 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+
+/*
+ * The KickOff flush, and how long the title waits on it.
+ *
+ * D3D's KickOff sets PFB 0x100410 bit 16 (flush the write-combine buffers),
+ * spins until it clears, and only then writes DMA_PUT. The ack loop below
+ * clears it at the top of each tick, and a tick was the scan of the last
+ * segment plus a Sleep(1). BLiNX 2 kicks ~16 times a frame, so on macOS it
+ * spent ~19 ms of every 33 ms frame in that spin with nothing drawn -- and
+ * whatever the walker's draws cost was added on top (a simulated 9.5 ms of
+ * draw per frame made it 28.6 ms).
+ *
+ * Acknowledging the flush on another thread at once does not work: the
+ * title then runs a segment or more ahead, its MakeSpace (0x002E8110) finds
+ * more than 8 KB outstanding, puts a NOP-with-notify in the pushbuffer and
+ * blocks on the GPU interrupt that would answer it -- which nothing here
+ * raises, so it waits forever. The flush wait is what keeps the title within
+ * one segment of the walker.
+ *
+ * So the ack loop keeps the job, but polls every ~50 us between ticks while
+ * the title is kicking (RECOMP_FAST_KICK, default on; =0 is the old
+ * Sleep(1)). A kick then waits for the walker to finish the segment before
+ * it, not for a timer, and the walker starts on a new PUT within ~50 us.
+ *
+ * With RECOMP_FLIP_LOG an observer thread watches the bit, so the [PB-PERF]
+ * line can say how many kicks a frame made and how long they waited.
+ */
+#define NV2A_KICK_REG  0x100410u
+#define NV2A_KICK_BIT  0x00010000u
+static HANDLE g_nv2a_kick_thread;
+static int g_kick_fast;                      /* RECOMP_FAST_KICK */
+static uint64_t g_kick_seen_ns;              /* first seen set, 0 = not set */
+static uint32_t g_kick_count;
+static uint32_t g_scanned_put;   /* DMA_PUT the walker has executed up to */
+static uint64_t g_kick_wait_ns;
+
+uint64_t nv2a_pb_now_ns(void);
+
+static void kick_nap_us(unsigned us)
+{
+#if defined(_WIN32)
+    /* Sleep() is whole milliseconds; NtDelayExecution takes 100 ns units,
+     * which Wine honours (select with a timeval) and native Windows rounds
+     * to its timer resolution. */
+    typedef LONG (WINAPI *delay_fn)(BOOLEAN, PLARGE_INTEGER);
+    static delay_fn delay;
+    static int looked;
+    if (!looked) {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        looked = 1;
+        if (nt)
+            delay = (delay_fn)(void *)GetProcAddress(nt, "NtDelayExecution");
+    }
+    if (delay) {
+        LARGE_INTEGER t;
+        t.QuadPart = -(LONGLONG)us * 10;
+        delay(FALSE, &t);
+    } else {
+        Sleep(1);
+    }
+#else
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = (long)us * 1000L;
+    nanosleep(&ts, NULL);
+#endif
+}
+
+/* The bit was seen clear by whoever cleared it: account the wait. */
+static void kick_cleared(uint64_t now)
+{
+    uint64_t seen = __atomic_exchange_n(&g_kick_seen_ns, 0, __ATOMIC_ACQ_REL);
+    __atomic_fetch_add(&g_kick_count, 1, __ATOMIC_RELAXED);
+    if (seen && now > seen)
+        __atomic_fetch_add(&g_kick_wait_ns, now - seen, __ATOMIC_RELAXED);
+}
+
+uint32_t xbox_Nv2aKickStats(uint64_t *wait_ns)
+{
+    if (wait_ns)
+        *wait_ns = __atomic_exchange_n(&g_kick_wait_ns, 0, __ATOMIC_RELAXED);
+    return __atomic_exchange_n(&g_kick_count, 0, __ATOMIC_RELAXED);
+}
+
+static DWORD WINAPI nv2a_kick_thread(LPVOID param)
+{
+    volatile uint32_t *r = (volatile uint32_t *)((char *)param + NV2A_KICK_REG);
+    uint64_t last_kick = 0;
+    xbox_log_thread_role("nv2a-kick", 0);
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        uint64_t now = nv2a_pb_now_ns();
+        if (*r & NV2A_KICK_BIT) {
+            uint64_t zero = 0;
+            __atomic_compare_exchange_n(&g_kick_seen_ns, &zero, now, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+            last_kick = now;
+        }
+        /* Fine-grained while the title is kicking, 1 ms when it is not. */
+        kick_nap_us(now - last_kick < 200000000ull ? 50 : 1000);
+    }
+    return 0;
+}
+
+static void xbox_Nv2aKickStart(void *regs)
+{
+    const char *e = getenv("RECOMP_FAST_KICK");
+    g_kick_fast = !(e && *e == '0');
+    fprintf(stderr, "  NV2A KickOff flush: %s\n", g_kick_fast
+            ? "ack loop polls at ~50 us while kicking (RECOMP_FAST_KICK=0: Sleep(1))"
+            : "ack loop ticks at Sleep(1) (RECOMP_FAST_KICK=0)");
+    if (getenv("RECOMP_FLIP_LOG"))
+        g_nv2a_kick_thread = CreateThread(NULL, 0, nv2a_kick_thread, regs, 0, NULL);
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     xbox_log_thread_role("nv2a-ack", 0);
@@ -1198,8 +1313,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            if (NV2A_ACK[i].offset == NV2A_KICK_REG && g_kick_fast)
+                continue;               /* kick_ack, below */
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
+                if (NV2A_ACK[i].offset == NV2A_KICK_REG)
+                    kick_cleared(nv2a_pb_now_ns());
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
@@ -1246,10 +1365,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
              * title's pushbuffer writer has got to; if it never moves, nothing
              * is being drawn and the missing piece is upstream of the GPU. */
             static DWORD  last_put_ms;
-            static uint32_t last_put;
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            if (put != last_put || (now_ms - last_put_ms) > 2000) {
+            if (put != g_scanned_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern void nv2a_pb_scan(uint32_t, uint32_t);
@@ -1284,13 +1402,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     static uint32_t put_lo, put_hi;
                     if (!put_lo || put < put_lo) put_lo = put;
                     if (put > put_hi) put_hi = put;
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                    if (g_scanned_put && put > g_scanned_put) {
+                        nv2a_pb_scan(XBOX_CONTIG_BASE | (g_scanned_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
+                    } else if (g_scanned_put && put < g_scanned_put) {
+                        if (put_hi > g_scanned_put)
                             nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                XBOX_CONTIG_BASE | (g_scanned_put & 0x0FFFFFFFu),
                                 XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
                         if (put > put_lo)
                             nv2a_pb_scan(
@@ -1300,7 +1418,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             static unsigned wraps;
                             if (wraps++ < 8)
                                 fprintf(stderr, "  [NV2A] pushbuffer wrapped "
-                                        "(0x%08X -> 0x%08X)\n", last_put, put);
+                                        "(0x%08X -> 0x%08X)\n", g_scanned_put, put);
                         }
                     }
                     /* Periodic, because what the title submits at init is not
@@ -1319,7 +1437,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     *get = put;
                 }
                 pgraph_fence_tick(regs);
-                last_put = put; last_put_ms = now_ms;
+                g_scanned_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET
                  * tells those apart -- D3D waits for GET to reach PUT before it
@@ -1384,7 +1502,45 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * executor's flip rate (20 -> 41 per s, RECOMP_PB_EXEC=1), with the
          * thread at ~14%. A native Windows host needs timeBeginPeriod(1)
          * for this, as the kernel timer's Sleep(10) already does. */
-        Sleep(1);
+        if (!g_kick_fast) {
+            Sleep(1);
+            continue;
+        }
+        /* RECOMP_FAST_KICK: until the next tick is due (1 ms), poll the
+         * KickOff flush and PUT every ~50 us, so a kick is acknowledged as
+         * soon as the walker is idle and a new PUT is scanned at once. The
+         * rest of the tick keeps its ~1 ms rate or slower. Idle for 200 ms,
+         * it is a plain Sleep(1) again. */
+        {
+            static uint64_t last_active;
+            uint64_t t0 = nv2a_pb_now_ns(), now = t0;
+            volatile uint32_t *kr =
+                (volatile uint32_t *)((char *)regs + NV2A_KICK_REG);
+            uint32_t put0 = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            (void)put0;
+            for (;;) {
+                uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+                if (put != g_scanned_put) {
+                    last_active = now;
+                    break;              /* new work: tick now */
+                }
+                /* Everything submitted has been executed: the next kick may
+                 * go. Never earlier -- see the comment at NV2A_KICK_REG. */
+                if (*kr & NV2A_KICK_BIT) {
+                    *kr &= ~NV2A_KICK_BIT;
+                    kick_cleared(now);
+                    last_active = now;
+                }
+                if (now - t0 >= 1000000ull)
+                    break;
+                if (now - last_active > 200000000ull) {
+                    Sleep(1);
+                    break;
+                }
+                kick_nap_us(50);
+                now = nv2a_pb_now_ns();
+            }
+        }
     }
     return 0;
 }
@@ -1396,6 +1552,7 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    xbox_Nv2aKickStart(g_nv2a_memory);
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
@@ -3292,6 +3449,11 @@ void xbox_MemoryLayoutShutdown(void)
     if (g_nv2a_ack_thread) {
         InterlockedExchange(&g_nv2a_ack_stop, 1);
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
+        if (g_nv2a_kick_thread) {
+            WaitForSingleObject(g_nv2a_kick_thread, 1000);
+            CloseHandle(g_nv2a_kick_thread);
+            g_nv2a_kick_thread = NULL;
+        }
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
     }

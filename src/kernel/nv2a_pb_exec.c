@@ -2248,7 +2248,7 @@ static struct {
  * with nv2a_pb_perf_scan_begin/end; the line is printed and reset at the flip,
  * which arrives inside a scan, so the open scan is counted up to that point. */
 static struct {
-    uint64_t scan, draw, scan_t0, flip_t0;
+    uint64_t scan, draw, flip, scan_t0, flip_t0;
     uint32_t methods, batches;
 } s_perf;
 
@@ -4839,7 +4839,14 @@ static const struct nv2a_pb_backend *s_backend = &s_cpu_backend;
 
 /* RECOMP_PB_BACKEND=null: the walker and its decode, drawing nothing. Times
  * the platform-independent part of a frame on its own (the [PB-PERF] line). */
-static const struct nv2a_pb_backend s_null_backend = { NULL, NULL, NULL, NULL };
+static int s_null_draw_us;  /* RECOMP_PB_NULL_DRAW_US: a backend's cost, simulated */
+static void null_on_draw(const struct nv2a_pb_draw *d)
+{
+    uint64_t end = rt_now() + (uint64_t)s_null_draw_us * 1000u;
+    (void)d;
+    while (rt_now() < end) { }
+}
+static struct nv2a_pb_backend s_null_backend = { NULL, NULL, NULL, NULL };
 
 void nv2a_pb_set_backend(const struct nv2a_pb_backend *backend)
 {
@@ -4867,7 +4874,9 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    /* ~14 lines a second at 2.8k batches a frame, each a locked write to
+     * stderr from the walker: verbose only. */
+    if ((s_gpu.draws % 200) == 0 && env_cached("RECOMP_PB_EXEC_VERBOSE"))
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -5184,6 +5193,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         {
             const char *b = getenv("RECOMP_PB_BACKEND");
             if (b && !strcmp(b, "null")) {
+                const char *us = getenv("RECOMP_PB_NULL_DRAW_US");
+                s_null_draw_us = us ? atoi(us) : 0;
+                if (s_null_draw_us > 0)
+                    s_null_backend.on_draw = null_on_draw;
                 nv2a_pb_set_backend(&s_null_backend);
                 fprintf(stderr, "  [GPU] RECOMP_PB_BACKEND=null: walker only, nothing drawn\n");
             }
@@ -5427,10 +5440,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * finished is the one the last batch drew into, which is what
          * drawn_offset holds and why it exists: by the flip, color_offset has
          * already moved to the next buffer. */
-        if (s_backend->on_flip)
+        if (s_backend->on_flip) {
+            uint64_t t0 = rt_now();
             s_backend->on_flip(s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                   : s_gpu.color_offset,
                                s_gpu.pitch);
+            s_perf.flip += rt_now() - t0;   /* Present, for the [PB-PERF] line */
+        }
         /* RECOMP_FB_DUMP_FLIPS=<n>: with RECOMP_FB_DUMP, the finished frame
          * at every nth flip that drew something (up to 200), so a run leaves
          * whole frames behind rather than only the mid-frame 3D dumps. */
@@ -5488,16 +5504,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 prev_px = s_gpu.pixels; prev_zr = s_vsh.z_rejected;
                 memset(&s_rt, 0, sizeof s_rt);
                 {
-                    uint64_t now = rt_now();
+                    uint64_t now = rt_now(), kwait = 0;
                     uint64_t scan = s_perf.scan + (now - s_perf.scan_t0);
+                    uint32_t kicks = xbox_Nv2aKickStats(&kwait);
+                    /* decode is walk minus draw minus present; kicks are the
+                     * title's KickOff flushes acknowledged since the last
+                     * flip, kickwait how long it spun on them in all. */
                     fprintf(stderr, "[PB-PERF] flip %u wall %.2f ms walk %.2f ms"
-                            " (draw %.2f, decode %.2f) methods %u batches %u\n",
+                            " (draw %.2f, decode %.2f) methods %u batches %u"
+                            " present %.2f kicks %u kickwait %.2f\n",
                             s_gpu.flips,
                             s_perf.flip_t0 ? (now - s_perf.flip_t0) / 1e6 : 0.0,
                             scan / 1e6, s_perf.draw / 1e6,
-                            (double)(int64_t)(scan - s_perf.draw) / 1e6,
-                            s_perf.methods, s_perf.batches);
-                    s_perf.scan = s_perf.draw = 0;
+                            (double)(int64_t)(scan - s_perf.draw - s_perf.flip) / 1e6,
+                            s_perf.methods, s_perf.batches,
+                            s_perf.flip / 1e6, kicks, kwait / 1e6);
+                    s_perf.scan = s_perf.draw = s_perf.flip = 0;
                     s_perf.methods = s_perf.batches = 0;
                     s_perf.scan_t0 = s_perf.flip_t0 = now;
                 }
