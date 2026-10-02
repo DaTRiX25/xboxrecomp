@@ -399,6 +399,184 @@ uint32_t nv2a_prim_to_list(uint32_t prim, const uint16_t *v, uint32_t n,
  * with the FINAL bit (or the end). *len, if given, gets the slot count. */
 uint32_t nv2a_vsh_program_hash(const struct nv2a_pb_vsh *v, uint32_t *len);
 
+/* ------------------------------------------------------------------------ */
+/* Depth, stencil, alpha test and blending                                   */
+/* ------------------------------------------------------------------------ */
+
+/* Compare functions in GL's order (SET_DEPTH_FUNC / SET_ALPHA_FUNC take GL's
+ * 0x200 NEVER .. 0x207 ALWAYS, SET_STENCIL_FUNC its low bits), which is also
+ * D3D11_COMPARISON_* - 1 and MTLCompareFunction's order. */
+enum nv2a_cmp {
+    NV2A_CMP_NEVER = 0, NV2A_CMP_LESS, NV2A_CMP_EQUAL, NV2A_CMP_LEQUAL,
+    NV2A_CMP_GREATER, NV2A_CMP_NOTEQUAL, NV2A_CMP_GEQUAL, NV2A_CMP_ALWAYS
+};
+
+/* A GL compare code as nv2a_cmp; anything else tests as ALWAYS. */
+static inline uint32_t nv2a_cmp_from_gl(uint32_t gl)
+{
+    return (gl >= 0x200 && gl <= 0x207) ? gl - 0x200 : NV2A_CMP_ALWAYS;
+}
+
+/* Whether `a cmp b` passes (a the incoming value, b the stored or ref). */
+static inline int nv2a_cmp_test_u(uint32_t cmp, uint32_t a, uint32_t b)
+{
+    switch (cmp) {
+    case NV2A_CMP_NEVER:    return 0;
+    case NV2A_CMP_LESS:     return a <  b;
+    case NV2A_CMP_EQUAL:    return a == b;
+    case NV2A_CMP_LEQUAL:   return a <= b;
+    case NV2A_CMP_GREATER:  return a >  b;
+    case NV2A_CMP_NOTEQUAL: return a != b;
+    case NV2A_CMP_GEQUAL:   return a >= b;
+    default:                return 1;
+    }
+}
+
+static inline int nv2a_cmp_test_f(uint32_t cmp, float a, float b)
+{
+    switch (cmp) {
+    case NV2A_CMP_NEVER:    return 0;
+    case NV2A_CMP_LESS:     return a <  b;
+    case NV2A_CMP_EQUAL:    return a == b;
+    case NV2A_CMP_LEQUAL:   return a <= b;
+    case NV2A_CMP_GREATER:  return a >  b;
+    case NV2A_CMP_NOTEQUAL: return a != b;
+    case NV2A_CMP_GEQUAL:   return a >= b;
+    default:                return 1;
+    }
+}
+
+/* Stencil ops, in D3D11_STENCIL_OP_* - 1 (and MTLStencilOperation) order. */
+enum nv2a_stencil_op {
+    NV2A_SOP_KEEP = 0, NV2A_SOP_ZERO, NV2A_SOP_REPLACE, NV2A_SOP_INCR_SAT,
+    NV2A_SOP_DECR_SAT, NV2A_SOP_INVERT, NV2A_SOP_INCR, NV2A_SOP_DECR
+};
+
+/* GL's stencil op codes; anything else keeps. */
+static inline uint32_t nv2a_stencil_op_from_gl(uint32_t gl)
+{
+    switch (gl) {
+    case 0x0000: return NV2A_SOP_ZERO;
+    case 0x1E01: return NV2A_SOP_REPLACE;
+    case 0x1E02: return NV2A_SOP_INCR_SAT;
+    case 0x1E03: return NV2A_SOP_DECR_SAT;
+    case 0x150A: return NV2A_SOP_INVERT;
+    case 0x8507: return NV2A_SOP_INCR;
+    case 0x8508: return NV2A_SOP_DECR;
+    default:     return NV2A_SOP_KEEP;
+    }
+}
+
+/* The stencil value op makes of v (before the write mask). */
+static inline uint32_t nv2a_stencil_op_apply(uint32_t op, uint32_t v,
+                                             uint32_t ref)
+{
+    switch (op) {
+    case NV2A_SOP_ZERO:     return 0;
+    case NV2A_SOP_REPLACE:  return ref;
+    case NV2A_SOP_INCR_SAT: return v < 255u ? v + 1u : 255u;
+    case NV2A_SOP_DECR_SAT: return v ? v - 1u : 0u;
+    case NV2A_SOP_INVERT:   return ~v;
+    case NV2A_SOP_INCR:     return v + 1u;
+    case NV2A_SOP_DECR:     return v - 1u;
+    default:                return v;
+    }
+}
+
+/* SET_SURFACE_FORMAT's zeta field: 1 = Z16, else Z24S8. The largest depth
+ * value, and a CLEAR_SURFACE value as depth in [0,1]. */
+static inline float nv2a_zmax(uint32_t surface_format)
+{
+    return ((surface_format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
+}
+
+static inline float nv2a_zclear_depth(uint32_t surface_format, uint32_t zclear)
+{
+    return ((surface_format >> 4) & 0xF) == 1
+         ? (float)(zclear & 0xFFFFu) / 65535.0f
+         : (float)(zclear >> 8) / 16777215.0f;
+}
+
+/* Blend factors (SET_BLEND_FUNC_SFACTOR / DFACTOR take GL's codes). */
+enum nv2a_blend {
+    NV2A_BF_ZERO = 0, NV2A_BF_ONE,
+    NV2A_BF_SRC_COLOR, NV2A_BF_INV_SRC_COLOR,
+    NV2A_BF_SRC_ALPHA, NV2A_BF_INV_SRC_ALPHA,
+    NV2A_BF_DST_ALPHA, NV2A_BF_INV_DST_ALPHA,
+    NV2A_BF_DST_COLOR, NV2A_BF_INV_DST_COLOR,
+    NV2A_BF_SRC_ALPHA_SAT,
+    NV2A_BF_CONST_COLOR, NV2A_BF_INV_CONST_COLOR,
+    NV2A_BF_CONST_ALPHA, NV2A_BF_INV_CONST_ALPHA,
+    NV2A_BF_UNKNOWN
+};
+
+static inline uint32_t nv2a_blend_from_gl(uint32_t gl)
+{
+    switch (gl) {
+    case 0x0000: return NV2A_BF_ZERO;
+    case 0x0001: return NV2A_BF_ONE;
+    case 0x0300: return NV2A_BF_SRC_COLOR;
+    case 0x0301: return NV2A_BF_INV_SRC_COLOR;
+    case 0x0302: return NV2A_BF_SRC_ALPHA;
+    case 0x0303: return NV2A_BF_INV_SRC_ALPHA;
+    case 0x0304: return NV2A_BF_DST_ALPHA;
+    case 0x0305: return NV2A_BF_INV_DST_ALPHA;
+    case 0x0306: return NV2A_BF_DST_COLOR;
+    case 0x0307: return NV2A_BF_INV_DST_COLOR;
+    case 0x0308: return NV2A_BF_SRC_ALPHA_SAT;
+    case 0x8001: return NV2A_BF_CONST_COLOR;
+    case 0x8002: return NV2A_BF_INV_CONST_COLOR;
+    case 0x8003: return NV2A_BF_CONST_ALPHA;
+    case 0x8004: return NV2A_BF_INV_CONST_ALPHA;
+    default:     return NV2A_BF_UNKNOWN;
+    }
+}
+
+/* The factor as used on the alpha channel: a _COLOR factor reads alpha. */
+static inline uint32_t nv2a_blend_for_alpha(uint32_t bf)
+{
+    switch (bf) {
+    case NV2A_BF_SRC_COLOR:     return NV2A_BF_SRC_ALPHA;
+    case NV2A_BF_INV_SRC_COLOR: return NV2A_BF_INV_SRC_ALPHA;
+    case NV2A_BF_DST_COLOR:     return NV2A_BF_DST_ALPHA;
+    case NV2A_BF_INV_DST_COLOR: return NV2A_BF_INV_DST_ALPHA;
+    default:                    return bf;
+    }
+}
+
+/* A factor for the channel at bit `sh` of the ARGB words, 0..255, as the CPU
+ * blender computes it. ponytail: SRC_ALPHA_SAT and unknown codes read as
+ * INV_DST_COLOR here, as the CPU path always has. */
+static inline uint32_t nv2a_blend_factor_u8(uint32_t bf, uint32_t src,
+                                            uint32_t dst, uint32_t constant,
+                                            uint32_t sh)
+{
+    switch (bf) {
+    case NV2A_BF_ZERO:            return 0;
+    case NV2A_BF_ONE:             return 255;
+    case NV2A_BF_SRC_COLOR:       return (src >> sh) & 0xFF;
+    case NV2A_BF_INV_SRC_COLOR:   return 255 - ((src >> sh) & 0xFF);
+    case NV2A_BF_SRC_ALPHA:       return src >> 24;
+    case NV2A_BF_INV_SRC_ALPHA:   return 255 - (src >> 24);
+    case NV2A_BF_DST_ALPHA:       return dst >> 24;
+    case NV2A_BF_INV_DST_ALPHA:   return 255 - (dst >> 24);
+    case NV2A_BF_DST_COLOR:       return (dst >> sh) & 0xFF;
+    case NV2A_BF_CONST_COLOR:     return (constant >> sh) & 0xFF;
+    case NV2A_BF_INV_CONST_COLOR: return 255 - ((constant >> sh) & 0xFF);
+    case NV2A_BF_CONST_ALPHA:     return constant >> 24;
+    case NV2A_BF_INV_CONST_ALPHA: return 255 - (constant >> 24);
+    default:                      return 255 - ((dst >> sh) & 0xFF);
+    }
+}
+
+/* The constant blend factor an API with one RGBA constant needs, from
+ * SET_BLEND_COLOR (ARGB) and the two factors: with only _ALPHA constants the
+ * alpha is replicated into all four, a mix of _COLOR and _ALPHA keeps the
+ * colour (*mixed set, for the caller to report). With no constant factor in
+ * use, (1,1,1,1) and 0 is returned. */
+int nv2a_blend_constant(int enable, uint32_t sfactor, uint32_t dfactor,
+                        uint32_t color, float bf[4], int *mixed);
+
 #ifdef __cplusplus
 }
 #endif

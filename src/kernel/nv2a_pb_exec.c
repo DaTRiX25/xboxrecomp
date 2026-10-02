@@ -1288,31 +1288,18 @@ static int surface_begin_batch(const uint8_t *mem)
     return 1;
 }
 
+/* A GL blend factor the CPU blender computes as GL does (not SRC_ALPHA_SAT). */
 static int blend_known(uint32_t f)
 {
-    return f == 0 || f == 1 || (f >= 0x300 && f <= 0x307)
-        || (f >= 0x8001 && f <= 0x8004);
+    uint32_t bf = nv2a_blend_from_gl(f);
+    return bf != NV2A_BF_UNKNOWN && bf != NV2A_BF_SRC_ALPHA_SAT;
 }
 
 /* A GL blend factor for the channel at bit `sh` of an ARGB word, 0..255. */
 static uint32_t blend_factor(uint32_t f, uint32_t src, uint32_t dst, uint32_t sh)
 {
-    switch (f) {
-    case 0:     return 0;
-    case 1:     return 255;
-    case 0x300: return (src >> sh) & 0xFF;                 /* SRC_COLOR */
-    case 0x301: return 255 - ((src >> sh) & 0xFF);
-    case 0x302: return src >> 24;                          /* SRC_ALPHA */
-    case 0x303: return 255 - (src >> 24);
-    case 0x304: return dst >> 24;                          /* DST_ALPHA */
-    case 0x305: return 255 - (dst >> 24);
-    case 0x306: return (dst >> sh) & 0xFF;                 /* DST_COLOR */
-    case 0x8001: return (s_gpu.blend_color >> sh) & 0xFF;  /* CONSTANT_COLOR */
-    case 0x8002: return 255 - ((s_gpu.blend_color >> sh) & 0xFF);
-    case 0x8003: return s_gpu.blend_color >> 24;           /* CONSTANT_ALPHA */
-    case 0x8004: return 255 - (s_gpu.blend_color >> 24);
-    default:    return 255 - ((dst >> sh) & 0xFF);         /* 0x307 */
-    }
+    return nv2a_blend_factor_u8(nv2a_blend_from_gl(f), src, dst,
+                                s_gpu.blend_color, sh);
 }
 
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
@@ -2139,8 +2126,7 @@ static void vsh_transform(uint32_t index, XfVert *xv)
  * A colour clear that also names Z resets it (see vsh_clear_depth). */
 static float vsh_zmax(void)
 {
-    /* SET_SURFACE_FORMAT zeta field: 1 = Z16, 2 = Z24S8. */
-    return ((s_gpu.format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
+    return nv2a_zmax(s_gpu.format);
 }
 
 static int vsh_zbuf_ready(void)
@@ -2178,31 +2164,16 @@ static int vsh_stencil_ready(void)
 static int stencil_pass(uint8_t stored)
 {
     uint32_t m = s_vsh.stencil_rmask, r = s_vsh.stencil_ref & m, v = stored & m;
-    switch (s_vsh.stencil_func) {
-    case 0: return 0;
-    case 1: return r <  v;
-    case 2: return r == v;
-    case 3: return r <= v;
-    case 4: return r >  v;
-    case 5: return r != v;
-    case 6: return r >= v;
-    default: return 1;
-    }
+    uint32_t f = s_vsh.stencil_func;
+    return nv2a_cmp_test_u(f <= NV2A_CMP_ALWAYS ? f : NV2A_CMP_ALWAYS, r, v);
 }
 
 static void stencil_apply(uint8_t *sp, uint32_t op)
 {
-    uint32_t v = *sp, n;
-    switch (op) {
-    case 0x0000: n = 0; break;
-    case 0x1E01: n = s_vsh.stencil_ref; break;
-    case 0x1E02: n = v < 255u ? v + 1u : 255u; break;
-    case 0x1E03: n = v ? v - 1u : 0u; break;
-    case 0x150A: n = ~v; break;
-    case 0x8507: n = v + 1u; break;
-    case 0x8508: n = v - 1u; break;
-    default: return;                       /* KEEP, and anything unset */
-    }
+    uint32_t v = *sp, n, sop = nv2a_stencil_op_from_gl(op);
+    if (sop == NV2A_SOP_KEEP)
+        return;                            /* KEEP, and anything unset */
+    n = nv2a_stencil_op_apply(sop, v, s_vsh.stencil_ref);
     *sp = (uint8_t)((v & ~s_vsh.stencil_wmask) | (n & s_vsh.stencil_wmask));
 }
 
@@ -2250,25 +2221,14 @@ static void vsh_clear_depth(uint32_t param)
     s_vsh.zclear_color_off = s_gpu.color_offset;
     s_vsh.zclear_zeta_off = s_vsh.zeta_offset;
     s_vsh.zclear_batch = s_vsh.batches_prog;
-    z = ((s_gpu.format >> 4) & 0xF) == 1
-      ? (float)(s_vsh.zclear & 0xFFFFu) / 65535.0f
-      : (float)(s_vsh.zclear >> 8) / 16777215.0f;
+    z = nv2a_zclear_depth(s_gpu.format, s_vsh.zclear);
     for (i = 0; i < s_zbuf_w * s_zbuf_h; i++)
         s_zbuf[i] = z;
 }
 
 static int depth_pass(float z, float stored)
 {
-    switch (s_vsh.depth_func) {
-    case 0x200: return 0;
-    case 0x201: return z <  stored;
-    case 0x202: return z == stored;
-    case 0x203: return z <= stored;
-    case 0x204: return z >  stored;
-    case 0x205: return z != stored;
-    case 0x206: return z >= stored;
-    default:    return 1;                  /* ALWAYS, and anything unset */
-    }
+    return nv2a_cmp_test_f(nv2a_cmp_from_gl(s_vsh.depth_func), z, stored);
 }
 
 static int wrap_signed(int c, uint32_t size, uint32_t mode)
@@ -2730,16 +2690,7 @@ static int vsh_rc_active(void)
 static int alpha_test_pass(float a)
 {
     uint32_t v = (uint32_t)(clamp01(a) * 255.0f + 0.5f), ref = s_vsh.atest_ref;
-    switch (s_vsh.atest_func) {
-    case 0x200: return 0;
-    case 0x201: return v <  ref;
-    case 0x202: return v == ref;
-    case 0x203: return v <= ref;
-    case 0x204: return v >  ref;
-    case 0x205: return v != ref;
-    case 0x206: return v >= ref;
-    default:    return 1;
-    }
+    return nv2a_cmp_test_u(nv2a_cmp_from_gl(s_vsh.atest_func), v, ref);
 }
 
 static void stage_sample(int n, const float tc[4], float o[4])

@@ -573,16 +573,7 @@ static DepthTarget *depth_target(UINT w, UINT h)
  * CPU. */
 static uint32_t stencil_op(uint32_t op)
 {
-    switch (op) {
-    case 0x0000: return D3D11_STENCIL_OP_ZERO;
-    case 0x1E01: return D3D11_STENCIL_OP_REPLACE;
-    case 0x1E02: return D3D11_STENCIL_OP_INCR_SAT;
-    case 0x1E03: return D3D11_STENCIL_OP_DECR_SAT;
-    case 0x150A: return D3D11_STENCIL_OP_INVERT;
-    case 0x8507: return D3D11_STENCIL_OP_INCR;
-    case 0x8508: return D3D11_STENCIL_OP_DECR;
-    default:     return D3D11_STENCIL_OP_KEEP;
-    }
+    return nv2a_stencil_op_from_gl(op) + D3D11_STENCIL_OP_KEEP;
 }
 
 /* SET_DEPTH_FUNC takes GL's codes, 0x200 NEVER .. 0x207 ALWAYS, in the order
@@ -592,8 +583,7 @@ static uint32_t stencil_op(uint32_t op)
 static ID3D11DepthStencilState *depth_state(int depth, int stencil)
 {
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
-    uint32_t f = (v->depth_func >= 0x200 && v->depth_func <= 0x207)
-               ? v->depth_func - 0x200 : 7;
+    uint32_t f = nv2a_cmp_from_gl(v->depth_func);
     uint64_t key = 0;
     D3D11_DEPTH_STENCIL_DESC dd;
     int i;
@@ -651,9 +641,7 @@ static void d3d11_on_zclear(uint32_t param)
     dt = depth_target(rt->w, rt->h);
     if (!dt)
         return;
-    z = ((g->format >> 4) & 0xF) == 1
-      ? (float)(v->zclear & 0xFFFFu) / 65535.0f
-      : (float)(v->zclear >> 8) / 16777215.0f;
+    z = nv2a_zclear_depth(g->format, v->zclear);
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, dt->dsv,
         ((param & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((param & 2u) ? D3D11_CLEAR_STENCIL : 0u),
         z, (UINT8)(v->zclear & 0xFFu));
@@ -939,22 +927,20 @@ static ID3D11InputLayout *input_layout(VsEntry *e, const uint8_t fmt[16])
 
 static D3D11_BLEND blend_factor(uint32_t gl, int alpha)
 {
-    switch (gl) {
-    case 0x0000: return D3D11_BLEND_ZERO;
-    case 0x0001: return D3D11_BLEND_ONE;
-    case 0x0300: return alpha ? D3D11_BLEND_SRC_ALPHA : D3D11_BLEND_SRC_COLOR;
-    case 0x0301: return alpha ? D3D11_BLEND_INV_SRC_ALPHA : D3D11_BLEND_INV_SRC_COLOR;
-    case 0x0302: return D3D11_BLEND_SRC_ALPHA;
-    case 0x0303: return D3D11_BLEND_INV_SRC_ALPHA;
-    case 0x0304: return D3D11_BLEND_DEST_ALPHA;
-    case 0x0305: return D3D11_BLEND_INV_DEST_ALPHA;
-    case 0x0306: return alpha ? D3D11_BLEND_DEST_ALPHA : D3D11_BLEND_DEST_COLOR;
-    case 0x0307: return alpha ? D3D11_BLEND_INV_DEST_ALPHA : D3D11_BLEND_INV_DEST_COLOR;
-    case 0x0308: return D3D11_BLEND_SRC_ALPHA_SAT;
-    case 0x8001: case 0x8003: return D3D11_BLEND_BLEND_FACTOR;
-    case 0x8002: case 0x8004: return D3D11_BLEND_INV_BLEND_FACTOR;
-    default:     return D3D11_BLEND_ONE;
-    }
+    static const D3D11_BLEND map[NV2A_BF_UNKNOWN + 1] = {
+        D3D11_BLEND_ZERO, D3D11_BLEND_ONE,
+        D3D11_BLEND_SRC_COLOR, D3D11_BLEND_INV_SRC_COLOR,
+        D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA,
+        D3D11_BLEND_DEST_ALPHA, D3D11_BLEND_INV_DEST_ALPHA,
+        D3D11_BLEND_DEST_COLOR, D3D11_BLEND_INV_DEST_COLOR,
+        D3D11_BLEND_SRC_ALPHA_SAT,
+        /* No CONSTANT_ALPHA: blend_color() puts the right value in. */
+        D3D11_BLEND_BLEND_FACTOR, D3D11_BLEND_INV_BLEND_FACTOR,
+        D3D11_BLEND_BLEND_FACTOR, D3D11_BLEND_INV_BLEND_FACTOR,
+        D3D11_BLEND_ONE,                        /* unknown */
+    };
+    uint32_t bf = nv2a_blend_from_gl(gl);
+    return map[alpha ? nv2a_blend_for_alpha(bf) : bf];
 }
 
 static ID3D11BlendState *blend_state(void)
@@ -1017,32 +1003,19 @@ static ID3D11BlendState *blend_state(void)
 static int blend_color(float bf[4])
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
-    uint32_t s = g->blend_sfactor, d = g->blend_dfactor, c = g->blend_color;
-    int col = s == 0x8001 || s == 0x8002 || d == 0x8001 || d == 0x8002;
-    int alp = s == 0x8003 || s == 0x8004 || d == 0x8003 || d == 0x8004;
-
-    if (!g->blend_enable || (!col && !alp)) {
-        bf[0] = bf[1] = bf[2] = bf[3] = 1.0f;
-        return 0;
-    }
-    bf[3] = (float)(c >> 24) / 255.0f;
-    if (col && alp) {
+    int mixed, on = nv2a_blend_constant(g->blend_enable, g->blend_sfactor,
+                                        g->blend_dfactor, g->blend_color,
+                                        bf, &mixed);
+    if (mixed) {
         static int warned;
         if (!warned) {
             warned = 1;
             fprintf(stderr, LOGP "blend: CONSTANT_COLOR and CONSTANT_ALPHA mixed"
                     " (sfactor 0x%04X dfactor 0x%04X); the _ALPHA side uses the"
-                    " colour\n", s, d);
+                    " colour\n", g->blend_sfactor, g->blend_dfactor);
         }
     }
-    if (col) {
-        bf[0] = (float)((c >> 16) & 0xFF) / 255.0f;
-        bf[1] = (float)((c >>  8) & 0xFF) / 255.0f;
-        bf[2] = (float)( c        & 0xFF) / 255.0f;
-    } else {
-        bf[0] = bf[1] = bf[2] = bf[3];
-    }
-    return 1;
+    return on;
 }
 
 /* ---- textures -------------------------------------------------------------
@@ -1771,8 +1744,7 @@ static ID3D11PixelShader *setup_pixel(void)
     }
     pc.alpha_ref = (float)v->atest_ref / 255.0f;
     pc.alpha_test_enable = v->atest_enable ? 1u : 0u;
-    pc.alpha_func = (v->atest_func >= 0x200 && v->atest_func <= 0x207)
-                  ? v->atest_func - 0x200 + 1 : 8;          /* GL -> D3DCMP */
+    pc.alpha_func = nv2a_cmp_from_gl(v->atest_func) + 1;   /* GL -> D3DCMP */
     if (memo_on() && s_cb_ps_ok && !memcmp(&s_cb_ps_shadow, &pc, sizeof pc)) {
         /* the buffer already holds these bytes */
     } else if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_ps, 0,
@@ -2520,7 +2492,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         static uint8_t vp_shadow[80];
         static int consts_ok, vp_ok;
         D3D11_MAPPED_SUBRESOURCE m;
-        float zmax = ((g->format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
+        float zmax = nv2a_zmax(g->format);
         float c[12];
         uint32_t u[8];
         uint8_t vp[80];

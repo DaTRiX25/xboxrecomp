@@ -241,3 +241,29 @@ uint32_t nv2a_vsh_program_hash(const struct nv2a_pb_vsh *v, uint32_t *len)
         *len = n;
     return h;
 }
+
+int nv2a_blend_constant(int enable, uint32_t sfactor, uint32_t dfactor,
+                        uint32_t color, float bf[4], int *mixed)
+{
+    uint32_t s = nv2a_blend_from_gl(sfactor), d = nv2a_blend_from_gl(dfactor);
+    int col = s == NV2A_BF_CONST_COLOR || s == NV2A_BF_INV_CONST_COLOR
+           || d == NV2A_BF_CONST_COLOR || d == NV2A_BF_INV_CONST_COLOR;
+    int alp = s == NV2A_BF_CONST_ALPHA || s == NV2A_BF_INV_CONST_ALPHA
+           || d == NV2A_BF_CONST_ALPHA || d == NV2A_BF_INV_CONST_ALPHA;
+
+    *mixed = 0;
+    if (!enable || (!col && !alp)) {
+        bf[0] = bf[1] = bf[2] = bf[3] = 1.0f;
+        return 0;
+    }
+    bf[3] = (float)(color >> 24) / 255.0f;
+    *mixed = col && alp;
+    if (col) {
+        bf[0] = (float)((color >> 16) & 0xFF) / 255.0f;
+        bf[1] = (float)((color >>  8) & 0xFF) / 255.0f;
+        bf[2] = (float)( color        & 0xFF) / 255.0f;
+    } else {
+        bf[0] = bf[1] = bf[2] = bf[3];
+    }
+    return 1;
+}
