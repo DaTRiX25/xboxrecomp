@@ -53,18 +53,17 @@ static int s_seen_count;
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 
-/* Walks that stopped short of PUT. The words from the stop to PUT are never
- * executed, and they may hold the semaphore release the title's next fence
- * wait spins on, so the fence mirror reads this and catches the fence up
- * once (fence_mirrors_tick). Counted here as well because after eight
- * warning lines a stop is otherwise silent. */
-static uint32_t s_tot_stops;
+/* Walks that stopped short of PUT. Counted because after eight warning lines
+ * a stop is otherwise silent. */
+static uint32_t s_tot_stops, s_tot_salvaged, s_catchups;
 uint32_t nv2a_pb_scan_stops(void) { return s_tot_stops; }
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+extern uint32_t nv2a_pb_exec_semaphore_last_value(void);
+extern uint32_t nv2a_pb_exec_semaphore_releases(void);
 extern void nv2a_pb_perf_scan_begin(void);
 extern void nv2a_pb_perf_scan_end(void);
 static int s_exec_enabled = -1;
@@ -193,9 +192,10 @@ void nv2a_pb_scan_report(void)
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
     fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised,"
-                    " %u stopped -- %d distinct (subchannel, method) pairs\n",
+                    " %u stopped (%u with a fence release salvaged, %u catch-ups)"
+                    " -- %d distinct (subchannel, method) pairs\n",
             s_tot_segments, s_tot_words, s_tot_jumps, s_tot_unknown,
-            s_tot_stops, s_seen_count);
+            s_tot_stops, s_tot_salvaged, s_catchups, s_seen_count);
     for (i = 0; i < s_seen_count; i++)
         fprintf(stderr, "  [PB]   subch %u  method 0x%04X  x%-6u %s\n",
                 s_seen[i].subch, s_seen[i].method, s_seen[i].count,
@@ -216,16 +216,78 @@ void nv2a_pb_poll(void)
         b->on_poll();
 }
 
+static int pb_in_window(uint32_t va)
+{
+    return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;
+}
+
+/* The words from a stop to PUT are never executed, and they may hold the
+ * semaphore release the title's next fence wait spins on. stop_salvage
+ * runs that release itself. When it cannot search the span, or finds
+ * releases there but none it trusts, it asks for a catch-up instead: the
+ * fence mirror then writes the title's submitted count once
+ * (fence_mirrors_tick). */
+uint32_t nv2a_pb_scan_catchups(void) { return s_catchups; }
+
+/* The XDK writes a fence as the pair (BACK_END_WRITE_SEMAPHORE_RELEASE,
+ * count 1, subchannel 0) and its value. Run the last such release found in
+ * [from, to): releasing that one marks all the earlier ones done too, and
+ * none beyond PUT. Mirroring the submitted count would also pass fences
+ * the title has not yet handed over, and a resource it is still using
+ * could then be freed.
+ *
+ * The pair can also be data: ARRAY_ELEMENT16 indices 7536, 4 read as
+ * 0x00041D70. A value taken from data could jump the fence far ahead,
+ * which would turn fences off for the rest of the run. So a candidate
+ * counts only if it looks like the next fence: odd (the XDK's fence values
+ * are), after the last release, and at most 128 past it. Returns how the
+ * fence was handled, for the log. */
+static const char *stop_salvage(const uint8_t *mem, uint32_t from, uint32_t to,
+                                uint32_t *value)
+{
+    uint32_t va, last, rel;
+    int found = 0, seen = 0;
+
+    if (!s_exec_enabled)
+        return "not executing";
+    if (from >= to || !pb_in_window(from) || !pb_in_window(to - 4)) {
+        s_catchups++;
+        return "span wraps or is unreadable; fence catch-up requested";
+    }
+    last = nv2a_pb_exec_semaphore_last_value();
+    for (va = from; va + 4 < to; va += 4) {
+        if (*(const uint32_t *)(mem + va) == 0x00041D70u) {
+            uint32_t v = *(const uint32_t *)(mem + va + 4);
+            seen++;
+            if ((v & 1u) && (int32_t)(v - last) > 0 && v - last <= 128u) {
+                last = v;
+                found = 1;
+            }
+        }
+    }
+    if (!found && seen) {
+        /* Data, or a real release the check turned down (an even value,
+         * or one far past a stale last value): not running it could leave
+         * the title waiting for ever, so fall back to the mirror. */
+        s_catchups++;
+        return "release(s) in the rest but none plausible; catch-up requested";
+    }
+    if (!found)
+        return "no fence release in the rest";
+    rel = nv2a_pb_exec_semaphore_releases();
+    nv2a_pb_exec_method(0, 0x1D70u, last);
+    *value = last;
+    if (nv2a_pb_exec_semaphore_releases() == rel)
+        return "fence release found but refused by the executor";
+    s_tot_salvaged++;
+    return "fence release salvaged";
+}
+
 /* A method header's parameters can go past PUT: the title may submit
  * the header and some of its data now and the rest with the next PUT. So
  * the method in progress outlives one walk. */
 static uint32_t s_left, s_subch, s_method;
 static int s_noninc;
-
-static int pb_in_window(uint32_t va)
-{
-    return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;
-}
 
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
@@ -316,12 +378,14 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (why) {
         static unsigned said;
         s_left = 0;                 /* out of step: drop the method in progress */
+        uint32_t v = 0;
+        const char *fence = stop_salvage(mem, at, end_va, &v);
         s_tot_stops++;
         if (said++ < 8)
             fprintf(stderr, "[PB] walk 0x%08X -> 0x%08X stopped at 0x%08X"
                     " (word 0x%08X) after %u words without reaching PUT (%s);"
-                    " fence caught up\n",
-                    start_va, end_va, at, w, words, why);
+                    " %s 0x%08X\n",
+                    start_va, end_va, at, w, words, why, fence, v);
     }
 
     if (s_exec_enabled)

@@ -2,8 +2,16 @@
 add_library(xbox_video STATIC
     video_player.c
     video_pump.c
-    fb_present.c
 )
+# The framebuffer window: GDI on Windows; on POSIX an SDL2 window that owns
+# the process main thread (fb_present_sdl.c, xbox_HostWindowMain).
+if(WIN32)
+    target_sources(xbox_video PRIVATE fb_present.c)
+else()
+    find_package(SDL2 REQUIRED)
+    target_sources(xbox_video PRIVATE fb_present_sdl.c)
+    target_link_libraries(xbox_video PUBLIC SDL2::SDL2 xbox_input)
+endif()
 target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
