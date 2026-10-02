@@ -2382,6 +2382,7 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
                 t->width, t->height, t->offset, t->pitch, t->addr_u, t->addr_v,
                 t->filter, t->palette,
                 s_stage_src[k] ? s_stage_src[k] : "?");
+        fprintf(stderr, " levels %u lod %u-%u", t->levels, t->lod_min, t->lod_max);
         if (s_stage_rt[k])
             fprintf(stderr, " (surface 0x%08X %ux%u, drawn %llu, cleared %llu)",
                     s_stage_rt[k]->offset, s_stage_rt[k]->w, s_stage_rt[k]->h,
