@@ -19,6 +19,12 @@
  *   (w & 0xFFFF0003) == 0x00020000  return
  * For a method header: count = (w >> 18) & 0x7FF, subchannel = (w >> 13) & 7,
  * method = w & 0x1FFC.
+ *
+ * The walk goes from GET to PUT the way the DMA engine does: a jump moves
+ * GET to its target (new style w & ~3, old style w & 0x1FFFFFFC), a call
+ * does the same and keeps one return address, and a return goes back to it.
+ * So a ring wrap is the title's own jump back to the start, and a segment
+ * with a jump in it goes on after it to PUT.
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -199,38 +205,51 @@ void nv2a_pb_poll(void)
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t va = start_va;
+    uint32_t va = start_va, base = start_va & 0xF0000000u, ret_va = 0;
     uint32_t words = 0, jumps = 0, unknown = 0;
+    int in_call = 0;
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
     if (s_scan_enabled < 0)
         s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
-    if (!(s_scan_enabled || s_exec_enabled) || end_va <= start_va)
+    if (!(s_scan_enabled || s_exec_enabled) || end_va == start_va)
         return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
     if (s_exec_enabled)
         nv2a_pb_perf_scan_begin();
 
-    while (va < end_va && words < 0x100000u) {
+    /* Bounded at 4 MB of words, a sane single-frame amount: GET that never
+     * reaches PUT is a stream this walk is out of step with. */
+    while (va != end_va && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
             jumps++;
-            break;                            /* a jump ends this segment */
-        }
-        if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
+            va = base | (((w & 3u) == 1u ? w & ~3u : w & 0x1FFFFFFCu) & 0x0FFFFFFFu);
             continue;
+        }
+        if ((w & 3u) == 2u) {                 /* call */
+            jumps++;
+            ret_va = va;
+            in_call = 1;
+            va = base | (w & 0x0FFFFFFCu);
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {   /* return */
+            if (in_call)
+                va = ret_va;
+            in_call = 0;
+            continue;
+        }
         if ((w & 0x00030003u) == 0u) {
             uint32_t count  = (w >> 18) & 0x7FFu;
             uint32_t subch  = (w >> 13) & 7u;
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            for (uint32_t i = 0; i < count && va != end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
@@ -245,6 +264,12 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             continue;
         }
         unknown++;
+    }
+    if (va != end_va) {
+        static unsigned said;
+        if (said++ < 8)
+            fprintf(stderr, "[PB] walk 0x%08X -> 0x%08X stopped at 0x%08X after"
+                    " %u words without reaching PUT\n", start_va, end_va, va, words);
     }
 
     if (s_exec_enabled)
