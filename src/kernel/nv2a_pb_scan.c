@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "nv2a_pb_state.h"
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 #define PB_MAX_METHODS 4096
@@ -179,6 +181,19 @@ void nv2a_pb_scan_report(void)
                 s_seen[i].subch, s_seen[i].method, s_seen[i].count,
                 nv097_name(s_seen[i].method));
     fflush(stderr);
+}
+
+/* Once per pass of the ack thread's loop: the backend's on_poll, so a
+ * deferred visibility-test report can complete while no pushbuffer comes
+ * (a title spinning on GetVisibilityTestResult submits nothing). */
+void nv2a_pb_poll(void)
+{
+    const struct nv2a_pb_backend *b;
+    if (s_exec_enabled <= 0)
+        return;
+    b = nv2a_pb_get_backend();
+    if (b && b->on_poll)
+        b->on_poll();
 }
 
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
