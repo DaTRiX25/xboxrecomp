@@ -1012,6 +1012,7 @@ static void frame_counters_tick(void)
 static int s_pb_exec = 0;
 
 extern uint32_t nv2a_pb_exec_semaphore_releases(void);
+extern uint32_t nv2a_pb_scan_stops(void);
 extern uint32_t nv2a_pb_exec_semaphore_last_va(void);
 
 /* Mirror "submitted" into "completed" -- now only the fallback.
@@ -1029,6 +1030,15 @@ extern uint32_t nv2a_pb_exec_semaphore_last_va(void);
 static void fence_mirrors_tick(void)
 {
     uint32_t releases = s_pb_exec ? nv2a_pb_exec_semaphore_releases() : 0;
+    /* A walk that stopped short of PUT never runs the rest of its segment,
+     * and a semaphore release there would leave the title's next fence wait
+     * spinning for ever. So after a stop the mirror does its write once even
+     * where the executor owns the fence: everything submitted counts as
+     * done, and the title goes on. */
+    static uint32_t last_stops;
+    uint32_t stops = nv2a_pb_scan_stops();
+    int caught_up = stops != last_stops;
+    last_stops = stops;
 
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
@@ -1059,7 +1069,7 @@ static void fence_mirrors_tick(void)
                         sema);
                 fflush(stderr);
             }
-            if (same)
+            if (same && !caught_up)
                 continue;
         }
         {
