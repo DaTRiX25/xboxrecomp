@@ -607,6 +607,12 @@ static void clear_surface(uint32_t param)
         }
     }
     s_gpu.clears++;
+    /* A colour clear is drawing too. drawn_offset is what a flip presents, and
+     * only the triangle rasteriser used to set it, so a frame that was a clear
+     * plus non-triangle work left it on the last surface a triangle touched.
+     * BLiNX 2 under Proton: every flip republished 0x01034000 while the
+     * executor was clearing and drawing 0x01160000, and the window was black. */
+    s_gpu.drawn_offset = s_gpu.color_offset;
     /* Progress markers, interleaved with everything else in the log. The
      * summary says drawing stopped; only a marker next to the surrounding
      * activity says what the title was doing when it stopped. */
@@ -1931,11 +1937,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
             }
         }
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        /* The first few always, so a log says whether flips happen at all
+         * and which surface each one put on screen; more with VERBOSE. */
+        {
             static unsigned n;
-            if (n++ < 8) {
-                fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
-                        s_gpu.flips, s_gpu.flip_read, s_gpu.flip_write);
+            unsigned limit = getenv("RECOMP_PB_EXEC_VERBOSE") ? 8u : 4u;
+            if (n++ < limit) {
+                uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                                   : s_gpu.color_offset;
+                fprintf(stderr, "  [GPU] flip %u: read=%u write=%u presents"
+                        " 0x%08X (-> 0x%08X)\n", s_gpu.flips, s_gpu.flip_read,
+                        s_gpu.flip_write, done, done ? dma_resolve(done) : 0u);
                 fflush(stderr);
             }
         }
