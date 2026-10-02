@@ -63,6 +63,21 @@ static compile_fn              s_compile;
 static ID3D11Buffer           *s_cb_consts;     /* b1: c[192]            */
 static ID3D11Buffer           *s_cb_vp;         /* b2: vp_scale, vp_off  */
 static ID3D11Buffer           *s_cb_ps;         /* PS b0: PsConsts       */
+
+/* Per-batch CPU memos (RECOMP_D3D11_MEMO=0 turns them off for A/B): a
+ * constant buffer is only rewritten when its bytes change, and the shader
+ * and texture lookups reuse the last batch's answer when their inputs are
+ * the same. Each one returns what the full path would, so the output does
+ * not change. */
+static int s_memo = -1;
+static int memo_on(void)
+{
+    if (s_memo < 0) {
+        const char *e = getenv("RECOMP_D3D11_MEMO");
+        s_memo = !(e && *e == '0');
+    }
+    return s_memo;
+}
 static ID3D11Buffer           *s_vb;            /* ring of float4 streams */
 static UINT                    s_vb_size, s_vb_pos;
 static ID3D11Buffer           *s_ib;
@@ -775,16 +790,28 @@ static VsEntry *vertex_shader(int program)
     static NV2AVshProgram parsed;
     static char hlsl[65536];
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
-    uint32_t hash = program ? program_hash(v) : 0;
+    uint32_t hash = 0;
     VsEntry *e = NULL;
     ID3DBlob *code = NULL;
     const char *src;
     char name[32];
     int i;
+    static struct { int valid, program; uint32_t dwords, start; VsEntry *e; } memo;
 
+    if (memo_on() && memo.valid && memo.program == program
+            && memo.dwords == v->prog_dwords && memo.start == v->start)
+        return memo.e;
+    if (program)
+        hash = program_hash(v);
     for (i = 0; i < VS_MAX; i++) {
-        if (s_vs[i].used && s_vs[i].hash == hash)
-            return s_vs[i].bad ? NULL : &s_vs[i];
+        if (s_vs[i].used && s_vs[i].hash == hash) {
+            memo.valid = 1;
+            memo.program = program;
+            memo.dwords = v->prog_dwords;
+            memo.start = v->start;
+            memo.e = s_vs[i].bad ? NULL : &s_vs[i];
+            return memo.e;
+        }
         if (!s_vs[i].used && !e)
             e = &s_vs[i];
     }
@@ -966,6 +993,8 @@ typedef struct {
 
 static TexEntry  s_tc[TEX_CACHE];
 static uint32_t  s_tc_clock;
+static TexEntry *s_tc_recent[4];   /* last hits, checked before the scan */
+static uint32_t  s_tc_recent_next;
 static uint32_t *s_texels;
 static size_t    s_texels_cap;
 static ID3D11ShaderResourceView *s_black_srv;   /* too large: (0,0,0,1) */
@@ -1333,7 +1362,18 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         }
         return s_magenta_srv ? s_magenta_srv : s_black_srv;
     }
-    for (i = 0; i < TEX_CACHE; i++) {
+    if (memo_on()) {
+        for (i = 0; i < 4; i++) {
+            TexEntry *c = s_tc_recent[i];
+            if (c && c->live && c->offset == t->offset && c->color == t->color
+                    && c->width == t->width && c->height == t->height
+                    && c->pitch == t->pitch && c->palette == t->palette) {
+                e = c;
+                break;
+            }
+        }
+    }
+    for (i = 0; !e && i < TEX_CACHE; i++) {
         TexEntry *c = &s_tc[i];
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
@@ -1374,6 +1414,9 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         e->live = 1;
     }
     e->used = ++s_tc_clock;
+    if (s_tc_recent[0] != e && s_tc_recent[1] != e
+            && s_tc_recent[2] != e && s_tc_recent[3] != e)
+        s_tc_recent[s_tc_recent_next++ & 3] = e;
     return e->srv;
 }
 
@@ -1468,6 +1511,7 @@ typedef struct {
 } RcEntry;
 static RcEntry  s_rc[RC_MAX];
 static uint64_t s_rc_compiles;
+static RcEntry *s_rc_last;      /* the entry combiner_ps last returned from */
 
 static uint32_t rc_hash(const NV2ACombinerState *st)
 {
@@ -1492,6 +1536,7 @@ static ID3D11PixelShader *combiner_ps(const NV2ACombinerState *st)
         RcEntry *c = &s_rc[i];
         if (c->used && c->hash == h && !memcmp(&c->st, st, sizeof *st)) {
             c->last_use = s_tick;
+            s_rc_last = c;
             return c->bad ? NULL : c->ps;
         }
         if (!c->used) {
@@ -1505,6 +1550,7 @@ static ID3D11PixelShader *combiner_ps(const NV2ACombinerState *st)
         if (e->ps) ID3D11PixelShader_Release(e->ps);
     }
     memset(e, 0, sizeof *e);
+    s_rc_last = e;
     e->used = 1;
     e->hash = h;
     e->st = *st;
@@ -1675,6 +1721,9 @@ static ID3D11PixelShader *debug_ps(void)
 
 /* Stages, textures, samplers and PS constants for the batch about to be
  * drawn. Returns the pixel shader to use. */
+static PsConsts s_cb_ps_shadow;
+static int      s_cb_ps_ok;
+
 static ID3D11PixelShader *setup_pixel(void)
 {
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
@@ -1733,10 +1782,14 @@ static ID3D11PixelShader *setup_pixel(void)
     pc.alpha_test_enable = v->atest_enable ? 1u : 0u;
     pc.alpha_func = (v->atest_func >= 0x200 && v->atest_func <= 0x207)
                   ? v->atest_func - 0x200 + 1 : 8;          /* GL -> D3DCMP */
-    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_ps, 0,
+    if (memo_on() && s_cb_ps_ok && !memcmp(&s_cb_ps_shadow, &pc, sizeof pc)) {
+        /* the buffer already holds these bytes */
+    } else if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_ps, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, &pc, sizeof pc);
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_ps, 0);
+        s_cb_ps_shadow = pc;
+        s_cb_ps_ok = 1;
     }
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
@@ -1755,14 +1808,49 @@ static ID3D11PixelShader *setup_pixel(void)
             if (m && m != 4) m = 1;
             modes |= m << (5 * n);
         }
-        d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw,
-                                 v->rc_aocw, v->rc_ctl, v->rc_fcw0,
-                                 v->rc_fcw1, modes, &st);
-        s_last_rc = st;
+        /* The registers and modes that make the state: the same as the last
+         * batch's give the same state and so the same shader. */
+        static struct {
+            uint32_t r[36];
+            int      key_ok, ps_ok;   /* s_last_rc is r's state; ps is its shader */
+            ID3D11PixelShader *ps;
+            RcEntry *e;
+            uint64_t compiles;
+        } memo;
+        uint32_t key[36];
+        int hit;
+        memcpy(key, v->rc_cicw, 32);
+        memcpy(key + 8, v->rc_aicw, 32);
+        memcpy(key + 16, v->rc_cocw, 32);
+        memcpy(key + 24, v->rc_aocw, 32);
+        key[32] = v->rc_ctl;
+        key[33] = v->rc_fcw0;
+        key[34] = v->rc_fcw1;
+        key[35] = modes;
+        hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
+        if (!hit) {
+            d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw,
+                                     v->rc_aocw, v->rc_ctl, v->rc_fcw0,
+                                     v->rc_fcw1, modes, &st);
+            s_last_rc = st;
+            memcpy(memo.r, key, sizeof key);
+            memo.key_ok = 1;
+            memo.ps_ok = 0;
+        }
         s_last_rc_on = 1;
         if ((ps = debug_ps()) != NULL)
             return ps;
-        ps = combiner_ps(&st);
+        /* A compile since may have evicted the entry remembered. */
+        if (hit && memo.ps_ok && memo.compiles == s_rc_compiles) {
+            memo.e->last_use = s_tick;   /* as combiner_ps's hit does */
+            ps = memo.ps;
+        } else {
+            ps = combiner_ps(&s_last_rc);
+            memo.ps = ps;
+            memo.e = s_rc_last;
+            memo.compiles = s_rc_compiles;
+            memo.ps_ok = 1;
+        }
         if (ps)
             return ps;
     }
@@ -2176,28 +2264,40 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 
     /* Constants: the program's c[192] at b1 and the pixels->NDC mapping. */
     {
+        static uint8_t consts_shadow[sizeof v->c];
+        static float vp_shadow[8];
+        static int consts_ok, vp_ok;
         D3D11_MAPPED_SUBRESOURCE m;
-        if (d->program && SUCCEEDED(ID3D11DeviceContext_Map(
+        float zmax = ((g->format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
+        float c[8];
+        c[0] = 2.0f / (float)rt->w;
+        c[1] = -2.0f / (float)rt->h;
+        c[2] = 1.0f / zmax;
+        c[3] = 0.0f;
+        c[4] = -1.0f;
+        c[5] = 1.0f;
+        c[6] = 0.0f;
+        c[7] = 0.0f;
+        if (!d->program
+                || (memo_on() && consts_ok && !memcmp(consts_shadow, v->c, sizeof v->c))) {
+            /* the buffer already holds these bytes */
+        } else if (SUCCEEDED(ID3D11DeviceContext_Map(
                 s_ctx, (ID3D11Resource *)s_cb_consts, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &m))) {
             memcpy(m.pData, v->c, sizeof v->c);
             ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_consts, 0);
+            memcpy(consts_shadow, v->c, sizeof v->c);
+            consts_ok = 1;
         }
-        if (SUCCEEDED(ID3D11DeviceContext_Map(
+        if (memo_on() && vp_ok && !memcmp(vp_shadow, c, sizeof c)) {
+            /* unchanged */
+        } else if (SUCCEEDED(ID3D11DeviceContext_Map(
                 s_ctx, (ID3D11Resource *)s_cb_vp, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            float zmax = ((g->format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
-            float c[8];
-            c[0] = 2.0f / (float)rt->w;
-            c[1] = -2.0f / (float)rt->h;
-            c[2] = 1.0f / zmax;
-            c[3] = 0.0f;
-            c[4] = -1.0f;
-            c[5] = 1.0f;
-            c[6] = 0.0f;
-            c[7] = 0.0f;
             memcpy(m.pData, c, sizeof c);
             ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_vp, 0);
+            memcpy(vp_shadow, c, sizeof c);
+            vp_ok = 1;
         }
     }
 
