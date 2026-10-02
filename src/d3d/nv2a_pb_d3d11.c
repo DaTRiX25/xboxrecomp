@@ -41,6 +41,7 @@
 #include "d3d8_combiners.h"
 #include "d3d8_swizzle.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_backend_common.h"
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 
@@ -123,16 +124,9 @@ static ID3D11RasterizerState  *s_rs;
 static ID3D11DepthStencilState *s_ds_off;
 static ID3D11PixelShader      *s_ps;
 
-/* The pixel shaders' constants (PS b0). The layout is NV2APSConstants
- * (d3d8_combiners.h) plus the per-stage texture-coordinate scale and mode. */
-typedef struct {
-    float    c0[8][4], c1[8][4], fc0[4], fc1[4], fog_color[4];
-    float    alpha_ref;
-    uint32_t alpha_func, alpha_test_enable, fog_enable;
-    uint32_t alpha_only[4];
-    float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear) */
-    uint32_t tex_mode[4];       /* stage texture-shader mode, 0 = none */
-} PsConsts;
+/* The pixel shaders' constants (PS b0): struct nv2a_ps_consts, whose
+ * layout PS_CB_DECL must match. */
+typedef struct nv2a_ps_consts PsConsts;
 
 #define PS_CB_DECL \
     "cbuffer CombinerCB : register(b0) {\n" \
@@ -162,7 +156,7 @@ typedef struct {
     uint64_t                last_draw, last_clear;  /* s_seq at the last one */
 } RenderTarget;
 
-typedef struct Stage Stage;
+typedef struct nv2a_stage Stage;
 static RenderTarget s_rt[RT_MAX];
 static RenderTarget *s_drawn;   /* what the last flip presented */
 static RenderTarget *s_cur;     /* the target of the batch being drawn */
@@ -572,16 +566,7 @@ static DepthTarget *depth_target(UINT w, UINT h)
  * CPU. */
 static uint32_t stencil_op(uint32_t op)
 {
-    switch (op) {
-    case 0x0000: return D3D11_STENCIL_OP_ZERO;
-    case 0x1E01: return D3D11_STENCIL_OP_REPLACE;
-    case 0x1E02: return D3D11_STENCIL_OP_INCR_SAT;
-    case 0x1E03: return D3D11_STENCIL_OP_DECR_SAT;
-    case 0x150A: return D3D11_STENCIL_OP_INVERT;
-    case 0x8507: return D3D11_STENCIL_OP_INCR;
-    case 0x8508: return D3D11_STENCIL_OP_DECR;
-    default:     return D3D11_STENCIL_OP_KEEP;
-    }
+    return nv2a_stencil_op_from_gl(op) + D3D11_STENCIL_OP_KEEP;
 }
 
 /* SET_DEPTH_FUNC takes GL's codes, 0x200 NEVER .. 0x207 ALWAYS, in the order
@@ -591,8 +576,7 @@ static uint32_t stencil_op(uint32_t op)
 static ID3D11DepthStencilState *depth_state(int depth, int stencil)
 {
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
-    uint32_t f = (v->depth_func >= 0x200 && v->depth_func <= 0x207)
-               ? v->depth_func - 0x200 : 7;
+    uint32_t f = nv2a_cmp_from_gl(v->depth_func);
     uint64_t key = 0;
     D3D11_DEPTH_STENCIL_DESC dd;
     int i;
@@ -650,9 +634,7 @@ static void d3d11_on_zclear(uint32_t param)
     dt = depth_target(rt->w, rt->h);
     if (!dt)
         return;
-    z = ((g->format >> 4) & 0xF) == 1
-      ? (float)(v->zclear & 0xFFFFu) / 65535.0f
-      : (float)(v->zclear >> 8) / 16777215.0f;
+    z = nv2a_zclear_depth(g->format, v->zclear);
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, dt->dsv,
         ((param & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((param & 2u) ? D3D11_CLEAR_STENCIL : 0u),
         z, (UINT8)(v->zclear & 0xFFu));
@@ -688,7 +670,6 @@ static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
                  uint32_t index, float out[4])
 {
     const uint8_t *p;
-    uint32_t i;
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
@@ -703,52 +684,7 @@ static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
         p = (const uint8_t *)xbox_GetMemoryOffset() + a->offset
           + (size_t)index * a->stride;
     }
-    switch (a->type) {
-    case NV2A_VTX_D3DCOLOR:
-        out[0] = (float)p[2] / 255.0f;
-        out[1] = (float)p[1] / 255.0f;
-        out[2] = (float)p[0] / 255.0f;
-        out[3] = (float)p[3] / 255.0f;
-        return 1;
-    case NV2A_VTX_FLOAT:
-        for (i = 0; i < a->size && i < 4; i++)
-            memcpy(&out[i], p + 4 * i, 4);
-        return 1;
-    case NV2A_VTX_UBYTE:
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = (float)p[i] / 255.0f;
-        return 1;
-    case NV2A_VTX_S1:
-        for (i = 0; i < a->size && i < 4; i++) {
-            int16_t s;
-            float f;
-            memcpy(&s, p + 2 * i, 2);
-            f = (float)s / 32767.0f;
-            out[i] = f < -1.0f ? -1.0f : f;
-        }
-        return 1;
-    case NV2A_VTX_S32K:
-        for (i = 0; i < a->size && i < 4; i++) {
-            int16_t s;
-            memcpy(&s, p + 2 * i, 2);
-            out[i] = (float)s;
-        }
-        return 1;
-    case NV2A_VTX_CMP: {
-        uint32_t w;
-        int32_t x, y, z;
-        memcpy(&w, p, 4);
-        x = (int32_t)(w << 21) >> 21;
-        y = (int32_t)(w << 10) >> 21;
-        z = (int32_t)w >> 22;
-        out[0] = (float)x / 1023.0f;
-        out[1] = (float)y / 1023.0f;
-        out[2] = (float)z / 511.0f;
-        return 1;
-    }
-    default:
-        return 0;
-    }
+    return nv2a_vtx_decode(a->type, a->size, p, out);
 }
 
 /* The DXGI format a stream can be read in as it is, so its bytes are copied
@@ -856,59 +792,11 @@ static void vb_end(void)
 static uint32_t convert_indices(const struct nv2a_pb_draw *d, uint32_t base,
                                 uint32_t *out, D3D11_PRIMITIVE_TOPOLOGY *topo)
 {
-    const uint16_t *v = d->idx;
-    uint32_t n = d->idx_count, k = 0, i;
-
-#define PUT(x) (out[k++] = (uint32_t)(x) - base)
-    switch (d->prim) {
-    case NV_PRIM_POINTS:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
-        for (i = 0; i < n; i++) PUT(v[i]);
-        break;
-    case NV_PRIM_LINES:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
-        for (i = 0; i + 1 < n; i += 2) { PUT(v[i]); PUT(v[i + 1]); }
-        break;
-    case NV_PRIM_LINE_LOOP:
-    case NV_PRIM_LINE_STRIP:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
-        for (i = 0; i + 1 < n; i++) { PUT(v[i]); PUT(v[i + 1]); }
-        if (d->prim == NV_PRIM_LINE_LOOP && n > 2) { PUT(v[n - 1]); PUT(v[0]); }
-        break;
-    case NV_PRIM_TRIANGLES:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        for (i = 0; i + 2 < n; i += 3) { PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 2]); }
-        break;
-    case NV_PRIM_TRIANGLE_STRIP:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        for (i = 0; i + 2 < n; i++) {
-            if (i & 1) { PUT(v[i + 1]); PUT(v[i]); PUT(v[i + 2]); }
-            else       { PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 2]); }
-        }
-        break;
-    case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_POLYGON:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        for (i = 1; i + 1 < n; i++) { PUT(v[0]); PUT(v[i]); PUT(v[i + 1]); }
-        break;
-    case NV_PRIM_QUADS:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        for (i = 0; i + 3 < n; i += 4) {
-            PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 2]);
-            PUT(v[i]); PUT(v[i + 2]); PUT(v[i + 3]);
-        }
-        break;
-    case NV_PRIM_QUAD_STRIP:
-        *topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        for (i = 0; i + 3 < n; i += 2) {
-            PUT(v[i]); PUT(v[i + 1]); PUT(v[i + 3]);
-            PUT(v[i]); PUT(v[i + 3]); PUT(v[i + 2]);
-        }
-        break;
-    default:
-        return 0;
-    }
-#undef PUT
+    enum nv2a_topology t;
+    uint32_t k = nv2a_prim_to_list(d->prim, d->idx, d->idx_count, base, out, &t);
+    *topo = t == NV2A_TOPO_POINTS ? D3D11_PRIMITIVE_TOPOLOGY_POINTLIST
+          : t == NV2A_TOPO_LINES  ? D3D11_PRIMITIVE_TOPOLOGY_LINELIST
+          :                         D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     return k;
 }
 
@@ -916,15 +804,7 @@ static uint32_t convert_indices(const struct nv2a_pb_draw *d, uint32_t base,
 
 static uint32_t program_hash(const struct nv2a_pb_vsh *v)
 {
-    uint32_t h = 2166136261u, pc, k;
-    for (pc = v->start; pc < NV2A_VSH_SLOTS; pc++) {
-        for (k = 0; k < 4; k++) {
-            h ^= v->prog[pc][k];
-            h *= 16777619u;
-        }
-        if (v->prog[pc][3] & 1u)      /* FINAL */
-            break;
-    }
+    uint32_t h = nv2a_vsh_program_hash(v, NULL);
     return h ? h : 1;
 }
 
@@ -965,7 +845,7 @@ static VsEntry *vertex_shader(int program)
     e->bad = 1;
 
     if (program) {
-        d3d8_vsh_parse((const DWORD *)&v->prog[v->start][0],
+        d3d8_vsh_parse(&v->prog[v->start][0],
                        NV2A_VSH_SLOTS - (int)v->start, &parsed);
         if (d3d8_vsh_generate_hlsl_ex(&parsed, NV2A_VSH_HLSL_SCREEN_SPACE,
                                       hlsl, sizeof hlsl) <= 0) {
@@ -1040,22 +920,20 @@ static ID3D11InputLayout *input_layout(VsEntry *e, const uint8_t fmt[16])
 
 static D3D11_BLEND blend_factor(uint32_t gl, int alpha)
 {
-    switch (gl) {
-    case 0x0000: return D3D11_BLEND_ZERO;
-    case 0x0001: return D3D11_BLEND_ONE;
-    case 0x0300: return alpha ? D3D11_BLEND_SRC_ALPHA : D3D11_BLEND_SRC_COLOR;
-    case 0x0301: return alpha ? D3D11_BLEND_INV_SRC_ALPHA : D3D11_BLEND_INV_SRC_COLOR;
-    case 0x0302: return D3D11_BLEND_SRC_ALPHA;
-    case 0x0303: return D3D11_BLEND_INV_SRC_ALPHA;
-    case 0x0304: return D3D11_BLEND_DEST_ALPHA;
-    case 0x0305: return D3D11_BLEND_INV_DEST_ALPHA;
-    case 0x0306: return alpha ? D3D11_BLEND_DEST_ALPHA : D3D11_BLEND_DEST_COLOR;
-    case 0x0307: return alpha ? D3D11_BLEND_INV_DEST_ALPHA : D3D11_BLEND_INV_DEST_COLOR;
-    case 0x0308: return D3D11_BLEND_SRC_ALPHA_SAT;
-    case 0x8001: case 0x8003: return D3D11_BLEND_BLEND_FACTOR;
-    case 0x8002: case 0x8004: return D3D11_BLEND_INV_BLEND_FACTOR;
-    default:     return D3D11_BLEND_ONE;
-    }
+    static const D3D11_BLEND map[NV2A_BF_UNKNOWN + 1] = {
+        D3D11_BLEND_ZERO, D3D11_BLEND_ONE,
+        D3D11_BLEND_SRC_COLOR, D3D11_BLEND_INV_SRC_COLOR,
+        D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA,
+        D3D11_BLEND_DEST_ALPHA, D3D11_BLEND_INV_DEST_ALPHA,
+        D3D11_BLEND_DEST_COLOR, D3D11_BLEND_INV_DEST_COLOR,
+        D3D11_BLEND_SRC_ALPHA_SAT,
+        /* No CONSTANT_ALPHA: blend_color() puts the right value in. */
+        D3D11_BLEND_BLEND_FACTOR, D3D11_BLEND_INV_BLEND_FACTOR,
+        D3D11_BLEND_BLEND_FACTOR, D3D11_BLEND_INV_BLEND_FACTOR,
+        D3D11_BLEND_ONE,                        /* unknown */
+    };
+    uint32_t bf = nv2a_blend_from_gl(gl);
+    return map[alpha ? nv2a_blend_for_alpha(bf) : bf];
 }
 
 static ID3D11BlendState *blend_state(void)
@@ -1118,32 +996,19 @@ static ID3D11BlendState *blend_state(void)
 static int blend_color(float bf[4])
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
-    uint32_t s = g->blend_sfactor, d = g->blend_dfactor, c = g->blend_color;
-    int col = s == 0x8001 || s == 0x8002 || d == 0x8001 || d == 0x8002;
-    int alp = s == 0x8003 || s == 0x8004 || d == 0x8003 || d == 0x8004;
-
-    if (!g->blend_enable || (!col && !alp)) {
-        bf[0] = bf[1] = bf[2] = bf[3] = 1.0f;
-        return 0;
-    }
-    bf[3] = (float)(c >> 24) / 255.0f;
-    if (col && alp) {
+    int mixed, on = nv2a_blend_constant(g->blend_enable, g->blend_sfactor,
+                                        g->blend_dfactor, g->blend_color,
+                                        bf, &mixed);
+    if (mixed) {
         static int warned;
         if (!warned) {
             warned = 1;
             fprintf(stderr, LOGP "blend: CONSTANT_COLOR and CONSTANT_ALPHA mixed"
                     " (sfactor 0x%04X dfactor 0x%04X); the _ALPHA side uses the"
-                    " colour\n", s, d);
+                    " colour\n", g->blend_sfactor, g->blend_dfactor);
         }
     }
-    if (col) {
-        bf[0] = (float)((c >> 16) & 0xFF) / 255.0f;
-        bf[1] = (float)((c >>  8) & 0xFF) / 255.0f;
-        bf[2] = (float)( c        & 0xFF) / 255.0f;
-    } else {
-        bf[0] = bf[1] = bf[2] = bf[3];
-    }
-    return 1;
+    return on;
 }
 
 /* ---- textures -------------------------------------------------------------
@@ -1171,17 +1036,6 @@ static int blend_color(float bf[4])
  * ponytail: DXT is decoded rather than uploaded as BC1-3; a texture
  * rewritten between two batches of one flip is not seen; cube maps and 3D
  * textures are face/slice 0 only. */
-
-struct Stage {
-    uint32_t offset, color, width, height, pitch, addr_u, addr_v;
-    uint32_t palette, pal_len;  /* P8: resolved palette address, entries */
-    uint32_t filter;            /* SET_TEXTURE_FILTER as written */
-    uint32_t levels;            /* mip levels uploaded (1 for linear)    */
-    uint32_t lod_min, lod_max;  /* CONTROL0 LOD clamps, within levels    */
-    int      valid;
-    int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
-    int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
-};
 
 static Stage s_stage[4];
 /* What each stage's SRV came from, for the batch trace. */
@@ -1219,13 +1073,6 @@ static uint32_t *s_texels;
 static size_t    s_texels_cap;
 static ID3D11ShaderResourceView *s_black_srv;   /* too large: (0,0,0,1) */
 static ID3D11ShaderResourceView *s_magenta_srv; /* format not decoded */
-static const uint32_t *s_pal;                   /* P8 palette, while decoding */
-static uint32_t        s_pal_len;
-
-static int tex_size_from_format(uint32_t fmt)
-{
-    return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
-}
 
 static int no_mips(void)
 {
@@ -1243,60 +1090,15 @@ static void build_stages(void)
     int n;
 
     for (n = 0; n < 4; n++) {
-        const uint32_t *r = &regs[(0x40u * n) / 4];
-        const uint8_t  *set = &sets[(0x40u * n) / 4];
         Stage *t = &s_stage[n];
-        uint32_t fmt = r[0x04 / 4], ctl0 = r[0x0C / 4];
-        int on = (ctl0 >> 30) & 1;
         int mode;
 
-        memset(t, 0, sizeof *t);
-        t->offset = r[0] ? nv2a_pb_dma_resolve(r[0]) : 0;
-        t->color = (fmt >> 8) & 0xFF;
-        if (tex_size_from_format(t->color)) {
-            t->width  = 1u << ((fmt >> 20) & 0xF);
-            t->height = 1u << ((fmt >> 24) & 0xF);
-        } else {
-            t->width  = r[0x1C / 4] >> 16;
-            t->height = r[0x1C / 4] & 0xFFFF;
-        }
-        /* CONTROL1's pitch means nothing to a swizzled or DXT texture,
-         * and left in the cache key a stale one splits it in two. */
-        t->pitch  = tex_size_from_format(t->color) ? 0 : r[0x10 / 4] >> 16;
-        t->addr_u =  r[0x08 / 4]       & 0xF;
-        t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
-        t->filter = r[0x14 / 4];
-        /* P8: SET_TEXTURE_PALETTE (0x1B20): offset in bits 6-31, length
-         * 256 >> bits 2-3, entries A8R8G8B8. */
-        if (t->color == 0x0B) {
-            uint32_t pal = r[0x20 / 4];
-            t->palette = (pal & ~0x3Fu) ? nv2a_pb_dma_resolve(pal & ~0x3Fu) : 0;
-            t->pal_len = 256u >> ((pal >> 2) & 3u);
-        }
-        t->levels = 1;
-        if (tex_size_from_format(t->color) && !no_mips()) {
-            /* As xemu's pgraph_get_texture_shape: the format's count, no
-             * more than MAX_LOD_CLAMP + 1, none smaller than 1x1. The
-             * clamps are whole levels (xemu reads the 12-bit fields as is). */
-            uint32_t lu = (fmt >> 20) & 0xF, lv = (fmt >> 24) & 0xF;
-            uint32_t lmax = (ctl0 >> 6) & 0xFFF, lmin = (ctl0 >> 18) & 0xFFF;
-            uint32_t lv_n = (fmt >> 16) & 0xF;
-            if (lv_n > lmax + 1u) lv_n = lmax + 1u;
-            if (lv_n > (lu > lv ? lu : lv) + 1u) lv_n = (lu > lv ? lu : lv) + 1u;
-            t->levels = lv_n ? lv_n : 1u;
-            t->lod_min = lmin < t->levels - 1u ? lmin : t->levels - 1u;
-            t->lod_max = lmax < t->levels - 1u ? lmax : t->levels - 1u;
-        }
-        t->valid = t->offset && t->width && t->height
-                && (tex_size_from_format(t->color) || t->pitch)
-                && (t->color != 0x0B || t->palette);
-        if (n == 0 && !set[0x0C / 4])
-            on = 1;                        /* never configured: as the CPU path */
-        if (v->shader_set)
-            mode = (int)((v->shader_prog >> (5 * n)) & 0x1F);
-        else
-            mode = n == 0 ? 1 : 0;
-        if (mode && mode != 4 && (!on || !t->valid)) {
+        nv2a_stage_decode(n, &regs[(0x40u * n) / 4], &sets[(0x40u * n) / 4],
+                          v->shader_set, v->shader_prog, nv2a_pb_dma_resolve,
+                          NV2A_STAGE_P8_PALETTE | NV2A_STAGE_PITCH_LINEAR
+                          | (no_mips() ? 0u : NV2A_STAGE_MIPS), t);
+        mode = t->raw_mode;
+        if (mode && mode != 4 && (!t->on || !t->valid)) {
             /* The program asks for a texture this stage cannot give: it
              * reads 0 now. Said once per stage, mode and format, since a
              * world drawn in flat vertex colour starts exactly here. */
@@ -1306,238 +1108,27 @@ static void build_stages(void)
                 said[n][mode & 31][(t->color >> 3) & 31] |= bit;
                 fprintf(stderr, LOGP "\x1b[1;35mstage %d: mode %d with no texture"
                         " (enabled %d, offset 0x%08X, format 0x%02X, %ux%u, pitch %u)"
-                        "\x1b[0m\n", n, mode, on, t->offset, t->color,
+                        "\x1b[0m\n", n, mode, t->on, t->offset, t->color,
                         t->width, t->height, t->pitch);
             }
         }
-        t->on = on;
-        if (mode != 4 && (!on || !t->valid))
-            mode = 0;
-        if (mode == 5)
-            mode = 0;   /* CLIP_PLANE: no texture, the register reads 0
-                         * (ponytail: its per-pixel discard is not done) */
-        t->mode = mode;
-    }
-}
-
-/* The linear format with the same texel encoding as a swizzled one. */
-static uint32_t linear_twin(uint32_t fmt)
-{
-    switch (fmt) {
-    case 0x00: return 0x13;
-    case 0x02: return 0x10;
-    case 0x03: return 0x1C;
-    case 0x04: return 0x1D;
-    case 0x05: return 0x11;
-    case 0x06: return 0x12;
-    case 0x07: return 0x1E;
-    case 0x19: return 0x1F;
-    case 0x01: return 0x1B;     /* AY8 */
-    case 0x1A: return 0x20;     /* A8Y8 */
-    case 0x27: return 0x37;     /* R6G5B5 */
-    case 0x28: return 0x17;     /* G8B8 */
-    case 0x32: return 0x35;     /* Y16 */
-    case 0x38: return 0x3D;     /* R5G5B5A1 */
-    case 0x39: return 0x3E;     /* R4G4B4A4 */
-    case 0x3A: return 0x3F;     /* A8B8G8R8 */
-    case 0x3B: return 0x40;     /* B8G8R8A8 */
-    case 0x3C: return 0x41;     /* R8G8B8A8 */
-    default:   return fmt;      /* already linear, P8, or not decoded */
-    }
-}
-
-static uint32_t texel_bytes(uint32_t lin)
-{
-    switch (lin) {
-    case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return 4;
-    case 0x10: case 0x1C: case 0x11: case 0x1D: case 0x24: case 0x25:
-    case 0x20: case 0x37: case 0x35: case 0x3D: case 0x3E: case 0x17: return 2;
-    case 0x13: case 0x1F: case 0x1B: case 0x0B: return 1;
-    default: return 0;
+        if (t->mode == 5)
+            t->mode = 0;    /* CLIP_PLANE: no texture, the register reads 0
+                             * (ponytail: its per-pixel discard is not done) */
     }
 }
 
 /* Bytes of guest memory the texture occupies; 0 if it cannot be decoded. */
 static uint32_t tex_extent(const Stage *t)
 {
-    uint32_t bb = d3d8_format_dxt_block_bytes(t->color), tb, l, w, h, n = 0;
     if (!t->valid || (uint64_t)t->width * t->height > TEX_MAX_TEXELS)
         return 0;
-    if (bb || d3d8_format_is_swizzled(t->color)) {
-        tb = bb ? 0 : texel_bytes(linear_twin(t->color));
-        if (!bb && !tb)
-            return 0;
-        for (l = 0, w = t->width, h = t->height; l < t->levels; l++) {
-            n += bb ? ((w + 3u) / 4u) * ((h + 3u) / 4u) * bb : w * h * tb;
-            w = w > 1 ? w / 2 : 1;
-            h = h > 1 ? h / 2 : 1;
-        }
-        return n;
-    }
-    tb = texel_bytes(t->color);
-    if (!tb || !t->pitch)
-        return 0;
-    return t->pitch * (t->height - 1u) + t->width * tb;
+    return nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
 }
 
 static uint64_t tex_hash(const uint8_t *p, uint32_t n)
 {
-    uint64_t h = 0xCBF29CE484222325ull;
-    uint64_t l[4] = { h, h ^ 1u, h ^ 2u, h ^ 3u };
-    uint32_t i;
-    for (i = 0; i + 32 <= n; i += 32) {
-        uint64_t w[4];
-        memcpy(w, p + i, 32);
-        l[0] = (l[0] ^ w[0]) * 0x100000001B3ull;
-        l[1] = (l[1] ^ w[1]) * 0x100000001B3ull;
-        l[2] = (l[2] ^ w[2]) * 0x100000001B3ull;
-        l[3] = (l[3] ^ w[3]) * 0x100000001B3ull;
-    }
-    for (; i < n; i++)
-        l[0] = (l[0] ^ p[i]) * 0x100000001B3ull;
-    return (l[0] ^ (l[1] << 1) ^ (l[2] << 2) ^ (l[3] << 3)) * 0x100000001B3ull;
-}
-
-static uint8_t clamp255(int x) { return (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x); }
-
-/* One texel as A8R8G8B8, from texel index u of the row at p (linear
- * formats; for swizzled ones p is the image base and u the Morton index). */
-static uint32_t decode_texel(uint32_t fmt, const uint8_t *p, uint32_t u)
-{
-    uint32_t t;
-    switch (fmt) {
-    case 0x12: return ((const uint32_t *)p)[u];
-    case 0x1E: return ((const uint32_t *)p)[u] | 0xFF000000u;
-    case 0x3F:
-        t = ((const uint32_t *)p)[u];
-        return (t & 0xFF00FF00u) | ((t & 0xFF) << 16) | ((t >> 16) & 0xFF);
-    case 0x40:
-        t = ((const uint32_t *)p)[u];
-        return ((t & 0xFFu) << 24) | (((t >> 8) & 0xFFu) << 16)
-             | (((t >> 16) & 0xFFu) << 8) | ((t >> 24) & 0xFFu);
-    case 0x41:
-        t = ((const uint32_t *)p)[u];
-        return ((t & 0xFFu) << 24) | (t >> 8);
-    case 0x10:
-        t = ((const uint16_t *)p)[u];
-        return ((t & 0x8000u) ? 0xFF000000u : 0u)
-             | (d3d8_expand_channel((t >> 10) & 0x1F, 5) << 16)
-             | (d3d8_expand_channel((t >> 5) & 0x1F, 5) << 8)
-             |  d3d8_expand_channel(t & 0x1F, 5);
-    case 0x1C:
-        t = ((const uint16_t *)p)[u];
-        return 0xFF000000u
-             | (d3d8_expand_channel((t >> 10) & 0x1F, 5) << 16)
-             | (d3d8_expand_channel((t >> 5) & 0x1F, 5) << 8)
-             |  d3d8_expand_channel(t & 0x1F, 5);
-    case 0x11:
-        t = ((const uint16_t *)p)[u];
-        return 0xFF000000u
-             | (d3d8_expand_channel((t >> 11) & 0x1F, 5) << 16)
-             | (d3d8_expand_channel((t >> 5) & 0x3F, 6) << 8)
-             |  d3d8_expand_channel(t & 0x1F, 5);
-    case 0x1D:
-        t = ((const uint16_t *)p)[u];
-        return (d3d8_expand_channel((t >> 12) & 0xF, 4) << 24)
-             | (d3d8_expand_channel((t >> 8) & 0xF, 4) << 16)
-             | (d3d8_expand_channel((t >> 4) & 0xF, 4) << 8)
-             |  d3d8_expand_channel(t & 0xF, 4);
-    case 0x13:
-        t = p[u];
-        return 0xFF000000u | (t << 16) | (t << 8) | t;
-    case 0x1F:
-        return ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
-    case 0x1B:                              /* AY8: Y in all four */
-        return (uint32_t)p[u] * 0x01010101u;
-    case 0x20:                              /* A8Y8: Y low byte, A high */
-        t = ((const uint16_t *)p)[u];
-        return ((t >> 8) << 24) | (t & 0xFFu) * 0x010101u;
-    case 0x17:                              /* G8B8: xemu RG8, swizzle (R,G,R,G) */
-        t = ((const uint16_t *)p)[u];
-        return ((t >> 8) << 24) | ((t & 0xFFu) << 16) | ((t >> 8) << 8) | (t & 0xFFu);
-    case 0x35:                              /* Y16: top byte */
-        t = ((const uint16_t *)p)[u] >> 8;
-        return 0xFF000000u | t * 0x010101u;
-    case 0x37:                              /* R6G5B5 */
-        t = ((const uint16_t *)p)[u];
-        return 0xFF000000u
-             | (d3d8_expand_channel((t >> 10) & 0x3F, 6) << 16)
-             | (d3d8_expand_channel((t >> 5) & 0x1F, 5) << 8)
-             |  d3d8_expand_channel(t & 0x1F, 5);
-    case 0x3D:                              /* R5G5B5A1 */
-        t = ((const uint16_t *)p)[u];
-        return ((t & 1u) ? 0xFF000000u : 0u)
-             | (d3d8_expand_channel((t >> 11) & 0x1F, 5) << 16)
-             | (d3d8_expand_channel((t >> 6) & 0x1F, 5) << 8)
-             |  d3d8_expand_channel((t >> 1) & 0x1F, 5);
-    case 0x3E:                              /* R4G4B4A4 */
-        t = ((const uint16_t *)p)[u];
-        return (d3d8_expand_channel(t & 0xF, 4) << 24)
-             | (d3d8_expand_channel((t >> 12) & 0xF, 4) << 16)
-             | (d3d8_expand_channel((t >> 8) & 0xF, 4) << 8)
-             |  d3d8_expand_channel((t >> 4) & 0xF, 4);
-    case 0x0B:                              /* P8, through the palette */
-        t = p[u];
-        return t < s_pal_len ? s_pal[t] : 0xFFFF00FFu;
-    case 0x24:                              /* YUY2 */
-    case 0x25: {                            /* UYVY */
-        uint32_t yoff = (fmt == 0x24) ? 0u : 1u;
-        const uint8_t *g = p + (size_t)(u & ~1u) * 2;
-        int c  = (int)g[(u & 1u) ? 2 + yoff : yoff] - 16;
-        int cu = (int)g[1 - yoff] - 128;
-        int cv = (int)g[3 - yoff] - 128;
-        return 0xFF000000u
-             | ((uint32_t)clamp255((298 * c + 409 * cv + 128) >> 8) << 16)
-             | ((uint32_t)clamp255((298 * c - 100 * cu - 208 * cv + 128) >> 8) << 8)
-             |  (uint32_t)clamp255((298 * c + 516 * cu + 128) >> 8);
-    }
-    default:
-        return 0;
-    }
-}
-
-/* Level l's size: halved per level, never below 1. */
-static uint32_t level_dim(uint32_t d, uint32_t l)
-{
-    d >>= l;
-    return d ? d : 1u;
-}
-
-/* Texels in levels 0..levels-1, the size s_texels needs. */
-static size_t tex_texels(const Stage *t)
-{
-    size_t n = 0;
-    uint32_t l;
-    for (l = 0; l < t->levels; l++)
-        n += (size_t)level_dim(t->width, l) * level_dim(t->height, l);
-    return n;
-}
-
-/* One swizzled or DXT level of w x h at mem into out (A8R8G8B8); returns
- * the guest bytes it took, which is where the next level starts. */
-static uint32_t decode_level(const uint8_t *mem, uint32_t fmt, uint32_t w,
-                             uint32_t h, uint32_t *out)
-{
-    uint32_t x, y, bb = d3d8_format_dxt_block_bytes(fmt);
-    if (bb) {
-        for (y = 0; y < h; y++)
-            for (x = 0; x < w; x++) {
-                uint32_t argb = 0;
-                d3d8_dxt_decode_texel(mem, fmt, x, y, w, &argb);
-                out[(size_t)y * w + x] = argb;
-            }
-        return ((w + 3u) / 4u) * ((h + 3u) / 4u) * bb;
-    } else {
-        uint32_t mx, my, lin = linear_twin(fmt);
-        xbox_swizzle_masks(w, h, &mx, &my);
-        for (y = 0; y < h; y++) {
-            uint32_t oy = swizzle_deposit(y, my);
-            for (x = 0; x < w; x++)
-                out[(size_t)y * w + x] =
-                    decode_texel(lin, mem, swizzle_deposit(x, mx) | oy);
-        }
-        return w * h * texel_bytes(lin);
-    }
+    return nv2a_tex_hash(p, n, NV2A_TEX_HASH_SEED);
 }
 
 /* The whole texture into s_texels (A8R8G8B8): level 0 (width x height),
@@ -1545,8 +1136,8 @@ static uint32_t decode_level(const uint8_t *mem, uint32_t fmt, uint32_t w,
 static int decode_texture(const Stage *t)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset() + t->offset;
-    size_t n = tex_texels(t);
-    uint32_t x, y, fmt = t->color;
+    size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
+    const uint32_t *pal = NULL;
 
     if (n > s_texels_cap) {
         uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
@@ -1555,25 +1146,11 @@ static int decode_texture(const Stage *t)
         s_texels = p;
         s_texels_cap = n;
     }
-    if (fmt == 0x0B) {
-        s_pal = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset()
-                                   + t->palette);
-        s_pal_len = t->pal_len;
-    }
-    if (tex_size_from_format(fmt)) {
-        uint32_t *out = s_texels, l;
-        for (l = 0; l < t->levels; l++) {
-            uint32_t w = level_dim(t->width, l), h = level_dim(t->height, l);
-            mem += decode_level(mem, fmt, w, h, out);
-            out += (size_t)w * h;
-        }
-        return 1;
-    }
-    for (y = 0; y < t->height; y++) {
-        const uint8_t *row = mem + (size_t)y * t->pitch;
-        for (x = 0; x < t->width; x++)
-            s_texels[(size_t)y * t->width + x] = decode_texel(fmt, row, x);
-    }
+    if (t->color == NV2A_TEX_P8)
+        pal = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset()
+                                 + t->palette);
+    nv2a_tex_decode(mem, t->color, t->width, t->height, t->pitch, t->levels,
+                    pal, pal ? t->pal_len : 0, s_texels);
     return 1;
 }
 
@@ -1604,7 +1181,7 @@ static int tex_upload(TexEntry *e, const Stage *t)
         }
     }
     for (l = 0, src = s_texels; l < t->levels; l++) {
-        uint32_t w = level_dim(t->width, l), h = level_dim(t->height, l);
+        uint32_t w = nv2a_tex_level_dim(t->width, l), h = nv2a_tex_level_dim(t->height, l);
         ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex,
                                               l, NULL, src, w * 4, 0);
         src += (size_t)w * h;
@@ -1948,14 +1525,6 @@ static ID3D11PixelShader *combiner_ps(const NV2ACombinerState *st)
     return e->bad ? NULL : e->ps;
 }
 
-static void argb_to_float4(uint32_t c, float o[4])
-{
-    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
-    o[1] = (float)((c >> 8) & 0xFF) / 255.0f;
-    o[2] = (float)(c & 0xFF) / 255.0f;
-    o[3] = (float)(c >> 24) / 255.0f;
-}
-
 /* Render to texture: a stage whose texture lies where a surface this backend
  * renders into starts samples that surface. The guest's copy of those bytes
  * is stale (nothing here writes guest memory), so decoding it would show
@@ -2020,7 +1589,7 @@ static RenderTarget *rt_texture(const Stage *t)
     if (off)
         return NULL;
     if (!t->offset || d3d8_format_dxt_block_bytes(t->color)
-            || texel_bytes(linear_twin(t->color)) != 4)
+            || nv2a_tex_texel_bytes(nv2a_tex_linear_twin(t->color)) != 4)
         return NULL;
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
@@ -2114,14 +1683,11 @@ static ID3D11PixelShader *setup_pixel(void)
     int n, textured = 0;
 
     build_stages();
-    memset(&pc, 0, sizeof pc);
+    nv2a_ps_consts_fill(v, s_stage, &pc);
     for (n = 0; n < 4; n++) {
         const Stage *t = &s_stage[n];
-        int scaled = tex_size_from_format(t->color);
+        int scaled = nv2a_tex_size_from_format(t->color);
         RenderTarget *src = (t->mode && t->mode != 4) ? rt_texture(t) : NULL;
-        pc.tex_mode[n] = (uint32_t)t->mode;
-        pc.tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;
-        pc.tex_scale[n][1] = scaled || !t->height ? 1.0f : 1.0f / (float)t->height;
         s_stage_rt[n] = src;
         s_stage_src[n] = !t->mode ? "none" : t->mode == 4 ? "passthru" : "cache";
         if (src) {
@@ -2145,23 +1711,6 @@ static ID3D11PixelShader *setup_pixel(void)
         }
         smp[n] = sampler(t);
     }
-    for (n = 0; n < 8; n++) {
-        argb_to_float4(v->rc_f0[n], pc.c0[n]);
-        argb_to_float4(v->rc_f1[n], pc.c1[n]);
-    }
-    argb_to_float4(v->rc_sf[0], pc.fc0);
-    argb_to_float4(v->rc_sf[1], pc.fc1);
-    argb_to_float4(v->fog_color, pc.fog_color);
-    {   /* the CPU path reads the fog colour register as RGBA, alpha 1 */
-        float t = pc.fog_color[0];
-        pc.fog_color[0] = pc.fog_color[2];
-        pc.fog_color[2] = t;
-        pc.fog_color[3] = 1.0f;
-    }
-    pc.alpha_ref = (float)v->atest_ref / 255.0f;
-    pc.alpha_test_enable = v->atest_enable ? 1u : 0u;
-    pc.alpha_func = (v->atest_func >= 0x200 && v->atest_func <= 0x207)
-                  ? v->atest_func - 0x200 + 1 : 8;          /* GL -> D3DCMP */
     if (memo_on() && s_cb_ps_ok && !memcmp(&s_cb_ps_shadow, &pc, sizeof pc)) {
         /* the buffer already holds these bytes */
     } else if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_ps, 0,
@@ -2503,7 +2052,7 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
     {
         static NV2AVshProgram parsed;
         static char hlsl[65536];
-        d3d8_vsh_parse((const DWORD *)&v->prog[v->start][0],
+        d3d8_vsh_parse(&v->prog[v->start][0],
                        NV2A_VSH_SLOTS - (int)v->start, &parsed);
         if (d3d8_vsh_generate_hlsl_ex(&parsed, NV2A_VSH_HLSL_SCREEN_SPACE,
                                       hlsl, sizeof hlsl) > 0)
@@ -2909,40 +2458,11 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         static uint8_t vp_shadow[80];
         static int consts_ok, vp_ok;
         D3D11_MAPPED_SUBRESOURCE m;
-        float zmax = ((g->format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
-        float c[12];
-        uint32_t u[8];
+        struct nv2a_vp_consts vc;
         uint8_t vp[80];
-        c[0] = 2.0f / (float)rt->w;
-        c[1] = -2.0f / (float)rt->h;
-        c[2] = 1.0f / zmax;
-        c[3] = 0.0f;
-        c[4] = -1.0f;
-        c[5] = 1.0f;
-        c[6] = 0.0f;
-        c[7] = 0.0f;
-        /* Fog and specular, as the CPU path's vsh_fog_factor and
-         * vsh_transform apply them (xemu vsh.c). */
-        c[8] = v->fog_param[0];
-        c[9] = v->fog_param[1];
-        c[10] = v->fog_param[2];
-        c[11] = 0.0f;
-        memset(u, 0, sizeof u);
-        switch (v->fog_mode) {
-        case 0x2601: u[1] = 0; u[2] = 0; u[3] = 1; break;   /* LINEAR */
-        case 0x0804: u[1] = 0; u[2] = 1; u[3] = 1; break;   /* LINEAR_ABS */
-        case 0x0800: u[1] = 1; u[2] = 0; u[3] = 1; break;   /* EXP */
-        case 0x0802: u[1] = 1; u[2] = 1; u[3] = 0; break;   /* EXP_ABS */
-        case 0x0801: u[1] = 2; u[2] = 0; u[3] = 0; break;   /* EXP2 */
-        case 0x0803: u[1] = 2; u[2] = 1; u[3] = 0; break;   /* EXP2_ABS */
-        default: break;                                     /* not set: no fog */
-        }
-        u[0] = (v->fog_enable && (v->fog_mode == 0x2601
-                || (v->fog_mode >= 0x800 && v->fog_mode <= 0x804))) ? 1u : 0u;
-        u[4] = v->spec_enable ? 1u : 0u;
-        u[5] = (v->light_ctl >> 17) & 1u;
-        memcpy(vp, c, sizeof c);
-        memcpy(vp + sizeof c, u, sizeof u);
+        nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, &vc);
+        memcpy(vp, vc.c, sizeof vc.c);
+        memcpy(vp + sizeof vc.c, vc.u, sizeof vc.u);
         if (!d->program
                 || (memo_on() && consts_ok && !memcmp(consts_shadow, v->c, sizeof v->c))) {
             /* the buffer already holds these bytes */
@@ -3137,9 +2657,7 @@ static void dump_frame(void)
     ID3D11Texture2D_Release(st);
 }
 
-static uint64_t s_occ_reports, s_occ_late, s_occ_vis, s_occ_sync_us, s_occ_super;
-static int      s_occ_npend;
-static void     occ_poll(UINT flags);
+static struct nv2a_occ s_occ;           /* see "Visibility tests" below */
 
 /* The surface a flip puts on screen: the walker's pick (present_pick in
  * nv2a_pb_exec.c, the same for every backend), as the render target of that
@@ -3193,19 +2711,19 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_tex_rehash - p_re),
             (unsigned long long)(s_vb_native - p_vn),
             (unsigned long long)(s_vb_expanded - p_ve),
-            (unsigned long long)(s_occ_reports - p_occ),
-            (unsigned long long)(s_occ_vis - p_occ_vis), s_occ_npend,
-            (unsigned long long)(s_occ_late - p_occ_late),
-            (unsigned long long)(s_occ_super - p_occ_super),
-            (unsigned long long)(s_occ_sync_us - p_occ_us),
+            (unsigned long long)(s_occ.reports - p_occ),
+            (unsigned long long)(s_occ.vis - p_occ_vis), s_occ.npend,
+            (unsigned long long)(s_occ.late - p_occ_late),
+            (unsigned long long)(s_occ.super - p_occ_super),
+            (unsigned long long)(s_occ.sync_us - p_occ_us),
             s_drawn ? s_drawn->offset : 0, surface_offset);
     p_draws = s_draws; p_prog = s_draws_prog; p_tex = s_draws_tex;
     p_rtt = s_rtt_binds; p_skip = s_draws_skipped; p_clears = s_clears;
     p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
     p_vn = s_vb_native; p_ve = s_vb_expanded; p_self = s_self_copies;
     p_mip = s_tex_mip_uploads;
-    p_occ = s_occ_reports; p_occ_vis = s_occ_vis; p_occ_us = s_occ_sync_us;
-    p_occ_late = s_occ_late; p_occ_super = s_occ_super;
+    p_occ = s_occ.reports; p_occ_vis = s_occ.vis; p_occ_us = s_occ.sync_us;
+    p_occ_late = s_occ.late; p_occ_super = s_occ.super;
 }
 
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
@@ -3215,7 +2733,8 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (!init())
         return;
     pump();
-    occ_poll(D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (s_occ.ops)
+        nv2a_occ_poll(&s_occ, 0);
     s_drawn = present_target(surface_offset);
     if (s_drawn) {
         if (s_drawn->w == s_back_w && s_drawn->h == s_back_h) {
@@ -3294,20 +2813,9 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
  * queries go back to the pool unread and nothing is written for the old
  * test, so its late completion cannot land over the title's reset status or
  * the new count. */
-#define OCC_SEG     8       /* stretches per report */
-#define OCC_PENDING 128
-#define OCC_POOL    (OCC_PENDING * 2 + OCC_SEG)
-typedef struct {
-    uint32_t     va;
-    int          n, overflow;
-    uint64_t     t0;
-    ID3D11Query *q[OCC_SEG];
-} OccReport;
+#define OCC_POOL    (NV2A_OCC_PENDING * 2 + NV2A_OCC_SEG)
 static ID3D11Query *s_occ_pool[OCC_POOL];
 static int          s_occ_pool_n, s_occ_made;
-static ID3D11Query *s_occ_seg[OCC_SEG];      /* since the last clear */
-static int          s_occ_nseg, s_occ_open, s_occ_en, s_occ_ovf;
-static OccReport    s_occ_pend[OCC_PENDING];
 static int          s_occ_mode = -1;         /* 0 defer, 1 sync, 2 fixed */
 
 static int occ_mode(void)
@@ -3319,20 +2827,22 @@ static int occ_mode(void)
     return s_occ_mode;
 }
 
-static uint64_t occ_now_us(void)
+static uint64_t occ_now_us(void *ctx)
 {
     static LARGE_INTEGER f;
     LARGE_INTEGER c;
+    (void)ctx;
     if (!f.QuadPart)
         QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&c);
     return (uint64_t)(c.QuadPart * 1000000.0 / (double)f.QuadPart);
 }
 
-static ID3D11Query *occ_get(void)
+static void *occ_get(void *ctx)
 {
     ID3D11Query *q = NULL;
     D3D11_QUERY_DESC qd;
+    (void)ctx;
     if (s_occ_pool_n)
         return s_occ_pool[--s_occ_pool_n];
     if (s_occ_made >= OCC_POOL)
@@ -3345,183 +2855,77 @@ static ID3D11Query *occ_get(void)
     return q;
 }
 
-static void occ_put(ID3D11Query *q)
+static void occ_put(void *ctx, void *q)
 {
+    (void)ctx;
     if (q && s_occ_pool_n < OCC_POOL)
-        s_occ_pool[s_occ_pool_n++] = q;
+        s_occ_pool[s_occ_pool_n++] = (ID3D11Query *)q;
     else if (q)
-        ID3D11Query_Release(q);
+        ID3D11Query_Release((ID3D11Query *)q);
 }
 
-static void occ_begin(void)
+static void occ_begin(void *ctx, void *q)
 {
-    ID3D11Query *q;
-    if (s_occ_open)
-        return;
-    if (s_occ_nseg >= OCC_SEG || !(q = occ_get())) {
-        s_occ_ovf = 1;
-        return;
-    }
+    (void)ctx;
     ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)q);
-    s_occ_seg[s_occ_nseg++] = q;
-    s_occ_open = 1;
 }
 
-static void occ_end(void)
+static void occ_end(void *ctx, void *q)
 {
-    if (!s_occ_open)
-        return;
-    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_occ_seg[s_occ_nseg - 1]);
-    s_occ_open = 0;
+    (void)ctx;
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)q);
 }
 
-static void occ_write(uint32_t va, uint32_t count)
+/* GetData without a flush polls; with one, it pushes the GPU along. */
+static int occ_result(void *ctx, void *q, int flush, uint64_t *count)
 {
-    volatile uint32_t *r = (volatile uint32_t *)
-        ((uint8_t *)xbox_GetMemoryOffset() + va);
-    r[0] = 0;                              /* timestamp */
-    r[1] = 0;
-    r[2] = count;
-    MemoryBarrier();                       /* the count before the status */
-    r[3] = 0;                              /* status: done */
-}
-
-/* 1 when every query of the report has its result (summed into *count). */
-static int occ_ready(OccReport *p, UINT flags, uint32_t *count)
-{
-    uint64_t sum = 0;
-    int i;
-    for (i = 0; i < p->n; i++) {
-        UINT64 v = 0;
-        if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)p->q[i],
-                                        &v, sizeof v, flags) != S_OK)
-            return 0;
-        sum += v;
-    }
-    *count = sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sum;
+    UINT64 v = 0;
+    (void)ctx;
+    if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)q, &v, sizeof v,
+                                    flush ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+        return 0;
+    *count = v;
     return 1;
 }
 
-static void occ_finish(OccReport *p, uint32_t count)
-{
-    int i;
-    occ_write(p->va, count);
-    s_occ_vis += count != 0;
-    for (i = 0; i < p->n; i++)
-        occ_put(p->q[i]);
-    p->n = 0;
-}
+static const struct nv2a_occ_ops s_occ_ops = {
+    occ_get, occ_put, occ_begin, occ_end, occ_result, occ_now_us, NULL
+};
 
-static void occ_poll(UINT flags)
+/* The tracker, set up on first use (init() has made the device). */
+static int occ_ready_on(void)
 {
-    uint64_t now;
-    int i, j;
-    if (!s_occ_npend)
-        return;
-    now = occ_now_us();
-    for (i = j = 0; i < s_occ_npend; i++) {
-        OccReport *p = &s_occ_pend[i];
-        uint32_t count;
-        if (p->overflow) {
-            occ_finish(p, 0x10000u);
-        } else if (occ_ready(p, flags, &count)) {
-            occ_finish(p, count);
-        } else if (now - p->t0 > 250000u) {
-            s_occ_late++;
-            occ_finish(p, 0x10000u);
-        } else {
-            s_occ_pend[j++] = *p;
-        }
-    }
-    s_occ_npend = j;
+    if (occ_mode() == 2 || !init())
+        return 0;
+    if (!s_occ.ops)
+        nv2a_occ_init(&s_occ, &s_occ_ops, (uint8_t *)xbox_GetMemoryOffset());
+    return 1;
 }
 
 static void d3d11_on_zpass(int enable)
 {
-    if (occ_mode() == 2 || !init())
-        return;
-    s_occ_en = enable;
-    if (enable)
-        occ_begin();
-    else
-        occ_end();
+    if (occ_ready_on())
+        nv2a_occ_zpass(&s_occ, enable);
 }
 
 static void d3d11_on_zpass_clear(void)
 {
-    int i;
-    if (occ_mode() == 2 || !init())
-        return;
-    occ_end();
-    for (i = 0; i < s_occ_nseg; i++)
-        occ_put(s_occ_seg[i]);   /* ended; Begin on reuse drops the result */
-    s_occ_nseg = 0;
-    s_occ_ovf = 0;
-    if (s_occ_en)
-        occ_begin();
+    if (occ_ready_on())
+        nv2a_occ_zpass_clear(&s_occ);
 }
 
 static int d3d11_on_report(uint32_t va)
 {
-    OccReport *p;
-    int i;
-    if (occ_mode() == 2 || !init())
+    if (!occ_ready_on())
         return 0;
-    occ_end();
-    /* Supersede a report still pending at this va (see above) before any
-     * poll: a poll here could finish the old one over the title's reset. */
-    for (i = 0; i < s_occ_npend; i++)
-        if (s_occ_pend[i].va == va) {
-            int k;
-            for (k = 0; k < s_occ_pend[i].n; k++)
-                occ_put(s_occ_pend[i].q[k]);
-            memmove(&s_occ_pend[i], &s_occ_pend[i + 1],
-                    (size_t)(s_occ_npend - i - 1) * sizeof s_occ_pend[0]);
-            s_occ_npend--;
-            s_occ_super++;
-            break;              /* at most one: each push supersedes */
-        }
-    occ_poll(D3D11_ASYNC_GETDATA_DONOTFLUSH);
-    if (s_occ_npend >= OCC_PENDING)
-        occ_poll(0);
-    if (s_occ_npend >= OCC_PENDING) {
-        /* Still full: the oldest is answered as visible. */
-        s_occ_late++;
-        occ_finish(&s_occ_pend[0], 0x10000u);
-        memmove(&s_occ_pend[0], &s_occ_pend[1],
-                (size_t)(--s_occ_npend) * sizeof s_occ_pend[0]);
-    }
-    /* Pending until done, whatever the title left in the status. */
-    ((volatile uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va))[3] = 0xFFFFFFFFu;
-    p = &s_occ_pend[s_occ_npend++];
-    p->va = va;
-    p->n = s_occ_nseg;
-    p->overflow = s_occ_ovf;
-    p->t0 = occ_now_us();
-    for (i = 0; i < s_occ_nseg; i++)
-        p->q[i] = s_occ_seg[i];
-    /* The report owns them now; a report with no clear before the next one
-     * counts from here (the XDK always clears first). */
-    s_occ_nseg = 0;
-    s_occ_ovf = 0;
-    s_occ_reports++;
-    if (occ_mode() == 1) {
-        uint64_t t = occ_now_us();
-        uint32_t count;
-        while (!occ_ready(p, 0, &count) && occ_now_us() - t < 250000u)
-            ;
-        s_occ_sync_us += occ_now_us() - t;
-        occ_poll(0);
-    }
-    if (s_occ_en)
-        occ_begin();
+    nv2a_occ_report(&s_occ, va, occ_mode() == 1);
     return 1;
 }
 
 static void d3d11_on_poll(void)
 {
-    if (s_occ_npend && s_dev)
-        occ_poll(0);
+    if (s_occ.npend && s_dev)
+        nv2a_occ_poll(&s_occ, 1);
 }
 
 static const struct nv2a_pb_backend s_d3d11_backend = {
