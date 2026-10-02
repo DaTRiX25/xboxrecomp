@@ -4833,10 +4833,7 @@ static void get_report(uint32_t param)
     if (env_cached("RECOMP_ZPASS_TRACE") && s_reports <= 64)
         fprintf(stderr, "  [GPU] GET_REPORT 0x%08X -> 0x%08X count %u\n",
                 param, va, value);
-    *(volatile uint32_t *)(mem + va + 0) = 0;          /* timestamp */
-    *(volatile uint32_t *)(mem + va + 4) = 0;
-    *(volatile uint32_t *)(mem + va + 8) = value;
-    *(volatile uint32_t *)(mem + va + 12) = 0;         /* status: done */
+    nv2a_report_write(mem, va, value);
 }
 
 /* RECOMP_PB_BACKEND=null: the walker and its decode, drawing nothing. Times

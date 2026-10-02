@@ -4,6 +4,8 @@
  */
 #include "nv2a_backend_common.h"
 
+#include <stdatomic.h>
+
 uint32_t nv2a_tex_extent(uint32_t fmt, uint32_t w, uint32_t h,
                          uint32_t pitch, uint32_t levels)
 {
@@ -328,4 +330,177 @@ void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
     }
     o->u[4] = v->spec_enable ? 1u : 0u;
     o->u[5] = (v->light_ctl >> 17) & 1u;
+}
+
+void nv2a_report_write(uint8_t *mem, uint32_t va, uint32_t count)
+{
+    volatile uint32_t *r = (volatile uint32_t *)(mem + va);
+    r[0] = 0;                              /* timestamp */
+    r[1] = 0;
+    r[2] = count;
+    atomic_thread_fence(memory_order_seq_cst);  /* the count before the status */
+    r[3] = 0;                              /* status: done */
+}
+
+void nv2a_report_set_pending(uint8_t *mem, uint32_t va)
+{
+    ((volatile uint32_t *)(mem + va))[3] = 0xFFFFFFFFu;
+}
+
+void nv2a_occ_init(struct nv2a_occ *o, const struct nv2a_occ_ops *ops,
+                   uint8_t *mem)
+{
+    memset(o, 0, sizeof *o);
+    o->ops = ops;
+    o->mem = mem;
+}
+
+static void occ_begin(struct nv2a_occ *o)
+{
+    void *q;
+    if (o->open)
+        return;
+    if (o->nseg >= NV2A_OCC_SEG || !(q = o->ops->get(o->ops->ctx))) {
+        o->ovf = 1;
+        return;
+    }
+    o->ops->begin(o->ops->ctx, q);
+    o->seg[o->nseg++] = q;
+    o->open = 1;
+}
+
+static void occ_end(struct nv2a_occ *o)
+{
+    if (!o->open)
+        return;
+    o->ops->end(o->ops->ctx, o->seg[o->nseg - 1]);
+    o->open = 0;
+}
+
+/* 1 when every query of the report has its result (summed into *count). */
+static int occ_ready(struct nv2a_occ *o, const struct nv2a_occ_report *p,
+                     int flush, uint32_t *count)
+{
+    uint64_t sum = 0;
+    int i;
+    for (i = 0; i < p->n; i++) {
+        uint64_t v = 0;
+        if (!o->ops->result(o->ops->ctx, p->q[i], flush, &v))
+            return 0;
+        sum += v;
+    }
+    *count = sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sum;
+    return 1;
+}
+
+static void occ_finish(struct nv2a_occ *o, struct nv2a_occ_report *p,
+                       uint32_t count)
+{
+    int i;
+    nv2a_report_write(o->mem, p->va, count);
+    o->vis += count != 0;
+    for (i = 0; i < p->n; i++)
+        o->ops->put(o->ops->ctx, p->q[i]);
+    p->n = 0;
+}
+
+void nv2a_occ_poll(struct nv2a_occ *o, int flush)
+{
+    uint64_t now;
+    int i, j;
+    if (!o->npend)
+        return;
+    now = o->ops->now_us(o->ops->ctx);
+    for (i = j = 0; i < o->npend; i++) {
+        struct nv2a_occ_report *p = &o->pend[i];
+        uint32_t count;
+        if (p->overflow) {
+            occ_finish(o, p, NV2A_OCC_VISIBLE);
+        } else if (occ_ready(o, p, flush, &count)) {
+            occ_finish(o, p, count);
+        } else if (now - p->t0 > NV2A_OCC_LATE_US) {
+            o->late++;
+            occ_finish(o, p, NV2A_OCC_VISIBLE);
+        } else {
+            o->pend[j++] = *p;
+        }
+    }
+    o->npend = j;
+}
+
+void nv2a_occ_zpass(struct nv2a_occ *o, int enable)
+{
+    o->en = enable;
+    if (enable)
+        occ_begin(o);
+    else
+        occ_end(o);
+}
+
+void nv2a_occ_zpass_clear(struct nv2a_occ *o)
+{
+    int i;
+    occ_end(o);
+    for (i = 0; i < o->nseg; i++)
+        o->ops->put(o->ops->ctx, o->seg[i]);   /* ended; Begin on reuse drops it */
+    o->nseg = 0;
+    o->ovf = 0;
+    if (o->en)
+        occ_begin(o);
+}
+
+void nv2a_occ_report(struct nv2a_occ *o, uint32_t va, int sync)
+{
+    struct nv2a_occ_report *p;
+    int i;
+
+    occ_end(o);
+    /* Supersede a report still pending at this va before any poll: a poll
+     * here could finish the old one over the title's reset. */
+    for (i = 0; i < o->npend; i++)
+        if (o->pend[i].va == va) {
+            int k;
+            for (k = 0; k < o->pend[i].n; k++)
+                o->ops->put(o->ops->ctx, o->pend[i].q[k]);
+            memmove(&o->pend[i], &o->pend[i + 1],
+                    (size_t)(o->npend - i - 1) * sizeof o->pend[0]);
+            o->npend--;
+            o->super++;
+            break;              /* at most one: each push supersedes */
+        }
+    nv2a_occ_poll(o, 0);
+    if (o->npend >= NV2A_OCC_PENDING)
+        nv2a_occ_poll(o, 1);
+    if (o->npend >= NV2A_OCC_PENDING) {
+        /* Still full: the oldest is answered as visible. */
+        o->late++;
+        occ_finish(o, &o->pend[0], NV2A_OCC_VISIBLE);
+        memmove(&o->pend[0], &o->pend[1],
+                (size_t)(--o->npend) * sizeof o->pend[0]);
+    }
+    /* Pending until done, whatever the title left in the status. */
+    nv2a_report_set_pending(o->mem, va);
+    p = &o->pend[o->npend++];
+    p->va = va;
+    p->n = o->nseg;
+    p->overflow = o->ovf;
+    p->t0 = o->ops->now_us(o->ops->ctx);
+    for (i = 0; i < o->nseg; i++)
+        p->q[i] = o->seg[i];
+    /* The report owns them now; a report with no clear before the next one
+     * counts from here (the XDK always clears first). */
+    o->nseg = 0;
+    o->ovf = 0;
+    o->reports++;
+    if (sync) {
+        uint64_t t = o->ops->now_us(o->ops->ctx);
+        uint32_t count;
+        while (!occ_ready(o, p, 1, &count)
+               && o->ops->now_us(o->ops->ctx) - t < NV2A_OCC_LATE_US)
+            ;
+        o->sync_us += o->ops->now_us(o->ops->ctx) - t;
+        nv2a_occ_poll(o, 1);
+    }
+    if (o->en)
+        occ_begin(o);
 }

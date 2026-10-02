@@ -671,6 +671,73 @@ struct nv2a_vp_consts {
 void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
                          uint32_t w, uint32_t h, struct nv2a_vp_consts *o);
 
+/* ------------------------------------------------------------------------ */
+/* Visibility-test reports (GET_REPORT)                                      */
+/* ------------------------------------------------------------------------ */
+
+/* A report's 16 bytes at guest va: timestamp (two words), count, status.
+ * The count is stored before the status, with a fence between, so a title
+ * polling the status from another core never reads a stale count. */
+void nv2a_report_write(uint8_t *mem, uint32_t va, uint32_t count);
+
+/* Mark a report pending: status 0xFFFFFFFF, which GetVisibilityTestResult
+ * reads as D3DERR_TESTINCOMPLETE. */
+void nv2a_report_set_pending(uint8_t *mem, uint32_t va);
+
+/* API-independent bookkeeping for occlusion queries.
+ *
+ * Each stretch with SET_ZPASS_PIXEL_COUNT_ENABLE on is one query (begun at
+ * enable, or at a clear while enabled; ended at disable or the report), and
+ * a report sums the stretches since the last clear. Reports go on a pending
+ * list and are polled; one still pending after NV2A_OCC_LATE_US, or with
+ * more than NV2A_OCC_SEG stretches, completes as visible (NV2A_OCC_VISIBLE).
+ * A GET_REPORT naming a va that still has one pending supersedes it: the old
+ * queries go back unread, and nothing is written for the old test. The
+ * backend supplies the queries through nv2a_occ_ops; handles are opaque. */
+#define NV2A_OCC_SEG      8         /* stretches per report */
+#define NV2A_OCC_PENDING  128
+#define NV2A_OCC_VISIBLE  0x10000u
+#define NV2A_OCC_LATE_US  250000u
+
+struct nv2a_occ_ops {
+    void *(*get)(void *ctx);                        /* NULL if none */
+    void  (*put)(void *ctx, void *q);               /* back to the pool */
+    void  (*begin)(void *ctx, void *q);
+    void  (*end)(void *ctx, void *q);
+    /* 1 and *count when q's result is in; flush: may push the GPU. */
+    int   (*result)(void *ctx, void *q, int flush, uint64_t *count);
+    uint64_t (*now_us)(void *ctx);
+    void *ctx;
+};
+
+struct nv2a_occ_report {
+    uint32_t va;
+    int      n, overflow;
+    uint64_t t0;
+    void    *q[NV2A_OCC_SEG];
+};
+
+struct nv2a_occ {
+    const struct nv2a_occ_ops *ops;
+    uint8_t *mem;                       /* guest memory base */
+    void    *seg[NV2A_OCC_SEG];         /* since the last clear */
+    int      nseg, open, en, ovf;
+    struct nv2a_occ_report pend[NV2A_OCC_PENDING];
+    int      npend;
+    /* For the flip log: reports, completed visible (count != 0, fallbacks
+     * included), late fallbacks, superseded, and microseconds waited in
+     * sync mode. */
+    uint64_t reports, vis, late, super, sync_us;
+};
+
+void nv2a_occ_init(struct nv2a_occ *o, const struct nv2a_occ_ops *ops,
+                   uint8_t *mem);
+void nv2a_occ_zpass(struct nv2a_occ *o, int enable);
+void nv2a_occ_zpass_clear(struct nv2a_occ *o);
+/* GET_REPORT at va; sync waits (up to NV2A_OCC_LATE_US) for the result. */
+void nv2a_occ_report(struct nv2a_occ *o, uint32_t va, int sync);
+void nv2a_occ_poll(struct nv2a_occ *o, int flush);
+
 #ifdef __cplusplus
 }
 #endif
