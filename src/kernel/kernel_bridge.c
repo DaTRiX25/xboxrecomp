@@ -3450,8 +3450,9 @@ static void bridge_NtCreateFile(void)
                   : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
                   : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
         else
-            fprintf(stderr, "  [FILE] %s (disp %u) -> 0x%08X\n",
-                    gpath, (unsigned)disposition, g_eax);
+            fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
+                    gpath, (unsigned)disposition, options,
+                    g_xbox_kernel_caller, g_eax);
     }
     fflush(stderr);
 }
@@ -3768,15 +3769,15 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
-                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
+            fprintf(stderr, "  [READ] from=0x%08X buf=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller, buffer_va, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
-                    g_xbox_kernel_caller,
+            fprintf(stderr, "  [READ] from=0x%08X buf=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller, buffer_va,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
@@ -3830,6 +3831,17 @@ static void bridge_NtWriteFile(void)
     }
     g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+    /* The same record as [READ]: where the bytes came from and the first of
+     * them. A cache copy that comes out all zeros is either a write from the
+     * wrong buffer or a right buffer that was cleared, and this tells which. */
+    if (length >= 4096) {
+        const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
+        fprintf(stderr, "  [WRITE] from=0x%08X buf=0x%08X @%lld len=%u st=0x%08X  "
+                "%02X %02X %02X %02X\n", g_xbox_kernel_caller, buffer_va,
+                poff ? (long long)off.QuadPart : -1LL, length, g_eax,
+                p[0], p[1], p[2], p[3]);
+        fflush(stderr);
+    }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
