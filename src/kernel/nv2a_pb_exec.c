@@ -2922,6 +2922,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         inited = 1;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
+#ifdef _WIN32
+        {   /* RECOMP_PB_BACKEND=d3d11: src/d3d/nv2a_pb_d3d11.c */
+            extern void nv2a_pb_d3d11_register_from_env(void);
+            nv2a_pb_d3d11_register_from_env();
+        }
+#endif
     }
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
