@@ -43,14 +43,36 @@ static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+extern void nv2a_pb_perf_scan_begin(void);
+extern void nv2a_pb_perf_scan_end(void);
 static int s_exec_enabled = -1;
+static int s_scan_enabled = -1;   /* RECOMP_PB_SCAN, read once */
+
+/* s_seen's slot for each (subchannel, method), plus one (0: not seen yet).
+ * The walker calls note() for every method in the stream, ~100,000 a frame in
+ * BLiNX 2's attract demo, and a linear search of a few hundred pairs there was
+ * half the walker's time. s_seen keeps first-seen order for the report. */
+static uint16_t s_seen_slot[8][0x2000 / 4];
 
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
-            s_seen[i].count++;
+    static uint16_t none;
+    uint16_t *slot = &none;
+
+    /* An incrementing run can carry the method past 0x1FFC; those (rare)
+     * keep the linear search. */
+    if (method < 0x2000 && !(method & 3)) {
+        slot = &s_seen_slot[subch & 7][method >> 2];
+        if (*slot) {
+            s_seen[*slot - 1].count++;
             return;
+        }
+    } else {
+        for (int i = 0; i < s_seen_count; i++) {
+            if (s_seen[i].method == method && s_seen[i].subch == subch) {
+                s_seen[i].count++;
+                return;
+            }
         }
     }
     if (s_seen_count >= PB_MAX_METHODS) {
@@ -69,6 +91,8 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
         s_seen_count++;
+        if (slot != &none)
+            *slot = (uint16_t)s_seen_count;
     }
 }
 
@@ -165,10 +189,14 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
+    if (s_scan_enabled < 0)
+        s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!(s_scan_enabled || s_exec_enabled) || end_va <= start_va)
         return;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
+    if (s_exec_enabled)
+        nv2a_pb_perf_scan_begin();
 
     while (va < end_va && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
@@ -204,6 +232,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         unknown++;
     }
 
+    if (s_exec_enabled)
+        nv2a_pb_perf_scan_end();
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
