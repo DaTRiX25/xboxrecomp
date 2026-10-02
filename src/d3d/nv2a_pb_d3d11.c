@@ -943,6 +943,7 @@ static ID3D11BlendState *blend_state(void)
 struct Stage {
     uint32_t offset, color, width, height, pitch, addr_u, addr_v;
     uint32_t palette, pal_len;  /* P8: resolved palette address, entries */
+    uint32_t filter;            /* SET_TEXTURE_FILTER as written */
     int      valid;
     int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
     int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
@@ -1008,6 +1009,7 @@ static void build_stages(void)
         t->pitch  = tex_size_from_format(t->color) ? 0 : r[0x10 / 4] >> 16;
         t->addr_u =  r[0x08 / 4]       & 0xF;
         t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
+        t->filter = r[0x14 / 4];
         /* P8: SET_TEXTURE_PALETTE (0x1B20): offset in bits 6-31, length
          * 256 >> bits 2-3, entries A8R8G8B8. */
         if (t->color == 0x0B) {
@@ -1387,23 +1389,46 @@ static D3D11_TEXTURE_ADDRESS_MODE address_mode(uint32_t m)
     }
 }
 
-static ID3D11SamplerState *sampler(uint32_t u, uint32_t v)
+/* SET_TEXTURE_FILTER: MIN in bits 16-21 (1 nearest, 2 linear, 3-6 the
+ * mipmapped ones, odd = nearest within a level, 7 convolution), MAG in bits
+ * 24-27 (1 nearest, 2 linear, 4 convolution). Only level 0 is uploaded, so
+ * a mipmapped MIN filters within level 0 the way its base filter does, and
+ * convolution is taken as linear. RECOMP_D3D11_POINT=1 forces nearest for
+ * every stage (the CPU path's sampling) to compare. */
+static int filter_linear(uint32_t f, int mag)
 {
-    static ID3D11SamplerState *cache[16][16];
+    uint32_t m = mag ? (f >> 24) & 0xF : (f >> 16) & 0x3F;
+    if (mag)
+        return m == 2 || m == 4;
+    return m == 2 || m == 4 || m == 6 || m == 7;
+}
+
+static ID3D11SamplerState *sampler(uint32_t u, uint32_t v, uint32_t filter)
+{
+    static ID3D11SamplerState *cache[16][16][2][2];
+    static int point = -1;
     D3D11_SAMPLER_DESC sd;
+    int mn, mg;
+    if (point < 0)
+        point = getenv("RECOMP_D3D11_POINT") != NULL;
     u &= 0xF;
     v &= 0xF;
-    if (cache[u][v])
-        return cache[u][v];
+    mn = !point && filter_linear(filter, 0);
+    mg = !point && filter_linear(filter, 1);
+    if (cache[u][v][mn][mg])
+        return cache[u][v][mn][mg];
     memset(&sd, 0, sizeof sd);
-    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.Filter = mn ? (mg ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                         : D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT)
+                   : (mg ? D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT
+                         : D3D11_FILTER_MIN_MAG_MIP_POINT);
     sd.AddressU = address_mode(u);
     sd.AddressV = address_mode(v);
     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
-    ID3D11Device_CreateSamplerState(s_dev, &sd, &cache[u][v]);
-    return cache[u][v];
+    ID3D11Device_CreateSamplerState(s_dev, &sd, &cache[u][v][mn][mg]);
+    return cache[u][v][mn][mg];
 }
 
 static ID3D11ShaderResourceView *solid_texture(uint32_t argb)
@@ -1714,7 +1739,7 @@ static ID3D11PixelShader *setup_pixel(void)
         } else {
             srv[n] = s_black_srv;
         }
-        smp[n] = sampler(t->addr_u, t->addr_v);
+        smp[n] = sampler(t->addr_u, t->addr_v, t->filter);
     }
     for (n = 0; n < 8; n++) {
         argb_to_float4(v->rc_f0[n], pc.c0[n]);
@@ -1952,8 +1977,9 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
     for (k = 0; k < 4; k++) {
         const Stage *t = &s_stage[k];
         fprintf(stderr, "[D3D11-WHITE]  tex%d mode %d on %d fmt %02X %ux%u off %08X pitch %u"
-                " addr %u/%u pal %08X src %s", k, t->mode, t->on, t->color, t->width,
-                t->height, t->offset, t->pitch, t->addr_u, t->addr_v, t->palette,
+                " addr %u/%u filter %08X pal %08X src %s", k, t->mode, t->on, t->color,
+                t->width, t->height, t->offset, t->pitch, t->addr_u, t->addr_v,
+                t->filter, t->palette,
                 s_stage_src[k] ? s_stage_src[k] : "?");
         if (s_stage_rt[k])
             fprintf(stderr, " (surface 0x%08X %ux%u, drawn %llu, cleared %llu)",
@@ -2334,28 +2360,49 @@ static void dump_frame(void)
  * largest surface (for the first flip, before the second buffer has been
  * named). Of those, the one drawn into most recently since the last flip;
  * if none was, the one cleared most recently; if none was either, the
- * frame on screen stays. */
+ * frame on screen stays.
+ *
+ * Size first, though. "Named at a flip" is sticky, and a title that once
+ * flipped with a downsample target bound (BLiNX 2: 0x00811000, 320x240)
+ * left it a candidate for good; drawn after the back buffer, it was then
+ * presented on 34 flips while the walker named 0x00104000/0x00230000. So
+ * the candidates the size of the surface named at this flip go first (it
+ * is the next back buffer, the same size as the one just finished) and
+ * only those: if none of them was drawn or cleared, the frame on screen
+ * stays. With no render target at the named surface yet (the first flips),
+ * the largest candidates go first, then the rest. */
 static RenderTarget *present_target(uint32_t surface_offset)
 {
-    RenderTarget *best = NULL;
-    UINT max_area = 0;
-    int i, pass;
+    RenderTarget *best = NULL, *named = NULL;
+    UINT max_area = 0, cand_area = 0;
+    int i, pass, tier;
 
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (!rt->tex)
             continue;
         if (surface_offset && rt->offset == surface_offset)
-            rt->flipped = 1;
+            rt->flipped = 1, named = rt;
         if (rt->w * rt->h > max_area)
             max_area = rt->w * rt->h;
     }
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (rt->tex && (rt->flipped || rt->w * rt->h == max_area)
+                && rt->w * rt->h > cand_area)
+            cand_area = rt->w * rt->h;
+    }
+    for (tier = named ? 0 : 1; tier < (named ? 1 : 3) && !best; tier++)
     for (pass = 0; pass < 2 && !best; pass++) {
         uint64_t top = s_flip_seq;
         for (i = 0; i < RT_MAX; i++) {
             RenderTarget *rt = &s_rt[i];
             uint64_t when;
             if (!rt->tex || !(rt->flipped || rt->w * rt->h == max_area))
+                continue;
+            if (tier == 0 && (rt->w != named->w || rt->h != named->h))
+                continue;
+            if (tier == 1 && rt->w * rt->h != cand_area)
                 continue;
             when = pass == 0 ? rt->last_draw : rt->last_clear;
             if (when > top) {

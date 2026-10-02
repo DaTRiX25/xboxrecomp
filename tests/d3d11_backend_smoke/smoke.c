@@ -308,6 +308,9 @@ int main(int argc, char **argv)
                           | (1u << 4) | (2u << 0));
                 M(0x1B08, 0x00000101u);
                 M(0x1B20, PAL_GUEST);          /* TEXTURE_PALETTE: 256 entries */
+                /* The P8 one magnified with TEXTURE_FILTER MIN/MAG linear:
+                 * soft band edges; everything else stays nearest. */
+                M(0x1B14, q ? 0x01010000u : 0x02020000u);
                 M(0x17FC, 8);
                 vertex_uv(x0,         20.0f,  0xFFFFFFFFu, uv[0]);
                 vertex_uv(x0 + 80.0f, 20.0f,  0xFFFFFFFFu, uv[1]);
@@ -315,6 +318,7 @@ int main(int argc, char **argv)
                 vertex_uv(x0,         100.0f, 0xFFFFFFFFu, uv[3]);
                 M(0x17FC, 0);
             }
+            M(0x1B14, 0x01010000u);
         }
         /* A vertex-program batch: mov oPos, v0; mov oD0, v3; mov oT0, v9,
          * hand-encoded, with the checker texture. It draws the same as a
@@ -386,7 +390,10 @@ int main(int argc, char **argv)
         vertex(20.0f + 200.0f * t, 180.0f, 0xFFFF8000u);
         M(0x17FC, 0);
 
-        M(0x0210, buf[(f + 1) & 1]);           /* next buffer, as the XDK does */
+        /* next buffer, as the XDK does -- except the first flip, with the
+         * offscreen target still bound: named at a flip, it must still not
+         * be presented over the back buffers. */
+        M(0x0210, f == 0 ? OFFSCREEN : buf[(f + 1) & 1]);
         M(0x0130, 0);                          /* FLIP_STALL */
         Sleep(16);
     }
