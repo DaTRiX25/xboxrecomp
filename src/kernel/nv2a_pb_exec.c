@@ -254,6 +254,7 @@ static int      s_zpass_enable;
 static uint32_t s_reports, s_reports_zero;
 uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_sema_releases; }
 uint32_t nv2a_pb_exec_semaphore_last_va(void) { return s_sema_last_va; }
+uint32_t nv2a_pb_exec_semaphore_last_value(void) { return s_sema_last_value; }
 
 /* getenv, read once per name.
  *
