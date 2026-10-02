@@ -257,6 +257,21 @@ static void compile_combiner(void)
         return;
     }
     compile("combiner_t0_v0", hlsl, "ps_5_0");
+
+    /* The pushbuffer backend's variant: FOG comes in from the vertex shader
+     * and the final combiner blends towards the fog colour by FOG.a. */
+    st.fog_input = 1;
+    st.final_input[0].reg = NV2A_REG_FOG;
+    st.final_input[0].mapping = NV2A_MAP_UNSIGNED_IDENTITY;
+    st.final_input[0].alpha_rep = 1;
+    st.final_input[2].reg = NV2A_REG_FOG;
+    n = d3d8_combiners_generate_hlsl(&st, hlsl, sizeof hlsl);
+    say("     combiner fog: %d bytes of HLSL\n", n);
+    if (n <= 0) {
+        s_fail++;
+        return;
+    }
+    compile("combiner_fog", hlsl, "ps_5_0");
 }
 
 int main(int argc, char **argv)

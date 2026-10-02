@@ -131,6 +131,7 @@ typedef struct {
     float x, y, z, w;           /* screen pixels, depth units, clip w */
     float d0[4], d1[4];
     float t[4][4];              /* oT0..oT3 */
+    float fog;                  /* fog factor (FOG register alpha), unclamped */
     int   ok;
 } XfVert;
 
@@ -155,6 +156,12 @@ struct nv2a_pb_vsh {
     uint32_t atest_func, atest_ref;
     int      poly_offset;
     float    poly_factor, poly_bias;
+    /* Fog and specular, as xemu's vsh.c turns them into vtxFog and vtxD1.
+     * fog_mode and fog_gen are the raw SET_FOG_MODE / SET_FOG_GEN_MODE
+     * parameters (0x800 EXP, 0x801 EXP2, 0x802 EXP_ABS, 0x803 EXP2_ABS,
+     * 0x804 LINEAR_ABS, 0x2601 LINEAR); fog_param is SET_FOG_PARAMS. */
+    uint32_t fog_mode, fog_gen, spec_enable, light_ctl;
+    float    fog_param[3];
     /* survey */
     uint32_t prog_dwords, prog_loads, prog_starts, const_dwords, const_loads;
     uint32_t mode_sets, ff_matrix_dwords, vp_dwords;

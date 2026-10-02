@@ -1732,18 +1732,18 @@ static int vsh_enabled(void)
 /* The transform-unit methods. Returns 1 if `method` was one of them. */
 /* RECOMP_WHITE_TRACE: state the executor does not otherwise keep, recorded
  * for the per-batch trace only. */
-static uint32_t s_wt_spec = ~0u, s_wt_fogmode = ~0u, s_wt_foggen = ~0u, s_wt_light = ~0u;
-static float s_wt_fogp[3];
+static uint32_t s_wt_light = ~0u;
 
 static int vsh_method(uint32_t method, uint32_t param)
 {
     switch (method) {
-    case 0x03B8: s_wt_spec = param; break;          /* SET_SPECULAR_ENABLE */
-    case 0x029C: s_wt_fogmode = param; break;       /* SET_FOG_MODE */
-    case 0x02A0: s_wt_foggen = param; break;        /* SET_FOG_GEN_MODE */
+    case 0x03B8: s_vsh.spec_enable = param != 0; return 1;  /* SET_SPECULAR_ENABLE */
+    case 0x0294: s_vsh.light_ctl = param; return 1;         /* SET_LIGHT_CONTROL */
+    case 0x029C: s_vsh.fog_mode = param; return 1;          /* SET_FOG_MODE */
+    case 0x02A0: s_vsh.fog_gen = param; return 1;           /* SET_FOG_GEN_MODE */
     case 0x0314: s_wt_light = param; break;         /* SET_LIGHTING_ENABLE */
     case 0x09C0: case 0x09C4: case 0x09C8:          /* SET_FOG_PARAMS */
-        s_wt_fogp[(method - 0x09C0) / 4] = u2f(param); break;
+        s_vsh.fog_param[(method - 0x09C0) / 4] = u2f(param); return 1;
     default: break;
     }
     if (method >= NV097_SET_TRANSFORM_PROGRAM_M
@@ -2002,6 +2002,45 @@ static void vsh_inputs(uint32_t index, float v[NV2A_VSH_INPUTS][4])
     }
 }
 
+/* The fog factor for one vertex, from the program's oFog.x: xemu vsh.c,
+ * including its offsets (fogParam.x is 1.5 for the EXP modes and the factor
+ * comes out of exp2 shifted by it). A program-mode batch takes the fog
+ * distance from oFog.x whatever SET_FOG_GEN_MODE says. Disabled fog is 1:
+ * the final combiner's FOG alpha then leaves the colour alone. */
+static float vsh_fog_factor(float d)
+{
+    float p0 = s_vsh.fog_param[0], p1 = s_vsh.fog_param[1], f;
+    int abs_ = 0;
+
+    if (!s_vsh.fog_enable)
+        return 1.0f;
+    if (isinf(d))
+        return (s_vsh.fog_mode == 0x2601 || s_vsh.fog_mode == 0x804
+                || s_vsh.fog_mode == 0x800) ? 1.0f : 0.0f;
+    switch (s_vsh.fog_mode) {
+    case 0x804: abs_ = 1; /* fallthrough */          /* LINEAR_ABS */
+    case 0x2601:                                     /* LINEAR */
+        f = p0 + d * p1 - 1.0f;
+        break;
+    case 0x802: abs_ = 1; /* fallthrough */          /* EXP_ABS */
+    case 0x800:                                      /* EXP */
+        f = p0 + exp2f(d * p1 * 16.0f) - 1.5f;
+        break;
+    case 0x803: abs_ = 1; /* fallthrough */          /* EXP2_ABS */
+    case 0x801:                                      /* EXP2 */
+        f = p0 + exp2f(-d * d * p1 * p1 * 32.0f) - 1.5f;
+        break;
+    default:
+        return 1.0f;
+    }
+    if (abs_)
+        f = fabsf(f);
+    if (isnan(f))
+        return (s_vsh.fog_mode == 0x2601 || s_vsh.fog_mode == 0x804
+                || s_vsh.fog_mode == 0x800) ? 1.0f : 0.0f;
+    return f;
+}
+
 static void vsh_transform(uint32_t index, XfVert *xv)
 {
     float v[NV2A_VSH_INPUTS][4];
@@ -2024,6 +2063,16 @@ static void vsh_transform(uint32_t index, XfVert *xv)
         for (t = 0; t < 4; t++)
             xv->t[t][k] = o.o[NV2A_VSH_O_T0 + t][k];
     }
+    /* What xemu's vsh.c does after the program: vtxD1 is (0, 0, 0, 1) unless
+     * specular is enabled, and then its alpha is 1 unless SET_LIGHT_CONTROL
+     * asks for ALPHA_FROM_MATERIAL_SPECULAR (bit 17). */
+    if (!s_vsh.spec_enable) {
+        xv->d1[0] = xv->d1[1] = xv->d1[2] = 0.0f;
+        xv->d1[3] = 1.0f;
+    } else if (!(s_vsh.light_ctl & (1u << 17))) {
+        xv->d1[3] = 1.0f;
+    }
+    xv->fog = vsh_fog_factor(o.o[NV2A_VSH_O_FOG][0]);
     /* ok means usable: the program finished and the position is finite. A
      * vertex behind the eye (w <= 0) or far outside the surface is usable --
      * clip_tri cuts the triangle down to the part that is in front. */
@@ -2678,7 +2727,8 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
                     r[5][k] = pa * a->d1[k] + pb * b->d1[k] + pc * c->d1[k];
                 rc_unpack(s_vsh.fog_color, r[3]);
                 { float t_ = r[3][0]; r[3][0] = r[3][2]; r[3][2] = t_; } /* RGBA */
-                r[3][3] = 1.0f;
+                r[3][3] = s_vsh.fog_enable
+                        ? clamp01(pa * a->fog + pb * b->fog + pc * c->fog) : 1.0f;
                 for (n = 0; n < 4; n++) {
                     if (!s_stage_mode[n])
                         continue;
@@ -3017,6 +3067,7 @@ static struct {
     int      v1_inv, r0_inv, sum_clamp;
     float    tmpl[16][4];                /* register file at pixel start */
     uint32_t dirty;                      /* registers reset between pixels */
+    int      fog_var;                    /* FOG alpha varies per pixel */
 } s_rcp;
 
 /* Registers whose value at a stage's input is the same for every pixel. */
@@ -3026,7 +3077,7 @@ static const float *rc_const_reg(uint32_t reg, const float f0[4], const float f1
     if (reg == 0) return s_rcp.tmpl[0];
     if (reg == 1) return f0;
     if (reg == 2) return f1;
-    if (reg == 3 && !(written & (1u << 3))) return s_rcp.tmpl[3];
+    if (reg == 3 && !(written & (1u << 3)) && !s_rcp.fog_var) return s_rcp.tmpl[3];
     return NULL;
 }
 
@@ -3090,6 +3141,7 @@ static void rc_plan_build(void)
     rc_unpack(s_vsh.fog_color, s_rcp.tmpl[3]);
     { float t_ = s_rcp.tmpl[3][0]; s_rcp.tmpl[3][0] = s_rcp.tmpl[3][2]; s_rcp.tmpl[3][2] = t_; }
     s_rcp.tmpl[3][3] = 1.0f;
+    s_rcp.fog_var = s_vsh.fog_enable;
 
     s_rcp.stages = s_vsh.rc_ctl & 0xFF;
     if (s_rcp.stages > 8)
@@ -3494,6 +3546,8 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                 memcpy(r[4], col, sizeof col);
                 for (k = 0; k < 4; k++)
                     r[5][k] = pa * a->d1[k] + pb * b->d1[k] + pc * c->d1[k];
+                if (s_rcp.fog_var)
+                    r[3][3] = clamp01(pa * a->fog + pb * b->fog + pc * c->fog);
                 for (n = 0; n < 4; n++) {
                     if (!s_stage_mode[n])
                         continue;
@@ -3644,6 +3698,7 @@ static void clip_lerp(const ClipVert *a, const ClipVert *b, float t, ClipVert *o
     int k, n;
     if (!(t >= 0.0f)) t = 0.0f;
     if (t > 1.0f)     t = 1.0f;
+    o->v.fog = a->v.fog + t * (b->v.fog - a->v.fog);
     for (k = 0; k < 4; k++) {
         o->h[k] = a->h[k] + t * (b->h[k] - a->h[k]);
         o->v.d0[k] = a->v.d0[k] + t * (b->v.d0[k] - a->v.d0[k]);
@@ -3839,9 +3894,9 @@ static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
     fprintf(stderr, "[WHITE] batch prim %u n %u prog start %u len %u | spec %d light %d"
                     " fog en %d mode 0x%X gen %u params %g %g %g colour %08X | rc %d ctl %08X"
                     " shader %08X | stage fmt %02X %02X %02X %02X mode %d %d %d %d\n",
-            s_gpu.prim, n, s_vsh.start, plen, (int)s_wt_spec, (int)s_wt_light,
-            s_vsh.fog_enable, s_wt_fogmode, s_wt_foggen, s_wt_fogp[0], s_wt_fogp[1],
-            s_wt_fogp[2], s_vsh.fog_color, vsh_rc_active(), s_vsh.rc_ctl, s_vsh.shader_prog,
+            s_gpu.prim, n, s_vsh.start, plen, (int)s_vsh.spec_enable, (int)s_wt_light,
+            s_vsh.fog_enable, s_vsh.fog_mode, s_vsh.fog_gen, s_vsh.fog_param[0],
+            s_vsh.fog_param[1], s_vsh.fog_param[2], s_vsh.fog_color, vsh_rc_active(), s_vsh.rc_ctl, s_vsh.shader_prog,
             s_stage_tex[0].color, s_stage_tex[1].color, s_stage_tex[2].color,
             s_stage_tex[3].color, s_stage_mode[0], s_stage_mode[1], s_stage_mode[2],
             s_stage_mode[3]);
@@ -3907,7 +3962,8 @@ static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
         }
         rc_unpack(s_vsh.fog_color, r[3]);
         { float t_ = r[3][0]; r[3][0] = r[3][2]; r[3][2] = t_; }
-        r[3][3] = 1.0f;
+        r[3][3] = s_vsh.fog_enable
+                ? clamp01(pa * a->fog + pb * b->fog + pc * c->fog) : 1.0f;
         for (st = 0; st < 4; st++) {
             float tc[4];
             if (!s_stage_mode[st])

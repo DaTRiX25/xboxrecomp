@@ -359,14 +359,19 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
          "    float4 tc0 : TEXCOORD0;\n"
          "    float4 tc1 : TEXCOORD1;\n"
          "    float4 tc2 : TEXCOORD2;\n"
-         "    float4 tc3 : TEXCOORD3;\n"
-         "};\n");
+         "    float4 tc3 : TEXCOORD3;\n");
+    if (state->fog_input)
+        EMIT("    float  fog : FOG;\n");
+    EMIT("};\n");
     EMIT("%s", s_rc_helpers);
 
     EMIT("float4 main(PS_IN i) : SV_Target {\n");
     for (k = 0; k < 16; k++)
         EMIT("    float4 x%d = 0;\n", k);
-    EMIT("    x3 = fog_color;\n");
+    if (state->fog_input)
+        EMIT("    x3 = float4(fog_color.rgb, saturate(i.fog));\n");
+    else
+        EMIT("    x3 = fog_color;\n");
     EMIT("    x4 = i.d0;\n");
     EMIT("    x5 = i.d1;\n");
 

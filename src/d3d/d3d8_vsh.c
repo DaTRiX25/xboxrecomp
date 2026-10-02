@@ -653,6 +653,9 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
             "cbuffer VSH_Viewport : register(b2) {\n"
             "    float4 vp_scale;\n"
             "    float4 vp_off;\n"
+            "    float4 fog_param;   /* SET_FOG_PARAMS[0], [1] */\n"
+            "    uint4  fog_ctl;     /* enable, 0 linear/1 exp/2 exp2, abs, inf/NaN result */\n"
+            "    uint4  spec_ctl;    /* x: specular on, y: alpha from material */\n"
             "};\n"
             "\n");
 
@@ -762,6 +765,30 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
             "                    oPos.z * vp_scale.z * pw, pw);\n");
     } else {
         sb_append(&sb, "    o.oPos = oPos;\n");
+    }
+    if (flags & NV2A_VSH_HLSL_SCREEN_SPACE) {
+        /* The NV2A pushbuffer path: what xemu's vsh.c appends to every
+         * program. oFog.x is the fog distance and leaves as the fog factor;
+         * specular off forces oD1 to (0,0,0,1), and its alpha is 1 unless
+         * SET_LIGHT_CONTROL takes it from the material. */
+        sb_append(&sb,
+            "    {\n"
+            "        float fd = oFog.x, ff = 1.0;\n"
+            "        if (fog_ctl.x != 0u) {\n"
+            "            if (fog_ctl.y == 0u)      ff = fog_param.x + fd * fog_param.y - 1.0;\n"
+            "            else if (fog_ctl.y == 1u) ff = fog_param.x + exp2(fd * fog_param.y * 16.0) - 1.5;\n"
+            "            else ff = fog_param.x + exp2(-fd * fd * fog_param.y * fog_param.y * 32.0) - 1.5;\n"
+            "            if (fog_ctl.z != 0u) ff = abs(ff);\n"
+            /* isinf/isnan by bits: vkd3d's compiler has neither, and
+             * fxc may fold an x != x test away. */
+            "            if ((asuint(fd) & 0x7FFFFFFFu) == 0x7F800000u\n"
+            "                    || (asuint(ff) & 0x7FFFFFFFu) > 0x7F800000u)\n"
+            "                ff = fog_ctl.w != 0u ? 1.0 : 0.0;\n"
+            "        }\n"
+            "        oFog = float4(ff, ff, ff, ff);\n"
+            "        if (spec_ctl.x == 0u) oD1 = float4(0, 0, 0, 1);\n"
+            "        else if (spec_ctl.y == 0u) oD1.w = 1.0;\n"
+            "    }\n");
     }
     sb_append(&sb,
 
