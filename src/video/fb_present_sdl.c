@@ -78,7 +78,7 @@ static volatile int    s_wake_pending;
 static volatile int    s_in_present;         /* ack thread inside Present */
 
 /* Ack-thread side counters, read by the stats line. */
-static volatile uint64_t s_flips, s_copy_ns;
+static uint64_t s_flips, s_copy_ns;          /* relaxed atomics */
 
 static uint64_t now_ns(clockid_t c)
 {
@@ -103,10 +103,13 @@ static void present_copy(uint32_t fb_va, uint32_t pitch);
 /* Called by the backend at each flip, on the nv2a-ack thread. */
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
-    if (!s_running || !fb_va || !pitch)
+    /* Dekker-style handshake with the close path: each side stores its own
+     * flag and then loads the other's, all seq_cst, so either the window sees
+     * this present in flight or this present sees the window closing. */
+    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !fb_va || !pitch)
         return;
     __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
-    if (!s_running) {                /* the window closed meanwhile */
+    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST)) {   /* closing */
         __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
         return;
     }
@@ -172,8 +175,8 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
         SDL_PushEvent(&ev);
     }
 
-    s_flips++;
-    s_copy_ns += now_ns(CLOCK_MONOTONIC) - t0;
+    __atomic_add_fetch(&s_flips, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&s_copy_ns, now_ns(CLOCK_MONOTONIC) - t0, __ATOMIC_RELAXED);
 }
 
 /* ── The guest thread ─────────────────────────────────────────────────── */
@@ -352,6 +355,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     SDL_RenderPresent(ren);
 
     s_guest_done_event = SDL_RegisterEvents(2);
+    if (s_guest_done_event == (Uint32)-1) {
+        fprintf(stderr, "[PRESENT] SDL_RegisterEvents failed; running headless\n");
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        return guest_main();
+    }
     s_frame_event = s_guest_done_event + 1;
     s_guest_main = guest_main;
     xbox_InputSetMainPump(1);
@@ -451,13 +461,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             if (t - t_stat >= 5000000000ull) {
                 uint64_t cpu = now_ns(CLOCK_THREAD_CPUTIME_ID);
                 double dt = (double)(t - t_stat) / 1e9;
-                uint64_t fl = s_flips;
+                uint64_t fl = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
                 fprintf(stderr, "[PRESENT] %.1f flips/s copied, %.1f presents/s,"
                         " main thread %.1f%% of a core, ack copy %.3f ms/flip\n",
                         (double)(fl - flips_stat) / dt,
                         (double)(presents - pres_stat) / dt,
                         100.0 * (double)(cpu - cpu_stat) / (double)(t - t_stat),
-                        fl ? (double)s_copy_ns / (double)fl / 1e6 : 0.0);
+                        fl ? (double)__atomic_load_n(&s_copy_ns, __ATOMIC_RELAXED) / (double)fl / 1e6 : 0.0);
                 t_stat = t;
                 cpu_stat = cpu;
                 pres_stat = presents;
@@ -467,13 +477,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     }
 
     /* No present may be mid-publish (it pushes an SDL event) once SDL goes. */
-    s_running = 0;
+    __atomic_store_n(&s_running, 0, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&s_in_present, __ATOMIC_SEQ_CST))
         sched_yield();
     {
         uint64_t t = now_ns(CLOCK_MONOTONIC), cpu = now_ns(CLOCK_THREAD_CPUTIME_ID);
         double dt = (double)(t - t_start) / 1e9;
-        uint64_t fl = s_flips;
+        uint64_t fl = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
         fprintf(stderr, "[PRESENT] %s after %.1f s: %llu flips copied (%.1f/s),"
                 " %llu presents (%.1f/s), %llu dropped, main thread %.1f%% of a"
                 " core, upload %.3f ms/frame, ack copy %.3f ms/flip\n",
@@ -483,7 +493,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 (unsigned long long)dropped_base,
                 t > t_start ? 100.0 * (double)(cpu - cpu_start) / (double)(t - t_start) : 0.0,
                 shown_seq ? (double)upload_ns / (double)shown_seq / 1e6 : 0.0,
-                fl ? (double)s_copy_ns / (double)fl / 1e6 : 0.0);
+                fl ? (double)__atomic_load_n(&s_copy_ns, __ATOMIC_RELAXED) / (double)fl / 1e6 : 0.0);
     }
     fflush(stdout);
     fflush(stderr);
@@ -499,7 +509,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_DestroyTexture(tex);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
-    xbox_InputSetMainPump(0);
+    /* The main pump flag stays set: guest and OHCI threads keep running
+     * until exit(), and must not start calling SDL_GameControllerUpdate
+     * while SDL is torn down under them. */
     if (!xbox_InputAnyOpen())
         SDL_Quit();
     else
