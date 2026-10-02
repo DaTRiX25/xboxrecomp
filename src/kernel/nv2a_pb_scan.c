@@ -53,6 +53,14 @@ static int s_seen_count;
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 
+/* Walks that stopped short of PUT. The words from the stop to PUT are never
+ * executed, and they may hold the semaphore release the title's next fence
+ * wait spins on, so the fence mirror reads this and catches the fence up
+ * once (fence_mirrors_tick). Counted here as well because after eight
+ * warning lines a stop is otherwise silent. */
+static uint32_t s_tot_stops;
+uint32_t nv2a_pb_scan_stops(void) { return s_tot_stops; }
+
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
@@ -184,10 +192,10 @@ void nv2a_pb_scan_report(void)
         nv2a_pb_exec_report();
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
-    fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised"
-                    " -- %d distinct (subchannel, method) pairs\n",
+    fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised,"
+                    " %u stopped -- %d distinct (subchannel, method) pairs\n",
             s_tot_segments, s_tot_words, s_tot_jumps, s_tot_unknown,
-            s_seen_count);
+            s_tot_stops, s_seen_count);
     for (i = 0; i < s_seen_count; i++)
         fprintf(stderr, "  [PB]   subch %u  method 0x%04X  x%-6u %s\n",
                 s_seen[i].subch, s_seen[i].method, s_seen[i].count,
@@ -222,8 +230,9 @@ static int pb_in_window(uint32_t va)
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t va = start_va, ret_va = 0;
+    uint32_t va = start_va, ret_va = 0, at = start_va, w = 0;
     uint32_t words = 0, jumps = 0, unknown = 0;
+    static int inject = -1;
     const char *why = NULL;
     int in_call = 0;
 
@@ -235,12 +244,23 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         return;
     if (s_exec_enabled)
         nv2a_pb_perf_scan_begin();
+    /* Test hook: RECOMP_PB_INJECT_STOP=N stops every Nth walk at its first
+     * word, so the recovery from a stop can be seen without a real desync.
+     * Never the first walk: it sets up the semaphore, and without that the
+     * executor never takes the fence over and there is nothing to recover. */
+    if (inject < 0)
+        inject = getenv("RECOMP_PB_INJECT_STOP")
+               ? atoi(getenv("RECOMP_PB_INJECT_STOP")) : 0;
+    if (inject > 0 && s_tot_segments && s_tot_segments % (uint32_t)inject == 0)
+        why = "injected (RECOMP_PB_INJECT_STOP)";
 
     /* Bounded at 4 MB of words, a sane single-frame amount: GET that never
      * reaches PUT is a stream this walk is out of step with. */
-    while (va != end_va) {
-        uint32_t w, tgt;
+    while (!why && va != end_va) {
+        uint32_t tgt;
 
+        at = va;
+        w = 0;
         if (words >= 0x100000u) { why = "word limit"; break; }
         if (!pb_in_window(va)) { why = "outside the contiguous window"; break; }
         w = *(const uint32_t *)(mem + va);
@@ -276,9 +296,9 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             va = XBOX_CONTIG_BASE | tgt;
             continue;
         }
-        if ((w & 0xFFFF0003u) == 0x00020000u) {   /* return */
-            if (in_call)
-                va = ret_va;
+        if (w == 0x00020000u) {               /* return */
+            if (!in_call) { why = "return outside a call"; break; }
+            va = ret_va;
             in_call = 0;
             continue;
         }
@@ -296,10 +316,12 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (why) {
         static unsigned said;
         s_left = 0;                 /* out of step: drop the method in progress */
+        s_tot_stops++;
         if (said++ < 8)
-            fprintf(stderr, "[PB] walk 0x%08X -> 0x%08X stopped at 0x%08X after"
-                    " %u words without reaching PUT (%s)\n",
-                    start_va, end_va, va, words, why);
+            fprintf(stderr, "[PB] walk 0x%08X -> 0x%08X stopped at 0x%08X"
+                    " (word 0x%08X) after %u words without reaching PUT (%s);"
+                    " fence caught up\n",
+                    start_va, end_va, at, w, words, why);
     }
 
     if (s_exec_enabled)
