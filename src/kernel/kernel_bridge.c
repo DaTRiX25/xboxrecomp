@@ -490,6 +490,7 @@ static void thread_set_os_name(const char *name)
 
 void xbox_log_thread_role(const char *role, uint32_t routine)
 {
+    static DWORD main_tid;   /* the thread that logged process-main */
     char os[16];
 
     /* Workers are told apart by the low 16 bits of their routine. */
@@ -497,7 +498,12 @@ void xbox_log_thread_role(const char *role, uint32_t routine)
         snprintf(os, sizeof os, "guest-w-%04X", (unsigned)(routine & 0xFFFF));
     else
         snprintf(os, sizeof os, "%.15s", role);
-    thread_set_os_name(os);
+    if (!strcmp(role, "process-main"))
+        main_tid = GetCurrentThreadId();
+    /* Not the initial thread: on Linux (Wine included) its name is the
+     * process comm, so renaming it to guest-main breaks pgrep and ps. */
+    if (GetCurrentThreadId() != main_tid)
+        thread_set_os_name(os);
     if (routine)
         fprintf(stderr, "[THREAD] tid=%lu role=%s routine=0x%08X\n",
                 (unsigned long)GetCurrentThreadId(), role, routine);
