@@ -1,5 +1,6 @@
 # Xbox D3D8 Compatibility Layer
 #   _WIN32 -> backed by Direct3D 11 (d3d8_*.c, d3d8_combiners.c, d3d8_vsh.c)
+#   Both   -> d3d8_vsh_parse.c (NV2A vertex-program parser, no graphics API)
 #   POSIX  -> backed by OpenGL 3.3 core via SDL2 + libepoxy (d3d8_gl.c)
 
 if(WIN32)
@@ -11,6 +12,7 @@ if(WIN32)
         d3d8_states.c
         d3d8_combiners.c
         d3d8_vsh.c
+        d3d8_vsh_parse.c
         nv2a_pb_d3d11.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
@@ -31,6 +33,7 @@ if(WIN32)
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c
+        d3d8_vsh_parse.c
     )
     find_package(SDL2 REQUIRED)
     find_package(PkgConfig REQUIRED)

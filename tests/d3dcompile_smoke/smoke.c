@@ -198,7 +198,7 @@ static void compile_dump(const char *path)
         return;
     }
     fclose(f);
-    d3d8_vsh_parse(&prog[start][0], NV2A_VS_MAX_INSTRUCTIONS - (int)start,
+    d3d8_vsh_parse((const uint32_t *)&prog[start][0], NV2A_VS_MAX_INSTRUCTIONS - (int)start,
                    &parsed);
     n = d3d8_vsh_generate_hlsl_ex(&parsed, NV2A_VSH_HLSL_SCREEN_SPACE,
                                   hlsl, sizeof hlsl);

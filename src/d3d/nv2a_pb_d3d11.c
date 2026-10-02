@@ -845,7 +845,7 @@ static VsEntry *vertex_shader(int program)
     e->bad = 1;
 
     if (program) {
-        d3d8_vsh_parse((const DWORD *)&v->prog[v->start][0],
+        d3d8_vsh_parse(&v->prog[v->start][0],
                        NV2A_VSH_SLOTS - (int)v->start, &parsed);
         if (d3d8_vsh_generate_hlsl_ex(&parsed, NV2A_VSH_HLSL_SCREEN_SPACE,
                                       hlsl, sizeof hlsl) <= 0) {
@@ -2052,7 +2052,7 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
     {
         static NV2AVshProgram parsed;
         static char hlsl[65536];
-        d3d8_vsh_parse((const DWORD *)&v->prog[v->start][0],
+        d3d8_vsh_parse(&v->prog[v->start][0],
                        NV2A_VSH_SLOTS - (int)v->start, &parsed);
         if (d3d8_vsh_generate_hlsl_ex(&parsed, NV2A_VSH_HLSL_SCREEN_SPACE,
                                       hlsl, sizeof hlsl) > 0)
