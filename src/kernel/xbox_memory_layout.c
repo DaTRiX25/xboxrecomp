@@ -1073,6 +1073,52 @@ static void fence_mirrors_tick(void)
     }
 }
 
+/* PGRAPH 0x400B10 follows the completed fence.
+ *
+ * XDK D3D's wait-for-idle (BLiNX 2 sub_002E7E80, reached from the Swap path
+ * after a PFB flush) spins until bits 2..6 of this register equal the low five
+ * bits of the fence word:
+ *
+ *   L: mov eax, [regs+0x400B10]
+ *      mov ecx, [fence]       ; re-read each pass
+ *      shl ecx, 2
+ *      xor ecx, eax
+ *      test cl, 0x7c
+ *      jne L
+ *
+ * That reads as "the GPU's own copy of the last semaphore value has reached
+ * memory". The fence word is written only when the release is consumed (by the
+ * executor, or the mirror above), so tracking it here, after the work has been
+ * done, gives the same answer the hardware would. Against plain RAM the
+ * register stays 0 and the wait only passes when the fence happens to be a
+ * multiple of 32. The name is not confirmed; the behaviour is what the wait
+ * needs. */
+#define NV2A_PGRAPH_FENCE_MIRROR 0x400B10u
+
+static void pgraph_fence_tick(volatile uint32_t *regs)
+{
+    for (int i = 0; i < g_fence_mirror_count; i++) {
+        uint32_t dev, get_ptr, v;
+        volatile uint32_t *r;
+
+        if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4))
+            continue;
+        get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
+                                         + g_memory_offset);
+        if (!fence_readable(get_ptr, 4))
+            continue;
+        v = *(volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
+        r = (volatile uint32_t *)((char *)regs + NV2A_PGRAPH_FENCE_MIRROR);
+        if (((*r ^ (v << 2)) & 0x7Cu) != 0)
+            *r = (*r & ~0x7Cu) | ((v << 2) & 0x7Cu);
+        return;   /* one device drives the GPU */
+    }
+}
+
 static int s_nv2a_trace = 0;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
@@ -1260,6 +1306,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                               + NV2A_USER_DMA_GET);
                     *get = put;
                 }
+                pgraph_fence_tick(regs);
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET
