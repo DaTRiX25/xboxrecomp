@@ -2321,9 +2321,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
                     XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
         } else {
-            fprintf(stderr, "  WARNING: contiguous window at 0x%08X failed "
-                    "(error %lu); pinned physical allocations will fault\n",
-                    XBOX_CONTIG_BASE, GetLastError());
+            /* Say what is in the way. Under Wine the base view lands wherever
+             * the loader left room, and 0x80000000 + offset can be taken. */
+            DWORD err = GetLastError();
+            MEMORY_BASIC_INFORMATION mbi;
+            fprintf(stderr, "  WARNING: contiguous window at 0x%08X (native %p) "
+                    "failed (error %lu); pinned physical allocations will fault\n",
+                    XBOX_CONTIG_BASE, (void *)contig_native, err);
+            if (VirtualQuery((LPCVOID)contig_native, &mbi, sizeof(mbi)))
+                fprintf(stderr, "    occupant: base %p alloc-base %p size 0x%zx "
+                        "state 0x%lx type 0x%lx\n",
+                        mbi.BaseAddress, mbi.AllocationBase, mbi.RegionSize,
+                        (unsigned long)mbi.State, (unsigned long)mbi.Type);
         }
     }
 
@@ -2652,8 +2661,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * physical address, so if the two are not the same bytes the GPU
              * sees empty buffers and the screen stays black -- with nothing
              * anywhere to say why. One write and one read turns that into a
-             * startup line. */
-            {
+             * startup line. Only when the contiguous window is where it
+             * should be: if it fell back or failed, reading it would fault. */
+            if (g_contig_memory !=
+                    (void *)(uintptr_t)(XBOX_CONTIG_BASE + g_memory_offset)) {
+                fprintf(stderr, "  WARNING: tiled aperture alias not checked:"
+                        " contiguous window is not mapped\n");
+            } else {
                 volatile uint32_t *via_tiled =
                     (volatile uint32_t *)((uintptr_t)(XBOX_TILED_BASE + 0x1000)
                                           + g_memory_offset);
