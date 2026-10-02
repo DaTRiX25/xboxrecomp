@@ -126,6 +126,9 @@ struct nv2a_pb_gpu {
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
+    /* SET_BLEND_COLOR: the CONSTANT_COLOR/ALPHA factors' colour, packed
+     * ARGB as the method carries it (xemu: NV_PGRAPH_BLENDCOLOR). */
+    uint32_t blend_color, blend_color_writes;
     /* SET_COLOR_MASK, inverted: the ARGB bits a draw leaves alone. 0 (the
      * reset state) writes every channel; 0xFFFFFFFF writes none, as for a
      * stencil- or depth-only pass. */
