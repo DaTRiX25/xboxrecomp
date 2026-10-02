@@ -186,6 +186,11 @@ uint32_t xbox_Nv2aKickStats(uint64_t *wait_ns);
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
 uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
+/* A display-mode generation: AvSetDisplayMode bumps it (on the title's
+ * thread), the walker's present pick reads it to notice a mode set even when
+ * address and pitch stay the same. 0 until the first mode set. */
+void xbox_DisplayModeBump(void);
+uint32_t xbox_DisplayModeGeneration(void);
 
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
  * below 256 MB, or 0 when the arena is exhausted. */
