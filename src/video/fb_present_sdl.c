@@ -28,6 +28,17 @@
  * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
  * RECOMP_PRESENT_STATS=1 prints a [PRESENT] line every 5 s (one is always
  * printed at exit); RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
+ *
+ * RECOMP_WINDOW_SHOT=<flip>[,<flip>...]: read back what the renderer drew for
+ * the frame of that walker flip count (the number RECOMP_FB_DUMP_FLIPS and
+ * RECOMP_FLIP_LOG print), at the window's pixel size, with
+ * SDL_RenderReadPixels, into <prefix>win_flip<NNNNN>.bmp. <prefix> is
+ * RECOMP_WINDOW_SHOT_PREFIX, else RECOMP_FB_DUMP, else "window_". A flip the
+ * window dropped is shot at the next frame it shows, under that frame's own
+ * flip number. Only the process's own pixels are read.
+ *
+ * RECOMP_WINDOW_QUIT_AFTER=<seconds>: post SDL_QUIT then, the event the
+ * window's close button produces, so a script can test the close path.
  */
 #if !defined(_WIN32)
 
@@ -38,6 +49,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sched.h>
 #include <sys/resource.h>
 
 #include "kernel/nv2a_pb_state.h"
@@ -45,6 +57,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
+extern int  xbox_InputAnyOpen(void);
 
 /* ── Handoff: three slots, one each for writer, reader and the ready frame ── */
 
@@ -52,6 +65,7 @@ struct fb_slot {
     uint8_t *px;
     size_t   cap;
     uint32_t w, h, bpp;
+    uint32_t flip;                 /* the walker's flip count at this frame */
 };
 
 static struct fb_slot  s_slot[3];
@@ -61,6 +75,7 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int    s_running;            /* window up: flips copy */
 static Uint32          s_frame_event;        /* wakes the main loop */
 static volatile int    s_wake_pending;
+static volatile int    s_in_present;         /* ack thread inside Present */
 
 /* Ack-thread side counters, read by the stats line. */
 static volatile uint64_t s_flips, s_copy_ns;
@@ -83,19 +98,31 @@ void xbox_FramebufferWindowStart(void) {}
 /* No keyboard path on POSIX: the keyboard pad (xinput_device.c) is Win32-only. */
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 
+static void present_copy(uint32_t fb_va, uint32_t pitch);
+
 /* Called by the backend at each flip, on the nv2a-ack thread. */
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+{
+
+    if (!s_running || !fb_va || !pitch)
+        return;
+    __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+    if (!s_running) {                /* the window closed meanwhile */
+        __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+    present_copy(fb_va, pitch);
+    __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+}
+
+static void present_copy(uint32_t fb_va, uint32_t pitch)
 {
     const struct nv2a_pb_present *p;
     struct fb_slot *s;
     const uint8_t *src;
     uint32_t w = 640, h = 480, bpp, y;
     size_t need;
-    uint64_t t0;
-
-    if (!s_running || !fb_va || !pitch)
-        return;
-    t0 = now_ns(CLOCK_MONOTONIC);
+    uint64_t t0 = now_ns(CLOCK_MONOTONIC);
 
     /* The walker's pick has the surface's own size; before its first pick
      * (or for a surface it did not pick) the display's 640x480. */
@@ -125,6 +152,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     s->w = w;
     s->h = h;
     s->bpp = bpp;
+    s->flip = nv2a_pb_gpu_state()->flips;
 
     /* Publish: the finished slot becomes the ready one. An unshown ready
      * frame is overwritten (dropped), never waited for. */
@@ -211,6 +239,63 @@ static int start_guest(void)
 
 /* ── The window, on the process main thread ───────────────────────────── */
 
+#define SHOT_MAX 32
+static uint32_t s_shot[SHOT_MAX];
+static int      s_shot_n;
+
+static void shot_parse(void)
+{
+    const char *e = getenv("RECOMP_WINDOW_SHOT");
+    while (e && *e && s_shot_n < SHOT_MAX) {
+        char *end;
+        unsigned long v = strtoul(e, &end, 0);
+        if (end == e)
+            break;
+        s_shot[s_shot_n++] = (uint32_t)v;
+        e = *end == ',' ? end + 1 : end;
+    }
+}
+
+/* The first pending target this frame reaches, removed; -1 if none. */
+static int shot_due(uint32_t flip)
+{
+    int i;
+    for (i = 0; i < s_shot_n; i++)
+        if (flip >= s_shot[i]) {
+            s_shot[i] = s_shot[--s_shot_n];
+            return 1;
+        }
+    return 0;
+}
+
+/* Between RenderCopy and RenderPresent: the back buffer is what is shown. */
+static void shot_save(SDL_Renderer *ren, uint32_t flip)
+{
+    const char *prefix = getenv("RECOMP_WINDOW_SHOT_PREFIX");
+    SDL_Surface *surf;
+    char path[512];
+    int w = 0, h = 0;
+
+    if (!prefix)
+        prefix = getenv("RECOMP_FB_DUMP");
+    if (!prefix)
+        prefix = "window_";
+    if (SDL_GetRendererOutputSize(ren, &w, &h) != 0 || w <= 0 || h <= 0)
+        return;
+    surf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 24, SDL_PIXELFORMAT_BGR24);
+    if (!surf)
+        return;
+    snprintf(path, sizeof path, "%swin_flip%05u.bmp", prefix, flip);
+    if (SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_BGR24, surf->pixels,
+                             surf->pitch) == 0 && SDL_SaveBMP(surf, path) == 0)
+        fprintf(stderr, "[PRESENT] window shot: %s (%dx%d, flip %u)\n",
+                path, w, h, flip);
+    else
+        fprintf(stderr, "[PRESENT] window shot at flip %u failed: %s\n",
+                flip, SDL_GetError());
+    SDL_FreeSurface(surf);
+}
+
 int xbox_HostWindowMain(int (*guest_main)(void))
 {
     SDL_Window *win;
@@ -223,10 +308,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     int vsync = !getenv("RECOMP_PRESENT_VSYNC") || env_on("RECOMP_PRESENT_VSYNC");
     int stats = env_on("RECOMP_PRESENT_STATS");
     int scale = getenv("RECOMP_WINDOW_SCALE") ? atoi(getenv("RECOMP_WINDOW_SCALE")) : 2;
-    int quit = 0, guest_done = 0, dirty = 0;
+    int quit = 0, guest_done = 0, dirty = 0, shoot = 0;
+    double quit_after = getenv("RECOMP_WINDOW_QUIT_AFTER")
+                      ? atof(getenv("RECOMP_WINDOW_QUIT_AFTER")) : 0.0;
+    uint32_t shown_flip = 0;
 
     if (env_on("RECOMP_HEADLESS"))
         return guest_main();
+    shot_parse();
 
     /* Ctrl-C and SIGTERM keep their default meaning (benches rely on it);
      * SDL would turn them into SDL_QUIT. */
@@ -317,6 +406,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             uint64_t t0 = now_ns(CLOCK_MONOTONIC);
 
             dropped_base += seq - shown_seq - 1;
+            shown_flip = f->flip;
+            shoot = s_shot_n && shot_due(shown_flip);
             shown_seq = seq;
             if (!tex || f->w != tex_w || f->h != tex_h || f->bpp != tex_bpp) {
                 if (tex)
@@ -340,10 +431,22 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             SDL_RenderClear(ren);
             if (tex)
                 SDL_RenderCopy(ren, tex, NULL, NULL);
+            if (shoot) {
+                shoot = 0;
+                shot_save(ren, shown_flip);
+            }
             SDL_RenderPresent(ren);
             presents++;
         }
 
+        if (quit_after > 0 && (double)(now_ns(CLOCK_MONOTONIC) - t_start) / 1e9
+                                  >= quit_after) {
+            SDL_Event q;
+            memset(&q, 0, sizeof q);
+            q.type = SDL_QUIT;
+            SDL_PushEvent(&q);
+            quit_after = 0;
+        }
         if (stats) {
             uint64_t t = now_ns(CLOCK_MONOTONIC);
             if (t - t_stat >= 5000000000ull) {
@@ -364,7 +467,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
     }
 
+    /* No present may be mid-publish (it pushes an SDL event) once SDL goes. */
     s_running = 0;
+    while (__atomic_load_n(&s_in_present, __ATOMIC_SEQ_CST))
+        sched_yield();
     {
         uint64_t t = now_ns(CLOCK_MONOTONIC), cpu = now_ns(CLOCK_THREAD_CPUTIME_ID);
         double dt = (double)(t - t_start) / 1e9;
@@ -385,8 +491,20 @@ int xbox_HostWindowMain(int (*guest_main)(void))
 
     /* The guest is still running when the window closes, and there is no way
      * to stop lifted code mid-flight. exit() ends every thread; atexit
-     * handlers (ICALL feedback, profiles) still run. SDL is deliberately not
-     * shut down first: the USB thread may be reading a controller. */
+     * handlers (ICALL feedback, profiles) still run.
+     *
+     * Window and renderer go first, on this thread as AppKit wants. SDL_Quit
+     * is only safe once nothing else uses SDL: the USB thread reads the
+     * game controllers, so with one open SDL stays up and exit() reclaims it. */
+    if (tex)
+        SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    xbox_InputSetMainPump(0);
+    if (!xbox_InputAnyOpen())
+        SDL_Quit();
+    else
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
     if (quit)
         exit(0);
     return s_guest_rc;

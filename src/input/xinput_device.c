@@ -261,6 +261,15 @@ static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
  * racing to pump. */
 static volatile int g_main_pump;
 void xbox_InputSetMainPump(int on) { g_main_pump = on; }
+
+/* Whether a controller is open, i.e. whether SDL may still be in use here. */
+int xbox_InputAnyOpen(void)
+{
+    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_pads[i])
+            return 1;
+    return 0;
+}
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
