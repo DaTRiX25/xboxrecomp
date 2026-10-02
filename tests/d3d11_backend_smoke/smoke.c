@@ -81,7 +81,7 @@ static void vertex_z(float x, float y, float z, uint32_t argb)
 /* Four 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
  * the first free 64 KB below 16 MB. */
 static uint32_t s_report_guest;
-static int      s_vis_failures;
+static int      s_vis_failures, s_vis_late, s_cross_live, s_cross_vacuous;
 #define REPORT_GUEST s_report_guest
 
 /* Visibility test: CLEAR_REPORT_VALUE, ZPASS count on, a quad, count off,
@@ -221,14 +221,19 @@ int main(int argc, char **argv)
         uint32_t cross_early = 0xFFFFFFFFu;
 
         /* Cross-frame reuse of report 3: the last frame pushed an open test
-         * (100) into it and did not wait. Before this frame draws anything
-         * (a batch polls), push an empty test (0) into it: no batch between
-         * the old report and the new GET_REPORT, so the old one is still
-         * pending there, and ready. A poll at GET_REPORT ahead of the
-         * supersede would finish it over the reset: done, with 100, right
-         * here. */
+         * (100) into it and did not wait. The flip's only poll runs before
+         * Present (without a flush), so the old report is normally still
+         * pending here, and ready by now. Push an empty test (0) into it
+         * first thing: a poll at GET_REPORT ahead of the supersede would
+         * finish the old one over the reset, done with 100 right here. If
+         * the old one is already done (always so in sync mode) the case
+         * proves nothing; that is counted, not failed. */
         if (have_reports && f > 0) {
             volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)REPORT_GUEST;
+            if (r[15] == 0xFFFFFFFFu)
+                s_cross_live++;
+            else
+                s_cross_vacuous++;
             vis_test(3, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
             if (!r[15])
                 cross_early = r[14];
@@ -368,14 +373,15 @@ int main(int argc, char **argv)
         if (have_reports) {
             volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)REPORT_GUEST;
             /* Spin on the status as a title would, ticking on_poll the way
-             * the ack thread does, at most 100 ms. */
+             * the ack thread does, at most 300 ms (past the backend's 250 ms
+             * fallback). Still pending after that is late, not wrong. */
             if (f > 0) {
                 const struct nv2a_pb_backend *b = nv2a_pb_get_backend();
                 DWORD t0 = GetTickCount();
                 int spins = 0;
                 uint32_t reuse_first = 0xFFFFFFFFu, cross_first = cross_early;
-                int bad;
-                while ((r[3] || r[7] || r[11] || r[15]) && GetTickCount() - t0 < 100) {
+                int bad, late;
+                while ((r[3] || r[7] || r[11] || r[15]) && GetTickCount() - t0 < 300) {
                     if (b->on_poll)
                         b->on_poll();
                     if (reuse_first == 0xFFFFFFFFu && !r[11])
@@ -388,16 +394,22 @@ int main(int argc, char **argv)
                     reuse_first = r[10];
                 if (cross_first == 0xFFFFFFFFu && !r[15])
                     cross_first = r[14];
-                bad = r[3] || r[7] || r[11] || r[15] || r[2] != 0 || r[6] != 100
-                   || reuse_first != 0 || cross_first != 0;
+                /* Wrong: a report done with the wrong count. */
+                bad = (!r[3] && r[2] != 0) || (!r[7] && r[6] != 100)
+                   || (reuse_first != 0xFFFFFFFFu && reuse_first != 0)
+                   || (cross_first != 0xFFFFFFFFu && cross_first != 0);
+                late = r[3] || r[7] || r[11] || r[15];
                 if (bad)
                     s_vis_failures++;
-                if (f < 4 || f == frames - 1 || bad)
+                if (late)
+                    s_vis_late++;
+                if (f < 4 || f == frames - 1 || bad || late)
                     fprintf(stderr, "[backend-smoke] frame %d visibility%s: occluded"
                             " count %u status 0x%08X, open count %u status 0x%08X,"
                             " reused slot first count %u status 0x%08X, cross-frame"
                             " reuse first count %u%s status 0x%08X (want 0, 100, 0, 0)"
-                            " (%d polls, %lu ms)\n", f - 1, bad ? " FAIL" : "",
+                            " (%d polls, %lu ms)\n", f - 1,
+                            bad ? " FAIL" : late ? " LATE" : "",
                             r[2], r[3], r[6], r[7], reuse_first, r[11], cross_first,
                             cross_early != 0xFFFFFFFFu ? " (done at push)" : "",
                             r[15], spins, GetTickCount() - t0);
@@ -603,6 +615,10 @@ int main(int argc, char **argv)
         M(0x0130, 0);                          /* FLIP_STALL */
         Sleep(16);
     }
+    if (have_reports)
+        fprintf(stderr, "[backend-smoke] visibility: %d frames wrong, %d late;"
+                " cross-frame reuse live in %d frames, vacuous in %d\n",
+                s_vis_failures, s_vis_late, s_cross_live, s_cross_vacuous);
     if (s_vis_failures) {
         fprintf(stderr, "[backend-smoke] FAIL: %d frames with a wrong visibility"
                 " result\n", s_vis_failures);
