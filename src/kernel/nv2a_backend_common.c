@@ -334,8 +334,10 @@ void nv2a_report_write(uint8_t *mem, uint32_t va, uint32_t count)
     r[0] = 0;                              /* timestamp */
     r[1] = 0;
     r[2] = count;
-    atomic_thread_fence(memory_order_seq_cst);  /* the count before the status */
-    r[3] = 0;                              /* status: done */
+    /* status: done, as a release store, so the count (and the rest of the
+     * report) is visible before it on any host, arm64 included. */
+    atomic_store_explicit((_Atomic uint32_t *)(mem + va + 12), 0u,
+                          memory_order_release);
 }
 
 void nv2a_report_set_pending(uint8_t *mem, uint32_t va)
