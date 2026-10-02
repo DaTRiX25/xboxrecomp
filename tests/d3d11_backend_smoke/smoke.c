@@ -72,6 +72,8 @@ static void vertex_z(float x, float y, float z, uint32_t argb)
  * guest address is a host address, and it has to fit in 32 bits. */
 #define TEX_GUEST 0x10000000u
 #define OFFSCREEN 0x01800000u   /* a 320x240 render target */
+#define P8_GUEST  (TEX_GUEST + 0x8000u)
+#define PAL_GUEST (TEX_GUEST + 0x9000u)
 #define TEX_LOG2  6                            /* 64x64 */
 
 /* A swizzled A8R8G8B8 texture: 8x8-texel checker, orange and blue, with a
@@ -80,7 +82,7 @@ static int make_texture(void)
 {
     uint32_t n = 1u << TEX_LOG2, x, y;
     uint32_t *p = (uint32_t *)VirtualAlloc((void *)(uintptr_t)TEX_GUEST,
-                                           n * n * 4 + 128 * 32, MEM_RESERVE | MEM_COMMIT,
+                                           0x10000, MEM_RESERVE | MEM_COMMIT,
                                            PAGE_READWRITE);
     if (!p)
         return 0;
@@ -104,6 +106,19 @@ static int make_texture(void)
                 g[2] = (uint8_t)(16 + (x + 1) * 219 / 63);     /* Y1 */
                 g[3] = (uint8_t)(128 + y * 3);                  /* Cr */
             }
+    }
+    /* A swizzled P8 texture, 16x16, at P8_GUEST, and its palette at
+     * PAL_GUEST: 4x4-texel diagonal bands through entries 0..3 (red,
+     * yellow, cyan, white); the other 252 entries dark grey. */
+    {
+        uint8_t *i8 = (uint8_t *)(uintptr_t)P8_GUEST;
+        uint32_t *pal = (uint32_t *)(uintptr_t)PAL_GUEST;
+        static const uint32_t band[4] = {0xFFFF0000u, 0xFFFFFF00u, 0xFF00FFFFu, 0xFFFFFFFFu};
+        for (x = 0; x < 256; x++)
+            pal[x] = x < 4 ? band[x] : 0xFF404040u;
+        for (y = 0; y < 16; y++)
+            for (x = 0; x < 16; x++)
+                i8[swizzle_offset(x, y, 16, 16)] = (uint8_t)(((x >> 2) + (y >> 2)) & 3);
     }
     return 1;
 }
@@ -279,6 +294,28 @@ int main(int argc, char **argv)
             vertex_uv(20.0f,  140.0f, 0xFFFFFFFFu, uv[3]);
         }
         M(0x17FC, 0);
+
+        /* A palettized (P8) texture, and next to it one in a format with no
+         * decoder (0x2A, a swizzled depth format), which must come out
+         * magenta and be logged once. */
+        {
+            static const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+            int q;
+            for (q = 0; q < 2; q++) {
+                float x0 = q ? 300.0f : 200.0f;
+                M(0x1B00, P8_GUEST);
+                M(0x1B04, ((q ? 0x2Au : 0x0Bu) << 8) | (4u << 20) | (4u << 24)
+                          | (1u << 4) | (2u << 0));
+                M(0x1B08, 0x00000101u);
+                M(0x1B20, PAL_GUEST);          /* TEXTURE_PALETTE: 256 entries */
+                M(0x17FC, 8);
+                vertex_uv(x0,         20.0f,  0xFFFFFFFFu, uv[0]);
+                vertex_uv(x0 + 80.0f, 20.0f,  0xFFFFFFFFu, uv[1]);
+                vertex_uv(x0 + 80.0f, 100.0f, 0xFFFFFFFFu, uv[2]);
+                vertex_uv(x0,         100.0f, 0xFFFFFFFFu, uv[3]);
+                M(0x17FC, 0);
+            }
+        }
         M(0x1760 + 4 * 9, 0x02u);
         M(0x1B0C, 0);
 
