@@ -157,7 +157,6 @@ typedef struct {
     ID3D11ShaderResourceView *srv;      /* for render-to-texture, made lazily */
     uint64_t                last_use;
     uint64_t                last_draw, last_clear;  /* s_seq at the last one */
-    int                     flipped;    /* the walker named it at a flip */
 } RenderTarget;
 
 typedef struct Stage Stage;
@@ -165,7 +164,7 @@ static RenderTarget s_rt[RT_MAX];
 static RenderTarget *s_drawn;   /* what the last flip presented */
 static RenderTarget *s_cur;     /* the target of the batch being drawn */
 static uint64_t      s_tick;
-static uint64_t      s_seq, s_flip_seq;  /* draw/clear order; s_seq at the last flip */
+static uint64_t      s_seq;              /* draw/clear order */
 static uint64_t      s_rtt_binds;        /* textures served from a render target */
 
 /* ---- shaders --------------------------------------------------------------- */
@@ -3077,72 +3076,22 @@ static void dump_frame(void)
     ID3D11Texture2D_Release(st);
 }
 
-/* The surface a flip puts on screen.
- *
- * The walker hands over drawn_offset, else color_offset. drawn_offset is the
- * CPU backend's bookkeeping, so here it is color_offset: by FLIP_STALL the
- * XDK has already pointed that at the next back buffer. And the last surface
- * drawn into is not the answer either -- a title renders glow, shadow and
- * reflection targets too, sometimes last.
- *
- * What is used instead: the swap-chain buffers are the surfaces the walker
- * names at flips (both of them, after two), plus anything as large as the
- * largest surface (for the first flip, before the second buffer has been
- * named). Of those, the one drawn into most recently since the last flip;
- * if none was, the one cleared most recently; if none was either, the
- * frame on screen stays.
- *
- * Size first, though. "Named at a flip" is sticky, and a title that once
- * flipped with a downsample target bound (BLiNX 2: 0x00811000, 320x240)
- * left it a candidate for good; drawn after the back buffer, it was then
- * presented on 34 flips while the walker named 0x00104000/0x00230000. So
- * the candidates the size of the surface named at this flip go first (it
- * is the next back buffer, the same size as the one just finished) and
- * only those: if none of them was drawn or cleared, the frame on screen
- * stays. With no render target at the named surface yet (the first flips),
- * the largest candidates go first, then the rest. */
+/* The surface a flip puts on screen: the walker's pick (present_pick in
+ * nv2a_pb_exec.c, the same for every backend), as the render target of that
+ * offset and size. The walker hands its offset over as `surface_offset`.
+ * With no render target for it here yet, the frame on screen stays. */
 static RenderTarget *present_target(uint32_t surface_offset)
 {
-    RenderTarget *best = NULL, *named = NULL;
-    UINT max_area = 0, cand_area = 0;
-    int i, pass, tier;
+    const struct nv2a_pb_present *p = nv2a_pb_present_state();
+    int i;
 
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
-        if (!rt->tex)
-            continue;
-        if (surface_offset && rt->offset == surface_offset)
-            rt->flipped = 1, named = rt;
-        if (rt->w * rt->h > max_area)
-            max_area = rt->w * rt->h;
+        if (rt->tex && surface_offset && rt->offset == surface_offset
+                && (!p->offset || (rt->w == p->w && rt->h == p->h)))
+            return rt;
     }
-    for (i = 0; i < RT_MAX; i++) {
-        RenderTarget *rt = &s_rt[i];
-        if (rt->tex && (rt->flipped || rt->w * rt->h == max_area)
-                && rt->w * rt->h > cand_area)
-            cand_area = rt->w * rt->h;
-    }
-    for (tier = named ? 0 : 1; tier < (named ? 1 : 3) && !best; tier++)
-    for (pass = 0; pass < 2 && !best; pass++) {
-        uint64_t top = s_flip_seq;
-        for (i = 0; i < RT_MAX; i++) {
-            RenderTarget *rt = &s_rt[i];
-            uint64_t when;
-            if (!rt->tex || !(rt->flipped || rt->w * rt->h == max_area))
-                continue;
-            if (tier == 0 && (rt->w != named->w || rt->h != named->h))
-                continue;
-            if (tier == 1 && rt->w * rt->h != cand_area)
-                continue;
-            when = pass == 0 ? rt->last_draw : rt->last_clear;
-            if (when > top) {
-                top = when;
-                best = rt;
-            }
-        }
-    }
-    s_flip_seq = s_seq;
-    return best ? best : s_drawn;
+    return s_drawn;
 }
 
 /* RECOMP_FLIP_LOG: a line per flip, just before the walker's "[GPU] flip"

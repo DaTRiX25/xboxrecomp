@@ -561,77 +561,124 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
     return 1;
 }
 
-/* The geometry each colour surface was last drawn with, by DMA offset, so a
- * debug dump of a named surface uses its own pitch and format rather than
- * whatever the current target has. */
-#define SURF_GEOM_MAX 16
-static struct { uint32_t offset, pitch, w, h, format; } s_surf_geom[SURF_GEOM_MAX];
+/* ── Present surface ─────────────────────────────────────────────────────
+ *
+ * Which colour surface a flip puts on screen, decided here for every backend
+ * (nv2a_pb_present_state() in nv2a_pb_state.h).
+ *
+ * Not color_offset: by FLIP_STALL the XDK has already pointed that at the
+ * next back buffer. Not the last surface drawn into either: a title renders
+ * glow, shadow and downsample targets too, sometimes last -- BLiNX 2's demo
+ * ends each frame in a 320x240 target at 0x00811000, and presenting that put
+ * an inset on screen (D3D11) or dumped the wrong buffer (CPU).
+ *
+ * The rule is size first. A surface is the colour offset plus the size the
+ * clip gives it, as the draws and clears that used it saw it. The size wanted
+ * is the display's: that of the surface at the address AvSetDisplayMode
+ * scans out (the largest, if the title used it at more than one size), or,
+ * with no display mode yet, of the largest surface seen. Of the surfaces that
+ * size, the one drawn into most recently since the last flip wins; if none
+ * was, the one cleared most recently; if none was either, the frame on
+ * screen stays. Nothing carries over from one flip to the next, so a stray
+ * flip with an odd target bound decides that flip and no other. */
+#define PRESENT_MAX 16
+static struct {
+    uint32_t offset, w, h, pitch, format;
+    uint64_t last_use, last_draw, last_clear;
+} s_psurf[PRESENT_MAX];
+static uint64_t s_psurf_seq, s_psurf_flip_seq;
+static struct nv2a_pb_present s_present;
 
-static void surf_geom_note(void)
+/* A draw (clear = 0) or colour clear (clear = 1) into the current surface. */
+static void present_note(int clear)
 {
-    int i;
-    for (i = 0; i < SURF_GEOM_MAX; i++)
-        if (!s_surf_geom[i].offset || s_surf_geom[i].offset == s_gpu.color_offset)
-            break;
-    if (i == SURF_GEOM_MAX)
+    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h;
+    int i, e = -1, lru = 0;
+
+    if (!s_gpu.color_offset || !w || !h)
         return;
-    s_surf_geom[i].offset = s_gpu.color_offset;
-    s_surf_geom[i].pitch  = s_gpu.pitch;
-    s_surf_geom[i].w      = s_gpu.clip_x + s_gpu.clip_w;
-    s_surf_geom[i].h      = s_gpu.clip_y + s_gpu.clip_h;
-    s_surf_geom[i].format = s_gpu.format;
+    for (i = 0; i < PRESENT_MAX; i++) {
+        if (s_psurf[i].offset == s_gpu.color_offset
+                && s_psurf[i].w == w && s_psurf[i].h == h) {
+            e = i;
+            break;
+        }
+        if (s_psurf[i].last_use < s_psurf[lru].last_use)
+            lru = i;
+    }
+    if (e < 0) {
+        e = lru;
+        memset(&s_psurf[e], 0, sizeof s_psurf[e]);
+        s_psurf[e].offset = s_gpu.color_offset;
+        s_psurf[e].w = w;
+        s_psurf[e].h = h;
+    }
+    s_psurf[e].pitch = s_gpu.pitch;
+    s_psurf[e].format = s_gpu.format;
+    s_psurf[e].last_use = ++s_psurf_seq;
+    if (clear)
+        s_psurf[e].last_clear = s_psurf_seq;
+    else
+        s_psurf[e].last_draw = s_psurf_seq;
 }
 
-/* RECOMP_FB_DUMP_SURFACE=0x00104000[,0x00230000...]: debug only. At each
- * flip that RECOMP_FB_DUMP_FLIPS selects, dump each listed surface as it was
- * last drawn (its own pitch, size and format), as <prefix>s<offset>_<flip>.bmp.
- * The presented surface is whatever the title drew last, which in BLiNX 2's
- * demo is a 320x240 offscreen target; this shows the real back buffers. */
-static void dump_named_surfaces(void)
+/* At FLIP_STALL: pick what it presents, into s_present. */
+static void present_pick(void)
 {
-    static int parsed;
-    static uint32_t want[8];
-    static int nwant;
-    static unsigned files;
-    const char *prefix = getenv("RECOMP_FB_DUMP");
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    int k, i;
+    uint32_t disp_pitch = 0, disp = xbox_GetDisplayFramebuffer(&disp_pitch);
+    uint32_t tw = 0, th = 0;
+    uint64_t area = 0;
+    int i, pass, best = -1;
 
-    if (!parsed) {
-        const char *e = getenv("RECOMP_FB_DUMP_SURFACE");
-        parsed = 1;
-        while (e && *e && nwant < 8) {
-            char *end;
-            uint32_t v = (uint32_t)strtoul(e, &end, 0);
-            if (end == e)
-                break;
-            want[nwant++] = v;
-            e = (*end == ',') ? end + 1 : end;
+    for (pass = 0; pass < 2 && !area; pass++)
+        for (i = 0; i < PRESENT_MAX; i++) {
+            uint64_t a = (uint64_t)s_psurf[i].w * s_psurf[i].h;
+            if (!s_psurf[i].offset || a <= area)
+                continue;
+            if (pass == 0 && (!disp || dma_resolve(s_psurf[i].offset) != disp))
+                continue;
+            area = a;
+            tw = s_psurf[i].w;
+            th = s_psurf[i].h;
+        }
+    for (pass = 0; pass < 2 && best < 0; pass++) {
+        uint64_t top = s_psurf_flip_seq;
+        for (i = 0; i < PRESENT_MAX; i++) {
+            uint64_t when = pass == 0 ? s_psurf[i].last_draw : s_psurf[i].last_clear;
+            if (s_psurf[i].offset && s_psurf[i].w == tw && s_psurf[i].h == th
+                    && when > top) {
+                top = when;
+                best = i;
+            }
         }
     }
-    if (!prefix || !nwant || files >= 600)
+    if (best >= 0) {
+        s_present.offset = s_psurf[best].offset;
+        s_present.w      = s_psurf[best].w;
+        s_present.h      = s_psurf[best].h;
+        s_present.pitch  = s_psurf[best].pitch;
+        s_present.format = s_psurf[best].format;
+    }
+    s_psurf_flip_seq = s_psurf_seq;
+}
+
+/* RECOMP_FB_DUMP at a flip: the surface that flip presents, at its own size
+ * and pitch, as <prefix>NNN.bmp in the same sequence as dump_surface_bmp. */
+static int s_bmp_seq;
+static void dump_present_bmp(void)
+{
+    const char *prefix = getenv("RECOMP_FB_DUMP");
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = s_present.w ? s_present.pitch / s_present.w : 0;
+    char path[512];
+
+    if (!prefix || !s_present.offset || (bpp != 2 && bpp != 4))
         return;
-    for (k = 0; k < nwant; k++)
-        for (i = 0; i < SURF_GEOM_MAX; i++) {
-            uint32_t bpp, swz = 0, w, h, cf;
-            char path[512];
-            if (s_surf_geom[i].offset != want[k])
-                continue;
-            cf = s_surf_geom[i].format & 0xF;
-            bpp = (cf == 0x3 || cf == 0x1 || cf == 0x2) ? 2 : 4;   /* R5G6B5/X1R5G5B5 */
-            w = s_surf_geom[i].w; h = s_surf_geom[i].h;
-            if (((s_surf_geom[i].format >> 8) & 0xF) == 2) {
-                swz = ((s_surf_geom[i].format >> 16) & 0x1F)
-                    | (((s_surf_geom[i].format >> 24) & 0x1F) << 8);
-                w = 1u << (swz & 0xFF); h = 1u << (swz >> 8);
-            } else if (s_surf_geom[i].pitch / bpp < w) {
-                w = s_surf_geom[i].pitch / bpp;
-            }
-            snprintf(path, sizeof path, "%ss%08X_%05u.bmp", prefix, want[k], s_gpu.flips);
-            if (write_bmp_at(path, mem + dma_resolve(want[k]), s_surf_geom[i].pitch,
-                             w, h, bpp, swz))
-                files++;
-        }
+    snprintf(path, sizeof path, "%s%03d.bmp", prefix, s_bmp_seq++);
+    if (write_bmp_at(path, mem + dma_resolve(s_present.offset), s_present.pitch,
+                     s_present.w, s_present.h, bpp, 0) && s_bmp_seq == 1)
+        fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
+                path, s_present.w, s_present.h, s_present.offset, bpp);
 }
 
 /* Write the current surface out as a 24-bit BMP.
@@ -648,7 +695,6 @@ static void dump_surface_bmp(void)
     const char *prefix = getenv("RECOMP_FB_DUMP");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
-    static int seq;
     char path[512];
     uint32_t w = s_gpu.clip_w, h = s_gpu.clip_h, y, x;
     uint32_t row_bytes, pad, filesz;
@@ -662,7 +708,7 @@ static void dump_surface_bmp(void)
     pad = (4 - (row_bytes & 3)) & 3;
     filesz = 54 + (row_bytes + pad) * h;
 
-    snprintf(path, sizeof path, "%s%03d.bmp", prefix, seq++);
+    snprintf(path, sizeof path, "%s%03d.bmp", prefix, s_bmp_seq++);
     f = fopen(path, "wb");
     if (!f)
         return;
@@ -705,7 +751,7 @@ static void dump_surface_bmp(void)
         }
     }
     fclose(f);
-    if (seq == 1)
+    if (s_bmp_seq == 1)
         fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
                 path, w, h, s_gpu.color_offset, bpp);
 }
@@ -733,7 +779,6 @@ static void surf_mark_written(void)
 
     if (!lo || hi <= lo)
         return;
-    surf_geom_note();
     s_surf_wr_seq++;
     for (i = 0; i < SURF_WR_MAX; i++) {
         if (s_surf_wr[i].lo == lo) {
@@ -5041,6 +5086,7 @@ const struct nv2a_pb_vsh *nv2a_pb_vsh_state(void) { return &s_vsh; }
 const uint32_t *nv2a_pb_tex_regs(void)            { return s_tex_reg; }
 const uint8_t  *nv2a_pb_tex_regs_set(void)        { return s_tex_set; }
 uint32_t nv2a_pb_dma_resolve(uint32_t offset)     { return dma_resolve(offset); }
+const struct nv2a_pb_present *nv2a_pb_present_state(void) { return &s_present; }
 
 /* What a batch actually contains. Before anything can be rasterised, the
  * question is what space attribute 0 arrives in: a title running a vertex
@@ -5076,6 +5122,8 @@ static void draw_primitive(void)
         }
     }
 
+    if (s_gpu.color_keep != 0xFFFFFFFFu)   /* a depth/stencil-only pass draws no colour */
+        present_note(0);
     if (s_backend->on_draw) {
         uint64_t t0 = rt_now();
         struct nv2a_pb_draw d;
@@ -5474,6 +5522,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          | ((param & (1u <<  0)) ? 0 : 0x000000FFu);
         break;
     case NV097_CLEAR_SURFACE:
+        if (param & 0xF0)
+            present_note(1);
         if (s_backend->on_zclear)
             s_backend->on_zclear(param);
         if (s_backend->on_clear)
@@ -5628,15 +5678,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
-        /* Present the frame just finished. The buffer the title has
-         * finished is the one the last batch drew into, which is what
-         * drawn_offset holds and why it exists: by the flip, color_offset has
-         * already moved to the next buffer. */
+        /* Present the frame just finished: present_pick says which surface
+         * that is, for every backend. Before anything qualifies (no draw or
+         * clear yet), the old answer: the last surface drawn, else the
+         * current one. */
+        present_pick();
         if (s_backend->on_flip) {
             uint64_t t0 = rt_now();
-            s_backend->on_flip(s_gpu.drawn_offset ? s_gpu.drawn_offset
-                                                  : s_gpu.color_offset,
-                               s_gpu.pitch);
+            if (s_present.offset)
+                s_backend->on_flip(s_present.offset, s_present.pitch);
+            else
+                s_backend->on_flip(s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                                      : s_gpu.color_offset,
+                                   s_gpu.pitch);
             s_perf.flip += rt_now() - t0;   /* Present, for the [PB-PERF] line */
         }
         /* RECOMP_FB_DUMP_FLIPS=<n>: with RECOMP_FB_DUMP, the finished frame
@@ -5650,13 +5704,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 const char *e = getenv("RECOMP_FB_DUMP_FLIPS");
                 every = e ? atoi(e) : 0;
             }
-            if (s_gpu.flips % (uint32_t)(every > 0 ? every : 30) == 0)
-                dump_named_surfaces();
             if (every > 0 && s_gpu.flips % (uint32_t)every == 0
                     && s_gpu.tris_drawn != prev_tris && dumped < 200) {
                 dumped++;
                 fprintf(stderr, "  [GPU] flip %u: frame dump\n", s_gpu.flips);
-                dump_surface_bmp();
+                dump_present_bmp();
             }
             if (every > 0 && s_gpu.flips % (uint32_t)every == 0)
                 prev_tris = s_gpu.tris_drawn;
@@ -5672,15 +5724,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             if (on) {
                 uint32_t b = s_gpu.batches_textured + s_gpu.batches_no_uv
                            + s_gpu.batches_no_tex;
-                uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+                uint32_t done = s_present.offset ? s_present.offset
+                              : s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                    : s_gpu.color_offset;
                 fprintf(stderr, "[GPU] flip %u %lu ms fence 0x%08X batches %u"
-                        " tex %u presents 0x%08X raster %.3f ms (xf %.3f setup"
+                        " tex %u presents 0x%08X %ux%u raster %.3f ms (xf %.3f setup"
                         " %.3f texdec %.3f px %.3f) yuv %u wr %llu zrej %llu"
                         " tris %u drop %u clip %llu\n",
                         s_gpu.flips,
                         xbox_log_ms(), s_sema_last_value, b - prev_b,
                         s_gpu.batches_textured - prev_t, done,
+                        s_present.w, s_present.h,
                         s_rt.total / 1e6, s_rt.xform / 1e6, s_rt.setup / 1e6,
                         s_rt.tex / 1e6,
                         (double)(int64_t)(s_rt.total - s_rt.xform - s_rt.setup
@@ -5723,7 +5777,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             static unsigned n;
             unsigned limit = env_cached("RECOMP_PB_EXEC_VERBOSE") ? 8u : 4u;
             if (n++ < limit) {
-                uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+                uint32_t done = s_present.offset ? s_present.offset
+                              : s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                    : s_gpu.color_offset;
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u presents"
                         " 0x%08X (-> 0x%08X)\n", s_gpu.flips, s_gpu.flip_read,
