@@ -1028,6 +1028,28 @@ static int surface_begin_batch(const uint8_t *mem)
     return 1;
 }
 
+static int blend_known(uint32_t f)
+{
+    return f == 0 || f == 1 || (f >= 0x300 && f <= 0x307);
+}
+
+/* A GL blend factor for the channel at bit `sh` of an ARGB word, 0..255. */
+static uint32_t blend_factor(uint32_t f, uint32_t src, uint32_t dst, uint32_t sh)
+{
+    switch (f) {
+    case 0:     return 0;
+    case 1:     return 255;
+    case 0x300: return (src >> sh) & 0xFF;                 /* SRC_COLOR */
+    case 0x301: return 255 - ((src >> sh) & 0xFF);
+    case 0x302: return src >> 24;                          /* SRC_ALPHA */
+    case 0x303: return 255 - (src >> 24);
+    case 0x304: return dst >> 24;                          /* DST_ALPHA */
+    case 0x305: return 255 - (dst >> 24);
+    case 0x306: return (dst >> sh) & 0xFF;                 /* DST_COLOR */
+    default:    return 255 - ((dst >> sh) & 0xFF);         /* 0x307 */
+    }
+}
+
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *row;
@@ -1042,11 +1064,9 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         s_gpu.pixel_max = argb;
     row = s_surface + (size_t)y * s_gpu.pitch;
 
-    /* src*srcAlpha + dst*(1-srcAlpha), and only that pair.
-     *
-     * Any other factor combination falls through to an opaque write rather
-     * than being approximated: a wrong blend is harder to recognise on
-     * screen than no blend, and this is the only pair this title sets.
+    /* src*srcAlpha + dst*(1-srcAlpha) first, on its own path, because it was
+     * the only pair here for a long time and the intro was checked against
+     * exactly this arithmetic. The other GL factor pairs follow it.
      *
      * Fully opaque is left alone deliberately. It is the same arithmetic,
      * but skipping it keeps the full-screen quads -- which are drawn with
@@ -1076,6 +1096,30 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
                         + ((dst      ) & 0xFF) * (255u - sa) + 127u) / 255u;
             argb = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
+    } else if (s_gpu.blend_enable
+               && !(s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
+                    && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA)
+               && blend_known(s_gpu.blend_sfactor)
+               && blend_known(s_gpu.blend_dfactor)) {
+        /* Every other GL factor pair, with the ADD equation. Additive glows
+         * (SRC_ALPHA, ONE) are what the title's loading screen uses, and an
+         * opaque write turns each one into a black square. */
+        uint32_t dst = 0, out = 0, sh;
+        if (bpp == 4) {
+            dst = ((const uint32_t *)row)[x];
+        } else if (bpp == 2) {
+            uint32_t t = ((const uint16_t *)row)[x];
+            dst = 0xFF000000u | (((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
+                 | ((t & 0x001Fu) << 3));
+        }
+        for (sh = 0; sh <= 24; sh += 8) {
+            uint32_t sc = (argb >> sh) & 0xFF, dc = (dst >> sh) & 0xFF;
+            uint32_t v = (sc * blend_factor(s_gpu.blend_sfactor, argb, dst, sh)
+                        + dc * blend_factor(s_gpu.blend_dfactor, argb, dst, sh)
+                        + 127u) / 255u;
+            out |= (v > 255u ? 255u : v) << sh;
+        }
+        argb = out;
     }
 
     if (bpp == 4) {
@@ -2241,6 +2285,23 @@ static void raster_batch_vsh(void)
                 s_vsh.depth_func, s_vsh.depth_mask, s_vsh.poly_offset,
                 s_vsh.poly_factor, s_vsh.poly_bias, xv[0].z, xv[0].w,
                 s_gpu.tex.offset, s_gpu.tex.color);
+    if (plen > 12 && getenv("RECOMP_VSH_TRACE")) {
+        static int shown3d;
+        if (shown3d++ < 6) {
+            float v[NV2A_VSH_INPUTS][4];
+            fprintf(stderr, "  [VSH] 3D batch: prim %u n %u start %u c58 %g %g %g %g"
+                            " c59 %g %g %g %g\n", s_gpu.prim, n, s_vsh.start,
+                    s_vsh.c[58][0], s_vsh.c[58][1], s_vsh.c[58][2], s_vsh.c[58][3],
+                    s_vsh.c[59][0], s_vsh.c[59][1], s_vsh.c[59][2], s_vsh.c[59][3]);
+            for (i = 0; i < n && i < 6; i++) {
+                vsh_inputs(s_gpu.idx[i], v);
+                fprintf(stderr, "  [VSH]   v%u idx %u in v0 %g %g %g %g ->"
+                                " (%g, %g, %g, w %g) ok %d\n", i, s_gpu.idx[i],
+                        v[0][0], v[0][1], v[0][2], v[0][3],
+                        xv[i].x, xv[i].y, xv[i].z, xv[i].w, xv[i].ok);
+            }
+        }
+    }
     if (n)
         memcpy(s_vsh_last_d0, xv[0].d0, sizeof s_vsh_last_d0), s_vsh_last_v0 = xv[0];
 
