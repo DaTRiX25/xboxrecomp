@@ -770,20 +770,82 @@ static void present_pick(void)
 /* RECOMP_FB_DUMP at a flip: the surface that flip presents, at its own size
  * and pitch, as <prefix>NNN.bmp in the same sequence as dump_surface_bmp. */
 static int s_bmp_seq;
+static int write_present_bmp(const char *path)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = s_present.w ? s_present.pitch / s_present.w : 0;
+
+    if (!s_present.offset || (bpp != 2 && bpp != 4))
+        return 0;
+    return write_bmp_at(path, mem + dma_resolve(s_present.offset), s_present.pitch,
+                        s_present.w, s_present.h, bpp, 0);
+}
+
 static void dump_present_bmp(void)
 {
     const char *prefix = getenv("RECOMP_FB_DUMP");
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = s_present.w ? s_present.pitch / s_present.w : 0;
     char path[512];
 
-    if (!prefix || !s_present.offset || (bpp != 2 && bpp != 4))
+    if (!prefix || !s_present.offset)
         return;
     snprintf(path, sizeof path, "%s%03d.bmp", prefix, s_bmp_seq++);
-    if (write_bmp_at(path, mem + dma_resolve(s_present.offset), s_present.pitch,
-                     s_present.w, s_present.h, bpp, 0) && s_bmp_seq == 1)
-        fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
-                path, s_present.w, s_present.h, s_present.offset, bpp);
+    if (write_present_bmp(path) && s_bmp_seq == 1)
+        fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X)\n",
+                path, s_present.w, s_present.h, s_present.offset);
+}
+
+/* RECOMP_FB_DUMP_AT=<flips>: with RECOMP_FB_DUMP, the frame each listed flip
+ * presents, as <prefix>flip_NNNNN.bmp named by the flip number (the number
+ * RECOMP_FLIP_LOG prints), whatever else dumps in between. <flips> is a comma
+ * list of numbers and ranges (a-b), up to 64 items. Flip N is the frame
+ * RECOMP_D3D11_DUMP writes as present N, so scripts/golden.py asks for
+ * golden dump k as flip 60k+1, or for a window around an event. Needs a
+ * backend that writes back (Metal) or the CPU path. */
+static void dump_at_flip(uint32_t flip)
+{
+    static int parsed;
+    static int n;
+    static uint32_t lo[64], hi[64];
+    const char *prefix = getenv("RECOMP_FB_DUMP");
+    char path[512];
+    int i;
+
+    if (!parsed) {
+        const char *e = getenv("RECOMP_FB_DUMP_AT");
+        parsed = 1;
+        while (e && *e && n < 64) {
+            char *end;
+            unsigned long a = strtoul(e, &end, 10), b = a;
+            if (end == e)
+                break;
+            if (*end == '-') {
+                e = end + 1;
+                b = strtoul(e, &end, 10);
+                if (end == e)
+                    break;
+            }
+            if (b >= a) {
+                lo[n] = (uint32_t)a;
+                hi[n] = (uint32_t)b;
+                n++;
+            }
+            e = *end == ',' ? end + 1 : end;
+            if (*end != ',')
+                break;
+        }
+        if (n)
+            fprintf(stderr, "  [GPU] RECOMP_FB_DUMP_AT: %d flip ranges\n", n);
+    }
+    if (!n || !prefix)
+        return;
+    for (i = 0; i < n; i++)
+        if (flip >= lo[i] && flip <= hi[i])
+            break;
+    if (i == n)
+        return;
+    snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix, flip);
+    if (!write_present_bmp(path))
+        fprintf(stderr, "  [GPU] flip %u: RECOMP_FB_DUMP_AT dump failed\n", flip);
 }
 
 /* Write the current surface out as a 24-bit BMP.
@@ -5530,6 +5592,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                    s_gpu.pitch);
             s_perf.flip += rt_now() - t0;   /* Present, for the [PB-PERF] line */
         }
+        dump_at_flip(s_gpu.flips);
         /* RECOMP_FB_DUMP_FLIPS=<n>: with RECOMP_FB_DUMP, the finished frame
          * at every nth flip that drew something (up to 200), so a run leaves
          * whole frames behind rather than only the mid-frame 3D dumps. */
