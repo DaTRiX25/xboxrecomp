@@ -1231,7 +1231,13 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                /* One trap at a time: once the front end is trapped, a second
+                 * idle voice in the same frame would overwrite FEDECPARAM
+                 * before the ISR has read the first. The rest trap on later
+                 * frames, after the ISR has resumed the front end. */
+                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                        != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                    fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
