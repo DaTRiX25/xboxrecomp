@@ -958,7 +958,7 @@ static ID3D11InputLayout *input_layout(VsEntry *e, const uint8_t fmt[16])
 /* The state for the pgraph cull setting: CULL_FACE 0x404 FRONT, 0x405 BACK,
  * 0x408 FRONT_AND_BACK; FRONT_FACE 0x900 CW, 0x901 CCW. *all is set when the
  * draw culls every triangle (FRONT_AND_BACK), which D3D11 cannot express.
- * BLiNX 2's character shadows need it: each body part's shadow volume is
+ * Character shadow volumes need it: each body part's shadow volume is
  * drawn twice into destination alpha, back faces (CULL_FRONT) added and
  * front faces (CULL_BACK) reverse-subtracted, which leaves alpha only where
  * the floor lies inside a volume. With no culling both passes cover the

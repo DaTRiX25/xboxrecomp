@@ -72,7 +72,7 @@ static int s_scan_enabled = -1;   /* RECOMP_PB_SCAN, read once */
 
 /* s_seen's slot for each (subchannel, method), plus one (0: not seen yet).
  * The walker calls note() for every method in the stream, ~100,000 a frame in
- * BLiNX 2's attract demo, and a linear search of a few hundred pairs there was
+ * a busy scene, and a linear search of a few hundred pairs there was
  * half the walker's time. s_seen keeps first-seen order for the report. */
 static uint16_t s_seen_slot[8][0x2000 / 4];
 

@@ -22,8 +22,14 @@
 #ifndef XBOX_WINNT_H
 #define XBOX_WINNT_H
 
-/* Thread-local storage qualifier (portable). */
-#if defined(_WIN32)
+/* Thread-local storage qualifier (portable).
+ *
+ * __declspec(thread) only for MSVC. MinGW spells __declspec(x) as
+ * __attribute__((x)), and clang/GCC ignore an unknown 'thread' attribute
+ * with a warning, so under the MinGW cross-build every XBOX_THREAD_LOCAL
+ * was one process-wide variable: the IRQL one thread set in an ISR was the
+ * IRQL every guest thread read. */
+#if defined(_MSC_VER)
 #define XBOX_THREAD_LOCAL __declspec(thread)
 #else
 #define XBOX_THREAD_LOCAL __thread

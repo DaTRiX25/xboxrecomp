@@ -896,14 +896,12 @@ class FunctionDetector:
           looks intra-function to them. It still leaves the alias's own
           lifted body.
 
-        BLiNX 2's display-list interpreter sub_00044900 has both. A lone int3
-        (a switch default) at 0x00044CFA splits it at a CC boundary. The two
-        halves and their aliases then branch into each other's interiors at
-        0x000449B7, 0x00044C20, 0x00044C80, 0x00044CD0, 0x00044DDA and
-        0x00044E72, and all six were stubs. The common path left 0x88 bytes
-        of its frame on the guest stack and returned esi = 0, so the scene
-        walk that called it re-walked the tree from a stale edi until the
-        native stack overflowed.
+        A function split at a lone int3 (a switch default that lands on a CC
+        boundary) can have both: the two halves and their aliases branch into
+        each other's interiors, and every such target was a stub. In one title
+        the common path left its frame on the guest stack and returned a
+        zeroed register, so its caller re-walked a tree from a stale pointer
+        until the native stack overflowed.
 
         Each target found here becomes an alias that runs to the end of the
         function it lands in, as the tail-jump pass does. New aliases can

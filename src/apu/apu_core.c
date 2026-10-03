@@ -25,6 +25,7 @@
 #include "apu_xaudio2.h"
 #include "apu_wav.h"
 #include "fpconv.h"
+#include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 
 /* ============================================================
  * Globals
@@ -60,6 +61,45 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
+/* Physical addresses, resolved the way every other bus master here does it
+ * (dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c).
+ *
+ * DirectSound builds its voice, SGE and notifier structures in
+ * MmAllocateContiguousMemory and hands the APU their physical addresses.
+ * Physical P and the contiguous window's 0x80000000 + P are the same bytes on
+ * hardware; here the window is separate storage. Reading every address as low
+ * RAM meant the voice processor walked zeroes and wrote each "voice done"
+ * notification into ordinary RAM, where DirectSound never looked -- so a
+ * buffer never reported that it had stopped, and Burnout 3's frontend waits
+ * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
+extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
+extern uint32_t xbox_ContiguousAllocatedBytes(void);
+
+uint8_t *mcpx_apu_phys(uint64_t addr)
+{
+    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    /* A page the contiguous allocator handed out is the window, even where
+     * it overlaps the image's physical range: BLiNX 2's image runs to
+     * 0x0303AC20 (its BSS), and DirectSound's voice array sits at physical
+     * 0x009E8000, inside it. Resolved to RAM, the VP never saw the driver
+     * take an idle voice off its list and re-trapped it every frame. */
+    if (a < (64u << 20)) {             /* the window's 64 MB */
+        const volatile uint8_t *map = xbox_ContiguousPageMap();
+        if (map[a >> 12])
+            return g_apu_ram_ptr + 0x80000000u + a;
+    }
+    if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return g_apu_ram_ptr + a;
+    if (a < xbox_ContiguousAllocatedBytes())
+        return g_apu_ram_ptr + 0x80000000u + a;
+    return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+}
+
+/* The interrupt line, as the frame thread sees it. update_irq used to call
+ * pci_irq_assert, which is an empty stub here, so DirectSound's service
+ * routine never ran and no voice completion ever reached it. */
+static volatile LONG s_irq_line;
+
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -69,12 +109,122 @@ static void update_irq(MCPXAPUState *d)
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
-        /* In standalone mode we don't raise a PCI IRQ; the game's kernel
-         * stub will poll ISTS directly or we'll signal via a flag. */
-        pci_irq_assert(PCI_DEVICE(d));
+        InterlockedExchange(&s_irq_line, 1);
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
-        pci_irq_deassert(PCI_DEVICE(d));
+        InterlockedExchange(&s_irq_line, 0);
+    }
+}
+
+/* ---- delivering it ---------------------------------------------------- */
+
+/* HalGetInterruptVector(5) -- the APU's IRQ -- is what DirectSound connects
+ * its service routine to (0x002F8E81 in Burnout 3). */
+#define APU_VECTOR 5
+
+typedef void (*apu_guest_fn)(void);
+extern apu_guest_fn recomp_lookup(uint32_t xbox_va);
+extern int  xbox_worker_stack_alloc(void);
+extern void xbox_worker_stack_free(int slot);
+extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+extern uint32_t xbox_AllocThreadTib(void);
+extern int xbox_IrqlBlocksInterrupts(void);
+extern int xbox_IrqlEnterInterrupt(int level);
+extern void xbox_IrqlLeaveInterrupt(int saved);
+#if defined(_MSC_VER)
+#  define APU_TLS __declspec(thread)
+#else
+#  define APU_TLS __thread
+#endif
+extern APU_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
+extern APU_TLS uint32_t g_fs_base;
+
+/* Call the connected service routine while the line is up, from the frame
+ * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
+ * a worker stack for the call, a TIB of this thread's own, and a hold-off
+ * while a guest thread sits at raised IRQL, which is when the single-CPU
+ * console could not have taken the interrupt. The routine acknowledges by
+ * writing ISTS, which drops the line through update_irq. */
+ApuIrqStats apu_irq_stats;
+
+/* Every 5 s under RECOMP_APU_TRACE: traps, deliveries, frames held off by a
+ * raised IRQL, and deliveries forced after the full hold-off. Traps well
+ * above deliveries, or many forced ones, are what costs playback. */
+static void apu_irq_stats_line(void)
+{
+    static int trace = -1;
+    static uint64_t next_ns;
+    uint64_t now;
+
+    if (trace < 0)
+        trace = recomp_env(RENV_APU_TRACE) != NULL;
+    if (!trace)
+        return;
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (now < next_ns)
+        return;
+    if (next_ns)
+        fprintf(stderr, "[APU-IRQ] traps %u delivered %u held-frames %u forced %u\n",
+                apu_irq_stats.traps, apu_irq_stats.delivered,
+                apu_irq_stats.held_frames, apu_irq_stats.forced);
+    next_ns = now + 5000000000ull;
+}
+
+static void apu_deliver_irq(MCPXAPUState *d)
+{
+    static int tib_ready;
+    static unsigned held_off;
+    uint32_t kint, routine, context;
+    apu_guest_fn fn;
+    int slot;
+
+    apu_irq_stats_line();
+    if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
+        return;
+    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
+        apu_irq_stats.held_frames++;
+        return;
+    }
+    if (held_off > 50)
+        apu_irq_stats.forced++;
+    held_off = 0;
+    kint = xbox_GetConnectedInterrupt(APU_VECTOR);
+    if (!kint)
+        return;
+    routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
+    context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
+    fn = routine ? recomp_lookup(routine) : NULL;
+    if (!fn)
+        return;
+    if (!tib_ready) {
+        uint32_t tib = xbox_AllocThreadTib();
+        if (!tib)
+            return;
+        g_fs_base = tib;
+        tib_ready = 1;
+    }
+    slot = xbox_worker_stack_alloc();
+    if (slot < 0)
+        return;
+
+    qemu_mutex_unlock(&d->lock);
+    g_esp = XBOX_WORKER_STACK_TOP(slot);
+    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    apu_irq_stats.delivered++;
+    xbox_worker_stack_free(slot);
+    qemu_mutex_lock(&d->lock);
+
+    {
+        static unsigned n;
+        if (n++ < 3) {
+            fprintf(stderr, "[APU] interrupt delivered to 0x%08X -> %s\n",
+                    routine, (g_eax & 1) ? "claimed" : "declined");
+            fflush(stderr);
+        }
     }
 }
 
@@ -535,6 +685,13 @@ static void *mcpx_apu_frame_thread(void *arg)
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
 
+        /* The doorbell ack stands in for the GP DSP, which on hardware runs
+         * whatever the front end is doing. Tying it to se_frame stopped it
+         * whenever FECTL was trapped or halted, and DirectSound then waits
+         * forever to post its next command: Burnout 3 stalls in
+         * sub_002F805E polling the same doorbell it was acked on at init. */
+        mcpx_apu_dsp_ack_poll(d);
+
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -550,6 +707,30 @@ static void *mcpx_apu_frame_thread(void *arg)
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
+
+        /* What xemu's frame thread does after each frame: turn a pending
+         * notification (set by the voice processor or a trapped method) into
+         * the interrupt line. Nothing here ever did, so the line never rose
+         * even before there was anything to deliver it to. */
+        if (d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+        }
+        apu_deliver_irq(d);
+
+        /* Let the guest in once per frame.
+         *
+         * The thread holds d->lock for its whole loop and only drops it inside
+         * throttle()'s wait. Once voices really play, processing can run
+         * behind real time, throttle never waits, and the lock is never
+         * released -- while every VOICE_ON/OFF/RELEASE the title writes needs
+         * it (voice_lock). A critical section is not fair, so the title's
+         * thread starved there indefinitely: Burnout 3 froze on its vehicle
+         * select, blocked in voice_lock at raised IRQL, which in turn held
+         * off every USB interrupt. */
+        qemu_mutex_unlock(&d->lock);
+        SwitchToThread();
+        qemu_mutex_lock(&d->lock);
     }
 
     qemu_mutex_unlock(&d->lock);

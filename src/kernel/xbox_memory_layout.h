@@ -208,6 +208,9 @@ int xbox_ContiguousFree(uint32_t va);
 uint32_t xbox_ContiguousBlockSize(uint32_t va);
 /* High-water mark (never decreases) and current usage, in bytes. */
 uint32_t xbox_ContiguousAllocatedBytes(void);
+/* One byte per 4 KB page of the window, nonzero while the page is allocated
+ * (or claimed). Read without the arena lock; a device model's view. */
+const volatile uint8_t *xbox_ContiguousPageMap(void);
 uint32_t xbox_ContiguousInUseBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
@@ -351,7 +354,7 @@ typedef union RecompXmm {
  *
  * These used to be fixed -- scratch at 0x00700000, stack at 0x00780000, heap
  * at 0x00F80000 -- which is right only while the title's image ends below
- * 0x00700000. BLiNX 2's 73 sections run to 0x0303AC20, so the stack, the
+ * 0x00700000. A large title's image can run to tens of MB, so the stack, the
  * kernel data exports and the heap all sat inside its .data/BSS and the first
  * zeroed heap allocation wiped the title's globals.
  *

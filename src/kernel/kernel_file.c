@@ -121,9 +121,9 @@ static DWORD xbox_share_to_win32(ULONG Share)
  * An overwrite open (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF) of an
  * existing file sets its size to 0 on FATX, but FATX keeps no valid-data
  * length, so a later SetEndOfFile that grows the file brings back the bytes
- * already on disk. BLiNX 2's z: texture cache depends on it: it writes x.tmp,
+ * already on disk. A utility-drive texture cache can depend on it: it writes x.tmp,
  * reopens it with CREATE_ALWAYS, only sets the end of file to the true size,
- * and renames it to x.ipk. CREATE_ALWAYS / TRUNCATE_EXISTING on NTFS (and
+ * and renames it to x.dat. CREATE_ALWAYS / TRUNCATE_EXISTING on NTFS (and
  * Wine's ftruncate) zero-fill on the regrow, so every cache file came out as
  * zeros of the right length.
  *
@@ -921,13 +921,13 @@ static int posix_open_flags(ACCESS_MASK access, ULONG disposition)
  * An overwrite open (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF) of an
  * existing file sets its size to 0 on FATX, but FATX keeps no valid-data
  * length: growing the file again with SetEndOfFile, without writing, brings
- * back the bytes already on disk. BLiNX 2 relies on this when it builds the
- * utility-drive texture cache (sub_001B8140 / sub_001B8240):
+ * back the bytes already on disk. A title can rely on this to build a
+ * utility-drive texture cache:
  *
  *   CreateFile(x.tmp, CREATE_ALWAYS, NO_BUFFERING|OVERLAPPED)
  *   SetEndOfFile(size rounded up to 512); WriteFile(all of it); CloseHandle
  *   CreateFile(x.tmp, CREATE_ALWAYS)      <- the second overwrite
- *   SetEndOfFile(true size); CloseHandle; rename x.tmp -> x.ipk
+ *   SetEndOfFile(true size); CloseHandle; rename x.tmp -> x.dat
  *
  * The second open only trims the sector padding. With O_TRUNC the host
  * filesystem zero-fills on the regrow, so every cache file came out as zeros
@@ -1258,9 +1258,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileAllocationInformation: {
             /* Reserve space before writing. The Win32 backend has handled this
              * since Halo's save path needed it; POSIX fell through to
-             * STATUS_NOT_IMPLEMENTED. BLiNX 2 calls it on
-             * z:\lng_us\title_tex_us.tmp as it copies the title-screen
-             * textures into the utility-drive cache after the intro. (That
+             * STATUS_NOT_IMPLEMENTED. Titles call it on
+             * a z:\ .tmp file as they copy textures into the
+             * utility-drive cache. (That
              * failure was not what stopped it there -- the D3DX JPEG loader's
              * setjmp was, see translator._func_has_offset_frame -- but the
              * call should succeed as it does on Win32.)
@@ -1309,10 +1309,11 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
 
 /* Rename an open file (NtSetInformationFile, FileRenameInformation).
  *
- * BLiNX 2 builds each utility-drive texture cache as z:\...\name.tmp, then
- * renames it to name.ipk, and later opens the .ipk. With this class
- * unimplemented the rename failed, so every .ipk open failed with
- * STATUS_OBJECT_NAME_NOT_FOUND and the game rebuilt the cache instead.
+ * A title may build each utility-drive texture cache as z:\...\name.tmp,
+ * rename it to its final name (a game archive file, name.dat here), and
+ * later open that. With this class unimplemented the rename failed, so
+ * every open of the final name failed with
+ * STATUS_OBJECT_NAME_NOT_FOUND and the title rebuilt the cache instead.
  *
  * The new name is resolved the way NT does:
  *   RootDirectory set    relative to that directory handle

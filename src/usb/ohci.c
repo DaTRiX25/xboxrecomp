@@ -636,15 +636,12 @@ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
     hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
 }
 
-static int ohci_run_control_list(OhciController *hc)
+/* Both runners add to the caller's done queue rather than publishing their
+ * own; see the service loop for why there is exactly one queue per pass. */
+static int ohci_run_control_list(OhciController *hc, uint32_t *done_head)
 {
-    uint32_t done_head = 0;
-    int completed = ohci_walk_eds(hc,
-            hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, &done_head);
-
-    if (completed)
-        ohci_publish_done(hc, done_head);
-    return completed;
+    return ohci_walk_eds(hc, hc->reg[HcControlHeadED / 4] & ED_PTR_MASK,
+                         done_head);
 }
 
 /* The periodic list for the current frame.
@@ -653,10 +650,9 @@ static int ohci_run_control_list(OhciController *hc)
  * services the one the frame number selects. An interrupt endpoint polled
  * every 4 ms appears in several slots, so cycling through them the way the
  * frame counter does is what makes its transfers happen at all. */
-static int ohci_run_periodic_list(OhciController *hc)
+static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
 {
     uint32_t hcca = hc->reg[HcHCCA / 4];
-    uint32_t done_head = 0;
     uint32_t slot, ed;
     int completed;
 
@@ -685,10 +681,65 @@ static int ohci_run_periodic_list(OhciController *hc)
                     "info=%08X\n", hc->index, slot, ed, rd32(ed));
             fflush(stderr);
         }
-        completed += ohci_walk_eds(hc, ed, &done_head);
+        completed += ohci_walk_eds(hc, ed, done_head);
     }
-    if (completed)
-        ohci_publish_done(hc, done_head);
+
+    /* RECOMP_USB_STATS: one line every five seconds -- transfers the
+     * periodic list completed, and the state of each endpoint on it. "The pad
+     * stopped" has several causes that look the same from the title (nothing
+     * queued, a halted endpoint, an interrupt never delivered), and the full
+     * register trace is far too much to leave on for the minutes it takes to
+     * reach one. */
+    {
+        static int stats = -1;
+        static unsigned long last;
+        static unsigned total;
+        unsigned long now;
+        total += (unsigned)completed;
+        if (stats < 0)
+            stats = recomp_env(RENV_USB_STATS) != NULL;
+        now = (unsigned long)GetTickCount();
+        if (stats && now - last >= 5000) {
+            uint32_t seen[8] = {0};
+            int nseen = 0, i;
+            last = now;
+            fprintf(stderr, "  [OHCI%d] stats: %u periodic transfers; "
+                    "ctl=%08X ien=%08X ists=%08X irql-depth=%d",
+                    hc->index, total, hc->reg[HcControl / 4],
+                    hc->reg[HcInterruptEnable / 4],
+                    hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount());
+            {
+                uint32_t c = hc->reg[HcControlHeadED / 4] & ED_PTR_MASK;
+                int n;
+                fprintf(stderr, " cmd=%08X ctlhead=%08X",
+                        hc->reg[HcCommandStatus / 4], c);
+                for (n = 0; c && n < 4; n++, c = rd32(c + 12) & ED_PTR_MASK)
+                    fprintf(stderr, " [cED %08X info=%08X head=%08X tail=%08X]",
+                            c, rd32(c), rd32(c + 8), rd32(c + 4));
+            }
+            for (slot = 0; slot < 32u; slot++) {
+                ed = rd32(hcca + slot * 4u) & ED_PTR_MASK;
+                while (ed && nseen < 8) {
+                    for (i = 0; i < nseen && seen[i] != ed; i++) ;
+                    if (i < nseen)
+                        break;
+                    seen[nseen++] = ed;
+                    if (rd32(ed) & 0x7FFu)          /* skip placeholder EDs */
+                        fprintf(stderr, " | ED %08X info=%08X head=%08X "
+                                "tail=%08X", ed, rd32(ed), rd32(ed + 8),
+                                rd32(ed + 4));
+                    ed = rd32(ed + 12) & ED_PTR_MASK;
+                }
+            }
+            fprintf(stderr, "\n");
+            /* A raised IRQL that never drops holds every interrupt off until
+             * the forced-delivery timeout, which looks like a slow pad. Name
+             * who is holding it. */
+            if (xbox_IrqlRaisedCount() > 0)
+                xbox_IrqlDumpHolders();
+            fflush(stderr);
+        }
+    }
     return completed;
 }
 
@@ -747,7 +798,7 @@ static int ohci_call_isr(OhciController *hc)
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
-    fn();
+    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
 
     xbox_worker_stack_free(slot);
     return (int)(g_eax & 1u);
@@ -881,6 +932,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     for (;;) {
         OhciController *hc = &s_hc[s_device_hc];
         uint32_t control, enable, status;
+        uint32_t pass_done = 0;     /* this pass's done queue, newest first */
 
         Sleep(OHCI_TICK_MS);
         control = hc->reg[HcControl / 4];
@@ -972,7 +1024,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                         hc->index, control, hc->reg[HcHCCA / 4]);
                 fflush(stderr);
             }
-            ohci_run_periodic_list(hc);
+            ohci_run_periodic_list(hc, &pass_done);
         }
 
         /* BulkListEnable, bit 5. Nothing on this device uses bulk, but the
@@ -980,19 +1032,30 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * there is owed the same service. */
         if ((control & 0x20u)
          && guest_ok(hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK, 16)) {
-            uint32_t done_head = 0;
             if (ohci_walk_eds(hc, hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK,
-                              &done_head)) {
-                ohci_publish_done(hc, done_head);
+                              &pass_done))
                 hc->reg[HcCommandStatus / 4] &= ~0x04u;   /* BLF consumed */
-            }
         }
 
         if ((control & 0x10u)
          && guest_ok(hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, 16)) {
-            if (ohci_run_control_list(hc))
+            if (ohci_run_control_list(hc, &pass_done))
                 hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
         }
+
+        /* One done queue per pass, covering all three lists.
+         *
+         * The lists used to publish one after another, so the control list
+         * wrote HccaDoneHead straight over what the periodic list had just
+         * put there. That stayed invisible until a title used both at once:
+         * Burnout 3 sends its pad a rumble report (SET_REPORT, 21 09) on the
+         * control pipe every frame once its menus are up, the input report
+         * completing in the same pass was lost, and the driver -- which
+         * re-arms the interrupt endpoint from that completion -- stopped
+         * polling the pad. A real controller accumulates everything that
+         * retires in a frame and writes the queue back once; so does this. */
+        if (pass_done)
+            ohci_publish_done(hc, pass_done);
 
         /* Level-triggered, which is what OHCI is: while an enabled source is
          * set, the line is asserted. The handler clears the status bit, so

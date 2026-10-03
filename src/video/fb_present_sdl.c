@@ -39,6 +39,9 @@
  *
  * RECOMP_WINDOW_QUIT_AFTER=<seconds>: post SDL_QUIT then, the event the
  * window's close button produces, so a script can test the close path.
+ *
+ * The window title is the title's to choose: call xbox_HostWindowSetTitle()
+ * before xbox_HostWindowMain(). Unset, it reads "Xbox Recomp".
  */
 #if !defined(_WIN32)
 
@@ -234,6 +237,14 @@ static void *guest_thread(void *arg)
     return NULL;
 }
 
+static char s_title[128] = "Xbox Recomp";
+
+void xbox_HostWindowSetTitle(const char *title)
+{
+    if (title && *title)
+        snprintf(s_title, sizeof s_title, "%s", title);
+}
+
 static int start_guest(void)
 {
     pthread_attr_t attr;
@@ -360,7 +371,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     }
     if (scale < 1 || scale > 8)
         scale = 2;
-    win = SDL_CreateWindow("BLiNX 2 (recomp)", SDL_WINDOWPOS_CENTERED,
+    win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED,
                            SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale,
                            SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
