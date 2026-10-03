@@ -45,14 +45,40 @@
 #define A64_CTX_V(uc, n) ((uc)->uc_mcontext->__ns.__v[(n)])
 #elif defined(__linux__)
 #include <ucontext.h>
+#include <asm/sigcontext.h>      /* struct _aarch64_ctx, fpsimd_context */
 #define A64_CTX_PC(uc)   ((uc)->uc_mcontext.pc)
 #define A64_CTX_X(uc, n) ((uc)->uc_mcontext.regs[(n)])
 #define A64_CTX_FP(uc)   ((uc)->uc_mcontext.regs[29])
 #define A64_CTX_LR(uc)   ((uc)->uc_mcontext.regs[30])
 #define A64_CTX_SP(uc)   ((uc)->uc_mcontext.sp)
-/* The FP/SIMD file lives in uc_mcontext.__reserved as an fpsimd_context
- * record; not parsed yet, so FP forms return 0 on Linux. */
-#define A64_CTX_HAS_V 0
+/* The FP/SIMD file is a record in uc_mcontext.__reserved: a chain of
+ * _aarch64_ctx headers (magic, size), the fpsimd_context among them and a
+ * zero magic at the end. rt_sigreturn restores the V registers from it, so
+ * writing there is how a load lands. Streaming-SVE state, which an SVE
+ * record would supersede, does not arise in lifted code: clang's volatile
+ * MEM32() accesses are plain LDR/STR. */
+static inline __uint128_t *mmio_a64_linux_vregs(ucontext_t *uc)
+{
+    unsigned char *p = (unsigned char *)uc->uc_mcontext.__reserved;
+    unsigned char *end = p + sizeof(uc->uc_mcontext.__reserved);
+    while (p + sizeof(struct _aarch64_ctx) <= end) {
+        struct _aarch64_ctx *h = (struct _aarch64_ctx *)p;
+        if (h->magic == 0 || h->size < sizeof(*h))
+            break;
+        if (h->magic == FPSIMD_MAGIC) {
+            if (p + sizeof(struct fpsimd_context) > end) return 0;
+            return ((struct fpsimd_context *)p)->vregs;
+        }
+        p += h->size;
+    }
+    return 0;
+}
+#define A64_CTX_HAS_V 1
+#define A64_CTX_V_OK(uc) (mmio_a64_linux_vregs(uc) != 0)
+#define A64_CTX_V(uc, n) (mmio_a64_linux_vregs(uc)[(n)])
+#endif
+#ifndef A64_CTX_V_OK
+#define A64_CTX_V_OK(uc) 1
 #endif
 
 typedef uint64_t (*mmio_a64_read_fn)(void *dev, uint32_t off, int size);
@@ -77,6 +103,8 @@ static inline int mmio_emulate_a64(ucontext_t *uc, uint32_t off, void *dev,
     int V = (insn >> 26) & 1;
 
     if (!rd || !wr)
+        return 0;
+    if (V && !A64_CTX_V_OK(uc))                  /* no FP/SIMD record to edit */
         return 0;
 
     if (op29_27 == 7) {                          /* load/store register */
