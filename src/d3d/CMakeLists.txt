@@ -53,6 +53,20 @@ else()
     # in via add_subdirectory from tests/, where the link fails with
     # "library 'epoxy' not found". The _LINK_LIBRARIES form is absolute paths.
     target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
+    if(APPLE)
+        # The pushbuffer executor's Metal backend (RECOMP_PB_BACKEND=metal).
+        # Manual retain/release (no -fobjc-arc); shaders are MSL compiled at
+        # runtime, so no metallib build step.
+        target_sources(xbox_d3d8 PRIVATE nv2a_pb_metal.m)
+        target_include_directories(xbox_d3d8 PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        target_link_libraries(xbox_d3d8 PUBLIC
+            "-framework Metal" "-framework QuartzCore" "-framework Foundation")
+        # The executor's backend, driven by a synthetic stream: Metal against
+        # the CPU rasteriser, frame by frame.
+        add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_backend_smoke
+                         ${CMAKE_CURRENT_BINARY_DIR}/nv2a_backend_smoke)
+    endif()
 endif()
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
