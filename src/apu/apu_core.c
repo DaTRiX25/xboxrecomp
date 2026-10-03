@@ -74,6 +74,14 @@ void mcpx_debug_end_frame(void) {}
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
 extern size_t g_xbox_total_ram;
+extern size_t g_xbox_map_size;     /* host mapping; 0 means same as RAM */
+
+/* How far up the host actually mapped guest RAM: the map size when it was
+ * set apart from the RAM size (xbox_SetMapSize), else the RAM size. */
+static inline uint32_t apu_mapped_ram(void)
+{
+    return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
+}
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
@@ -89,7 +97,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * There is no window ambiguity up here, so it is RAM, as far as the host
      * mapped it. */
     if (a >= (64u << 20)) {
-        if (a < g_xbox_total_ram)
+        if (a < apu_mapped_ram())
             return g_apu_ram_ptr + a;
         return g_apu_ram_ptr + (a & 0x03FFFFFFu);
     }
@@ -119,7 +127,7 @@ const char *mcpx_apu_phys_class(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     if (a >= (64u << 20))
-        return a < g_xbox_total_ram ? "ram" : "wrap";
+        return a < apu_mapped_ram() ? "ram" : "wrap";
     if (xbox_ContiguousPageMap()[a >> 12])
         return "win";
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
