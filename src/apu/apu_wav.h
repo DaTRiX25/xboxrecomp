@@ -6,10 +6,10 @@
  * is what was played.
  *
  * The header is valid at every point a run can end: it is rewritten with the
- * current sizes once per second of audio (so a hard kill, including the
- * watchdog's _exit, loses at most the last second), and finalised by
- * apu_wav_close, which mcpx_apu_shutdown, an atexit handler and (on Windows)
- * the console-control handler all call.
+ * current sizes once per second of audio (so a hard kill loses at most the
+ * last second), and finalised by apu_wav_close, which mcpx_apu_shutdown, an
+ * atexit handler and (on Windows) the console-control handler all call. The
+ * watchdog's _exit skips atexit, so it calls apu_wav_close_nowait first.
  */
 #ifndef APU_WAV_H
 #define APU_WAV_H
@@ -30,6 +30,12 @@ void apu_wav_write(const int16_t *samples, int count);
 /* Finalise the header and close. Safe to call more than once and from any
  * thread. */
 void apu_wav_close(void);
+
+/* apu_wav_close for a thread about to _exit (the watchdog): tries the lock
+ * for up to wait_ms and gives up rather than block on a writer that will
+ * never release it. Returns 1 if closed (or nothing was open), 0 if the
+ * lock stayed held -- the last once-a-second header refresh then stands. */
+int  apu_wav_close_nowait(int wait_ms);
 
 int  apu_wav_is_open(void);
 

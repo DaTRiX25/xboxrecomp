@@ -150,6 +150,20 @@ static int apu_trace_on(void)
     return s_trace;
 }
 
+/* Start the RECOMP_APU_TRACE reporter (every 10 s). Called once from
+ * mcpx_apu_init_standalone, not from the fault handler: creating a thread
+ * inside a vectored exception handler takes the loader lock. */
+void apu_hook_trace_start(void)
+{
+    if (!apu_trace_on())
+        return;
+    if (!InterlockedExchange(&s_reporter_started, 1)) {
+        HANDLE h = CreateThread(NULL, 0, apu_trace_reporter, NULL, 0, NULL);
+        if (h)
+            CloseHandle(h);
+    }
+}
+
 bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
@@ -177,12 +191,6 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
             InterlockedIncrement(&s_hist_r[slot]);
         }
     }
-    if (!s_reporter_started && !InterlockedExchange(&s_reporter_started, 1)) {
-        HANDLE h = CreateThread(NULL, 0, apu_trace_reporter, NULL, 0, NULL);
-        if (h)
-            CloseHandle(h);
-    }
-
     /* What the title actually asks the APU for. The DSPs are stubbed here, so
      * a title that waits on one waits forever, and the only way to work out
      * what it is waiting for is to see the register traffic that precedes the
@@ -244,3 +252,7 @@ double apu_hook_fault_bench(unsigned n)
 }
 
 #endif /* _WIN32 */
+
+#if !defined(_WIN32)
+void apu_hook_trace_start(void) {}
+#endif

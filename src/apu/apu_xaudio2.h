@@ -24,9 +24,30 @@ int xa2_get_buffer_size(void);
 /* Number of device buffers the voice may hold. */
 int xa2_get_buffer_count(void);
 
-/* 256-sample granules handed over and not yet played (queued buffers plus
- * the partly filled one). Also counts underruns: see xa2_underruns. */
-int xa2_queued_granules(void);
+/* Samples handed over and not yet played (queued buffers plus the partly
+ * filled one). Also counts underruns: see xa2_underruns. */
+int xa2_queued_samples(void);
+
+/* The queue is about to drain on purpose (the frame thread is pausing):
+ * the dry spell that follows is not an underrun. */
+void xa2_expect_drain(void);
+
+/* Pacing marks in samples for count buffers of buf_samples, fed one period
+ * (period samples) at a time. A period is submitted only while queued <
+ * high, so high is capped where that period could fill a buffer the voice
+ * has no slot for: queued + period must stay below (count + 1) buffers
+ * (count on the voice, one staging). Exact in samples, so buffer sizes that
+ * are not multiples of the period work too. low is half of high. */
+static inline void xa2_pacing_marks(int buf_samples, int count, int period,
+                                    int *low, int *high)
+{
+    int h = buf_samples * count;
+    int cap = buf_samples * (count + 1) - period;
+    if (h > cap) h = cap;
+    if (h < 1) h = 1;
+    *high = h;
+    *low = h / 2;
+}
 
 /* Times the voice ran dry after audio started ([XA2] underrun x%u). */
 unsigned xa2_underruns(void);

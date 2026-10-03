@@ -192,9 +192,11 @@ static struct {
 #define WAVEOUT_NUM_BUFS 4
 #define WAVEOUT_BUF_SAMPLES 2048  /* ~42.7ms at 48kHz, matches 8-frame delivery rate */
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
-/* Granule = one EP period of output: 256 stereo s16 samples, 1024 bytes.
- * monitor.queued_bytes_low/high are the pacing marks in those bytes. */
-#define GRANULE_BYTES (MIXER_FRAME_SAMPLES * 2 * (int)sizeof(int16_t))
+/* monitor.queued_bytes_low/high are the pacing marks in bytes of stereo
+ * s16 output; pacing compares them in samples (SAMPLE_BYTES each), so a
+ * device buffer that is not a multiple of the 256-sample EP period keeps
+ * exact marks. */
+#define SAMPLE_BYTES (2 * (int)sizeof(int16_t))
 
 typedef struct {
     HWAVEOUT hwo;
@@ -224,16 +226,19 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
-        /* Pacing marks: keep between half the device buffers and all of
-         * them queued. high must not exceed what the voice can hold, or a
-         * full staging buffer would find no free slot and be dropped. */
-        int buf = xa2_get_buffer_size() * 2 * (int)sizeof(int16_t);
-        int n   = xa2_get_buffer_count();
-        d->monitor.queued_bytes_low  = buf * (n / 2);
-        d->monitor.queued_bytes_high = buf * n;
-        fprintf(stderr, "[APU] Using XAudio2 audio backend (pacing: %d..%d granules queued)\n",
-                d->monitor.queued_bytes_low / GRANULE_BYTES,
-                d->monitor.queued_bytes_high / GRANULE_BYTES);
+        /* Pacing marks in samples (xa2_pacing_marks): high is all the
+         * device buffers, capped so a period submitted below it never
+         * fills a buffer the voice has no slot for; low is half of it. */
+        int low, high;
+        xa2_pacing_marks(xa2_get_buffer_size(), xa2_get_buffer_count(),
+                         MIXER_FRAME_SAMPLES, &low, &high);
+        d->monitor.queued_bytes_low  = low * SAMPLE_BYTES;
+        d->monitor.queued_bytes_high = high * SAMPLE_BYTES;
+        fprintf(stderr, "[APU] Using XAudio2 audio backend (pacing: %d..%d samples queued)\n",
+                low, high);
+        if (high < 2 * MIXER_FRAME_SAMPLES)
+            fprintf(stderr, "[APU] device buffers hold under two EP periods;"
+                            " expect underruns\n");
         return;
     }
     fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
@@ -404,7 +409,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  *                    not advanced, so a stalled device stops rendering
  *                    at high and nothing is dropped)
  *   queued <= low    render ahead of the clock, but no further ahead of it
- *                    than the queue can hold (high granules), so a device
+ *                    than the queue can hold (high samples), so a device
  *                    that stops consuming cannot run the APU ahead of guest
  *                    time. (Bounding it by one device buffer instead holds
  *                    the queue under any low mark larger than a buffer: the
@@ -425,13 +430,13 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
         return 0;
 
     if (xa2_is_active()) {
-        int q    = xa2_queued_granules();
-        int low  = d->monitor.queued_bytes_low / GRANULE_BYTES;
-        int high = d->monitor.queued_bytes_high / GRANULE_BYTES;
+        int q    = xa2_queued_samples();
+        int low  = d->monitor.queued_bytes_low / SAMPLE_BYTES;
+        int high = d->monitor.queued_bytes_high / SAMPLE_BYTES;
         if (q >= high)
             return EP_FRAME_US;
         if (q <= low)
-            ahead_us = (int64_t)high * EP_FRAME_US;
+            ahead_us = (int64_t)high * EP_FRAME_US / MIXER_FRAME_SAMPLES;
         else
             mid_band = 1;
     }
@@ -516,6 +521,8 @@ static void *mcpx_apu_frame_thread(void *arg)
     while (!qatomic_read(&d->exiting)) {
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
             d->is_idle = true;
+            if (xa2_is_active())
+                xa2_expect_drain();     /* a pause, not an underrun */
             qemu_cond_signal(&d->idle_cond);
             qemu_cond_wait(&d->cond, &d->lock);
             d->is_idle = false;
@@ -612,6 +619,9 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     qemu_mutex_lock(&d->lock);
     qemu_cond_init(&d->cond);
     qemu_cond_init(&d->idle_cond);
+
+    /* RECOMP_APU_TRACE reporter: here, not on the first trapped access. */
+    apu_hook_trace_start();
 
     /* Init VP (voice processor) */
     mcpx_apu_vp_init(d);

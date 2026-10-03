@@ -7,6 +7,8 @@
  *   apu_wav_test check-3    <path>   parse what exit-write left
  *   apu_wav_test kill-write <path>   write 1.5 s, _exit() without close
  *   apu_wav_test check-kill <path>   parse what kill-write left
+ *   apu_wav_test wd-write   <path>   write 1.5 s, close_nowait, _exit()
+ *   apu_wav_test check-wd   <path>   parse what wd-write left: all of it
  */
 #include "apu_wav.h"
 
@@ -119,6 +121,17 @@ int main(int argc, char **argv)
         write_frames(0, 48000 + 24000);
         fflush(stdout);
         _exit(0);                                /* no atexit, no close */
+    } else if (!strcmp(mode, "wd-write")) {     /* the watchdog's exit */
+        if (!apu_wav_open(path, 0)) return 1;
+        write_frames(0, 48000 + 24000);
+        if (!apu_wav_close_nowait(500)) return 1;
+        CHECK("closed", !apu_wav_is_open());
+        CHECK("nothing open: nowait is a no-op", apu_wav_close_nowait(0));
+        fflush(stdout);
+        _exit(failures ? 1 : 0);
+    } else if (!strcmp(mode, "check-wd")) {
+        n = parse(path);
+        CHECK("close_nowait before _exit keeps the tail", n == 72000);
     } else if (!strcmp(mode, "check-kill")) {
         n = parse(path);
         CHECK("refresh covers the first second", n >= 48000 && n <= 72000);

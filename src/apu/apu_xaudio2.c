@@ -221,12 +221,13 @@ int xa2_get_buffer_count(void)
     return XA2_NUM_BUFS;
 }
 
-/* Granules (256 samples) handed over and not yet played: the buffers the
- * voice still holds plus what is staged in the next one. Also the underrun
- * detector: the voice running dry after audio has started is one underrun,
- * counted once per dry spell and reported at most once a second. */
+/* Samples handed over and not yet played: the buffers the voice still
+ * holds plus what is staged in the next one. Also the underrun detector:
+ * the voice running dry after audio has started is one underrun, counted
+ * once per dry spell and reported at most once a second. A drain announced
+ * by xa2_expect_drain (the frame thread pausing) is not one. */
 
-int xa2_queued_granules(void)
+int xa2_queued_samples(void)
 {
     XAUDIO2_VOICE_STATE state;
 
@@ -246,7 +247,14 @@ int xa2_queued_granules(void)
     } else {
         g_xa2_dry = 0;
     }
-    return (int)(((int)state.BuffersQueued * XA2_BUF_SAMPLES + g_xa2_fill) / 256);
+    return (int)state.BuffersQueued * XA2_BUF_SAMPLES + g_xa2_fill;
+}
+
+/* Mark the coming dry spell as already seen; the first call that finds
+ * buffers queued again clears it, so later dry spells count as before. */
+void xa2_expect_drain(void)
+{
+    g_xa2_dry = 1;
 }
 
 unsigned xa2_underruns(void)
@@ -262,7 +270,8 @@ int  xa2_is_active(void)                              { return 0; }
 int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
 int  xa2_get_buffer_size(void)                        { return 0; }
 int  xa2_get_buffer_count(void)                       { return 0; }
-int  xa2_queued_granules(void)                        { return 0; }
+int  xa2_queued_samples(void)                         { return 0; }
+void xa2_expect_drain(void)                           {}
 unsigned xa2_underruns(void)                          { return 0; }
 
 #endif /* _WIN32 */

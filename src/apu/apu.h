@@ -32,6 +32,10 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
  * not run). Windows x86-64 only (apu_mmio_hook.c). */
 double apu_hook_fault_bench(unsigned n);
 
+/* RECOMP_APU_TRACE: start the periodic access-rate reporter (no-op when the
+ * variable is unset, or off Windows). */
+void apu_hook_trace_start(void);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);

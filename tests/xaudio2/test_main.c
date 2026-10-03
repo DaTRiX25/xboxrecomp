@@ -119,6 +119,8 @@ static void reset(void)
     g_xa2_source = NULL;
     g_xa2_initialized = 0;
     g_xa2_fill = 0;
+    g_xa2_underruns = 0;
+    g_xa2_dry = 0;
     com_refs = releases = master_destroys = source_destroys = 0;
     queue_count = 0;
     com_result = create_result = master_result = source_result = S_OK;
@@ -245,7 +247,7 @@ int main(void)
     }
 
     /* Pacing contract (apu_core.c mcpx_apu_pace_step): submitting one
-     * period only while xa2_queued_granules() < count * size / 256 never
+     * period only while xa2_queued_samples() < high (count * size) never
      * finds the voice full, so no staged buffer is ever dropped. The fake
      * voice completes its oldest buffer every third period. Then a voice
      * that runs dry after audio started is one underrun per dry spell. */
@@ -257,8 +259,12 @@ int main(void)
         reset();
         max_queue = 4;
         CHECK(xa2_init() == 1);
-        high = xa2_get_buffer_count() * xa2_get_buffer_size() / 256;
-        CHECK(high == 8);
+        {
+            int low;
+            xa2_pacing_marks(xa2_get_buffer_size(), xa2_get_buffer_count(),
+                             256, &low, &high);
+            CHECK(high == 2048 && low == 1024);
+        }
         for (int step = 0; step < 300; step++) {
             /* The voice starts playing once the queue has filled (a
              * pre-roll); before that, a fake that drains faster than the
@@ -271,7 +277,7 @@ int main(void)
                 }
                 queue_count--;
             }
-            if (xa2_queued_granules() < high
+            if (xa2_queued_samples() < high
                     && !xa2_submit_samples(&period[0][0], 256))
                 refused++;
         }
@@ -279,19 +285,93 @@ int main(void)
         CHECK(xa2_underruns() == 0);
         check_queued();                     /* no queued buffer overwritten */
         queue_count = 0;                                     /* ran dry */
-        xa2_queued_granules();
-        xa2_queued_granules();
+        xa2_queued_samples();
+        xa2_queued_samples();
         CHECK(xa2_underruns() == 1);
         {
-            int staged = xa2_queued_granules();   /* the partly filled buffer */
+            int staged = xa2_queued_samples();    /* the partly filled buffer */
             xa2_submit_samples(&period[0][0], 256);
             xa2_submit_samples(&period[0][0], 256);          /* refilled */
-            CHECK(xa2_queued_granules() == staged + 2);
+            CHECK(xa2_queued_samples() == staged + 512);
         }
         queue_count = 0;
-        xa2_queued_granules();
+        xa2_queued_samples();
         CHECK(xa2_underruns() == 2);
+        /* A pause drains the queue on purpose: not an underrun. Audio
+         * after the pause runs dry as before. */
+        xa2_submit_samples(&period[0][0], 256);
+        xa2_submit_samples(&period[0][0], 256);
+        xa2_queued_samples();
+        xa2_expect_drain();
+        queue_count = 0;
+        xa2_queued_samples();
+        CHECK(xa2_underruns() == 2);
+        xa2_submit_samples(&period[0][0], 256);
+        xa2_submit_samples(&period[0][0], 256);
+        CHECK(xa2_queued_samples() > 0);
+        queue_count = 0;
+        xa2_queued_samples();
+        CHECK(xa2_underruns() == 3);
         xa2_shutdown();
+        max_queue = 8;
+    }
+
+    /* Buffers that are not multiples of the 256-sample period: the marks
+     * are exact in samples, and pacing a voice that plays at the device
+     * rate (in 32-sample steps, starting once the pacer first waits) never
+     * drops or overwrites a buffer. 320 x 3 keeps the voice fed; 128 x 2
+     * holds one period, so it refills only when empty (underruns, but no
+     * loss). */
+    {
+        struct { const char *s, *n; int b, cnt, low, high, fed; } c[] = {
+            { "RECOMP_AUDIO_BUF_SAMPLES=320", "RECOMP_AUDIO_BUF_COUNT=3", 320, 3, 480, 960, 1 },
+            { "RECOMP_AUDIO_BUF_SAMPLES=128", "RECOMP_AUDIO_BUF_COUNT=2", 128, 2,  64, 128, 0 },
+        };
+        static int16_t period[256][2];
+        for (int k = 0; k < 2; k++) {
+            int low, high, refused = 0, started = 0, credit = 0, submits = 0;
+            _putenv(c[k].s);
+            _putenv(c[k].n);
+            reset();
+            max_queue = (UINT32)c[k].cnt;
+            CHECK(xa2_init() == 1);
+            xa2_pacing_marks(xa2_get_buffer_size(), xa2_get_buffer_count(),
+                             256, &low, &high);
+            if (low != c[k].low || high != c[k].high) {
+                printf("FAIL: %d x %d marks %d..%d, want %d..%d\n",
+                       c[k].cnt, c[k].b, low, high, c[k].low, c[k].high);
+                failures++;
+            }
+            for (int step = 0; step < 20000; step++) {
+                if (started) {
+                    credit += 32;
+                    while (credit >= c[k].b && queue_count > 0) {
+                        for (UINT32 i = 0; i + 1 < queue_count; i++) {
+                            queued[i] = queued[i + 1];
+                            queued_bytes[i] = queued_bytes[i + 1];
+                            memcpy(snapshots[i], snapshots[i + 1], queued_bytes[i]);
+                        }
+                        queue_count--;
+                        credit -= c[k].b;
+                    }
+                    if (queue_count == 0) credit = 0;
+                }
+                if (xa2_queued_samples() < high) {
+                    if (!xa2_submit_samples(&period[0][0], 256)) refused++;
+                    submits++;
+                } else {
+                    started = 1;
+                }
+            }
+            printf("pacing %d x %d: marks %d..%d samples, %d periods, "
+                   "%d refused, %u underruns\n", c[k].cnt, c[k].b, low, high,
+                   submits, refused, xa2_underruns());
+            CHECK(refused == 0);
+            check_queued();
+            CHECK(submits > 20000 * 32 / 256 - 8);   /* kept the device rate */
+            if (c[k].fed) CHECK(xa2_underruns() == 0);
+            xa2_shutdown();
+        }
         max_queue = 8;
     }
 

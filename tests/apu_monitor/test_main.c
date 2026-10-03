@@ -36,7 +36,8 @@ int  xa2_is_active(void)     { return 1; }
 int  xa2_get_buffer_size(void) { return 512; }
 int  xa2_get_buffer_count(void) { return 4; }
 unsigned xa2_underruns(void) { return 0; }
-int  xa2_queued_granules(void) { return (int)((dev_tail - dev_head) / PERIOD); }
+int  xa2_queued_samples(void) { return (int)(dev_tail - dev_head); }
+void xa2_expect_drain(void)  {}
 int  xa2_submit_samples(const int16_t *s, int n)
 {
     got_calls++;
@@ -195,7 +196,7 @@ static void pacing_case(void)
         } else {
             dev_head = c > dev_head ? c : dev_head;
         }
-        q = xa2_queued_granules();
+        q = xa2_queued_samples() / PERIOD;
         if (now > 200000 && !(now >= stall_from && now < stall_from + stall_us + 200000)) {
             if (q < minq) minq = q;
             if (q > maxq) maxq = q;
@@ -218,10 +219,12 @@ static void pacing_case(void)
         periods++;
         if (now >= stall_from && now < stall_from + stall_us)
             submits_in_stall++;
-        /* Rendering never pushes the queue past high. */
-        if (xa2_queued_granules() > high) {
-            printf("FAIL: queue %d > high %d after a submit\n",
-                   xa2_queued_granules(), high);
+        /* Rendering starts only below high, so one period takes the queue
+         * at most PERIOD - 1 samples past it (this fake drains sample by
+         * sample; a real voice reports whole buffers). */
+        if (xa2_queued_samples() > high * PERIOD + PERIOD - 1) {
+            printf("FAIL: queue %d samples > high %d + one period after a submit\n",
+                   xa2_queued_samples(), high * PERIOD);
             failures++;
             break;
         }

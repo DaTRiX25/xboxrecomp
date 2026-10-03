@@ -23,11 +23,21 @@ static void wav_lock(void)
     EnterCriticalSection(&s_lock);
 }
 static void wav_unlock(void) { LeaveCriticalSection(&s_lock); }
+/* Only called with a file open, so the lock is initialised. */
+static int  wav_trylock(void) { return TryEnterCriticalSection(&s_lock) != 0; }
+static void wav_nap(void)     { Sleep(1); }
 #else
 #include <pthread.h>
+#include <time.h>
 static pthread_mutex_t s_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void wav_lock(void)   { pthread_mutex_lock(&s_mutex); }
 static void wav_unlock(void) { pthread_mutex_unlock(&s_mutex); }
+static int  wav_trylock(void) { return pthread_mutex_trylock(&s_mutex) == 0; }
+static void wav_nap(void)
+{
+    struct timespec ts = { 0, 1000000 };
+    nanosleep(&ts, NULL);
+}
 #endif
 
 #define FRAME_BYTES (APU_WAV_CHANNELS * 2)
@@ -87,6 +97,24 @@ void apu_wav_close(void)
     wav_lock();
     close_locked();
     wav_unlock();
+}
+
+int apu_wav_close_nowait(int wait_ms)
+{
+    int t;
+
+    if (!s_fp)
+        return 1;
+    for (t = 0; ; t++) {
+        if (wav_trylock()) {
+            close_locked();
+            wav_unlock();
+            return 1;
+        }
+        if (t >= wait_ms)
+            return 0;
+        wav_nap();
+    }
 }
 
 static void wav_atexit(void) { apu_wav_close(); }

@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2385,6 +2386,10 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                 *(const uint32_t *)(mem + a));
     }
     fflush(stderr);
+    /* _exit skips atexit: finalise a RECOMP_AUDIO_WAV dump here, or up to
+     * its last second is past the header. Bounded, in case the frame
+     * thread is wedged inside a write. */
+    apu_wav_close_nowait(500);
     _exit(3);
     return 0;
 }

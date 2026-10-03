@@ -24,9 +24,15 @@ add_test(NAME apu_wav_exit_check COMMAND apu_wav_test check-3 ${dir}/exit.wav)
 set_tests_properties(apu_wav_exit_write PROPERTIES FIXTURES_SETUP wav_exit)
 set_tests_properties(apu_wav_exit_check PROPERTIES FIXTURES_REQUIRED wav_exit)
 
-# A hard kill (_exit, as the watchdog does) after more than a second: the
+# A hard kill (_exit with no close) after more than a second: the
 # once-per-second header refresh must cover at least the first second.
 add_test(NAME apu_wav_kill_write COMMAND apu_wav_test kill-write ${dir}/kill.wav)
 add_test(NAME apu_wav_kill_check COMMAND apu_wav_test check-kill ${dir}/kill.wav)
 set_tests_properties(apu_wav_kill_write PROPERTIES FIXTURES_SETUP wav_kill)
 set_tests_properties(apu_wav_kill_check PROPERTIES FIXTURES_REQUIRED wav_kill)
+
+# The watchdog's exit: apu_wav_close_nowait, then _exit. Nothing is lost.
+add_test(NAME apu_wav_wd_write COMMAND apu_wav_test wd-write ${dir}/wd.wav)
+add_test(NAME apu_wav_wd_check COMMAND apu_wav_test check-wd ${dir}/wd.wav)
+set_tests_properties(apu_wav_wd_write PROPERTIES FIXTURES_SETUP wav_wd)
+set_tests_properties(apu_wav_wd_check PROPERTIES FIXTURES_REQUIRED wav_wd)
