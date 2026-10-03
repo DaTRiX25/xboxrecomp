@@ -2120,27 +2120,60 @@ static float vsh_zmax(void)
     return nv2a_zmax(s_gpu.format);
 }
 
+/* One depth/stencil buffer per zeta offset and extent, as the D3D11 backend
+ * keeps one per zeta offset and surface size (depth_target). A single shared
+ * buffer was reset to the far plane each time the game switched to its
+ * 256x256 offscreen pass and back, so in stage 1-1 the sky, drawn after that
+ * pass with the depth test on, painted over the cliff and stairs above the
+ * horizon (issue #36). s_zbuf/s_sbuf/s_zbuf_w/s_zbuf_h name the live entry. */
+#define ZB_MAX 4
+static struct {
+    uint32_t zeta, w, h;
+    float   *z;
+    uint8_t *s;
+    uint64_t last_use;
+} s_zb[ZB_MAX];
+static uint64_t s_zb_tick;
+
 static int vsh_zbuf_ready(void)
 {
     uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h;
+    uint32_t zeta = s_vsh.zeta_offset, i;
+    int k, e = -1, lru = 0;
+
     if (!w || !h || w > 4096 || h > 4096)
         return 0;
-    if (w != s_zbuf_w || h != s_zbuf_h || !s_zbuf || !s_sbuf) {
-        float *n = (float *)realloc(s_zbuf, (size_t)w * h * sizeof(float));
-        uint8_t *sn;
-        uint32_t i;
-        if (!n)
-            return 0;
-        s_zbuf = n;
-        sn = (uint8_t *)realloc(s_sbuf, (size_t)w * h);
-        if (!sn)
-            return 0;
-        s_sbuf = sn;
-        s_zbuf_w = w; s_zbuf_h = h;
-        for (i = 0; i < w * h; i++)
-            s_zbuf[i] = 1.0f;
-        memset(s_sbuf, 0, (size_t)w * h);
+    s_zb_tick++;
+    for (k = 0; k < ZB_MAX; k++) {
+        if (s_zb[k].z && s_zb[k].zeta == zeta && s_zb[k].w == w && s_zb[k].h == h) {
+            e = k;
+            break;
+        }
+        if (s_zb[k].last_use < s_zb[lru].last_use)
+            lru = k;
     }
+    if (e < 0) {
+        for (k = 0; k < ZB_MAX && s_zb[k].z; k++)
+            ;
+        e = k < ZB_MAX ? k : lru;
+        free(s_zb[e].z);
+        free(s_zb[e].s);
+        s_zb[e].z = (float *)malloc((size_t)w * h * sizeof(float));
+        s_zb[e].s = (uint8_t *)malloc((size_t)w * h);
+        if (!s_zb[e].z || !s_zb[e].s) {
+            free(s_zb[e].z); free(s_zb[e].s);
+            s_zb[e].z = NULL; s_zb[e].s = NULL;
+            s_zbuf = NULL; s_sbuf = NULL; s_zbuf_w = s_zbuf_h = 0;
+            return 0;
+        }
+        s_zb[e].zeta = zeta; s_zb[e].w = w; s_zb[e].h = h;
+        for (i = 0; i < w * h; i++)
+            s_zb[e].z[i] = 1.0f;
+        memset(s_zb[e].s, 0, (size_t)w * h);
+    }
+    s_zb[e].last_use = s_zb_tick;
+    s_zbuf = s_zb[e].z; s_sbuf = s_zb[e].s;
+    s_zbuf_w = w; s_zbuf_h = h;
     return 1;
 }
 
