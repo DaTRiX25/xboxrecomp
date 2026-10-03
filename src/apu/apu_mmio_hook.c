@@ -244,14 +244,27 @@ static int g_apu_mmio_decode_fail;
 static volatile uint32_t s_last_wval;
 volatile int g_apu_hook_bench_active;
 
+/* The model's registers are 32-bit and its read/write ignore the size, so an
+ * 8-byte access (ldr/str x, a d register, each half of a q register) is two
+ * 4-byte accesses here; handing it over whole would drop the high dword. */
 static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
 {
+    if (size == 8) {
+        uint64_t lo = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, 4);
+        uint64_t hi = mcpx_apu_mmio_read((MCPXAPUState *)dev, off + 4, 4);
+        return lo | (hi << 32);
+    }
     return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
 }
 
 static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
 {
     s_last_wval = (uint32_t)v;
+    if (size == 8) {
+        mcpx_apu_mmio_write((MCPXAPUState *)dev, off, (uint32_t)v, 4);
+        mcpx_apu_mmio_write((MCPXAPUState *)dev, off + 4, (uint32_t)(v >> 32), 4);
+        return;
+    }
     mcpx_apu_mmio_write((MCPXAPUState *)dev, off, v, (unsigned)size);
 }
 
