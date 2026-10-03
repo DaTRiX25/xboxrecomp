@@ -8,10 +8,12 @@
  *
  *   on_clear  -> a render pass with loadAction Clear on the surface at
  *                color_offset (one MTLTexture per guest surface)
- *   on_draw   -> pre-transformed (screen-space) batches through a pass-through
- *                vertex function, with stage 0 textured from the shared decode
- *                (nv2a_backend_common.h). Vertex-program batches are M2 and are
- *                skipped (counted).
+ *   on_draw   -> vertex-program batches through the program as MSL
+ *                (d3d8_vsh_msl.c), pre-transformed (screen-space) ones through
+ *                a pass-through vertex function; pixels through the register
+ *                combiners as MSL (d3d8_combiners_msl.c) when they are
+ *                programmed, else MODULATE. Four stages, textured from the
+ *                shared decode (nv2a_backend_common.h).
  *   on_flip   -> commit, wait, read the surface the walker picked for this flip
  *                (nv2a_pb_present_state) back into guest memory, then hand that
  *                surface to xbox_FramebufferWindowPresent as the CPU path does.
@@ -34,10 +36,11 @@
  *  - Guest memory is touched on the executor's thread only: no completion
  *    handlers; the flip waits for the command buffer and then copies.
  *
- * Not yet (M2+): vertex programs (MSL emitter), register combiners, stages
- * 1-3, depth/stencil, render-to-texture, occlusion queries (the walker reports
- * RECOMP_ZPASS_FIXED for a backend without on_report), LOD bias (Metal
- * samplers have none), swizzled render targets.
+ * Depth/stencil and render-to-texture as the D3D11 backend (M2).
+ * Not yet: occlusion queries (the walker reports
+ * RECOMP_ZPASS_FIXED for a backend without on_report), swizzled render
+ * targets. The mip LOD bias is a sample() argument (MsPsConsts.tex_bias),
+ * not a sampler field, so every macOS takes the same path.
  *
  * Everything runs on the NV2A ack thread (or the smoke test's main thread).
  *
@@ -57,6 +60,7 @@
 
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
+#include "d3d8_msl.h"
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
  * which collides with Objective-C and CoreServices: declare what is used. */
 ptrdiff_t xbox_GetMemoryOffset(void);
@@ -78,6 +82,9 @@ extern void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch);
 
 /* VpConsts (MSL): float4 c[3]; uint4 u[2]; */
 _Static_assert(sizeof(struct nv2a_vp_consts) == 80, "nv2a_vp_consts is not 5 x 16 bytes");
+/* A program's c[] (MSL constant float4 *c, buffer 1) is v->c as it is. */
+_Static_assert(sizeof(((struct nv2a_pb_vsh *)0)->c) == NV2A_VS_MAX_CONSTANTS * 16,
+               "vertex constants are not 192 float4");
 _Static_assert(offsetof(struct nv2a_vp_consts, u) == 48, "nv2a_vp_consts.u moved");
 
 /* PsConsts (MSL): float4 c0[8], c1[8], fc0, fc1, fog_color; uint4 atest
@@ -99,6 +106,16 @@ PS_AT(tex_scale, 336);
 PS_AT(tex_mode, 400);
 #undef PS_AT
 _Static_assert(sizeof(struct nv2a_ps_consts) == 416, "nv2a_ps_consts size changed");
+
+/* The MSL PsConsts: the shared constants plus Metal's own trailing float4
+ * tex_bias (per stage mip LOD bias, passed to sample() as bias()). Kept out
+ * of nv2a_ps_consts, whose size the D3D11 backend pins to NV2APSConstants. */
+typedef struct {
+    struct nv2a_ps_consts b;
+    float tex_bias[4];
+} MsPsConsts;
+_Static_assert(offsetof(MsPsConsts, tex_bias) == 416 && sizeof(MsPsConsts) == 432,
+               "MsPsConsts.tex_bias moved");
 _Static_assert(sizeof(float) == 4 && sizeof(uint32_t) == 4, "alpha_ref is read as uint bits");
 
 /* One expanded vertex of a pass-through batch: attributes 0, 3, 4, 9..12 as
@@ -110,16 +127,10 @@ static const char s_msl[] =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "struct VpConsts { float4 c[3]; uint4 u[2]; };\n"
-    "struct PsConsts {\n"
-    "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n"
-    "    uint4 atest; uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n"
-    "};\n"
-    "struct VOut {\n"
-    "    float4 pos [[position]];\n"
-    "    float4 d0; float4 d1; float4 t0; float4 t1; float4 t2; float4 t3;\n"
-    "    float  fog;\n"
-    "    float  psize [[point_size]];\n"
-    "};\n"
+    D3D8_MSL_PSCONSTS
+    /* The emitters' VOut (d3d8_msl.h), so vs_pass links with a combiner
+     * fs_main and a program's vs_main with fs_basic. */
+    D3D8_MSL_VOUT
     /* Attribute 0 is already in surface pixels (x, y, z, rhw): c[0] is
      * (2/w, -2/h, 1/zmax, 0) and c[1] (-1, 1, 0, 0), as the D3D11
      * pass-through's vp_scale / vp_off. */
@@ -149,7 +160,7 @@ static const char s_msl[] =
     "    } else if (pc.tex_mode.x != 0u) {\n"
     "        float2 uv = i.t0.xy;\n"
     "        if (pc.tex_mode.x == 1u && i.t0.w != 0.0 && i.t0.w != 1.0) uv /= i.t0.w;\n"
-    "        c *= tex0.sample(samp0, uv * pc.tex_scale[0].xy);\n"
+    "        c *= tex0.sample(samp0, uv * pc.tex_scale[0].xy, bias(pc.tex_bias.x));\n"
     "    }\n"
     "    if (pc.atest.z != 0u) {\n"
     "        float ref = as_type<float>(pc.atest.x);\n"
@@ -173,6 +184,7 @@ static const char s_msl[] =
 static id<MTLDevice>               s_dev;
 static id<MTLCommandQueue>         s_queue;
 static id<MTLFunction>             s_vs_pass, s_fs_basic;
+static MTLCompileOptions          *s_opts;     /* fast math off, kept for M2's shaders */
 static id<MTLCommandBuffer>        s_cmd;      /* the frame's, begun lazily */
 static id<MTLRenderCommandEncoder> s_enc;      /* open pass, or nil */
 static int                         s_failed;
@@ -188,17 +200,34 @@ static uint64_t s_presents, s_clears, s_draws, s_draws_skipped, s_draws_prog,
 
 /* ---- render targets: one per guest surface --------------------------------- */
 
+/* Depth/stencil buffers, one per zeta surface and size, as the D3D11
+ * backend's: Depth32Float_Stencil8, so the test compares the same normalised
+ * float z (depth units / zmax) the CPU path keeps, and the 8 stencil bits
+ * are Z24S8's. Never read back to guest memory. */
+#define DT_MAX 4
+typedef struct {
+    uint32_t       zeta, w, h;
+    id<MTLTexture> tex;
+    uint64_t       last_use;
+    int            fresh;      /* contents undefined: the next pass clears */
+} DepthTarget;
+
 #define RT_MAX 8
 typedef struct {
     uint32_t       offset;     /* color_offset, as the title set it */
+    uint32_t       addr;       /* its guest address (nv2a_pb_dma_resolve) */
     uint32_t       w, h;
     id<MTLTexture> tex;
     uint64_t       last_use;
+    DepthTarget   *dt;         /* the depth buffer its passes attach, or NULL */
 } RenderTarget;
 
 static RenderTarget  s_rt[RT_MAX];
 static RenderTarget *s_enc_rt;   /* the target s_enc draws into */
+static DepthTarget  *s_enc_dt;   /* and its depth attachment, or NULL */
+static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
+static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
 
 static void end_encoder(void)
 {
@@ -208,6 +237,7 @@ static void end_encoder(void)
         s_enc = nil;
     }
     s_enc_rt = NULL;
+    s_enc_dt = NULL;
 }
 
 /* End the open pass, commit the frame's command buffer and (wait) block
@@ -246,10 +276,15 @@ static void ensure_cmd(void)
         s_cmd = [[s_queue commandBuffer] retain];
 }
 
-/* Open a pass on rt: with `clear`, loadAction Clear to c; else Load. */
-static void begin_encoder(RenderTarget *rt, int clear, const double c[4])
+/* Open a pass on rt: with `clear`, loadAction Clear to c; else Load. The
+ * pass attaches rt->dt when it has one; zmask (CLEAR_SURFACE's bit 0 depth,
+ * bit 1 stencil) clears it to z / st, and a fresh buffer clears to the far
+ * plane and stencil 0, where the CPU path starts its own. */
+static void begin_pass(RenderTarget *rt, int clear, const double c[4],
+                       unsigned zmask, float z, uint32_t st)
 {
     MTLRenderPassDescriptor *rp;
+    DepthTarget *dt = rt->dt;
     end_encoder();
     ensure_cmd();
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -261,8 +296,26 @@ static void begin_encoder(RenderTarget *rt, int clear, const double c[4])
     } else {
         rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     }
+    if (dt) {
+        int zc = (zmask & 1u) || dt->fresh, sc = (zmask & 2u) || dt->fresh;
+        rp.depthAttachment.texture = dt->tex;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        rp.depthAttachment.loadAction = zc ? MTLLoadActionClear : MTLLoadActionLoad;
+        rp.depthAttachment.clearDepth = (zmask & 1u) ? z : 1.0;
+        rp.stencilAttachment.texture = dt->tex;
+        rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        rp.stencilAttachment.loadAction = sc ? MTLLoadActionClear : MTLLoadActionLoad;
+        rp.stencilAttachment.clearStencil = (zmask & 2u) ? (st & 0xFFu) : 0u;
+        dt->fresh = 0;
+    }
     s_enc = [[s_cmd renderCommandEncoderWithDescriptor:rp] retain];
     s_enc_rt = rt;
+    s_enc_dt = dt;
+}
+
+static void begin_encoder(RenderTarget *rt, int clear, const double c[4])
+{
+    begin_pass(rt, clear, c, 0, 1.0f, 0);
 }
 
 static int init(void)
@@ -297,9 +350,9 @@ static int init(void)
             opts.mathMode = MTLMathModeSafe;
             opts.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
         }
+        s_opts = opts;
         lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:s_msl]
                                   options:opts error:&err];
-        [opts release];
         if (!lib) {
             fprintf(stderr, LOGP "MSL compile failed: %s\n",
                     err ? [[err localizedDescription] UTF8String] : "?");
@@ -336,6 +389,52 @@ static void rt_free(RenderTarget *rt)
         end_encoder();
     [rt->tex release];
     memset(rt, 0, sizeof *rt);
+}
+
+/* The depth buffer for the zeta surface now set, at w x h; made on first
+ * use (fresh), the least recently used one giving way when all are taken. */
+static DepthTarget *depth_target(uint32_t w, uint32_t h)
+{
+    uint32_t zeta = nv2a_pb_vsh_state()->zeta_offset;
+    DepthTarget *e = NULL, *lru = &s_dt[0];
+    MTLTextureDescriptor *td;
+    int i;
+
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *d = &s_dt[i];
+        if (d->tex && d->zeta == zeta && d->w == w && d->h == h) {
+            d->last_use = s_tick;
+            return d;
+        }
+        if (!d->tex && !e)
+            e = d;
+        if (d->last_use < lru->last_use)
+            lru = d;
+    }
+    if (!e) {
+        e = lru;
+        if (s_enc_dt == e)
+            end_encoder();
+        for (i = 0; i < RT_MAX; i++)
+            if (s_rt[i].dt == e)
+                s_rt[i].dt = NULL;
+        [e->tex release];
+        memset(e, 0, sizeof *e);
+    }
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                                            width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    e->tex = [s_dev newTextureWithDescriptor:td];
+    if (!e->tex)
+        return NULL;
+    e->zeta = zeta;
+    e->w = w;
+    e->h = h;
+    e->last_use = s_tick;
+    e->fresh = 1;
+    fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer\n", zeta, w, h);
+    return e;
 }
 
 /* The render target for the surface at color_offset, the size of its clip
@@ -381,6 +480,7 @@ static RenderTarget *surface(void)
     if (!free_rt->tex)
         return NULL;
     free_rt->offset = g->color_offset;
+    free_rt->addr = nv2a_pb_dma_resolve(g->color_offset);
     free_rt->w = w;
     free_rt->h = h;
     free_rt->last_use = s_tick;
@@ -413,6 +513,33 @@ static void metal_on_clear(uint32_t param)
         c[3] = (double)(g->clear_color >> 24) / 255.0;
         begin_encoder(rt, 1, c);
         s_clears++;
+    }
+}
+
+/* CLEAR_SURFACE with the Z or stencil bit: the value scaled as the CPU path
+ * scales it, by the zeta format's range; the stencil its low byte. A pass
+ * that loads colour and clears the depth buffer. */
+static void metal_on_zclear(uint32_t param)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    RenderTarget *rt;
+    DepthTarget *dt;
+
+    if (!(param & 3u) || !init())
+        return;
+    @autoreleasepool {
+        rt = surface();
+        if (!rt)
+            return;
+        dt = depth_target(rt->w, rt->h);
+        if (!dt)
+            return;
+        rt->dt = dt;
+        begin_pass(rt, 0, NULL, param & 3u, nv2a_zclear_depth(g->format, v->zclear),
+                   v->zclear & 0xFFu);
+        if (param & 1u)
+            s_zclears++;
     }
 }
 
@@ -491,32 +618,48 @@ static MTLBlendFactor blend_factor(uint32_t gl, int alpha)
     return map[alpha ? nv2a_blend_for_alpha(bf) : bf];
 }
 
-#define PSO_MAX 64
-static struct { uint32_t key[5]; id<MTLRenderPipelineState> pso; } s_pso[PSO_MAX];
-static int s_pso_n;
+/* A pipeline is its two functions plus the blend state. The functions are
+ * cached for the life of the process (vs_cache, fs_cache), so their
+ * pointers identify them. */
+typedef struct {
+    uint64_t vs, fs;
+    uint32_t key[6];
+} PsoKey;
+#define PSO_MAX 512
+static struct { PsoKey k; id<MTLRenderPipelineState> pso; } s_pso[PSO_MAX];
+static int s_pso_n, s_pso_last;
 
-static id<MTLRenderPipelineState> pipeline(void)
+static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> fs)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     MTLRenderPipelineDescriptor *pd;
     MTLRenderPipelineColorAttachmentDescriptor *ca;
     id<MTLRenderPipelineState> pso;
     NSError *err = nil;
-    uint32_t key[5];
+    PsoKey pk;
+    uint32_t *key = pk.key;
     int i;
 
+    memset(&pk, 0, sizeof pk);
+    pk.vs = (uint64_t)(uintptr_t)vs;
+    pk.fs = (uint64_t)(uintptr_t)fs;
     key[0] = g->blend_enable ? 1 : 0;
     key[1] = key[0] ? g->blend_sfactor : 0;
     key[2] = key[0] ? g->blend_dfactor : 0;
     key[3] = g->color_keep;             /* SET_COLOR_MASK, inverted */
     key[4] = key[0] ? (uint32_t)blend_op(g->blend_equation) : 0;
+    key[5] = s_enc_dt ? 1 : 0;          /* the open pass has a depth buffer */
+    if (s_pso_last < s_pso_n && !memcmp(&s_pso[s_pso_last].k, &pk, sizeof pk))
+        return s_pso[s_pso_last].pso;
     for (i = 0; i < s_pso_n; i++)
-        if (!memcmp(s_pso[i].key, key, sizeof key))
+        if (!memcmp(&s_pso[i].k, &pk, sizeof pk)) {
+            s_pso_last = i;
             return s_pso[i].pso;
+        }
 
     pd = [[MTLRenderPipelineDescriptor alloc] init];
-    pd.vertexFunction = s_vs_pass;
-    pd.fragmentFunction = s_fs_basic;
+    pd.vertexFunction = vs;
+    pd.fragmentFunction = fs;
     ca = pd.colorAttachments[0];
     ca.pixelFormat = MTLPixelFormatBGRA8Unorm;
     ca.blendingEnabled = key[0] ? YES : NO;
@@ -532,6 +675,10 @@ static id<MTLRenderPipelineState> pipeline(void)
                  | ((key[3] & 0x0000FF00u) ? 0 : MTLColorWriteMaskGreen)
                  | ((key[3] & 0x000000FFu) ? 0 : MTLColorWriteMaskBlue)
                  | ((key[3] & 0xFF000000u) ? 0 : MTLColorWriteMaskAlpha);
+    if (key[5]) {
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    }
     pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
     [pd release];
     if (!pso) {
@@ -548,12 +695,13 @@ static id<MTLRenderPipelineState> pipeline(void)
         i = (int)(next++ % PSO_MAX);
         [s_pso[i].pso release];   /* an encoded draw keeps its own reference */
     }
-    memcpy(s_pso[i].key, key, sizeof key);
+    s_pso[i].k = pk;
     s_pso[i].pso = pso;
+    s_pso_last = i;
     return pso;
 }
 
-/* ---- textures (stage 0 in M1) ------------------------------------------------
+/* ---- textures ------------------------------------------------
  *
  * Decoded to A8R8G8B8 on the CPU by the shared decode (nv2a_tex_decode), the
  * same texels the CPU sampler and the D3D11 backend see, and uploaded as
@@ -766,6 +914,15 @@ static int filter_mip(uint32_t f)
     return m == 3 || m == 4 ? 1 : m == 5 || m == 6 ? 2 : 0;
 }
 
+/* SET_TEXTURE_FILTER [12:0]: the mip LOD bias, signed 5.8 fixed point. */
+static float lod_bias(uint32_t f)
+{
+    int b = (int)(f & 0x1FFFu);
+    if (b & 0x1000)
+        b -= 0x2000;
+    return (float)b / 256.0f;
+}
+
 #define SMP_MAX 128
 static struct { uint64_t key; id<MTLSamplerState> s; } s_smp[SMP_MAX];
 static int s_smp_n;
@@ -816,6 +973,313 @@ static id<MTLSamplerState> sampler(const Stage *t)
     return st;
 }
 
+/* ---- shaders (M2): vertex programs and register combiners ------------------
+ *
+ * As the D3D11 backend's vertex_shader and combiner_ps: the program is
+ * parsed from the slots it starts at (d3d8_vsh_parse) and emitted as MSL
+ * (d3d8_vsh_generate_msl, screen-space epilogue), keyed by
+ * nv2a_vsh_program_hash; the combiner registers become NV2ACombinerState
+ * (d3d8_combiners_from_regs) and MSL (d3d8_combiners_generate_msl), keyed by
+ * the state's bytes. Each compiles once, with s_opts (fast math off). A
+ * source that fails to compile is logged with its text, counted
+ * (s_compile_errors, in the present log) and remembered as bad. */
+
+static uint64_t s_compile_errors, s_vs_compiled, s_fs_compiled;
+
+static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *what)
+{
+    NSError *err = nil;
+    id<MTLLibrary> lib;
+    id<MTLFunction> fn;
+
+    lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:src]
+                              options:s_opts error:&err];
+    if (!lib) {
+        s_compile_errors++;
+        if (s_compile_errors <= 4)
+            fprintf(stderr, LOGP "\x1b[1;31m%s: MSL compile failed: %s\x1b[0m\n%s\n",
+                    what, err ? [[err localizedDescription] UTF8String] : "?", src);
+        return nil;
+    }
+    fn = [lib newFunctionWithName:name];
+    [lib release];
+    if (!fn) {
+        s_compile_errors++;
+        fprintf(stderr, LOGP "%s: no function %s\n", what, [name UTF8String]);
+    }
+    return fn;
+}
+
+#define VS_MAX 512
+typedef struct {
+    uint32_t        hash;
+    uint16_t        inputs;
+    int             used, bad;
+    id<MTLFunction> fn;
+} VsEntry;
+static VsEntry s_vs[VS_MAX];
+
+static VsEntry *vs_cache(void)
+{
+    static NV2AVshProgram parsed;
+    static char msl[65536];
+    static struct { int valid; uint32_t dwords, start; VsEntry *e; } memo;
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    uint32_t hash;
+    VsEntry *e = NULL;
+    char what[32];
+    int i;
+
+    /* Programs only change by upload (prog_dwords) or a new start slot. */
+    if (memo.valid && memo.dwords == v->prog_dwords && memo.start == v->start)
+        return memo.e;
+    hash = nv2a_vsh_program_hash(v, NULL);
+    if (!hash)
+        hash = 1;
+    for (i = 0; i < VS_MAX; i++) {
+        if (s_vs[i].used && s_vs[i].hash == hash) {
+            e = &s_vs[i];
+            break;
+        }
+    }
+    if (!e) {
+        for (i = 0; i < VS_MAX && s_vs[i].used; i++)
+            ;
+        if (i == VS_MAX)
+            return NULL;   /* full: a title with this many programs wants LRU */
+        e = &s_vs[i];
+        e->used = 1;
+        e->hash = hash;
+        e->bad = 1;
+        d3d8_vsh_parse(&v->prog[v->start][0], NV2A_VSH_SLOTS - (int)v->start, &parsed);
+        snprintf(what, sizeof what, "program %08X", hash);
+        if (d3d8_vsh_generate_msl(&parsed, D3D8_MSL_SCREEN_SPACE, msl, (int)sizeof msl) <= 0) {
+            s_compile_errors++;
+            fprintf(stderr, LOGP "%s: no MSL\n", what);
+        } else if ((e->fn = compile_fn(msl, @"vs_main", what)) != nil) {
+            e->inputs = parsed.inputs_read;
+            e->bad = 0;
+            s_vs_compiled++;
+        }
+    }
+    memo.valid = 1;
+    memo.dwords = v->prog_dwords;
+    memo.start = v->start;
+    memo.e = e->bad ? NULL : e;
+    return memo.e;
+}
+
+#define FS_MAX 512
+typedef struct {
+    uint32_t          hash;
+    int               bad;
+    NV2ACombinerState st;
+    id<MTLFunction>   fn;
+} FsEntry;
+static FsEntry *s_fs;   /* FS_MAX, allocated on first use */
+static int      s_fs_n;
+
+static uint32_t fnv(const void *p, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    uint32_t h = 0x811c9dc5u;
+    while (n--) {
+        h ^= *b++;
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+/* The fragment function for the batch: its register combiners when they
+ * are programmed (v->rc_set and a stage count), else fs_basic. As the D3D11
+ * setup_pixel, only 2D textures are bound, so every sampling mode is passed
+ * to the combiners as 2D. */
+static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
+{
+    static char msl[65536];
+    static struct { int valid; uint32_t r[36]; id<MTLFunction> fn; } memo;
+    NV2ACombinerState st;
+    uint32_t key[36], modes = 0, hash;
+    FsEntry *e = NULL;
+    char what[32];
+    int n;
+
+    if (!(v->rc_set && (v->rc_ctl & 0xFF)))
+        return s_fs_basic;
+    for (n = 0; n < 4; n++) {
+        uint32_t m = (uint32_t)s_stage[n].mode;
+        if (m && m != 4) m = 1;
+        modes |= m << (5 * n);
+    }
+    memcpy(key, v->rc_cicw, 32);
+    memcpy(key + 8, v->rc_aicw, 32);
+    memcpy(key + 16, v->rc_cocw, 32);
+    memcpy(key + 24, v->rc_aocw, 32);
+    key[32] = v->rc_ctl;
+    key[33] = v->rc_fcw0;
+    key[34] = v->rc_fcw1;
+    key[35] = modes;
+    if (memo.valid && !memcmp(memo.r, key, sizeof key))
+        return memo.fn;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw,
+                             v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
+    st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
+    hash = fnv(&st, sizeof st);
+    if (!s_fs && !(s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs)))
+        return s_fs_basic;
+    for (n = 0; n < s_fs_n; n++)
+        if (s_fs[n].hash == hash && !memcmp(&s_fs[n].st, &st, sizeof st)) {
+            e = &s_fs[n];
+            break;
+        }
+    if (!e) {
+        if (s_fs_n == FS_MAX)
+            return s_fs_basic;
+        e = &s_fs[s_fs_n++];
+        e->hash = hash;
+        e->st = st;
+        e->bad = 1;
+        snprintf(what, sizeof what, "combiners %08X", hash);
+        if (d3d8_combiners_generate_msl(&st, msl, (int)sizeof msl) <= 0) {
+            s_compile_errors++;
+            fprintf(stderr, LOGP "%s: no MSL\n", what);
+        } else if ((e->fn = compile_fn(msl, @"fs_main", what)) != nil) {
+            e->bad = 0;
+            s_fs_compiled++;
+        }
+    }
+    memcpy(memo.r, key, sizeof key);
+    memo.valid = 1;
+    memo.fn = e->bad ? s_fs_basic : e->fn;   /* as D3D11: the basic PS */
+    return memo.fn;
+}
+
+/* ---- depth / stencil state ---------------------------------------------------
+ *
+ * As the D3D11 backend's depth_state: SET_DEPTH_FUNC and SET_STENCIL_FUNC
+ * are GL compare codes in MTLCompareFunction's order (nv2a_cmp_from_gl), the
+ * stencil ops in MTLStencilOperation's (nv2a_stencil_op_from_gl). Depth and
+ * stencil each only when enabled; one state per distinct key. */
+#define DSS_MAX 64
+static struct { uint64_t key; id<MTLDepthStencilState> dss; } s_dss[DSS_MAX];
+static int s_dss_n;
+
+static id<MTLDepthStencilState> depth_state(int depth, int stencil)
+{
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    uint32_t f = nv2a_cmp_from_gl(v->depth_func);
+    uint64_t key = 0;
+    MTLDepthStencilDescriptor *dd;
+    id<MTLDepthStencilState> st;
+    int i;
+
+    if (depth)
+        key |= 1u | f << 1 | (v->depth_mask ? 1u : 0u) << 4;
+    if (stencil)
+        key |= (uint64_t)(1u | (v->stencil_func & 7u) << 1
+                          | nv2a_stencil_op_from_gl(v->stencil_op[0]) << 4
+                          | nv2a_stencil_op_from_gl(v->stencil_op[1]) << 8
+                          | nv2a_stencil_op_from_gl(v->stencil_op[2]) << 12
+                          | (v->stencil_rmask & 0xFFu) << 16
+                          | (v->stencil_wmask & 0xFFu) << 24) << 8;
+    for (i = 0; i < s_dss_n; i++)
+        if (s_dss[i].key == key)
+            return s_dss[i].dss;
+    dd = [[MTLDepthStencilDescriptor alloc] init];
+    dd.depthCompareFunction = depth ? (MTLCompareFunction)f : MTLCompareFunctionAlways;
+    dd.depthWriteEnabled = depth && v->depth_mask ? YES : NO;
+    if (stencil) {
+        MTLStencilDescriptor *sd = [[MTLStencilDescriptor alloc] init];
+        sd.stencilCompareFunction = (MTLCompareFunction)(v->stencil_func & 7u);
+        sd.stencilFailureOperation = (MTLStencilOperation)nv2a_stencil_op_from_gl(v->stencil_op[0]);
+        sd.depthFailureOperation = (MTLStencilOperation)nv2a_stencil_op_from_gl(v->stencil_op[1]);
+        sd.depthStencilPassOperation = (MTLStencilOperation)nv2a_stencil_op_from_gl(v->stencil_op[2]);
+        sd.readMask = v->stencil_rmask & 0xFFu;
+        sd.writeMask = v->stencil_wmask & 0xFFu;
+        dd.frontFaceStencil = sd;               /* GL one-sided stencil */
+        dd.backFaceStencil = sd;
+        [sd release];
+    }
+    st = [s_dev newDepthStencilStateWithDescriptor:dd];
+    [dd release];
+    if (!st)
+        return nil;
+    if (s_dss_n >= DSS_MAX)
+        return st;   /* uncached: a title with this many wants LRU (leaks) */
+    s_dss[s_dss_n].key = key;
+    s_dss[s_dss_n].dss = st;
+    s_dss_n++;
+    return st;
+}
+
+/* ---- render-to-texture ---------------------------------------------------------
+ *
+ * A stage whose texture is a surface this backend draws into samples the
+ * render target itself, as the D3D11 backend's rt_texture: guest memory
+ * under it only changes at a flip's write-back (and then only for the
+ * present surface). 32-bit, non-compressed formats only; the low 27 bits of
+ * the address compare, so either memory window matches. The target being
+ * drawn into is sampled through a copy (s_self), made by a blit between
+ * passes. RECOMP_METAL_NO_RTT=1 decodes guest memory instead (A/B). */
+static RenderTarget s_self;   /* tex, w, h: the copy; offset: whose */
+
+static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
+{
+    static int off = -1;
+    RenderTarget *self = NULL;
+    int i;
+
+    if (off < 0)
+        off = getenv("RECOMP_METAL_NO_RTT") != NULL;
+    if (off || !t->offset || d3d8_format_dxt_block_bytes(t->color)
+            || nv2a_tex_texel_bytes(nv2a_tex_linear_twin(t->color)) != 4)
+        return NULL;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->tex || ((rt->addr ^ t->offset) & 0x07FFFFFFu))
+            continue;
+        if (rt == cur) {
+            self = rt;
+            continue;
+        }
+        return rt;
+    }
+    if (!self)
+        return NULL;
+    if (!s_self.tex || s_self.w != self->w || s_self.h != self->h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                         width:self->w height:self->h mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        [s_self.tex release];
+        s_self.tex = [s_dev newTextureWithDescriptor:td];
+        if (!s_self.tex)
+            return NULL;
+        s_self.w = self->w;
+        s_self.h = self->h;
+    }
+    {
+        id<MTLBlitCommandEncoder> b;
+        end_encoder();
+        ensure_cmd();
+        b = [s_cmd blitCommandEncoder];
+        [b copyFromTexture:self->tex toTexture:s_self.tex];
+        [b endEncoding];
+    }
+    s_self.offset = self->offset;
+    s_self_copies++;
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "surface 0x%08X sampled while drawn into:"
+                    " bound as a copy\n", self->offset);
+    }
+    return &s_self;
+}
+
 /* ---- draws ------------------------------------------------------------------- */
 
 static void metal_on_draw(const struct nv2a_pb_draw *d)
@@ -827,34 +1291,60 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     MTLPrimitiveType ptype;
     RenderTarget *rt;
     id<MTLRenderPipelineState> pso;
+    id<MTLFunction> vfn, ffn;
     struct nv2a_vp_consts vc;
-    struct nv2a_ps_consts pc;
-    NSUInteger vb_off, ib_off;
-    uint32_t lo = 0xFFFF, hi = 0, count, nidx, i, k;
+    MsPsConsts mpc;
+    NSUInteger vb_off, ib_off, vbytes;
+    uint32_t lo = 0xFFFF, hi = 0, count, nidx, i, k, nf4 = 0;
+    int slot[NV2A_VS_MAX_INPUTS];
     float *vf;
     void *ip;
     int cull = 0, cull_all = 0;
+    /* Stencil only on a Z24S8 zeta surface, as on the CPU. */
+    int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
+    int use_z = v->depth_enable || use_s;
+    id<MTLTexture> stex[4];
 
     if (!init())
         return;
-    if (d->program) {          /* M2: vertex programs through an MSL emitter */
-        s_draws_prog++;
-        s_draws_skipped++;
-        return;
-    }
-    if (g->color_keep == 0xFFFFFFFFu)   /* no colour writes, no depth yet */
-        return;
+    if (g->color_keep == 0xFFFFFFFFu && !(v->depth_enable && v->depth_mask) && !use_s)
+        return;                         /* writes nothing */
     if (!d->idx_count) {
         s_draws_skipped++;
         return;
     }
     @autoreleasepool {
+        /* Vertex function and the float4 inputs it reads, in order. */
+        if (d->program) {
+            VsEntry *e = vs_cache();
+            s_draws_prog++;
+            if (!e) {
+                s_draws_skipped++;
+                return;
+            }
+            vfn = e->fn;
+            for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
+                if (e->inputs & (1u << i))
+                    slot[nf4++] = (int)i;
+        } else {
+            vfn = s_vs_pass;
+            for (k = 0; k < VTX_F4; k++)
+                slot[nf4++] = s_vtx_attr[k];
+        }
         rt = surface();
-        pso = rt ? pipeline() : nil;
-        if (!rt || !pso) {
+        if (!rt) {
             s_draws_skipped++;
             return;
         }
+        build_stages();
+        nv2a_ps_consts_fill(v, s_stage, &mpc.b);
+        for (k = 0; k < 4; k++) {
+            /* As the D3D11 MipLODBias: only a mipmapped stage has one. */
+            const Stage *t = &s_stage[k];
+            float b = t->levels > 1 && filter_mip(t->filter) ? lod_bias(t->filter) : 0.0f;
+            mpc.tex_bias[k] = b > 15.99f ? 15.99f : b < -16.0f ? -16.0f : b;
+        }
+        ffn = fs_select(v);
         for (i = 0; i < d->idx_count; i++) {
             if (d->idx[i] < lo) lo = d->idx[i];
             if (d->idx[i] > hi) hi = d->idx[i];
@@ -879,8 +1369,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
 
         /* Rings first: an overflow flushes, which ends the open pass. */
-        vf = (float *)ring_alloc(s_vb, s_vb_size, &s_vb_pos,
-                                 (NSUInteger)count * VTX_F4 * 16u, &vb_off);
+        vbytes = (NSUInteger)count * nf4 * 16u;
+        if (vbytes < 16)
+            vbytes = 16;
+        vf = (float *)ring_alloc(s_vb, s_vb_size, &s_vb_pos, vbytes, &vb_off);
         {
             uint64_t fl = s_flushes;
             ip = vf ? ring_alloc(s_ib, s_ib_size, &s_ib_pos, (NSUInteger)nidx * 4u, &ib_off)
@@ -888,34 +1380,80 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             if (vf && ip && fl != s_flushes) {
                 /* The index ring overflowed after the vertices were placed,
                  * and its flush reset the vertex ring: place them again. */
-                vf = (float *)ring_alloc(s_vb, s_vb_size, &s_vb_pos,
-                                         (NSUInteger)count * VTX_F4 * 16u, &vb_off);
+                vf = (float *)ring_alloc(s_vb, s_vb_size, &s_vb_pos, vbytes, &vb_off);
             }
         }
         if (!vf || !ip) {
             s_draws_skipped++;
             return;
         }
-        for (k = 0; k < VTX_F4; k++) {
-            const VertexAttr *a = &d->attr[s_vtx_attr[k]];
+        /* Each input as float4, fetched as the CPU path does; a disabled
+         * one (or one without data) is its SET_VERTEX_DATA value. */
+        for (k = 0; k < nf4; k++) {
+            const VertexAttr *a = &d->attr[slot[k]];
             int on = a->size && a->stride;
             for (i = 0; i < count; i++) {
-                float *o = vf + ((size_t)i * VTX_F4 + k) * 4;
+                float *o = vf + ((size_t)i * nf4 + k) * 4;
                 if (!on || !fetch(d, a, lo + i, o))
-                    memcpy(o, v->inl[s_vtx_attr[k]], 16);
+                    memcpy(o, v->inl[slot[k]], 16);
             }
         }
         memcpy(ip, idx, (size_t)nidx * 4u);
 
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, &vc);
-        build_stages();
-        nv2a_ps_consts_fill(v, s_stage, &pc);
-        for (k = 1; k < 4; k++)   /* M1: stage 0 only */
-            pc.tex_mode[k] = 0;
+
+        /* Depth: the zeta surface's buffer, attached to this target's
+         * passes from now on (a new pass if the open one lacks it). */
+        if (use_z) {
+            DepthTarget *dt = depth_target(rt->w, rt->h);
+            if (dt && rt->dt != dt) {
+                rt->dt = dt;
+                if (s_enc_rt == rt)
+                    end_encoder();
+            }
+        }
+        /* Textures before the pass: a self copy is a blit between passes. */
+        {
+            int textured = 0;
+            for (k = 0; k < 4; k++) {
+                const Stage *t = &s_stage[k];
+                RenderTarget *src;
+                stex[k] = s_black;
+                if (!t->mode || t->mode == 4)
+                    continue;
+                textured = 1;
+                if ((src = rt_texture(t, rt)) != NULL) {
+                    stex[k] = src->tex;
+                    /* Linear coordinates are texels of the surface as drawn. */
+                    if (!nv2a_tex_size_from_format(t->color)) {
+                        mpc.b.tex_scale[k][0] = 1.0f / (float)src->w;
+                        mpc.b.tex_scale[k][1] = 1.0f / (float)src->h;
+                    }
+                    s_rtt_binds++;
+                } else {
+                    stex[k] = tex_bind(t);
+                }
+            }
+            if (textured)
+                s_draws_tex++;
+        }
 
         if (!s_enc || s_enc_rt != rt)
             begin_encoder(rt, 0, NULL);
+        pso = pipeline(vfn, ffn);
+        if (!pso) {
+            s_draws_skipped++;
+            return;
+        }
         [s_enc setRenderPipelineState:pso];
+        if (s_enc_dt) {
+            id<MTLDepthStencilState> dss = use_z ? depth_state(v->depth_enable, use_s)
+                                                 : depth_state(0, 0);
+            [s_enc setDepthStencilState:dss];
+            [s_enc setStencilReferenceValue:use_s ? (v->stencil_ref & 0xFFu) : 0u];
+            if (use_z)
+                s_draws_z++;
+        }
         {
             MTLViewport vp = {0.0, 0.0, (double)rt->w, (double)rt->h, 0.0, 1.0};
             [s_enc setViewport:vp];
@@ -931,17 +1469,17 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             [s_enc setBlendColorRed:bf[0] green:bf[1] blue:bf[2] alpha:bf[3]];
         }
         [s_enc setVertexBuffer:s_vb offset:vb_off atIndex:0];
-        [s_enc setVertexBytes:&vc length:sizeof vc atIndex:1];
-        [s_enc setFragmentBytes:&pc length:sizeof pc atIndex:0];
-        {
-            const Stage *t = &s_stage[0];
-            id<MTLTexture> tex = s_black;
-            if (t->mode && t->mode != 4) {
-                tex = tex_bind(t);
-                s_draws_tex++;
-            }
-            [s_enc setFragmentTexture:tex atIndex:0];
-            [s_enc setFragmentSamplerState:sampler(t) atIndex:0];
+        if (d->program) {
+            /* c[192] is 3 KB: under setVertexBytes' 4 KB. */
+            [s_enc setVertexBytes:v->c length:sizeof v->c atIndex:1];
+            [s_enc setVertexBytes:&vc length:sizeof vc atIndex:2];
+        } else {
+            [s_enc setVertexBytes:&vc length:sizeof vc atIndex:1];
+        }
+        [s_enc setFragmentBytes:&mpc length:sizeof mpc atIndex:0];
+        for (k = 0; k < 4; k++) {
+            [s_enc setFragmentTexture:stex[k] atIndex:k];
+            [s_enc setFragmentSamplerState:sampler(&s_stage[k]) atIndex:k];
         }
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
@@ -1014,7 +1552,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
         on = getenv("RECOMP_FLIP_LOG") != NULL;
     if (!on)
         return;
-    fprintf(stderr, "[METAL] flip %llu batches %llu prog-skipped %llu skipped %llu"
+    fprintf(stderr, "[METAL] flip %llu batches %llu prog %llu skipped %llu"
             " culled %llu clears %llu tex %llu uploads %llu changed %llu rehash %llu"
             " flushes %llu present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
@@ -1064,15 +1602,21 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
     flip_log(surface_offset, rt);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (%s), %llu clears,"
-                " %llu draws, %llu skipped (%llu vertex-program), %llu culled,"
-                " %llu texture uploads, %llu rehashes, %llu write-backs\n",
+                " %llu draws (%llu vertex-program), %llu skipped, %llu culled,"
+                " %llu texture uploads, %llu rehashes, %llu write-backs;"
+                " shaders %llu vs + %llu fs, %llu compile errors;"
+                " %llu z-clears, %llu depth draws, %llu rt binds (%llu self copies)\n",
                 (unsigned long long)s_presents, surface_offset,
                 rt ? "drawn here" : "guest bytes",
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
-                (unsigned long long)s_draws_skipped, (unsigned long long)s_draws_prog,
+                (unsigned long long)s_draws_prog, (unsigned long long)s_draws_skipped,
                 (unsigned long long)s_draws_culled,
                 (unsigned long long)s_tex_uploads, (unsigned long long)s_tex_rehash,
-                (unsigned long long)s_writebacks);
+                (unsigned long long)s_writebacks,
+                (unsigned long long)s_vs_compiled, (unsigned long long)s_fs_compiled,
+                (unsigned long long)s_compile_errors,
+                (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
+                (unsigned long long)s_rtt_binds, (unsigned long long)s_self_copies);
     if (!pitch || !addr)
         return;
     xbox_FramebufferWindowSet(addr, pitch);
@@ -1083,7 +1627,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
 
 static const struct nv2a_pb_backend s_metal_backend = {
     metal_on_clear,
-    NULL,               /* on_zclear: depth is M3 */
+    metal_on_zclear,
     metal_on_draw,
     metal_on_flip,
     NULL, NULL, NULL, NULL,   /* visibility tests: the walker's fixed answer */

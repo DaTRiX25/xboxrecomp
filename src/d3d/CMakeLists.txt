@@ -2,7 +2,8 @@
 #   _WIN32 -> backed by Direct3D 11 (d3d8_*.c, d3d8_combiners.c, d3d8_vsh.c)
 #   Both   -> d3d8_vsh_parse.c, d3d8_combiners_parse.c (NV2A vertex-program
 #             and register-combiner decoders) and d3d8_vsh_hlsl.c,
-#             d3d8_combiners_hlsl.c (their HLSL emitters): no graphics API
+#             d3d8_combiners_hlsl.c (their HLSL emitters), d3d8_vsh_msl.c,
+#             d3d8_combiners_msl.c (their MSL emitters): no graphics API
 #   POSIX  -> backed by OpenGL 3.3 core via SDL2 + libepoxy (d3d8_gl.c)
 
 if(WIN32)
@@ -18,6 +19,8 @@ if(WIN32)
         d3d8_combiners_parse.c
         d3d8_vsh_hlsl.c
         d3d8_combiners_hlsl.c
+        d3d8_vsh_msl.c
+        d3d8_combiners_msl.c
         nv2a_pb_d3d11.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
@@ -42,6 +45,8 @@ else()
         d3d8_combiners_parse.c
         d3d8_vsh_hlsl.c
         d3d8_combiners_hlsl.c
+        d3d8_vsh_msl.c
+        d3d8_combiners_msl.c
     )
     find_package(SDL2 REQUIRED)
     find_package(PkgConfig REQUIRED)
@@ -81,3 +86,7 @@ if(MSVC)
 else()
     target_compile_options(xbox_d3d8 PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
+# The MSL emitters' (d3d8_msl.h) hash test; it builds on every host, and on
+# macOS also compiles each case with Metal.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_msl_split
+                 ${CMAKE_CURRENT_BINARY_DIR}/d3d8_msl_split)
