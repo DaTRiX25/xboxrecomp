@@ -15,6 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The runtime links against the title's dispatch; nothing here calls it. */
+void *recomp_lookup(unsigned long address) { (void)address; abort(); }
+void *recomp_lookup_manual(unsigned long address) { (void)address; abort(); }
+
 #define PERIOD 256
 #define SUB    NUM_SAMPLES_PER_FRAME      /* 32 */
 

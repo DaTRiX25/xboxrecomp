@@ -309,7 +309,7 @@ Wreckless did exactly this and reached its main loop with no renderer set up.
 
 **Diagnose before shimming**:
 - `RECOMP_AC97_READY` (on by default where the host can trap MMIO: x86-64
-  Windows/Proton) reports the codec ready and routes the APU aperture to the
+  Windows/Proton, and macOS/Linux arm64 through the A64 decoder) reports the codec ready and routes the APU aperture to the
   emulated APU. If behaviour changes with `RECOMP_AC97_READY=0`, the audio
   probe was the gate.
 - NV2A register space has no semantics by default and nothing raises a GPU

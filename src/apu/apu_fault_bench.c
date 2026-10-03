@@ -55,3 +55,40 @@ double apu_hook_fault_bench(unsigned n)
 }
 
 #endif /* _WIN32 */
+
+#if !defined(_WIN32) && defined(__aarch64__)
+#include <time.h>
+extern volatile int g_apu_hook_bench_active;    /* apu_mmio_hook.c */
+extern MCPXAPUState *g_apu_state;
+
+/* The POSIX arm64 twin: n trapped `ldr w` reads of PIO_FREE through SIGBUS,
+ * the A64 decoder and the model. */
+double apu_hook_fault_bench(unsigned n)
+{
+    extern ptrdiff_t xbox_GetMemoryOffset(void);
+    volatile uint32_t *p;
+    struct timespec a, b;
+    uint32_t sink = 0;
+    double us;
+
+    if (!g_apu_state || !n)
+        return 0;
+    p = (volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset() + 0xFE820010u);
+    g_apu_hook_bench_active = 1;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t v;
+        __asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(p) : "memory");
+        sink += v;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    g_apu_hook_bench_active = 0;
+    us = ((b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec)) / 1e3 / n;
+    fprintf(stderr, "[APU] fault bench: %u trapped reads of PIO_FREE, %.2f us"
+            " each (fault + signal + decode + model; value 0x%X)\n",
+            n, us, sink / n);
+    return us;
+}
+#elif !defined(_WIN32)
+double apu_hook_fault_bench(unsigned n) { (void)n; return 0; }
+#endif

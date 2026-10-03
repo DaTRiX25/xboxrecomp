@@ -266,13 +266,23 @@ static void load(void)
 
     /* Switches that default on: unset means on, =0 (or empty) off, so a
      * reader keeps asking only "is it set". Audio needs the host to service
-     * the APU's MMIO faults (x86-64 Windows/Proton); elsewhere it is off,
+     * the APU's MMIO faults (x86-64 Windows/Proton, or POSIX arm64 with the
+     * A64 decoder); elsewhere it is off,
      * with a note when asked for explicitly. */
     default_on(values, RENV_PB_EXEC, 1);
-#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+#if (defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))) || \
+    (!defined(_WIN32) && defined(__aarch64__))
     default_on(values, RENV_AC97_READY, 1);
 #else
     default_on(values, RENV_AC97_READY, 0);
+#endif
+
+#ifdef RECOMP_ENV_GAME_DEFAULTS
+    /* The game's defaults for toolkit keys (recomp_env_game.h): used when
+     * neither spelling is in the environment. */
+#define RENV_GAME_DEFAULT(id, v) if (!set[RENV_##id]) values[RENV_##id] = (v);
+    RECOMP_ENV_GAME_DEFAULTS(RENV_GAME_DEFAULT)
+#undef RENV_GAME_DEFAULT
 #endif
 
     /* Generated code (the recompiler's unresolved-stub file) reads its

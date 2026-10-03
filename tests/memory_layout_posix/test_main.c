@@ -132,6 +132,11 @@ int main(int argc, char **argv)
      * of which check reached it. */
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    /* Audio defaults on where the host traps MMIO (arm64 here), and then the
+     * MCPX aperture is left PROT_NONE for the trap. This test checks plain
+     * mappings, so it runs without it. */
+    recomp_env_set(RENV_AC97_READY, NULL);
+
     const char *path = argc > 1 ? argv[1] : "tools/conformance/test.xbe";
     size_t n = 0;
     unsigned char *xbe = load_xbe(path, &n);

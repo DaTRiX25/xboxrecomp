@@ -74,10 +74,26 @@ void mcpx_debug_end_frame(void) {}
  * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
+extern size_t g_xbox_total_ram;
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    /* RAM above the window's 64 MB. The target maps 128 MB (a devkit) and
+     * its heap runs from 0x038C0000 to 0x08000000, so most of what the title
+     * malloc()s -- BLiNX 2's sound buffers among them, handed to DirectSound
+     * as plain pointers and turned into physical addresses by
+     * MmGetPhysicalAddress, which is the identity for RAM -- sits above
+     * 0x04000000. Folding those into the low 64 MB, as the fallback below
+     * used to, read .text as PCM: full-scale white noise on every effect, and
+     * music that lost its upper half each time its ring crossed the boundary.
+     * There is no window ambiguity up here, so it is RAM, as far as the host
+     * mapped it. */
+    if (a >= (64u << 20)) {
+        if (a < g_xbox_total_ram)
+            return g_apu_ram_ptr + a;
+        return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+    }
     /* A page the contiguous allocator handed out is the window, even where
      * it overlaps the image's physical range: BLiNX 2's image runs to
      * 0x0303AC20 (its BSS), and DirectSound's voice array sits at physical
@@ -93,6 +109,25 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
     if (a < xbox_ContiguousAllocatedBytes())
         return g_apu_ram_ptr + 0x80000000u + a;
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+}
+
+/* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
+ * per-voice line: "win" (a page the contiguous allocator handed out), "img"
+ * (inside the XBE image), "hiwin" (below the arena's high-water mark but not
+ * a live page), "ram" (plain RAM below 64 MB) or "wrap" (at or above 64 MB,
+ * which the fallback folds into the low 64 MB). */
+const char *mcpx_apu_phys_class(uint64_t addr)
+{
+    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    if (a >= (64u << 20))
+        return a < g_xbox_total_ram ? "ram" : "wrap";
+    if (xbox_ContiguousPageMap()[a >> 12])
+        return "win";
+    if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return "img";
+    if (a < xbox_ContiguousAllocatedBytes())
+        return "hiwin";
+    return "ram";
 }
 
 /* The interrupt line, as the frame thread sees it. update_irq used to call
@@ -148,8 +183,10 @@ extern APU_TLS uint32_t g_fs_base;
 ApuIrqStats apu_irq_stats;
 
 /* Every 5 s under RECOMP_APU_TRACE: traps, deliveries, frames held off by a
- * raised IRQL, and deliveries forced after the full hold-off. Traps well
- * above deliveries, or many forced ones, are what costs playback. */
+ * raised IRQL, deliveries forced after the full hold-off, the running count
+ * of VP/DSP frames (se_frame) and the device underruns. Traps well above
+ * deliveries, many forced ones, or se_frames standing still are what costs
+ * playback. */
 static void apu_irq_stats_line(void)
 {
     static int trace = -1;
@@ -164,9 +201,11 @@ static void apu_irq_stats_line(void)
     if (now < next_ns)
         return;
     if (next_ns)
-        fprintf(stderr, "[APU-IRQ] traps %u delivered %u held-frames %u forced %u\n",
+        fprintf(stderr, "[APU-IRQ] traps %u delivered %u held-frames %u forced %u se_frames %u fe-trapped-frames %u underruns %u\n",
                 apu_irq_stats.traps, apu_irq_stats.delivered,
-                apu_irq_stats.held_frames, apu_irq_stats.forced);
+                apu_irq_stats.held_frames, apu_irq_stats.forced,
+                apu_irq_stats.se_frames, apu_irq_stats.fe_trapped_frames,
+                xa2_underruns());
     next_ns = now + 5000000000ull;
 }
 
@@ -385,14 +424,14 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
                          MIXER_FRAME_SAMPLES, &low, &high);
         d->monitor.queued_bytes_low  = low * SAMPLE_BYTES;
         d->monitor.queued_bytes_high = high * SAMPLE_BYTES;
-        fprintf(stderr, "[APU] Using XAudio2 audio backend (pacing: %d..%d samples queued)\n",
-                low, high);
+        fprintf(stderr, "[APU] Using %s audio backend (pacing: %d..%d samples queued)\n",
+                XA2_BACKEND_NAME, low, high);
         if (high < 2 * MIXER_FRAME_SAMPLES)
             fprintf(stderr, "[APU] device buffers hold under two EP periods;"
                             " expect underruns\n");
         return;
     }
-    fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
+    fprintf(stderr, "[APU] %s unavailable, falling back to waveOut\n", XA2_BACKEND_NAME);
 
     WAVEFORMATEX wfx = { 0 };
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -646,6 +685,7 @@ static void se_frame(MCPXAPUState *d)
         d->sleep_acc_us = 0;
     }
     d->frame_count++;
+    apu_irq_stats.se_frames++;
 
     /* Buffer for all mixbins for this frame */
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
@@ -699,9 +739,26 @@ static void *mcpx_apu_frame_thread(void *arg)
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
+        bool fe_trapped = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+                          (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
+                          !g_test_tone.active;
+
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
+        } else if (fe_trapped) {
+            /* The title has the APU on, but the front end is trapped (a voice
+             * went idle under FETFORCE1) and stays so until DirectSound's
+             * service routine clears FECTL. No frame is produced meanwhile,
+             * as in xemu, which waits here and re-checks: the device queue
+             * holds what is already paced into it. This used to fall through
+             * to the lightweight branch, which advances the frame counter
+             * and hands the device a period with this frame's 32 samples
+             * silent -- one hole per trapped frame, four or five in a row
+             * when the routine ran a DPC later (BLiNX 2: 32-160 samples of
+             * digital zero in the music every few seconds). The interrupt is
+             * delivered below; the wait is after it. */
+            apu_irq_stats.fe_trapped_frames++;
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
@@ -731,6 +788,14 @@ static void *mcpx_apu_frame_thread(void *arg)
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
+        if (fe_trapped &&
+            (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
+             NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {
+            /* Still trapped after the delivery (held off at raised IRQL, or
+             * cleared from a DPC): give the title a millisecond with the lock
+             * dropped rather than spinning on it. */
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+        }
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -791,6 +856,17 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
     d->ram_ptr = ram_ptr;
+
+    /* RECOMP_DEBUG=apu_solo=<voice>: mute every other voice in the mix, for
+     * telling which voice a sound (or a noise) comes from. */
+    {
+        const char *solo = recomp_env(RENV_APU_SOLO);
+        if (solo && *solo) {
+            g_dbg_voice_monitor = atoi(solo);
+            fprintf(stderr, "[APU] solo: only voice %d is mixed\n",
+                    g_dbg_voice_monitor);
+        }
+    }
 
     d->set_irq = false;
     d->exiting = false;
