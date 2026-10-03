@@ -54,7 +54,12 @@ static int xa2_env_int(const char *name, int def, int lo, int hi)
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
 static IXAudio2SourceVoice    *g_xa2_source = NULL;
-static int16_t                 g_xa2_bufs[XA2_NUM_BUFS_MAX][XA2_BUF_SAMPLES_MAX][2];
+/* One slot more than can be queued: with every buffer on the voice, the
+ * next one is staged in a slot the voice does not hold. With only
+ * XA2_NUM_BUFS slots the staging buffer was the oldest queued one, and
+ * filling it overwrote audio the device had not played yet. */
+#define XA2_RING (XA2_NUM_BUFS + 1)
+static int16_t                 g_xa2_bufs[XA2_NUM_BUFS_MAX + 1][XA2_BUF_SAMPLES_MAX][2];
 static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_fill = 0;  /* samples staged in bufs[next_buf] */
 static unsigned  g_xa2_underruns;
@@ -200,7 +205,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
         if (FAILED(hr)) { ok = 0; continue; }
 
-        g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
+        g_xa2_next_buf = (idx + 1) % XA2_RING;
         g_xa2_frames_written++;
     }
     return ok;

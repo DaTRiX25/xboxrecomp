@@ -260,7 +260,10 @@ int main(void)
         high = xa2_get_buffer_count() * xa2_get_buffer_size() / 256;
         CHECK(high == 8);
         for (int step = 0; step < 300; step++) {
-            if (step % 3 == 2 && queue_count > 0) {          /* one played */
+            /* The voice starts playing once the queue has filled (a
+             * pre-roll); before that, a fake that drains faster than the
+             * first periods arrive runs dry by construction. */
+            if (step >= 8 && step % 3 == 2 && queue_count > 0) { /* one played */
                 for (UINT32 i = 0; i + 1 < queue_count; i++) {
                     queued[i] = queued[i + 1];
                     queued_bytes[i] = queued_bytes[i + 1];
@@ -274,13 +277,17 @@ int main(void)
         }
         CHECK(refused == 0);
         CHECK(xa2_underruns() == 0);
+        check_queued();                     /* no queued buffer overwritten */
         queue_count = 0;                                     /* ran dry */
         xa2_queued_granules();
         xa2_queued_granules();
         CHECK(xa2_underruns() == 1);
-        xa2_submit_samples(&period[0][0], 256);
-        xa2_submit_samples(&period[0][0], 256);              /* refilled */
-        CHECK(xa2_queued_granules() == 2);
+        {
+            int staged = xa2_queued_granules();   /* the partly filled buffer */
+            xa2_submit_samples(&period[0][0], 256);
+            xa2_submit_samples(&period[0][0], 256);          /* refilled */
+            CHECK(xa2_queued_granules() == staged + 2);
+        }
         queue_count = 0;
         xa2_queued_granules();
         CHECK(xa2_underruns() == 2);
