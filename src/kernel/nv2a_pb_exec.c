@@ -784,9 +784,11 @@ static int write_present_bmp(const char *path)
 static void dump_present_bmp(void)
 {
     const char *prefix = getenv("RECOMP_FB_DUMP");
+    uint32_t bpp = s_present.w ? s_present.pitch / s_present.w : 0;
     char path[512];
 
-    if (!prefix || !s_present.offset)
+    /* Check the format before taking a number, so the numbering has no gaps. */
+    if (!prefix || !s_present.offset || (bpp != 2 && bpp != 4))
         return;
     snprintf(path, sizeof path, "%s%03d.bmp", prefix, s_bmp_seq++);
     if (write_present_bmp(path) && s_bmp_seq == 1)

@@ -16,9 +16,10 @@
  *                shared decode (nv2a_backend_common.h).
  *   on_flip   -> commit, wait, read the surface the walker picked for this flip
  *                (nv2a_pb_present_state) back into guest memory (RECOMP_FB_DUMP
- *                and the title read those bytes), and hand the window the same
- *                texture's pixels (xbox_FramebufferWindowPresentPixels) when it
- *                is up; RECOMP_WINDOW_SHOT reads back what the window drew.
+ *                and the title read those bytes), and, when the window is up,
+ *                read the same texture back again for it
+ *                (xbox_FramebufferWindowPresentPixels; a readback, not
+ *                zero-copy); RECOMP_WINDOW_SHOT reads back what the window drew.
  *
  * Opt-in: RECOMP_PB_BACKEND=metal (nv2a_pb_metal_register_from_env). The CPU
  * rasteriser stays the default and the oracle.
@@ -80,7 +81,7 @@ extern void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch);
 extern int  xbox_FramebufferWindowRunning(void);
 extern void xbox_FramebufferWindowPresentPixels(const void *px, uint32_t w, uint32_t h,
                                                 uint32_t pitch, uint32_t bpp);
-static uint64_t s_window_presents;   /* frames handed to the window from a texture */
+static uint64_t s_window_presents;   /* frames sent to the window by texture readback */
 
 /* ---- shader ABI ------------------------------------------------------------
  *
@@ -1787,6 +1788,25 @@ static void metal_on_zpass_clear(void)
     }
 }
 
+static uint64_t s_report_commits;    /* flushes at GET_REPORT */
+
+/* Does the report just pushed at va count in the open command buffer? */
+static int report_in_cmd(uint32_t va)
+{
+    const struct nv2a_occ_report *p;
+    int k, i;
+    if (!s_occ.npend || s_occ.pend[s_occ.npend - 1].va != va)
+        return 0;
+    p = &s_occ.pend[s_occ.npend - 1];
+    for (k = 0; k < p->n; k++) {
+        const OccQuery *q = (const OccQuery *)p->q[k];
+        for (i = 0; i < q->n; i++)
+            if (q->cmd[i] == s_cmd)
+                return 1;
+    }
+    return 0;
+}
+
 static int metal_on_report(uint32_t va)
 {
     if (!occ_ready_on())
@@ -1794,9 +1814,14 @@ static int metal_on_report(uint32_t va)
     @autoreleasepool {
         nv2a_occ_report(&s_occ, va, occ_mode() == 1);
         /* Commit now, so the count can land within the frame, as a D3D11
-         * query's does; held to the flip, it lands a frame late. */
-        if (occ_mode() == 0 && s_cmd)
+         * query's does; held to the flip, it lands a frame late. Only when
+         * the report counts in s_cmd: each commit ends the pass (a tile
+         * store and load), and a report whose queries drew nothing, or
+         * drew in a buffer already committed, gains nothing from it. */
+        if (occ_mode() == 0 && s_cmd && report_in_cmd(va)) {
+            s_report_commits++;
             flush(0);
+        }
     }
     return 1;
 }
@@ -1891,7 +1916,8 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 " %llu texture uploads, %llu rehashes, %llu write-backs;"
                 " shaders %llu vs + %llu fs, %llu compile errors;"
                 " %llu z-clears, %llu depth draws, %llu rt binds (%llu self copies);"
-                " %llu window presents from the texture\n",
+                " %llu window presents (texture readback); %llu flushes,"
+                " %llu at GET_REPORT\n",
                 (unsigned long long)s_presents, surface_offset,
                 rt ? "drawn here" : "guest bytes",
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
@@ -1903,13 +1929,17 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_compile_errors,
                 (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
                 (unsigned long long)s_rtt_binds, (unsigned long long)s_self_copies,
-                (unsigned long long)s_window_presents);
+                (unsigned long long)s_window_presents,
+                (unsigned long long)s_flushes, (unsigned long long)s_report_commits);
     if (!pitch || !addr)
         return;
     xbox_FramebufferWindowSet(addr, pitch);
-    /* Present (4.5): a surface drawn here goes to the window from its
-     * texture, read back after the flip's wait, not from the guest bytes;
-     * one the backend never drew (guest bytes) as the CPU path presents it. */
+    /* Present (4.5): a surface drawn here reaches the window by readback,
+     * not zero-copy: getBytes of rt->tex after the flip's wait (GPU->CPU),
+     * a copy into the window's slot, then SDL_UpdateTexture (CPU->GPU),
+     * about 1.2 MB each way per 640x480 frame. It reads the texture, not
+     * the guest bytes. A surface the backend never drew (guest bytes) goes
+     * as the CPU path presents it. A zero-copy CAMetalLayer blit is 4.9. */
     if (rt && xbox_FramebufferWindowRunning()) {
         static uint8_t *px;
         static size_t cap;
