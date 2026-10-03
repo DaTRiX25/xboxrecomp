@@ -1781,7 +1781,9 @@ class Lifter:
             r = ops[1].reg
             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                 src = f"SX8({src})"
-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
+            # bp and sp too: without them `movsx eax, bp` read LO16(ebp)
+            # zero-extended (BLiNX 2's right-stick Y, 0x0021C457).
+            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
                 src = f"SX16({src})"
         return [_fmt_operand_write(ops[0], src)]
 

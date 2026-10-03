@@ -1,6 +1,11 @@
 # Xbox Input → XInput Compatibility Layer
+#   input_map.c     the host -> Duke mapping table and pure helpers
+#   input_core.c    public API, connection cache, probe backoff
+#   xinput_device.c host backends (XInput on Windows, SDL2 elsewhere)
 
 add_library(xbox_input STATIC
+    input_map.c
+    input_core.c
     xinput_device.c
 )
 
@@ -10,7 +15,7 @@ if(WIN32)
     target_link_libraries(xbox_input PUBLIC platform xinput)
 else()
     find_package(SDL2 REQUIRED)
-    target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)
+    target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2 m)
 endif()
 
 if(MSVC)
@@ -18,3 +23,8 @@ if(MSVC)
 else()
     target_compile_options(xbox_input PRIVATE -Wall -Wextra -O2)
 endif()
+
+# The mapping table, deadzone and connection cache, against a fake backend
+# (every host, no device needed).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_map
+                 ${CMAKE_CURRENT_BINARY_DIR}/input_map)

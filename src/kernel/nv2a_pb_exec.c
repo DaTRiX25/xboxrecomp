@@ -38,6 +38,7 @@
 #include "nv2a_vsh_cpu.h"
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_zbuf_cache.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -2120,27 +2121,42 @@ static float vsh_zmax(void)
     return nv2a_zmax(s_gpu.format);
 }
 
+/* One depth/stencil buffer per zeta offset and clip extent, picked by
+ * zb_select (nv2a_zbuf_cache.h, which also says why: issue #36, and what the
+ * key leaves out). s_zbuf/s_sbuf/s_zbuf_w/s_zbuf_h name the live entry. */
+static ZbCache  s_zbc;
+static float   *s_zb_z[ZB_MAX];
+static uint8_t *s_zb_s[ZB_MAX];
+
 static int vsh_zbuf_ready(void)
 {
-    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h;
+    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h, i;
+    ZbPick pk;
+
     if (!w || !h || w > 4096 || h > 4096)
         return 0;
-    if (w != s_zbuf_w || h != s_zbuf_h || !s_zbuf || !s_sbuf) {
-        float *n = (float *)realloc(s_zbuf, (size_t)w * h * sizeof(float));
-        uint8_t *sn;
-        uint32_t i;
-        if (!n)
+    pk = zb_select(&s_zbc, s_vsh.zeta_offset, w, h);
+    if (pk.evicted && s_zbc.evictions == 1)
+        fprintf(stderr, "[VSH] depth buffer cache full (%d zeta/extent keys): evicting"
+                        " the least recently used; depth may be lost (#36)\n", ZB_MAX);
+    if (pk.fresh || !s_zb_z[pk.index] || !s_zb_s[pk.index]) {
+        free(s_zb_z[pk.index]);
+        free(s_zb_s[pk.index]);
+        s_zb_z[pk.index] = (float *)malloc((size_t)w * h * sizeof(float));
+        s_zb_s[pk.index] = (uint8_t *)malloc((size_t)w * h);
+        if (!s_zb_z[pk.index] || !s_zb_s[pk.index]) {
+            free(s_zb_z[pk.index]); free(s_zb_s[pk.index]);
+            s_zb_z[pk.index] = NULL; s_zb_s[pk.index] = NULL;
+            s_zbc.slot[pk.index].used = 0;
+            s_zbuf = NULL; s_sbuf = NULL; s_zbuf_w = s_zbuf_h = 0;
             return 0;
-        s_zbuf = n;
-        sn = (uint8_t *)realloc(s_sbuf, (size_t)w * h);
-        if (!sn)
-            return 0;
-        s_sbuf = sn;
-        s_zbuf_w = w; s_zbuf_h = h;
+        }
         for (i = 0; i < w * h; i++)
-            s_zbuf[i] = 1.0f;
-        memset(s_sbuf, 0, (size_t)w * h);
+            s_zb_z[pk.index][i] = 1.0f;
+        memset(s_zb_s[pk.index], 0, (size_t)w * h);
     }
+    s_zbuf = s_zb_z[pk.index]; s_sbuf = s_zb_s[pk.index];
+    s_zbuf_w = w; s_zbuf_h = h;
     return 1;
 }
 
@@ -4432,14 +4448,16 @@ static void vsh_report(void)
     fprintf(stderr, "[VSH] viewport offset %.2f %.2f %.2f %.2f scale %.2f %.2f"
                     " %.2f %.2f | c58 %.2f %.2f %.2f c59 %.2f %.2f %.2f |"
                     " cull %d face 0x%X front 0x%X | depth %d func 0x%X mask %d"
-                    " | surface fmt 0x%X zeta 0x%X, %u clears (%u with Z)\n",
+                    " | surface fmt 0x%X zeta 0x%X, %u clears (%u with Z),"
+                    " %llu depth buffer evictions\n",
             s_vsh.vp_off[0], s_vsh.vp_off[1], s_vsh.vp_off[2], s_vsh.vp_off[3],
             s_vsh.vp_scale[0], s_vsh.vp_scale[1], s_vsh.vp_scale[2], s_vsh.vp_scale[3],
             s_vsh.c[58][0], s_vsh.c[58][1], s_vsh.c[58][2],
             s_vsh.c[59][0], s_vsh.c[59][1], s_vsh.c[59][2],
             s_vsh.cull_enable, s_vsh.cull_face, s_vsh.front_face,
             s_vsh.depth_enable, s_vsh.depth_func, s_vsh.depth_mask,
-            s_gpu.format, s_vsh.zeta_offset, s_vsh.clears_seen, s_vsh.zclears);
+            s_gpu.format, s_vsh.zeta_offset, s_vsh.clears_seen, s_vsh.zclears,
+            (unsigned long long)s_zbc.evictions);
     for (a = 0; a < NV_VERTEX_ATTRS; a++) {
         int any = 0;
         for (t = 0; t < 8; t++) any |= s_vsh.fmt_seen[a][t] != 0;
@@ -4860,6 +4878,10 @@ static void get_report(uint32_t param)
 
 /* RECOMP_PB_BACKEND=null: the walker and its decode, drawing nothing. Times
  * the platform-independent part of a frame on its own (the [PB-PERF] line). */
+/* Batches handed to a GPU backend that writes its frame back to guest memory
+ * (writes_back): the CPU rasteriser's tris_drawn stays put under one, and
+ * RECOMP_FB_DUMP_FLIPS reads "drew something" from both. */
+static uint32_t s_gpu_backend_batches;
 static int s_null_draw_us;  /* RECOMP_PB_NULL_DRAW_US: a backend's cost, simulated */
 static void null_on_draw(const struct nv2a_pb_draw *d)
 {
@@ -4933,6 +4955,8 @@ static void draw_primitive(void)
         d.program      = vsh_batch_active();
         s_backend->on_draw(&d);
         s_perf.draw += rt_now() - t0;
+        if (s_backend->writes_back)
+            s_gpu_backend_batches++;
     }
     s_perf.batches++;
 
@@ -5212,6 +5236,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         {   /* RECOMP_PB_BACKEND=d3d11: src/d3d/nv2a_pb_d3d11.c */
             extern void nv2a_pb_d3d11_register_from_env(void);
             nv2a_pb_d3d11_register_from_env();
+        }
+#endif
+#ifdef __APPLE__
+        {   /* RECOMP_PB_BACKEND=metal: src/d3d/nv2a_pb_metal.m */
+            extern void nv2a_pb_metal_register_from_env(void);
+            nv2a_pb_metal_register_from_env();
         }
 #endif
         {
@@ -5507,18 +5537,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             static int every = -1;
             static unsigned dumped;
             static uint32_t prev_tris;
+            uint32_t drew = s_gpu.tris_drawn + s_gpu_backend_batches;
             if (every < 0) {
                 const char *e = getenv("RECOMP_FB_DUMP_FLIPS");
                 every = e ? atoi(e) : 0;
             }
             if (every > 0 && s_gpu.flips % (uint32_t)every == 0
-                    && s_gpu.tris_drawn != prev_tris && dumped < 200) {
+                    && drew != prev_tris && dumped < 200) {
                 dumped++;
                 fprintf(stderr, "  [GPU] flip %u: frame dump\n", s_gpu.flips);
                 dump_present_bmp();
             }
             if (every > 0 && s_gpu.flips % (uint32_t)every == 0)
-                prev_tris = s_gpu.tris_drawn;
+                prev_tris = drew;
         }
         /* RECOMP_FLIP_LOG=1: every flip, with the batches drawn since the last. */
         {

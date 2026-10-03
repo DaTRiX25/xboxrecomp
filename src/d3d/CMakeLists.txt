@@ -2,7 +2,8 @@
 #   _WIN32 -> backed by Direct3D 11 (d3d8_*.c, d3d8_combiners.c, d3d8_vsh.c)
 #   Both   -> d3d8_vsh_parse.c, d3d8_combiners_parse.c (NV2A vertex-program
 #             and register-combiner decoders) and d3d8_vsh_hlsl.c,
-#             d3d8_combiners_hlsl.c (their HLSL emitters): no graphics API
+#             d3d8_combiners_hlsl.c (their HLSL emitters), d3d8_vsh_msl.c,
+#             d3d8_combiners_msl.c (their MSL emitters): no graphics API
 #   POSIX  -> backed by OpenGL 3.3 core via SDL2 + libepoxy (d3d8_gl.c)
 
 if(WIN32)
@@ -18,6 +19,8 @@ if(WIN32)
         d3d8_combiners_parse.c
         d3d8_vsh_hlsl.c
         d3d8_combiners_hlsl.c
+        d3d8_vsh_msl.c
+        d3d8_combiners_msl.c
         nv2a_pb_d3d11.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
@@ -42,6 +45,8 @@ else()
         d3d8_combiners_parse.c
         d3d8_vsh_hlsl.c
         d3d8_combiners_hlsl.c
+        d3d8_vsh_msl.c
+        d3d8_combiners_msl.c
     )
     find_package(SDL2 REQUIRED)
     find_package(PkgConfig REQUIRED)
@@ -53,6 +58,20 @@ else()
     # in via add_subdirectory from tests/, where the link fails with
     # "library 'epoxy' not found". The _LINK_LIBRARIES form is absolute paths.
     target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
+    if(APPLE)
+        # The pushbuffer executor's Metal backend (RECOMP_PB_BACKEND=metal).
+        # Manual retain/release (no -fobjc-arc); shaders are MSL compiled at
+        # runtime, so no metallib build step.
+        target_sources(xbox_d3d8 PRIVATE nv2a_pb_metal.m)
+        target_include_directories(xbox_d3d8 PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        target_link_libraries(xbox_d3d8 PUBLIC
+            "-framework Metal" "-framework QuartzCore" "-framework Foundation")
+        # The executor's backend, driven by a synthetic stream: Metal against
+        # the CPU rasteriser, frame by frame.
+        add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_backend_smoke
+                         ${CMAKE_CURRENT_BINARY_DIR}/nv2a_backend_smoke)
+    endif()
 endif()
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -67,3 +86,7 @@ if(MSVC)
 else()
     target_compile_options(xbox_d3d8 PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
+# The MSL emitters' (d3d8_msl.h) hash test; it builds on every host, and on
+# macOS also compiles each case with Metal.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_msl_split
+                 ${CMAKE_CURRENT_BINARY_DIR}/d3d8_msl_split)
