@@ -36,11 +36,14 @@
  *  - Guest memory is touched on the executor's thread only: no completion
  *    handlers; the flip waits for the command buffer and then copies.
  *
- * Depth/stencil and render-to-texture as the D3D11 backend (M2).
- * Not yet: occlusion queries (the walker reports
- * RECOMP_ZPASS_FIXED for a backend without on_report), swizzled render
- * targets. The mip LOD bias is a sample() argument (MsPsConsts.tex_bias),
- * not a sampler field, so every macOS takes the same path.
+ * Depth/stencil and render-to-texture as the D3D11 backend (M2); visibility
+ * tests (GET_REPORT) from Metal visibility results through the shared
+ * tracker (M3, "Visibility tests" below). Near clipping needs nothing extra:
+ * the vertex programs hand Metal clip-space positions (w kept, as for D3D11)
+ * and the default MTLDepthClipModeClip clips at the near and far planes, as
+ * D3D11's DepthClipEnable does. Not yet: swizzled render targets. The mip
+ * LOD bias is a sample() argument (MsPsConsts.tex_bias), not a sampler
+ * field, so every macOS takes the same path.
  *
  * Everything runs on the NV2A ack thread (or the smoke test's main thread).
  *
@@ -57,6 +60,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
@@ -194,6 +198,8 @@ static int                         s_unified;  /* shared textures readable */
 static id<MTLBuffer> s_vb, s_ib;
 static NSUInteger    s_vb_size, s_vb_pos, s_ib_size, s_ib_pos;
 
+#define VIS_SLOTS 8192
+
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped, s_draws_prog,
                 s_draws_culled, s_draws_tex, s_tex_uploads, s_tex_rehash,
                 s_tex_changed, s_flushes, s_writebacks, s_cmd_errors;
@@ -229,9 +235,19 @@ static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
 
+/* Visibility tests (see "Visibility tests" below): the slot counting on the
+ * open pass, opened by begin_pass and closed here. */
+static void occ_pass_begin(void);
+static void occ_pass_end(void);
+static void occ_after_wait(void);
+static id<MTLBuffer> s_vis;      /* visibility result slots, 8 bytes each */
+static struct OccQuery *s_occ_q;     /* the query counting now, or NULL */
+static int s_occ_slot = -1;          /* its slot on s_enc */
+
 static void end_encoder(void)
 {
     if (s_enc) {
+        occ_pass_end();
         [s_enc endEncoding];
         [s_enc release];
         s_enc = nil;
@@ -268,6 +284,8 @@ static void flush(int wait)
     [s_cmd release];
     s_cmd = nil;
     s_flushes++;
+    if (wait)
+        occ_after_wait();
 }
 
 static void ensure_cmd(void)
@@ -308,9 +326,11 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
         rp.stencilAttachment.clearStencil = (zmask & 2u) ? (st & 0xFFu) : 0u;
         dt->fresh = 0;
     }
+    rp.visibilityResultBuffer = s_vis;
     s_enc = [[s_cmd renderCommandEncoderWithDescriptor:rp] retain];
     s_enc_rt = rt;
     s_enc_dt = dt;
+    occ_pass_begin();
 }
 
 static void begin_encoder(RenderTarget *rt, int clear, const double c[4])
@@ -370,7 +390,9 @@ static int init(void)
         s_ib_size = 4u << 20;
         s_vb = [s_dev newBufferWithLength:s_vb_size options:MTLResourceStorageModeShared];
         s_ib = [s_dev newBufferWithLength:s_ib_size options:MTLResourceStorageModeShared];
-        if (!s_vb || !s_ib) {
+        s_vis = [s_dev newBufferWithLength:VIS_SLOTS * 8u
+                                   options:MTLResourceStorageModeShared];
+        if (!s_vb || !s_ib || !s_vis) {
             fprintf(stderr, LOGP "buffer creation failed\n");
             return 0;
         }
@@ -1307,8 +1329,11 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
 
     if (!init())
         return;
-    if (g->color_keep == 0xFFFFFFFFu && !(v->depth_enable && v->depth_mask) && !use_s)
-        return;                         /* writes nothing */
+    /* A batch that writes nothing is dropped, unless a visibility test is
+     * counting it: a test's bounding draws typically mask every write. */
+    if (g->color_keep == 0xFFFFFFFFu && !(v->depth_enable && v->depth_mask) && !use_s
+            && !s_occ_q)
+        return;
     if (!d->idx_count) {
         s_draws_skipped++;
         return;
@@ -1543,18 +1568,260 @@ static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
     s_writebacks++;
 }
 
+/* ---- Visibility tests: Metal visibility-result counting ---------------------
+ *
+ * The shared tracker (nv2a_occ, nv2a_backend_common.h) as the D3D11 backend
+ * drives it: BeginVisibilityTest is CLEAR_REPORT_VALUE +
+ * SET_ZPASS_PIXEL_COUNT_ENABLE(1), EndVisibilityTest is ENABLE(0) +
+ * GET_REPORT; each stretch with counting on is one query, and a report sums
+ * the stretches since the last clear, completing later (poll at every batch
+ * and flip, with a flush on the ack thread's idle tick) or as visible after
+ * 250 ms. The count is samples passing depth and stencil, alpha-test discard
+ * applied.
+ *
+ * A query here is a list of slots in s_vis, one per render pass it spans:
+ * Metal resets, at the start of a pass, every offset that pass names (even
+ * in setVisibilityResultMode:Disabled), so a slot never outlives its pass
+ * and a stretch over a pass change takes a new one. Slots accumulate within
+ * the pass. A result is in once every slot's command buffer has completed;
+ * a flush commits the open command buffer so that it can. A slot freed while
+ * its command buffer is still in flight retires until the flip's wait.
+ *
+ * RECOMP_METAL_OCC=sync waits at GET_REPORT; =fixed leaves reports to the
+ * walker (RECOMP_ZPASS_FIXED, every test visible). */
+#define OCC_QSLOTS 16
+#define OCC_POOL   (NV2A_OCC_PENDING * 2 + NV2A_OCC_SEG)
+typedef struct OccQuery {
+    int                   slot[OCC_QSLOTS];
+    id<MTLCommandBuffer>  cmd[OCC_QSLOTS];   /* retained */
+    int                   n, ovf;
+    struct OccQuery      *next;              /* free list */
+} OccQuery;
+static OccQuery          s_qpool[OCC_POOL];
+static OccQuery         *s_qfree;
+static int               s_qmade;
+static unsigned char     s_vis_used[VIS_SLOTS];
+static int               s_vis_next;
+static int               s_retire[VIS_SLOTS], s_nretire;
+static struct nv2a_occ   s_occ;
+static int               s_occ_mode = -1;  /* 0 defer, 1 sync, 2 fixed */
+static uint64_t          s_occ_ovf;
+
+static int occ_mode(void)
+{
+    if (s_occ_mode < 0) {
+        const char *e = getenv("RECOMP_METAL_OCC");
+        s_occ_mode = !e ? 0 : !strcasecmp(e, "sync") ? 1 : !strcasecmp(e, "fixed") ? 2 : 0;
+    }
+    return s_occ_mode;
+}
+
+static int vis_alloc(void)
+{
+    int i, k;
+    for (k = 0; k < VIS_SLOTS; k++) {
+        i = (s_vis_next + k) % VIS_SLOTS;
+        if (!s_vis_used[i]) {
+            s_vis_used[i] = 1;
+            s_vis_next = (i + 1) % VIS_SLOTS;
+            ((uint64_t *)[s_vis contents])[i] = 0;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void occ_pass_begin(void)
+{
+    OccQuery *q = s_occ_q;
+    int i;
+    if (!q || !s_enc || s_occ_slot >= 0)
+        return;
+    if (q->n >= OCC_QSLOTS || (i = vis_alloc()) < 0) {
+        q->ovf = 1;
+        s_occ_ovf++;
+        return;
+    }
+    q->slot[q->n] = i;
+    q->cmd[q->n] = [s_cmd retain];
+    q->n++;
+    [s_enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(NSUInteger)i * 8u];
+    s_occ_slot = i;
+}
+
+static void occ_pass_end(void)
+{
+    if (s_occ_slot >= 0 && s_enc)
+        [s_enc setVisibilityResultMode:MTLVisibilityResultModeDisabled
+                                offset:(NSUInteger)s_occ_slot * 8u];
+    s_occ_slot = -1;
+}
+
+static uint64_t occ_now_us(void *ctx)
+{
+    struct timespec ts;
+    (void)ctx;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static void *occ_get(void *ctx)
+{
+    OccQuery *q;
+    (void)ctx;
+    if (s_qfree) {
+        q = s_qfree;
+        s_qfree = q->next;
+    } else if (s_qmade < OCC_POOL) {
+        q = &s_qpool[s_qmade++];
+    } else {
+        return NULL;
+    }
+    q->n = 0;
+    q->ovf = 0;
+    return q;
+}
+
+static int cmd_done(id<MTLCommandBuffer> c)
+{
+    MTLCommandBufferStatus st = [c status];
+    return st == MTLCommandBufferStatusCompleted || st == MTLCommandBufferStatusError;
+}
+
+static void occ_put(void *ctx, void *qv)
+{
+    OccQuery *q = (OccQuery *)qv;
+    int i;
+    (void)ctx;
+    if (!q)
+        return;
+    if (q == s_occ_q) {     /* not expected: the tracker ends a query first */
+        occ_pass_end();
+        s_occ_q = NULL;
+    }
+    for (i = 0; i < q->n; i++) {
+        if (cmd_done(q->cmd[i]))
+            s_vis_used[q->slot[i]] = 0;
+        else
+            s_retire[s_nretire++] = q->slot[i];
+        [q->cmd[i] release];
+    }
+    q->n = 0;
+    q->next = s_qfree;
+    s_qfree = q;
+}
+
+static void occ_begin(void *ctx, void *qv)
+{
+    (void)ctx;
+    occ_pass_end();
+    s_occ_q = (OccQuery *)qv;
+    occ_pass_begin();
+}
+
+static void occ_end(void *ctx, void *qv)
+{
+    (void)ctx;
+    if (s_occ_q == (OccQuery *)qv) {
+        occ_pass_end();
+        s_occ_q = NULL;
+    }
+}
+
+static int occ_result(void *ctx, void *qv, int flush_gpu, uint64_t *count)
+{
+    OccQuery *q = (OccQuery *)qv;
+    const uint64_t *v = (const uint64_t *)[s_vis contents];
+    uint64_t sum = 0;
+    int i;
+    (void)ctx;
+    for (i = 0; i < q->n; i++) {
+        if (q->cmd[i] == s_cmd) {       /* not committed yet */
+            if (!flush_gpu)
+                return 0;
+            flush(0);
+        }
+        if (!cmd_done(q->cmd[i]))
+            return 0;
+    }
+    for (i = 0; i < q->n; i++)
+        sum += v[q->slot[i]];
+    *count = q->ovf ? NV2A_OCC_VISIBLE : sum;
+    return 1;
+}
+
+static const struct nv2a_occ_ops s_occ_ops = {
+    occ_get, occ_put, occ_begin, occ_end, occ_result, occ_now_us, NULL
+};
+
+static int occ_ready_on(void)
+{
+    if (occ_mode() == 2 || !init())
+        return 0;
+    if (!s_occ.ops)
+        nv2a_occ_init(&s_occ, &s_occ_ops, (uint8_t *)xbox_GetMemoryOffset());
+    return 1;
+}
+
+static void metal_on_zpass(int enable)
+{
+    if (occ_ready_on()) {
+        @autoreleasepool {
+            nv2a_occ_zpass(&s_occ, enable);
+        }
+    }
+}
+
+static void metal_on_zpass_clear(void)
+{
+    if (occ_ready_on()) {
+        @autoreleasepool {
+            nv2a_occ_zpass_clear(&s_occ);
+        }
+    }
+}
+
+static int metal_on_report(uint32_t va)
+{
+    if (!occ_ready_on())
+        return 0;
+    @autoreleasepool {
+        nv2a_occ_report(&s_occ, va, occ_mode() == 1);
+    }
+    return 1;
+}
+
+static void metal_on_poll(void)
+{
+    if (s_occ.npend) {
+        @autoreleasepool {
+            nv2a_occ_poll(&s_occ, 1);
+        }
+    }
+}
+
+/* After the flip's wait every command buffer is done: retired slots free. */
+static void occ_after_wait(void)
+{
+    while (s_nretire)
+        s_vis_used[s_retire[--s_nretire]] = 0;
+    if (s_occ.ops)
+        nv2a_occ_poll(&s_occ, 0);
+}
+
 static void flip_log(uint32_t surface_offset, RenderTarget *rt)
 {
     static int on = -1;
     static uint64_t p_draws, p_prog, p_skip, p_cull, p_clears, p_tex, p_up,
-                    p_chg, p_re, p_fl;
+                    p_chg, p_re, p_fl, p_occ, p_vis, p_late, p_super, p_sync, p_ovf;
     if (on < 0)
         on = getenv("RECOMP_FLIP_LOG") != NULL;
     if (!on)
         return;
     fprintf(stderr, "[METAL] flip %llu batches %llu prog %llu skipped %llu"
             " culled %llu clears %llu tex %llu uploads %llu changed %llu rehash %llu"
-            " flushes %llu present 0x%08X walker 0x%08X\n",
+            " flushes %llu occ %llu (visible %llu, pending %d, late %llu, superseded %llu,"
+            " sync %llu us, slot overflow %llu) present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
             (unsigned long long)(s_draws - p_draws),
             (unsigned long long)(s_draws_prog - p_prog),
@@ -1566,7 +1833,15 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
             (unsigned long long)(s_tex_changed - p_chg),
             (unsigned long long)(s_tex_rehash - p_re),
             (unsigned long long)(s_flushes - p_fl),
+            (unsigned long long)(s_occ.reports - p_occ),
+            (unsigned long long)(s_occ.vis - p_vis), s_occ.npend,
+            (unsigned long long)(s_occ.late - p_late),
+            (unsigned long long)(s_occ.super - p_super),
+            (unsigned long long)(s_occ.sync_us - p_sync),
+            (unsigned long long)(s_occ_ovf - p_ovf),
             rt ? rt->offset : 0, surface_offset);
+    p_occ = s_occ.reports; p_vis = s_occ.vis; p_late = s_occ.late;
+    p_super = s_occ.super; p_sync = s_occ.sync_us; p_ovf = s_occ_ovf;
     p_draws = s_draws; p_prog = s_draws_prog; p_skip = s_draws_skipped;
     p_cull = s_draws_culled; p_clears = s_clears; p_tex = s_draws_tex;
     p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
@@ -1630,7 +1905,10 @@ static const struct nv2a_pb_backend s_metal_backend = {
     metal_on_zclear,
     metal_on_draw,
     metal_on_flip,
-    NULL, NULL, NULL, NULL,   /* visibility tests: the walker's fixed answer */
+    metal_on_zpass,
+    metal_on_zpass_clear,
+    metal_on_report,
+    metal_on_poll,
     1,                  /* writes_back: on_flip reads the RT into guest memory */
 };
 
