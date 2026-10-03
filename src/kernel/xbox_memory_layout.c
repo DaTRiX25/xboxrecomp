@@ -546,7 +546,9 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 
 static void *g_ac97_page = NULL;      /* host address of the trapped page */
 static void *g_ac97_veh  = NULL;
-static RECOMP_TLS int s_ac97_stepping = 0;
+#if defined(_WIN32)
+static RECOMP_TLS int s_ac97_stepping = 0;   /* the VEH's single-step state */
+#endif
 
 static void ac97_clear_reset_bits(void)
 {
@@ -638,6 +640,8 @@ static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
  * reporting. The store is emulated onto the page (open for the moment),
  * the controller's reaction applied, and the page closed again. Returns 1
  * when the fault was this trap and the access was serviced. */
+static volatile int g_ac97_posix_lock;
+
 int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
 {
     int ok;
@@ -645,12 +649,24 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
     if (!g_ac97_page || fault < (uintptr_t)g_ac97_page
             || fault >= (uintptr_t)g_ac97_page + g_ac97_hsize)
         return 0;
+    /* One trap at a time. The page is open process-wide while the store is
+     * emulated, so a second thread trapping in that window would have its
+     * page closed under it by the first thread's mprotect and fault inside
+     * the emulation. Spin: the window is a few hundred instructions, and a
+     * plain store from another thread while the page is open is still
+     * caught by the sweep below if it lands before it; one landing between
+     * the sweep and the close keeps its RR bit until the next trap. That
+     * residual needs two threads resetting channels at once, which
+     * DirectSound's single-threaded init never does. */
+    while (__atomic_exchange_n(&g_ac97_posix_lock, 1, __ATOMIC_ACQUIRE))
+        ;
     mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE);
     ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
                           g_ac97_page, ac97_posix_rd, ac97_posix_wr);
     if (ok)
         ac97_clear_reset_bits();
     mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
+    __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
     return ok;
 }
 #endif
