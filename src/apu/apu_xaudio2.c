@@ -32,6 +32,7 @@ static IXAudio2MasteringVoice *g_xa2_master = NULL;
 static IXAudio2SourceVoice    *g_xa2_source = NULL;
 static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
 static int                     g_xa2_next_buf = 0;
+static int                     g_xa2_fill = 0;  /* samples staged in bufs[next_buf] */
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 
@@ -84,6 +85,7 @@ int xa2_init(void)
     }
 
     g_xa2_next_buf = 0;
+    g_xa2_fill = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
 
@@ -125,35 +127,48 @@ int xa2_is_active(void)
     return g_xa2_initialized;
 }
 
-/* Submit a buffer of mixed samples to XAudio2.
- * Called from APU frame thread. Returns 1 if buffer was submitted. */
+/* Hand mixed samples to XAudio2. Called from the APU frame thread with one
+ * EP period (256 samples) at a time. Samples accumulate in the current device
+ * buffer, which is submitted when full, so a call shorter than a buffer is
+ * kept, not padded or dropped. Returns 1 if every sample was accepted; 0 if
+ * the voice already had every buffer queued when one filled, in which case
+ * that buffer is discarded (pacing by queue depth is what prevents it). */
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     XAUDIO2_VOICE_STATE state;
     XAUDIO2_BUFFER xbuf;
-    int idx;
-    int copy_samples;
+    int idx, n, ok = 1;
     HRESULT hr;
 
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
-    IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    while (num_samples > 0) {
+        idx = g_xa2_next_buf;
+        n = XA2_BUF_SAMPLES - g_xa2_fill;
+        if (n > num_samples) n = num_samples;
+        memcpy(g_xa2_bufs[idx][g_xa2_fill], samples,
+               n * XA2_CHANNELS * sizeof(int16_t));
+        g_xa2_fill += n;
+        samples += n * XA2_CHANNELS;
+        num_samples -= n;
+        if (g_xa2_fill < XA2_BUF_SAMPLES)
+            break;
 
-    idx = g_xa2_next_buf;
-    copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
-    memcpy(g_xa2_bufs[idx], samples, copy_samples * XA2_CHANNELS * sizeof(int16_t));
+        g_xa2_fill = 0;
+        IXAudio2SourceVoice_GetState(g_xa2_source, &state,
+                                     XAUDIO2_VOICE_NOSAMPLESPLAYED);
+        if ((int)state.BuffersQueued >= XA2_NUM_BUFS) { ok = 0; continue; }
 
-    memset(&xbuf, 0, sizeof(xbuf));
-    xbuf.AudioBytes = copy_samples * XA2_CHANNELS * sizeof(int16_t);
-    xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
+        memset(&xbuf, 0, sizeof(xbuf));
+        xbuf.AudioBytes = XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t);
+        xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
+        hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+        if (FAILED(hr)) { ok = 0; continue; }
 
-    hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
-    if (FAILED(hr)) return 0;
-
-    g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
-    g_xa2_frames_written++;
-    return 1;
+        g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
+        g_xa2_frames_written++;
+    }
+    return ok;
 }
 
 int xa2_get_buffer_size(void)

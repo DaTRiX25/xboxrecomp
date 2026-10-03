@@ -268,98 +268,102 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+/* Saturating add of a 16-bit stereo block into another. */
+static void mix_into(int16_t dst[][2], const int16_t src[][2], int n)
+{
+    for (int i = 0; i < n; i++) {
+        for (int c = 0; c < 2; c++) {
+            int32_t v = (int32_t)dst[i][c] + src[i][c];
+            if (v > 32767)  v = 32767;
+            if (v < -32768) v = -32768;
+            dst[i][c] = (int16_t)v;
+        }
+    }
+}
+
+/* Hand one EP period (MIXER_FRAME_SAMPLES samples) to the waveOut arm. The
+ * device buffers are larger than a period, so periods accumulate in the
+ * current buffer and it is written when full: every sample rendered is
+ * written once, none is rendered twice. */
+static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
+{
+    static int fill;                     /* samples already in next_buf */
+    int idx = g_waveout.next_buf;
+    WAVEHDR *hdr = &g_waveout.hdrs[idx];
+
+    if (fill == 0) {
+        /* Wait if this buffer is still playing (with timeout) */
+        int wait_loops = 0;
+        while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
+            qemu_mutex_unlock(&d->lock);
+            Sleep(1);
+            qemu_mutex_lock(&d->lock);
+            if (++wait_loops > 50) break;
+        }
+    }
+
+    memcpy(g_waveout.bufs[idx][fill], period,
+           MIXER_FRAME_SAMPLES * 2 * sizeof(int16_t));
+    fill += MIXER_FRAME_SAMPLES;
+    if (fill < WAVEOUT_BUF_SAMPLES)
+        return;
+
+    hdr->dwFlags &= ~WHDR_DONE;
+    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
+    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
+    g_waveout.frames_written++;
+    fill = 0;
+}
+
+/* Called once per 32-sample frame; acts on the last frame of each EP period
+ * (8 frames, 256 samples, 5.33 ms).
+ *
+ * frame_buf holds the period the DSP stage just wrote (mcpx_apu_dsp_frame,
+ * or the VP monitor point, which accumulates). The test tone and the
+ * software mixer are rendered into a scratch period and added to it, and
+ * exactly that one period is handed to the device -- once.
+ *
+ * This used to clear frame_buf before rendering the tone and the mixer into
+ * it, so whatever the VP and DSP produced never reached the device, and it
+ * rendered a whole device buffer (1024 samples) per 256-sample period. */
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
+    int16_t period[MIXER_FRAME_SAMPLES][2];
+    int16_t extra[MIXER_FRAME_SAMPLES][2];
+
     if ((d->ep_frame_div + 1) % 8) {
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
-    if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+    memcpy(period, d->monitor.frame_buf, sizeof(period));
+    /* The VP monitor point accumulates into frame_buf, so the next period
+     * has to start from silence. */
+    memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
-            }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
-        }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
-        return;
-    }
-
-    if (!g_waveout.initialized) return;
-
-    int idx = g_waveout.next_buf;
-    WAVEHDR *hdr = &g_waveout.hdrs[idx];
-
-    /* Wait if this buffer is still playing (with timeout) */
-    int wait_loops = 0;
-    while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
-        qemu_mutex_unlock(&d->lock);
-        Sleep(1);
-        qemu_mutex_lock(&d->lock);
-        if (++wait_loops > 50) break;
-    }
-
-    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
-    int16_t *out = (int16_t *)g_waveout.bufs[idx];
-    int remaining = WAVEOUT_BUF_SAMPLES;
-    int out_offset = 0;
-
-    while (remaining > 0) {
-        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-
-        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-        /* Test tone (skip if muted) */
-        if (g_test_tone.active && !g_audio_muted) {
-            for (int i = 0; i < chunk; i++) {
+    if (g_audio_muted) {
+        memset(period, 0, sizeof(period));
+    } else {
+        memset(extra, 0, sizeof(extra));
+        if (g_test_tone.active) {
+            for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
                 int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                d->monitor.frame_buf[i][0] = s;
-                d->monitor.frame_buf[i][1] = s;
+                extra[i][0] = s;
+                extra[i][1] = s;
                 g_test_tone.phase += g_test_tone.phase_inc;
                 if (g_test_tone.phase >= 2.0 * M_PI)
                     g_test_tone.phase -= 2.0 * M_PI;
             }
         }
-
-        /* Mix software voices (skip if muted) */
-        if (!g_audio_muted)
-            mixer_render(d->monitor.frame_buf, chunk);
-
-        /* Copy to waveOut buffer */
-        memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-        out_offset += chunk;
-        remaining -= chunk;
+        mixer_render(extra, MIXER_FRAME_SAMPLES);
+        mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
     }
 
-    /* Submit to waveOut */
-    hdr->dwFlags &= ~WHDR_DONE;
-    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
-
-    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
-    g_waveout.frames_written++;
+    if (xa2_is_active()) {
+        xa2_submit_samples((const int16_t *)period, MIXER_FRAME_SAMPLES);
+        return;
+    }
+    if (g_waveout.initialized)
+        waveout_submit(d, (const int16_t (*)[2])period);
 }
 
 /* ============================================================

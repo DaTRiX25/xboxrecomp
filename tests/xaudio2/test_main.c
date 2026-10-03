@@ -116,6 +116,7 @@ static void reset(void)
     g_xa2_master = NULL;
     g_xa2_source = NULL;
     g_xa2_initialized = 0;
+    g_xa2_fill = 0;
     com_refs = releases = master_destroys = source_destroys = 0;
     queue_count = 0;
     com_result = create_result = master_result = source_result = S_OK;
@@ -188,6 +189,27 @@ int main(void)
     CHECK(master_destroys == 1 && source_destroys == 1);
     xa2_shutdown();
     CHECK(releases == 1 && master_destroys == 1 && source_destroys == 1);
+
+    /* The monitor hands over one 256-sample EP period at a time. Periods
+     * accumulate in the device buffer: nothing is queued until it is full,
+     * and then it holds the periods in order. */
+    reset();
+    CHECK(xa2_init() == 1);
+    {
+        int16_t period[256][2];
+        for (int p = 0; p < 4; p++) {
+            memset(period, 0x10 + p, sizeof(period));
+            CHECK(xa2_submit_samples(&period[0][0], 256) == 1);
+            CHECK(queue_count == (p == 3 ? 1u : 0u));
+        }
+        CHECK(queued_bytes[0] == 1024 * 4);
+        for (int p = 0; p < 4; p++)
+            CHECK(snapshots[0][p * 1024] == 0x10 + p
+                  && snapshots[0][p * 1024 + 1023] == 0x10 + p);
+        CHECK(g_xa2_next_buf == 1 && g_xa2_fill == 0);
+    }
+    xa2_shutdown();
+
     printf("XAudio2 regression: %d failures\n", failures);
     return failures ? 1 : 0;
 }
