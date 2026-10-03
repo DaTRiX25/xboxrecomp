@@ -48,7 +48,11 @@ static inline int64_t qemu_clock_get_us(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000LL / freq.QuadPart);
+    /* Split, not count * 1e6 / freq: on POSIX the counter is CLOCK_MONOTONIC
+     * in nanoseconds (freq 1e9), and the product overflows int64 after about
+     * 2.5 hours of host uptime, which made the pacer's clock jump about. */
+    return (int64_t)(count.QuadPart / freq.QuadPart) * 1000000LL +
+           (int64_t)(count.QuadPart % freq.QuadPart) * 1000000LL / freq.QuadPart;
 }
 #endif
 
