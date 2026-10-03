@@ -10,8 +10,7 @@
  * read-only.
  *
  * The default backend is the CPU rasteriser in nv2a_pb_exec.c. A GPU backend
- * (D3D11 first, see analysis/reviews/spike-render-perf-2026-10-01.md in cat/)
- * registers itself with nv2a_pb_set_backend() and replaces it.
+ * (D3D11, Metal) registers itself with nv2a_pb_set_backend() and replaces it.
  *
  * Everything here runs on the NV2A ack thread, which drives the executor. The
  * state pointers stay valid for the life of the process, but the contents are

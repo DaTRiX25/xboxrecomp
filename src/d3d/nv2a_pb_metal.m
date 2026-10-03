@@ -1,6 +1,6 @@
 /**
  * A Metal backend for the pushbuffer executor (struct nv2a_pb_backend), the
- * macOS sibling of nv2a_pb_d3d11.c. render-gpu-backend tasks §4, milestone M1.
+ * macOS sibling of nv2a_pb_d3d11.c.
  *
  * The executor (src/kernel/nv2a_pb_exec.c) decodes the title's pushbuffer into
  * the state in nv2a_pb_state.h and calls the hooks of struct nv2a_pb_backend;
@@ -1590,8 +1590,8 @@ static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
  * and a stretch over a pass change takes a new one. Slots accumulate within
  * the pass. A result is in once every slot's command buffer has completed,
  * so GET_REPORT commits the open command buffer: a count held to the flip
- * lands a frame later than D3D11's, and BLiNX 2's attract light shafts
- * (brightness from the count) come out too bright. A slot freed while
+ * lands a frame later than D3D11's, and light shafts whose brightness
+ * comes from the count come out too bright. A slot freed while
  * its command buffer is still in flight retires until the flip's wait.
  *
  * RECOMP_METAL_OCC=sync waits at GET_REPORT; =fixed leaves reports to the

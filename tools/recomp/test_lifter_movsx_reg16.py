@@ -1,9 +1,9 @@
 """movsx r32, r16 sign-extends every 16-bit register source.
 
 `bp` and `sp` were missing from the register list, so `movsx eax, bp` was
-lifted as a plain zero-extending read of LO16(ebp). BLiNX 2's pad poll
-normalises the right stick's Y through exactly that instruction (0x0021C457),
-so a stick pushed down read as a large positive value.
+lifted as a plain zero-extending read of LO16(ebp). A pad poll that
+normalises the right stick's Y through exactly that instruction would then
+misread it, so a stick pushed down read as a large positive value.
 """
 
 import pytest

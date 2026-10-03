@@ -3,8 +3,8 @@
  *
  * The CPU raster keeps one depth/stencil buffer per (zeta offset, extent),
  * the same shape as the D3D11 backend's depth_target. With a single shared
- * buffer, stage 1-1's mid-frame 256x256 offscreen pass reset the main depth
- * and the sky painted over the cliff (issue #36).
+ * buffer, a level's mid-frame 256x256 offscreen pass reset the main depth
+ * and the sky painted over the terrain drawn before it.
  *
  * The extent is the clip rectangle's (clip_x + clip_w, clip_y + clip_h), not
  * the surface's: the CPU raster sizes its buffers by the clip extent, where

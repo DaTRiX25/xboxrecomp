@@ -236,6 +236,20 @@ int xbox_FramebufferDumpBmp(const char *path)
 
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
 
+static char          s_title[128] = "Xbox Recomp";
+static HWND volatile s_hwnd;
+
+void xbox_HostWindowSetTitle(const char *title)
+{
+    HWND h;
+    if (!title || !title[0])
+        return;
+    snprintf(s_title, sizeof(s_title), "%s", title);
+    h = s_hwnd;
+    if (h)
+        SetWindowTextA(h, s_title);
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     xbox_log_thread_role("fb-present", 0);
@@ -257,7 +271,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", s_title,
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
@@ -266,6 +280,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
+    s_hwnd = hwnd;
     hdc = GetDC(hwnd);
 
     memset(&bi, 0, sizeof(bi));
@@ -334,6 +349,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         Sleep(16);
     }
 
+    s_hwnd = NULL;
     ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);
     free(s_rgb);

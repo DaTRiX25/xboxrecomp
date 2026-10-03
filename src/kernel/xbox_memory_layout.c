@@ -1104,7 +1104,7 @@ static void fence_mirrors_tick(void)
 
 /* PGRAPH 0x400B10 follows the completed fence.
  *
- * XDK D3D's wait-for-idle (BLiNX 2 sub_002E7E80, reached from the Swap path
+ * XDK D3D's wait-for-idle (reached from the Swap path
  * after a PFB flush) spins until bits 2..6 of this register equal the low five
  * bits of the fence word:
  *
@@ -1238,13 +1238,13 @@ static void framebuffer_probe_tick(void)
  * D3D's KickOff sets PFB 0x100410 bit 16 (flush the write-combine buffers),
  * spins until it clears, and only then writes DMA_PUT. The ack loop below
  * clears it at the top of each tick, and a tick was the scan of the last
- * segment plus a Sleep(1). BLiNX 2 kicks ~16 times a frame, so on macOS it
+ * segment plus a Sleep(1). A title can kick ~16 times a frame, so on macOS it
  * spent ~19 ms of every 33 ms frame in that spin with nothing drawn -- and
  * whatever the walker's draws cost was added on top (a simulated 9.5 ms of
  * draw per frame made it 28.6 ms).
  *
  * Acknowledging the flush on another thread at once does not work: the
- * title then runs a segment or more ahead, its MakeSpace (0x002E8110) finds
+ * title then runs a segment or more ahead, its MakeSpace finds
  * more than 8 KB outstanding, puts a NOP-with-notify in the pushbuffer and
  * blocks on the GPU interrupt that would answer it -- which nothing here
  * raises, so it waits forever. The flush wait is what keeps the title within
@@ -1445,8 +1445,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * the lowest, guessing the ring's bounds. Each lap ends
                      * at a different place, so that dropped the tail of a
                      * lap that ended past the guess, and ran old words from
-                     * an earlier lap when it ended short of it. In BLiNX 2
-                     * those old words wrote -9999 into c26, which the title
+                     * an earlier lap when it ended short of it. In one
+                     * title those old words wrote -9999 into c26, which the title
                      * never leaves there; whether it happened went with
                      * timing. */
                     if (g_scanned_put && put != g_scanned_put) {
@@ -3791,9 +3791,9 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * This was a bump allocator on the theory that contiguous blocks are
  * framebuffers and pushbuffers, allocated once. They are also every texture
  * and vertex buffer a D3D title creates, and those come and go with the scene:
- * BLiNX 2 frees and reallocates them as each texture pack loads, and with
- * nothing reclaimed the 64 MB window ran out at about 119 s, while stage 1-1
- * loaded. MmFreeContiguousMemory meanwhile passed the address to
+ * a title may free and reallocate them as each texture pack loads, and with
+ * nothing reclaimed the 64 MB window ran out at about 119 s into one
+ * title's run. MmFreeContiguousMemory meanwhile passed the address to
  * xbox_HeapFree, which never matched it.
  *
  * Now a first-fit page allocator: one byte of state per 4 KB page, plus the
@@ -3815,14 +3815,14 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * MmAllocateContiguousMemoryEx(0x1000, 0, 0xFFFFFF, ...), the first time each
  * page of 256 tests is used. The console kernel fills contiguous memory from
  * the top, so low memory is still free when that call comes. This arena fills
- * it from the bottom, so by stage 1-1 of BLiNX 2 the low 16 MB was full (26 MB
+ * it from the bottom, so a few minutes into one title the low 16 MB was full (26 MB
  * in use, all of it starting at 0). Every report-page call failed, 700 to 1,900
  * times a run, EndVisibilityTest returned E_OUTOFMEMORY, and
  * GetVisibilityTestResult read its results through a NULL page.
  *
  * Allocating from the top would match the console, but it would move every
- * surface and buffer this toolkit's logs and tools name by address (BLiNX 2's
- * back buffers at 0x00104000/0x00230000, for one). Keeping one megabyte back
+ * surface and buffer this toolkit's logs and tools name by address (a title's
+ * back buffers, for one). Keeping one megabyte back
  * changes nothing that is placed below 15 MB. A request whose range ends
  * below 16 MB can use the reserve; any other request skips it. */
 #define CONTIG_LOW_RESERVE_START ((15u << 20) / CONTIG_PAGE)

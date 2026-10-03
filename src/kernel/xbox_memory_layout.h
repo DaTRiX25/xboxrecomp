@@ -351,7 +351,7 @@ typedef union RecompXmm {
  *
  * These used to be fixed -- scratch at 0x00700000, stack at 0x00780000, heap
  * at 0x00F80000 -- which is right only while the title's image ends below
- * 0x00700000. BLiNX 2's 73 sections run to 0x0303AC20, so the stack, the
+ * 0x00700000. A large title's image can run to tens of MB, so the stack, the
  * kernel data exports and the heap all sat inside its .data/BSS and the first
  * zeroed heap allocation wiped the title's globals.
  *

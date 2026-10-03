@@ -802,7 +802,7 @@ DWORD SuspendThread(HANDLE h)
      * one only counts, for ResumeThread. A thread suspending *itself* is a
      * different matter: it is at a known point, and it parks on the same gate
      * CREATE_SUSPENDED uses until a ResumeThread brings the count to zero.
-     * Worker pools idle that way; returning at once turned BLiNX 2's into a
+     * Worker pools idle that way; returning at once turned one title's into a
      * suspend/check spin of millions of calls a second. */
     if (h == PSEUDO_CURRENT_THREAD) h = GetCurrentThread();
     w32_object *o = (w32_object *)h;

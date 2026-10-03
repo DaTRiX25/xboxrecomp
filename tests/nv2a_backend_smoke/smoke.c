@@ -10,7 +10,7 @@
  * backend writes its present surface back at the flip -- so the comparison
  * is the same bytes RECOMP_FB_DUMP and the SDL2 window read.
  *
- * Scenes (M1 of render-gpu-backend §4):
+ * Scenes:
  *   clear_quad   colour clear + a solid quad (pre-transformed, INLINE_ARRAY)
  *   checker      + a swizzled A8R8G8B8 checker, stage 0, wrap addressing
  *   yuy2         + a linear YUY2 ramp (the movie texture's format), clamp
@@ -19,7 +19,7 @@
  *
  * Pass: per scene, an exact match. Every scene is screen-space with nearest
  * sampling, so the two paths compute the same bytes; the golden-limit
- * statistics (scripts/golden.py: MAE per channel, share off by more than 8)
+ * statistics (MAE per channel, share off by more than 8)
  * are printed alongside. The presented surface must also be the one drawn.
  *
  * Backend under test: RECOMP_SMOKE_BACKEND, default "metal" (the only one
