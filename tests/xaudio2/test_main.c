@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <xaudio2.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static HRESULT com_result, create_result, master_result, source_result;
@@ -17,9 +18,10 @@ static IXAudio2MasteringVoice master;
 static IXAudio2SourceVoice source;
 static IXAudio2MasteringVoiceVtbl master_vtable;
 static IXAudio2SourceVoiceVtbl source_vtable;
-static const BYTE *queued[3];
-static BYTE snapshots[3][4096];
-static UINT32 queued_bytes[3], queue_count;
+static const BYTE *queued[8];
+static BYTE snapshots[8][4096 * 4];
+static UINT32 queued_bytes[8], queue_count;
+static UINT32 max_queue = 3;   /* the buffer count the backend was given */
 
 #define CHECK(test) do { if (!(test)) { \
     fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #test); failures++; \
@@ -78,8 +80,8 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
 {
     check_queued();
     if (FAILED(submit_result)) return submit_result;
-    CHECK(queue_count < 3);
-    if (queue_count == 3) return E_FAIL;
+    CHECK(queue_count < max_queue);
+    if (queue_count >= max_queue) return E_FAIL;
     queued[queue_count] = buffer->pAudioData;
     queued_bytes[queue_count] = buffer->AudioBytes;
     memcpy(snapshots[queue_count], buffer->pAudioData, buffer->AudioBytes);
@@ -148,6 +150,10 @@ int main(void)
     source_vtable.DestroyVoice = destroy_source;
     master.lpVtbl = &master_vtable;
     source.lpVtbl = &source_vtable;
+    /* The ring cases below were written for 3 x 1024; pin them there. The
+     * defaults and the override are checked at the end. */
+    _putenv("RECOMP_AUDIO_BUF_SAMPLES=1024");
+    _putenv("RECOMP_AUDIO_BUF_COUNT=3");
     check_init_failures(S_OK);
     check_init_failures(S_FALSE);
     check_init_failures(RPC_E_CHANGED_MODE);
@@ -209,6 +215,57 @@ int main(void)
         CHECK(g_xa2_next_buf == 1 && g_xa2_fill == 0);
     }
     xa2_shutdown();
+
+    /* Buffer size and count: defaults 512 x 4, overrides reach the
+     * submitted buffers and the queue limit, out-of-range values clamp. */
+    {
+        struct { const char *samples, *count; UINT32 want_s, want_n; } c[] = {
+            { "RECOMP_AUDIO_BUF_SAMPLES=",     "RECOMP_AUDIO_BUF_COUNT=",   512, 4 },
+            { "RECOMP_AUDIO_BUF_SAMPLES=256",  "RECOMP_AUDIO_BUF_COUNT=6",  256, 6 },
+            { "RECOMP_AUDIO_BUF_SAMPLES=9999", "RECOMP_AUDIO_BUF_COUNT=1", 4096, 2 },
+            { "RECOMP_AUDIO_BUF_SAMPLES=16",   "RECOMP_AUDIO_BUF_COUNT=99", 128, 8 },
+        };
+        static int16_t period[256][2];
+        for (int k = 0; k < 4; k++) {
+            _putenv(c[k].samples);
+            _putenv(c[k].count);
+            reset();
+            max_queue = c[k].want_n;
+            CHECK(xa2_init() == 1);
+            CHECK(xa2_get_buffer_size() == (int)c[k].want_s);
+            /* Fill every buffer and one more: exactly want_n get queued,
+             * each want_s samples long. */
+            for (UINT32 i = 0; i < (c[k].want_n + 1) * c[k].want_s / 128; i++)
+                xa2_submit_samples(&period[0][0], 128);
+            CHECK(queue_count == c[k].want_n);
+            CHECK(queued_bytes[0] == c[k].want_s * 4);
+            xa2_shutdown();
+        }
+        max_queue = 8;
+    }
+
+    /* The init line names the sizes (last, since stderr is redirected). */
+    {
+        char line[512] = "";
+        FILE *f;
+        _putenv("RECOMP_AUDIO_BUF_SAMPLES=256");
+        _putenv("RECOMP_AUDIO_BUF_COUNT=5");
+        reset();
+        max_queue = 5;
+        fflush(stderr);
+        if (freopen("xa2_init_line.txt", "w", stderr)) {
+            xa2_init();
+            fflush(stderr);
+            xa2_shutdown();
+            fclose(stderr);
+            f = fopen("xa2_init_line.txt", "r");
+            if (f) { if (!fgets(line, sizeof line, f)) line[0] = 0; fclose(f); }
+            if (!strstr(line, "5 x 256-sample buffers")) {
+                printf("FAIL: init line does not name 5 x 256: %s\n", line);
+                failures++;
+            }
+        }
+    }
 
     printf("XAudio2 regression: %d failures\n", failures);
     return failures ? 1 : 0;

@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
 
@@ -24,13 +25,36 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+/* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
+ * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
+ * override them at xa2_init, clamped to the static storage below. */
+#define XA2_BUF_SAMPLES_DEFAULT 512
+#define XA2_NUM_BUFS_DEFAULT    4
+#define XA2_BUF_SAMPLES_MIN     128
+#define XA2_BUF_SAMPLES_MAX     4096
+#define XA2_NUM_BUFS_MIN        2
+#define XA2_NUM_BUFS_MAX        8
+
+static int g_xa2_buf_samples = XA2_BUF_SAMPLES_DEFAULT;
+static int g_xa2_num_bufs    = XA2_NUM_BUFS_DEFAULT;
+#define XA2_BUF_SAMPLES g_xa2_buf_samples
+#define XA2_NUM_BUFS    g_xa2_num_bufs
+
+static int xa2_env_int(const char *name, int def, int lo, int hi)
+{
+    const char *e = getenv(name);
+    int v;
+    if (!e || !*e) return def;
+    v = atoi(e);
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return v;
+}
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
 static IXAudio2SourceVoice    *g_xa2_source = NULL;
-static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
+static int16_t                 g_xa2_bufs[XA2_NUM_BUFS_MAX][XA2_BUF_SAMPLES_MAX][2];
 static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_fill = 0;  /* samples staged in bufs[next_buf] */
 static int                     g_xa2_initialized = 0;
@@ -43,6 +67,12 @@ int xa2_init(void)
     WAVEFORMATEX wfx = { 0 };
 
     if (g_xa2_initialized) return 1;
+
+    g_xa2_buf_samples = xa2_env_int("RECOMP_AUDIO_BUF_SAMPLES",
+                                    XA2_BUF_SAMPLES_DEFAULT,
+                                    XA2_BUF_SAMPLES_MIN, XA2_BUF_SAMPLES_MAX);
+    g_xa2_num_bufs = xa2_env_int("RECOMP_AUDIO_BUF_COUNT", XA2_NUM_BUFS_DEFAULT,
+                                 XA2_NUM_BUFS_MIN, XA2_NUM_BUFS_MAX);
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
@@ -89,8 +119,9 @@ int xa2_init(void)
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
 
-    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
-            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
+    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)\n",
+            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES,
+            1000.0 * XA2_NUM_BUFS * XA2_BUF_SAMPLES / XA2_SAMPLE_RATE);
     return 1;
 
 fail:
