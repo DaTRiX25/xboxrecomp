@@ -530,6 +530,10 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
  * hands those 256 samples to the device. */
 void mcpx_apu_monitor_frame(MCPXAPUState *d);
 
+/* Frame-thread pacing at an EP-period boundary: 0 = render the next period
+ * now, else microseconds to wait before asking again. See apu_core.c. */
+int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
+
 /* Debug globals */
 extern MCPXAPUState *g_state;
 extern struct McpxApuDebug g_dbg, g_dbg_cache;

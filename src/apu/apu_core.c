@@ -192,6 +192,9 @@ static struct {
 #define WAVEOUT_NUM_BUFS 4
 #define WAVEOUT_BUF_SAMPLES 2048  /* ~42.7ms at 48kHz, matches 8-frame delivery rate */
 #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
+/* Granule = one EP period of output: 256 stereo s16 samples, 1024 bytes.
+ * monitor.queued_bytes_low/high are the pacing marks in those bytes. */
+#define GRANULE_BYTES (MIXER_FRAME_SAMPLES * 2 * (int)sizeof(int16_t))
 
 typedef struct {
     HWAVEOUT hwo;
@@ -221,7 +224,16 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
-        fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+        /* Pacing marks: keep between half the device buffers and all of
+         * them queued. high must not exceed what the voice can hold, or a
+         * full staging buffer would find no free slot and be dropped. */
+        int buf = xa2_get_buffer_size() * 2 * (int)sizeof(int16_t);
+        int n   = xa2_get_buffer_count();
+        d->monitor.queued_bytes_low  = buf * (n / 2);
+        d->monitor.queued_bytes_high = buf * n;
+        fprintf(stderr, "[APU] Using XAudio2 audio backend (pacing: %d..%d granules queued)\n",
+                d->monitor.queued_bytes_low / GRANULE_BYTES,
+                d->monitor.queued_bytes_high / GRANULE_BYTES);
         return;
     }
     fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
@@ -382,31 +394,79 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * Throttle (timing control for frame pacing)
  * ============================================================ */
 
-static void throttle(MCPXAPUState *d)
+/* One pacing decision, taken at an EP-period boundary. Returns 0 to render
+ * the next period now, or how many microseconds to wait before asking again.
+ *
+ * Without a queue to read (waveOut, or no device), the host clock paces one
+ * period per EP_FRAME_US, as before. With XAudio2 the device queue paces:
+ *
+ *   queued >= high   wait one period (the device has enough; the clock is
+ *                    not advanced, so a stalled device stops rendering
+ *                    at high and nothing is dropped)
+ *   queued <= low    render ahead of the clock, but no further ahead of it
+ *                    than the queue can hold (high granules), so a device
+ *                    that stops consuming cannot run the APU ahead of guest
+ *                    time. (Bounding it by one device buffer instead holds
+ *                    the queue under any low mark larger than a buffer: the
+ *                    clock then admits one period per period and the queue
+ *                    never climbs.)
+ *   otherwise        one period per EP_FRAME_US of host clock, counted
+ *                    from now rather than from a schedule a render-ahead
+ *                    pushed forward
+ *
+ * A clock that has fallen more than a period behind (after a stall, or the
+ * first call) restarts from now instead of rendering the backlog in a burst. */
+int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
 {
-    if (d->ep_frame_div % 8) {
-        return;
-    }
+    int64_t ahead_us = 0;
+    int mid_band = 0;
 
-    int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    if (d->ep_frame_div % 8)
+        return 0;
+
+    if (xa2_is_active()) {
+        int q    = xa2_queued_granules();
+        int low  = d->monitor.queued_bytes_low / GRANULE_BYTES;
+        int high = d->monitor.queued_bytes_high / GRANULE_BYTES;
+        if (q >= high)
+            return EP_FRAME_US;
+        if (q <= low)
+            ahead_us = (int64_t)high * EP_FRAME_US;
+        else
+            mid_band = 1;
+    }
 
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > EP_FRAME_US)
         d->next_frame_time_us = now_us;
-    }
+
+    /* In the band the lead a render-ahead built is already in the queue;
+     * keeping it in the schedule as well would idle until the queue had
+     * drained it. One period per period from here holds the level. */
+    if (mid_band && d->next_frame_time_us - now_us > EP_FRAME_US)
+        d->next_frame_time_us = now_us + EP_FRAME_US;
+
+    if (d->next_frame_time_us - now_us > ahead_us)
+        return d->next_frame_time_us - now_us - ahead_us;
+
+    d->next_frame_time_us += EP_FRAME_US;
+    return 0;
+}
+
+static void throttle(MCPXAPUState *d)
+{
+    int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
     while (!d->pause_requested) {
-        now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-        int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
-        if (remaining_ms > 0) {
-            qemu_cond_timedwait(&d->cond, &d->lock, (int)remaining_ms);
-        } else {
+        int64_t wait_us = mcpx_apu_pace_step(
+            d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
+        if (wait_us <= 0)
             break;
-        }
+        qemu_cond_timedwait(&d->cond, &d->lock,
+                            (int)((wait_us + 999) / 1000));
     }
-    d->next_frame_time_us += EP_FRAME_US;
 
-    d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
+    d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us);
 }
 
 /* ============================================================

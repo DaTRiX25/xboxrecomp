@@ -244,6 +244,50 @@ int main(void)
         max_queue = 8;
     }
 
+    /* Pacing contract (apu_core.c mcpx_apu_pace_step): submitting one
+     * period only while xa2_queued_granules() < count * size / 256 never
+     * finds the voice full, so no staged buffer is ever dropped. The fake
+     * voice completes its oldest buffer every third period. Then a voice
+     * that runs dry after audio started is one underrun per dry spell. */
+    {
+        static int16_t period[256][2];
+        int high, refused = 0;
+        _putenv("RECOMP_AUDIO_BUF_SAMPLES=");
+        _putenv("RECOMP_AUDIO_BUF_COUNT=");
+        reset();
+        max_queue = 4;
+        CHECK(xa2_init() == 1);
+        high = xa2_get_buffer_count() * xa2_get_buffer_size() / 256;
+        CHECK(high == 8);
+        for (int step = 0; step < 300; step++) {
+            if (step % 3 == 2 && queue_count > 0) {          /* one played */
+                for (UINT32 i = 0; i + 1 < queue_count; i++) {
+                    queued[i] = queued[i + 1];
+                    queued_bytes[i] = queued_bytes[i + 1];
+                    memcpy(snapshots[i], snapshots[i + 1], queued_bytes[i]);
+                }
+                queue_count--;
+            }
+            if (xa2_queued_granules() < high
+                    && !xa2_submit_samples(&period[0][0], 256))
+                refused++;
+        }
+        CHECK(refused == 0);
+        CHECK(xa2_underruns() == 0);
+        queue_count = 0;                                     /* ran dry */
+        xa2_queued_granules();
+        xa2_queued_granules();
+        CHECK(xa2_underruns() == 1);
+        xa2_submit_samples(&period[0][0], 256);
+        xa2_submit_samples(&period[0][0], 256);              /* refilled */
+        CHECK(xa2_queued_granules() == 2);
+        queue_count = 0;
+        xa2_queued_granules();
+        CHECK(xa2_underruns() == 2);
+        xa2_shutdown();
+        max_queue = 8;
+    }
+
     /* The init line names the sizes (last, since stderr is redirected). */
     {
         char line[512] = "";

@@ -21,4 +21,14 @@ int xa2_submit_samples(const int16_t *samples, int num_samples);
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);
 
+/* Number of device buffers the voice may hold. */
+int xa2_get_buffer_count(void);
+
+/* 256-sample granules handed over and not yet played (queued buffers plus
+ * the partly filled one). Also counts underruns: see xa2_underruns. */
+int xa2_queued_granules(void);
+
+/* Times the voice ran dry after audio started ([XA2] underrun x%u). */
+unsigned xa2_underruns(void);
+
 #endif /* APU_XAUDIO2_H */

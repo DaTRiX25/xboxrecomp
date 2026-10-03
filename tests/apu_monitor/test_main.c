@@ -20,17 +20,38 @@
 
 extern volatile int g_audio_muted;
 
-/* ---- fake device: every xa2_* symbol, so apu_xaudio2.o is not linked ---- */
+/* ---- fake device: every xa2_* symbol, so apu_xaudio2.o is not linked ----
+ * It records what it is given and, for the pacing case, models a queue that
+ * a consumption clock drains (dev_*). */
 static int16_t got[PERIOD * 8][2];
 static int got_samples, got_calls;
+
+static int      dev_model;          /* pacing case: check sequence numbers  */
+static uint64_t dev_tail, dev_head; /* samples submitted / consumed         */
+static int      dev_seq_errors;
 
 int  xa2_init(void)          { return 1; }
 void xa2_shutdown(void)      {}
 int  xa2_is_active(void)     { return 1; }
-int  xa2_get_buffer_size(void) { return PERIOD; }
+int  xa2_get_buffer_size(void) { return 512; }
+int  xa2_get_buffer_count(void) { return 4; }
+unsigned xa2_underruns(void) { return 0; }
+int  xa2_queued_granules(void) { return (int)((dev_tail - dev_head) / PERIOD); }
 int  xa2_submit_samples(const int16_t *s, int n)
 {
     got_calls++;
+    if (dev_model) {
+        /* Sample k carries its sequence number: left = k & 0x7FFF,
+         * right = k >> 15. Anything dropped or doubled breaks the run. */
+        for (int i = 0; i < n; i++) {
+            uint64_t k = dev_tail + (uint64_t)i;
+            if ((uint16_t)s[2 * i] != (k & 0x7FFF)
+                    || (uint16_t)s[2 * i + 1] != (uint16_t)(k >> 15))
+                dev_seq_errors++;
+        }
+        dev_tail += (uint64_t)n;
+        return 1;
+    }
     if (got_samples + n <= PERIOD * 8)
         memcpy(got[got_samples], s, (size_t)n * 2 * sizeof(int16_t));
     got_samples += n;
@@ -135,6 +156,91 @@ static void voice_trace_case(void)
     free(d);
 }
 
+/* ---- 2.3: pacing by queue depth ----
+ * The frame thread's decision (mcpx_apu_pace_step) against the fake queue,
+ * on a simulated clock: the device consumes 48 samples per millisecond
+ * except during a stall. Rendering takes no simulated time, which is the
+ * worst case for running ahead. */
+static uint64_t sim_consumed_at(int64_t now_us, int64_t stall_from,
+                                int64_t stall_us, uint64_t *played_us)
+{
+    (void)played_us;
+    int64_t t = now_us;
+    if (t > stall_from)
+        t = (t < stall_from + stall_us) ? stall_from : t - stall_us;
+    return (uint64_t)(t * 48 / 1000);
+}
+
+static void pacing_case(void)
+{
+    MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
+    const int low = 4, high = 8;             /* granules: 512 x 4 marks */
+    const int64_t stall_from = 3000000, stall_us = 100000;
+    int64_t now = 0;
+    uint64_t seq = 0, underruns = 0;
+    int periods = 0, minq = 1 << 30, maxq = 0, max_q_stall = 0;
+    int submits_in_stall = 0, waits = 0;
+
+    if (!d) { failures++; return; }
+    d->monitor.queued_bytes_low  = low  * PERIOD * 4;
+    d->monitor.queued_bytes_high = high * PERIOD * 4;
+    dev_model = 1; dev_tail = dev_head = 0; dev_seq_errors = 0;
+
+    while (periods < 1000) {
+        uint64_t c = sim_consumed_at(now, stall_from, stall_us, NULL);
+        int q;
+        if (c > dev_tail) {                  /* ran dry: plays silence */
+            underruns++;
+            dev_head = dev_tail;
+        } else {
+            dev_head = c > dev_head ? c : dev_head;
+        }
+        q = xa2_queued_granules();
+        if (now > 200000 && !(now >= stall_from && now < stall_from + stall_us + 200000)) {
+            if (q < minq) minq = q;
+            if (q > maxq) maxq = q;
+        }
+        if (now >= stall_from && now < stall_from + stall_us && q > max_q_stall)
+            max_q_stall = q;
+
+        d->ep_frame_div = 0;
+        int64_t w = mcpx_apu_pace_step(d, now);
+        if (w > 0) { now += w; waits++; continue; }
+
+        for (int i = 0; i < PERIOD; i++) {
+            uint64_t k = seq + (uint64_t)i;
+            d->monitor.frame_buf[i][0] = (int16_t)(k & 0x7FFF);
+            d->monitor.frame_buf[i][1] = (int16_t)(uint16_t)(k >> 15);
+        }
+        d->ep_frame_div = 7;
+        mcpx_apu_monitor_frame(d);
+        seq += PERIOD;
+        periods++;
+        if (now >= stall_from && now < stall_from + stall_us)
+            submits_in_stall++;
+        /* Rendering never pushes the queue past high. */
+        if (xa2_queued_granules() > high) {
+            printf("FAIL: queue %d > high %d after a submit\n",
+                   xa2_queued_granules(), high);
+            failures++;
+            break;
+        }
+    }
+    printf("pacing: 1000 periods in %.3f s simulated, queue %d..%d steady, "
+           "%d at most in the stall, %llu underruns, %d submits during the stall\n",
+           now / 1e6, minq, maxq, max_q_stall, (unsigned long long)underruns,
+           submits_in_stall);
+    CHECK("steady queue stays within [low, high]", minq >= low && maxq <= high);
+    CHECK("stall stops submission at high", max_q_stall <= high);
+    CHECK("no underrun after start", underruns <= 1);
+    CHECK("no sample dropped or duplicated", dev_seq_errors == 0
+          && dev_tail == 1000ull * PERIOD);
+    CHECK("runs at the device rate (1000 periods ~ 5.33 s)",
+          now > 5200000 + stall_us - 100000 && now < 5500000 + stall_us);
+    dev_model = 0;
+    free(d);
+}
+
 int main(void)
 {
     /* Zeroed: ram_ptr NULL keeps dsp_ack_frame out of guest memory, and
@@ -197,6 +303,7 @@ int main(void)
     CHECK("ten periods, 2560 samples", got_samples == 10 * PERIOD);
 
     free(d);
+    pacing_case();
     voice_trace_case();                      /* last: it redirects stderr */
     if (failures == 0) { printf("apu_monitor: ALL PASS\n"); return 0; }
     printf("apu_monitor: %d FAILURE(S)\n", failures);

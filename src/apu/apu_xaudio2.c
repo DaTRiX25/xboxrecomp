@@ -57,6 +57,9 @@ static IXAudio2SourceVoice    *g_xa2_source = NULL;
 static int16_t                 g_xa2_bufs[XA2_NUM_BUFS_MAX][XA2_BUF_SAMPLES_MAX][2];
 static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_fill = 0;  /* samples staged in bufs[next_buf] */
+static unsigned  g_xa2_underruns;
+static int       g_xa2_dry;
+static ULONGLONG g_xa2_underrun_logged;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 
@@ -116,6 +119,7 @@ int xa2_init(void)
 
     g_xa2_next_buf = 0;
     g_xa2_fill = 0;
+    g_xa2_dry = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
 
@@ -207,6 +211,44 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
+int xa2_get_buffer_count(void)
+{
+    return XA2_NUM_BUFS;
+}
+
+/* Granules (256 samples) handed over and not yet played: the buffers the
+ * voice still holds plus what is staged in the next one. Also the underrun
+ * detector: the voice running dry after audio has started is one underrun,
+ * counted once per dry spell and reported at most once a second. */
+
+int xa2_queued_granules(void)
+{
+    XAUDIO2_VOICE_STATE state;
+
+    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state,
+                                 XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    if (state.BuffersQueued == 0 && g_xa2_frames_written > 0) {
+        if (!g_xa2_dry) {
+            ULONGLONG now = GetTickCount64();
+            g_xa2_dry = 1;
+            g_xa2_underruns++;
+            if (now - g_xa2_underrun_logged >= 1000) {
+                g_xa2_underrun_logged = now;
+                fprintf(stderr, "[XA2] underrun x%u\n", g_xa2_underruns);
+            }
+        }
+    } else {
+        g_xa2_dry = 0;
+    }
+    return (int)(((int)state.BuffersQueued * XA2_BUF_SAMPLES + g_xa2_fill) / 256);
+}
+
+unsigned xa2_underruns(void)
+{
+    return g_xa2_underruns;
+}
+
 #else /* !_WIN32 -- POSIX stubs (no audio output yet) */
 
 int  xa2_init(void)                                   { return 0; }
@@ -214,5 +256,8 @@ void xa2_shutdown(void)                               {}
 int  xa2_is_active(void)                              { return 0; }
 int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
 int  xa2_get_buffer_size(void)                        { return 0; }
+int  xa2_get_buffer_count(void)                       { return 0; }
+int  xa2_queued_granules(void)                        { return 0; }
+unsigned xa2_underruns(void)                          { return 0; }
 
 #endif /* _WIN32 */
