@@ -377,8 +377,17 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
      * missing. Absolute; under Wine a DOS path (Z:\home\...) is safest. */
     {
         const char *ov = getenv("RECOMP_SAVE_DIR");
+        /* Room for the longest suffix the rules append (UDATA\<title id>\
+         * <save>\<file>); a longer root would only truncate later. */
+        int n = (ov && ov[0])
+              ? MultiByteToWideChar(CP_UTF8, 0, ov, -1, s_user_dir, MAX_PATH) : 0;
+        if (ov && ov[0] && (n == 0 || n > MAX_PATH - 96)) {
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                     "RECOMP_SAVE_DIR %s: %s; using the default save dir",
+                     ov, n == 0 ? "conversion failed (longer than MAX_PATH?)" : "too long for the paths under it");
+            ov = NULL;
+        }
         if (ov && ov[0]) {
-            MultiByteToWideChar(CP_UTF8, 0, ov, -1, s_user_dir, MAX_PATH);
             for (WCHAR *p = s_user_dir; *p; p++)
                 if (*p == L'/') *p = L'\\';
             len = wcslen(s_user_dir);
