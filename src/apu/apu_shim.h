@@ -100,6 +100,7 @@ static inline void qemu_thread_join(QemuThread *t) {
 extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
 /* Where a physical address the title handed the APU lives. See apu_core.c. */
 uint8_t *mcpx_apu_phys(uint64_t addr);
+const char *mcpx_apu_phys_class(uint64_t addr);
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {

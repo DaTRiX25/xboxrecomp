@@ -110,6 +110,25 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
 
+/* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
+ * per-voice line: "win" (a page the contiguous allocator handed out), "img"
+ * (inside the XBE image), "hiwin" (below the arena's high-water mark but not
+ * a live page), "ram" (plain RAM below 64 MB) or "wrap" (at or above 64 MB,
+ * which the fallback folds into the low 64 MB). */
+const char *mcpx_apu_phys_class(uint64_t addr)
+{
+    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    if (a >= (64u << 20))
+        return a < g_xbox_total_ram ? "ram" : "wrap";
+    if (xbox_ContiguousPageMap()[a >> 12])
+        return "win";
+    if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return "img";
+    if (a < xbox_ContiguousAllocatedBytes())
+        return "hiwin";
+    return "ram";
+}
+
 /* The interrupt line, as the frame thread sees it. update_irq used to call
  * pci_irq_assert, which is an empty stub here, so DirectSound's service
  * routine never ran and no voice completion ever reached it. */
@@ -836,6 +855,17 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
     d->ram_ptr = ram_ptr;
+
+    /* RECOMP_APU_SOLO=<voice>: mute every other voice in the mix, for
+     * telling which voice a sound (or a noise) comes from. */
+    {
+        const char *solo = getenv("RECOMP_APU_SOLO");
+        if (solo && *solo) {
+            g_dbg_voice_monitor = atoi(solo);
+            fprintf(stderr, "[APU] solo: only voice %d is mixed\n",
+                    g_dbg_voice_monitor);
+        }
+    }
 
     d->set_irq = false;
     d->exiting = false;
