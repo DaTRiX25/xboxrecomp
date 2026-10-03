@@ -74,6 +74,8 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
     }
+    d->vp.filters[v].rs_have = 0;
+    d->vp.filters[v].rs_pos = 0.0f;
 }
 
 static bool voice_should_mute(uint16_t v)
@@ -725,6 +727,109 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
 }
 
 /* ============================================================
+ * Per-voice source statistics (RECOMP_APU_TRACE)
+ *
+ * What each voice fed the mixer over the last second: its format word, where
+ * its data was read from and how that address resolved, the amplitude
+ * envelope and the first two volumes/bins, plus the RMS and zero-crossing
+ * rate of the fetched samples. The zero-crossing rate separates music
+ * (~0.1-0.2) from white noise (~0.5) without a spectrum, so a voice that
+ * reads garbage shows up by itself.
+ *
+ * RECOMP_APU_VOICE_DUMP=<voice> also writes that voice's fetched samples,
+ * before gain, as raw s16 stereo 48 kHz to RECOMP_APU_VOICE_DUMP_FILE
+ * (default voice_dump.raw in the working directory).
+ * ============================================================ */
+
+struct VpVoiceStat {
+    uint32_t frames, zc;
+    double   sq;
+    float    last, ea, rate;
+    uint32_t addr, fmt;
+    uint16_t vol0, vol1;
+    uint8_t  bin0, bin1;
+    const char *cls;
+};
+static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
+static int s_vstat_on = -1;
+static int s_vdump_voice = -1;
+static FILE *s_vdump;
+
+static void vp_stat_init(void)
+{
+    const char *e;
+    s_vstat_on = getenv("RECOMP_APU_TRACE") != NULL;
+    e = getenv("RECOMP_APU_VOICE_DUMP");
+    if (e && *e) {
+        const char *path = getenv("RECOMP_APU_VOICE_DUMP_FILE");
+        s_vdump_voice = atoi(e);
+        s_vdump = fopen(path && *path ? path : "voice_dump.raw", "wb");
+        fprintf(stderr, "[APU] voice dump: voice %d -> %s\n", s_vdump_voice,
+                s_vdump ? (path && *path ? path : "voice_dump.raw") : "(open failed)");
+    }
+}
+
+static void vp_stat_samples(MCPXAPUState *d, uint32_t v, const float samples[][2],
+                            int n, hwaddr first_addr, uint32_t fmt)
+{
+    struct VpVoiceStat *s = &s_vstat[v];
+    if (s_vstat_on < 0) vp_stat_init();
+    if (!s_vstat_on && (int)v != s_vdump_voice) return;
+    if (n <= 0) return;
+    if (s->frames == 0) {
+        s->addr = (uint32_t)first_addr;
+        s->cls = mcpx_apu_phys_class(first_addr);
+        s->fmt = fmt;
+    }
+    for (int i = 0; i < n; i++) {
+        float x = samples[i][0];
+        s->sq += (double)x * x;
+        if ((x < 0) != (s->last < 0)) s->zc++;
+        s->last = x;
+    }
+    s->frames += (uint32_t)n;
+    if ((int)v == s_vdump_voice && s_vdump) {
+        int16_t out[NUM_SAMPLES_PER_FRAME * 2];
+        for (int i = 0; i < n && i < NUM_SAMPLES_PER_FRAME; i++) {
+            for (int c = 0; c < 2; c++) {
+                float x = samples[i][c] * 32767.0f;
+                if (x > 32767.0f) x = 32767.0f;
+                if (x < -32768.0f) x = -32768.0f;
+                out[2 * i + c] = (int16_t)x;
+            }
+        }
+        fwrite(out, sizeof(int16_t) * 2, (size_t)(n < NUM_SAMPLES_PER_FRAME ? n : NUM_SAMPLES_PER_FRAME), s_vdump);
+    }
+    (void)d;
+}
+
+static void vp_stat_report(void)
+{
+    static unsigned frames, secs;
+    if (s_vstat_on <= 0) return;
+    if (++frames % 1500) return;
+    secs++;
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        struct VpVoiceStat *s = &s_vstat[v];
+        if (!s->frames) continue;
+        fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
+                " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
+                " frames=%u rms=%.0f zcr=%.2f\n",
+                secs, v, s->fmt,
+                (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
+                (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) != 0),
+                (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE)),
+                (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE) >> ctz32(NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE)),
+                (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK)),
+                s->rate, s->ea, s->vol0, s->vol1, s->bin0, s->bin1, s->addr,
+                s->cls ? s->cls : "?", s->frames,
+                sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
+        s->frames = 0; s->zc = 0; s->sq = 0;
+    }
+    if (s_vdump) fflush(s_vdump);
+}
+
+/* ============================================================
  * Sample fetching from voice buffers
  * ============================================================ */
 
@@ -835,8 +940,16 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     block_size *= samples_per_block;
 
     int sample_count = 0;
+    hwaddr stat_addr = 0;
     for (; (sample_count < num_samples_requested) && (cbo <= ebo);
          sample_count++, cbo++) {
+        if (sample_count == 0) {
+            uint32_t lin = adpcm ? (cbo / ADPCM_SAMPLES_PER_BLOCK) * (uint32_t)block_size
+                                 : cbo * (uint32_t)block_size;
+            stat_addr = stream ? segment_offset + lin
+                               : get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                              0xFFFFFFFF, ba + lin);
+        }
         if (adpcm) {
             unsigned int block_index = cbo / ADPCM_SAMPLES_PER_BLOCK;
             unsigned int block_position = cbo % ADPCM_SAMPLES_PER_BLOCK;
@@ -912,6 +1025,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
     }
 
+    vp_stat_samples(d, v, samples, sample_count, stat_addr,
+                    voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
+                                   0xFFFFFFFF));
+
     if (cbo >= ebo) {
         if (stream) {
             d->vp.ssl[v].ssl_seg += 1;
@@ -950,23 +1067,80 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
+    /* Linear interpolation in place of libsamplerate. `rate` is the output
+     * to source ratio the VP's pitch encodes (libsamplerate's src_ratio):
+     * 1.088 for BLiNX 2's 44.1 kHz material at the 48 kHz frame rate, so
+     * each output consumes 1/rate source samples. Fetching one source sample
+     * per output, as the stub before did, played everything a semitone and a
+     * half high, 8.8 % too fast -- and drained each stream buffer faster than
+     * the title filled it, which is where the periodic dropouts came from.
+     *
+     * State per voice: the two source samples the output sits between
+     * (rs_last at 0, rs_next at 1) and the output's position rs_pos in
+     * [0,1). Source samples arrive from voice_get_samples in the voice's own
+     * units; a shortfall (the voice ended or its stream ran dry) returns the
+     * outputs that could be made, and a fetch failure with nothing made is
+     * passed through as it was. */
+    MCPXAPUVoiceFilter *f = &d->vp.filters[v];
+    float src[NUM_SAMPLES_PER_FRAME * 4 + 2][2];
+    const int max_src = (int)(sizeof(src) / sizeof(src[0]));
+    float step;
+    int need, got, in, out;
+
+    if (!(rate > 0.0f)) rate = 1.0f;
+    step = 1.0f / rate;
+
+    if (!f->rs_have) {
+        got = voice_get_samples(d, v, src, 2);
+        if (got < 2) return got < 0 ? got : 0;
+        f->rs_last[0] = src[0][0]; f->rs_last[1] = src[0][1];
+        f->rs_next[0] = src[1][0]; f->rs_next[1] = src[1][1];
+        f->rs_pos = 0.0f;
+        f->rs_have = 1;
+    }
+
+    /* Source samples the next requested_num outputs will step past, exactly:
+     * output k sits at rs_pos + k * step, and every whole unit that position
+     * reaches before the last output is a source sample consumed. The last
+     * output's own step is left pending in rs_pos for the next call, so
+     * nothing fetched here goes unused -- fetching floor(rs_pos + n * step)
+     * instead over-read by up to one sample a frame, which was dropped: the
+     * music came out 3 % fast. A rate far below 1 (a deep pitch bend) would
+     * want more than the buffer holds; make fewer outputs rather than lose
+     * source. */
+    for (;;) {
+        need = (int)floorf(f->rs_pos + (float)(requested_num - 1) * step);
+        if (need <= max_src || requested_num <= 1) break;
+        requested_num /= 2;
+    }
+    if (need > max_src) need = max_src;
+    if (need < 0) need = 0;
+
+    got = need > 0 ? voice_get_samples(d, v, src, need) : 0;
+    if (got < 0) got = 0;
+
+    for (in = 0, out = 0; out < requested_num; out++) {
+        while (f->rs_pos >= 1.0f) {
+            if (in >= got) goto done;
+            f->rs_last[0] = f->rs_next[0]; f->rs_last[1] = f->rs_next[1];
+            f->rs_next[0] = src[in][0];    f->rs_next[1] = src[in][1];
+            in++;
+            f->rs_pos -= 1.0f;
+        }
+        samples[out][0] = f->rs_last[0] + f->rs_pos * (f->rs_next[0] - f->rs_last[0]);
+        samples[out][1] = f->rs_last[1] + f->rs_pos * (f->rs_next[1] - f->rs_last[1]);
+        f->rs_pos += step;
+    }
+done:
+    if (out == 0 && got == 0) {
+        /* Nothing new and nothing left to interpolate: the voice has stopped
+         * or its stream is empty. voice_process treats 0 as an underrun and
+         * a negative as the end; the voice's active bit says which. */
         int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                     NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
-
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+        return active ? 0 : -1;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    return out;
 }
 
 /* ============================================================
@@ -1096,6 +1270,10 @@ static void voice_process(MCPXAPUState *d,
         dbg->bin[i] = (uint8_t)bin[i];
         dbg->vol[i] = vol[i];
     }
+    s_vstat[v].ea = ea_value;
+    s_vstat[v].rate = rate;
+    s_vstat[v].vol0 = vol[0]; s_vstat[v].vol1 = vol[1];
+    s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
 
     if (voice_should_mute(v)) return;
 
@@ -1248,6 +1426,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     }
 
     vp_trace_positions(d);
+    vp_stat_report();
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {

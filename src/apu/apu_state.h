@@ -380,6 +380,11 @@ typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
     SRC_STATE *resampler;
+    /* Linear-interpolation resampler state (voice_resample): the two source
+     * samples the output sits between, the output's position in [0,1)
+     * between them, and whether they have been fetched yet. */
+    float rs_last[2], rs_next[2], rs_pos;
+    int   rs_have;
     sv_filter svf[2];
     HrtfFilter hrtf;
 } MCPXAPUVoiceFilter;
@@ -545,5 +550,7 @@ extern uint64_t g_dbg_muted_voices[4];
  * counted under the APU lock, the rest by the frame thread. */
 typedef struct {
     unsigned traps, delivered, held_frames, forced;
+    unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
+    unsigned fe_trapped_frames; /* frames that found FECTL trapped */
 } ApuIrqStats;
 extern ApuIrqStats apu_irq_stats;
