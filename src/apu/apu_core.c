@@ -384,14 +384,14 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
                          MIXER_FRAME_SAMPLES, &low, &high);
         d->monitor.queued_bytes_low  = low * SAMPLE_BYTES;
         d->monitor.queued_bytes_high = high * SAMPLE_BYTES;
-        fprintf(stderr, "[APU] Using XAudio2 audio backend (pacing: %d..%d samples queued)\n",
-                low, high);
+        fprintf(stderr, "[APU] Using %s audio backend (pacing: %d..%d samples queued)\n",
+                XA2_BACKEND_NAME, low, high);
         if (high < 2 * MIXER_FRAME_SAMPLES)
             fprintf(stderr, "[APU] device buffers hold under two EP periods;"
                             " expect underruns\n");
         return;
     }
-    fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
+    fprintf(stderr, "[APU] %s unavailable, falling back to waveOut\n", XA2_BACKEND_NAME);
 
     WAVEFORMATEX wfx = { 0 };
     wfx.wFormatTag      = WAVE_FORMAT_PCM;

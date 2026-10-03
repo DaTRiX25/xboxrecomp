@@ -6,7 +6,15 @@
 
 #include <stdint.h>
 
-/* Initialize XAudio2. Returns 1 on success, 0 on failure. */
+/* The device backend behind these functions: XAudio2 on Windows
+ * (apu_xaudio2.c), SDL2 on POSIX hosts (apu_sdl2.c). Same contract. */
+#if defined(_WIN32)
+#define XA2_BACKEND_NAME "XAudio2"
+#else
+#define XA2_BACKEND_NAME "SDL2"
+#endif
+
+/* Initialize the device backend. Returns 1 on success, 0 on failure. */
 int xa2_init(void);
 
 /* Shut down XAudio2 and release all resources. */
