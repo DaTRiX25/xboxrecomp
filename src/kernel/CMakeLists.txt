@@ -49,6 +49,10 @@ else()
     target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
 endif()
 
+# The watchdog finalises the APU's WAV dump before _exit (apu_wav_close_nowait).
+# Link-only, so xbox_apu follows xbox_kernel on the link line.
+target_link_libraries(xbox_kernel PRIVATE xbox_apu)
+
 if(MSVC)
     target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
