@@ -1583,8 +1583,10 @@ static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
  * Metal resets, at the start of a pass, every offset that pass names (even
  * in setVisibilityResultMode:Disabled), so a slot never outlives its pass
  * and a stretch over a pass change takes a new one. Slots accumulate within
- * the pass. A result is in once every slot's command buffer has completed;
- * a flush commits the open command buffer so that it can. A slot freed while
+ * the pass. A result is in once every slot's command buffer has completed,
+ * so GET_REPORT commits the open command buffer: a count held to the flip
+ * lands a frame later than D3D11's, and BLiNX 2's attract light shafts
+ * (brightness from the count) come out too bright. A slot freed while
  * its command buffer is still in flight retires until the flip's wait.
  *
  * RECOMP_METAL_OCC=sync waits at GET_REPORT; =fixed leaves reports to the
@@ -1787,6 +1789,10 @@ static int metal_on_report(uint32_t va)
         return 0;
     @autoreleasepool {
         nv2a_occ_report(&s_occ, va, occ_mode() == 1);
+        /* Commit now, so the count can land within the frame, as a D3D11
+         * query's does; held to the flip, it lands a frame late. */
+        if (occ_mode() == 0 && s_cmd)
+            flush(0);
     }
     return 1;
 }
