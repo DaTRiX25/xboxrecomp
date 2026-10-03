@@ -15,10 +15,10 @@
  *                programmed, else MODULATE. Four stages, textured from the
  *                shared decode (nv2a_backend_common.h).
  *   on_flip   -> commit, wait, read the surface the walker picked for this flip
- *                (nv2a_pb_present_state) back into guest memory, then hand that
- *                surface to xbox_FramebufferWindowPresent as the CPU path does.
- *                So the SDL2 window, RECOMP_FB_DUMP and RECOMP_WINDOW_SHOT work
- *                unchanged: they read the same guest bytes.
+ *                (nv2a_pb_present_state) back into guest memory (RECOMP_FB_DUMP
+ *                and the title read those bytes), and hand the window the same
+ *                texture's pixels (xbox_FramebufferWindowPresentPixels) when it
+ *                is up; RECOMP_WINDOW_SHOT reads back what the window drew.
  *
  * Opt-in: RECOMP_PB_BACKEND=metal (nv2a_pb_metal_register_from_env). The CPU
  * rasteriser stays the default and the oracle.
@@ -77,6 +77,10 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch);
+extern int  xbox_FramebufferWindowRunning(void);
+extern void xbox_FramebufferWindowPresentPixels(const void *px, uint32_t w, uint32_t h,
+                                                uint32_t pitch, uint32_t bpp);
+static uint64_t s_window_presents;   /* frames handed to the window from a texture */
 
 /* ---- shader ABI ------------------------------------------------------------
  *
@@ -1886,7 +1890,8 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 " %llu draws (%llu vertex-program), %llu skipped, %llu culled,"
                 " %llu texture uploads, %llu rehashes, %llu write-backs;"
                 " shaders %llu vs + %llu fs, %llu compile errors;"
-                " %llu z-clears, %llu depth draws, %llu rt binds (%llu self copies)\n",
+                " %llu z-clears, %llu depth draws, %llu rt binds (%llu self copies);"
+                " %llu window presents from the texture\n",
                 (unsigned long long)s_presents, surface_offset,
                 rt ? "drawn here" : "guest bytes",
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
@@ -1897,10 +1902,33 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_vs_compiled, (unsigned long long)s_fs_compiled,
                 (unsigned long long)s_compile_errors,
                 (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
-                (unsigned long long)s_rtt_binds, (unsigned long long)s_self_copies);
+                (unsigned long long)s_rtt_binds, (unsigned long long)s_self_copies,
+                (unsigned long long)s_window_presents);
     if (!pitch || !addr)
         return;
     xbox_FramebufferWindowSet(addr, pitch);
+    /* Present (4.5): a surface drawn here goes to the window from its
+     * texture, read back after the flip's wait, not from the guest bytes;
+     * one the backend never drew (guest bytes) as the CPU path presents it. */
+    if (rt && xbox_FramebufferWindowRunning()) {
+        static uint8_t *px;
+        static size_t cap;
+        size_t need = (size_t)rt->w * rt->h * 4u;
+        if (cap < need) {
+            uint8_t *n = (uint8_t *)realloc(px, need);
+            if (n) {
+                px = n;
+                cap = need;
+            }
+        }
+        if (cap >= need) {
+            [rt->tex getBytes:px bytesPerRow:rt->w * 4u
+                   fromRegion:MTLRegionMake2D(0, 0, rt->w, rt->h) mipmapLevel:0];
+            xbox_FramebufferWindowPresentPixels(px, rt->w, rt->h, rt->w * 4u, 4u);
+            s_window_presents++;
+            return;
+        }
+    }
     xbox_FramebufferWindowPresent(addr, pitch);
 }
 

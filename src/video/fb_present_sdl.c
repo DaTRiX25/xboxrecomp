@@ -99,6 +99,31 @@ void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 
 static void present_copy(uint32_t fb_va, uint32_t pitch);
+static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
+                           uint32_t pitch, uint32_t bpp, uint64_t t0);
+
+/* Whether the window is up and takes frames: a GPU backend skips its
+ * readback for the window when not (headless). */
+int xbox_FramebufferWindowRunning(void)
+{
+    return __atomic_load_n(&s_running, __ATOMIC_SEQ_CST) != 0;
+}
+
+/* A GPU backend's frame, already in host memory (Metal: the presented
+ * MTLTexture read back at the flip, BGRA8 = X8R8G8B8, bpp 4), handed to the
+ * window instead of the guest surface. Same thread and handshake as
+ * xbox_FramebufferWindowPresent. */
+void xbox_FramebufferWindowPresentPixels(const void *px, uint32_t w, uint32_t h,
+                                         uint32_t pitch, uint32_t bpp)
+{
+    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !px || !w || !h
+            || (bpp != 2 && bpp != 4) || pitch < w * bpp)
+        return;
+    __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_running, __ATOMIC_SEQ_CST))
+        present_pixels((const uint8_t *)px, w, h, pitch, bpp, now_ns(CLOCK_MONOTONIC));
+    __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+}
 
 /* Called by the backend at each flip, on the nv2a-ack thread. */
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
@@ -120,10 +145,8 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 static void present_copy(uint32_t fb_va, uint32_t pitch)
 {
     const struct nv2a_pb_present *p;
-    struct fb_slot *s;
     const uint8_t *src;
-    uint32_t w = 640, h = 480, bpp, y;
-    size_t need;
+    uint32_t w = 640, h = 480, bpp;
     uint64_t t0 = now_ns(CLOCK_MONOTONIC);
 
     /* The walker's pick has the surface's own size; before its first pick
@@ -137,6 +160,19 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
     bpp = pitch / w;
     if (bpp != 2 && bpp != 4)
         return;
+    src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
+    present_pixels(src, w, h, pitch, bpp, t0);
+}
+
+/* The copy and the publish, from any w x h image of `bpp` bytes a pixel,
+ * `pitch` bytes a row: guest memory for present_copy, a GPU backend's own
+ * readback for xbox_FramebufferWindowPresentPixels. */
+static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
+                           uint32_t pitch, uint32_t bpp, uint64_t t0)
+{
+    struct fb_slot *s;
+    size_t need;
+    uint32_t y;
 
     s = &s_slot[s_back];               /* only this thread touches s_back */
     need = (size_t)w * h * bpp;
@@ -147,7 +183,6 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
         s->px = n;
         s->cap = need;
     }
-    src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
     for (y = 0; y < h; y++)
         memcpy(s->px + (size_t)y * w * bpp, src + (size_t)y * pitch,
                (size_t)w * bpp);
