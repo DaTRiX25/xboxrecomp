@@ -1058,10 +1058,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
+ * Voice resampling (linear interpolation in place of libsamplerate)
  *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * libsamplerate is stubbed; voice_resample below interpolates linearly
+ * between source frames at the pitch's ratio, keeping its position and
+ * the last frame across calls in the voice's filter state.
  * ============================================================ */
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
