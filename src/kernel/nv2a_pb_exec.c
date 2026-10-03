@@ -210,8 +210,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 
 /* GPU completion fences. D3D names a semaphore DMA object once, points the
  * semaphore at a word inside it once, and from then on asks the back end to
- * write the fence value it has just submitted -- BLiNX 2 sends the first two
- * once and the release ~3 times a frame. The title's fence wait spins on that
+ * write the fence value it has just submitted -- a title typically sends the
+ * first two once and the release a few times a frame. The title's fence wait spins on that
  * word, so writing it HERE, when the executor reaches it in the stream, is
  * what makes the fence mean "the GPU got this far". The old answer, mirroring
  * "submitted" into "completed" from the ack thread (xbox_Nv2aMirrorFence),
@@ -238,8 +238,8 @@ static uint32_t s_sema_last_va, s_sema_last_value;
  * GetVisibilityTestResult returns D3DERR_TESTINCOMPLETE until it changes.
  *
  * With no GET_REPORT the status never changed, so every test stayed
- * incomplete. BLiNX 2 decides from these tests whether to draw the player
- * character, and Stick was not drawn at all on either backend.
+ * incomplete. A title can decide from these tests whether to draw the
+ * player character, which then was not drawn at all on either backend.
  *
  * The count is xemu's: fragments that pass the depth, stencil and alpha
  * tests while counting is enabled. The CPU rasteriser counts them
@@ -524,8 +524,8 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  *
  * Not color_offset: by FLIP_STALL the XDK has already pointed that at the
  * next back buffer. Not the last surface drawn into either: a title renders
- * glow, shadow and downsample targets too, sometimes last -- BLiNX 2's demo
- * ends each frame in a 320x240 target at 0x00811000, and presenting that put
+ * glow, shadow and downsample targets too, sometimes last -- one title's demo
+ * ends each frame in a 320x240 target, and presenting that put
  * an inset on screen (D3D11) or dumped the wrong buffer (CPU).
  *
  * The rule is size first. A surface is the colour offset plus the size the
@@ -535,7 +535,7 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  * with no display mode yet, of the largest surface seen; and the pitch is
  * the display's too, once there is a display mode. A run of draws with the
  * clip at 640x480 but offset and pitch still those of the 320x240 target
- * (BLiNX 2 @stage1, the odd frame) is 640x480 but nothing the display could
+ * (seen on the odd frame) is 640x480 but nothing the display could
  * scan out. Of the surfaces that size, the one drawn into most recently
  * since the last flip wins; if none
  * was, the one cleared most recently; if none was either, the frame on
@@ -800,8 +800,8 @@ static void dump_present_bmp(void)
  * presents, as <prefix>flip_NNNNN.bmp named by the flip number (the number
  * RECOMP_FLIP_LOG prints), whatever else dumps in between. <flips> is a comma
  * list of numbers and ranges (a-b), up to 64 items. Flip N is the frame
- * RECOMP_D3D11_DUMP writes as present N, so scripts/golden.py asks for
- * golden dump k as flip 60k+1, or for a window around an event. Needs a
+ * RECOMP_D3D11_DUMP writes as present N, so a golden-frame script can ask for
+ * dump k as flip 60k+1, or for a window around an event. Needs a
  * backend that writes back (Metal) or the CPU path. */
 static void dump_at_flip(uint32_t flip)
 {
@@ -1072,8 +1072,8 @@ static void clear_surface(uint32_t param)
     /* A colour clear is drawing too. drawn_offset is what a flip presents, and
      * only the triangle rasteriser used to set it, so a frame that was a clear
      * plus non-triangle work left it on the last surface a triangle touched.
-     * BLiNX 2 under Proton: every flip republished 0x01034000 while the
-     * executor was clearing and drawing 0x01160000, and the window was black. */
+     * Seen under Proton: every flip republished one surface while the
+     * executor was clearing and drawing another, and the window was black. */
     s_gpu.drawn_offset = s_gpu.color_offset;
     surf_mark_written();
     /* Progress markers, interleaved with everything else in the log. The
@@ -1246,7 +1246,7 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
     if (nv2a_tex_decode_texel(fmt, p, u, NULL, 0, argb))
         return 1;
     /* Magenta, so an undecoded format shows up as itself rather than as the
-     * vertex colour (which made BLiNX 2's P8 and G8B8 surfaces look like
+     * vertex colour (which made P8 and G8B8 surfaces look like
      * plain white boxes). Logged once per format. */
     if (!s_tex_fail[t->color & 0xFF]++)
         fprintf(stderr, "  [GPU] texture format 0x%02X has no decoder;"
@@ -3044,8 +3044,8 @@ static uint32_t tc_extent(const Texture *t)
 /* The texture's bytes, all of them.
  *
  * nv2a_pb_state.h's policy fingerprints the first and the last page, and
- * RECOMP_PB_FAST_AB showed that is not enough for this title: the attract
- * movie (YUY2, 1024x512 at 0x80FE0000) is letterboxed, so its first and last
+ * RECOMP_PB_FAST_AB showed that is not enough for one title: its attract
+ * movie (YUY2, 1024x512) is letterboxed, so its first and last
  * pages are black bars that never change while the picture between them
  * does, and the cache kept showing an old frame. Hashing everything costs
  * ~0.1 ms per megabyte per flip, and the textures here total about that. */
@@ -3743,8 +3743,8 @@ static void fast_batch_setup(void)
         s_stage_tc[n] = (mode != 0 && mode != 4) ? tc_bind(t) : NULL;
         /* A stage reading the surface this batch draws into sees its own
          * earlier pixels: the reference sampler reads memory as it changes,
-         * a cached copy would not. BLiNX 2's title fade draws 0x00104000
-         * and 0x00230000 with themselves as texture, and from the cache it
+         * a cached copy would not. A title fade can draw the two back
+         * buffers with themselves as texture, and from the cache it
          * came out one step darker on ~4000 pixels per pass. Read those
          * live, like the reference does. */
         if (s_stage_tc[n] && lo && t->offset < hi
@@ -5420,7 +5420,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_COLOR_MASK:
         /* One enable bit per channel (xemu pgraph.c): B bit 0, G bit 8,
-         * R bit 16, A bit 24. BLiNX 2 draws a stencil-only quad round the
+         * R bit 16, A bit 24. A title can draw a stencil-only quad round the
          * player with all four off; written anyway it is a white square. */
         s_gpu.color_keep = ((param & (1u << 24)) ? 0 : 0xFF000000u)
                          | ((param & (1u << 16)) ? 0 : 0x00FF0000u)

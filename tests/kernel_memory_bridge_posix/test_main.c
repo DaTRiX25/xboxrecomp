@@ -5,7 +5,7 @@
  *
  *   NtFreeVirtualMemory (199)   passed a guest VA to the host as a PVOID * and
  *                               called VirtualFree on what it read there; it
- *                               failed every call (BLiNX 2: 51,215 in 4 min).
+ *                               failed every call (51,215 in 4 min in one title).
  *   MmFreeContiguousMemory (171) handed window addresses to the general heap,
  *                               which never matched them; the window was a
  *                               bump allocator and ran out at ~119 s.
@@ -343,7 +343,7 @@ static void test_overwrite(const char *cache)
     long n;
     int same = 1;
 
-    printf("FATX overwrite (the texture-cache copy, sub_001B8140/sub_001B8240)\n");
+    printf("FATX overwrite (the texture-cache copy)\n");
     for (i = 0; i < 1024; i++) G8(buf + i) = (uint8_t)(i * 7 + 1);
     h = create("z:\\o.tmp");
     set_eof(h, 1024);

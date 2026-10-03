@@ -4,7 +4,7 @@
 # and no XInput, so it builds and runs on every host:
 #   cmake --build <build> --target input_map_test && ctest -R input_map
 # Cross-built for Windows, ctest runs it through CMAKE_CROSSCOMPILING_EMULATOR
-# (tests/proton_run.sh), as bench.sh tests does.
+# (tests/proton_run.sh).
 # INPUT_MAP_README_OUT=<file> writes the table block the README should hold.
 
 set(INPUT_SRC ${CMAKE_CURRENT_LIST_DIR}/../../src/input)

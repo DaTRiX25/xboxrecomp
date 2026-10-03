@@ -1,7 +1,7 @@
 /*
  * nv2a_zbuf - the CPU raster's depth-buffer selection (nv2a_zbuf_cache.h).
  *
- * Issue #36: one shared buffer was reset when stage 1-1 switched to its
+ * Issue #36: one shared buffer was reset when a level switched to its
  * 256x256 offscreen pass and back, and the sky then drew over the cliff.
  *
  *   cc -I src/kernel tests/nv2a_zbuf/test_main.c

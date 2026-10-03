@@ -1235,7 +1235,7 @@ class FunctionTranslator:
         sharply for setjmp, which saves g_seh_ebp into the jmp_buf. Left
         unpublished, that slot held the caller's frame, so the longjmp resumed
         with the wrong ebp and the "add ebp, N; leave" epilogue returned with
-        esp moved. In BLiNX 2 that is libjpeg's error recovery in D3DX's JPEG
+        esp moved. One case is libjpeg's error recovery in D3DX's JPEG
         loader: a texture that is not a JPEG longjmps out, the loader returns
         0x90 bytes high, and the caller pops ebx = 0xFFFFFFFF and spins
         forever counting a mip chain that never meets it.

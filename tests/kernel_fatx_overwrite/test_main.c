@@ -1,7 +1,7 @@
 /*
  * FATX overwrite: regrowing after an overwrite keeps the data.
  *
- * BLiNX 2 builds its z: texture cache (sub_001B8140 / sub_001B8240) as:
+ * A title can build its z: texture cache as:
  *
  *   NtCreateFile(x.tmp, FILE_OVERWRITE_IF, opts 0x48)   no buffering
  *   set end of file (size rounded up to 512); write all of it; close
@@ -173,7 +173,7 @@ int main(int argc, char **argv)
     for (i = 0; i < 4096; i++) buf[i] = pattern(i);
     memcpy(buf, "IPK1", 4);
 
-    printf("FATX overwrite (the texture-cache copy, sub_001B8140/sub_001B8240)\n");
+    printf("FATX overwrite (the texture-cache copy)\n");
 
     /* First pass: create, size, write unbuffered, close. */
     st = open_file("z:\\o.tmp", XBOX_FILE_OVERWRITE_IF, 0x48, &h);

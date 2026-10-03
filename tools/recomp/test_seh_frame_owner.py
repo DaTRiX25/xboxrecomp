@@ -68,7 +68,7 @@ class SehFrameOwnerTest(unittest.TestCase):
         self.assertFalse(self.t._func_owns_a_frame(insns))
 
     def test_msvc_offset_frame_owns_a_frame(self):
-        # BLiNX 2 sub_002F89C3: push ebp; lea ebp, [esp - 0x70]
+        # MSVC offset frame: push ebp; lea ebp, [esp - 0x70]
         insns = [_Insn("push", "ebp"), _Insn("lea", "ebp, [esp - 0x70]"),
                  _Insn("sub", "esp, 0x274")]
         self.assertFalse(self.t._func_has_prologue(insns))

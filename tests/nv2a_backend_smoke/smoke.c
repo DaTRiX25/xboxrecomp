@@ -19,7 +19,7 @@
  *
  * Pass: per scene, an exact match. Every scene is screen-space with nearest
  * sampling, so the two paths compute the same bytes; the golden-limit
- * statistics (scripts/golden.py: MAE per channel, share off by more than 8)
+ * statistics (MAE per channel, share off by more than 8)
  * are printed alongside. The presented surface must also be the one drawn.
  *
  * Backend under test: RECOMP_SMOKE_BACKEND, default "metal" (the only one

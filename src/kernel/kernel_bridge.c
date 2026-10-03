@@ -467,12 +467,12 @@ struct bridge_thread_start {
  * startup writes it through the second, the CRT reads it through the first.
  *
  * The loader cannot know that size: it is computed at run time from the TLS
- * directory in .rdata, and BLiNX 2's header copy of that directory is all
- * zeros. The loader therefore built a 4-byte block, fs:[4] sat 4 bytes past
+ * directory in .rdata, and a title's header copy of that directory can be
+ * all zeros. The loader therefore built a 4-byte block, fs:[4] sat 4 bytes past
  * it, and the CRT read its per-thread pointer from 0x90 bytes below the block
  * -- zeros on most threads (so the CRT's exit path cleared guest address 0xC)
- * and, on stage loader #7, the tail of a texture someone else had allocated
- * next to that thread's TIB, which faulted at sub_002D8294+0x1F0.
+ * and, on one loader thread, the tail of a texture someone else had allocated
+ * next to that thread's TIB, which faulted.
  *
  * `kthread` is the object fs:[0x28] names for this thread; `top` is where the
  * block ends. Returns the new fs:[4], 0 when there was nothing to do. */
@@ -570,7 +570,7 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h);
  *
  * reading SignalState at +4 and ExitStatus at +0x120. ObReferenceObjectByHandle
  * used to hand back NULL, so the title read guest page 0, saw STILL_ACTIVE
- * forever, and BLiNX 2 spun on it after its stage loader exited.
+ * forever, and spun on it after a loader thread exited.
  *
  * Every spawned thread now gets a zeroed 0x200-byte object (Type 6 =
  * ThreadObject), carved from contiguous pages because that allocator is
@@ -1411,7 +1411,7 @@ static void bridge_NtQueryVirtualMemory(void)
  * a 32-bit guest VA and *FreeSize a 32-bit byte count. This used to hand
  * XBOX_TO_NATIVE(base_ptr) to xbox_NtFreeVirtualMemory as a host PVOID *, which
  * read 8 bytes there -- the guest VA plus the next stack word -- and called the
- * host VirtualFree on the result. That failed every time (BLiNX 2: 51,215
+ * host VirtualFree on the result. That failed every time (one title: 51,215
  * "NtFreeVirtualMemory failed ... err=487" in four minutes, 95% of the kernel
  * log), and even a correct read would have released a slice of the guest RAM
  * view out from under the title.
@@ -1498,7 +1498,7 @@ static void bridge_NtFreeVirtualMemory(void)
     BRIDGE_MEM32(size_ptr) = size;
     g_eax = 0;                                          /* STATUS_SUCCESS */
 
-    /* Hot on a title with a growable heap: BLiNX 2 decommits ~200 times a
+    /* Hot on a title with a growable heap: one decommits ~200 times a
      * second. A running summary, not a line per call. */
     if (KERNEL_LOG_ON() || decommits + releases <= 4
             || ((decommits + releases) & 0x3FFFu) == 0) {
@@ -2514,9 +2514,9 @@ static int kernel_raise_interrupt(uint32_t vector)
 
 /* The vblank acknowledgement, done when the guest gives it.
  *
- * PMC_INTR_0 and PCRTC_INTR_0 are write-1-to-clear. BLiNX 2's DPC reads
+ * PMC_INTR_0 and PCRTC_INTR_0 are write-1-to-clear. An XDK vblank DPC reads
  * PMC_INTR_0 to see what is pending, acks with PCRTC_INTR_0 = 1, and then
- * spins (0x002EA590) until PMC_INTR_0 shows PCRTC clear. Against plain RAM
+ * spins until PMC_INTR_0 shows PCRTC clear. Against plain RAM
  * only the nv2a-ack thread cleared that bit, once per pass. At Sleep(0) that
  * was immediate. At Sleep(1), with the push-buffer executor making each pass
  * take milliseconds, every vblank held the timer thread for the rest of a
@@ -3173,7 +3173,7 @@ static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
 
 /* Every guest thread allocates and frees tokens. Without a lock, two threads
  * that ask at the same moment can both take the same free slot and get the
- * same token for different HANDLEs. BLiNX 2 hit that: one token named both a
+ * same token for different HANDLEs. A title hit that: one token named both a
  * new loader thread and a file a worker had open. When the worker closed its
  * file, the thread lost its guest object, and the main thread's
  * GetExitCodeThread poll never saw the thread end. */
@@ -3970,8 +3970,8 @@ static void bridge_NtSetInformationFile(void)
      *     +0  BOOLEAN       ReplaceIfExists
      *     +4  HANDLE        RootDirectory
      *     +8  OBJECT_STRING FileName { u16 Length, u16 Max, char *Buffer }
-     * BLiNX 2 writes each z:\ texture cache as .tmp and renames it to .ipk;
-     * unhandled, every later .ipk open failed with 0xC0000034. */
+     * A title that writes a cache file as .tmp and renames it to its final
+     * name needs this; unhandled, every later open of the final name failed with 0xC0000034. */
     if (infoclass == 10u) {
         XBOX_OBJECT_ATTRIBUTES oa;
         XBOX_ANSI_STRING name;
@@ -6679,9 +6679,8 @@ static void ke_shadow_remove(uint32_t guest_va)
 /* The host event for a guest KEVENT, shadowing it on first use.
  *
  * KeInitializeEvent is where a shadow is normally made, but nothing obliges
- * a title to call it: a KEVENT is a 16-byte DISPATCHER_HEADER, and the D3D8
- * library in BLiNX 2 builds the one its vblank DPC signals (guest 0x002F3D7C,
- * in .bss) inline. Every Ke* event export then missed the table and fell
+ * a title to call it: a KEVENT is a 16-byte DISPATCHER_HEADER, and the XDK D3D8
+ * library builds the one its vblank DPC signals (in .bss) inline. Every Ke* event export then missed the table and fell
  * back to XBOX_TO_NATIVE, handing the host a guest pointer as an event handle:
  * on POSIX SetEvent dereferences it and the DPC faults.
  *

@@ -6,20 +6,19 @@ sub_<target>. When nothing starts at the target, that is an unresolved stub
 which adds 4 to esp and returns, as if the guest had executed a `ret`. The
 native chain unwinds and the guest frame does not.
 
-BLiNX 2's sub_00044900 is split at a lone int3 (0x00044CFA) into two primary
-bodies. The halves and their aliases branch into each other's interiors:
+The fixture is a function F split at a lone int3 into two primary bodies, A
+and B. The halves and their aliases branch into each other's interiors:
 
-- sub_00044CFB has `jne 0x00044C20`, a jcc into the middle of sub_00044900.
-  The tail-jump pass looks only at unconditional jumps, and the orphan pass
-  looks only at gaps.
-- The alias sub_00044C0B (from 0x00044C0B to sub_00044900's end) has
-  `jle 0x000449B7`, before its own start but inside its primary. Every pass
-  tests "leaves its function" against the primary bodies, so it looks like an
+- B has a `jne` into the middle of A. The tail-jump pass looks only at
+  unconditional jumps, and the orphan pass looks only at gaps.
+- An alias that starts partway into A and runs to A's end has a `jle` back
+  to a label before its own start but inside its primary. Every pass tests
+  "leaves its function" against the primary bodies, so it looks like an
   intra-function branch.
 
-Both went to stubs. The display-list interpreter returned with 0x88 bytes of
-frame still on the guest stack, and its caller's scene walk recursed until
-the native stack overflowed.
+Before the closure pass both went to stubs: the function returned with its
+frame still on the guest stack, and its caller recursed until the native
+stack overflowed.
 
 Run: python3 -m pytest tools/disasm/test_branch_alias_closure.py
 """
@@ -63,49 +62,54 @@ def _detector(insns, functions, aliases=None):
 
 # Two primary bodies, as the int3 split leaves them, plus one alias the
 # earlier passes already found.
-A_START, A_END = 0x44900, 0x44CFB
-B_START, B_END = 0x44CFB, 0x44F3E
-ALIAS_C0B = 0x44C0B
+BASE = 0x10000
+A_START, A_END = BASE, BASE + 0x3FB
+B_START, B_END = BASE + 0x3FB, BASE + 0x63E
+ALIAS = BASE + 0x30B             # an alias into A, running to A_END
+LOOP_HEAD = BASE + 0xB7          # inside A, before ALIAS
+LOOP_LABEL = BASE + 0x320        # inside A and inside ALIAS
+JLE_AT = BASE + 0x330            # in ALIAS: jle LOOP_HEAD
+JNE_AT = BASE + 0x500            # in B: jne LOOP_LABEL
 
 
-def _blinx_shape():
+def _split_function_shape():
     insns = [_Insn(a) for a in range(A_START, B_END, 0x10)]
     insns += [
-        _Insn(0x449B7),                                   # loop head
-        _Insn(0x44C20),                                   # loop body label
-        _Insn(0x44C30, mnemonic="jle", target=0x449B7, is_cond_jump=True),
-        _Insn(0x44E00, mnemonic="jne", target=0x44C20, is_cond_jump=True),
-        _Insn(0x44E10, mnemonic="jmp", target=A_START + 0x10, is_jump=True),
+        _Insn(LOOP_HEAD),
+        _Insn(LOOP_LABEL),
+        _Insn(JLE_AT, mnemonic="jle", target=LOOP_HEAD, is_cond_jump=True),
+        _Insn(JNE_AT, mnemonic="jne", target=LOOP_LABEL, is_cond_jump=True),
+        _Insn(JNE_AT + 0x10, mnemonic="jmp", target=A_START + 0x10, is_jump=True),
     ]
     return insns
 
 
 def test_jcc_into_another_body_becomes_alias():
-    det = _detector(_blinx_shape(), [(A_START, A_END), (B_START, B_END)])
+    det = _detector(_split_function_shape(), [(A_START, A_END), (B_START, B_END)])
     det._pass_branch_alias_closure()
-    assert det._alias_entries.get(0x44C20) == A_END
+    assert det._alias_entries.get(LOOP_LABEL) == A_END
 
 
 def test_branch_back_out_of_an_alias_becomes_alias():
-    det = _detector(_blinx_shape(), [(A_START, A_END), (B_START, B_END)],
-                    aliases={ALIAS_C0B: A_END})
+    det = _detector(_split_function_shape(), [(A_START, A_END), (B_START, B_END)],
+                    aliases={ALIAS: A_END})
     det._pass_branch_alias_closure()
-    # 0x44C30 sits inside the alias [0x44C0B, A_END) and branches to before
+    # JLE_AT sits inside the alias [ALIAS, A_END) and branches to before
     # its start: an entry is needed there even though the primary covers it.
-    assert det._alias_entries.get(0x449B7) == A_END
+    assert det._alias_entries.get(LOOP_HEAD) == A_END
 
 
 def test_closure_follows_new_aliases():
-    # Only the jcc in B is visible at first. The alias it creates at 0x44C20
-    # contains the jle to 0x449B7, which needs an entry of its own.
-    det = _detector(_blinx_shape(), [(A_START, A_END), (B_START, B_END)])
+    # Only the jcc in B is visible at first. The alias it creates at
+    # LOOP_LABEL contains the jle to LOOP_HEAD, which needs an entry of its own.
+    det = _detector(_split_function_shape(), [(A_START, A_END), (B_START, B_END)])
     det._pass_branch_alias_closure()
-    assert 0x44C20 in det._alias_entries
-    assert det._alias_entries.get(0x449B7) == A_END
+    assert LOOP_LABEL in det._alias_entries
+    assert det._alias_entries.get(LOOP_HEAD) == A_END
 
 
 def test_intra_body_and_known_targets_are_left_alone():
-    insns = _blinx_shape()
+    insns = _split_function_shape()
     det = _detector(insns, [(A_START, A_END), (B_START, B_END)])
     det._pass_branch_alias_closure()
     # The jmp to A_START + 0x10 is a known instruction inside A, so it gets
