@@ -100,7 +100,9 @@ static int s_trace = -1;               /* getenv once, not per access */
 static volatile LONG s_hist_r[APU_HIST_SLOTS], s_hist_w[APU_HIST_SLOTS];
 static volatile uint32_t s_hist_lastw[APU_HIST_SLOTS];
 static volatile LONG64 s_tot_r, s_tot_w, s_handler_ticks;
-static volatile LONG s_reporter_started, s_bench_active;
+static volatile LONG s_reporter_started;
+/* Set by apu_hook_fault_bench (apu_fault_bench.c) while it runs. */
+volatile LONG g_apu_hook_bench_active;
 static LARGE_INTEGER s_qpf;
 
 static void apu_trace_report(int with_table, double t)
@@ -169,7 +171,7 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
     LARGE_INTEGER a, b;
-    int trace = apu_trace_on() && !s_bench_active;
+    int trace = apu_trace_on() && !g_apu_hook_bench_active;
 
     (void)fault_addr;
     if (trace)
@@ -211,44 +213,6 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
         }
     }
     return ok;
-}
-
-/* RECOMP_APU_FAULT_BENCH=<n>: the full cost of one trapped access.
- *
- * Time n reads of NV1BA0_PIO_FREE (0xFE820010, read-only, the register
- * DirectSound polls most) through the same page fault, VEH and decoder a
- * guest access takes, from the calling thread. Call it after the VEH is
- * installed and g_apu_state is set. The accesses are left out of the
- * RECOMP_APU_TRACE tallies. Prints one line and returns the microseconds per
- * access (0 if it did not run). */
-double apu_hook_fault_bench(unsigned n)
-{
-    extern ptrdiff_t xbox_GetMemoryOffset(void);
-    volatile uint32_t *p;
-    LARGE_INTEGER f, a, b;
-    uint32_t sink = 0;
-    double us;
-
-    if (!g_apu_state || !n)
-        return 0;
-    p = (volatile uint32_t *)((uintptr_t)xbox_GetMemoryOffset() + 0xFE820010u);
-    QueryPerformanceFrequency(&f);
-    InterlockedExchange(&s_bench_active, 1);
-    QueryPerformanceCounter(&a);
-    /* A plain MOV load: left to itself the compiler folds the read into
-     * `add r32, [mem]`, a form the decoder does not handle. */
-    for (unsigned i = 0; i < n; i++) {
-        uint32_t v;
-        __asm__ volatile("movl (%1), %0" : "=r"(v) : "r"(p) : "memory");
-        sink += v;
-    }
-    QueryPerformanceCounter(&b);
-    InterlockedExchange(&s_bench_active, 0);
-    us = (double)(b.QuadPart - a.QuadPart) * 1e6 / (double)f.QuadPart / n;
-    fprintf(stderr, "[APU] fault bench: %u trapped reads of PIO_FREE, %.2f us"
-            " each (fault + VEH + decode + model; value 0x%X)\n",
-            n, us, sink / n);
-    return us;
 }
 
 #endif /* _WIN32 */
