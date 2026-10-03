@@ -67,4 +67,15 @@ void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
 
+/* The host window's title. The title sets it, before the window opens or at
+ * any time after; unset, it reads "Xbox Recomp". */
+void xbox_HostWindowSetTitle(const char *title);
+
+#if !defined(_WIN32)
+/* POSIX: the process main thread runs the window's event loop and guest_main
+ * runs on a thread of its own (fb_present_sdl.c). Returns guest_main's exit
+ * code. */
+int xbox_HostWindowMain(int (*guest_main)(void));
+#endif
+
 #endif /* BURNOUT3_VIDEO_PLAYER_H */
