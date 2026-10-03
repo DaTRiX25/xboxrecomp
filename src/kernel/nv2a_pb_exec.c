@@ -38,6 +38,7 @@
 #include "nv2a_vsh_cpu.h"
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_zbuf_cache.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -2120,59 +2121,41 @@ static float vsh_zmax(void)
     return nv2a_zmax(s_gpu.format);
 }
 
-/* One depth/stencil buffer per zeta offset and extent, as the D3D11 backend
- * keeps one per zeta offset and surface size (depth_target). A single shared
- * buffer was reset to the far plane each time the game switched to its
- * 256x256 offscreen pass and back, so in stage 1-1 the sky, drawn after that
- * pass with the depth test on, painted over the cliff and stairs above the
- * horizon (issue #36). s_zbuf/s_sbuf/s_zbuf_w/s_zbuf_h name the live entry. */
-#define ZB_MAX 4
-static struct {
-    uint32_t zeta, w, h;
-    float   *z;
-    uint8_t *s;
-    uint64_t last_use;
-} s_zb[ZB_MAX];
-static uint64_t s_zb_tick;
+/* One depth/stencil buffer per zeta offset and clip extent, picked by
+ * zb_select (nv2a_zbuf_cache.h, which also says why: issue #36, and what the
+ * key leaves out). s_zbuf/s_sbuf/s_zbuf_w/s_zbuf_h name the live entry. */
+static ZbCache  s_zbc;
+static float   *s_zb_z[ZB_MAX];
+static uint8_t *s_zb_s[ZB_MAX];
 
 static int vsh_zbuf_ready(void)
 {
-    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h;
-    uint32_t zeta = s_vsh.zeta_offset, i;
-    int k, e = -1, lru = 0;
+    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h, i;
+    ZbPick pk;
 
     if (!w || !h || w > 4096 || h > 4096)
         return 0;
-    s_zb_tick++;
-    for (k = 0; k < ZB_MAX; k++) {
-        if (s_zb[k].z && s_zb[k].zeta == zeta && s_zb[k].w == w && s_zb[k].h == h) {
-            e = k;
-            break;
-        }
-        if (s_zb[k].last_use < s_zb[lru].last_use)
-            lru = k;
-    }
-    if (e < 0) {
-        for (k = 0; k < ZB_MAX && s_zb[k].z; k++)
-            ;
-        e = k < ZB_MAX ? k : lru;
-        free(s_zb[e].z);
-        free(s_zb[e].s);
-        s_zb[e].z = (float *)malloc((size_t)w * h * sizeof(float));
-        s_zb[e].s = (uint8_t *)malloc((size_t)w * h);
-        if (!s_zb[e].z || !s_zb[e].s) {
-            free(s_zb[e].z); free(s_zb[e].s);
-            s_zb[e].z = NULL; s_zb[e].s = NULL;
+    pk = zb_select(&s_zbc, s_vsh.zeta_offset, w, h);
+    if (pk.evicted && s_zbc.evictions == 1)
+        fprintf(stderr, "[VSH] depth buffer cache full (%d zeta/extent keys): evicting"
+                        " the least recently used; depth may be lost (#36)\n", ZB_MAX);
+    if (pk.fresh || !s_zb_z[pk.index] || !s_zb_s[pk.index]) {
+        free(s_zb_z[pk.index]);
+        free(s_zb_s[pk.index]);
+        s_zb_z[pk.index] = (float *)malloc((size_t)w * h * sizeof(float));
+        s_zb_s[pk.index] = (uint8_t *)malloc((size_t)w * h);
+        if (!s_zb_z[pk.index] || !s_zb_s[pk.index]) {
+            free(s_zb_z[pk.index]); free(s_zb_s[pk.index]);
+            s_zb_z[pk.index] = NULL; s_zb_s[pk.index] = NULL;
+            s_zbc.slot[pk.index].used = 0;
             s_zbuf = NULL; s_sbuf = NULL; s_zbuf_w = s_zbuf_h = 0;
             return 0;
         }
-        s_zb[e].zeta = zeta; s_zb[e].w = w; s_zb[e].h = h;
         for (i = 0; i < w * h; i++)
-            s_zb[e].z[i] = 1.0f;
-        memset(s_zb[e].s, 0, (size_t)w * h);
+            s_zb_z[pk.index][i] = 1.0f;
+        memset(s_zb_s[pk.index], 0, (size_t)w * h);
     }
-    s_zb[e].last_use = s_zb_tick;
-    s_zbuf = s_zb[e].z; s_sbuf = s_zb[e].s;
+    s_zbuf = s_zb_z[pk.index]; s_sbuf = s_zb_s[pk.index];
     s_zbuf_w = w; s_zbuf_h = h;
     return 1;
 }
@@ -4465,14 +4448,16 @@ static void vsh_report(void)
     fprintf(stderr, "[VSH] viewport offset %.2f %.2f %.2f %.2f scale %.2f %.2f"
                     " %.2f %.2f | c58 %.2f %.2f %.2f c59 %.2f %.2f %.2f |"
                     " cull %d face 0x%X front 0x%X | depth %d func 0x%X mask %d"
-                    " | surface fmt 0x%X zeta 0x%X, %u clears (%u with Z)\n",
+                    " | surface fmt 0x%X zeta 0x%X, %u clears (%u with Z),"
+                    " %llu depth buffer evictions\n",
             s_vsh.vp_off[0], s_vsh.vp_off[1], s_vsh.vp_off[2], s_vsh.vp_off[3],
             s_vsh.vp_scale[0], s_vsh.vp_scale[1], s_vsh.vp_scale[2], s_vsh.vp_scale[3],
             s_vsh.c[58][0], s_vsh.c[58][1], s_vsh.c[58][2],
             s_vsh.c[59][0], s_vsh.c[59][1], s_vsh.c[59][2],
             s_vsh.cull_enable, s_vsh.cull_face, s_vsh.front_face,
             s_vsh.depth_enable, s_vsh.depth_func, s_vsh.depth_mask,
-            s_gpu.format, s_vsh.zeta_offset, s_vsh.clears_seen, s_vsh.zclears);
+            s_gpu.format, s_vsh.zeta_offset, s_vsh.clears_seen, s_vsh.zclears,
+            (unsigned long long)s_zbc.evictions);
     for (a = 0; a < NV_VERTEX_ATTRS; a++) {
         int any = 0;
         for (t = 0; t < 8; t++) any |= s_vsh.fmt_seen[a][t] != 0;
