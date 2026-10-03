@@ -167,14 +167,20 @@ void xbox_IrqlDumpHolders(void)
     fflush(stderr);
 }
 
+/* Whether this thread is in g_irql_raised_count. The count moves on this
+ * flag, not on the edge alone, so a thread can never be counted twice or
+ * taken off a count it was never on. */
+static XBOX_THREAD_LOCAL int t_irql_counted;
+
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
-    int was = (old_level >= DISPATCH_LEVEL);
     int now = (new_level >= DISPATCH_LEVEL);
     LONG d;
 
-    if (now == was)
+    (void)old_level;
+    if (now == t_irql_counted)
         return;
+    t_irql_counted = now;
 
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
@@ -256,21 +262,17 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
     if (NewIrql > g_current_irql) {
-        /* A lower that raises the count.
-         *
-         * irql_track works on the edge, so this call crosses the boundary
-         * upwards and increments. The pair that would bring it back down has
-         * already happened, so the depth is now permanently one too high --
-         * and the count is what every device model reads before delivering.
-         * One of these ends interrupts for the rest of the run.
-         *
-         * Loud rather than a filtered warning because of that consequence:
-         * the symptom is a device going silent minutes later, with nothing
-         * connecting it back to here. */
+        /* A lower that would raise. The title's own pairs never do this;
+         * one that does is restoring a level it read from somewhere other
+         * than its matching raise. Take the level it asks for, but never
+         * count it: a raise counted here has no lower to undo it, and the
+         * count is what every device model reads before delivering, so one
+         * of these used to end interrupts for the rest of the run. A thread
+         * already counted stays counted until it really lowers. */
         static volatile LONG n;
         if (InterlockedIncrement(&n) <= 20) {
             fprintf(stderr, "  [IRQLBUG] tid %lu KfLowerIrql(%d) while at %d"
-                    " -- counted as a raise, depth is now stuck\n",
+                    " -- level set, not counted as a raise\n",
                     (unsigned long)GetCurrentThreadId(),
                     (int)NewIrql, (int)g_current_irql);
             fflush(stderr);
@@ -278,6 +280,9 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
             g_current_irql, NewIrql);
+        g_current_irql = NewIrql;
+        irql_publish();
+        return;
     }
 
     irql_track(g_current_irql, NewIrql, IRQL_CALLER());
