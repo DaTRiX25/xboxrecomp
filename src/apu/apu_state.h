@@ -545,5 +545,6 @@ extern uint64_t g_dbg_muted_voices[4];
  * counted under the APU lock, the rest by the frame thread. */
 typedef struct {
     unsigned traps, delivered, held_frames, forced;
+    unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
 } ApuIrqStats;
 extern ApuIrqStats apu_irq_stats;

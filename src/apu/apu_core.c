@@ -147,8 +147,10 @@ extern APU_TLS uint32_t g_fs_base;
 ApuIrqStats apu_irq_stats;
 
 /* Every 5 s under RECOMP_APU_TRACE: traps, deliveries, frames held off by a
- * raised IRQL, and deliveries forced after the full hold-off. Traps well
- * above deliveries, or many forced ones, are what costs playback. */
+ * raised IRQL, deliveries forced after the full hold-off, the running count
+ * of VP/DSP frames (se_frame) and the device underruns. Traps well above
+ * deliveries, many forced ones, or se_frames standing still are what costs
+ * playback. */
 static void apu_irq_stats_line(void)
 {
     static int trace = -1;
@@ -163,9 +165,10 @@ static void apu_irq_stats_line(void)
     if (now < next_ns)
         return;
     if (next_ns)
-        fprintf(stderr, "[APU-IRQ] traps %u delivered %u held-frames %u forced %u\n",
+        fprintf(stderr, "[APU-IRQ] traps %u delivered %u held-frames %u forced %u se_frames %u underruns %u\n",
                 apu_irq_stats.traps, apu_irq_stats.delivered,
-                apu_irq_stats.held_frames, apu_irq_stats.forced);
+                apu_irq_stats.held_frames, apu_irq_stats.forced,
+                apu_irq_stats.se_frames, xa2_underruns());
     next_ns = now + 5000000000ull;
 }
 
@@ -645,6 +648,7 @@ static void se_frame(MCPXAPUState *d)
         d->sleep_acc_us = 0;
     }
     d->frame_count++;
+    apu_irq_stats.se_frames++;
 
     /* Buffer for all mixbins for this frame */
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
