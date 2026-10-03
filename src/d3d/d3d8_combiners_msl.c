@@ -115,7 +115,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
             continue;
         }
         if (m == NV2A_TEXMODE_3D || m == NV2A_TEXMODE_CUBEMAP) {
-            EMIT("    x%d = tex%d.sample(samp%d, i.t%d.xyz);\n", 8 + i, i, i, i);
+            EMIT("    x%d = tex%d.sample(samp%d, i.t%d.xyz, bias(pc.tex_bias[%d]));\n",
+                 8 + i, i, i, i, i);
         } else {
             EMIT("    {\n");
             EMIT("        float2 uv = i.t%d.xy;\n", i);
@@ -123,8 +124,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                 /* As the HLSL: only true 2D stages divide by q. */
                 EMIT("        if (pc.tex_mode[%d] == 1u && i.t%d.w != 0.0 && i.t%d.w != 1.0)"
                      " uv /= i.t%d.w;\n", i, i, i, i);
-            EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy);\n",
-                 8 + i, i, i, i);
+            EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy,"
+                 " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i);
             EMIT("    }\n");
         }
         EMIT("    if (pc.alpha_only[%d] != 0u) x%d.rgb = float3(1.0);\n", i, 8 + i);

@@ -38,12 +38,14 @@ extern "C" {
     "};\n"
 
 /** The fragment constants: struct nv2a_ps_consts (nv2a_backend_common.h)
- * declared in float4/uint4 only. atest is (alpha_ref as float bits,
- * alpha_func, alpha_test_enable, fog_enable). */
+ * declared in float4/uint4 only, then Metal's own tex_bias (stage k's mip
+ * LOD bias, passed to sample() as bias()). atest is (alpha_ref as float
+ * bits, alpha_func, alpha_test_enable, fog_enable). */
 #define D3D8_MSL_PSCONSTS \
     "struct PsConsts {\n" \
     "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n" \
     "    uint4 atest; uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n" \
+    "    float4 tex_bias;\n" \
     "};\n"
 
 /**

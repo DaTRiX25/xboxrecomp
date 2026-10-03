@@ -38,8 +38,9 @@
  *
  * Depth/stencil and render-to-texture as the D3D11 backend (M2).
  * Not yet: occlusion queries (the walker reports
- * RECOMP_ZPASS_FIXED for a backend without on_report), LOD bias before macOS 26
- * (MTLSamplerDescriptor.lodBias), swizzled render targets.
+ * RECOMP_ZPASS_FIXED for a backend without on_report), swizzled render
+ * targets. The mip LOD bias is a sample() argument (MsPsConsts.tex_bias),
+ * not a sampler field, so every macOS takes the same path.
  *
  * Everything runs on the NV2A ack thread (or the smoke test's main thread).
  *
@@ -105,6 +106,16 @@ PS_AT(tex_scale, 336);
 PS_AT(tex_mode, 400);
 #undef PS_AT
 _Static_assert(sizeof(struct nv2a_ps_consts) == 416, "nv2a_ps_consts size changed");
+
+/* The MSL PsConsts: the shared constants plus Metal's own trailing float4
+ * tex_bias (per stage mip LOD bias, passed to sample() as bias()). Kept out
+ * of nv2a_ps_consts, whose size the D3D11 backend pins to NV2APSConstants. */
+typedef struct {
+    struct nv2a_ps_consts b;
+    float tex_bias[4];
+} MsPsConsts;
+_Static_assert(offsetof(MsPsConsts, tex_bias) == 416 && sizeof(MsPsConsts) == 432,
+               "MsPsConsts.tex_bias moved");
 _Static_assert(sizeof(float) == 4 && sizeof(uint32_t) == 4, "alpha_ref is read as uint bits");
 
 /* One expanded vertex of a pass-through batch: attributes 0, 3, 4, 9..12 as
@@ -149,7 +160,7 @@ static const char s_msl[] =
     "    } else if (pc.tex_mode.x != 0u) {\n"
     "        float2 uv = i.t0.xy;\n"
     "        if (pc.tex_mode.x == 1u && i.t0.w != 0.0 && i.t0.w != 1.0) uv /= i.t0.w;\n"
-    "        c *= tex0.sample(samp0, uv * pc.tex_scale[0].xy);\n"
+    "        c *= tex0.sample(samp0, uv * pc.tex_scale[0].xy, bias(pc.tex_bias.x));\n"
     "    }\n"
     "    if (pc.atest.z != 0u) {\n"
     "        float ref = as_type<float>(pc.atest.x);\n"
@@ -932,8 +943,7 @@ static id<MTLSamplerState> sampler(const Stage *t)
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9 | (uint64_t)mip << 10;
     if (mip)
-        key |= (uint64_t)(t->filter & 0x1FFFu) << 12
-             | (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
+        key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
     for (i = 0; i < s_smp_n; i++)
         if (s_smp[i].key == key)
             return s_smp[i].s;
@@ -947,11 +957,6 @@ static id<MTLSamplerState> sampler(const Stage *t)
     sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
     sd.lodMinClamp = mip ? (float)t->lod_min : 0.0f;
     sd.lodMaxClamp = mip ? (float)t->lod_max : 0.0f;
-    if (@available(macOS 26.0, *)) {
-        /* As the D3D11 MipLODBias; before macOS 26 Metal samplers have none. */
-        float b = mip ? lod_bias(t->filter) : 0.0f;
-        sd.lodBias = b > 15.99f ? 15.99f : b < -16.0f ? -16.0f : b;
-    }
     st = [s_dev newSamplerStateWithDescriptor:sd];
     [sd release];
     if (!st)
@@ -1288,7 +1293,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     id<MTLRenderPipelineState> pso;
     id<MTLFunction> vfn, ffn;
     struct nv2a_vp_consts vc;
-    struct nv2a_ps_consts pc;
+    MsPsConsts mpc;
     NSUInteger vb_off, ib_off, vbytes;
     uint32_t lo = 0xFFFF, hi = 0, count, nidx, i, k, nf4 = 0;
     int slot[NV2A_VS_MAX_INPUTS];
@@ -1332,7 +1337,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             return;
         }
         build_stages();
-        nv2a_ps_consts_fill(v, s_stage, &pc);
+        nv2a_ps_consts_fill(v, s_stage, &mpc.b);
+        for (k = 0; k < 4; k++) {
+            /* As the D3D11 MipLODBias: only a mipmapped stage has one. */
+            const Stage *t = &s_stage[k];
+            float b = t->levels > 1 && filter_mip(t->filter) ? lod_bias(t->filter) : 0.0f;
+            mpc.tex_bias[k] = b > 15.99f ? 15.99f : b < -16.0f ? -16.0f : b;
+        }
         ffn = fs_select(v);
         for (i = 0; i < d->idx_count; i++) {
             if (d->idx[i] < lo) lo = d->idx[i];
@@ -1415,8 +1426,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     stex[k] = src->tex;
                     /* Linear coordinates are texels of the surface as drawn. */
                     if (!nv2a_tex_size_from_format(t->color)) {
-                        pc.tex_scale[k][0] = 1.0f / (float)src->w;
-                        pc.tex_scale[k][1] = 1.0f / (float)src->h;
+                        mpc.b.tex_scale[k][0] = 1.0f / (float)src->w;
+                        mpc.b.tex_scale[k][1] = 1.0f / (float)src->h;
                     }
                     s_rtt_binds++;
                 } else {
@@ -1465,7 +1476,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         } else {
             [s_enc setVertexBytes:&vc length:sizeof vc atIndex:1];
         }
-        [s_enc setFragmentBytes:&pc length:sizeof pc atIndex:0];
+        [s_enc setFragmentBytes:&mpc length:sizeof mpc atIndex:0];
         for (k = 0; k < 4; k++) {
             [s_enc setFragmentTexture:stex[k] atIndex:k];
             [s_enc setFragmentSamplerState:sampler(&s_stage[k]) atIndex:k];

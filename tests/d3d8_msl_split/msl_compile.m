@@ -1,5 +1,6 @@
 /* d3d8_msl_split's Metal step: compile one MSL source and look up its entry
- * point, with the options nv2a_pb_metal.m uses (fast math off). */
+ * point, with the options nv2a_pb_metal.m's init() uses (fast math off,
+ * safe math mode, precise functions). */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdio.h>
@@ -19,6 +20,10 @@ int msl_compile(const char *src, const char *fn, char *err, int errsize)
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
             opt.fastMathEnabled = NO;
 #pragma clang diagnostic pop
+            if (@available(macOS 15.0, *)) {
+                opt.mathMode = MTLMathModeSafe;
+                opt.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+            }
         }
         if (!dev) {
             snprintf(err, (size_t)errsize, "no Metal device");

@@ -165,8 +165,10 @@ static int emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         emit_source(sb, A, 0); sb_append(sb, " + "); emit_source(sb, C, 0);
         break;
     case NV2A_VSH_MAC_MAD:
-        /* No fma(): fast math is off, so this rounds twice, like the CPU's
-         * a * b + c. */
+        /* One expression, as the HLSL: Metal contracts a * b + c within a
+         * statement to fma even with fast math off, as FXC turns it into a
+         * mad, so this matches the D3D11 backend (and the hardware's MAD);
+         * the CPU's a * b + c may round once more. */
         emit_source(sb, A, 0); sb_append(sb, " * "); emit_source(sb, B, 0);
         sb_append(sb, " + "); emit_source(sb, C, 0);
         break;
