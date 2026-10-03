@@ -493,6 +493,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
             d->set_irq = true;
+            apu_irq_stats.traps++;
         }
         break;
 

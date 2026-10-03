@@ -134,6 +134,31 @@ extern APU_TLS uint32_t g_fs_base;
  * while a guest thread sits at raised IRQL, which is when the single-CPU
  * console could not have taken the interrupt. The routine acknowledges by
  * writing ISTS, which drops the line through update_irq. */
+ApuIrqStats apu_irq_stats;
+
+/* Every 5 s under RECOMP_APU_TRACE: traps, deliveries, frames held off by a
+ * raised IRQL, and deliveries forced after the full hold-off. Traps well
+ * above deliveries, or many forced ones, are what costs playback. */
+static void apu_irq_stats_line(void)
+{
+    static int trace = -1;
+    static uint64_t next_ns;
+    uint64_t now;
+
+    if (trace < 0)
+        trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (!trace)
+        return;
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (now < next_ns)
+        return;
+    if (next_ns)
+        fprintf(stderr, "[APU-IRQ] traps %u delivered %u held-frames %u forced %u\n",
+                apu_irq_stats.traps, apu_irq_stats.delivered,
+                apu_irq_stats.held_frames, apu_irq_stats.forced);
+    next_ns = now + 5000000000ull;
+}
+
 static void apu_deliver_irq(MCPXAPUState *d)
 {
     static int tib_ready;
@@ -142,10 +167,15 @@ static void apu_deliver_irq(MCPXAPUState *d)
     apu_guest_fn fn;
     int slot;
 
+    apu_irq_stats_line();
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
         return;
-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
+    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
+        apu_irq_stats.held_frames++;
         return;
+    }
+    if (held_off > 50)
+        apu_irq_stats.forced++;
     held_off = 0;
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
@@ -173,6 +203,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    apu_irq_stats.delivered++;
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
 

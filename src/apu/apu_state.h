@@ -540,3 +540,10 @@ extern MCPXAPUState *g_state;
 extern struct McpxApuDebug g_dbg, g_dbg_cache;
 extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];
+
+/* RECOMP_APU_TRACE: idle-voice traps against interrupt deliveries. Traps are
+ * counted under the APU lock, the rest by the frame thread. */
+typedef struct {
+    unsigned traps, delivered, held_frames, forced;
+} ApuIrqStats;
+extern ApuIrqStats apu_irq_stats;
