@@ -1362,11 +1362,12 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
             argb = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     } else if (s_gpu.blend_enable
-               && (blend_eq() != 0
-                   || !(s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
-                        && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA))
-               && blend_known(s_gpu.blend_sfactor)
-               && blend_known(s_gpu.blend_dfactor)) {
+               && (blend_eq() == 3 || blend_eq() == 4      /* MIN/MAX: no factors */
+                   || ((blend_eq() != 0
+                        || !(s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
+                             && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA))
+                       && blend_known(s_gpu.blend_sfactor)
+                       && blend_known(s_gpu.blend_dfactor)))) {
         /* Every other GL factor pair, and any pair with an equation other
          * than ADD. Additive glows (SRC_ALPHA, ONE) are what the title's
          * loading screen uses, and an opaque write turns each one into a
@@ -1383,16 +1384,19 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         }
         for (sh = 0; sh <= 24; sh += 8) {
             uint32_t sc = (argb >> sh) & 0xFF, dc = (dst >> sh) & 0xFF;
-            uint32_t s_ = (sc * blend_factor(s_gpu.blend_sfactor, argb, dst, sh) + 127u) / 255u;
-            uint32_t d_ = (dc * blend_factor(s_gpu.blend_dfactor, argb, dst, sh) + 127u) / 255u;
             uint32_t v;
-            if (eq == 1)      v = s_ > d_ ? s_ - d_ : 0;
-            else if (eq == 2) v = d_ > s_ ? d_ - s_ : 0;
-            else if (eq == 3) v = sc < dc ? sc : dc;
-            else if (eq == 4) v = sc > dc ? sc : dc;
-            else              v = (sc * blend_factor(s_gpu.blend_sfactor, argb, dst, sh)
-                                 + dc * blend_factor(s_gpu.blend_dfactor, argb, dst, sh)
-                                 + 127u) / 255u;
+            if (eq == 3) {
+                v = sc < dc ? sc : dc;
+            } else if (eq == 4) {
+                v = sc > dc ? sc : dc;
+            } else {
+                uint32_t fs = blend_factor(s_gpu.blend_sfactor, argb, dst, sh);
+                uint32_t fd = blend_factor(s_gpu.blend_dfactor, argb, dst, sh);
+                uint32_t s_ = (sc * fs + 127u) / 255u, d_ = (dc * fd + 127u) / 255u;
+                if (eq == 1)      v = s_ > d_ ? s_ - d_ : 0;
+                else if (eq == 2) v = d_ > s_ ? d_ - s_ : 0;
+                else              v = (sc * fs + dc * fd + 127u) / 255u;
+            }
             out |= (v > 255u ? 255u : v) << sh;
         }
         argb = out;

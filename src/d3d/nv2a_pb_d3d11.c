@@ -158,6 +158,9 @@ _Static_assert(sizeof(PsConsts) == sizeof(NV2APSConstants),
     "};\n"
 
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
+/* Draws dropped because CULL_FACE was FRONT_AND_BACK (D3D11 has no such
+ * mode); counted apart from s_draws_skipped, which means "could not draw". */
+static uint64_t s_draws_culled;
 static uint64_t s_draws_bconst;   /* drawn with a CONSTANT_* blend factor */
 static uint64_t s_tex_uploads, s_tex_rehash, s_tex_changed;
 static uint64_t s_tex_mip_uploads;   /* uploads with more than one level */
@@ -2473,9 +2476,13 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     count = hi - lo + 1;
     nidx = convert_indices(d, lo, idx, &topo);
     rs = rasterizer_state(&cull_all);
-    if (!nidx || (cull_all && (topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST
-                                || topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP))) {
+    if (!nidx) {
         s_draws_skipped++;
+        return;
+    }
+    if (cull_all && (topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+                     || topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)) {
+        s_draws_culled++;
         return;
     }
 
@@ -2817,14 +2824,14 @@ static void flip_log(uint32_t surface_offset)
 {
     static int on = -1;
     static uint64_t p_draws, p_prog, p_tex, p_rtt, p_clears, p_up, p_chg,
-                    p_re, p_vn, p_ve, p_skip, p_self, p_mip,
+                    p_re, p_vn, p_ve, p_skip, p_cull, p_self, p_mip,
                     p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super;
     if (on < 0)
         on = getenv("RECOMP_FLIP_LOG") != NULL;
     if (!on)
         return;
     fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu (self %llu)"
-            " skipped %llu clears %llu uploads %llu (mip %llu) changed %llu rehash %llu"
+            " skipped %llu culled %llu clears %llu uploads %llu (mip %llu) changed %llu rehash %llu"
             " vb %llu/%llu bytes occ %llu (visible %llu, pending %d, late %llu, superseded %llu, sync %llu us)"
             " present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
@@ -2834,6 +2841,7 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_rtt_binds - p_rtt),
             (unsigned long long)(s_self_copies - p_self),
             (unsigned long long)(s_draws_skipped - p_skip),
+            (unsigned long long)(s_draws_culled - p_cull),
             (unsigned long long)(s_clears - p_clears),
             (unsigned long long)(s_tex_uploads - p_up),
             (unsigned long long)(s_tex_mip_uploads - p_mip),
@@ -2848,7 +2856,7 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_occ.sync_us - p_occ_us),
             s_drawn ? s_drawn->offset : 0, surface_offset);
     p_draws = s_draws; p_prog = s_draws_prog; p_tex = s_draws_tex;
-    p_rtt = s_rtt_binds; p_skip = s_draws_skipped; p_clears = s_clears;
+    p_rtt = s_rtt_binds; p_skip = s_draws_skipped; p_cull = s_draws_culled; p_clears = s_clears;
     p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
     p_vn = s_vb_native; p_ve = s_vb_expanded; p_self = s_self_copies;
     p_mip = s_tex_mip_uploads;
@@ -2893,13 +2901,14 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     flip_log(surface_offset);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (walker said 0x%08X),"
-                " %llu clears, %llu draws, %llu skipped, %llu texture uploads,"
+                " %llu clears, %llu draws, %llu skipped, %llu culled, %llu texture uploads,"
                 " %llu rehashes, %llu combiner shaders, %llu zclears,"
                 " %llu depth-tested draws, %llu render-target textures\n",
                 (unsigned long long)s_presents,
                 s_drawn ? s_drawn->offset : 0, surface_offset,
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
                 (unsigned long long)s_draws_skipped,
+                (unsigned long long)s_draws_culled,
                 (unsigned long long)s_tex_uploads,
                 (unsigned long long)s_tex_rehash,
                 (unsigned long long)s_rc_compiles,

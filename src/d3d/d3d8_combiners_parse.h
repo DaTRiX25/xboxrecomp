@@ -148,7 +148,8 @@ typedef struct NV2ACombinerInput {
  *   [18]    cd_blue_to_alpha, [19] ab_blue_to_alpha
  *
  * Alpha output word (NV097_SET_COMBINER_ALPHA_OCW): the same destinations,
- * then [12] mux_sum and [15:13] output_map; no dot products.
+ * then [14] mux_sum and [17:15] output_map, as in the RGB word; bits [13:12]
+ * (the dot-product flags there) are unused.
  *
  * The "dot product" flag means AB = dot3(A, B) instead of A * B
  * component-wise. This is the key to bump mapping on NV2A.
