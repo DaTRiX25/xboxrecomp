@@ -208,6 +208,9 @@ int xbox_ContiguousFree(uint32_t va);
 uint32_t xbox_ContiguousBlockSize(uint32_t va);
 /* High-water mark (never decreases) and current usage, in bytes. */
 uint32_t xbox_ContiguousAllocatedBytes(void);
+/* One byte per 4 KB page of the window, nonzero while the page is allocated
+ * (or claimed). Read without the arena lock; a device model's view. */
+const volatile uint8_t *xbox_ContiguousPageMap(void);
 uint32_t xbox_ContiguousInUseBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,

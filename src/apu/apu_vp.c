@@ -493,6 +493,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
             d->set_irq = true;
+            apu_irq_stats.traps++;
         }
         break;
 
@@ -843,7 +844,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
+                    memcpy(adpcm_block, mcpx_apu_phys(addr),
                            block_size);
                 } else {
                     linear_addr += ba;
@@ -1038,6 +1039,7 @@ static void voice_process(MCPXAPUState *d,
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
         }
     } else {
+        int empty = 0;
         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
@@ -1045,6 +1047,11 @@ static void voice_process(MCPXAPUState *d,
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
             if (count < 0) break;
+            /* An active voice that keeps producing nothing is an underrun,
+             * not a reason to spin. Asking it again at once cannot change the
+             * answer, and this loop holds d->lock: Burnout 3's vehicle select
+             * sat here indefinitely while the title waited in voice_lock. */
+            if (count == 0 && ++empty > 4) break;
             sample_count += count;
         }
     }
@@ -1225,7 +1232,13 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                /* One trap at a time: once the front end is trapped, a second
+                 * idle voice in the same frame would overwrite FEDECPARAM
+                 * before the ISR has read the first. The rest trap on later
+                 * frames, after the ISR has resumed the front end. */
+                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                        != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                    fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);

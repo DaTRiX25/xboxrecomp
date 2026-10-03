@@ -2347,7 +2347,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     return 1;
 }
 
@@ -2399,10 +2399,7 @@ static void bridge_KeSynchronizeExecution(void)
  * routine has already run and there is nothing to cancel. FALSE is both the
  * honest answer and the one that keeps a caller's bookkeeping right.
  */
-static void bridge_KeRemoveQueueDpc(void)
-{
-    g_eax = 0;
-}
+static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
 
 /* The pending DPC queue.
  *
@@ -2426,6 +2423,33 @@ typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
 
+/* The queue is fed from several host threads at once -- the USB and APU
+ * controller threads raise interrupts whose ISRs queue DPCs, and the title
+ * queues its own -- and was an unlocked ring: two inserts could take the same
+ * slot and one DPC was lost. A lost USB DPC is a done queue the driver never
+ * acknowledges; the controller then completes nothing more and the pad goes
+ * dead mid-game, which is what it did.
+ *
+ * And a DPC already queued is not queued twice: the kernel keeps an Inserted
+ * flag in the KDPC (+2) and KeInsertQueueDpc returns FALSE while it is set.
+ * Running a driver's DPC twice for one interrupt makes it walk a done list it
+ * has already consumed. */
+static CRITICAL_SECTION g_dpc_lock;
+static INIT_ONCE g_dpc_lock_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK dpc_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_dpc_lock);
+    return TRUE;
+}
+
+static void dpc_lock(void)
+{
+    InitOnceExecuteOnce(&g_dpc_lock_once, dpc_lock_init, NULL, NULL);
+    EnterCriticalSection(&g_dpc_lock);
+}
+
 static void bridge_KeInsertQueueDpc(void)
 {
     uint32_t dpc  = STACK_ARG(0);
@@ -2435,9 +2459,16 @@ static void bridge_KeInsertQueueDpc(void)
 
     if (!dpc) { g_eax = 0; return; }
 
+    dpc_lock();
+    if (BRIDGE_MEM8(dpc + 2)) {                 /* already queued */
+        LeaveCriticalSection(&g_dpc_lock);
+        g_eax = 0;
+        return;
+    }
     tail = g_dpc_tail;
     next = (tail + 1) % XBOX_MAX_PENDING_DPC;
     if (next == g_dpc_head) {
+        LeaveCriticalSection(&g_dpc_lock);
         fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
         fflush(stderr);
         g_eax = 0;
@@ -2446,8 +2477,30 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_queue[tail].dpc  = dpc;
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
+    BRIDGE_MEM8(dpc + 2) = 1;
     g_dpc_tail = next;
+    LeaveCriticalSection(&g_dpc_lock);
     g_eax = 1;
+}
+
+/* Cancel a queued DPC: take it out of the queue if it is still there. */
+static void bridge_KeRemoveQueueDpc(void)
+{
+    uint32_t dpc = STACK_ARG(0);
+    LONG i;
+
+    g_eax = 0;
+    if (!dpc)
+        return;
+    dpc_lock();
+    if (BRIDGE_MEM8(dpc + 2)) {
+        for (i = g_dpc_head; i != g_dpc_tail; i = (i + 1) % XBOX_MAX_PENDING_DPC)
+            if (g_dpc_queue[i].dpc == dpc)
+                g_dpc_queue[i].dpc = 0;         /* drained as a no-op */
+        BRIDGE_MEM8(dpc + 2) = 0;
+        g_eax = 1;
+    }
+    LeaveCriticalSection(&g_dpc_lock);
 }
 
 /* Call a connected interrupt service routine.
@@ -2482,7 +2535,7 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     return (int)(g_eax & 1u);
 }
 
@@ -2641,11 +2694,22 @@ static long kernel_vblank_tick(void)
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
 {
-    while (g_dpc_head != g_dpc_tail) {
-        LONG head = g_dpc_head;
-        PendingDpc d = g_dpc_queue[head];
-        g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
-        kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+    for (;;) {
+        PendingDpc d;
+        dpc_lock();
+        if (g_dpc_head == g_dpc_tail) {
+            LeaveCriticalSection(&g_dpc_lock);
+            break;
+        }
+        d = g_dpc_queue[g_dpc_head];
+        g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
+        /* Cleared before the routine runs, as the kernel does: the routine
+         * may queue itself again. */
+        if (d.dpc)
+            BRIDGE_MEM8(d.dpc + 2) = 0;
+        LeaveCriticalSection(&g_dpc_lock);
+        if (d.dpc)
+            kernel_run_dpc(d.dpc, d.arg1, d.arg2);
     }
 }
 
