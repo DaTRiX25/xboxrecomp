@@ -525,6 +525,15 @@ void mcpx_apu_dsp_init(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 
+/* Monitor (host output): call after each 32-sample frame; on the last frame
+ * of an EP period it adds the software mixer and test tone to frame_buf and
+ * hands those 256 samples to the device. */
+void mcpx_apu_monitor_frame(MCPXAPUState *d);
+
+/* Frame-thread pacing at an EP-period boundary: 0 = render the next period
+ * now, else microseconds to wait before asking again. See apu_core.c. */
+int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
+
 /* Debug globals */
 extern MCPXAPUState *g_state;
 extern struct McpxApuDebug g_dbg, g_dbg_cache;

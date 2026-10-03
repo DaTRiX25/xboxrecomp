@@ -1169,6 +1169,37 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+/* RECOMP_APU_TRACE: every 60 VP frames, each active voice's play offset and
+ * end offset, in samples (CBO and EBO as the VP holds them). This is the
+ * audio clock Sofdec follows; the drift measurement compares how far these
+ * advance with the flip count. */
+static void vp_trace_positions(MCPXAPUState *d)
+{
+    static int trace = -1;
+    static unsigned frames;
+
+    if (trace < 0)
+        trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (!trace || ++frames % 60)
+        return;
+
+    for (int list = 0; list < 3; list++) {
+        uint32_t h = d->regs[voice_list_regs[list].top];
+        for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+            uint16_t v = (uint16_t)h;
+            if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                               NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+                fprintf(stderr, "[APU] voice %u pos=%u/%u\n", (unsigned)v,
+                        voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                                       NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                        voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT,
+                                       NV_PAVS_VOICE_PAR_NEXT_EBO));
+            h = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        }
+    }
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -1202,6 +1233,8 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             d->regs[current] = d->regs[next];
         }
     }
+
+    vp_trace_positions(d);
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
