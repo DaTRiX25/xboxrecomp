@@ -835,8 +835,17 @@ static void dump_at_flip(uint32_t flip)
             if (*end != ',')
                 break;
         }
-        if (n)
+        if (n) {
+            const struct nv2a_pb_backend *be = nv2a_pb_get_backend();
             fprintf(stderr, "  [GPU] RECOMP_FB_DUMP_AT: %d flip ranges\n", n);
+            if (!prefix)
+                fprintf(stderr, "  [GPU] WARNING: RECOMP_FB_DUMP_AT is set without"
+                        " RECOMP_FB_DUMP; no flips will be dumped\n");
+            else if (be != nv2a_pb_cpu_backend() && !be->writes_back)
+                fprintf(stderr, "  [GPU] WARNING: RECOMP_FB_DUMP_AT with a backend"
+                        " that does not write back (D3D11 presents from its own"
+                        " swap chain): the dumps hold stale guest memory\n");
+        }
     }
     if (!n || !prefix)
         return;
