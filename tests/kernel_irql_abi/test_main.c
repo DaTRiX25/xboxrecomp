@@ -48,7 +48,9 @@ static int lower_raises_case(void) {
     HANDLE t;
     failed |= check("starts passive and uncounted", xbox_KfRaiseIrql(0) == 0 && xbox_IrqlRaisedCount() == 0);
     xbox_KfLowerIrql(16);
-    failed |= check("lower-to-16 sets the level", xbox_KfRaiseIrql(16) == 16);
+    /* Read the level where the guest does, KPCR.Irql at fs:[0x24]: asking
+     * through KfRaiseIrql would itself count as a raise. */
+    failed |= check("lower-to-16 sets the level", memory[XBOX_TIB_MAIN + 0x24] == 16);
     failed |= check("lower-to-16 is not counted", xbox_IrqlRaisedCount() == 0);
     xbox_KfLowerIrql(0);
     failed |= check("back to passive, still uncounted", xbox_IrqlRaisedCount() == 0);
