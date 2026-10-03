@@ -9,6 +9,7 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
+#include "apu_regs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,71 @@ static int16_t want_l(int s) { return (int16_t)(left_of(s / SUB, s % SUB) * 3276
 static int16_t want_r(int s) { return (int16_t)(right_of(s / SUB, s % SUB) * 32767.0f); }
 
 static int16_t clamp16(int v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
+
+/* ---- 2.6: the voice position trace ----
+ * One looping 16-bit mono voice in fake guest RAM, run through the real VP
+ * for 120 frames with RECOMP_APU_TRACE set (ctest sets it). stderr is
+ * captured to a file; two "[APU] voice 0 pos=" lines must appear, with the
+ * position advancing between them. */
+extern uint8_t *g_apu_ram_ptr;
+
+static void wr32(uint32_t addr, uint32_t v) { memcpy(g_apu_ram_ptr + addr, &v, 4); }
+
+static void voice_trace_case(void)
+{
+    enum { VPV = 0x100000, SGE = 0x200000, PCM = 0x300000, EBO = 8000 };
+    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
+    char line[256];
+    unsigned pos[4], len[4], n = 0, v;
+    FILE *f;
+
+    g_apu_ram_ptr = (uint8_t *)calloc(1, 64u << 20);
+    if (!d || !g_apu_ram_ptr) { failures++; return; }
+
+    d->regs[NV_PAPU_VPVADDR]   = VPV;
+    d->regs[NV_PAPU_VPSGEADDR] = SGE;
+    d->regs[NV_PAPU_TVL2D] = 0;              /* voice 0 heads the 2D list */
+    d->regs[NV_PAPU_TVL3D] = 0xFFFF;
+    d->regs[NV_PAPU_TVLMP] = 0xFFFF;
+    for (int page = 0; page < 8; page++)     /* SGE: page k -> PCM + k*4K */
+        wr32(SGE + page * 8, PCM + page * 4096);
+    for (int i = 0; i < EBO; i++) {          /* a ramp, so it is not silence */
+        int16_t smp = (int16_t)(i * 4);
+        memcpy(g_apu_ram_ptr + PCM + i * 2, &smp, 2);
+    }
+    wr32(VPV + NV_PAVS_VOICE_CFG_FMT,
+         (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28)   /* S16          */
+         | (1u << 30)                                    /* 2-byte cont. */
+         | NV_PAVS_VOICE_CFG_FMT_LOOP);
+    wr32(VPV + NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+    wr32(VPV + NV_PAVS_VOICE_PAR_NEXT, EBO);
+    wr32(VPV + NV_PAVS_VOICE_TAR_PITCH_LINK, 0xFFFF);    /* end of list  */
+
+    fflush(stderr);
+    if (!freopen("apu_monitor_trace.txt", "w", stderr)) { failures++; return; }
+    for (int fr = 0; fr < 120; fr++) {
+        memset(mixbins, 0, sizeof(mixbins));
+        mcpx_apu_vp_frame(d, mixbins);
+    }
+    fflush(stderr);
+
+    f = fopen("apu_monitor_trace.txt", "r");
+    while (f && fgets(line, sizeof line, f))
+        if (n < 4 && sscanf(line, "[APU] voice %u pos=%u/%u", &v, &pos[n], &len[n]) == 3
+                && v == 0)
+            n++;
+    if (f) fclose(f);
+    printf("voice trace: %u lines", n);
+    for (unsigned i = 0; i < n; i++) printf(" %u/%u", pos[i], len[i]);
+    printf("\n");
+    CHECK("two trace lines in 120 frames", n == 2);
+    CHECK("position advances", n == 2 && pos[1] > pos[0]);
+    CHECK("length is the EBO", n >= 1 && len[0] == EBO);
+    free(g_apu_ram_ptr);
+    g_apu_ram_ptr = NULL;
+    free(d);
+}
 
 int main(void)
 {
@@ -131,6 +197,7 @@ int main(void)
     CHECK("ten periods, 2560 samples", got_samples == 10 * PERIOD);
 
     free(d);
+    voice_trace_case();                      /* last: it redirects stderr */
     if (failures == 0) { printf("apu_monitor: ALL PASS\n"); return 0; }
     printf("apu_monitor: %d FAILURE(S)\n", failures);
     return 1;
