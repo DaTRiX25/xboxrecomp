@@ -24,3 +24,7 @@ else()
     target_compile_options(xbox_input PRIVATE -Wall -Wextra -O2)
 endif()
 
+# The mapping table, deadzone and connection cache, against a fake backend
+# (every host, no device needed).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_map
+                 ${CMAKE_CURRENT_BINARY_DIR}/input_map)
