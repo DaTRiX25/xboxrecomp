@@ -1087,6 +1087,7 @@ static const struct nv2a_pb_backend s_metal_backend = {
     metal_on_draw,
     metal_on_flip,
     NULL, NULL, NULL, NULL,   /* visibility tests: the walker's fixed answer */
+    1,                  /* writes_back: on_flip reads the RT into guest memory */
 };
 
 const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)

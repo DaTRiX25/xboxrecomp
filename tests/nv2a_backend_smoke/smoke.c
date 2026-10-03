@@ -17,9 +17,10 @@
  *   blend        + an alpha-blended quad over the checker (SRC_ALPHA,
  *                  ONE_MINUS_SRC_ALPHA)
  *
- * Pass: per scene, the golden limits (scripts/golden.py): per-channel mean
- * absolute difference <= 1.0, and at most 1% of pixels off by more than 8 in
- * any channel. The presented surface must also be the one drawn.
+ * Pass: per scene, an exact match. Every scene is screen-space with nearest
+ * sampling, so the two paths compute the same bytes; the golden-limit
+ * statistics (scripts/golden.py: MAE per channel, share off by more than 8)
+ * are printed alongside. The presented surface must also be the one drawn.
  *
  * Backend under test: RECOMP_SMOKE_BACKEND, default "metal" (the only one
  * that writes back on POSIX). RECOMP_SMOKE_DUMP=<prefix> writes
@@ -154,6 +155,12 @@ static void scene(int sc, uint32_t buf, uint32_t other)
         M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
 
     quad_uv(80.0f, 120.0f, 240.0f, 360.0f, solid, NULL);
+    /* Fractional edges: a half-pixel offset in either rasteriser (pixel
+     * centres at .5, the top-left rule) moves a whole row or column here. */
+    {
+        static const uint32_t green[4] = {0xFF00C040u, 0xFF00C040u, 0xFF00C040u, 0xFF00C040u};
+        quad_uv(80.3f, 380.5f, 239.6f, 460.4f, green, NULL);
+    }
 
     if (sc >= SC_CHECKER) {
         static const float uv[4][2] = {{0, 0}, {2, 0}, {2, 2}, {0, 2}};
@@ -243,7 +250,7 @@ static int compare(const char *name, const uint32_t *a, const uint32_t *b)
     const int tol = 8;
     uint64_t sum[3] = {0, 0, 0};
     uint32_t bad = 0, i, maxd[3] = {0, 0, 0};
-    double mae[3], worst = 0.0, bad_frac;
+    double mae[3], bad_frac;
     int c, ok;
 
     for (i = 0; i < W * H; i++) {
@@ -257,14 +264,12 @@ static int compare(const char *name, const uint32_t *a, const uint32_t *b)
         }
         bad += (uint32_t)off;
     }
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < 3; c++)
         mae[c] = (double)sum[c] / (double)(W * H);
-        if (mae[c] > worst) worst = mae[c];
-    }
     bad_frac = (double)bad / (double)(W * H);
-    ok = worst <= 1.0 && bad_frac <= 0.01;
+    ok = maxd[0] == 0 && maxd[1] == 0 && maxd[2] == 0;   /* exact */
     fprintf(stderr, "[backend-smoke] %-10s %s: mae b/g/r %.3f/%.3f/%.3f max %u/%u/%u"
-            " bad %.4f%% (limits mae 1.0, bad 1%% at tol %d)\n", name,
+            " bad %.4f%% at tol %d (exact match required)\n", name,
             ok ? "PASS" : "FAIL", mae[0], mae[1], mae[2], maxd[0], maxd[1], maxd[2],
             100.0 * bad_frac, tol);
     return ok;
@@ -334,6 +339,6 @@ int main(void)
         fprintf(stderr, "[backend-smoke] FAIL: %d of %d scenes\n", failures, SC_COUNT);
         return 1;
     }
-    fprintf(stderr, "[backend-smoke] done: %d scenes within the golden limits\n", SC_COUNT);
+    fprintf(stderr, "[backend-smoke] done: %d scenes identical on both paths\n", SC_COUNT);
     return 0;
 }

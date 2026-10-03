@@ -4878,8 +4878,9 @@ static void get_report(uint32_t param)
 
 /* RECOMP_PB_BACKEND=null: the walker and its decode, drawing nothing. Times
  * the platform-independent part of a frame on its own (the [PB-PERF] line). */
-/* Batches handed to a GPU backend: the CPU rasteriser's tris_drawn stays
- * put under one, and RECOMP_FB_DUMP_FLIPS reads "drew something" from both. */
+/* Batches handed to a GPU backend that writes its frame back to guest memory
+ * (writes_back): the CPU rasteriser's tris_drawn stays put under one, and
+ * RECOMP_FB_DUMP_FLIPS reads "drew something" from both. */
 static uint32_t s_gpu_backend_batches;
 static int s_null_draw_us;  /* RECOMP_PB_NULL_DRAW_US: a backend's cost, simulated */
 static void null_on_draw(const struct nv2a_pb_draw *d)
@@ -4954,7 +4955,7 @@ static void draw_primitive(void)
         d.program      = vsh_batch_active();
         s_backend->on_draw(&d);
         s_perf.draw += rt_now() - t0;
-        if (s_backend != nv2a_pb_cpu_backend())
+        if (s_backend->writes_back)
             s_gpu_backend_batches++;
     }
     s_perf.batches++;
