@@ -73,10 +73,26 @@ void mcpx_debug_end_frame(void) {}
  * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
+extern size_t g_xbox_total_ram;
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    /* RAM above the window's 64 MB. The target maps 128 MB (a devkit) and
+     * its heap runs from 0x038C0000 to 0x08000000, so most of what the title
+     * malloc()s -- BLiNX 2's sound buffers among them, handed to DirectSound
+     * as plain pointers and turned into physical addresses by
+     * MmGetPhysicalAddress, which is the identity for RAM -- sits above
+     * 0x04000000. Folding those into the low 64 MB, as the fallback below
+     * used to, read .text as PCM: full-scale white noise on every effect, and
+     * music that lost its upper half each time its ring crossed the boundary.
+     * There is no window ambiguity up here, so it is RAM, as far as the host
+     * mapped it. */
+    if (a >= (64u << 20)) {
+        if (a < g_xbox_total_ram)
+            return g_apu_ram_ptr + a;
+        return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+    }
     /* A page the contiguous allocator handed out is the window, even where
      * it overlaps the image's physical range: BLiNX 2's image runs to
      * 0x0303AC20 (its BSS), and DirectSound's voice array sits at physical
