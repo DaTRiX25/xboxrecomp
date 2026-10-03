@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "recomp_env.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_wav.h"
@@ -218,8 +219,8 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     /* RECOMP_AUDIO_WAV=<path>: dump exactly what the device is given. */
     {
-        const char *wav = getenv("RECOMP_AUDIO_WAV");
-        const char *secs = getenv("RECOMP_AUDIO_WAV_SECS");
+        const char *wav = recomp_env(RENV_AUDIO_WAV);
+        const char *secs = recomp_env(RENV_AUDIO_WAV_SECS);
         if (wav && *wav)
             apu_wav_open(wav, secs ? atof(secs) : 0.0);
     }

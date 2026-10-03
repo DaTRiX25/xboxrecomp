@@ -7,6 +7,7 @@
  */
 
 #include "apu.h"
+#include "recomp_env.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -146,7 +147,7 @@ static DWORD WINAPI apu_trace_reporter(LPVOID unused)
 static int apu_trace_on(void)
 {
     if (s_trace < 0) {
-        s_trace = getenv("RECOMP_APU_TRACE") != NULL;
+        s_trace = recomp_env(RENV_APU_TRACE) != NULL;
         QueryPerformanceFrequency(&s_qpf);
     }
     return s_trace;

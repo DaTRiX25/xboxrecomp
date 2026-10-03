@@ -15,7 +15,7 @@ enable_testing()
 # only RECOMP_* and HLSL_* into Proton, passes it on.
 add_test(NAME apu_mixdown_all COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_all PROPERTIES
-                     ENVIRONMENT "RECOMP_APU_MIXDOWN_ALL=1;RECOMP_TEST_MIXDOWN_EXPECT=1")
+                     ENVIRONMENT "RECOMP_DEBUG=apu_mixdown_all=1;RECOMP_TEST_MIXDOWN_EXPECT=1")
 add_test(NAME apu_mixdown_two_bins COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_two_bins PROPERTIES
-                     ENVIRONMENT "RECOMP_APU_MIXDOWN_ALL=0;RECOMP_TEST_MIXDOWN_EXPECT=0")
+                     ENVIRONMENT "RECOMP_DEBUG=apu_mixdown_all=0;RECOMP_TEST_MIXDOWN_EXPECT=0")

@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "recomp_env.h"
 #include "fpconv.h"
 
 /* #define DEBUG_MCPX */
@@ -1179,7 +1180,7 @@ static void vp_trace_positions(MCPXAPUState *d)
     static unsigned frames;
 
     if (trace < 0)
-        trace = getenv("RECOMP_APU_TRACE") != NULL;
+        trace = recomp_env(RENV_APU_TRACE) != NULL;
     if (!trace || ++frames % 60)
         return;
 

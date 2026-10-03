@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
+#include "recomp_env.h"
 
 /* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
  * stubbed to report inactive; real audio output via SDL2 comes later. */
@@ -40,9 +41,9 @@ static int g_xa2_num_bufs    = XA2_NUM_BUFS_DEFAULT;
 #define XA2_BUF_SAMPLES g_xa2_buf_samples
 #define XA2_NUM_BUFS    g_xa2_num_bufs
 
-static int xa2_env_int(const char *name, int def, int lo, int hi)
+static int xa2_env_int(recomp_env_id id, int def, int lo, int hi)
 {
-    const char *e = getenv(name);
+    const char *e = recomp_env(id);
     int v;
     if (!e || !*e) return def;
     v = atoi(e);
@@ -76,10 +77,10 @@ int xa2_init(void)
 
     if (g_xa2_initialized) return 1;
 
-    g_xa2_buf_samples = xa2_env_int("RECOMP_AUDIO_BUF_SAMPLES",
+    g_xa2_buf_samples = xa2_env_int(RENV_AUDIO_BUF_SAMPLES,
                                     XA2_BUF_SAMPLES_DEFAULT,
                                     XA2_BUF_SAMPLES_MIN, XA2_BUF_SAMPLES_MAX);
-    g_xa2_num_bufs = xa2_env_int("RECOMP_AUDIO_BUF_COUNT", XA2_NUM_BUFS_DEFAULT,
+    g_xa2_num_bufs = xa2_env_int(RENV_AUDIO_BUF_COUNT, XA2_NUM_BUFS_DEFAULT,
                                  XA2_NUM_BUFS_MIN, XA2_NUM_BUFS_MAX);
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
