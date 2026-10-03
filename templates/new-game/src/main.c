@@ -316,6 +316,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    /* Read the environment once, before anything asks recomp_env(). */
+    recomp_env_init();
+
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);

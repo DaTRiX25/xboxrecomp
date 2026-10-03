@@ -32,13 +32,28 @@
 extern "C" {
 #endif
 
+/* A game adds its own keys, same row format, by defining
+ * RECOMP_ENV_HAVE_GAME_KEYS on the recomp_env target (PUBLIC, so every user
+ * agrees on the table) and putting a recomp_env_game.h on its include path
+ * that defines RECOMP_ENV_GAME_KEYS(X). Its rows come after the toolkit's, so
+ * the toolkit's ids are the same with or without them. A game key whose value
+ * may contain commas is named in RECOMP_ENV_GAME_COMMA_KEYS, a string list:
+ *   #define RECOMP_ENV_GAME_COMMA_KEYS "mem_dump",
+ */
+#ifdef RECOMP_ENV_HAVE_GAME_KEYS
+#include "recomp_env_game.h"
+#endif
+#ifndef RECOMP_ENV_GAME_KEYS
+#define RECOMP_ENV_GAME_KEYS(X)
+#endif
+
 /* X(ID, TIER, NAME, LEGACY, HELP)
  *   CONFIG: NAME is the variable; LEGACY an older variable, or NULL.
  *   TRACE / DEBUG: NAME is the key in RECOMP_TRACE / RECOMP_DEBUG; LEGACY
  *   the variable it replaces (an alias for the transition window). */
 #define RECOMP_ENV_KEYS(X) \
     /* ── config ─────────────────────────────────────────────────────── */ \
-    X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "run the pushbuffer executor (draw frames)") \
+    X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "pushbuffer executor (draws frames); default on, 0: off") \
     X(PB_BACKEND,        CONFIG, "RECOMP_PB_BACKEND",        NULL, "executor backend: cpu (default), metal, d3d11, null") \
     X(HEADLESS,          CONFIG, "RECOMP_HEADLESS",          NULL, "1: no window (SDL host)") \
     X(WINDOW_SCALE,      CONFIG, "RECOMP_WINDOW_SCALE",      NULL, "window scale factor (SDL host, default 2)") \
@@ -46,14 +61,9 @@ extern "C" {
     X(WINDOW_QUIT_AFTER, CONFIG, "RECOMP_WINDOW_QUIT_AFTER", NULL, "close the window after this many seconds") \
     X(FB_WINDOW,         CONFIG, "RECOMP_FB_WINDOW",         NULL, "Windows: show the framebuffer window") \
     X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA") \
-    X(SAVE_SEED,         CONFIG, "RECOMP_SAVE_SEED",         NULL, "seed the save dir from this save before boot (game)") \
-    X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "1: emulated APU and audio (x86-64 hosts)") \
+    X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton only), 0: off") \
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt") \
-    X(INPUT_SCRIPT,      CONFIG, "RECOMP_INPUT_SCRIPT",      NULL, "scripted pad: @preset, file or inline script (game)") \
-    X(INPUT_STRICT,      CONFIG, "RECOMP_INPUT_STRICT",      NULL, "1: a bad input script ends the run (game)") \
-    X(HOST_PAD,          CONFIG, "RECOMP_HOST_PAD",          NULL, "0/1: host gamepads in or out (game)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
-    X(RUMBLE,            CONFIG, "RECOMP_RUMBLE",            NULL, "0: no rumble (game)") \
     X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
@@ -89,7 +99,6 @@ extern "C" {
     X(USB_TRACE,         TRACE, "usb",             "RECOMP_USB_TRACE",         "OHCI trace") \
     X(USB_STATS,         TRACE, "usb_stats",       "RECOMP_USB_STATS",         "OHCI summary line every 5 s") \
     X(INPUT_DIAG,        TRACE, "input_diag",      "RECOMP_INPUT_DIAG",        "input chain probe once a second") \
-    X(INPUT_TRACE,       TRACE, "input",           "RECOMP_INPUT_TRACE",       "pad handles and states (game)") \
     X(KEY_TRACE,         TRACE, "key",             "RECOMP_KEY_TRACE",         "window key-down events") \
     X(CS_TRACE_CRT,      TRACE, "cs_crt",          "RECOMP_CS_TRACE_CRT",      "CRT critical sections; =all every one") \
     X(CS_WATCH,          TRACE, "cs_watch",        "RECOMP_CS_WATCH",          "=va: critical section at that address") \
@@ -125,7 +134,6 @@ extern "C" {
     X(DSP_ACK,           DEBUG, "dsp_ack",         "RECOMP_DSP_ACK",           "=va,...: zero these words (no APU)") \
     X(APU_DSP_ACK,       DEBUG, "apu_dsp_ack",     "RECOMP_APU_DSP_ACK",       "=va,...: APU DSP acks these words") \
     X(APU_MIXDOWN_ALL,   DEBUG, "apu_mixdown_all", "RECOMP_APU_MIXDOWN_ALL",   "=0: mix only two bins") \
-    X(APU_FAULT_BENCH,   DEBUG, "apu_fault_bench", "RECOMP_APU_FAULT_BENCH",   "=n: time n trapped APU accesses (game)") \
     X(POKE,              DEBUG, "poke",            "RECOMP_POKE",              "=va:value,...: write guest words") \
     X(WORKERS,           DEBUG, "workers",         "RECOMP_WORKERS",           "=inline: run worker threads inline") \
     X(CS_MODE,           DEBUG, "cs_mode",         "RECOMP_CS_MODE",           "=single: one lock for every guest lock") \
@@ -145,7 +153,7 @@ extern "C" {
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory") \
     X(METAL_OCC,         DEBUG, "metal_occ",       "RECOMP_METAL_OCC",         "=sync|fixed: Metal occlusion mode") \
     X(FB_VA,             DEBUG, "fb_va",           "RECOMP_FB_VA",             "=va: framebuffer window shows that address") \
-    X(USB,               DEBUG, "usb",             "RECOMP_USB",               "emulated OHCI/XID USB (unused path)") \
+    X(USB,               DEBUG, "ohci",            "RECOMP_USB",               "emulated OHCI/XID USB (unused path)") \
     X(USB_PORT,          DEBUG, "usb_port",        "RECOMP_USB_PORT",          "=n: USB pad port") \
     X(USB_HC,            DEBUG, "usb_hc",          "RECOMP_USB_HC",            "=1: pad on the second controller") \
     X(USB_NDP,           DEBUG, "usb_ndp",         "RECOMP_USB_NDP",           "=n: root-hub ports, 1..4") \
@@ -163,14 +171,13 @@ extern "C" {
     X(FMV_DUMP,          DEBUG, "fmv_dump",        "RECOMP_FMV_DUMP",          "=prefix: two movie frames") \
     X(AUDIO_WAV,         DEBUG, "audio_wav",       "RECOMP_AUDIO_WAV",         "=path: WAV of the audio output") \
     X(AUDIO_WAV_SECS,    DEBUG, "audio_wav_secs",  "RECOMP_AUDIO_WAV_SECS",    "=s: audio_wav length cap") \
-    X(MEM_DUMP,          DEBUG, "mem_dump",        "RECOMP_MEM_DUMP",          "=va,bytes,prefix: guest memory dumps (game)") \
-    X(MEM_DUMP_EVERY,    DEBUG, "mem_dump_every",  "RECOMP_MEM_DUMP_EVERY",    "=s: mem_dump period, default 20 (game)") \
-    X(THREAD_DUMP,       DEBUG, "thread_dump",     "RECOMP_THREAD_DUMP",       "SIGUSR1 dumps every thread (game, POSIX)") \
     X(WATCH,             DEBUG, "watch",           "RECOMP_WATCH",             "=spec: write watchpoint on a guest address") \
     X(WATCH_RAW,         DEBUG, "watch_raw",       "RECOMP_WATCH_RAW",         "watch also prints the raw frame") \
     X(WATCH_DEPTH,       DEBUG, "watch_depth",     "RECOMP_WATCH_DEPTH",       "=n: watch stack depth (14)") \
     X(WATCH_LEN,         DEBUG, "watch_len",       "RECOMP_WATCH_LEN",         "=bytes: watch range") \
-    X(WATCHDOG_SECS,     DEBUG, "watchdog",        "RECOMP_WATCHDOG_SECS",     "=s: dump and exit after s seconds")
+    X(WATCHDOG_SECS,     DEBUG, "watchdog",        "RECOMP_WATCHDOG_SECS",     "=s: dump and exit after s seconds") \
+    /* ── the game's own keys (RECOMP_ENV_GAME_KEYS, below) ──────────────── */ \
+    RECOMP_ENV_GAME_KEYS(X)
 
 typedef enum {
 #define RECOMP_ENV_ENUM_(id, tier, name, legacy, help) RENV_##id,
@@ -199,7 +206,11 @@ extern volatile int recomp_env_ready_;
 /* The value, or NULL when unset: what getenv(old name) returned. */
 static inline const char *recomp_env(recomp_env_id id)
 {
-    if (!recomp_env_ready_)
+#if defined(_MSC_VER)
+    if (!recomp_env_ready_)   /* volatile: acquire under MSVC's default /volatile:ms */
+#else
+    if (!__atomic_load_n(&recomp_env_ready_, __ATOMIC_ACQUIRE))
+#endif
         recomp_env_init();
     return recomp_env_value_[id];
 }

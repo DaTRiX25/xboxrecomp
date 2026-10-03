@@ -524,8 +524,8 @@ int main(int argc, char **argv)
         }
         /* A vertex-program batch: mov oPos, v0; mov oD0, v3; mov oT0, v9,
          * hand-encoded, with the checker texture. It draws the same as a
-         * pass-through quad would, and gives RECOMP_WHITE_TRACE a program
-         * batch to trace (stream output and the CPU interpreter must agree). */
+         * pass-through quad would (stream output and the CPU interpreter
+         * must agree). */
         {
             static const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
             static const uint32_t outs[3][2] = {{0, 0}, {3, 3}, {9, 9}}; /* {o, v} */

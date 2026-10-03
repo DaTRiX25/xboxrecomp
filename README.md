@@ -1377,8 +1377,8 @@ one title's WMV decoder as no-op comments.
   chain, without a run per level.
 - `RECOMP_WATCH_VA` — hardware watchpoint on a guest address, generalised from a
   single hardcoded one.
-- `RECOMP_PB_SCAN` / `RECOMP_PB_EXEC` — survey a title's NV2A pushbuffer and
-  execute its surface and clear methods. The survey ranks what is *not*
+- `RECOMP_TRACE=pb_scan` / `RECOMP_PB_EXEC` (on by default; `=0` turns it
+  off) — survey a title's NV2A pushbuffer and execute it. The survey ranks what is *not*
   implemented, so the remaining work is a list rather than a guess.
 - `RECOMP_FB_WINDOW` — a window on the guest framebuffer. Nothing else scans it
   out, so however much of the GPU works, none of it is observable without this.

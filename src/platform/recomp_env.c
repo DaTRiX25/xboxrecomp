@@ -85,6 +85,26 @@ void recomp_env_flush_notes(void)
     s_notes_len = 0;
 }
 
+/* Keys whose values contain commas. In a list, a fragment that is not a key
+ * continues the value before it only after one of these; anywhere else it
+ * is a typo and gets a warning, not silently glued onto a path. */
+static const char *const s_comma_keys[] = {
+    "peek", "peek_chain", "px", "px_consts", "dsp_ack", "apu_dsp_ack",
+    "poke", "fb_dump_at", "window_shot",
+#ifdef RECOMP_ENV_GAME_COMMA_KEYS
+    RECOMP_ENV_GAME_COMMA_KEYS
+#endif
+};
+
+static int takes_commas(int id)
+{
+    size_t i;
+    for (i = 0; i < sizeof s_comma_keys / sizeof s_comma_keys[0]; i++)
+        if (!strcmp(s_keys[id].name, s_comma_keys[i]))
+            return 1;
+    return 0;
+}
+
 static int find_key(int tier, const char *key, size_t len)
 {
     int i;
@@ -142,7 +162,7 @@ static void parse_list(int tier, const char **values, char *set)
             other = id >= 0;
         }
         if (id < 0) {
-            if (last >= 0) {
+            if (last >= 0 && takes_commas(last)) {
                 /* A value with commas in it: fb_dump_at=61,121,181. */
                 size_t old = strlen(values[last]);
                 char *v = (char *)malloc(old + 1 + len + 1);
@@ -190,6 +210,19 @@ static void set_process_env(const char *name, const char *value)
 #endif
 }
 
+static void default_on(const char **values, int id, int supported)
+{
+    const char *v = values[id];
+    int on = v ? (*v && *v != '0') : 1;
+
+    if (on && !supported) {
+        if (v)
+            note("[ENV] %s: audio unsupported on this host; ignored\n", s_keys[id].name);
+        on = 0;
+    }
+    values[id] = on ? (v ? v : "1") : NULL;
+}
+
 static void load(void)
 {
     const char *values[RENV_COUNT];
@@ -230,6 +263,17 @@ static void load(void)
             set[i] = 1;
         }
     }
+
+    /* Switches that default on: unset means on, =0 (or empty) off, so a
+     * reader keeps asking only "is it set". Audio needs the host to service
+     * the APU's MMIO faults (x86-64 Windows/Proton); elsewhere it is off,
+     * with a note when asked for explicitly. */
+    default_on(values, RENV_PB_EXEC, 1);
+#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+    default_on(values, RENV_AC97_READY, 1);
+#else
+    default_on(values, RENV_AC97_READY, 0);
+#endif
 
     /* Generated code (the recompiler's unresolved-stub file) reads its
      * switch with getenv and only changes on a regen; hand it the value. */
