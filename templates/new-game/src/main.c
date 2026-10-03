@@ -31,6 +31,7 @@
  */
 
 #include <windows.h>
+#include "recomp_env.h"
 #include <dbghelp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -359,7 +360,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * and a model nothing traps into never sees a register. The APU walks
      * Xbox physical RAM to find voice buffers, so it gets the guest RAM
      * base. */
-    if (getenv("RECOMP_AC97_READY")) {
+    if (recomp_env(RENV_AC97_READY)) {
         g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
         fprintf(stderr, "[BOOT] emulated APU %s\n",
                 g_apu_state ? "up" : "FAILED to initialise");

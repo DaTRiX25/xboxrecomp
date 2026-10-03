@@ -32,6 +32,7 @@
  * point anywhere in 256 MB, and only 64 MB is mapped).
  */
 #include <stdio.h>
+#include "recomp_env.h"
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
@@ -189,7 +190,7 @@ void nv2a_pb_scan_report(void)
 
     if (s_exec_enabled > 0)
         nv2a_pb_exec_report();
-    if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
+    if (!s_seen_count || !recomp_env(RENV_PB_SCAN))
         return;
     fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised,"
                     " %u stopped (%u with a fence release salvaged, %u catch-ups)"
@@ -299,9 +300,9 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     int in_call = 0;
 
     if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+        s_exec_enabled = recomp_env(RENV_PB_EXEC) != NULL;
     if (s_scan_enabled < 0)
-        s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
+        s_scan_enabled = recomp_env(RENV_PB_SCAN) != NULL;
     if (!(s_scan_enabled || s_exec_enabled) || end_va == start_va)
         return;
     if (s_exec_enabled)
@@ -311,10 +312,10 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
      * Never the first walk: it sets up the semaphore, and without that the
      * executor never takes the fence over and there is nothing to recover. */
     if (inject < 0)
-        inject = getenv("RECOMP_PB_INJECT_STOP")
-               ? atoi(getenv("RECOMP_PB_INJECT_STOP")) : 0;
+        inject = recomp_env(RENV_PB_INJECT_STOP)
+               ? atoi(recomp_env(RENV_PB_INJECT_STOP)) : 0;
     if (inject > 0 && s_tot_segments && s_tot_segments % (uint32_t)inject == 0)
-        why = "injected (RECOMP_PB_INJECT_STOP)";
+        why = "injected (RECOMP_DEBUG=pb_inject_stop)";
 
     /* Bounded at 4 MB of words, a sane single-frame amount: GET that never
      * reaches PUT is a stream this walk is out of step with. */

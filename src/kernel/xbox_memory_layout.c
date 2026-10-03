@@ -13,6 +13,7 @@
  */
 
 #include "xbox_memory_layout.h"
+#include "recomp_env.h"
 #include "kernel.h"
 #include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
 #include <stdio.h>
@@ -674,7 +675,7 @@ static int g_dsp_ack_count = 0;
 
 static void dsp_ack_init(void)
 {
-    const char *spec = getenv("RECOMP_DSP_ACK");
+    const char *spec = recomp_env(RENV_DSP_ACK);
     char buf[128], *q, *end;
 
     if (!spec || !*spec)
@@ -711,7 +712,7 @@ static int g_poke_count;
 
 static void poke_init(void)
 {
-    const char *spec = getenv("RECOMP_POKE");
+    const char *spec = recomp_env(RENV_POKE);
     char buf[192], *q, *end;
 
     if (!spec || !*spec)
@@ -1336,12 +1337,12 @@ static DWORD WINAPI nv2a_kick_thread(LPVOID param)
 
 static void xbox_Nv2aKickStart(void *regs)
 {
-    const char *e = getenv("RECOMP_FAST_KICK");
+    const char *e = recomp_env(RENV_FAST_KICK);
     g_kick_fast = !(e && *e == '0');
     fprintf(stderr, "  NV2A KickOff flush: %s\n", g_kick_fast
-            ? "ack loop polls at ~50 us while kicking (RECOMP_FAST_KICK=0: Sleep(1))"
-            : "ack loop ticks at Sleep(1) (RECOMP_FAST_KICK=0)");
-    if (getenv("RECOMP_FLIP_LOG"))
+            ? "ack loop polls at ~50 us while kicking (RECOMP_DEBUG=fast_kick=0: Sleep(1))"
+            : "ack loop ticks at Sleep(1) (RECOMP_DEBUG=fast_kick=0)");
+    if (recomp_env(RENV_FLIP_LOG))
         g_nv2a_kick_thread = CreateThread(NULL, 0, nv2a_kick_thread, regs, 0, NULL);
 }
 
@@ -1452,7 +1453,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     if (g_scanned_put && put != g_scanned_put) {
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (g_scanned_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                        if (put < g_scanned_put && getenv("RECOMP_PB_WRAP_TRACE")) {
+                        if (put < g_scanned_put && recomp_env(RENV_PB_WRAP_TRACE)) {
                             static unsigned wraps;
                             if (wraps++ < 8)
                                 fprintf(stderr, "  [NV2A] pushbuffer wrapped "
@@ -1905,7 +1906,7 @@ static void watch_report(void)
      * answers "who wrote this"; the raw frame answers "to what object", which
      * is the next question every time -- saved registers and pointer
      * arguments live there and look nothing like code. */
-    if (getenv("RECOMP_WATCH_RAW")) {
+    if (recomp_env(RENV_WATCH_RAW)) {
         for (i = 0; esp && i < 24u; i++) {
             uint32_t slot = esp + i * 4u;
             if (!peek_readable(slot))
@@ -2004,7 +2005,7 @@ static void watch_posix_stack(void *ucv)
     /* RECOMP_WATCH_DEPTH frames (default 14); identical consecutive return
      * addresses (recursion) are folded into one line with a count. */
     {
-        const char *dv = getenv("RECOMP_WATCH_DEPTH");
+        const char *dv = recomp_env(RENV_WATCH_DEPTH);
         depth = dv && *dv ? atoi(dv) : 14;
     }
     while (n < depth && fp && (fp & 7) == 0) {
@@ -2099,7 +2100,7 @@ static int watch_posix_arm(void)
 {
     struct sigaction sa;
     pthread_t th;
-    const char *len = getenv("RECOMP_WATCH_LEN");
+    const char *len = recomp_env(RENV_WATCH_LEN);
     uint32_t room;
 
     g_watch_hsize = (uintptr_t)sysconf(_SC_PAGESIZE);
@@ -2193,7 +2194,7 @@ static DWORD WINAPI watch_resolver(LPVOID unused)
 
 void xbox_WatchInit(void)
 {
-    const char *spec = getenv("RECOMP_WATCH");
+    const char *spec = recomp_env(RENV_WATCH);
     const char *q;
     char *endp;
 
@@ -2268,7 +2269,7 @@ static int watch_arm(uint32_t va)
 void xbox_PeekSample(const char *label)
 {
     const uint8_t *mem = (const uint8_t *)g_memory_offset;
-    const char *spec = getenv("RECOMP_PEEK");
+    const char *spec = recomp_env(RENV_PEEK);
     char buf[256], *q, *end;
 
     if (!spec || !*spec || g_memory_base == NULL)
@@ -2396,7 +2397,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 
 void xbox_WatchdogStart(void)
 {
-    const char *secs = getenv("RECOMP_WATCHDOG_SECS");
+    const char *secs = recomp_env(RENV_WATCHDOG_SECS);
     HANDLE h;
 
     if (!secs || !*secs)
@@ -2444,7 +2445,7 @@ static void xbox_heap_reset_base(void);
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
-    g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
+    g_force_return = recomp_env(RENV_FORCE_RETURN) != NULL;
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
 
@@ -2607,7 +2608,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * expects whether or not the page is trapped.
      *
      * Best-effort: failing to protect it costs only the diagnostic. */
-    if (XBOX_MAP_START == 0 && getenv("RECOMP_TRAP_NULL")) {
+    if (XBOX_MAP_START == 0 && recomp_env(RENV_TRAP_NULL)) {
         DWORD old_protect;
         /* Protection is applied at host page granularity, and the host page
          * is not always the guest's 4 KB -- Apple Silicon uses 16 KB, so this
@@ -2632,7 +2633,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         long host_page = sysconf(_SC_PAGESIZE);
 #endif
         if (host_page > 0 && (uint32_t)host_page > XBOX_TIB_MAIN) {
-            fprintf(stderr, "  RECOMP_TRAP_NULL: not available -- the host page "
+            fprintf(stderr, "  trap_null: not available -- the host page "
                     "is %ld bytes, so trapping guest page zero would also trap "
                     "the TIB at 0x%08X\n", host_page, XBOX_TIB_MAIN);
         } else {
@@ -3106,10 +3107,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         g_nv2a_memory = layout_commit_at((LPVOID)nv2a_native, XBOX_NV2A_SIZE);
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
-        s_pb_exec = getenv("RECOMP_PB_EXEC") != NULL;
-        s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
-                    || getenv("RECOMP_PB_SCAN") != NULL
-                    || getenv("RECOMP_PB_EXEC") != NULL;
+        s_pb_exec = recomp_env(RENV_PB_EXEC) != NULL;
+        s_nv2a_trace = recomp_env(RENV_NV2A_TRACE) != NULL
+                    || recomp_env(RENV_PB_SCAN) != NULL
+                    || recomp_env(RENV_PB_EXEC) != NULL;
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
@@ -3178,7 +3179,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * init. Until the DSP handshake is answered, the honest default is
              * the failure that gets further, with the correct behaviour one
              * variable away. */
-            if (getenv("RECOMP_AC97_READY")) {
+            if (recomp_env(RENV_AC97_READY)) {
                 /* The APU's registers have to fault so they can be routed to
                  * the emulated APU, which is the half that answers the DSP
                  * handshake. Backed as plain memory the guest's writes go
@@ -4260,7 +4261,7 @@ static uint32_t heap_trace_va(void)
     static int init;
     static uint32_t va;
     if (!init) {
-        const char *e = getenv("RECOMP_HEAP_TRACE");
+        const char *e = recomp_env(RENV_HEAP_TRACE);
         va = e ? (uint32_t)strtoul(e, NULL, 0) : 0;
         init = 1;
     }

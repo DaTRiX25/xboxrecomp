@@ -43,6 +43,7 @@
 #if !defined(_WIN32)
 
 #include <SDL.h>
+#include "recomp_env.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -233,12 +234,6 @@ static void *guest_thread(void *arg)
     return NULL;
 }
 
-static int env_on(const char *name)
-{
-    const char *v = getenv(name);
-    return v && *v && *v != '0';
-}
-
 static int start_guest(void)
 {
     pthread_attr_t attr;
@@ -282,7 +277,7 @@ static int      s_shot_n;
 
 static void shot_parse(void)
 {
-    const char *e = getenv("RECOMP_WINDOW_SHOT");
+    const char *e = recomp_env(RENV_WINDOW_SHOT);
     while (e && *e && s_shot_n < SHOT_MAX) {
         char *end;
         unsigned long v = strtoul(e, &end, 0);
@@ -308,13 +303,13 @@ static int shot_due(uint32_t flip)
 /* Between RenderCopy and RenderPresent: the back buffer is what is shown. */
 static void shot_save(SDL_Renderer *ren, uint32_t flip)
 {
-    const char *prefix = getenv("RECOMP_WINDOW_SHOT_PREFIX");
+    const char *prefix = recomp_env(RENV_WINDOW_SHOT_PREFIX);
     SDL_Surface *surf;
     char path[512];
     int w = 0, h = 0;
 
     if (!prefix)
-        prefix = getenv("RECOMP_FB_DUMP");
+        prefix = recomp_env(RENV_FB_DUMP);
     if (!prefix)
         prefix = "window_";
     if (SDL_GetRendererOutputSize(ren, &w, &h) != 0 || w <= 0 || h <= 0)
@@ -342,15 +337,15 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     uint64_t shown_seq = 0, presents = 0, dropped_base = 0;
     uint64_t t_start, cpu_start, t_stat, cpu_stat, pres_stat = 0, flips_stat = 0;
     uint64_t upload_ns = 0;
-    int vsync = !getenv("RECOMP_PRESENT_VSYNC") || env_on("RECOMP_PRESENT_VSYNC");
-    int stats = env_on("RECOMP_PRESENT_STATS");
-    int scale = getenv("RECOMP_WINDOW_SCALE") ? atoi(getenv("RECOMP_WINDOW_SCALE")) : 2;
+    int vsync = !recomp_env(RENV_PRESENT_VSYNC) || recomp_env_on(RENV_PRESENT_VSYNC);
+    int stats = recomp_env_on(RENV_PRESENT_STATS);
+    int scale = recomp_env(RENV_WINDOW_SCALE) ? atoi(recomp_env(RENV_WINDOW_SCALE)) : 2;
     int quit = 0, guest_done = 0, dirty = 0, shoot = 0;
-    double quit_after = getenv("RECOMP_WINDOW_QUIT_AFTER")
-                      ? atof(getenv("RECOMP_WINDOW_QUIT_AFTER")) : 0.0;
+    double quit_after = recomp_env(RENV_WINDOW_QUIT_AFTER)
+                      ? atof(recomp_env(RENV_WINDOW_QUIT_AFTER)) : 0.0;
     uint32_t shown_flip = 0;
 
-    if (env_on("RECOMP_HEADLESS"))
+    if (recomp_env_on(RENV_HEADLESS))
         return guest_main();
     shot_parse();
 

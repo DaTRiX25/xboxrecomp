@@ -25,6 +25,7 @@
  * in an answer nobody has established.
  */
 #include "xbox_memory_layout.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -263,7 +264,7 @@ int main(int argc, char **argv)
      * that traps page zero by clobbering the TIB is not a fix.
      */
     {
-        setenv("RECOMP_TRAP_NULL", "1", 1);
+        recomp_env_set(RENV_TRAP_NULL, "1");
         BOOL trapped = xbox_MemoryLayoutInit(xbe, n);
         check(trapped, "init succeeds with RECOMP_TRAP_NULL set",
               "the guard must not cost the run");
@@ -290,7 +291,7 @@ int main(int argc, char **argv)
 
             xbox_MemoryLayoutShutdown();
         }
-        unsetenv("RECOMP_TRAP_NULL");
+        recomp_env_set(RENV_TRAP_NULL, NULL);
     }
 
     printf("\n%d failure(s)\n", failures);

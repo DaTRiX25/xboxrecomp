@@ -17,6 +17,7 @@
  *   RECOMP_D3D11_DUMP=<prefix>   presented frames 1, 61, ... as BMPs
  */
 #include <windows.h>
+#include "recomp_env.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,7 +167,7 @@ static int make_texture(void)
 
 int main(int argc, char **argv)
 {
-    const char *log = getenv("RECOMP_STDIO_LOG");
+    const char *log = recomp_env(RENV_STDIO_LOG);
     int frames = argc > 1 ? atoi(argv[1]) : 180;
     uint32_t buf[2] = {0x01000000u, 0x0112C000u};
     int f, a;
@@ -174,8 +175,8 @@ int main(int argc, char **argv)
     if (log)
         freopen(log, "w", stderr);
     setvbuf(stderr, NULL, _IONBF, 0);
-    if (!getenv("RECOMP_PB_BACKEND"))
-        _putenv("RECOMP_PB_BACKEND=d3d11");
+    if (!recomp_env(RENV_PB_BACKEND))
+        recomp_env_set(RENV_PB_BACKEND, "d3d11");
     fprintf(stderr, "[backend-smoke] %d frames\n", frames);
     int have_reports = 0;
     {
@@ -645,7 +646,7 @@ int main(int argc, char **argv)
         }
     }
     if (have_reports) {
-        const char *occ = getenv("RECOMP_D3D11_OCC");
+        const char *occ = recomp_env(RENV_D3D11_OCC);
         int deferred = !occ || (_stricmp(occ, "sync") && _stricmp(occ, "fixed"));
         fprintf(stderr, "[backend-smoke] visibility over %d frames and the last:"
                 " %d wrong, %d lost; cross-frame reuse live in %d of %d, vacuous"

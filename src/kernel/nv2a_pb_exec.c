@@ -21,10 +21,11 @@
  *
  * Enabled with RECOMP_PB_EXEC. RECOMP_RASTER_TEST draws one known triangle
  * after every clear, which separates "the pixel path is broken" from "the title
- * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes the surface to
+ * has not given us any vertices". RECOMP_DEBUG=fb_dump=<prefix> writes the surface to
  * <prefix>NNN.bmp, so the result can be looked at without a display.
  */
 #include <math.h>
+#include "recomp_env.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -259,31 +260,9 @@ uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_sema_releases; }
 uint32_t nv2a_pb_exec_semaphore_last_va(void) { return s_sema_last_va; }
 uint32_t nv2a_pb_exec_semaphore_last_value(void) { return s_sema_last_value; }
 
-/* getenv, read once per name.
- *
- * The walker asked the environment for its debug switches on every method,
- * batch and triangle. getenv is a linear scan of the environment -- under
- * Wine a locked, case-insensitive one over a Proton environment of a hundred
- * and more variables -- and at ~100,000 methods a frame that scan was most of
- * the walker's time. The answer cannot change while the walker runs (nothing
- * sets these after startup), so it is looked up once. Keyed by the address of
- * the name, so a call site costs a few pointer compares. Ack thread only. */
-static const char *env_cached(const char *name)
-{
-    static struct { const char *name, *value; } cache[48];
-    static int n;
-    int i;
-
-    for (i = 0; i < n; i++)
-        if (cache[i].name == name)
-            return cache[i].value;
-    if (n < (int)(sizeof cache / sizeof cache[0])) {
-        cache[n].name = name;
-        cache[n].value = getenv(name);
-        return cache[n++].value;
-    }
-    return getenv(name);
-}
+/* Switches come from recomp_env(): read once at startup, an array load per
+ * lookup. The walker consults them per method, batch and triangle, and a
+ * getenv there (a locked linear scan under Wine) was most of its time. */
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -369,7 +348,7 @@ static void note_texture_use(void)
                 static int every = -1;
                 static unsigned binds, seq;
                 if (every < 0) {
-                    const char *e = getenv("RECOMP_TEX_DUMP_EVERY");
+                    const char *e = recomp_env(RENV_TEX_DUMP_EVERY);
                     every = e ? atoi(e) : 0;
                 }
                 if (every > 0 && ++binds % (unsigned)every == 0
@@ -617,7 +596,7 @@ static void present_note(int clear)
     s_psurf[e].last_flip = s_gpu.flips;
     s_psurf[e].last_use = ++s_psurf_seq;
     if (s_ptrace_on < 0)
-        s_ptrace_on = getenv("RECOMP_PRESENT_TRACE") != NULL;
+        s_ptrace_on = recomp_env(RENV_PRESENT_TRACE) != NULL;
     if (s_ptrace_on) {
         int n = s_ptrace_n;
         if (!n || s_ptrace[n - 1].offset != s_gpu.color_offset
@@ -783,7 +762,7 @@ static int write_present_bmp(const char *path)
 
 static void dump_present_bmp(void)
 {
-    const char *prefix = getenv("RECOMP_FB_DUMP");
+    const char *prefix = recomp_env(RENV_FB_DUMP);
     uint32_t bpp = s_present.w ? s_present.pitch / s_present.w : 0;
     char path[512];
 
@@ -808,12 +787,12 @@ static void dump_at_flip(uint32_t flip)
     static int parsed;
     static int n;
     static uint32_t lo[64], hi[64];
-    const char *prefix = getenv("RECOMP_FB_DUMP");
+    const char *prefix = recomp_env(RENV_FB_DUMP);
     char path[512];
     int i;
 
     if (!parsed) {
-        const char *e = getenv("RECOMP_FB_DUMP_AT");
+        const char *e = recomp_env(RENV_FB_DUMP_AT);
         parsed = 1;
         while (e && *e && n < 64) {
             char *end;
@@ -837,12 +816,12 @@ static void dump_at_flip(uint32_t flip)
         }
         if (n) {
             const struct nv2a_pb_backend *be = nv2a_pb_get_backend();
-            fprintf(stderr, "  [GPU] RECOMP_FB_DUMP_AT: %d flip ranges\n", n);
+            fprintf(stderr, "  [GPU] fb_dump_at: %d flip ranges\n", n);
             if (!prefix)
-                fprintf(stderr, "  [GPU] WARNING: RECOMP_FB_DUMP_AT is set without"
-                        " RECOMP_FB_DUMP; no flips will be dumped\n");
+                fprintf(stderr, "  [GPU] WARNING: fb_dump_at is set without"
+                        " fb_dump; no flips will be dumped\n");
             else if (be != nv2a_pb_cpu_backend() && !be->writes_back)
-                fprintf(stderr, "  [GPU] WARNING: RECOMP_FB_DUMP_AT with a backend"
+                fprintf(stderr, "  [GPU] WARNING: fb_dump_at with a backend"
                         " that does not write back (D3D11 presents from its own"
                         " swap chain): the dumps hold stale guest memory\n");
         }
@@ -856,7 +835,7 @@ static void dump_at_flip(uint32_t flip)
         return;
     snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix, flip);
     if (!write_present_bmp(path))
-        fprintf(stderr, "  [GPU] flip %u: RECOMP_FB_DUMP_AT dump failed\n", flip);
+        fprintf(stderr, "  [GPU] flip %u: fb_dump_at dump failed\n", flip);
 }
 
 /* Write the current surface out as a 24-bit BMP.
@@ -870,7 +849,7 @@ static void dump_at_flip(uint32_t flip)
  */
 static void dump_surface_bmp(void)
 {
-    const char *prefix = getenv("RECOMP_FB_DUMP");
+    const char *prefix = recomp_env(RENV_FB_DUMP);
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     char path[512];
@@ -1111,7 +1090,7 @@ static void clear_surface(uint32_t param)
      * zero.
      *
      * ponytail: bring-up aid, not a feature. It costs one branch per clear. */
-    if (env_cached("RECOMP_RASTER_TEST")) {
+    if (recomp_env(RENV_RASTER_TEST)) {
         static int announced;
         /* Every clear, not once: the title clears each frame and double-buffers,
          * so a triangle drawn a single time is erased before anyone sees it. */
@@ -1275,7 +1254,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
  */
 static void dump_texture_bmp(uint32_t seq)
 {
-    const char *prefix = getenv("RECOMP_TEX_DUMP");
+    const char *prefix = recomp_env(RENV_TEX_DUMP);
     uint32_t w = s_gpu.tex.width, h = s_gpu.tex.height, x, y;
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
@@ -1852,17 +1831,13 @@ static int vsh_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("RECOMP_PB_VSH");
+        const char *e = recomp_env(RENV_PB_VSH);
         on = !(e && e[0] == '0');
     }
     return on;
 }
 
 /* The transform-unit methods. Returns 1 if `method` was one of them. */
-/* RECOMP_WHITE_TRACE: state the executor does not otherwise keep, recorded
- * for the per-batch trace only. */
-static uint32_t s_wt_light = ~0u;
-
 static int vsh_method(uint32_t method, uint32_t param)
 {
     switch (method) {
@@ -1870,7 +1845,6 @@ static int vsh_method(uint32_t method, uint32_t param)
     case 0x0294: s_vsh.light_ctl = param; return 1;         /* SET_LIGHT_CONTROL */
     case 0x029C: s_vsh.fog_mode = param; return 1;          /* SET_FOG_MODE */
     case 0x02A0: s_vsh.fog_gen = param; return 1;           /* SET_FOG_GEN_MODE */
-    case 0x0314: s_wt_light = param; break;         /* SET_LIGHTING_ENABLE */
     case 0x09C0: case 0x09C4: case 0x09C8:          /* SET_FOG_PARAMS */
         s_vsh.fog_param[(method - 0x09C0) / 4] = u2f(param); return 1;
     default: break;
@@ -2084,7 +2058,7 @@ static uint32_t vsh_note_program(void)
     s_vsh_progs[s_vsh_prog_count].batches = 1;
     s_vsh_prog_count++;
 
-    if (env_cached("RECOMP_VSH_TRACE")) {
+    if (recomp_env(RENV_VSH_TRACE)) {
         char buf[160];
         fprintf(stderr, "  [VSH] program #%d hash %08X start %u len %u"
                         " (cxt_write %d)\n",
@@ -2097,7 +2071,7 @@ static uint32_t vsh_note_program(void)
     /* Program memory, constants and the attribute table, raw, so the
      * interpreter can be run offline against exactly what the title sent. */
     {
-        const char *pre = getenv("RECOMP_VSH_DUMP");
+        const char *pre = recomp_env(RENV_VSH_DUMP);
         if (pre) {
             char path[512];
             FILE *f;
@@ -2288,7 +2262,7 @@ static void vsh_clear_depth(uint32_t param)
     uint32_t i;
 
     s_vsh.clears_seen++;
-    if (env_cached("RECOMP_VSH_ZLOG") && s_vsh.batches_prog < 1200)
+    if (recomp_env(RENV_VSH_ZLOG) && s_vsh.batches_prog < 1200)
         fprintf(stderr, "  [ZLOG] clear 0x%X colour 0x%X zeta 0x%X zclear 0x%X\n",
                 param, s_gpu.color_offset, s_vsh.zeta_offset, s_vsh.zclear);
     if (!(param & 3u) || !vsh_zbuf_ready())
@@ -2404,7 +2378,7 @@ static int tex_log_on(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("RECOMP_TEX_LOG");
+        const char *e = recomp_env(RENV_TEX_LOG);
         on = e && e[0] && e[0] != '0';
     }
     return on;
@@ -2549,7 +2523,7 @@ static void tex_log_report(void)
                         : d3d8_format_is_swizzled((uint32_t)k) ? "swz" : "lin",
                     ntex, nb, bad);
     }
-    if (getenv("RECOMP_TEX_LOG")[0] == '2')
+    if (recomp_env(RENV_TEX_LOG)[0] == '2')
         for (i = 0; i < s_tex_log_count; i++)
             tex_log_line("tex", i);
     for (k = 0; k < 256; k++)
@@ -2640,8 +2614,6 @@ static float rc_op(float x, uint32_t op)
 
 static float clamp01(float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; }
 
-static int s_rc_trace;                  /* RECOMP_WHITE_TRACE, one pixel */
-
 /* General combiners then the final combiner, on r[] (register-code indexed);
  * the result is written to out[4] as r,g,b,a. */
 static void rc_eval(float r[16][4], float out[4])
@@ -2704,14 +2676,6 @@ static void rc_eval(float r[16][4], float out[4])
         if ((ocw & (1u << 19)) && ((ocw >> 4) & 0xF)) nr[(ocw >> 4) & 0xF][3] = ab[2];
         if ((ocw & (1u << 18)) && (ocw & 0xF))        nr[ocw & 0xF][3] = cd[2];
         memcpy(r, nr, sizeof nr);
-        if (s_rc_trace)
-            fprintf(stderr, "  [WHITE]   stage %u icw %08X ocw %08X aicw %08X aocw %08X"
-                            " c0 %08X c1 %08X | r0 %.3f %.3f %.3f %.3f  r1 %.3f %.3f %.3f %.3f"
-                            "  t3 %.3f %.3f %.3f %.3f\n", s, icw, ocw, aicw, aocw,
-                    s_vsh.rc_f0[uniq0 ? s : 0], s_vsh.rc_f1[uniq1 ? s : 0],
-                    r[12][0], r[12][1], r[12][2], r[12][3],
-                    r[13][0], r[13][1], r[13][2], r[13][3],
-                    r[11][0], r[11][1], r[11][2], r[11][3]);
     }
 
     /* Final combiner: unsigned inputs, A*B + (1-A)*C + D, alpha from G. */
@@ -2746,14 +2710,6 @@ static void rc_eval(float r[16][4], float out[4])
         for (k = 0; k < 3; k++)
             out[k] = clamp01(A[k] * B[k] + (1.0f - A[k]) * C[k] + D[k]);
         out[3] = G;
-        if (s_rc_trace)
-            fprintf(stderr, "  [WHITE]   final cw0 %08X cw1 %08X sf %08X %08X | A %.3f %.3f %.3f"
-                            " B %.3f %.3f %.3f C %.3f %.3f %.3f D %.3f %.3f %.3f G %.3f"
-                            " | fog %.3f %.3f %.3f %.3f v1 %.3f %.3f %.3f -> %.3f %.3f %.3f %.3f\n",
-                    c0, c1, s_vsh.rc_sf[0], s_vsh.rc_sf[1], A[0], A[1], A[2], B[0], B[1], B[2],
-                    C[0], C[1], C[2], D[0], D[1], D[2], G,
-                    r[3][0], r[3][1], r[3][2], r[3][3], r[5][0], r[5][1], r[5][2],
-                    out[0], out[1], out[2], out[3]);
     }
 }
 
@@ -2761,7 +2717,7 @@ static int vsh_rc_active(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("RECOMP_PB_RC");
+        const char *e = recomp_env(RENV_PB_RC);
         on = !(e && e[0] == '0');
     }
     return on && s_vsh.rc_set && (s_vsh.rc_ctl & 0xFF);
@@ -2820,7 +2776,7 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
          * clockwise triangle faces the viewer. */
         int cw = area > 0.0f;
         int front = (s_vsh.front_face == 0x900) ? cw : !cw;
-        if (env_cached("RECOMP_PB_CULL_FLIP"))
+        if (recomp_env(RENV_PB_CULL_FLIP))
             front = !front;
         if ((s_vsh.cull_face == 0x405 && !front)
          || (s_vsh.cull_face == 0x404 && front)
@@ -2982,7 +2938,7 @@ static int pb_fast(void)
     if (s_fast_force >= 0)
         return s_fast_force;
     if (on < 0) {
-        const char *e = getenv("RECOMP_PB_FAST");
+        const char *e = recomp_env(RENV_PB_FAST);
         on = !(e && e[0] == '0');
     }
     return on;
@@ -3571,7 +3527,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
     if (s_vsh.cull_enable) {
         int cw = area > 0.0f;
         int front = (s_vsh.front_face == 0x900) ? cw : !cw;
-        if (env_cached("RECOMP_PB_CULL_FLIP"))
+        if (recomp_env(RENV_PB_CULL_FLIP))
             front = !front;
         if ((s_vsh.cull_face == 0x405 && !front)
          || (s_vsh.cull_face == 0x404 && front)
@@ -3805,7 +3761,7 @@ static int clip_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("RECOMP_PB_CLIP");
+        const char *e = recomp_env(RENV_PB_CLIP);
         on = !(e && e[0] == '0');
     }
     return on;
@@ -3948,7 +3904,7 @@ static void clip_tri(const XfVert *a, const XfVert *b, const XfVert *c,
         n = m;
         { ClipVert *t = src; src = dst; dst = t; }
     }
-    if (env_cached("RECOMP_CLIP_TRACE")) {
+    if (recomp_env(RENV_CLIP_TRACE)) {
         static int shown;
         /* Skip the triangles a program put wholly at the screen origin; they
          * have no area either way and drown out the rest. */
@@ -3977,191 +3933,6 @@ static void clip_tri(const XfVert *a, const XfVert *b, const XfVert *c,
     }
 }
 
-/* RECOMP_WHITE_TRACE=N: for the first N large textured program batches
- * (RECOMP_WHITE_MIN vertices, default 300), the vertex program's outputs for
- * three vertices, then one pixel (the first triangle's centroid) through the
- * texture stages, every combiner stage and the final combiner. */
-static void white_note_surface(void);
-static int s_wt_force;                  /* trace this batch regardless */
-
-/* RECOMP_WHITE_PX=x,y: the colour-surface pixel at (x,y), as a guest
- * pointer, or NULL. Used to find the batch that paints a pixel white. */
-static uint32_t *white_px(void)
-{
-    static int px = -2, py;
-    if (px == -2) {
-        const char *e = getenv("RECOMP_WHITE_PX");
-        px = -1;
-        if (e && sscanf(e, "%d,%d", &px, &py) != 2)
-            px = -1;
-    }
-    if (px < 0 || surface_bpp() != 4 || !s_gpu.color_offset
-            || (uint32_t)px >= s_gpu.clip_x + s_gpu.clip_w
-            || (uint32_t)py >= s_gpu.clip_y + s_gpu.clip_h)
-        return NULL;
-    return (uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + dma_resolve(s_gpu.color_offset)
-                        + (size_t)py * s_gpu.pitch) + px;
-}
-
-static void white_trace_batch(const XfVert *xv, uint32_t n, uint32_t plen)
-{
-    static int shown = -1, min_n;
-    uint32_t i, t;
-    int k, st;
-
-    if (shown < 0) {
-        const char *e = getenv("RECOMP_WHITE_TRACE"), *m = getenv("RECOMP_WHITE_MIN");
-        shown = e ? atoi(e) : 0;
-        min_n = m ? atoi(m) : 300;
-    }
-    if (s_wt_force) {
-        s_wt_force = 0;
-    } else {
-        /* RECOMP_WHITE_TEXOFF=<hex>: instead, batches with a texture at that
-         * address (low 27 bits compared), whatever their size. */
-        const char *to = getenv("RECOMP_WHITE_TEXOFF");
-        if (to) {
-            uint32_t want = (uint32_t)strtoul(to, NULL, 16);
-            int st_, hit = 0;
-            for (st_ = 0; st_ < 4; st_++)
-                if (s_stage_mode[st_] && ((s_stage_tex[st_].offset ^ want) & 0x07FFFFFFu) == 0)
-                    hit = 1;
-            if (shown <= 0 || !hit)
-                return;
-        } else if (shown <= 0 || n < (uint32_t)min_n || plen <= 12) {
-            return;
-        }
-    }
-    if (shown > 0)
-        shown--;
-    fprintf(stderr, "[WHITE] batch prim %u n %u prog start %u len %u | spec %d light %d"
-                    " fog en %d mode 0x%X gen %u params %g %g %g colour %08X | rc %d ctl %08X"
-                    " shader %08X | stage fmt %02X %02X %02X %02X mode %d %d %d %d\n",
-            s_gpu.prim, n, s_vsh.start, plen, (int)s_vsh.spec_enable, (int)s_wt_light,
-            s_vsh.fog_enable, s_vsh.fog_mode, s_vsh.fog_gen, s_vsh.fog_param[0],
-            s_vsh.fog_param[1], s_vsh.fog_param[2], s_vsh.fog_color, vsh_rc_active(), s_vsh.rc_ctl, s_vsh.shader_prog,
-            s_stage_tex[0].color, s_stage_tex[1].color, s_stage_tex[2].color,
-            s_stage_tex[3].color, s_stage_mode[0], s_stage_mode[1], s_stage_mode[2],
-            s_stage_mode[3]);
-    {
-        char buf[160];
-        uint32_t pc;
-        for (pc = s_vsh.start; pc < s_vsh.start + plen && pc < NV2A_VSH_SLOTS; pc++)
-            fprintf(stderr, "[WHITE]   vsh %3u: %s\n", pc,
-                    nv2a_vsh_disasm(s_vsh.prog[pc], buf, sizeof buf));
-    }
-    fprintf(stderr, "[WHITE]  surface 0x%08X fmt 0x%X pitch %u clip %u,%u %ux%u zeta 0x%X depth %d func 0x%X"
-                    " atest %d func 0x%X ref %u blend %d\n",
-            s_gpu.color_offset, s_gpu.format, s_gpu.pitch, s_gpu.clip_x, s_gpu.clip_y,
-            s_gpu.clip_w, s_gpu.clip_h, s_vsh.zeta_offset, s_vsh.depth_enable, s_vsh.depth_func,
-            s_vsh.atest_enable, s_vsh.atest_func, s_vsh.atest_ref, (int)s_gpu.blend_enable);
-    for (k = 0; k < NV_VERTEX_ATTRS; k++)
-        if (s_gpu.attr[k].size || s_gpu.attr[k].stride)
-            fprintf(stderr, "[WHITE]  attr%d type %u size %u stride %u offset 0x%X inline %d inl %g %g %g %g\n",
-                    k, s_gpu.attr[k].type, s_gpu.attr[k].size, s_gpu.attr[k].stride,
-                    s_gpu.attr[k].offset, s_gpu.inline_active, s_vsh.inl[k][0], s_vsh.inl[k][1],
-                    s_vsh.inl[k][2], s_vsh.inl[k][3]);
-    if (getenv("RECOMP_WHITE_RAW") && !s_gpu.inline_active && s_gpu.attr[0].offset) {
-        /* RECOMP_WHITE_RAW=1: the raw bytes of the batch's first vertices. */
-        const uint8_t *mem_ = (const uint8_t *)xbox_GetMemoryOffset();
-        uint32_t vi, b_, st_ = s_gpu.attr[0].stride;
-        for (vi = 0; vi < n && vi < 4 && st_; vi++) {
-            fprintf(stderr, "[WHITE]  raw idx %u @%08X:", s_gpu.idx[vi],
-                    s_gpu.attr[0].offset + s_gpu.idx[vi] * st_);
-            for (b_ = 0; b_ < st_ && b_ < 64; b_++)
-                fprintf(stderr, " %02X", mem_[s_gpu.attr[0].offset + s_gpu.idx[vi] * st_ + b_]);
-            fprintf(stderr, "\n");
-        }
-        {
-            static const uint32_t ms[] = { 0x358, 0x35C, 0x32C, 0x360, 0x364,
-                0x368, 0x36C, 0x370, 0x374, 0x1D84, 0x1D7C, 0x1D78, 0x300, 0x304 };
-            uint32_t mi;
-            int ui;
-            fprintf(stderr, "[WHITE]  unhandled state:");
-            for (mi = 0; mi < sizeof ms / sizeof ms[0]; mi++)
-                for (ui = 0; ui < s_unhandled_count; ui++)
-                    if (s_unhandled[ui].method == ms[mi])
-                        fprintf(stderr, " %X=%08X", ms[mi], s_unhandled[ui].last_param);
-            fprintf(stderr, "\n");
-        }
-        if (s_stage_tex[0].width <= 16 && s_stage_tex[0].height <= 16) {
-            uint32_t tx, ty, tv;
-            for (ty = 0; ty < s_stage_tex[0].height; ty++) {
-                fprintf(stderr, "[WHITE]  tex0 row %2u:", ty);
-                for (tx = 0; tx < s_stage_tex[0].width; tx++)
-                    fprintf(stderr, " %08X", sample_tex(&s_stage_tex[0], tx, ty, &tv) ? tv : 0xDEADu);
-                fprintf(stderr, "\n");
-            }
-        }
-    }
-    fprintf(stderr, "[WHITE]  c58 %g %g %g %g c59 %g %g %g %g vp_scale %g %g %g %g vp_off %g %g %g %g\n",
-            s_vsh.c[58][0], s_vsh.c[58][1], s_vsh.c[58][2], s_vsh.c[58][3],
-            s_vsh.c[59][0], s_vsh.c[59][1], s_vsh.c[59][2], s_vsh.c[59][3],
-            s_vsh.vp_scale[0], s_vsh.vp_scale[1], s_vsh.vp_scale[2], s_vsh.vp_scale[3],
-            s_vsh.vp_off[0], s_vsh.vp_off[1], s_vsh.vp_off[2], s_vsh.vp_off[3]);
-    for (i = 0; i < 3 && i < n; i++) {
-        float v[NV2A_VSH_INPUTS][4];
-        Nv2aVshOut o;
-        vsh_inputs(s_gpu.idx[i], v);
-        nv2a_vsh_run((const uint32_t (*)[4])s_vsh.prog, s_vsh.start, s_vsh.c, 0,
-                     (const float (*)[4])v, &o);
-        fprintf(stderr, "[WHITE]  vert %u:", i);
-        for (k = 0; k < 16; k++)
-            if (s_gpu.attr[k].size)
-                fprintf(stderr, " v%d(%g %g %g %g)", k, v[k][0], v[k][1], v[k][2], v[k][3]);
-        fprintf(stderr, "\n[WHITE]   pos %g %g %g %g D0 %g %g %g %g D1 %g %g %g %g Fog %g %g %g %g\n",
-                o.o[0][0], o.o[0][1], o.o[0][2], o.o[0][3],
-                o.o[3][0], o.o[3][1], o.o[3][2], o.o[3][3],
-                o.o[4][0], o.o[4][1], o.o[4][2], o.o[4][3],
-                o.o[5][0], o.o[5][1], o.o[5][2], o.o[5][3]);
-        for (t = 0; t < 4; t++)
-            fprintf(stderr, "[WHITE]   T%u %g %g %g %g\n", t, o.o[9 + t][0], o.o[9 + t][1],
-                    o.o[9 + t][2], o.o[9 + t][3]);
-    }
-    for (st = 0; st < 4; st++)
-        fprintf(stderr, "[WHITE]  tex%d off %08X %ux%u fmt %02X pitch %u addr %u/%u mode %d\n",
-                st, s_stage_tex[st].offset, s_stage_tex[st].width, s_stage_tex[st].height,
-                s_stage_tex[st].color, s_stage_tex[st].pitch, s_stage_tex[st].addr_u,
-                s_stage_tex[st].addr_v, s_stage_mode[st]);
-    /* One pixel: the first visible triangle's centroid. */
-    for (i = 0; i + 2 < n; i++) {
-        const XfVert *a = &xv[i], *b = &xv[i + 1], *c = &xv[i + 2];
-        float r[16][4], col[4], pa, pb, pc, ps;
-        if (!a->ok || !b->ok || !c->ok)
-            continue;
-        pa = 1.0f / a->w; pb = 1.0f / b->w; pc = 1.0f / c->w;
-        ps = pa + pb + pc; pa /= ps; pb /= ps; pc /= ps;
-        memset(r, 0, sizeof r);
-        for (k = 0; k < 4; k++) {
-            r[4][k] = pa * a->d0[k] + pb * b->d0[k] + pc * c->d0[k];
-            r[5][k] = pa * a->d1[k] + pb * b->d1[k] + pc * c->d1[k];
-        }
-        rc_unpack(s_vsh.fog_color, r[3]);
-        { float t_ = r[3][0]; r[3][0] = r[3][2]; r[3][2] = t_; }
-        r[3][3] = s_vsh.fog_enable
-                ? clamp01(pa * a->fog + pb * b->fog + pc * c->fog) : 1.0f;
-        for (st = 0; st < 4; st++) {
-            float tc[4];
-            if (!s_stage_mode[st])
-                continue;
-            for (k = 0; k < 4; k++)
-                tc[k] = pa * a->t[st][k] + pb * b->t[st][k] + pc * c->t[st][k];
-            stage_sample(st, tc, r[8 + st]);
-            fprintf(stderr, "[WHITE]  px (%.1f,%.1f) tc%d %g %g %g %g -> texel %.3f %.3f %.3f %.3f\n",
-                    (a->x + b->x + c->x) / 3, (a->y + b->y + c->y) / 3, st,
-                    tc[0], tc[1], tc[2], tc[3], r[8 + st][0], r[8 + st][1],
-                    r[8 + st][2], r[8 + st][3]);
-        }
-        r[12][3] = r[8][3];
-        fprintf(stderr, "[WHITE]  v0 %.3f %.3f %.3f %.3f v1 %.3f %.3f %.3f %.3f\n",
-                r[4][0], r[4][1], r[4][2], r[4][3], r[5][0], r[5][1], r[5][2], r[5][3]);
-        s_rc_trace = 1;
-        rc_eval(r, col);
-        s_rc_trace = 0;
-        break;
-    }
-}
-
 static void raster_batch_vsh_one(void)
 {
     static XfVert xv[NV_MAX_INDICES];
@@ -4182,14 +3953,14 @@ static void raster_batch_vsh_one(void)
             vsh_transform(s_gpu.idx[i], &xv[i]);
         s_rt.xform += rt_now() - t0;
     }
-    if (env_cached("RECOMP_VSH_ZLOG") && s_vsh.batches_prog < 1200 && n)
+    if (recomp_env(RENV_VSH_ZLOG) && s_vsh.batches_prog < 1200 && n)
         fprintf(stderr, "  [ZLOG] batch %u colour 0x%X depth %d func 0x%X mask %d"
                         " poly %d %g %g | v0 z %g w %g tex 0x%X fmt %02X\n",
                 s_vsh.batches_prog, s_gpu.color_offset, s_vsh.depth_enable,
                 s_vsh.depth_func, s_vsh.depth_mask, s_vsh.poly_offset,
                 s_vsh.poly_factor, s_vsh.poly_bias, xv[0].z, xv[0].w,
                 s_gpu.tex.offset, s_gpu.tex.color);
-    if (plen > 12 && env_cached("RECOMP_VSH_TRACE")) {
+    if (plen > 12 && recomp_env(RENV_VSH_TRACE)) {
         static int shown3d;
         if (shown3d++ < 6) {
             float v[NV2A_VSH_INPUTS][4];
@@ -4230,10 +4001,6 @@ static void raster_batch_vsh_one(void)
         s_rt.setup += rt_now() - t0;
     }
 
-    white_trace_batch(xv, n, plen);
-    white_note_surface();
-    {
-        uint32_t *wp = white_px(), before_px = wp ? *wp : 0;
 #define RASTER_TRI(p, q, r_, t) clip_tri(p, q, r_, t, fast)
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
@@ -4271,21 +4038,10 @@ static void raster_batch_vsh_one(void)
         break;
     }
 #undef RASTER_TRI
-        if (wp && *wp != before_px && (*wp & 0xF0F0F0u) == 0xF0F0F0u
-                && (before_px & 0xF0F0F0u) != 0xF0F0F0u) {
-            static int hits;
-            if (hits++ < 4) {
-                fprintf(stderr, "[WHITE] RECOMP_WHITE_PX: %08X -> %08X by this batch\n",
-                        before_px, *wp);
-                s_wt_force = 1;
-                white_trace_batch(xv, n, plen);
-            }
-        }
-    }
     if (textured)
         s_vsh.tris_textured += s_gpu.tris_drawn - before;
 
-    if (env_cached("RECOMP_VSH_TRACE")) {
+    if (recomp_env(RENV_VSH_TRACE)) {
         static int shown;
         if (shown < 24 && n) {
             shown++;
@@ -4479,7 +4235,7 @@ static void raster_batch_vsh(void)
 {
     static int ab = -1;
     if (ab < 0) {
-        const char *e = getenv("RECOMP_PB_FAST_AB");
+        const char *e = recomp_env(RENV_PB_FAST_AB);
         ab = e && e[0] && e[0] != '0';
     }
     if (ab)
@@ -4506,13 +4262,13 @@ static void vsh_report(void)
             s_vsh.batches_prog, s_vsh.batches_fixed, s_vsh.verts_run,
             s_vsh.verts_bad, s_vsh.tris, s_vsh.tris_textured, s_vsh.tris_culled,
             s_vsh.tris_clipped, (unsigned long long)s_vsh.z_rejected,
-            vsh_enabled() ? "" : "  [RECOMP_PB_VSH=0: path off]");
+            vsh_enabled() ? "" : "  [pb_vsh=0: path off]");
     tex_log_report();
     fprintf(stderr, "[VSH] clipping %s: %llu tris clipped (%llu partly behind"
                     " the eye, %llu wholly behind, %llu guard band, %llu z) ->"
                     " %llu drawn pieces, %llu clipped away; %llu with an unusable"
                     " vertex; %llu had all three vertices at screen (0, 0)\n",
-            clip_enabled() ? "on" : "OFF (RECOMP_PB_CLIP=0)",
+            clip_enabled() ? "on" : "OFF (pb_clip=0)",
             (unsigned long long)s_clip_tris, (unsigned long long)s_clip_why[0],
             (unsigned long long)s_clip_why[1], (unsigned long long)s_clip_why[2],
             (unsigned long long)s_clip_why[3], (unsigned long long)s_clip_out,
@@ -4548,8 +4304,8 @@ static void vsh_report(void)
                     " ctl 0x%X fcw 0x%08X/0x%08X; alpha test %d func 0x%X ref %u"
                     " (%llu px rejected); fog %d\n",
             s_vsh.batches_rc, s_vsh.batches_norc,
-            getenv("RECOMP_PB_RC") && getenv("RECOMP_PB_RC")[0] == '0'
-                ? " [RECOMP_PB_RC=0]" : "",
+            recomp_env(RENV_PB_RC) && recomp_env(RENV_PB_RC)[0] == '0'
+                ? " [pb_rc=0]" : "",
             s_vsh.rc_ctl, s_vsh.rc_fcw0, s_vsh.rc_fcw1, s_vsh.atest_enable,
             s_vsh.atest_func, s_vsh.atest_ref,
             (unsigned long long)s_vsh.a_rejected, s_vsh.fog_enable);
@@ -4658,7 +4414,7 @@ static void raster_batch_ab(void)
     if (diff) {
         /* RECOMP_PB_VSH_AB_DUMP=<prefix>: both versions of the first
          * differing batch per texture, as <prefix>NNN_old/new.bmp. */
-        const char *pre = getenv("RECOMP_PB_VSH_AB_DUMP");
+        const char *pre = recomp_env(RENV_PB_VSH_AB_DUMP);
         static uint32_t seen[16];
         static int nseen;
         int j, have = 0;
@@ -4713,7 +4469,7 @@ static void raster_batch(void)
     if (!s_vsh_ab_inner && vsh_batch_active()) {
         static int ab = -1;
         if (ab < 0)
-            ab = getenv("RECOMP_PB_VSH_AB") != NULL;
+            ab = recomp_env(RENV_PB_VSH_AB) != NULL;
         if (ab)
             raster_batch_ab();
         else
@@ -4815,95 +4571,9 @@ static void cpu_on_draw(const struct nv2a_pb_draw *draw)
 /* Hand the window a copy of the frame just finished. Copying here, rather
  * than letting the window read guest memory on its own clock, is what stops
  * it showing a surface the rasteriser is still writing. */
-/* RECOMP_WHITE_DUMP=<prefix>: debug only. Every RECOMP_WHITE_EVERY-th flip
- * (default 30), every colour surface a program batch drew into since the last
- * flip, as <prefix>f<flip>_<surface>.bmp. Independent of which surface the
- * flip presents. */
-#define WT_SURF 8
-static struct { uint32_t off, pitch, cx, cy, cw, ch, bpp; } s_wt_surf[WT_SURF];
-static int s_wt_nsurf;
-
-static void white_note_surface(void)
-{
-    int i;
-    if (!env_cached("RECOMP_WHITE_DUMP"))
-        return;
-    for (i = 0; i < s_wt_nsurf; i++)
-        if (s_wt_surf[i].off == s_gpu.color_offset)
-            return;
-    if (s_wt_nsurf >= WT_SURF || !s_gpu.clip_w)
-        return;
-    s_wt_surf[s_wt_nsurf].off = s_gpu.color_offset;
-    s_wt_surf[s_wt_nsurf].pitch = s_gpu.pitch;
-    s_wt_surf[s_wt_nsurf].cx = s_gpu.clip_x;
-    s_wt_surf[s_wt_nsurf].cy = s_gpu.clip_y;
-    s_wt_surf[s_wt_nsurf].cw = s_gpu.clip_w;
-    s_wt_surf[s_wt_nsurf].ch = s_gpu.clip_h;
-    s_wt_surf[s_wt_nsurf].bpp = surface_bpp();
-    s_wt_nsurf++;
-}
-
-static void white_dump_surfaces(void)
-{
-    const char *pre = getenv("RECOMP_WHITE_DUMP"), *ev = getenv("RECOMP_WHITE_EVERY");
-    static uint32_t flip;
-    uint32_t every = ev ? (uint32_t)atoi(ev) : 30;
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    int i;
-
-    if (!pre)
-        return;
-    flip++;
-    if (every && flip % every == 0) {
-        for (i = 0; i < s_wt_nsurf; i++) {
-            uint32_t w = s_wt_surf[i].cw, h = s_wt_surf[i].ch, bpp = s_wt_surf[i].bpp;
-            uint32_t x, y, row_bytes = w * 3, pad = (4 - (row_bytes & 3)) & 3;
-            uint32_t filesz = 54 + (row_bytes + pad) * h;
-            uint8_t hdr[54];
-            char path[512];
-            FILE *f;
-            if (bpp != 4 && bpp != 2)
-                continue;
-            snprintf(path, sizeof path, "%sf%05u_%08X.bmp", pre, flip, s_wt_surf[i].off);
-            f = fopen(path, "wb");
-            if (!f)
-                continue;
-            memset(hdr, 0, sizeof hdr);
-            hdr[0] = 'B'; hdr[1] = 'M';
-            memcpy(hdr + 2, &filesz, 4);
-            hdr[10] = 54; hdr[14] = 40;
-            memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &h, 4);
-            hdr[26] = 1; hdr[28] = 24;
-            fwrite(hdr, 1, sizeof hdr, f);
-            for (y = h; y-- > 0; ) {
-                const uint8_t *row = mem + dma_resolve(s_wt_surf[i].off)
-                                   + (size_t)(s_wt_surf[i].cy + y) * s_wt_surf[i].pitch;
-                for (x = 0; x < w; x++) {
-                    uint8_t bgr[3];
-                    if (bpp == 4) {
-                        uint32_t v = ((const uint32_t *)row)[s_wt_surf[i].cx + x];
-                        bgr[0] = (uint8_t)v; bgr[1] = (uint8_t)(v >> 8); bgr[2] = (uint8_t)(v >> 16);
-                    } else {
-                        uint16_t v = ((const uint16_t *)row)[s_wt_surf[i].cx + x];
-                        bgr[0] = (uint8_t)((v & 0x1F) << 3);
-                        bgr[1] = (uint8_t)(((v >> 5) & 0x3F) << 2);
-                        bgr[2] = (uint8_t)(((v >> 11) & 0x1F) << 3);
-                    }
-                    fwrite(bgr, 1, 3, f);
-                }
-                if (pad) { static const uint8_t z[3]; fwrite(z, 1, pad, f); }
-            }
-            fclose(f);
-        }
-    }
-    s_wt_nsurf = 0;
-}
-
 static void cpu_on_flip(uint32_t surface, uint32_t pitch)
 {
     extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
-
-    white_dump_surfaces();
 
     if (!pitch || !surface)
         return;
@@ -4927,7 +4597,7 @@ static void get_report(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
 
     if (fixed_set < 0) {
-        const char *e = getenv("RECOMP_ZPASS_FIXED");
+        const char *e = recomp_env(RENV_ZPASS_FIXED);
         fixed_set = e != NULL;
         if (e)
             fixed = (uint32_t)strtoul(e, NULL, 0);
@@ -4943,7 +4613,7 @@ static void get_report(uint32_t param)
     value = (fixed_set || s_backend != &s_cpu_backend) ? fixed : s_zpass_count;
     s_reports++;
     s_reports_zero += value == 0;
-    if (env_cached("RECOMP_ZPASS_TRACE") && s_reports <= 64)
+    if (recomp_env(RENV_ZPASS_TRACE) && s_reports <= 64)
         fprintf(stderr, "  [GPU] GET_REPORT 0x%08X -> 0x%08X count %u\n",
                 param, va, value);
     nv2a_report_write(mem, va, value);
@@ -4993,7 +4663,7 @@ static void draw_primitive(void)
     s_gpu.draws++;
     /* ~14 lines a second at 2.8k batches a frame, each a locked write to
      * stderr from the walker: verbose only. */
-    if ((s_gpu.draws % 200) == 0 && env_cached("RECOMP_PB_EXEC_VERBOSE"))
+    if ((s_gpu.draws % 200) == 0 && recomp_env(RENV_PB_EXEC_VERBOSE))
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -5033,7 +4703,7 @@ static void draw_primitive(void)
     }
     s_perf.batches++;
 
-    if (env_cached("RECOMP_PB_EXEC_VERBOSE")) {
+    if (recomp_env(RENV_PB_EXEC_VERBOSE)) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -5318,9 +4988,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
 #endif
         {
-            const char *b = getenv("RECOMP_PB_BACKEND");
+            const char *b = recomp_env(RENV_PB_BACKEND);
             if (b && !strcmp(b, "null")) {
-                const char *us = getenv("RECOMP_PB_NULL_DRAW_US");
+                const char *us = recomp_env(RENV_PB_NULL_DRAW_US);
                 s_null_draw_us = us ? atoi(us) : 0;
                 if (s_null_draw_us > 0)
                     s_null_backend.on_draw = null_on_draw;
@@ -5335,7 +5005,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * the values are visible. Read once: this runs for every method. */
     static int verbose = -1;
     if (verbose < 0)
-        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+        verbose = recomp_env(RENV_PB_EXEC_VERBOSE) != NULL;
     if (verbose) {
         static int shown[8];
         int slot = -1;
@@ -5363,7 +5033,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         static long from = -2;
         static int lines;
         if (from == -2) {
-            const char *e = getenv("RECOMP_SURF_TRACE");
+            const char *e = recomp_env(RENV_SURF_TRACE);
             from = e ? strtol(e, NULL, 0) : -1;
         }
         if (from >= 0 && method == 0x0210 && param == (uint32_t)from)
@@ -5550,7 +5220,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         *(volatile uint32_t *)(mem + va) = param;
         s_sema_last_va = va;
         s_sema_last_value = param;
-        if (s_sema_releases++ == 0 || env_cached("RECOMP_PB_SEMA_TRACE")) {
+        if (s_sema_releases++ == 0 || recomp_env(RENV_PB_SEMA_TRACE)) {
             static unsigned shown;
             if (shown++ < 16) {
                 fprintf(stderr, "  [GPU] semaphore release 0x%08X -> 0x%08X"
@@ -5613,7 +5283,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             static uint32_t prev_tris;
             uint32_t drew = s_gpu.tris_drawn + s_gpu_backend_batches;
             if (every < 0) {
-                const char *e = getenv("RECOMP_FB_DUMP_FLIPS");
+                const char *e = recomp_env(RENV_FB_DUMP_FLIPS);
                 every = e ? atoi(e) : 0;
             }
             if (every > 0 && s_gpu.flips % (uint32_t)every == 0
@@ -5632,7 +5302,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             static uint64_t prev_px, prev_zr, prev_clip;
             static uint32_t prev_tris, prev_drop;
             if (on < 0)
-                on = getenv("RECOMP_FLIP_LOG") != NULL;
+                on = recomp_env(RENV_FLIP_LOG) != NULL;
             if (on) {
                 uint32_t b = s_gpu.batches_textured + s_gpu.batches_no_uv
                            + s_gpu.batches_no_tex;
@@ -5694,7 +5364,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * and which surface each one put on screen; more with VERBOSE. */
         {
             static unsigned n;
-            unsigned limit = env_cached("RECOMP_PB_EXEC_VERBOSE") ? 8u : 4u;
+            unsigned limit = recomp_env(RENV_PB_EXEC_VERBOSE) ? 8u : 4u;
             if (n++ < limit) {
                 uint32_t done = s_present.offset ? s_present.offset
                               : s_gpu.drawn_offset ? s_gpu.drawn_offset
@@ -5856,7 +5526,7 @@ static void find_nan_matrices(void)
  * pointer or a number", and guessing wrong costs a run. */
 static void peek_addresses(void)
 {
-    const char *spec = getenv("RECOMP_PEEK");
+    const char *spec = recomp_env(RENV_PEEK);
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     char buf[256];
     char *tok, *ctx = NULL;
@@ -5887,7 +5557,7 @@ static void peek_addresses(void)
  */
 static void peek_chain(void)
 {
-    const char *spec = getenv("RECOMP_PEEK_CHAIN");
+    const char *spec = recomp_env(RENV_PEEK_CHAIN);
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     char buf[256], *tok, *ctx = NULL;
     uint32_t cur = 0;
@@ -5925,13 +5595,13 @@ void nv2a_pb_exec_report(void)
 {
     peek_addresses();
     peek_chain();
-    if (getenv("RECOMP_FIND_NAN")) {
+    if (recomp_env(RENV_FIND_NAN)) {
         /* Every report, not once: the matrix is fine early on and only turns
          * to NaN later, so a single scan at startup finds nothing and says
          * nothing. */
         find_nan_matrices();
     }
-    if (getenv("RECOMP_FIND_QUAD")) {
+    if (recomp_env(RENV_FIND_QUAD)) {
         static int done;
         if (!done) { done = 1; find_quad_vertices(); }
     }
@@ -5990,7 +5660,7 @@ void nv2a_pb_exec_report(void)
                     : d3d8_format_is_swizzled(s_tex_use[i].color) ? " swz" : " lin",
                 s_tex_use[i].batches);
 
-    if (getenv("RECOMP_TEX_STATE")) {
+    if (recomp_env(RENV_TEX_STATE)) {
         uint32_t k;
         for (k = 0; k < sizeof s_tex_set / sizeof s_tex_set[0]; k++)
             if (s_tex_set[k])
@@ -6007,7 +5677,7 @@ void nv2a_pb_exec_report(void)
      * stopped on, the answer is as likely to be the one seen twice as the
      * one seen a thousand times, and ten hides it. */
     {
-        int shown = getenv("RECOMP_PB_UNHANDLED_ALL") ? s_unhandled_count : 10;
+        int shown = recomp_env(RENV_PB_UNHANDLED_ALL) ? s_unhandled_count : 10;
     for (i = 0; i < shown && i < s_unhandled_count; i++) {
         int best = i;
         for (j = i + 1; j < s_unhandled_count; j++)

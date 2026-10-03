@@ -8,6 +8,7 @@
  */
 #include "input_map.h"
 #include "input_backend.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@ static void set_env(const char *k, const char *v)
 #else
     if (v) setenv(k, v, 1); else unsetenv(k);
 #endif
+    recomp_env_reload();   /* the runtime reads the environment once */
 }
 
 /* ── 1. every row, both helpers ────────────────────────────────────────── */

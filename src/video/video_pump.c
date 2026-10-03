@@ -12,6 +12,7 @@
 #if defined(_WIN32)
 #define COBJMACROS
 #include <windows.h>
+#include "recomp_env.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -140,10 +141,10 @@ static DWORD WINAPI vp_thread(LPVOID unused)
         /* A couple of frames to disc as evidence that real pixels were
          * drawn -- two of them, far enough apart to show the picture moving
          * rather than one still held for the duration. */
-        if ((frames == 60 || frames == 80) && getenv("RECOMP_FMV_DUMP")) {
+        if ((frames == 60 || frames == 80) && recomp_env(RENV_FMV_DUMP)) {
             char out[MAX_PATH];
             _snprintf_s(out, sizeof(out), _TRUNCATE, "%s.%u.bmp",
-                        getenv("RECOMP_FMV_DUMP"), frames);
+                        recomp_env(RENV_FMV_DUMP), frames);
             video_dump_frame_bmp(out);
         }
 
