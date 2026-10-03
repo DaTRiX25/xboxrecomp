@@ -181,10 +181,11 @@ static void apu_irq_stats_line(void)
     if (now < next_ns)
         return;
     if (next_ns)
-        fprintf(stderr, "[APU-IRQ] traps %u delivered %u held-frames %u forced %u se_frames %u underruns %u\n",
+        fprintf(stderr, "[APU-IRQ] traps %u delivered %u held-frames %u forced %u se_frames %u fe-trapped-frames %u underruns %u\n",
                 apu_irq_stats.traps, apu_irq_stats.delivered,
                 apu_irq_stats.held_frames, apu_irq_stats.forced,
-                apu_irq_stats.se_frames, xa2_underruns());
+                apu_irq_stats.se_frames, apu_irq_stats.fe_trapped_frames,
+                xa2_underruns());
     next_ns = now + 5000000000ull;
 }
 
@@ -718,9 +719,26 @@ static void *mcpx_apu_frame_thread(void *arg)
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
+        bool fe_trapped = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+                          (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
+                          !g_test_tone.active;
+
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
+        } else if (fe_trapped) {
+            /* The title has the APU on, but the front end is trapped (a voice
+             * went idle under FETFORCE1) and stays so until DirectSound's
+             * service routine clears FECTL. No frame is produced meanwhile,
+             * as in xemu, which waits here and re-checks: the device queue
+             * holds what is already paced into it. This used to fall through
+             * to the lightweight branch, which advances the frame counter
+             * and hands the device a period with this frame's 32 samples
+             * silent -- one hole per trapped frame, four or five in a row
+             * when the routine ran a DPC later (BLiNX 2: 32-160 samples of
+             * digital zero in the music every few seconds). The interrupt is
+             * delivered below; the wait is after it. */
+            apu_irq_stats.fe_trapped_frames++;
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
@@ -750,6 +768,14 @@ static void *mcpx_apu_frame_thread(void *arg)
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
+        if (fe_trapped &&
+            (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
+             NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {
+            /* Still trapped after the delivery (held off at raised IRQL, or
+             * cleared from a DPC): give the title a millisecond with the lock
+             * dropped rather than spinning on it. */
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+        }
     }
 
     qemu_mutex_unlock(&d->lock);
