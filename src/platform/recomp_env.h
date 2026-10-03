@@ -181,6 +181,10 @@ typedef enum {
 /* Read the environment into the cache. Idempotent; the first lookup calls
  * it. Call it first thing in main so deprecation lines come out early. */
 void recomp_env_init(void);
+/* Print the reader's notes (deprecated names, unknown keys, help), held
+ * since init. A host calls it once stderr is where it should be (after the
+ * RECOMP_STDIO_LOG redirect); otherwise they are printed at exit. */
+void recomp_env_flush_notes(void);
 
 /* Tests that setenv() a variable after the first lookup re-read with this. */
 void recomp_env_reload(void);

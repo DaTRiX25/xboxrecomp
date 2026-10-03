@@ -3,6 +3,7 @@
  */
 #include "recomp_env.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,52 @@ static char *dup_str(const char *s)
     return d;
 }
 
+/* What the reader has to say (deprecations, unknown keys, the help table) is
+ * held until recomp_env_flush_notes(): the environment is read before the
+ * host redirects stderr (RECOMP_STDIO_LOG is itself read from it), and under
+ * Proton anything printed before that redirect is lost. An atexit hook
+ * prints whatever a host never flushed. */
+static char *s_notes;
+static size_t s_notes_len, s_notes_cap;
+
+static void note(const char *fmt, ...)
+{
+    char line[512];
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    n = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return;
+    if ((size_t)n >= sizeof line)
+        n = (int)sizeof line - 1;
+    if (s_notes_len + (size_t)n + 1 > s_notes_cap) {
+        size_t cap = s_notes_cap ? s_notes_cap * 2 : 4096;
+        char *b;
+        while (cap < s_notes_len + (size_t)n + 1)
+            cap *= 2;
+        b = (char *)realloc(s_notes, cap);
+        if (!b)
+            return;
+        s_notes = b;
+        s_notes_cap = cap;
+    }
+    memcpy(s_notes + s_notes_len, line, (size_t)n);
+    s_notes_len += (size_t)n;
+    s_notes[s_notes_len] = 0;
+}
+
+void recomp_env_flush_notes(void)
+{
+    if (s_notes_len) {
+        fputs(s_notes, stderr);
+        fflush(stderr);
+    }
+    s_notes_len = 0;
+}
+
 static int find_key(int tier, const char *key, size_t len)
 {
     int i;
@@ -57,10 +104,10 @@ static void print_help(void)
     };
     int t, i;
     for (t = TIER_CONFIG; t <= TIER_DEBUG; t++) {
-        fprintf(stderr, "[ENV] %s\n", title[t]);
+        note("[ENV] %s\n", title[t]);
         for (i = 0; i < RENV_COUNT; i++)
             if (s_keys[i].tier == t)
-                fprintf(stderr, "[ENV]   %-26s %s\n", s_keys[i].name, s_keys[i].help);
+                note("[ENV]   %-26s %s\n", s_keys[i].name, s_keys[i].help);
     }
 }
 
@@ -108,12 +155,12 @@ static void parse_list(int tier, const char **values, char *set)
                 }
                 continue;
             }
-            fprintf(stderr, "[ENV] %s: unknown key '%.*s' ignored (%s=help lists them)\n",
+            note("[ENV] %s: unknown key '%.*s' ignored (%s=help lists them)\n",
                     var, (int)klen, frag, var);
             continue;
         }
         if (other)
-            fprintf(stderr, "[ENV] %s: '%s' belongs in %s; taken anyway\n",
+            note("[ENV] %s: '%s' belongs in %s; taken anyway\n",
                     var, s_keys[id].name, s_list_var[s_keys[id].tier]);
         if (eq) {
             char *v = (char *)malloc(len - klen);
@@ -170,10 +217,10 @@ static void load(void)
             continue;
         /* The old name: still honoured, once per run says what replaces it. */
         if (k->tier == TIER_CONFIG)
-            fprintf(stderr, "[ENV] %s is deprecated; use %s%s\n", k->legacy, k->name,
+            note("[ENV] %s is deprecated; use %s%s\n", k->legacy, k->name,
                     set[i] ? " (set too, so it wins)" : "");
         else
-            fprintf(stderr, "[ENV] %s is deprecated; use %s=%s%s%s%s\n", k->legacy,
+            note("[ENV] %s is deprecated; use %s=%s%s%s%s\n", k->legacy,
                     s_list_var[k->tier], k->name,
                     (*old && strcmp(old, "1")) ? "=" : "",
                     (*old && strcmp(old, "1")) ? old : "",
@@ -216,6 +263,7 @@ void recomp_env_init(void)
         return;
     if (cas(&s_state, 0, 1) == 0) {
         load();
+        atexit(recomp_env_flush_notes);
         cas(&s_state, 1, 2);              /* full barrier: values first */
         recomp_env_ready_ = 1;
         return;
