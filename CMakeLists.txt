@@ -16,6 +16,11 @@ project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# macOS: the Metal render backend (src/d3d/nv2a_pb_metal.m) is Objective-C.
+if(APPLE)
+    enable_language(OBJC)
+endif()
+
 # Common definitions for all targets
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
