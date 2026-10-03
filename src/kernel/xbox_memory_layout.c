@@ -4055,6 +4055,13 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
     return g_contig_high;
 }
 
+/* The in-use map, one byte per 4 KB page of the window: for a device model
+ * (the APU) deciding whether a physical address names the window or RAM. */
+const volatile uint8_t *xbox_ContiguousPageMap(void)
+{
+    return g_contig_used;
+}
+
 /* Bytes in use right now. */
 uint32_t xbox_ContiguousInUseBytes(void)
 {

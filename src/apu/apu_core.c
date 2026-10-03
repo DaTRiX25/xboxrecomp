@@ -77,6 +77,16 @@ extern uint32_t xbox_ContiguousAllocatedBytes(void);
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    /* A page the contiguous allocator handed out is the window, even where
+     * it overlaps the image's physical range: BLiNX 2's image runs to
+     * 0x0303AC20 (its BSS), and DirectSound's voice array sits at physical
+     * 0x009E8000, inside it. Resolved to RAM, the VP never saw the driver
+     * take an idle voice off its list and re-trapped it every frame. */
+    if (a < (64u << 20)) {             /* the window's 64 MB */
+        const volatile uint8_t *map = xbox_ContiguousPageMap();
+        if (map[a >> 12])
+            return g_apu_ram_ptr + 0x80000000u + a;
+    }
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (a < xbox_ContiguousAllocatedBytes())
