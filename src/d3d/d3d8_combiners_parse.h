@@ -39,7 +39,7 @@ typedef enum NV2ACombinerRegister {
     NV2A_REG_T3         = 11,  /* Texture 3 sample result */
     NV2A_REG_R0         = 12,  /* Temporary register 0 (also SPARE0) */
     NV2A_REG_R1         = 13,  /* Temporary register 1 (also SPARE1) */
-    /* Final combiner only (xemu psh.c, and the CPU path in nv2a_pb_exec.c): */
+    /* Final combiner only (xemu psh.c, and the CPU path in nv2a_combiner.c): */
     NV2A_REG_V1R0_SUM   = 14,  /* V1+R0 sum (final combiner) */
     NV2A_REG_EF_PROD    = 15,  /* E*F product (final combiner) */
     NV2A_REG_COUNT       = 16,

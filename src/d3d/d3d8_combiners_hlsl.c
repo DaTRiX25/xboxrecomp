@@ -9,8 +9,8 @@
 /* ================================================================
  * HLSL Code Generation
  *
- * The shader mirrors rc_eval in nv2a_pb_exec.c, so the GPU and CPU
- * paths agree:
+ * The shader mirrors nv2a_rc_eval_regs (src/kernel/nv2a_combiner.c), so
+ * the GPU and CPU paths agree:
  *   - registers x0..x15 by register code: 0 zero, 1 C0, 2 C1, 3 fog,
  *     4 V0, 5 V1, 8-11 T0-T3, 12 R0 (alpha starts as T0's), 13 R1,
  *     14 V1+R0 and 15 E*F (final combiner)
