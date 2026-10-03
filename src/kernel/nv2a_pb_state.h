@@ -47,7 +47,10 @@ typedef struct {
 
 #define NV_VERTEX_ATTRS 16
 #define NV_MAX_INDICES  4096
-#define NV_MAX_INLINE   4096            /* dwords of INLINE_ARRAY per batch */
+/* Dwords of INLINE_ARRAY (or immediate-mode vertices) per batch. 4096 held
+ * a few hundred vertices; a batch past it was cut short with no sign. 64K
+ * holds a thousand vertices of all sixteen attributes (upstream 5c3a42c). */
+#define NV_MAX_INLINE   65536
 
 /* Texture stage 0, decoded from what the title programmed.
  *

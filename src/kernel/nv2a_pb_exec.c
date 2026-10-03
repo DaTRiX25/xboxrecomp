@@ -226,6 +226,7 @@ static struct nv2a_pb_gpu s_gpu;
 /* Releases written, and where the last one landed. fence_mirrors_tick reads
  * them to decide whether its mirror is still needed; both run on the NV2A ack
  * thread, which is also the thread that drives this executor. */
+static uint32_t s_inline_overflow;      /* INLINE_ARRAY dwords past NV_MAX_INLINE */
 static uint32_t s_sema_releases;
 static uint32_t s_sema_last_va, s_sema_last_value;
 
@@ -5463,6 +5464,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * because the format is only fully known at END. */
         if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
             s_gpu.inline_buf[s_gpu.inline_count++] = param;
+        else if (s_gpu.prim && !s_inline_overflow++)
+            fprintf(stderr, "  [GPU] INLINE_ARRAY batch over %u dwords:"
+                            " the rest is dropped\n", (unsigned)NV_MAX_INLINE);
         break;
 
     case NV097_DRAW_ARRAYS: {
