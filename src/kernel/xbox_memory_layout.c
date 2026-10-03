@@ -615,6 +615,46 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
  * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
  * channel has nothing to gain from it, and the page fault costs something. */
+#if !defined(_WIN32) && defined(__aarch64__)
+#include "../platform/mmio_decode_a64.h"
+#include <unistd.h>
+#include <sys/mman.h>
+static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
+
+static uint64_t ac97_posix_rd(void *dev, uint32_t off, int size)
+{
+    uint64_t v = 0;
+    memcpy(&v, (char *)dev + off, size > 8 ? 8 : size);
+    return v;
+}
+
+static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
+{
+    memcpy((char *)dev + off, &v, size > 8 ? 8 : size);
+}
+
+/* POSIX arm64 half of the AC'97 write trap: the page is PROT_READ, so a
+ * write arrives as SIGBUS; the game target's handler calls this before
+ * reporting. The store is emulated onto the page (open for the moment),
+ * the controller's reaction applied, and the page closed again. Returns 1
+ * when the fault was this trap and the access was serviced. */
+int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
+{
+    int ok;
+
+    if (!g_ac97_page || fault < (uintptr_t)g_ac97_page
+            || fault >= (uintptr_t)g_ac97_page + g_ac97_hsize)
+        return 0;
+    mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE);
+    ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
+                          g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+    if (ok)
+        ac97_clear_reset_bits();
+    mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
+    return ok;
+}
+#endif
+
 static void ac97_arm_write_trap(void)
 {
     DWORD old;
@@ -622,6 +662,22 @@ static void ac97_arm_write_trap(void)
     if (!g_mcpx_memory || g_ac97_page)
         return;
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
+#if !defined(_WIN32) && defined(__aarch64__)
+    (void)old;
+    g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
+    if (g_ac97_hsize < AC97_TRAP_BYTES)
+        g_ac97_hsize = AC97_TRAP_BYTES;
+    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ) != 0) {
+        g_ac97_page = NULL;
+        fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
+                        " a channel reset will spin\n");
+        return;
+    }
+    fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
+                    " (POSIX; channel reset completes on write)\n",
+            XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+    return;
+#endif
     /* First, so it runs before the game target's own crash reporter, which
      * would otherwise print the write as an access violation. */
     g_ac97_veh = AddVectoredExceptionHandler(1, ac97_write_veh);

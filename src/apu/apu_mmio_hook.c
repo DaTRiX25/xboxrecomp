@@ -217,6 +217,133 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 
 #endif /* _WIN32 */
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && defined(__aarch64__)
+/* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
+ * (src/platform/mmio_decode_a64.h). The fault handler in the game target's
+ * main.c calls apu_hook_handle_mmio_posix before it reports a crash. */
+#include <pthread.h>
+#include <time.h>
+#include <string.h>
+#include <signal.h>
+#include "../platform/mmio_decode_a64.h"
+
+#define APU_MMIO_SIZE  0x00080000u
+
+static uint64_t s_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int s_trace = -1;
+static volatile uint64_t s_tot_r, s_tot_w, s_handler_ns;
+static volatile uint32_t s_hist_r[APU_MMIO_SIZE / 4], s_hist_w[APU_MMIO_SIZE / 4];
+static volatile uint32_t s_hist_lastw[APU_MMIO_SIZE / 4];
+static int g_apu_mmio_decode_fail;
+static volatile uint32_t s_last_wval;
+volatile int g_apu_hook_bench_active;
+
+static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
+{
+    return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
+}
+
+static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
+{
+    s_last_wval = (uint32_t)v;
+    mcpx_apu_mmio_write((MCPXAPUState *)dev, off, v, (unsigned)size);
+}
+
+static void *apu_trace_reporter(void *unused)
+{
+    uint64_t t0 = s_now_ns(), prev_r = 0, prev_w = 0;
+    unsigned k = 0;
+    (void)unused;
+    for (;;) {
+        struct timespec ts = { 10, 0 };
+        uint64_t r, w, ns, now;
+        nanosleep(&ts, NULL);
+        r = s_tot_r; w = s_tot_w; ns = s_handler_ns; now = s_now_ns();
+        fprintf(stderr, "[APUMMIO-STATS] t=%.1fs reads=%llu (+%.0f/s) writes=%llu"
+                " (+%.0f/s) fails=%d handler=%.2fus/access\n",
+                (now - t0) / 1e9, (unsigned long long)r, (r - prev_r) / 10.0,
+                (unsigned long long)w, (w - prev_w) / 10.0, g_apu_mmio_decode_fail,
+                (r + w) ? (double)ns / 1e3 / (double)(r + w) : 0.0);
+        prev_r = r; prev_w = w;
+        if (++k % 3 == 0) {
+            for (uint32_t i = 0; i < APU_MMIO_SIZE / 4; i++)
+                if (s_hist_r[i] || s_hist_w[i])
+                    fprintf(stderr, "[APUMMIO-HIST] 0x%05X r=%u w=%u lastw=%08X\n",
+                            i * 4, s_hist_r[i], s_hist_w[i], s_hist_lastw[i]);
+        }
+        fflush(stderr);
+    }
+    return NULL;
+}
+
+void apu_hook_trace_start(void)
+{
+    static int started;
+    pthread_t th;
+    if (s_trace < 0)
+        s_trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (!s_trace || started)
+        return;
+    started = 1;
+    if (pthread_create(&th, NULL, apu_trace_reporter, NULL) == 0)
+        pthread_detach(th);
+}
+
+/* Service one trapped APU access from a SIGBUS/SIGSEGV handler. ucv is the
+ * handler's ucontext; is_write is advisory (the decoder reads the opcode).
+ * Returns true when the access was emulated and pc advanced. */
+bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
+                                uint32_t fault_xbox_va, int is_write)
+{
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uint32_t off = fault_xbox_va - 0xFE800000u;
+    uint64_t a = 0;
+    int trace, ok;
+
+    (void)fault_addr; (void)is_write;
+    if (!g_apu_state || off >= APU_MMIO_SIZE)
+        return false;
+    if (s_trace < 0)
+        s_trace = getenv("RECOMP_APU_TRACE") != NULL;
+    trace = s_trace && !g_apu_hook_bench_active;
+    if (trace)
+        a = s_now_ns();
+    ok = mmio_emulate_a64(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr);
+    if (!ok) {
+        g_apu_mmio_decode_fail++;
+        if (g_apu_mmio_decode_fail <= 20)
+            fprintf(stderr, "[APU] MMIO decode fail at PC=%p insn=%08X offset=0x%X\n",
+                    (void *)(uintptr_t)A64_CTX_PC(uc),
+                    *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc), off);
+        return false;
+    }
+    if (!trace)
+        return true;
+    s_handler_ns += s_now_ns() - a;
+    {
+        /* Direction from the opcode: bit 22 clear is a store for the
+         * single-register forms; LDP/STP carry L in bit 22 as well. */
+        uint32_t insn = *(const uint32_t *)(uintptr_t)(A64_CTX_PC(uc) - 4);
+        int w = !((insn >> 22) & 1);
+        uint32_t slot = off >> 2;
+        if (w) { s_tot_w++; s_hist_w[slot]++; s_hist_lastw[slot] = s_last_wval; }
+        else   { s_tot_r++; s_hist_r[slot]++; }
+        {
+            static unsigned n;
+            if (n++ < 400)
+                fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X\n", w ? "write" : "read ",
+                        off, w ? s_last_wval
+                               : (uint32_t)mcpx_apu_mmio_read(g_apu_state, off, 4));
+        }
+    }
+    return true;
+}
+#elif !defined(_WIN32)
 void apu_hook_trace_start(void) {}
 #endif
