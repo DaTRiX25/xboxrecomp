@@ -6,12 +6,12 @@
  *   NtCreateFile(x.tmp, FILE_OVERWRITE_IF, opts 0x48)   no buffering
  *   set end of file (size rounded up to 512); write all of it; close
  *   NtCreateFile(x.tmp, FILE_OVERWRITE_IF, opts 0x60)
- *   query position; set end of file (true size); rename to x.ipk; close
+ *   query position; set end of file (true size); rename to x.dat; close
  *
  * FATX keeps no valid-data length, so the second open's trim exposes the
  * bytes already on disk. The host truncate (O_TRUNC, CREATE_ALWAYS) zero-
  * fills instead, and every cache file came out as zeros of the right length
- * (seen on Proton: plcom_tex.ipk, 1,022,691 bytes of zeros).
+ * (seen on Proton: a 1 MB game archive file, all zeros).
  *
  * Cross-platform: it calls the xbox_Nt* file functions directly, which are
  * the Win32 backend on Windows (and Proton) and the POSIX one elsewhere.
@@ -192,51 +192,51 @@ int main(int argc, char **argv)
     check(st == 0 && h, "reopen with OVERWRITE_IF", NULL);
     check(query_pos(h) == 0, "position query (XAPI SetEndOfFile does one)", NULL);
     check(set_eof(h, 3000) == 0, "set end of file to the true size, 3000", NULL);
-    st = rename_to(h, "z:\\o.ipk");
+    st = rename_to(h, "z:\\o.dat");
     snprintf(d, sizeof d, "status 0x%08X", (unsigned)st);
-    check(st == 0, "rename to z:\\o.ipk", d);
+    check(st == 0, "rename to z:\\o.dat", d);
     xbox_NtClose(h);
-    n = host_file("o.ipk", got, sizeof got);
+    n = host_file("o.dat", got, sizeof got);
     same = n == 3000;
     for (i = 0; same && i < 3000; i++)
         if (got[i] != (i < 4 ? (unsigned char)"IPK1"[i] : pattern(i))) same = 0;
     snprintf(d, sizeof d, "%ld bytes, first 0x%02X", n, n > 0 ? got[0] : 0);
-    check(n == 3000, "o.ipk is 3000 bytes", d);
+    check(n == 3000, "o.dat is 3000 bytes", d);
     check(same, "the bytes below the new end survive", d);
     check(host_file("o.tmp", got, sizeof got) < 0, "o.tmp is gone", NULL);
 
     /* An overwrite followed by a write is a plain truncate. */
-    st = open_file("z:\\o.ipk", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
-    check(st == 0, "overwrite o.ipk again", NULL);
+    st = open_file("z:\\o.dat", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
+    check(st == 0, "overwrite o.dat again", NULL);
     write_at(h, buf, 4, 0);
     xbox_NtClose(h);
-    check(host_file("o.ipk", got, sizeof got) == 4,
+    check(host_file("o.dat", got, sizeof got) == 4,
           "overwrite + 4-byte write leaves 4 bytes", NULL);
 
     /* A size query sees the overwrite. */
-    st = open_file("z:\\o.ipk", XBOX_FILE_OVERWRITE, 0x60, &h);
+    st = open_file("z:\\o.dat", XBOX_FILE_OVERWRITE, 0x60, &h);
     check(st == 0, "FILE_OVERWRITE of an existing file opens", NULL);
     snprintf(d, sizeof d, "size %lld", (long long)query_size(h));
     check(query_size(h) == 0, "overwrite + size query reports 0", d);
     xbox_NtClose(h);
 
     /* An overwrite that is just closed leaves an empty file. */
-    st = open_file("z:\\o.ipk", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
+    st = open_file("z:\\o.dat", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
     write_at(h, buf, 16, 0);
     xbox_NtClose(h);
-    st = open_file("z:\\o.ipk", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
+    st = open_file("z:\\o.dat", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
     xbox_NtClose(h);
-    check(host_file("o.ipk", got, sizeof got) == 0,
+    check(host_file("o.dat", got, sizeof got) == 0,
           "overwrite + close leaves 0 bytes", NULL);
 
     /* An overwrite that regrows past the old end zero-fills only the tail. */
-    st = open_file("z:\\o.ipk", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
+    st = open_file("z:\\o.dat", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
     write_at(h, buf, 100, 0);
     xbox_NtClose(h);
-    st = open_file("z:\\o.ipk", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
+    st = open_file("z:\\o.dat", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
     set_eof(h, 200);
     xbox_NtClose(h);
-    n = host_file("o.ipk", got, sizeof got);
+    n = host_file("o.dat", got, sizeof got);
     same = n == 200;
     for (i = 0; same && i < 200; i++)
         if (got[i] != (i < 4 ? (unsigned char)"IPK1"[i] : i < 100 ? pattern(i) : 0))
@@ -244,7 +244,7 @@ int main(int argc, char **argv)
     check(same, "regrow past the old end: old bytes, then zeros", NULL);
 
     /* FILE_OVERWRITE of a missing file still fails. */
-    st = open_file("z:\\missing.ipk", XBOX_FILE_OVERWRITE, 0x60, &h);
+    st = open_file("z:\\missing.dat", XBOX_FILE_OVERWRITE, 0x60, &h);
     check(st != 0, "FILE_OVERWRITE of a missing file fails", NULL);
 
 done:

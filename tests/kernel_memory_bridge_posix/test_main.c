@@ -10,8 +10,8 @@
  *                               which never matched them; the window was a
  *                               bump allocator and ran out at ~119 s.
  *   NtSetInformationFile (226)  had no FileRenameInformation, so a title that
- *                               writes x.tmp and renames it to x.ipk could
- *                               never open x.ipk.
+ *                               writes x.tmp and renames it to x.dat could
+ *                               never open x.dat.
  *
  * Each is driven by ordinal through recomp_lookup_kernel, as in
  * tests/kernel_bridge, but against a real guest window from
@@ -295,21 +295,21 @@ static void test_rename(const char *cache)
     printf("NtSetInformationFile(FileRenameInformation)\n");
     h = create("z:\\a.tmp");
     check(h != 0 && exists(cache, "a.tmp"), "create z:\\a.tmp", NULL);
-    st = rename_to(h, "z:\\a.ipk", 0);
+    st = rename_to(h, "z:\\a.dat", 0);
     snprintf(d, sizeof d, "status 0x%08X", st);
     check(st == 0, "rename to a full path succeeds", d);
-    check(exists(cache, "a.ipk") && !exists(cache, "a.tmp"),
-          "a.tmp became a.ipk on the host", NULL);
+    check(exists(cache, "a.dat") && !exists(cache, "a.tmp"),
+          "a.tmp became a.dat on the host", NULL);
     CALL(ORD_NTCLOSE, h);
 
     h2 = create("z:\\b.tmp");
-    st = rename_to(h2, "z:\\a.ipk", 0);
+    st = rename_to(h2, "z:\\a.dat", 0);
     snprintf(d, sizeof d, "status 0x%08X", st);
     check(st == 0xC0000035u, "existing target without ReplaceIfExists collides", d);
-    st = rename_to(h2, "z:\\a.ipk", 1);
+    st = rename_to(h2, "z:\\a.dat", 1);
     check(st == 0 && !exists(cache, "b.tmp"), "ReplaceIfExists replaces", NULL);
-    st = rename_to(h2, "c.ipk", 0);
-    check(st == 0 && exists(cache, "c.ipk") && !exists(cache, "a.ipk"),
+    st = rename_to(h2, "c.dat", 0);
+    check(st == 0 && exists(cache, "c.dat") && !exists(cache, "a.dat"),
           "bare name renames within the same directory", NULL);
     CALL(ORD_NTCLOSE, h2);
 }

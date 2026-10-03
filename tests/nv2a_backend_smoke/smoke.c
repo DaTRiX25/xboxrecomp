@@ -10,7 +10,7 @@
  * backend writes its present surface back at the flip -- so the comparison
  * is the same bytes RECOMP_FB_DUMP and the SDL2 window read.
  *
- * Scenes (M1 of render-gpu-backend §4):
+ * Scenes:
  *   clear_quad   colour clear + a solid quad (pre-transformed, INLINE_ARRAY)
  *   checker      + a swizzled A8R8G8B8 checker, stage 0, wrap addressing
  *   yuy2         + a linear YUY2 ramp (the movie texture's format), clamp

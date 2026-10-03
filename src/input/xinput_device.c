@@ -160,9 +160,8 @@ static int xi_keyboard(XBOX_INPUT_STATE *out)
 static uint64_t xi_now_ms(void) { return GetTickCount64(); }
 
 /* Under Wine XInputGetState has been seen to return ERROR_SUCCESS and an
- * idle pad for an empty user index; the Proton spike (input-real-devices
- * 1.3) records whether this Proton does, and if so the probe moves to
- * XInputGetCapabilities. */
+ * idle pad for an empty user index. If a Wine/Proton build does that, the
+ * connection probe has to move to XInputGetCapabilities. */
 const xbox_input_backend xbox_input_host_backend = {
     NULL, xi_get_state, xi_set_state, xi_keyboard, xi_now_ms
 };
@@ -205,8 +204,8 @@ _Static_assert(SDL_CONTROLLER_AXIS_LEFTX == XBOX_SDL_AXIS_LEFTX
                "XBOX_SDL_AXIS_* must match SDL_GameControllerAxis");
 
 /* Open up to XBOX_MAX_CONTROLLERS attached game controllers. Hotplug
- * (SDL_CONTROLLERDEVICEADDED/REMOVED in the main loop) is input-real-devices
- * 9.1; until then the controllers present at init are the ones used. */
+ * (SDL_CONTROLLERDEVICEADDED/REMOVED in the main loop) is not handled yet:
+ * the controllers present at init are the ones used. */
 static void open_controllers(void)
 {
     int slot = 0;

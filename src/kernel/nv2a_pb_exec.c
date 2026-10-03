@@ -2195,8 +2195,8 @@ static float vsh_zmax(void)
 }
 
 /* One depth/stencil buffer per zeta offset and clip extent, picked by
- * zb_select (nv2a_zbuf_cache.h, which also says why: issue #36, and what the
- * key leaves out). s_zbuf/s_sbuf/s_zbuf_w/s_zbuf_h name the live entry. */
+ * zb_select (nv2a_zbuf_cache.h, which also says why one shared buffer is not
+ * enough, and what the key leaves out). s_zbuf/s_sbuf/s_zbuf_w/s_zbuf_h name the live entry. */
 static ZbCache  s_zbc;
 static float   *s_zb_z[ZB_MAX];
 static uint8_t *s_zb_s[ZB_MAX];

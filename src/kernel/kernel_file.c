@@ -123,7 +123,7 @@ static DWORD xbox_share_to_win32(ULONG Share)
  * length, so a later SetEndOfFile that grows the file brings back the bytes
  * already on disk. A utility-drive texture cache can depend on it: it writes x.tmp,
  * reopens it with CREATE_ALWAYS, only sets the end of file to the true size,
- * and renames it to x.ipk. CREATE_ALWAYS / TRUNCATE_EXISTING on NTFS (and
+ * and renames it to x.dat. CREATE_ALWAYS / TRUNCATE_EXISTING on NTFS (and
  * Wine's ftruncate) zero-fill on the regrow, so every cache file came out as
  * zeros of the right length.
  *
@@ -927,7 +927,7 @@ static int posix_open_flags(ACCESS_MASK access, ULONG disposition)
  *   CreateFile(x.tmp, CREATE_ALWAYS, NO_BUFFERING|OVERLAPPED)
  *   SetEndOfFile(size rounded up to 512); WriteFile(all of it); CloseHandle
  *   CreateFile(x.tmp, CREATE_ALWAYS)      <- the second overwrite
- *   SetEndOfFile(true size); CloseHandle; rename x.tmp -> x.ipk
+ *   SetEndOfFile(true size); CloseHandle; rename x.tmp -> x.dat
  *
  * The second open only trims the sector padding. With O_TRUNC the host
  * filesystem zero-fills on the regrow, so every cache file came out as zeros
@@ -1309,9 +1309,10 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
 
 /* Rename an open file (NtSetInformationFile, FileRenameInformation).
  *
- * A title may build each utility-drive texture cache as z:\...\name.tmp, then
- * renames it to name.ipk, and later opens the .ipk. With this class
- * unimplemented the rename failed, so every .ipk open failed with
+ * A title may build each utility-drive texture cache as z:\...\name.tmp,
+ * rename it to its final name (a game archive file, name.dat here), and
+ * later open that. With this class unimplemented the rename failed, so
+ * every open of the final name failed with
  * STATUS_OBJECT_NAME_NOT_FOUND and the title rebuilt the cache instead.
  *
  * The new name is resolved the way NT does:

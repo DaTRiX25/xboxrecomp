@@ -1,6 +1,6 @@
 /**
  * A Metal backend for the pushbuffer executor (struct nv2a_pb_backend), the
- * macOS sibling of nv2a_pb_d3d11.c. render-gpu-backend tasks §4, milestone M1.
+ * macOS sibling of nv2a_pb_d3d11.c.
  *
  * The executor (src/kernel/nv2a_pb_exec.c) decodes the title's pushbuffer into
  * the state in nv2a_pb_state.h and calls the hooks of struct nv2a_pb_backend;
