@@ -458,12 +458,20 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     return nv2a_vtx_decode(a->type, a->size, p, out);
 }
 
+static uint32_t surf_fmt_bpp(uint32_t format);
+
 static uint32_t surface_bpp(void)
 {
-    /* The pitch and the clip width together give the pixel size, which is more
-     * reliable than decoding the format field: the format's colour code is
-     * only meaningful alongside a type the title also sets, while the pitch is
-     * always exactly how many bytes a row occupies. */
+    /* The surface format says it outright (SET_SURFACE_FORMAT's colour
+     * field). Pitch / clip width -- the only way before -- is right only
+     * while the clip spans the whole surface: Burnout 3 narrows the clip to
+     * a 250-pixel window for its option values, 2560 / 250 came out as 10
+     * bytes a pixel, and every such text quad was refused (upstream
+     * 777c1cd). The pitch rule stays as the fallback for a colour code the
+     * table does not know. */
+    uint32_t bpp = surf_fmt_bpp(s_gpu.format);
+    if (bpp)
+        return bpp;
     if (!s_gpu.clip_w)
         return 0;
     return s_gpu.pitch / s_gpu.clip_w;
