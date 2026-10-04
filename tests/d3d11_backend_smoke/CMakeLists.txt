@@ -7,8 +7,12 @@
 
 if(WIN32)
     add_executable(d3d11_backend_smoke smoke.c)
+    # xbox_usb: the kernel's trapped-MMIO dispatch (xbox_VehMmioFault) calls
+    # the OHCI model. xbox_kernel links it PRIVATE, but this file is read
+    # (from src/d3d) before src/usb defines the target, and the mingw link
+    # line came out without it; name it here.
     target_link_libraries(d3d11_backend_smoke PRIVATE xbox_kernel xbox_d3d8 xbox_video
-                          d3d11 dxgi dxguid)
+                          xbox_usb d3d11 dxgi dxguid)
     target_include_directories(d3d11_backend_smoke PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/../../src/d3d)
     # Needs a D3D11 device: under ctest, a Proton wrapper as
