@@ -221,6 +221,8 @@ static void open_controllers(void)
 
 static void sdl_init(void)
 {
+    /* Game controllers pull in SDL events; keep SIGINT/SIGTERM default. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     open_controllers();
