@@ -854,6 +854,206 @@ static void vp_stat_report(void)
 }
 
 /* ============================================================
+ * Ring monitor (RECOMP_TRACE=apu_ring)
+ *
+ * A title that streams compressed audio decodes it on the CPU into a looping
+ * PCM buffer voice and keeps writing ahead of the play cursor. If the writer
+ * falls behind, the VP plays the previous lap's data again: no digital zero,
+ * nothing a check on the mix can see, and only a stutter to the ear.
+ *
+ * Each looping PCM buffer is split into 1 KB blocks, and the samples the VP
+ * fetches are hashed per block as it plays them. When the cursor leaves a
+ * block it played whole, that hash is compared with the one from the
+ * block's previous play. Once some block of a buffer has played differently
+ * on two laps, the buffer is a ring (one loaded once and looped -- a sound
+ * effect -- never changes and is never judged). In a ring, a non-silent
+ * block that plays exactly as it did one lap before is a stale-lap replay.
+ *
+ * "lead" is how far ahead of the cursor the writer is: the blocks after the
+ * one being entered whose memory has changed since they were last played,
+ * in source frames.
+ *
+ *   [APU-RING] stale v=<voice> blk=<b>/<n> lap=<laps> ms=<wall ms>
+ *       first 200 stale-lap replays
+ *   [APU-RING] t=<s> v=<voice> bytes=<ring size> entries=<blocks played>
+ *       stale=<this second> stale_total=<run> lead_min=<frames> lead_avg=<frames>
+ *       once a VP second for each ring that played
+ * ============================================================ */
+
+#define RING_BLK      1024u
+#define RING_MAX_BLKS 1024u
+
+struct VpRing {
+    uint32_t ba, bytes, nblk;
+    uint32_t cur;                 /* block being played, ~0: none */
+    uint32_t cur_frames;          /* frames of it played so far */
+    uint64_t acc;                 /* hash of those frames */
+    bool     acc_sound;
+    uint32_t laps;
+    bool     dynamic;
+    uint32_t entries, stale, stale_total;
+    uint32_t lead_min, lead_n;
+    uint64_t lead_sum;
+    uint64_t played[RING_MAX_BLKS];   /* hash of its last whole play */
+    uint64_t mem[RING_MAX_BLKS];      /* memory hash when it was last entered */
+    uint8_t  seen[RING_MAX_BLKS];     /* bit 0: played, bit 1: mem valid */
+};
+static struct VpRing *s_ring[MCPX_HW_MAX_VOICES];
+static int s_ring_on = -1;
+static unsigned s_ring_logged;
+
+static uint64_t ring_hash_block(MCPXAPUState *d, uint32_t ba, uint32_t off,
+                                uint32_t len)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    while (len) {
+        uint32_t lin = ba + off;
+        uint32_t run = TARGET_PAGE_SIZE - lin % TARGET_PAGE_SIZE;
+        if (run > len) run = len;
+        const uint8_t *p = mcpx_apu_phys(
+            get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, lin));
+        uint32_t i = 0;
+        for (; i + 8 <= run; i += 8) {
+            uint64_t w;
+            memcpy(&w, p + i, 8);
+            h = (h ^ w) * 0x100000001B3ull;
+            h ^= h >> 29;
+        }
+        for (; i < run; i++)
+            h = (h ^ p[i]) * 0x100000001B3ull;
+        off += run;
+        len -= run;
+    }
+    return h;
+}
+
+/* The cursor left block r->cur. */
+static void ring_close_block(struct VpRing *r, uint32_t v, uint32_t frames_per_blk)
+{
+    uint32_t b = r->cur;
+    if (b == ~0u || r->cur_frames < frames_per_blk)
+        return;                              /* not played whole */
+    if (r->seen[b] & 1) {
+        if (r->acc != r->played[b]) {
+            r->dynamic = true;
+        } else if (r->dynamic && r->acc_sound) {
+            r->stale++;
+            r->stale_total++;
+            if (s_ring_logged < 200) {
+                s_ring_logged++;
+                fprintf(stderr, "[APU-RING] stale v=%u blk=%u/%u lap=%u ms=%llu\n",
+                        v, b, r->nblk, r->laps,
+                        (unsigned long long)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) / 1000));
+            }
+        }
+    }
+    r->played[b] = r->acc;
+    r->seen[b] |= 1;
+}
+
+/* The VP fetched n frames of a looping PCM buffer voice, the first at
+ * offset first; frames are frame_bytes apart in the buffer. */
+static void vp_ring_check(MCPXAPUState *d, uint32_t v, uint32_t ba,
+                          uint32_t ebo, uint32_t frame_bytes, uint32_t first,
+                          const float samples[][2], int n)
+{
+    struct VpRing *r;
+    uint32_t bytes = (ebo + 1) * frame_bytes;
+    uint32_t fpb;
+
+    if (s_ring_on < 0)
+        s_ring_on = recomp_env_on(RENV_APU_RING);
+    if (!s_ring_on || v >= MCPX_HW_MAX_VOICES || bytes < 2 * RING_BLK ||
+        frame_bytes == 0 || RING_BLK % frame_bytes)
+        return;
+    fpb = RING_BLK / frame_bytes;
+    r = s_ring[v];
+    if (!r) {
+        r = s_ring[v] = calloc(1, sizeof(*r));
+        if (!r) return;
+        r->ba = ~0u;
+    }
+    if (r->ba != ba || r->bytes != bytes) {   /* a new buffer on this voice */
+        uint32_t keep_total = r->stale_total;
+        memset(r, 0, sizeof(*r));
+        r->ba = ba;
+        r->bytes = bytes;
+        r->nblk = bytes / RING_BLK;           /* a partial last block is skipped */
+        if (r->nblk > RING_MAX_BLKS) r->nblk = RING_MAX_BLKS;
+        r->cur = ~0u;
+        r->lead_min = ~0u;
+        r->stale_total = keep_total;
+    }
+
+    for (int i = 0; i < n; i++) {
+        uint32_t b = (first + (uint32_t)i) / fpb;
+        if (b != r->cur) {
+            ring_close_block(r, v, fpb);
+            if (b < r->cur && r->cur != ~0u)
+                r->laps++;
+            r->cur = b;
+            r->cur_frames = 0;
+            r->acc = 0x9E3779B97F4A7C15ull;
+            r->acc_sound = false;
+            if (b < r->nblk) {
+                /* Entering b: the writer's lead, then b's memory hash. */
+                uint64_t h = ring_hash_block(d, ba, b * RING_BLK, RING_BLK);
+                r->entries++;
+                if (r->dynamic) {
+                    uint32_t k, lead = 0;
+                    for (k = 1; k < r->nblk; k++) {
+                        uint32_t bb = (b + k) % r->nblk;
+                        if (!(r->seen[bb] & 2))
+                            break;
+                        if (ring_hash_block(d, ba, bb * RING_BLK, RING_BLK) == r->mem[bb])
+                            break;
+                        lead++;
+                    }
+                    lead *= fpb;
+                    if (lead < r->lead_min) r->lead_min = lead;
+                    r->lead_sum += lead;
+                    r->lead_n++;
+                }
+                r->mem[b] = h;
+                r->seen[b] |= 2;
+            }
+        }
+        if (b >= r->nblk)
+            continue;
+        {
+            uint32_t w[2];
+            memcpy(w, samples[i], sizeof(w));
+            r->acc = (r->acc ^ (((uint64_t)w[0] << 32) | w[1])) * 0x100000001B3ull;
+            r->acc ^= r->acc >> 29;
+            if (w[0] | w[1]) r->acc_sound = true;
+            r->cur_frames++;
+        }
+    }
+}
+
+static void vp_ring_report(unsigned secs)
+{
+    if (s_ring_on <= 0) return;
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        struct VpRing *r = s_ring[v];
+        if (!r || !r->entries || !r->dynamic) {
+            if (r) r->entries = 0;
+            continue;
+        }
+        fprintf(stderr, "[APU-RING] t=%us v=%u bytes=%u entries=%u stale=%u"
+                " stale_total=%u lead_min=%u lead_avg=%llu\n",
+                secs, v, r->bytes, r->entries, r->stale, r->stale_total,
+                r->lead_n ? r->lead_min : 0,
+                (unsigned long long)(r->lead_n ? r->lead_sum / r->lead_n : 0));
+        r->entries = 0;
+        r->stale = 0;
+        r->lead_min = ~0u;
+        r->lead_sum = 0;
+        r->lead_n = 0;
+    }
+}
+
+/* ============================================================
  * Sample fetching from voice buffers
  * ============================================================ */
 
@@ -1052,6 +1252,9 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     vp_stat_samples(d, v, samples, sample_count, stat_addr,
                     voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
                                    0xFFFFFFFF));
+    if (!stream && loop && !adpcm && sample_count > 0)
+        vp_ring_check(d, v, ba, ebo, (uint32_t)block_size,
+                      cbo - (uint32_t)sample_count, samples, sample_count);
 
     if (cbo >= ebo) {
         if (stream) {
@@ -1452,6 +1655,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
     vp_trace_positions(d);
     vp_stat_report();
+    {
+        static unsigned ring_frames, ring_secs;
+        if (s_ring_on > 0 && ++ring_frames % 1500 == 0)
+            vp_ring_report(++ring_secs);
+    }
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {

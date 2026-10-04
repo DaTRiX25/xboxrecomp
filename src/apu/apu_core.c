@@ -491,7 +491,7 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 }
 
 /* ============================================================
- * Host playback accounting (RECOMP_APU_TRACE or RECOMP_AUDIO_HOSTSTATS)
+ * Host playback accounting (RECOMP_TRACE=apu or RECOMP_TRACE=audio_host)
  *
  * The WAV tap records every period handed to the device, back to back, so
  * it cannot show a period that reached the device late: the device plays
@@ -520,6 +520,7 @@ static struct {
     int64_t  trap_start_us, trap_max_us;    /* trap_max: this report interval */
     unsigned trap_spells, trap_long;        /* long: > 20 ms */
     int64_t  next_report_us;
+    int64_t  first_submit_us;               /* for the rate lines */
 } g_hs = { -1 };
 
 static int hs_on(void)
@@ -575,6 +576,13 @@ static void hs_submit(int n)
     played = xa2_samples_played();
     q = xa2_queued_samples();
 
+    /* The sample-rate lines audio_check --rate reads: samples= is what was
+     * submitted between the two times, so samples / (t_last - t_first) is
+     * the rate the device was fed at, pauses included. */
+    if (!g_hs.first_submit_us) {
+        g_hs.first_submit_us = now;
+        fprintf(stderr, "[APU] first submit t=%.6f\n", now / 1e6);
+    }
     if (g_hs.t0_us == 0) {
         g_hs.t0_us = now;
         g_hs.played0 = played;
@@ -615,6 +623,8 @@ static void hs_submit(int n)
                 (long long)deficit, g_hs.gap_max_us / 1000.0, g_hs.q_min,
                 g_hs.trap_spells, g_hs.trap_long, g_hs.trap_max_us / 1000.0,
                 xa2_underruns());
+        fprintf(stderr, "[APU] last submit t=%.6f samples=%llu\n", now / 1e6,
+                (unsigned long long)(g_hs.submitted - (uint64_t)n));
         g_hs.gap_max_us = 0;
         g_hs.trap_max_us = 0;
         g_hs.q_min = q;

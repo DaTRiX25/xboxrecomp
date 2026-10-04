@@ -99,7 +99,8 @@ extern "C" {
     X(TRACE_PROFILE,     TRACE, "call_profile",    "RECOMP_TRACE_PROFILE",     "call profile; =n report interval") \
     X(IRQL_TRACE,        TRACE, "irql",            "RECOMP_IRQL_TRACE",        "first IRQL transitions") \
     X(APU_TRACE,         TRACE, "apu",             "RECOMP_APU_TRACE",         "APU register and frame trace; [APU-IRQ] line every 5 s") \
-    X(AUDIO_HOST,        TRACE, "audio_host",      "RECOMP_AUDIO_HOSTSTATS",   "host audio playback vs wall clock; [AUDIO-HOST] starve lines (on with apu)") \
+    X(AUDIO_HOST,        TRACE, "audio_host",      NULL,                       "host audio playback vs wall clock; [AUDIO-HOST] starve lines (on with apu)") \
+    X(APU_RING,          TRACE, "apu_ring",        NULL,                       "looping APU buffers refilled by the title: [APU-RING] lead and stale-lap replays") \
     X(USB_TRACE,         TRACE, "usb",             "RECOMP_USB_TRACE",         "OHCI trace") \
     X(USB_STATS,         TRACE, "usb_stats",       "RECOMP_USB_STATS",         "OHCI summary line every 5 s") \
     X(INPUT_DIAG,        TRACE, "input_diag",      "RECOMP_INPUT_DIAG",        "input chain probe once a second") \
