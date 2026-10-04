@@ -1207,7 +1207,8 @@ static void clear_surface(uint32_t param)
  * visibly wrong rather than quietly wrong.
  *
  * Filtering is the stage sampler's (stage_sample_2d): nearest, or bilinear
- * when SET_TEXTURE_FILTER asks for TENT.
+ * when SET_TEXTURE_FILTER asks for TENT, on the mip level(s) the pixel's LOD
+ * picks when MIN mipmaps (stage_sample_mip).
  */
 /* Off the edge of the texture, the way the title asked for.
  *
@@ -2421,6 +2422,29 @@ static int     s_stage_mode[4];         /* 0 none, 1 2D, 4 pass-through, other *
 static float   s_stage_scale[4][2];     /* normalised -> texels */
 static int     s_stage_tent[4];         /* bilinear: SET_TEXTURE_FILTER asks TENT */
 
+/* Mip selection, per stage (stage_lod). A stage mipmaps when its texture
+ * has more than one level (nv2a_stage_decode with NV2A_STAGE_MIPS, as the
+ * GPU paths count them) and MIN asks for a mip mode; it is never a cube
+ * map. Level 0 of such a stage is the same texture s_stage_tex holds. */
+#define MIP_MAX_LEVELS 16
+typedef struct {
+    int      mip;                       /* 0 off, 1 nearest level, 2 blend two */
+    int      mag_lin, min_lin;          /* bilinear within a level */
+    uint32_t levels;
+    float    lod_min, lod_max, bias;
+    uint32_t off[MIP_MAX_LEVELS];       /* byte offset of each level */
+} StageMip;
+static StageMip s_stage_mip[4];
+
+/* The screen-space derivatives a triangle's pixels need for their LOD
+ * (lod_tri_setup): for each mipmapped stage, those of the perspective
+ * numerators of s, t and q (tc[3]) and of their shared denominator. */
+typedef struct {
+    int   on;                           /* some stage mipmaps */
+    float qx, qy;                       /* d(sum la/w)/dx, /dy */
+    float nx[4][3], ny[4][3];           /* d(sum la*t[k]/w)/dx, /dy, k = s,t,q */
+} LodTri;
+
 /* RECOMP_TEX_LOG=1: every distinct texture a program-mode batch samples,
  * per stage, with the raw format word decoded (dimensionality, cube map, mip
  * levels, log2 sizes), the pitch and image rect, whether the format is
@@ -2598,16 +2622,56 @@ static void tex_log_report(void)
  * minifying (as upstream 13c64d3; linear as the GPU backends read it,
  * nv2a_tex_filter_linear). A 64x32 sky gradient stretched over the screen
  * is blocks with nearest texels and a gradient with four.
- * ponytail: level 0 only, no mip selection -- minified textures shimmer.
+ * A stage that mipmaps (stage_mip_build) picks MAG or MIN per pixel from
+ * its LOD instead.
  * RECOMP_DEBUG=pb_bilinear=0 samples nearest whatever the filter says. */
-static int tex_filter_tent(uint32_t filter)
+static int pb_bilinear(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = recomp_env(RENV_PB_BILINEAR);
         on = !(e && e[0] == '0');
     }
-    return on && (nv2a_tex_filter_linear(filter, 1) || nv2a_tex_filter_linear(filter, 0));
+    return on;
+}
+
+static int tex_filter_tent(uint32_t filter)
+{
+    return pb_bilinear()
+        && (nv2a_tex_filter_linear(filter, 1) || nv2a_tex_filter_linear(filter, 0));
+}
+
+/* RECOMP_DEBUG=pb_mips=0: level 0 only, whatever MIN asks (A/B). */
+static int pb_mips(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_PB_MIPS);
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static void stage_mip_build(int n, const struct nv2a_stage *st)
+{
+    StageMip *m = &s_stage_mip[n];
+    uint32_t l;
+
+    m->mip = 0;
+    if (!pb_mips() || st->levels < 2 || st->cube || st->mode == 0 || st->mode == 4
+            || !nv2a_tex_size_from_format(st->color))
+        return;
+    m->mip = nv2a_tex_filter_mip(st->filter);
+    if (!m->mip)
+        return;
+    m->levels = st->levels < MIP_MAX_LEVELS ? st->levels : MIP_MAX_LEVELS;
+    m->lod_min = (float)st->lod_min;
+    m->lod_max = (float)st->lod_max;
+    m->bias = nv2a_tex_lod_bias(st->filter);
+    m->mag_lin = pb_bilinear() && nv2a_tex_filter_linear(st->filter, 1);
+    m->min_lin = pb_bilinear() && nv2a_tex_filter_linear(st->filter, 0);
+    for (l = 0; l < m->levels; l++)
+        m->off[l] = nv2a_tex_level_offset(st->color, st->width, st->height, l);
 }
 
 static void vsh_build_stages(void)
@@ -2619,8 +2683,9 @@ static void vsh_build_stages(void)
         struct nv2a_stage st;
         int from_fmt;
 
+        /* With NV2A_STAGE_MIPS only levels and the LOD clamps differ. */
         nv2a_stage_decode(n, r, &s_tex_set[(0x40u * n) / 4], s_vsh.shader_set,
-                          s_vsh.shader_prog, dma_resolve, 0, &st);
+                          s_vsh.shader_prog, dma_resolve, NV2A_STAGE_MIPS, &st);
         memset(t, 0, sizeof *t);
         t->offset = st.offset;
         t->width  = st.width;
@@ -2643,6 +2708,7 @@ static void vsh_build_stages(void)
         from_fmt = nv2a_tex_size_from_format(t->color);
         s_stage_scale[n][0] = from_fmt ? (float)t->width : 1.0f;
         s_stage_scale[n][1] = from_fmt ? (float)t->height : 1.0f;
+        stage_mip_build(n, &st);
     }
 }
 
@@ -2717,37 +2783,160 @@ static void bilerp(const float c[4][4], float wu, float wv, float o[4])
              + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
 }
 
-/* Bilinear setup: the top-left tap and the weights, at texel centres. */
-static void tent_setup(int n, float s, float t, int *iu, int *iv, float *wu, float *wv)
+/* Bilinear setup: the top-left tap and the weights, at texel centres, for
+ * coordinates scaled to texels by (sw, sh). */
+static void tent_setup(float sw, float sh, float s, float t, int *iu, int *iv,
+                       float *wu, float *wv)
 {
-    float fu = s * s_stage_scale[n][0] - 0.5f, fv = t * s_stage_scale[n][1] - 0.5f;
+    float fu = s * sw - 0.5f, fv = t * sh - 0.5f;
     *iu = (int)floorf(fu);
     *iv = (int)floorf(fv);
     *wu = fu - (float)*iu;
     *wv = fv - (float)*iv;
 }
 
-/* Stage n's texture `tx` (the stage's own, or one cube face of it) at
- * normalised (swizzled, DXT) or texel (linear) coordinates s, t. */
-static void stage_sample_2d(int n, const Texture *tx, float s, float t, float o[4])
+/* Texture `tx` at coordinates s, t scaled to texels by (sw, sh): bilinear
+ * (lin) or nearest, read live. */
+static void sample_2d_live(const Texture *tx, float sw, float sh, int lin,
+                           float s, float t, float o[4])
 {
     int iu, iv;
-    if (s_stage_tent[n]) {
+    if (lin) {
         float wu, wv, c[4][4];
         int k;
-        tent_setup(n, s, t, &iu, &iv, &wu, &wv);
+        tent_setup(sw, sh, s, t, &iu, &iv, &wu, &wv);
         for (k = 0; k < 4; k++)
             texel_live(tx, wrap_signed(iu + (k & 1), tx->width, tx->addr_u),
                        wrap_signed(iv + (k >> 1), tx->height, tx->addr_v), c[k]);
         bilerp(c, wu, wv, o);
         return;
     }
-    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), tx->width,  tx->addr_u);
-    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), tx->height, tx->addr_v);
+    iu = wrap_signed((int)floorf(s * sw), tx->width,  tx->addr_u);
+    iv = wrap_signed((int)floorf(t * sh), tx->height, tx->addr_v);
     texel_live(tx, iu, iv, o);
 }
 
-static void stage_sample(int n, const float tc[4], float o[4])
+/* Stage n's texture `tx` (the stage's own, or one cube face of it) at
+ * normalised (swizzled, DXT) or texel (linear) coordinates s, t. */
+static void stage_sample_2d(int n, const Texture *tx, float s, float t, float o[4])
+{
+    sample_2d_live(tx, s_stage_scale[n][0], s_stage_scale[n][1], s_stage_tent[n],
+                   s, t, o);
+}
+
+/* A triangle's LodTri. la, lb, lc are the edge functions over the area,
+ * linear in the pixel position; their per-pixel steps, over 1/w, give the
+ * derivatives of the perspective numerators and of their sum (the pixel's
+ * ps). Both rasterisers call this with the same operands. */
+static void lod_tri_setup(const XfVert *a, const XfVert *b, const XfVert *c,
+                          float area, const float inv_w[3], LodTri *L)
+{
+    const XfVert *v[3];
+    float dx[3], dy[3];
+    int n, i, j;
+    static const int comp[3] = { 0, 1, 3 };
+
+    L->on = 0;
+    for (n = 0; n < 4; n++)
+        L->on |= s_stage_mip[n].mip != 0;
+    if (!L->on)
+        return;
+    v[0] = a; v[1] = b; v[2] = c;
+    /* la = w1 / area, w1 = (c.x - b.x)(py - b.y) - (c.y - b.y)(px - b.x);
+     * lb from w2 (a, c), lc from w0 (b, a). Each times its 1/w. */
+    dx[0] = -(c->y - b->y) / area * inv_w[0]; dy[0] = (c->x - b->x) / area * inv_w[0];
+    dx[1] = -(a->y - c->y) / area * inv_w[1]; dy[1] = (a->x - c->x) / area * inv_w[1];
+    dx[2] = -(b->y - a->y) / area * inv_w[2]; dy[2] = (b->x - a->x) / area * inv_w[2];
+    L->qx = dx[0] + dx[1] + dx[2];
+    L->qy = dy[0] + dy[1] + dy[2];
+    for (n = 0; n < 4; n++) {
+        if (!s_stage_mip[n].mip)
+            continue;
+        for (j = 0; j < 3; j++) {
+            float sx = 0.0f, sy = 0.0f;
+            for (i = 0; i < 3; i++) {
+                sx += dx[i] * v[i]->t[n][comp[j]];
+                sy += dy[i] * v[i]->t[n][comp[j]];
+            }
+            L->nx[n][j] = sx;
+            L->ny[n][j] = sy;
+        }
+    }
+}
+
+/* Stage n's LOD at a pixel whose interpolated coordinate is tc and whose
+ * perspective sum is q: the coordinate's screen derivatives from the
+ * quotient rule, d(N/q) = (dN - (N/q) dq) / q, again through the projective
+ * divide for a 2D projective stage, in level-0 texels. */
+static float stage_lod(int n, const LodTri *L, const float tc[4], float q)
+{
+    const StageMip *m = &s_stage_mip[n];
+    float iq, sx, sy, tx, ty;
+
+    if (q == 0.0f)
+        return m->lod_min;
+    iq = 1.0f / q;
+    sx = (L->nx[n][0] - tc[0] * L->qx) * iq;
+    sy = (L->ny[n][0] - tc[0] * L->qy) * iq;
+    tx = (L->nx[n][1] - tc[1] * L->qx) * iq;
+    ty = (L->ny[n][1] - tc[1] * L->qy) * iq;
+    if (s_stage_mode[n] == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {
+        float rx = (L->nx[n][2] - tc[3] * L->qx) * iq;
+        float ry = (L->ny[n][2] - tc[3] * L->qy) * iq;
+        float ir = 1.0f / tc[3], ps = tc[0] * ir, pt = tc[1] * ir;
+        sx = (sx - ps * rx) * ir; sy = (sy - ps * ry) * ir;
+        tx = (tx - pt * rx) * ir; ty = (ty - pt * ry) * ir;
+    }
+    sx *= s_stage_scale[n][0]; sy *= s_stage_scale[n][0];
+    tx *= s_stage_scale[n][1]; ty *= s_stage_scale[n][1];
+    return nv2a_tex_lod(sx * sx + tx * tx, sy * sy + ty * ty, m->bias,
+                       m->lod_min, m->lod_max);
+}
+
+/* The two levels' samples, blended by f (trilinear); the same expression
+ * for the live and cached samplers. */
+static void mip_blend(float o[4], const float o1[4], float f)
+{
+    int j;
+    for (j = 0; j < 4; j++)
+        o[j] = o[j] * (1.0f - f) + o1[j] * f;
+}
+
+/* Level l of stage n's (mipmapped, so swizzled or DXT) texture. */
+static void stage_level_tex(int n, uint32_t l, Texture *lt)
+{
+    *lt = s_stage_tex[n];
+    lt->offset += s_stage_mip[n].off[l];
+    lt->width = nv2a_tex_level_dim(lt->width, l);
+    lt->height = nv2a_tex_level_dim(lt->height, l);
+}
+
+/* A mipmapped stage at (s, t), read live: the LOD picks MAG or MIN and the
+ * level(s). */
+static void stage_sample_mip(int n, const LodTri *L, const float tc[4], float q,
+                             float s, float t, float o[4])
+{
+    const StageMip *m = &s_stage_mip[n];
+    float lod = stage_lod(n, L, tc, q), f, o1[4];
+    int lin = lod > 0.0f ? m->min_lin : m->mag_lin;
+    uint32_t l0, l1;
+    Texture lt;
+
+    nv2a_tex_mip_levels(m->mip, lod, m->levels, &l0, &l1, &f);
+    stage_level_tex(n, l0, &lt);
+    sample_2d_live(&lt, (float)lt.width, (float)lt.height, lin, s, t, o);
+    if (f > 0.0f) {
+        stage_level_tex(n, l1, &lt);
+        sample_2d_live(&lt, (float)lt.width, (float)lt.height, lin, s, t, o1);
+        mip_blend(o, o1, f);
+    }
+}
+
+/* Stage n at the interpolated coordinate tc. L and q (the pixel's
+ * perspective sum, ps) give a mipmapped stage its LOD; with L NULL it
+ * samples level 0. */
+static void stage_sample(int n, const float tc[4], float q, const LodTri *L,
+                         float o[4])
 {
     int mode = s_stage_mode[n];
     float s, t;
@@ -2768,6 +2957,10 @@ static void stage_sample(int n, const float tc[4], float o[4])
     if (mode == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {   /* 2D projective */
         s /= tc[3]; t /= tc[3];
     }
+    if (L && s_stage_mip[n].mip) {
+        stage_sample_mip(n, L, tc, q, s, t, o);
+        return;
+    }
     stage_sample_2d(n, &s_stage_tex[n], s, t, o);
 }
 
@@ -2778,6 +2971,7 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
     uint32_t bpp = surface_bpp();
     float area, inv_w[3], zscale = 1.0f / vsh_zmax();
     int minx, maxx, miny, maxy, x, y, use_z, use_s, use_rc, n;
+    LodTri lod;
 
     if (bpp != 4 && bpp != 2)
         return;
@@ -2824,6 +3018,7 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
     }
 
     inv_w[0] = 1.0f / a->w; inv_w[1] = 1.0f / b->w; inv_w[2] = 1.0f / c->w;
+    lod_tri_setup(a, b, c, area, inv_w, &lod);
 
     for (y = miny; y < maxy; y++) {
         for (x = minx; x < maxx; x++) {
@@ -2876,7 +3071,7 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
                         continue;
                     for (k = 0; k < 4; k++)
                         tc[k] = pa * a->t[n][k] + pb * b->t[n][k] + pc * c->t[n][k];
-                    stage_sample(n, tc, r[8 + n]);
+                    stage_sample(n, tc, ps, &lod, r[8 + n]);
                 }
                 r[12][3] = r[8][3];
                 rc_eval(r, col);
@@ -2885,7 +3080,7 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
                 for (k = 0; k < 4; k++)
                     tc[k] = pa * a->t[0][k] + pb * b->t[0][k] + pc * c->t[0][k];
                 if (s_stage_mode[0]) {
-                    stage_sample(0, tc, tx);
+                    stage_sample(0, tc, ps, &lod, tx);
                     for (k = 0; k < 4; k++)
                         col[k] *= tx[k];
                 }
@@ -2990,13 +3185,18 @@ static void rc_unpack_fast(uint32_t c, float o[4])
 #define TC_MAX_TEXELS (2048u * 2048u)
 
 typedef struct {
-    uint32_t offset, color, width, height, pitch;   /* key */
+    uint32_t offset, color, width, height, pitch, levels;   /* key */
     uint32_t gen, used;
     uint32_t wseq;                      /* s_surf_wr_seq when last validated */
     uint64_t fp;
-    uint32_t *texels;
-    uint8_t  *tile_ok;
-    uint32_t tiles_x, tiles_y, cap_texels, cap_tiles;
+    uint32_t *texels;                   /* level 0, then each further level */
+    uint8_t  *tile_ok;                  /* level 0's tiles, then the next's */
+    uint32_t tiles, cap_texels, cap_tiles;
+    /* Per level: size, first texel, first tile, tiles per row, byte offset
+     * in guest memory from level 0. */
+    uint32_t lw[MIP_MAX_LEVELS], lh[MIP_MAX_LEVELS];
+    uint32_t ltex[MIP_MAX_LEVELS], ltile[MIP_MAX_LEVELS], ltx[MIP_MAX_LEVELS];
+    uint32_t lbyte[MIP_MAX_LEVELS];
     int      live;
 } TexCacheEntry;
 
@@ -3007,14 +3207,20 @@ static uint32_t       s_tc_clock;
 static uint64_t       s_tc_tiles_filled, s_tc_refp, s_tc_dropped, s_tc_binds;
 static uint64_t       s_tc_feedback;    /* binds read live: texture is the target */
 
-/* Bytes the sampler can read for this texture, 0 if it is not cacheable:
- * level 0 only, and not P8, whose palette is not in the key. */
-static uint32_t tc_extent(const Texture *t)
+/* Bytes the sampler can read for this texture's first `levels` levels, 0
+ * if it is not cacheable: not P8, whose palette is not in the key. */
+static uint32_t tc_extent(const Texture *t, uint32_t levels)
 {
     if (!t->valid || !t->width || !t->height || t->color == NV2A_TEX_P8
             || (uint64_t)t->width * t->height > TC_MAX_TEXELS)
         return 0;
-    return nv2a_tex_extent(t->color, t->width, t->height, t->pitch, 1);
+    return nv2a_tex_extent(t->color, t->width, t->height, t->pitch, levels);
+}
+
+/* The cached levels a stage samples: its mip chain, or level 0. */
+static uint32_t stage_tc_levels(int n)
+{
+    return s_stage_mip[n].mip ? s_stage_mip[n].levels : 1u;
 }
 
 /* The texture's bytes, all of them.
@@ -3031,9 +3237,9 @@ static uint64_t tc_fingerprint(const Texture *t, uint32_t bytes)
     return nv2a_tex_hash(mem, bytes, NV2A_TEX_HASH_SEED);
 }
 
-static TexCacheEntry *tc_bind(const Texture *t)
+static TexCacheEntry *tc_bind(const Texture *t, uint32_t levels)
 {
-    uint32_t bytes = tc_extent(t), gen = s_gpu.flips, i, tiles;
+    uint32_t bytes = tc_extent(t, levels), gen = s_gpu.flips, i, l, tiles, texels;
     TexCacheEntry *e = NULL, *victim = &s_tc[0];
     uint64_t t0;
 
@@ -3052,7 +3258,7 @@ static TexCacheEntry *tc_bind(const Texture *t)
         TexCacheEntry *c = &s_tc[i];
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
-                && c->pitch == t->pitch) {
+                && c->pitch == t->pitch && c->levels == levels) {
             e = c;
             break;
         }
@@ -3065,7 +3271,7 @@ static TexCacheEntry *tc_bind(const Texture *t)
             uint64_t fp = tc_fingerprint(t, bytes);
             s_tc_refp++;
             if (fp != e->fp) {
-                memset(e->tile_ok, 0, e->tiles_x * e->tiles_y);
+                memset(e->tile_ok, 0, e->tiles);
                 e->fp = fp;
                 s_tc_dropped++;
             }
@@ -3074,23 +3280,33 @@ static TexCacheEntry *tc_bind(const Texture *t)
         }
     } else {
         e = victim;
-        tiles = ((t->width + 7u) >> TC_TILE_LOG) * ((t->height + 7u) >> TC_TILE_LOG);
-        if (e->cap_texels < t->width * t->height) {
-            uint32_t *n = (uint32_t *)realloc(e->texels, (size_t)t->width * t->height * 4u);
-            if (!n) { e->live = 0; s_rt.tex += rt_now() - t0; return NULL; }
+        e->live = 0;
+        texels = tiles = 0;
+        for (l = 0; l < levels; l++) {
+            uint32_t w = nv2a_tex_level_dim(t->width, l), h = nv2a_tex_level_dim(t->height, l);
+            e->lw[l] = w; e->lh[l] = h;
+            e->ltex[l] = texels; e->ltile[l] = tiles;
+            e->ltx[l] = (w + 7u) >> TC_TILE_LOG;
+            e->lbyte[l] = nv2a_tex_level_offset(t->color, t->width, t->height, l);
+            texels += w * h;
+            tiles += e->ltx[l] * ((h + 7u) >> TC_TILE_LOG);
+        }
+        if (e->cap_texels < texels) {
+            uint32_t *n = (uint32_t *)realloc(e->texels, (size_t)texels * 4u);
+            if (!n) { s_rt.tex += rt_now() - t0; return NULL; }
             e->texels = n;
-            e->cap_texels = t->width * t->height;
+            e->cap_texels = texels;
         }
         if (e->cap_tiles < tiles) {
             uint8_t *n = (uint8_t *)realloc(e->tile_ok, tiles);
-            if (!n) { e->live = 0; s_rt.tex += rt_now() - t0; return NULL; }
+            if (!n) { s_rt.tex += rt_now() - t0; return NULL; }
             e->tile_ok = n;
             e->cap_tiles = tiles;
         }
         e->offset = t->offset; e->color = t->color;
         e->width = t->width; e->height = t->height; e->pitch = t->pitch;
-        e->tiles_x = (t->width + 7u) >> TC_TILE_LOG;
-        e->tiles_y = (t->height + 7u) >> TC_TILE_LOG;
+        e->levels = levels;
+        e->tiles = tiles;
         memset(e->tile_ok, 0, tiles);
         e->fp = tc_fingerprint(t, bytes);
         e->gen = gen;
@@ -3136,95 +3352,142 @@ static pthread_mutex_t s_tc_lock = PTHREAD_MUTEX_INITIALIZER;
 #define TC_UNLOCK() pthread_mutex_unlock(&s_tc_lock)
 #endif
 
-static void tc_fill_locked(TexCacheEntry *e, const Texture *t, uint32_t tile);
+static void tc_fill_locked(TexCacheEntry *e, const Texture *t, uint32_t l,
+                           uint32_t tile);
 
-static void tc_fill(TexCacheEntry *e, const Texture *t, uint32_t tile)
+/* Tile `tile` (index within level l) of level l of entry e, whose level 0
+ * is texture t. */
+static void tc_fill(TexCacheEntry *e, const Texture *t, uint32_t l, uint32_t tile)
 {
     TC_LOCK();
-    if (!e->tile_ok[tile])                  /* another thread may have */
-        tc_fill_locked(e, t, tile);
+    if (!e->tile_ok[e->ltile[l] + tile])    /* another thread may have */
+        tc_fill_locked(e, t, l, tile);
     TC_UNLOCK();
 }
 
-static void tc_fill_locked(TexCacheEntry *e, const Texture *t, uint32_t tile)
+static void tc_fill_locked(TexCacheEntry *e, const Texture *t, uint32_t l,
+                           uint32_t tile)
 {
-    uint32_t x0 = (tile % e->tiles_x) << TC_TILE_LOG;
-    uint32_t y0 = (tile / e->tiles_x) << TC_TILE_LOG;
-    uint32_t x1 = x0 + 8u < e->width ? x0 + 8u : e->width;
-    uint32_t y1 = y0 + 8u < e->height ? y0 + 8u : e->height;
-    uint32_t x, y;
+    uint32_t w = e->lw[l], h = e->lh[l];
+    uint32_t x0 = (tile % e->ltx[l]) << TC_TILE_LOG;
+    uint32_t y0 = (tile / e->ltx[l]) << TC_TILE_LOG;
+    uint32_t x1 = x0 + 8u < w ? x0 + 8u : w;
+    uint32_t y1 = y0 + 8u < h ? y0 + 8u : h;
+    uint32_t x, y, *out = e->texels + e->ltex[l];
     uint64_t t0 = rt_now();
+    Texture lt = *t;
 
+    lt.offset += e->lbyte[l];
+    lt.width = w;
+    lt.height = h;
     for (y = y0; y < y1; y++)
         for (x = x0; x < x1; x++) {
             uint32_t texel = 0;
-            sample_tex(t, x, y, &texel);   /* cacheable formats always decode */
-            e->texels[(size_t)y * e->width + x] = texel;
+            sample_tex(&lt, x, y, &texel); /* cacheable formats always decode */
+            out[(size_t)y * w + x] = texel;
         }
-    tile_publish(&e->tile_ok[tile]);
+    tile_publish(&e->tile_ok[e->ltile[l] + tile]);
     s_tc_tiles_filled++;
     s_rt.tex += rt_now() - t0;
 }
 
-/* Texel (iu, iv), already wrapped, from the cache. */
-static inline void texel_cached(TexCacheEntry *e, int n, int iu, int iv, float o[4])
+/* Texel (iu, iv) of level l, already wrapped, from the cache. */
+static inline void texel_cached(TexCacheEntry *e, int n, uint32_t l, int iu, int iv,
+                                float o[4])
 {
-    uint32_t tile = ((uint32_t)iv >> TC_TILE_LOG) * e->tiles_x + ((uint32_t)iu >> TC_TILE_LOG);
-    if (!tile_ready(&e->tile_ok[tile]))
-        tc_fill(e, &s_stage_tex[n], tile);
-    rc_unpack_fast(e->texels[(size_t)iv * e->width + (uint32_t)iu], o);
+    uint32_t tile = ((uint32_t)iv >> TC_TILE_LOG) * e->ltx[l] + ((uint32_t)iu >> TC_TILE_LOG);
+    if (!tile_ready(&e->tile_ok[e->ltile[l] + tile]))
+        tc_fill(e, &s_stage_tex[n], l, tile);
+    rc_unpack_fast(e->texels[e->ltex[l] + (size_t)iv * e->lw[l] + (uint32_t)iu], o);
+}
+
+/* Level l of the stage-n entry e at (s, t), bilinear (lin) or nearest: the
+ * live sampler's arithmetic on cached texels. Level 0 keeps the stage's
+ * scale (texels for a linear texture); a further level is always swizzled
+ * or DXT, so normalised.
+ *
+ * A bilinear tap whose weights are both 0 -- a pixel centre on a texel
+ * centre, as in a 1:1 screen quad -- is that one texel: the four-tap blend
+ * of the live sampler gives exactly it (the other taps are weighted by an
+ * exact 0), so the other three are not read. */
+static inline void fast_level(TexCacheEntry *e, int n, uint32_t l, int lin,
+                              float s, float t, float o[4])
+{
+    const Texture *tx = &s_stage_tex[n];
+    uint32_t w = e->lw[l], h = e->lh[l];
+    float sw = l ? (float)w : s_stage_scale[n][0];
+    float sh = l ? (float)h : s_stage_scale[n][1];
+    int iu, iv;
+
+    if (lin) {
+        float wu, wv, c[4][4];
+        int k;
+        int u[2], v[2];
+        tent_setup(sw, sh, s, t, &iu, &iv, &wu, &wv);
+        u[0] = wrap_signed(iu, w, tx->addr_u);
+        v[0] = wrap_signed(iv, h, tx->addr_v);
+        if (wu == 0.0f && wv == 0.0f) {
+            texel_cached(e, n, l, u[0], v[0], o);
+            return;
+        }
+        u[1] = wrap_signed(iu + 1, w, tx->addr_u);
+        v[1] = wrap_signed(iv + 1, h, tx->addr_v);
+        if (u[1] == u[0] + 1 && v[1] == v[0] + 1
+                && (u[0] & 7) != 7 && (v[0] & 7) != 7) {
+            /* all four in one tile: one check, adjacent texels */
+            uint32_t tile = ((uint32_t)v[0] >> TC_TILE_LOG) * e->ltx[l]
+                          + ((uint32_t)u[0] >> TC_TILE_LOG);
+            const uint32_t *p0;
+            if (!tile_ready(&e->tile_ok[e->ltile[l] + tile]))
+                tc_fill(e, tx, l, tile);
+            p0 = &e->texels[e->ltex[l] + (size_t)v[0] * w + (uint32_t)u[0]];
+            rc_unpack_fast(p0[0], c[0]);
+            rc_unpack_fast(p0[1], c[1]);
+            rc_unpack_fast(p0[w], c[2]);
+            rc_unpack_fast(p0[w + 1], c[3]);
+        } else {
+            for (k = 0; k < 4; k++)
+                texel_cached(e, n, l, u[k & 1], v[k >> 1], c[k]);
+        }
+        bilerp(c, wu, wv, o);
+        return;
+    }
+    iu = wrap_signed((int)floorf(s * sw), w, tx->addr_u);
+    iv = wrap_signed((int)floorf(t * sh), h, tx->addr_v);
+    texel_cached(e, n, l, iu, iv, o);
 }
 
 /* stage_sample, reading texels from the cache when the stage has an entry.
  * A cube stage has none (fast_batch_setup) and samples live. */
-static void stage_sample_fast(int n, const float tc[4], float o[4])
+static void stage_sample_fast(int n, const float tc[4], float q, const LodTri *L,
+                              float o[4])
 {
     TexCacheEntry *e = s_stage_tc[n];
-    const Texture *tx = &s_stage_tex[n];
     int mode = s_stage_mode[n];
     float s, t;
-    int iu, iv;
 
     if (!e || mode == 0 || mode == 4) {
-        stage_sample(n, tc, o);
+        stage_sample(n, tc, q, L, o);
         return;
     }
     s = tc[0]; t = tc[1];
     if (mode == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {   /* 2D projective */
         s /= tc[3]; t /= tc[3];
     }
-    if (s_stage_tent[n]) {
-        float wu, wv, c[4][4];
-        int k;
-        int u[2], v[2];
-        tent_setup(n, s, t, &iu, &iv, &wu, &wv);
-        u[0] = wrap_signed(iu, tx->width, tx->addr_u);
-        u[1] = wrap_signed(iu + 1, tx->width, tx->addr_u);
-        v[0] = wrap_signed(iv, tx->height, tx->addr_v);
-        v[1] = wrap_signed(iv + 1, tx->height, tx->addr_v);
-        if (u[1] == u[0] + 1 && v[1] == v[0] + 1
-                && (u[0] & 7) != 7 && (v[0] & 7) != 7) {
-            /* all four in one tile: one check, adjacent texels */
-            uint32_t tile = ((uint32_t)v[0] >> TC_TILE_LOG) * e->tiles_x
-                          + ((uint32_t)u[0] >> TC_TILE_LOG);
-            const uint32_t *p0;
-            if (!tile_ready(&e->tile_ok[tile]))
-                tc_fill(e, tx, tile);
-            p0 = &e->texels[(size_t)v[0] * e->width + (uint32_t)u[0]];
-            rc_unpack_fast(p0[0], c[0]);
-            rc_unpack_fast(p0[1], c[1]);
-            rc_unpack_fast(p0[e->width], c[2]);
-            rc_unpack_fast(p0[e->width + 1], c[3]);
-        } else {
-            for (k = 0; k < 4; k++)
-                texel_cached(e, n, u[k & 1], v[k >> 1], c[k]);
+    if (s_stage_mip[n].mip) {              /* as stage_sample_mip */
+        const StageMip *m = &s_stage_mip[n];
+        float lod = stage_lod(n, L, tc, q), f, o1[4];
+        int lin = lod > 0.0f ? m->min_lin : m->mag_lin;
+        uint32_t l0, l1;
+        nv2a_tex_mip_levels(m->mip, lod, m->levels, &l0, &l1, &f);
+        fast_level(e, n, l0, lin, s, t, o);
+        if (f > 0.0f) {
+            fast_level(e, n, l1, lin, s, t, o1);
+            mip_blend(o, o1, f);
         }
-        bilerp(c, wu, wv, o);
         return;
     }
-    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), tx->width,  tx->addr_u);
-    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), tx->height, tx->addr_v);
-    texel_cached(e, n, iu, iv, o);
+    fast_level(e, n, 0, s_stage_tent[n], s, t, o);
 }
 
 /* (b) -------------------------------------------------------------------
@@ -3309,6 +3572,7 @@ typedef struct {
     float area, inv_w[3], zscale;
     float e0dx, e0dy, e1dx, e1dy, e2dx, e2dy;
     int minx, maxx, miny, maxy, use_z, use_s, use_rc, textured, unit_w;
+    LodTri lod;
 } FastTri;
 
 /* Index of the lowest set bit of a non-zero word. */
@@ -3422,7 +3686,7 @@ static void fast_rows(const FastTri *T, int y0, int step)
                         continue;
                     for (k = 0; k < 4; k++)
                         tc[k] = pa * a->t[n][k] + pb * b->t[n][k] + pc * c->t[n][k];
-                    stage_sample_fast(n, tc, r[8 + n]);
+                    stage_sample_fast(n, tc, ps, &T->lod, r[8 + n]);
                 }
                 r[12][3] = r[8][3];
                 nv2a_rc_plan_eval(&s_rcp, r, col);
@@ -3431,7 +3695,7 @@ static void fast_rows(const FastTri *T, int y0, int step)
                 for (k = 0; k < 4; k++)
                     tc[k] = pa * a->t[0][k] + pb * b->t[0][k] + pc * c->t[0][k];
                 if (s_stage_mode[0]) {
-                    stage_sample_fast(0, tc, tx);
+                    stage_sample_fast(0, tc, ps, &T->lod, tx);
                     for (k = 0; k < 4; k++)
                         col[k] *= tx[k];
                 }
@@ -3703,6 +3967,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
     T.minx = minx; T.maxx = maxx; T.miny = miny; T.maxy = maxy;
     T.inv_w[0] = 1.0f / a->w; T.inv_w[1] = 1.0f / b->w; T.inv_w[2] = 1.0f / c->w;
     T.unit_w = a->w == 1.0f && b->w == 1.0f && c->w == 1.0f;
+    lod_tri_setup(a, b, c, area, T.inv_w, &T.lod);
     T.e0dx = b->x - a->x; T.e0dy = b->y - a->y;
     T.e1dx = c->x - b->x; T.e1dy = c->y - b->y;
     T.e2dx = a->x - c->x; T.e2dy = a->y - c->y;
@@ -3727,8 +3992,9 @@ static void fast_batch_setup(void)
     for (n = 0; n < 4; n++) {
         int mode = s_stage_mode[n];
         const Texture *t = &s_stage_tex[n];
+        uint32_t lv = stage_tc_levels(n);
         s_stage_tc[n] = (mode != 0 && mode != 4 && !(mode == 3 && t->face_stride))
-                      ? tc_bind(t) : NULL;
+                      ? tc_bind(t, lv) : NULL;
         /* A stage reading the surface this batch draws into sees its own
          * earlier pixels: the reference sampler reads memory as it changes,
          * a cached copy would not. A title fade can draw the two back
@@ -3736,7 +4002,7 @@ static void fast_batch_setup(void)
          * came out one step darker on ~4000 pixels per pass. Read those
          * live, like the reference does. */
         if (s_stage_tc[n] && lo && t->offset < hi
-                && lo < t->offset + tc_extent(t)) {
+                && lo < t->offset + tc_extent(t, lv)) {
             s_stage_tc[n] = NULL;
             s_tc_feedback++;
         }
@@ -3744,7 +4010,7 @@ static void fast_batch_setup(void)
          * pixels other rows are writing: draw that batch on one thread. */
         if (mode != 0 && mode != 4 && lo && t->valid && t->offset < hi
                 && lo < t->offset + (t->face_stride ? 6u * t->face_stride
-                        : nv2a_tex_extent(t->color, t->width, t->height, t->pitch, 1)))
+                        : nv2a_tex_extent(t->color, t->width, t->height, t->pitch, lv)))
             s_fast_serial = 1;
     }
     if (vsh_rc_active())
@@ -4249,7 +4515,7 @@ static void raster_batch_fast_ab(void)
                 if (e)
                     for (v = 0; v < e->height; v++)
                         for (u = 0; u < e->width; u++) {
-                            uint32_t tile = (v >> TC_TILE_LOG) * e->tiles_x + (u >> TC_TILE_LOG);
+                            uint32_t tile = (v >> TC_TILE_LOG) * e->ltx[0] + (u >> TC_TILE_LOG);
                             if (!e->tile_ok[tile]) continue;
                             seen++;
                             if (sample_tex(&s_stage_tex[0], u, v, &tv)
@@ -4260,7 +4526,7 @@ static void raster_batch_fast_ab(void)
                                 " %u of %u decoded texels stale; wseq %u written %u gen %u flips %u\n",
                         s_gpu.color_offset, s_gpu.color_base, e ? "bound" : "none",
                         stale, seen, e ? e->wseq : 0,
-                        e ? surf_written_since(e->offset, e->offset + tc_extent(&s_stage_tex[0])) : 0,
+                        e ? surf_written_since(e->offset, e->offset + tc_extent(&s_stage_tex[0], e->levels)) : 0,
                         e ? e->gen : 0, s_gpu.flips);
             }
         }

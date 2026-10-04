@@ -56,6 +56,45 @@ int main(void)
     CHECK(nv2a_tex_filter_mip(0x00060000u) == 2 && nv2a_tex_filter_mip(0x00030000u) == 1);
     CHECK(NEAR(nv2a_tex_lod_bias(0x1F00u), -1.0f) && NEAR(nv2a_tex_lod_bias(0x0080u), 0.5f));
 
+    /* Mip levels and LOD (the CPU sampler's; the GPU paths take the same
+     * bias and clamps as sampler state). Level offsets: A8R8G8B8 (0x06)
+     * 16x8 is 512 bytes, then 8x4 128, then 4x2; DXT1 (0x0C) 8x8 is 32,
+     * then 4x4 8, then 2x2 rounds up to a whole block. */
+    CHECK(nv2a_tex_level_offset(0x06, 16, 8, 0) == 0);
+    CHECK(nv2a_tex_level_offset(0x06, 16, 8, 1) == 512);
+    CHECK(nv2a_tex_level_offset(0x06, 16, 8, 2) == 640);
+    CHECK(nv2a_tex_level_offset(0x0C, 8, 8, 3) == 48);
+    /* rho 4 texels a pixel: LOD 2; the larger axis wins; the bias adds;
+     * the clamps hold; no footprint (0 or NaN) is lod_min. */
+    CHECK(NEAR(nv2a_tex_lod(16.0f, 1.0f, 0.0f, 0.0f, 7.0f), 2.0f));
+    CHECK(NEAR(nv2a_tex_lod(1.0f, 64.0f, 0.0f, 0.0f, 7.0f), 3.0f));
+    CHECK(NEAR(nv2a_tex_lod(16.0f, 0.0f, -0.5f, 0.0f, 7.0f), 1.5f));
+    CHECK(NEAR(nv2a_tex_lod(0.25f, 0.0f, 0.0f, 0.0f, 7.0f), 0.0f));   /* magnified */
+    CHECK(NEAR(nv2a_tex_lod(1e12f, 0.0f, 0.0f, 0.0f, 5.0f), 5.0f));
+    CHECK(NEAR(nv2a_tex_lod(1.0f, 1.0f, 0.0f, 2.0f, 5.0f), 2.0f));
+    CHECK(NEAR(nv2a_tex_lod(0.0f, 0.0f, 0.0f, 1.0f, 5.0f), 1.0f));
+    { float nan = 0.0f / 0.0f * 0.0f;
+      CHECK(NEAR(nv2a_tex_lod(nan, nan, 0.0f, 1.0f, 5.0f), 1.0f)); }
+    {   /* Which levels: nearest rounds, linear blends floor and floor + 1,
+         * the last level stands alone, mode 0 is level 0. */
+        uint32_t l0, l1;
+        float w;
+        nv2a_tex_mip_levels(1, 1.4f, 8, &l0, &l1, &w);
+        CHECK(l0 == 1 && l1 == 1 && w == 0.0f);
+        nv2a_tex_mip_levels(1, 1.6f, 8, &l0, &l1, &w);
+        CHECK(l0 == 2 && l1 == 2);
+        nv2a_tex_mip_levels(1, 7.9f, 8, &l0, &l1, &w);
+        CHECK(l0 == 7);
+        nv2a_tex_mip_levels(2, 2.25f, 8, &l0, &l1, &w);
+        CHECK(l0 == 2 && l1 == 3 && NEAR(w, 0.25f));
+        nv2a_tex_mip_levels(2, 7.0f, 8, &l0, &l1, &w);
+        CHECK(l0 == 7 && l1 == 7 && w == 0.0f);
+        nv2a_tex_mip_levels(2, 0.0f, 8, &l0, &l1, &w);
+        CHECK(l0 == 0 && l1 == 1 && w == 0.0f);
+        nv2a_tex_mip_levels(0, 3.0f, 8, &l0, &l1, &w);
+        CHECK(l0 == 0 && l1 == 0);
+    }
+
     puts("nv2a_tex: all passed");
     return 0;
 }

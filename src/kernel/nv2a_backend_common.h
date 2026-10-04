@@ -156,6 +156,50 @@ uint32_t nv2a_tex_face_stride(uint32_t fmt, uint32_t w, uint32_t h,
 uint32_t nv2a_tex_extent(uint32_t fmt, uint32_t w, uint32_t h,
                          uint32_t pitch, uint32_t levels);
 
+/* Level l's byte offset from level 0 in a swizzled or DXT mip chain (the
+ * levels before it, packed). */
+static inline uint32_t nv2a_tex_level_offset(uint32_t fmt, uint32_t w,
+                                             uint32_t h, uint32_t l)
+{
+    return l ? nv2a_tex_extent(fmt, w, h, 0, l) : 0u;
+}
+
+/* A sampler's level of detail, for a sampler that computes its own (the
+ * GPU paths get it from their sampler state: MipLODBias, MinLOD, MaxLOD):
+ * log2 of rho, the larger of the pixel's x and y footprints in level-0
+ * texels (rho2x, rho2y are their squares), plus the filter's LOD bias,
+ * clamped to CONTROL0's [lod_min, lod_max]. No footprint (0 or NaN) gives
+ * lod_min. */
+static inline float nv2a_tex_lod(float rho2x, float rho2y, float bias,
+                                 float lod_min, float lod_max)
+{
+    float r2 = rho2x > rho2y ? rho2x : rho2y, l;
+    if (!(r2 > 0.0f))
+        return lod_min;
+    l = 0.5f * log2f(r2) + bias;
+    if (!(l > lod_min)) return lod_min;     /* NaN too */
+    return l < lod_max ? l : lod_max;
+}
+
+/* The level(s) MIN mip mode `mip` (nv2a_tex_filter_mip) reads at a clamped
+ * LOD (>= 0) of a chain of `levels`: mode 1 the nearest level (*l0), mode 2
+ * the two around it, *l1 weighted *f. Level l1 == l0 with *f 0 when one
+ * level is all there is. */
+static inline void nv2a_tex_mip_levels(int mip, float lod, uint32_t levels,
+                                       uint32_t *l0, uint32_t *l1, float *f)
+{
+    uint32_t top = levels ? levels - 1u : 0u, l;
+    if (mip == 2) {
+        l = (uint32_t)lod;                  /* lod >= 0: floor */
+        if (l >= top) { *l0 = *l1 = top; *f = 0.0f; return; }
+        *l0 = l; *l1 = l + 1u; *f = lod - (float)l;
+        return;
+    }
+    l = mip == 1 ? (uint32_t)(lod + 0.5f) : 0u;
+    *l0 = *l1 = l < top ? l : top;
+    *f = 0.0f;
+}
+
 /* FNV-style over n bytes, four independent lanes so it runs at memory
  * speed. h is the seed (NV2A_TEX_HASH_SEED for a fresh hash). */
 #define NV2A_TEX_HASH_SEED 0xCBF29CE484222325ull
