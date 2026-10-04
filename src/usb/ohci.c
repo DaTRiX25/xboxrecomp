@@ -7,6 +7,7 @@
  * that decides how the rest gets built.
  */
 #include "ohci.h"
+#include "recomp_env.h"
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
@@ -696,7 +697,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
         unsigned long now;
         total += (unsigned)completed;
         if (stats < 0)
-            stats = getenv("RECOMP_USB_STATS") != NULL;
+            stats = recomp_env(RENV_USB_STATS) != NULL;
         now = (unsigned long)GetTickCount();
         if (stats && now - last >= 5000) {
             uint32_t seen[8] = {0};
@@ -957,7 +958,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * XAPI assigns it, and a title that reads "player 1" looks at slot
              * 0. RECOMP_USB_PORT picks it (0..1 on this controller) so the
              * mapping can be found by measurement rather than assumed. */
-            const char *pspec = getenv("RECOMP_USB_PORT");
+            const char *pspec = recomp_env(RENV_USB_PORT);
             unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
@@ -1135,14 +1136,14 @@ void xbox_OhciInit(void)
     /* Opt-in. Without a descriptor list walker behind it a driver that finds
      * a port has nothing to enumerate, so this must not change how a title
      * behaves until the rest of it exists. */
-    if (!getenv("RECOMP_USB"))
+    if (!recomp_env(RENV_USB))
         return;
 
     s_enabled = 1;
-    s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+    s_trace   = recomp_env(RENV_USB_TRACE) != NULL;
     {
-        const char *hcspec = getenv("RECOMP_USB_HC");
-        const char *ndpspec = getenv("RECOMP_USB_NDP");
+        const char *hcspec = recomp_env(RENV_USB_HC);
+        const char *ndpspec = recomp_env(RENV_USB_NDP);
         s_device_hc = (hcspec && atoi(hcspec) == 1) ? 1 : 0;
         if (ndpspec) {
             int n = atoi(ndpspec);

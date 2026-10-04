@@ -110,6 +110,14 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
 #undef IXAudio2SourceVoice_SubmitSourceBuffer
 #define IXAudio2SourceVoice_SubmitSourceBuffer(source, buffer, ...) fake_submit(buffer)
 #include "../../src/apu/apu_xaudio2.c"
+#include "../../src/platform/recomp_env.c"
+
+/* The runtime reads the environment once; re-read it after each change. */
+static void put_env(const char *assignment)
+{
+    _putenv(assignment);
+    recomp_env_reload();
+}
 
 static void reset(void)
 {
@@ -154,8 +162,8 @@ int main(void)
     source.lpVtbl = &source_vtable;
     /* The ring cases below were written for 3 x 1024; pin them there. The
      * defaults and the override are checked at the end. */
-    _putenv("RECOMP_AUDIO_BUF_SAMPLES=1024");
-    _putenv("RECOMP_AUDIO_BUF_COUNT=3");
+    put_env("RECOMP_AUDIO_BUF_SAMPLES=1024");
+    put_env("RECOMP_AUDIO_BUF_COUNT=3");
     check_init_failures(S_OK);
     check_init_failures(S_FALSE);
     check_init_failures(RPC_E_CHANGED_MODE);
@@ -229,8 +237,8 @@ int main(void)
         };
         static int16_t period[256][2];
         for (int k = 0; k < 4; k++) {
-            _putenv(c[k].samples);
-            _putenv(c[k].count);
+            put_env(c[k].samples);
+            put_env(c[k].count);
             reset();
             max_queue = c[k].want_n;
             CHECK(xa2_init() == 1);
@@ -254,8 +262,8 @@ int main(void)
     {
         static int16_t period[256][2];
         int high, refused = 0;
-        _putenv("RECOMP_AUDIO_BUF_SAMPLES=");
-        _putenv("RECOMP_AUDIO_BUF_COUNT=");
+        put_env("RECOMP_AUDIO_BUF_SAMPLES=");
+        put_env("RECOMP_AUDIO_BUF_COUNT=");
         reset();
         max_queue = 4;
         CHECK(xa2_init() == 1);
@@ -330,8 +338,8 @@ int main(void)
         static int16_t period[256][2];
         for (int k = 0; k < 2; k++) {
             int low, high, refused = 0, started = 0, credit = 0, submits = 0;
-            _putenv(c[k].s);
-            _putenv(c[k].n);
+            put_env(c[k].s);
+            put_env(c[k].n);
             reset();
             max_queue = (UINT32)c[k].cnt;
             CHECK(xa2_init() == 1);
@@ -379,8 +387,8 @@ int main(void)
     {
         char line[512] = "";
         FILE *f;
-        _putenv("RECOMP_AUDIO_BUF_SAMPLES=256");
-        _putenv("RECOMP_AUDIO_BUF_COUNT=5");
+        put_env("RECOMP_AUDIO_BUF_SAMPLES=256");
+        put_env("RECOMP_AUDIO_BUF_COUNT=5");
         reset();
         max_queue = 5;
         fflush(stderr);

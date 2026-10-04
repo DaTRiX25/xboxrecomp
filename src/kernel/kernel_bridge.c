@@ -26,6 +26,7 @@
  */
 
 #include "kernel.h"
+#include "recomp_env.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -239,7 +240,7 @@ static void kernel_data_init(void)
      * a level the way the console would tell it: "+map intro".
      */
     {
-        const char *cmdline = getenv("RECOMP_CMDLINE");
+        const char *cmdline = recomp_env(RENV_CMDLINE);
 
         if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
@@ -386,7 +387,7 @@ static long kernel_log_budget(void)
     static long budget = -1;
 
     if (budget < 0) {
-        const char *env = getenv("RECOMP_KERNEL_LOG_BUDGET");
+        const char *env = recomp_env(RENV_KERNEL_LOG_BUDGET);
         budget = env ? strtol(env, NULL, 0) : 200;
         if (budget < 0)
             budget = 0;
@@ -947,11 +948,11 @@ static void bridge_PsCreateSystemThreadEx(void)
                  * only goes wrong with two guest threads running, this says so
                  * in one run, and the answer separates a concurrency bug from
                  * everything else it might have been. */
-                const char *inline_workers = getenv("RECOMP_WORKERS");
+                const char *inline_workers = recomp_env(RENV_WORKERS);
                 uint32_t stack_top;
 
                 if (inline_workers && !strcmp(inline_workers, "inline")) {
-                    fprintf(stderr, "  [KERNEL] RECOMP_WORKERS=inline: running "
+                    fprintf(stderr, "  [KERNEL] workers=inline: running "
                             "worker 0x%08X on this thread\n", start_routine);
                     fflush(stderr);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
@@ -2636,7 +2637,7 @@ static long kernel_vblank_tick(void)
     long wait;
 
     if (enabled < 0)
-        enabled = getenv("RECOMP_VBLANK") != NULL;
+        enabled = recomp_env(RENV_VBLANK) != NULL;
     if (!enabled)
         return 10;
 
@@ -3538,7 +3539,7 @@ static void bridge_NtCreateFile(void)
      *
      * Off unless RECOMP_FMV_HOST is set: it is a substitute for the title's
      * own output, and that should be a decision rather than a default. */
-    if (g_eax == 0 && getenv("RECOMP_FMV_HOST")) {
+    if (g_eax == 0 && recomp_env(RENV_FMV_HOST)) {
         /* Declared here rather than included: the player lives in xbox_video,
          * which links xbox_d3d8, and having the kernel include its header
          * would make the dependency circular for no gain. Both land in the
@@ -3870,7 +3871,7 @@ static int bridge_async_io_enabled(void)
 {
     static int on = -1;
     if (on < 0)
-        on = getenv("RECOMP_ASYNC_IO") ? 1 : 0;
+        on = recomp_env(RENV_ASYNC_IO) ? 1 : 0;
     return on;
 }
 
@@ -8320,7 +8321,7 @@ static void bridge_PsCreateSystemThread(void)
                 fn();
                 g_esp += 12;
             } else {
-                const char *inline_workers = getenv("RECOMP_WORKERS");
+                const char *inline_workers = recomp_env(RENV_WORKERS);
                 uint32_t stack_top;
 
                 if (inline_workers && !strcmp(inline_workers, "inline")) {
@@ -9838,7 +9839,7 @@ static void kernel_watch_arm_once(void)
     if (done)
         return;
     done = 1;
-    env = getenv("RECOMP_KERNEL_WATCH");
+    env = recomp_env(RENV_KERNEL_WATCH);
     if (env)
         g_kernel_watch_va = (uint32_t)strtoul(env, NULL, 0);
 }
@@ -9939,7 +9940,7 @@ static void kernel_thunk_dispatch(void)
          * that was already wrong before the first call sampled it. Printing
          * every sample under RECOMP_KERNEL_WATCH_ALL shows when it changed
          * even if no single bridge did it. */
-        if (getenv("RECOMP_KERNEL_WATCH_ALL")) {
+        if (recomp_env(RENV_KERNEL_WATCH_ALL)) {
             static uint32_t seen = 0xDEADBEEFu;
             if (_watch_before != seen) {
                 seen = _watch_before;

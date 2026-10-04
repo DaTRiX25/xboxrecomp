@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "recomp_env.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_wav.h"
@@ -74,6 +75,14 @@ void mcpx_debug_end_frame(void) {}
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
 extern size_t g_xbox_total_ram;
+extern size_t g_xbox_map_size;     /* host mapping; 0 means same as RAM */
+
+/* How far up the host actually mapped guest RAM: the map size when it was
+ * set apart from the RAM size (xbox_SetMapSize), else the RAM size. */
+static inline uint32_t apu_mapped_ram(void)
+{
+    return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
+}
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
@@ -89,7 +98,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * There is no window ambiguity up here, so it is RAM, as far as the host
      * mapped it. */
     if (a >= (64u << 20)) {
-        if (a < g_xbox_total_ram)
+        if (a < apu_mapped_ram())
             return g_apu_ram_ptr + a;
         return g_apu_ram_ptr + (a & 0x03FFFFFFu);
     }
@@ -98,11 +107,8 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * 0x0303AC20 (its BSS), and DirectSound's voice array sits at physical
      * 0x009E8000, inside it. Resolved to RAM, the VP never saw the driver
      * take an idle voice off its list and re-trapped it every frame. */
-    if (a < (64u << 20)) {             /* the window's 64 MB */
-        const volatile uint8_t *map = xbox_ContiguousPageMap();
-        if (map[a >> 12])
-            return g_apu_ram_ptr + 0x80000000u + a;
-    }
+    if (xbox_ContiguousPageMap()[a >> 12])   /* a is below the window's 64 MB here */
+        return g_apu_ram_ptr + 0x80000000u + a;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (a < xbox_ContiguousAllocatedBytes())
@@ -119,7 +125,7 @@ const char *mcpx_apu_phys_class(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     if (a >= (64u << 20))
-        return a < g_xbox_total_ram ? "ram" : "wrap";
+        return a < apu_mapped_ram() ? "ram" : "wrap";
     if (xbox_ContiguousPageMap()[a >> 12])
         return "win";
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
@@ -193,7 +199,7 @@ static void apu_irq_stats_line(void)
     uint64_t now;
 
     if (trace < 0)
-        trace = getenv("RECOMP_APU_TRACE") != NULL;
+        trace = recomp_env(RENV_APU_TRACE) != NULL;
     if (!trace)
         return;
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -407,8 +413,8 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     /* RECOMP_AUDIO_WAV=<path>: dump exactly what the device is given. */
     {
-        const char *wav = getenv("RECOMP_AUDIO_WAV");
-        const char *secs = getenv("RECOMP_AUDIO_WAV_SECS");
+        const char *wav = recomp_env(RENV_AUDIO_WAV);
+        const char *secs = recomp_env(RENV_AUDIO_WAV_SECS);
         if (wav && *wav)
             apu_wav_open(wav, secs ? atof(secs) : 0.0);
     }
@@ -856,10 +862,10 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     g_state = d;
     d->ram_ptr = ram_ptr;
 
-    /* RECOMP_APU_SOLO=<voice>: mute every other voice in the mix, for
+    /* RECOMP_DEBUG=apu_solo=<voice>: mute every other voice in the mix, for
      * telling which voice a sound (or a noise) comes from. */
     {
-        const char *solo = getenv("RECOMP_APU_SOLO");
+        const char *solo = recomp_env(RENV_APU_SOLO);
         if (solo && *solo) {
             g_dbg_voice_monitor = atoi(solo);
             fprintf(stderr, "[APU] solo: only voice %d is mixed\n",

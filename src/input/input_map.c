@@ -4,6 +4,7 @@
  * alone on every host.
  */
 #include "input_map.h"
+#include "recomp_env.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -46,7 +47,7 @@ static int g_deadzone = -1;          /* -1: not read yet */
 int xbox_InputDeadzone(void)
 {
     if (g_deadzone < 0) {
-        const char *v = getenv("RECOMP_PAD_DEADZONE");
+        const char *v = recomp_env(RENV_PAD_DEADZONE);
         long n = (v && *v) ? strtol(v, NULL, 10) : 0;
         g_deadzone = n < 0 ? 0 : n > 32767 ? 32767 : (int)n;
     }

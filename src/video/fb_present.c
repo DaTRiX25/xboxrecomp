@@ -15,6 +15,7 @@
  * Off unless RECOMP_FB_WINDOW is set.
  */
 #include <stdint.h>
+#include "recomp_env.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -48,7 +49,7 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
      * whichever surface is being drawn into. A black window cannot distinguish
      * "the read path is broken" from "the title rendered black", and pointing
      * it at memory known to have content settles that. */
-    const char *pin = getenv("RECOMP_FB_VA");
+    const char *pin = recomp_env(RENV_FB_VA);
 
     s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
     if (pitch)
@@ -64,7 +65,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 
     if (!s_fb_running || !fb_va || !pitch)
         return;
-    if (getenv("RECOMP_FB_VA"))
+    if (recomp_env(RENV_FB_VA))
         return;                       /* pinned: leave the old path alone */
     next = (s_present_idx == 0) ? 1 : 0;
     if (!s_present[next]) {
@@ -138,7 +139,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          * one time in ten. That ambiguity is expensive when the only way
          * to test is to ask someone to press a key and describe what
          * happened. This answers "did it arrive" on its own. */
-        if (getenv("RECOMP_KEY_TRACE")) {
+        if (recomp_env(RENV_KEY_TRACE)) {
             static unsigned n;
             if (n++ < 40) {
                 fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)w);
@@ -334,8 +335,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              * double buffering those are different buffers, and measuring
              * progress from the executor's dump reports a blank screen while
              * the window is showing the title's logo. Ask the window. */
-            const char *dump = getenv("RECOMP_FB_DUMP");
-            const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
+            const char *dump = recomp_env(RENV_FB_DUMP);
+            const char *every = recomp_env(RENV_FB_WINDOW_DUMP_EVERY);
             static int frames;
             int period = every ? atoi(every) : 0;
             frames++;
@@ -361,7 +362,7 @@ void xbox_FramebufferWindowStart(void)
 {
     HANDLE th;
 
-    if (!getenv("RECOMP_FB_WINDOW"))
+    if (!recomp_env(RENV_FB_WINDOW))
         return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;

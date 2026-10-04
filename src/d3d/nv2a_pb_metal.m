@@ -56,6 +56,7 @@
 #import <Metal/Metal.h>
 
 #include <stddef.h>
+#include "recomp_env.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -772,7 +773,7 @@ static int no_mips(void)
 {
     static int off = -1;
     if (off < 0)
-        off = getenv("RECOMP_METAL_NO_MIPS") != NULL;
+        off = recomp_env(RENV_METAL_NO_MIPS) != NULL;
     return off;
 }
 
@@ -945,7 +946,7 @@ static id<MTLSamplerState> sampler(const Stage *t)
     uint64_t key;
 
     if (point < 0)
-        point = getenv("RECOMP_METAL_POINT") != NULL;
+        point = recomp_env(RENV_METAL_POINT) != NULL;
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
@@ -1240,7 +1241,7 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
     int i;
 
     if (off < 0)
-        off = getenv("RECOMP_METAL_NO_RTT") != NULL;
+        off = recomp_env(RENV_METAL_NO_RTT) != NULL;
     if (off || !t->offset || d3d8_format_dxt_block_bytes(t->color)
             || nv2a_tex_texel_bytes(nv2a_tex_linear_twin(t->color)) != 4)
         return NULL;
@@ -1598,7 +1599,7 @@ static uint64_t          s_occ_ovf;
 static int occ_mode(void)
 {
     if (s_occ_mode < 0) {
-        const char *e = getenv("RECOMP_METAL_OCC");
+        const char *e = recomp_env(RENV_METAL_OCC);
         s_occ_mode = !e ? 0 : !strcasecmp(e, "sync") ? 1 : !strcasecmp(e, "fixed") ? 2 : 0;
     }
     return s_occ_mode;
@@ -1831,7 +1832,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
     static uint64_t p_draws, p_prog, p_skip, p_cull, p_clears, p_tex, p_up,
                     p_chg, p_re, p_fl, p_occ, p_vis, p_late, p_super, p_sync, p_ovf;
     if (on < 0)
-        on = getenv("RECOMP_FLIP_LOG") != NULL;
+        on = recomp_env(RENV_FLIP_LOG) != NULL;
     if (!on)
         return;
     fprintf(stderr, "[METAL] flip %llu batches %llu prog %llu skipped %llu"
@@ -1972,7 +1973,7 @@ const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)
  * executor's first method, on the ack thread. */
 void nv2a_pb_metal_register_from_env(void)
 {
-    const char *b = getenv("RECOMP_PB_BACKEND");
+    const char *b = recomp_env(RENV_PB_BACKEND);
     if (b && !strcasecmp(b, "metal")) {
         const struct nv2a_pb_backend *mb = nv2a_pb_metal_backend();
         if (s_failed) {

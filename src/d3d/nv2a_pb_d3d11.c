@@ -29,6 +29,7 @@
 
 #define COBJMACROS
 #include <windows.h>
+#include "recomp_env.h"
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
@@ -76,7 +77,7 @@ static int s_memo = -1;
 static int memo_on(void)
 {
     if (s_memo < 0) {
-        const char *e = getenv("RECOMP_D3D11_MEMO");
+        const char *e = recomp_env(RENV_D3D11_MEMO);
         s_memo = !(e && *e == '0');
     }
     return s_memo;
@@ -246,7 +247,7 @@ static int compile(const char *what, const char *src, const char *target,
         fprintf(stderr, LOGP "compile %s failed hr=0x%08lX\n%s\n", what,
                 (unsigned long)hr,
                 err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "");
-        if (getenv("RECOMP_D3D11_VERBOSE"))
+        if (recomp_env(RENV_D3D11_VERBOSE))
             fprintf(stderr, "--- source ---\n%s\n--- end ---\n", src);
         if (err) ID3D10Blob_Release(err);
         return 0;
@@ -970,9 +971,9 @@ static ID3D11RasterizerState *rasterizer_state(int *all)
 
     static int flip = -1;
     if (off < 0)
-        off = getenv("RECOMP_D3D11_NO_CULL") != NULL;  /* A/B: cull nothing */
+        off = recomp_env(RENV_D3D11_NO_CULL) != NULL;  /* A/B: cull nothing */
     if (flip < 0)
-        flip = getenv("RECOMP_D3D11_CULL_FLIP") != NULL;  /* A/B: other winding */
+        flip = recomp_env(RENV_D3D11_CULL_FLIP) != NULL;  /* A/B: other winding */
     f ^= flip;
     *all = 0;
     if (v->cull_enable && !off) {
@@ -1161,7 +1162,7 @@ static int no_mips(void)
 {
     static int off = -1;
     if (off < 0)
-        off = getenv("RECOMP_D3D11_NO_MIPS") != NULL;
+        off = recomp_env(RENV_D3D11_NO_MIPS) != NULL;
     return off;
 }
 
@@ -1387,8 +1388,8 @@ static D3D11_TEXTURE_ADDRESS_MODE address_mode(uint32_t m)
  * 3/4 nearest/linear within the nearest level, 5/6 nearest/linear blended
  * between two levels, 7 convolution on level 0 (taken as linear). MAG: 1
  * nearest, 2 linear, 4 convolution (linear). The LOD range is CONTROL0's
- * clamps, as xemu's sampler: 0..0 when MIN does not mipmap. RECOMP_D3D11_POINT=1
- * forces nearest texels (the CPU path with RECOMP_PB_BILINEAR=0) for every
+ * clamps, as xemu's sampler: 0..0 when MIN does not mipmap. RECOMP_DEBUG=d3d11_point
+ * forces nearest texels (the CPU path with RECOMP_DEBUG=pb_bilinear=0) for every
  * stage. */
 #define filter_linear nv2a_tex_filter_linear   /* nv2a_backend_common.h */
 #define filter_mip    nv2a_tex_filter_mip
@@ -1410,7 +1411,7 @@ static ID3D11SamplerState *sampler(const Stage *t)
     ID3D11SamplerState *st = NULL;
 
     if (point < 0)
-        point = getenv("RECOMP_D3D11_POINT") != NULL;
+        point = recomp_env(RENV_D3D11_POINT) != NULL;
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
@@ -1584,7 +1585,7 @@ static ID3D11PixelShader *combiner_ps(const NV2ACombinerState *st)
                    ID3D10Blob_GetBufferSize(code), NULL, &e->ps)))
         e->bad = 1;
     ID3D10Blob_Release(code);
-    if (getenv("RECOMP_D3D11_VERBOSE"))
+    if (recomp_env(RENV_D3D11_VERBOSE))
         fprintf(stderr, LOGP "combiner shader %08X: %d stages\n%s\n",
                 (unsigned)h, st->num_stages, src);
     return e->bad ? NULL : e->ps;
@@ -1650,7 +1651,7 @@ static RenderTarget *rt_texture(const Stage *t)
     int i;
 
     if (off < 0)
-        off = getenv("RECOMP_D3D11_NO_RTT") != NULL;   /* A/B: decode memory */
+        off = recomp_env(RENV_D3D11_NO_RTT) != NULL;   /* A/B: decode memory */
     if (off)
         return NULL;
     if (!t->offset || d3d8_format_dxt_block_bytes(t->color)
@@ -1701,7 +1702,7 @@ static ID3D11PixelShader *debug_ps(void)
     if (tried)
         return ps;
     tried = 1;
-    w = getenv("RECOMP_D3D11_DEBUG_PS");
+    w = recomp_env(RENV_D3D11_DEBUG_PS);
     if (!w || !*w)
         return NULL;
     if (!strcmp(w, "d0"))
@@ -1728,7 +1729,7 @@ static ID3D11PixelShader *debug_ps(void)
                                        ID3D10Blob_GetBufferSize(code), NULL, &ps);
         ID3D10Blob_Release(code);
     }
-    fprintf(stderr, LOGP "RECOMP_D3D11_DEBUG_PS=%s: every batch draws %s%s\n",
+    fprintf(stderr, LOGP "d3d11_debug_ps=%s: every batch draws %s%s\n",
             w, expr, ps ? "" : " (FAILED to build)");
     return ps;
 }
@@ -1866,50 +1867,15 @@ static ID3D11PixelShader *setup_pixel(void)
 }
 
 
-/* ---- batch trace (RECOMP_WHITE_TRACE) ---------------------------------------
+/* ---- batch trace ------------------------------------------------------------
  *
- * The D3D11 side of the CPU path's [WHITE] trace, selected the same way:
- * RECOMP_WHITE_TRACE=N traces the first N program batches of at least
- * RECOMP_WHITE_MIN vertices (default 300), or with RECOMP_WHITE_TEXOFF=<hex>
- * the first N with a texture at that address (low 27 bits). For each one:
+ * The full state of one batch, for the pixel trace below (RECOMP_TRACE=px):
  * the state, every stage and where its SRV came from, the input layout, the
  * vertex program's outputs for the first three vertices twice -- from the CPU
  * interpreter on the same inputs, and read back from the GPU through stream
  * output -- the generated HLSL (once per program/combiner), and the colour
- * of the first triangle's centroid before and after the draw. Lines start
- * "[D3D11-WHITE]". */
-
-static int trace_pick(const struct nv2a_pb_draw *d)
-{
-    static int left = -1, min_n, by_tex;
-    static uint32_t texoff;
-    int n;
-
-    if (left < 0) {
-        const char *e = getenv("RECOMP_WHITE_TRACE"), *m = getenv("RECOMP_WHITE_MIN");
-        const char *to = getenv("RECOMP_WHITE_TEXOFF");
-        left = e ? atoi(e) : 0;
-        min_n = m ? atoi(m) : 300;
-        if (to) {
-            by_tex = 1;
-            texoff = (uint32_t)strtoul(to, NULL, 16);
-        }
-    }
-    if (left <= 0 || !d->program)
-        return 0;
-    if (by_tex) {
-        int hit = 0;
-        for (n = 0; n < 4; n++)
-            if (s_stage[n].offset && ((s_stage[n].offset ^ texoff) & 0x07FFFFFFu) == 0)
-                hit = 1;
-        if (!hit)
-            return 0;
-    } else if (d->idx_count < (uint32_t)min_n) {
-        return 0;
-    }
-    left--;
-    return 1;
-}
+ * of the first triangle's centroid before the draw. Lines start
+ * "[D3D11-WHITE]", after the investigation it was written for. */
 
 static uint32_t read_pixel(RenderTarget *rt, int x, int y)
 {
@@ -2070,7 +2036,7 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
             v->c[58][0], v->c[58][1], v->c[58][2], v->c[58][3],
             v->c[59][0], v->c[59][1], v->c[59][2], v->c[59][3]);
     {   /* RECOMP_D3D11_PX_CONSTS=a-b,c,...: those vertex constants too */
-        const char *e = getenv("RECOMP_D3D11_PX_CONSTS");
+        const char *e = recomp_env(RENV_D3D11_PX_CONSTS);
         while (e && *e) {
             char *end;
             long lo = strtol(e, &end, 10), hi = lo, c;
@@ -2090,7 +2056,7 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
          * vertex's screen position, for working a draw out by hand */
         static int all = -1;
         if (all < 0)
-            all = getenv("RECOMP_D3D11_PX_VERTS") != NULL;
+            all = recomp_env(RENV_D3D11_PX_VERTS) != NULL;
         for (k = 0; all && k < 16; k++)
             fprintf(stderr, "[D3D11-P] %d %08X %08X %08X %08X\n", k,
                     v->prog[v->start + k][0], v->prog[v->start + k][1],
@@ -2214,8 +2180,8 @@ static uint64_t s_px_f0, s_px_f1;
 static int px_on(void)
 {
     if (s_px_n < 0) {
-        const char *e = getenv("RECOMP_D3D11_PX"), *f = getenv("RECOMP_D3D11_PX_FLIPS");
-        const char *m = getenv("RECOMP_D3D11_PX_MAX");
+        const char *e = recomp_env(RENV_D3D11_PX), *f = recomp_env(RENV_D3D11_PX_FLIPS);
+        const char *m = recomp_env(RENV_D3D11_PX_MAX);
         s_px_n = 0;
         while (e && *e && s_px_n < 4) {
             int x, y;
@@ -2235,7 +2201,7 @@ static int px_on(void)
         }
         s_px_max = m ? atoi(m) : 400;
         if (s_px_n)
-            fprintf(stderr, LOGP "RECOMP_D3D11_PX: %d pixel(s), flips %llu-%llu\n",
+            fprintf(stderr, LOGP "px: %d pixel(s), flips %llu-%llu\n",
                     s_px_n, (unsigned long long)s_px_f0,
                     (unsigned long long)s_px_f1);
     }
@@ -2287,7 +2253,7 @@ static ID3D11PixelShader *px_shader(int pass)
         ID3D10Blob_Release(code);
     }
     if (!ps[pass])
-        fprintf(stderr, LOGP "RECOMP_D3D11_PX: probe shader %d FAILED to build\n", pass);
+        fprintf(stderr, LOGP "px: probe shader %d FAILED to build\n", pass);
     return ps[pass];
 }
 
@@ -2677,7 +2643,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             static int skip_post = -1;
             ID3D11PixelShader *ps;
             if (skip_post < 0)
-                skip_post = getenv("RECOMP_D3D11_DEBUG_PS_SKIP_POST") != NULL;
+                skip_post = recomp_env(RENV_D3D11_DEBUG_PS_SKIP_POST) != NULL;
             s_dbg_post = skip_post && !v->depth_enable && d->idx_count <= 8;
             ps = setup_pixel();
             /* setup_pixel may have compiled (and evicted) a shader */
@@ -2693,13 +2659,6 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 before[n] = read_pixel(rt, s_px_x[n], s_px_y[n]);
             ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
             px_probe(d, vs, rt, fmts, strides, offs, topo, nidx, dsv, before);
-        } else if (trace_pick(d)) {
-            int px, py;
-            trace_batch(d, vs, rt, fmts, strides, offs, topo, &px, &py);
-            ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
-            if (px >= 0)
-                fprintf(stderr, "[D3D11-WHITE]  px (%d,%d) after %08X\n", px, py,
-                        read_pixel(rt, px, py));
         } else {
             ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
         }
@@ -2730,7 +2689,7 @@ static void dump_frame(void)
 
     if (!checked) {
         checked = 1;
-        prefix = getenv("RECOMP_D3D11_DUMP");
+        prefix = recomp_env(RENV_D3D11_DUMP);
     }
     if (!prefix || (s_presents % 60) != 1)
         return;
@@ -2809,7 +2768,7 @@ static void flip_log(uint32_t surface_offset)
                     p_re, p_vn, p_ve, p_skip, p_cull, p_self, p_mip,
                     p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super;
     if (on < 0)
-        on = getenv("RECOMP_FLIP_LOG") != NULL;
+        on = recomp_env(RENV_FLIP_LOG) != NULL;
     if (!on)
         return;
     fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu (self %llu)"
@@ -2942,7 +2901,7 @@ static int          s_occ_mode = -1;         /* 0 defer, 1 sync, 2 fixed */
 static int occ_mode(void)
 {
     if (s_occ_mode < 0) {
-        const char *e = getenv("RECOMP_D3D11_OCC");
+        const char *e = recomp_env(RENV_D3D11_OCC);
         s_occ_mode = !e ? 0 : !_stricmp(e, "sync") ? 1 : !_stricmp(e, "fixed") ? 2 : 0;
     }
     return s_occ_mode;
@@ -3069,7 +3028,7 @@ const struct nv2a_pb_backend *nv2a_pb_d3d11_backend(void)
  * executor's first method, on the ack thread. */
 void nv2a_pb_d3d11_register_from_env(void)
 {
-    const char *b = getenv("RECOMP_PB_BACKEND");
+    const char *b = recomp_env(RENV_PB_BACKEND);
     if (b && !_stricmp(b, "d3d11")) {
         nv2a_pb_set_backend(&s_d3d11_backend);
         fprintf(stderr, LOGP "RECOMP_PB_BACKEND=d3d11: executor draws through D3D11\n");

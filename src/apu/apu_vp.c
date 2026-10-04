@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "recomp_env.h"
 #include "fpconv.h"
 
 /* #define DEBUG_MCPX */
@@ -758,10 +759,10 @@ static FILE *s_vdump;
 static void vp_stat_init(void)
 {
     const char *e;
-    s_vstat_on = getenv("RECOMP_APU_TRACE") != NULL;
-    e = getenv("RECOMP_APU_VOICE_DUMP");
+    s_vstat_on = recomp_env_on(RENV_APU_TRACE);
+    e = recomp_env(RENV_APU_VOICE_DUMP);
     if (e && *e) {
-        const char *path = getenv("RECOMP_APU_VOICE_DUMP_FILE");
+        const char *path = recomp_env(RENV_APU_VOICE_DUMP_FILE);
         s_vdump_voice = atoi(e);
         s_vdump = fopen(path && *path ? path : "voice_dump.raw", "wb");
         fprintf(stderr, "[APU] voice dump: voice %d -> %s\n", s_vdump_voice,
@@ -1058,10 +1059,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
+ * Voice resampling (linear interpolation in place of libsamplerate)
  *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * libsamplerate is stubbed; voice_resample below interpolates linearly
+ * between source frames at the pitch's ratio, keeping its position and
+ * the last frame across calls in the voice's filter state.
  * ============================================================ */
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
@@ -1364,7 +1366,7 @@ static void vp_trace_positions(MCPXAPUState *d)
     static unsigned frames;
 
     if (trace < 0)
-        trace = getenv("RECOMP_APU_TRACE") != NULL;
+        trace = recomp_env(RENV_APU_TRACE) != NULL;
     if (!trace || ++frames % 60)
         return;
 

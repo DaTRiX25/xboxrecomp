@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "recomp_env.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,7 +196,7 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
      * whose old level is not the level the raise set is a calling-convention
      * bug upstream of here, not a title doing something exotic. */
     if (s_trace < 0)
-        s_trace = getenv("RECOMP_IRQL_TRACE") ? 1 : 0;
+        s_trace = recomp_env(RENV_IRQL_TRACE) ? 1 : 0;
     if (s_trace && InterlockedIncrement(&s_traced) <= 20) {
         fprintf(stderr, "  [IRQL] tid %lu %s %d->%d depth=%ld\n",
                 (unsigned long)GetCurrentThreadId(),

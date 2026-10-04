@@ -1,0 +1,245 @@
+/*
+ * recomp_env.h - every environment variable the runtime reads, in one table.
+ *
+ * Three tiers:
+ *
+ *   config  A small set of documented, user-facing knobs, each its own
+ *           variable: RECOMP_PB_BACKEND=d3d11, RECOMP_SAVE_DIR=..., ...
+ *   trace   Log and report toggles, one comma list:
+ *               RECOMP_TRACE=flip,tex=2,heap=0x80123000
+ *   debug   Debug hacks, A/B switches, experiments, dumps and watchpoints,
+ *           one comma list:
+ *               RECOMP_DEBUG=pb_fast=0,fb_dump=/tmp/f_,fb_dump_at=61,121
+ *
+ * A list entry is `key` (value "1") or `key=value`. A later entry for the
+ * same key wins. Values may contain commas: a fragment that does not start
+ * with a known key continues the value before it, so `fb_dump_at=61,121`
+ * and `peek_chain=0x1315A8,8,0x10,0` read as one value each.
+ * RECOMP_TRACE=help or RECOMP_DEBUG=help prints the table.
+ *
+ * The environment is read once (recomp_env_init, or lazily on the first
+ * lookup) and cached, so a lookup is an array load: safe in hot paths.
+ * Values keep getenv's meaning: NULL when unset, otherwise the string.
+ *
+ * Transition: every variable these replace still works through an alias,
+ * which prints one deprecation line naming the new spelling. See
+ * cat/docs/env.md for the table with meanings.
+ */
+#ifndef RECOMP_ENV_H
+#define RECOMP_ENV_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* A game adds its own keys, same row format, by defining
+ * RECOMP_ENV_HAVE_GAME_KEYS on the recomp_env target (PUBLIC, so every user
+ * agrees on the table) and putting a recomp_env_game.h on its include path
+ * that defines RECOMP_ENV_GAME_KEYS(X). Its rows come after the toolkit's, so
+ * the toolkit's ids are the same with or without them. A game key whose value
+ * may contain commas is named in RECOMP_ENV_GAME_COMMA_KEYS, a string list:
+ *   #define RECOMP_ENV_GAME_COMMA_KEYS "mem_dump",
+ * A game can also give a toolkit key a default, used when neither its new
+ * nor its old spelling is set, with RECOMP_ENV_GAME_DEFAULTS(D):
+ *   #define RECOMP_ENV_GAME_DEFAULTS(D) D(APU_DSP_ACK, "0x80A1C810")
+ */
+#ifdef RECOMP_ENV_HAVE_GAME_KEYS
+#include "recomp_env_game.h"
+#endif
+#ifndef RECOMP_ENV_GAME_KEYS
+#define RECOMP_ENV_GAME_KEYS(X)
+#endif
+
+/* X(ID, TIER, NAME, LEGACY, HELP)
+ *   CONFIG: NAME is the variable; LEGACY an older variable, or NULL.
+ *   TRACE / DEBUG: NAME is the key in RECOMP_TRACE / RECOMP_DEBUG; LEGACY
+ *   the variable it replaces (an alias for the transition window). */
+#define RECOMP_ENV_KEYS(X) \
+    /* ── config ─────────────────────────────────────────────────────── */ \
+    X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "pushbuffer executor (draws frames); default on, 0: off") \
+    X(PB_BACKEND,        CONFIG, "RECOMP_PB_BACKEND",        NULL, "executor backend: cpu (default), metal, d3d11, null") \
+    X(HEADLESS,          CONFIG, "RECOMP_HEADLESS",          NULL, "1: no window (SDL host)") \
+    X(WINDOW_SCALE,      CONFIG, "RECOMP_WINDOW_SCALE",      NULL, "window scale factor (SDL host, default 2)") \
+    X(PRESENT_VSYNC,     CONFIG, "RECOMP_PRESENT_VSYNC",     NULL, "0: present without vsync (SDL host, default on)") \
+    X(WINDOW_QUIT_AFTER, CONFIG, "RECOMP_WINDOW_QUIT_AFTER", NULL, "close the window after this many seconds") \
+    X(FB_WINDOW,         CONFIG, "RECOMP_FB_WINDOW",         NULL, "Windows: show the framebuffer window") \
+    X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA") \
+    X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
+    X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt") \
+    X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
+    X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0)") \
+    X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
+    X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
+    X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \
+    X(AUDIO_BUF_COUNT,   CONFIG, "RECOMP_AUDIO_BUF_COUNT",   NULL, "audio output buffer count") \
+    X(CMDLINE,           CONFIG, "RECOMP_CMDLINE",           NULL, "launch-data command line handed to the title") \
+    X(FMV_HOST,          CONFIG, "RECOMP_FMV_HOST",          NULL, "play the title's movies through the host player") \
+    X(RASTER_THREADS,    CONFIG, "RECOMP_RASTER_THREADS",    NULL, "CPU raster threads, 1..16 (default: cores - 4)") \
+    /* ── trace: RECOMP_TRACE=key[=value],... ─────────────────────────── */ \
+    X(FLIP_LOG,          TRACE, "flip",            "RECOMP_FLIP_LOG",          "one line per flip (golden.py reads it)") \
+    X(PRESENT_TRACE,     TRACE, "present",         "RECOMP_PRESENT_TRACE",     "present-surface choices") \
+    X(PRESENT_STATS,     TRACE, "present_stats",   "RECOMP_PRESENT_STATS",     "SDL host present statistics") \
+    X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \
+    X(VSH_ZLOG,          TRACE, "zlog",            "RECOMP_VSH_ZLOG",          "depth clears and z-buffer use") \
+    X(TEX_LOG,           TRACE, "tex",             "RECOMP_TEX_LOG",           "texture format survey; =2 also every texture") \
+    X(TEX_STATE,         TRACE, "tex_state",       "RECOMP_TEX_STATE",         "texture-state methods seen, in the report") \
+    X(CLIP_TRACE,        TRACE, "clip",            "RECOMP_CLIP_TRACE",        "near-plane clipping, per triangle") \
+    X(ZPASS_TRACE,       TRACE, "zpass",           "RECOMP_ZPASS_TRACE",       "occlusion report writes") \
+    X(PB_EXEC_VERBOSE,   TRACE, "pb_verbose",      "RECOMP_PB_EXEC_VERBOSE",   "executor bring-up detail") \
+    X(SURF_TRACE,        TRACE, "surf",            "RECOMP_SURF_TRACE",        "=offset: surface methods from that colour offset") \
+    X(PB_SEMA_TRACE,     TRACE, "sema",            "RECOMP_PB_SEMA_TRACE",     "every semaphore release") \
+    X(PB_UNHANDLED_ALL,  TRACE, "unhandled_all",   "RECOMP_PB_UNHANDLED_ALL",  "list every unhandled method, not ten") \
+    X(PB_SCAN,           TRACE, "pb_scan",         "RECOMP_PB_SCAN",           "pushbuffer survey and its report") \
+    X(NV2A_TRACE,        TRACE, "nv2a",            "RECOMP_NV2A_TRACE",        "NV2A register poll") \
+    X(PB_WRAP_TRACE,     TRACE, "pb_wrap",         "RECOMP_PB_WRAP_TRACE",     "pushbuffer wraps") \
+    X(HEAP_TRACE,        TRACE, "heap",            "RECOMP_HEAP_TRACE",        "=va: heap blocks covering that address") \
+    X(KERNEL_LOG_BUDGET, TRACE, "kernel_budget",   "RECOMP_KERNEL_LOG_BUDGET", "=n: kernel log lines per call site (200)") \
+    X(TRACE_BUDGET,      TRACE, "call_budget",     "RECOMP_TRACE_BUDGET",      "=n: call-trace line budget (400000)") \
+    X(TRACE_ARGS,        TRACE, "call_args",       "RECOMP_TRACE_ARGS",        "=n: call trace prints n stack args") \
+    X(TRACE_DEREF,       TRACE, "call_deref",      "RECOMP_TRACE_DEREF",       "call trace follows pointer args") \
+    X(TRACE_PROFILE,     TRACE, "call_profile",    "RECOMP_TRACE_PROFILE",     "call profile; =n report interval") \
+    X(IRQL_TRACE,        TRACE, "irql",            "RECOMP_IRQL_TRACE",        "first IRQL transitions") \
+    X(APU_TRACE,         TRACE, "apu",             "RECOMP_APU_TRACE",         "APU register and frame trace; [APU-IRQ] line every 5 s") \
+    X(USB_TRACE,         TRACE, "usb",             "RECOMP_USB_TRACE",         "OHCI trace") \
+    X(USB_STATS,         TRACE, "usb_stats",       "RECOMP_USB_STATS",         "OHCI summary line every 5 s") \
+    X(INPUT_DIAG,        TRACE, "input_diag",      "RECOMP_INPUT_DIAG",        "input chain probe once a second") \
+    X(KEY_TRACE,         TRACE, "key",             "RECOMP_KEY_TRACE",         "window key-down events") \
+    X(CS_TRACE_CRT,      TRACE, "cs_crt",          "RECOMP_CS_TRACE_CRT",      "CRT critical sections; =all every one") \
+    X(CS_WATCH,          TRACE, "cs_watch",        "RECOMP_CS_WATCH",          "=va: critical section at that address") \
+    X(KERNEL_WATCH,      TRACE, "kernel_watch",    "RECOMP_KERNEL_WATCH",      "=va: report bridges that change it") \
+    X(KERNEL_WATCH_ALL,  TRACE, "kernel_watch_all","RECOMP_KERNEL_WATCH_ALL",  "kernel_watch: every new value") \
+    X(PEEK,              TRACE, "peek",            "RECOMP_PEEK",              "=va[:n],...: print guest memory at reports") \
+    X(PEEK_CHAIN,        TRACE, "peek_chain",      "RECOMP_PEEK_CHAIN",        "=va,off,...: follow a pointer chain") \
+    X(FIND_NAN,          TRACE, "find_nan",        "RECOMP_FIND_NAN",          "scan for NaN matrices at reports") \
+    X(FIND_QUAD,         TRACE, "find_quad",       "RECOMP_FIND_QUAD",         "scan for quad vertices once") \
+    X(D3D11_VERBOSE,     TRACE, "d3d11_verbose",   "RECOMP_D3D11_VERBOSE",     "D3D11 shader sources") \
+    X(D3D11_PX,          TRACE, "px",              "RECOMP_D3D11_PX",          "=x,y[;x,y]: D3D11 draws touching a pixel") \
+    X(D3D11_PX_FLIPS,    TRACE, "px_flips",        "RECOMP_D3D11_PX_FLIPS",    "=a[-b]: px only in those flips") \
+    X(D3D11_PX_MAX,      TRACE, "px_max",          "RECOMP_D3D11_PX_MAX",      "=n: px line limit (400)") \
+    X(D3D11_PX_CONSTS,   TRACE, "px_consts",       "RECOMP_D3D11_PX_CONSTS",   "=a-b,c: px also prints these constants") \
+    X(D3D11_PX_VERTS,    TRACE, "px_verts",        "RECOMP_D3D11_PX_VERTS",    "px also prints program and vertices") \
+    X(STUB_LOG,          TRACE, "stub",            "RECOMP_STUB_LOG",          "name each unresolved stub reached") \
+    /* ── debug: RECOMP_DEBUG=key[=value],... ─────────────────────────── */ \
+    X(PB_VSH,            DEBUG, "pb_vsh",          "RECOMP_PB_VSH",            "=0: no vertex-program interpreter") \
+    X(PB_RC,             DEBUG, "pb_rc",           "RECOMP_PB_RC",             "=0: no register combiners (MODULATE)") \
+    X(PB_FAST,           DEBUG, "pb_fast",         "RECOMP_PB_FAST",           "=0: CPU raster without fast paths") \
+    X(PB_FAST_AB,        DEBUG, "pb_fast_ab",      "RECOMP_PB_FAST_AB",        "compare fast and slow raster per batch") \
+    X(PB_BILINEAR,       DEBUG, "pb_bilinear",     "RECOMP_PB_BILINEAR",       "=0: CPU raster samples nearest, whatever the filter") \
+    X(PB_CLIP,           DEBUG, "pb_clip",         "RECOMP_PB_CLIP",           "=0: no near-plane clipping") \
+    X(PB_CULL_FLIP,      DEBUG, "pb_cull_flip",    "RECOMP_PB_CULL_FLIP",      "CPU raster culls the other winding") \
+    X(PB_VSH_AB,         DEBUG, "pb_vsh_ab",       "RECOMP_PB_VSH_AB",         "compare vertex-program paths per batch") \
+    X(PB_VSH_AB_DUMP,    DEBUG, "pb_vsh_ab_dump",  "RECOMP_PB_VSH_AB_DUMP",    "=prefix: pb_vsh_ab differing batches") \
+    X(RASTER_TEST,       DEBUG, "raster_test",     "RECOMP_RASTER_TEST",       "draw a known triangle on every clear") \
+    X(ZPASS_FIXED,       DEBUG, "zpass_fixed",     "RECOMP_ZPASS_FIXED",       "=n: every occlusion report reads n") \
+    X(PB_NULL_DRAW_US,   DEBUG, "null_draw_us",    "RECOMP_PB_NULL_DRAW_US",   "=us: null backend cost per draw") \
+    X(PB_INJECT_STOP,    DEBUG, "pb_inject_stop",  "RECOMP_PB_INJECT_STOP",    "=n: stop every nth walk (test hook)") \
+    X(FAST_KICK,         DEBUG, "fast_kick",       "RECOMP_FAST_KICK",         "=0: ack loop ticks at Sleep(1)") \
+    X(FORCE_RETURN,      DEBUG, "force_return",    "RECOMP_FORCE_RETURN",      "honour forced returns in the build") \
+    X(TRAP_NULL,         DEBUG, "trap_null",       "RECOMP_TRAP_NULL",         "guest page zero faults") \
+    X(DSP_ACK,           DEBUG, "dsp_ack",         "RECOMP_DSP_ACK",           "=va,...: zero these words (no APU)") \
+    X(APU_DSP_ACK,       DEBUG, "apu_dsp_ack",     "RECOMP_APU_DSP_ACK",       "=va,...: APU DSP acks these words") \
+    X(APU_SOLO,          DEBUG, "apu_solo",        "RECOMP_APU_SOLO",          "=voice: mix only this APU voice") \
+    X(APU_VOICE_DUMP,    DEBUG, "apu_voice_dump",  "RECOMP_APU_VOICE_DUMP",    "=voice: raw samples of one APU voice to a file") \
+    X(APU_VOICE_DUMP_FILE, DEBUG, "apu_voice_dump_file", "RECOMP_APU_VOICE_DUMP_FILE", "=path: apu_voice_dump output, default voice_dump.raw") \
+    X(APU_MIXDOWN_ALL,   DEBUG, "apu_mixdown_all", "RECOMP_APU_MIXDOWN_ALL",   "=0: mix only two bins") \
+    X(POKE,              DEBUG, "poke",            "RECOMP_POKE",              "=va:value,...: write guest words") \
+    X(WORKERS,           DEBUG, "workers",         "RECOMP_WORKERS",           "=inline: run worker threads inline") \
+    X(CS_MODE,           DEBUG, "cs_mode",         "RECOMP_CS_MODE",           "=single: one lock for every guest lock") \
+    X(ASYNC_IO,          DEBUG, "async_io",        "RECOMP_ASYNC_IO",          "asynchronous file I/O") \
+    X(UNIMPL_TRAP,       DEBUG, "unimpl_trap",     "RECOMP_UNIMPL_TRAP",       "stop at an unimplemented instruction") \
+    X(D3D11_MEMO,        DEBUG, "d3d11_memo",      "RECOMP_D3D11_MEMO",        "=0: no D3D11 state memo") \
+    X(D3D11_NO_CULL,     DEBUG, "d3d11_no_cull",   "RECOMP_D3D11_NO_CULL",     "D3D11 culls nothing") \
+    X(D3D11_CULL_FLIP,   DEBUG, "d3d11_cull_flip", "RECOMP_D3D11_CULL_FLIP",   "D3D11 culls the other winding") \
+    X(D3D11_NO_MIPS,     DEBUG, "d3d11_no_mips",   "RECOMP_D3D11_NO_MIPS",     "D3D11 uploads level 0 only") \
+    X(D3D11_POINT,       DEBUG, "d3d11_point",     "RECOMP_D3D11_POINT",       "D3D11 point sampling") \
+    X(D3D11_NO_RTT,      DEBUG, "d3d11_no_rtt",    "RECOMP_D3D11_NO_RTT",      "D3D11 decodes render targets from memory") \
+    X(D3D11_DEBUG_PS,    DEBUG, "d3d11_debug_ps",  "RECOMP_D3D11_DEBUG_PS",    "=name: replace pixel shaders") \
+    X(D3D11_DEBUG_PS_SKIP_POST, DEBUG, "d3d11_debug_ps_skip_post", "RECOMP_D3D11_DEBUG_PS_SKIP_POST", "debug_ps spares post passes") \
+    X(D3D11_OCC,         DEBUG, "d3d11_occ",       "RECOMP_D3D11_OCC",         "=sync|fixed: D3D11 occlusion mode") \
+    X(METAL_NO_MIPS,     DEBUG, "metal_no_mips",   "RECOMP_METAL_NO_MIPS",     "Metal uploads level 0 only") \
+    X(METAL_POINT,       DEBUG, "metal_point",     "RECOMP_METAL_POINT",       "Metal point sampling") \
+    X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory") \
+    X(METAL_OCC,         DEBUG, "metal_occ",       "RECOMP_METAL_OCC",         "=sync|fixed: Metal occlusion mode") \
+    X(FB_VA,             DEBUG, "fb_va",           "RECOMP_FB_VA",             "=va: framebuffer window shows that address") \
+    X(USB,               DEBUG, "ohci",            "RECOMP_USB",               "emulated OHCI/XID USB (unused path)") \
+    X(USB_PORT,          DEBUG, "usb_port",        "RECOMP_USB_PORT",          "=n: USB pad port") \
+    X(USB_HC,            DEBUG, "usb_hc",          "RECOMP_USB_HC",            "=1: pad on the second controller") \
+    X(USB_NDP,           DEBUG, "usb_ndp",         "RECOMP_USB_NDP",           "=n: root-hub ports, 1..4") \
+    X(PAD_PRESS,         DEBUG, "pad_press",       "RECOMP_PAD_PRESS",         "=mask: pulse these buttons (USB pad)") \
+    X(FB_DUMP,           DEBUG, "fb_dump",         "RECOMP_FB_DUMP",           "=prefix: frame dumps (CPU/Metal, window)") \
+    X(FB_DUMP_AT,        DEBUG, "fb_dump_at",      "RECOMP_FB_DUMP_AT",        "=flips: fb_dump at these flips") \
+    X(FB_DUMP_FLIPS,     DEBUG, "fb_dump_flips",   "RECOMP_FB_DUMP_FLIPS",     "=n: fb_dump every nth flip") \
+    X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \
+    X(WINDOW_SHOT,       DEBUG, "window_shot",     "RECOMP_WINDOW_SHOT",       "=flips: SDL window shots") \
+    X(WINDOW_SHOT_PREFIX, DEBUG, "window_shot_prefix", "RECOMP_WINDOW_SHOT_PREFIX", "=prefix: window shot files") \
+    X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=prefix: textures, first use") \
+    X(TEX_DUMP_EVERY,    DEBUG, "tex_dump_every",  "RECOMP_TEX_DUMP_EVERY",    "=n: tex_dump every nth bind too") \
+    X(VSH_DUMP,          DEBUG, "vsh_dump",        "RECOMP_VSH_DUMP",          "=prefix: vertex programs, raw") \
+    X(D3D11_DUMP,        DEBUG, "d3d11_dump",      "RECOMP_D3D11_DUMP",        "=prefix: D3D11 present 60k+1 (golden)") \
+    X(FMV_DUMP,          DEBUG, "fmv_dump",        "RECOMP_FMV_DUMP",          "=prefix: two movie frames") \
+    X(AUDIO_WAV,         DEBUG, "audio_wav",       "RECOMP_AUDIO_WAV",         "=path: WAV of the audio output") \
+    X(AUDIO_WAV_SECS,    DEBUG, "audio_wav_secs",  "RECOMP_AUDIO_WAV_SECS",    "=s: audio_wav length cap") \
+    X(WATCH,             DEBUG, "watch",           "RECOMP_WATCH",             "=spec: write watchpoint on a guest address") \
+    X(WATCH_RAW,         DEBUG, "watch_raw",       "RECOMP_WATCH_RAW",         "watch also prints the raw frame") \
+    X(WATCH_DEPTH,       DEBUG, "watch_depth",     "RECOMP_WATCH_DEPTH",       "=n: watch stack depth (14)") \
+    X(WATCH_LEN,         DEBUG, "watch_len",       "RECOMP_WATCH_LEN",         "=bytes: watch range") \
+    X(WATCHDOG_SECS,     DEBUG, "watchdog",        "RECOMP_WATCHDOG_SECS",     "=s: dump and exit after s seconds") \
+    /* ── the game's own keys (RECOMP_ENV_GAME_KEYS, below) ──────────────── */ \
+    RECOMP_ENV_GAME_KEYS(X)
+
+typedef enum {
+#define RECOMP_ENV_ENUM_(id, tier, name, legacy, help) RENV_##id,
+    RECOMP_ENV_KEYS(RECOMP_ENV_ENUM_)
+#undef RECOMP_ENV_ENUM_
+    RENV_COUNT
+} recomp_env_id;
+
+/* Read the environment into the cache. Idempotent; the first lookup calls
+ * it. Call it first thing in main so deprecation lines come out early. */
+void recomp_env_init(void);
+/* Print the reader's notes (deprecated names, unknown keys, help), held
+ * since init. A host calls it once stderr is where it should be (after the
+ * RECOMP_STDIO_LOG redirect); otherwise they are printed at exit. */
+void recomp_env_flush_notes(void);
+
+/* Tests that setenv() a variable after the first lookup re-read with this. */
+void recomp_env_reload(void);
+
+/* Override a value from code (NULL clears it). Takes a copy. */
+void recomp_env_set(recomp_env_id id, const char *value);
+
+extern const char *recomp_env_value_[RENV_COUNT];
+extern volatile int recomp_env_ready_;
+
+/* The value, or NULL when unset: what getenv(old name) returned. */
+static inline const char *recomp_env(recomp_env_id id)
+{
+#if defined(_MSC_VER)
+    if (!recomp_env_ready_)   /* volatile: acquire under MSVC's default /volatile:ms */
+#else
+    if (!__atomic_load_n(&recomp_env_ready_, __ATOMIC_ACQUIRE))
+#endif
+        recomp_env_init();
+    return recomp_env_value_[id];
+}
+
+/* Set, non-empty and not starting with '0'. */
+static inline int recomp_env_on(recomp_env_id id)
+{
+    const char *v = recomp_env(id);
+    return v && *v && *v != '0';
+}
+
+/* atoi / strtoul(,0) / atof of the value, or `def` when unset. */
+long recomp_env_int(recomp_env_id id, long def);
+unsigned long recomp_env_ulong(recomp_env_id id, unsigned long def);
+double recomp_env_double(recomp_env_id id, double def);
+
+/* The variable or list key, for messages. */
+const char *recomp_env_name(recomp_env_id id);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* RECOMP_ENV_H */

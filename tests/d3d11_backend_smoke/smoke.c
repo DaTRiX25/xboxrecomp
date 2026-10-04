@@ -17,6 +17,7 @@
  *   RECOMP_D3D11_DUMP=<prefix>   presented frames 1, 61, ... as BMPs
  */
 #include <windows.h>
+#include "recomp_env.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,7 +167,7 @@ static int make_texture(void)
 
 int main(int argc, char **argv)
 {
-    const char *log = getenv("RECOMP_STDIO_LOG");
+    const char *log = recomp_env(RENV_STDIO_LOG);
     int frames = argc > 1 ? atoi(argv[1]) : 180;
     uint32_t buf[2] = {0x01000000u, 0x0112C000u};
     int f, a;
@@ -174,8 +175,8 @@ int main(int argc, char **argv)
     if (log)
         freopen(log, "w", stderr);
     setvbuf(stderr, NULL, _IONBF, 0);
-    if (!getenv("RECOMP_PB_BACKEND"))
-        _putenv("RECOMP_PB_BACKEND=d3d11");
+    if (!recomp_env(RENV_PB_BACKEND))
+        recomp_env_set(RENV_PB_BACKEND, "d3d11");
     fprintf(stderr, "[backend-smoke] %d frames\n", frames);
     int have_reports = 0;
     {
@@ -523,8 +524,8 @@ int main(int argc, char **argv)
         }
         /* A vertex-program batch: mov oPos, v0; mov oD0, v3; mov oT0, v9,
          * hand-encoded, with the checker texture. It draws the same as a
-         * pass-through quad would, and gives RECOMP_WHITE_TRACE a program
-         * batch to trace (stream output and the CPU interpreter must agree). */
+         * pass-through quad would (stream output and the CPU interpreter
+         * must agree). */
         {
             static const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
             static const uint32_t outs[3][2] = {{0, 0}, {3, 3}, {9, 9}}; /* {o, v} */
@@ -645,7 +646,7 @@ int main(int argc, char **argv)
         }
     }
     if (have_reports) {
-        const char *occ = getenv("RECOMP_D3D11_OCC");
+        const char *occ = recomp_env(RENV_D3D11_OCC);
         int deferred = !occ || (_stricmp(occ, "sync") && _stricmp(occ, "fixed"));
         fprintf(stderr, "[backend-smoke] visibility over %d frames and the last:"
                 " %d wrong, %d lost; cross-frame reuse live in %d of %d, vacuous"

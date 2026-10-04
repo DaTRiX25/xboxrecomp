@@ -21,6 +21,7 @@
  * RECOMP_STDIO_LOG if set. */
 #define COBJMACROS
 #include <windows.h>
+#include "recomp_env.h"
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
@@ -276,7 +277,7 @@ static void compile_combiner(void)
 
 int main(int argc, char **argv)
 {
-    const char *logpath = getenv("RECOMP_STDIO_LOG");
+    const char *logpath = recomp_env(RENV_STDIO_LOG);
     HMODULE mod;
     char path[MAX_PATH];
     int i;

@@ -7,6 +7,7 @@
  */
 
 #include "apu.h"
+#include "recomp_env.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -45,9 +46,18 @@ static volatile uint32_t s_last_wval;
  * APU register model behind it.
  * ============================================================ */
 
+/* The model's registers are 32-bit and its read/write ignore the size, so an
+ * 8-byte access (the decoder emits size 8 for REX.W) is two 4-byte accesses
+ * here; handing it over whole dropped the high dword on a store and returned
+ * zero for it on a load. The POSIX arm64 hook below splits the same way. */
 static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
 {
     g_apu_mmio_read_count++;
+    if (size == 8) {
+        uint64_t lo = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, 4);
+        uint64_t hi = mcpx_apu_mmio_read((MCPXAPUState *)dev, off + 4, 4);
+        return lo | (hi << 32);
+    }
     return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
 }
 
@@ -55,6 +65,11 @@ static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
 {
     g_apu_mmio_write_count++;
     s_last_wval = (uint32_t)v;
+    if (size == 8) {
+        mcpx_apu_mmio_write((MCPXAPUState *)dev, off, (uint32_t)v, 4);
+        mcpx_apu_mmio_write((MCPXAPUState *)dev, off + 4, (uint32_t)(v >> 32), 4);
+        return;
+    }
     mcpx_apu_mmio_write((MCPXAPUState *)dev, off, v, (unsigned)size);
 }
 
@@ -96,7 +111,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
  * exception round trip around it is not visible from here (see
  * apu_hook_fault_bench). */
 #define APU_HIST_SLOTS (APU_MMIO_SIZE / 4)
-static int s_trace = -1;               /* getenv once, not per access */
+static int s_trace = -1;               /* looked up once, not per access */
 static volatile LONG s_hist_r[APU_HIST_SLOTS], s_hist_w[APU_HIST_SLOTS];
 static volatile uint32_t s_hist_lastw[APU_HIST_SLOTS];
 static volatile LONG64 s_tot_r, s_tot_w, s_handler_ticks;
@@ -146,7 +161,7 @@ static DWORD WINAPI apu_trace_reporter(LPVOID unused)
 static int apu_trace_on(void)
 {
     if (s_trace < 0) {
-        s_trace = getenv("RECOMP_APU_TRACE") != NULL;
+        s_trace = recomp_env(RENV_APU_TRACE) != NULL;
         QueryPerformanceFrequency(&s_qpf);
     }
     return s_trace;
@@ -300,7 +315,7 @@ void apu_hook_trace_start(void)
     static int started;
     pthread_t th;
     if (s_trace < 0)
-        s_trace = getenv("RECOMP_APU_TRACE") != NULL;
+        s_trace = recomp_env_on(RENV_APU_TRACE);
     if (!s_trace || started)
         return;
     started = 1;
@@ -323,7 +338,7 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
     if (!g_apu_state || off >= APU_MMIO_SIZE)
         return false;
     if (s_trace < 0)
-        s_trace = getenv("RECOMP_APU_TRACE") != NULL;
+        s_trace = recomp_env_on(RENV_APU_TRACE);
     trace = s_trace && !g_apu_hook_bench_active;
     if (trace)
         a = s_now_ns();
