@@ -102,6 +102,7 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
 | **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF). On by default (`RECOMP_AC97_READY`) on x86-64 Windows/Proton (XAudio2) and on macOS/Linux arm64 (SDL2, A64 MMIO decoder); off on x86-64 POSIX |
 | **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
+| **NV2A pushbuffer executor** *(in xbox_kernel)* | Custom | One pushbuffer walker (`nv2a_pb_scan.c`) behind a backend seam (`nv2a_pb_state.h`): a CPU rasteriser on every host (vertex programs, combiners, bilinear, threaded rows), **D3D11** on Windows and **Metal** on macOS. Vertex microcode and the combiners each have one decoder (`nv2a_vsh_fields.h`, `nv2a_combiner.h`) shared by the CPU path and both shader generators (HLSL, MSL) |
 | **xbox_input** | Custom | Xbox gamepad → XInput |
 | **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture, plus a window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
 
@@ -164,7 +165,7 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 ### Prerequisites
 
 - **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
-- **macOS**: homebrew, docker `tools/macos/setup.sh`
+- **macOS**: homebrew, docker `tools/macos/setup.sh` (Metal backend, or the CPU rasteriser)
 - **Python 3.10+** with `capstone` (`pip install capstone`)
 - **Visual Studio 2022** (MSVC compiler)
 - **CMake 3.20+**

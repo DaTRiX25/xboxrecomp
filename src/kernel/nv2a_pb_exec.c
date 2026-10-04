@@ -37,9 +37,18 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_cpu.h"
+#include "nv2a_combiner.h"
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_zbuf_cache.h"
+#if defined(_WIN32)
+#include <windows.h>
+#define NV_TLS __declspec(thread)
+#else
+#include <pthread.h>
+#include <unistd.h>
+#define NV_TLS __thread
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -227,6 +236,7 @@ static struct nv2a_pb_gpu s_gpu;
 /* Releases written, and where the last one landed. fence_mirrors_tick reads
  * them to decide whether its mirror is still needed; both run on the NV2A ack
  * thread, which is also the thread that drives this executor. */
+static uint32_t s_inline_overflow;      /* INLINE_ARRAY dwords past NV_MAX_INLINE */
 static uint32_t s_sema_releases;
 static uint32_t s_sema_last_va, s_sema_last_value;
 
@@ -255,6 +265,17 @@ static uint32_t s_sema_last_va, s_sema_last_value;
 #define NV097_GET_REPORT                    0x17D0
 static uint32_t s_zpass_count;           /* since the last CLEAR_REPORT_VALUE */
 static int      s_zpass_enable;
+
+/* The rasteriser's per-pixel counters, when a worker thread draws rows of a
+ * triangle (fast_rows_parallel): each thread counts into its own, merged
+ * into s_gpu, s_vsh and s_zpass_count afterwards. NULL on the executor
+ * thread outside that, where the globals are written directly. */
+typedef struct {
+    uint64_t pixels, z_rejected, a_rejected;
+    uint32_t zpass, pixel_max;
+    int      max_y;                     /* row pixel_max was set on, -1 none */
+} RasterCount;
+static NV_TLS RasterCount *t_cnt;
 static uint32_t s_reports, s_reports_zero;
 uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_sema_releases; }
 uint32_t nv2a_pb_exec_semaphore_last_va(void) { return s_sema_last_va; }
@@ -1168,8 +1189,8 @@ static void clear_surface(uint32_t param)
  * format samples nothing and the caller keeps the vertex colour, which is
  * visibly wrong rather than quietly wrong.
  *
- * ponytail: nearest texel, no filtering, whatever SET_TEXTURE_FILTER asked
- * for. Bilinear when a title's output actually depends on it.
+ * Filtering is the stage sampler's (stage_sample_2d): nearest, or bilinear
+ * when SET_TEXTURE_FILTER asks for TENT.
  */
 /* Off the edge of the texture, the way the title asked for.
  *
@@ -1189,6 +1210,16 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
 }
 
 static uint64_t s_tex_fail[256];        /* texels refused, by format code */
+
+/* s_tex_fail[k]++, returning the old count: raster threads sample too. */
+static uint64_t tex_fail_count(uint64_t *c)
+{
+#if defined(_WIN32)
+    return (uint64_t)InterlockedIncrement64((volatile LONG64 *)c) - 1u;
+#else
+    return __atomic_fetch_add(c, 1, __ATOMIC_RELAXED);
+#endif
+}
 
 static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
 {
@@ -1227,7 +1258,7 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
     /* Magenta, so an undecoded format shows up as itself rather than as the
      * vertex colour (which made P8 and G8B8 surfaces look like
      * plain white boxes). Logged once per format. */
-    if (!s_tex_fail[t->color & 0xFF]++)
+    if (!tex_fail_count(&s_tex_fail[t->color & 0xFF]))
         fprintf(stderr, "  [GPU] texture format 0x%02X has no decoder;"
                         " sampling magenta\n", t->color);
     *argb = NV2A_TEX_MAGENTA;
@@ -1375,12 +1406,24 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     } else {
         row = s_surface + (size_t)y * s_gpu.pitch;
     }
-    s_zpass_count += (uint32_t)s_zpass_enable;   /* passed every test */
-    if (s_gpu.color_keep == 0xFFFFFFFFu)
-        return;                            /* SET_COLOR_MASK: no channel written */
-    s_gpu.pixels++;
-    if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
-        s_gpu.pixel_max = argb;
+    if (t_cnt) {
+        RasterCount *cn = t_cnt;
+        cn->zpass += (uint32_t)s_zpass_enable;
+        if (s_gpu.color_keep == 0xFFFFFFFFu)
+            return;
+        cn->pixels++;
+        if ((argb & 0x00FFFFFFu) > (cn->pixel_max & 0x00FFFFFFu)) {
+            cn->pixel_max = argb;
+            cn->max_y = y;
+        }
+    } else {
+        s_zpass_count += (uint32_t)s_zpass_enable;   /* passed every test */
+        if (s_gpu.color_keep == 0xFFFFFFFFu)
+            return;                        /* SET_COLOR_MASK: no channel written */
+        s_gpu.pixels++;
+        if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
+            s_gpu.pixel_max = argb;
+    }
 
     /* src*srcAlpha + dst*(1-srcAlpha) first, on its own path, because it was
      * the only pair here for a long time and the intro was checked against
@@ -2244,7 +2287,7 @@ static int zs_early(int use_s, int use_z, float z, const float *zp,
     if (use_s && !stencil_pass(*sp))
         *op = s_vsh.stencil_op[0];
     else if (use_z && !depth_pass(z, *zp)) {
-        s_vsh.z_rejected++;
+        if (t_cnt) t_cnt->z_rejected++; else s_vsh.z_rejected++;
         if (!use_s)
             return 1;
         *op = s_vsh.stencil_op[1];
@@ -2359,6 +2402,7 @@ void nv2a_pb_perf_scan_end(void)
 static Texture s_stage_tex[4];
 static int     s_stage_mode[4];         /* 0 none, 1 2D, 4 pass-through, other */
 static float   s_stage_scale[4][2];     /* normalised -> texels */
+static int     s_stage_tent[4];         /* bilinear: SET_TEXTURE_FILTER asks TENT */
 
 /* RECOMP_TEX_LOG=1: every distinct texture a program-mode batch samples,
  * per stage, with the raw format word decoded (dimensionality, cube map, mip
@@ -2533,6 +2577,22 @@ static void tex_log_report(void)
                     (unsigned long long)s_tex_fail[k]);
 }
 
+/* Bilinear when SET_TEXTURE_FILTER asks for a linear filter, magnifying or
+ * minifying (as upstream 13c64d3; linear as the GPU backends read it,
+ * nv2a_tex_filter_linear). A 64x32 sky gradient stretched over the screen
+ * is blocks with nearest texels and a gradient with four.
+ * ponytail: level 0 only, no mip selection -- minified textures shimmer.
+ * RECOMP_DEBUG=pb_bilinear=0 samples nearest whatever the filter says. */
+static int tex_filter_tent(uint32_t filter)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_PB_BILINEAR);
+        on = !(e && e[0] == '0');
+    }
+    return on && (nv2a_tex_filter_linear(filter, 1) || nv2a_tex_filter_linear(filter, 0));
+}
+
 static void vsh_build_stages(void)
 {
     int n;
@@ -2554,7 +2614,11 @@ static void vsh_build_stages(void)
         t->addr_v = st.addr_v;
         t->palette = st.palette;
         t->pal_len = st.pal_len;
+        t->filter = st.filter;
+        t->face_stride = st.cube ? nv2a_tex_face_stride(st.color, st.width, st.height,
+                                                        st.pitch, st.fmt_levels) : 0;
         t->valid  = st.valid;
+        s_stage_tent[n] = tex_filter_tent(st.filter);
         s_vsh.stage_mode_seen[n][st.raw_mode]++;
         s_stage_mode[n] = st.mode;
         if (st.mode != 0 && st.mode != 4)
@@ -2570,147 +2634,33 @@ static void rc_unpack(uint32_t c, float o[4])
     nv2a_argb_to_float4(c, o);
 }
 
-static float rc_map(float x, uint32_t map)
-{
-    switch (map) {
-    case 0: return x < 0.0f ? 0.0f : x;                     /* unsigned */
-    case 1: return 1.0f - (x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x);
-    case 2: return 2.0f * (x < 0.0f ? 0.0f : x) - 1.0f;     /* expand */
-    case 3: return 1.0f - 2.0f * (x < 0.0f ? 0.0f : x);
-    case 4: return (x < 0.0f ? 0.0f : x) - 0.5f;            /* half bias */
-    case 5: return 0.5f - (x < 0.0f ? 0.0f : x);
-    case 6: return x;                                       /* signed */
-    default: return -x;
-    }
-}
-
-static void rc_in_rgb(float r[16][4], uint32_t b, float v[3])
-{
-    const float *s = r[b & 0xF];
-    uint32_t map = (b >> 5) & 7;
-    int k;
-    for (k = 0; k < 3; k++)
-        v[k] = rc_map((b & 0x10) ? s[3] : s[k], map);
-}
-
-static float rc_in_a(float r[16][4], uint32_t b)
-{
-    const float *s = r[b & 0xF];
-    return rc_map((b & 0x10) ? s[3] : s[2], (b >> 5) & 7);
-}
-
-static float rc_op(float x, uint32_t op)
-{
-    switch (op) {
-    case 1: x -= 0.5f; break;
-    case 2: x *= 2.0f; break;
-    case 3: x = (x - 0.5f) * 2.0f; break;
-    case 4: x *= 4.0f; break;
-    case 6: x *= 0.5f; break;
-    default: break;
-    }
-    return x < -1.0f ? -1.0f : x > 1.0f ? 1.0f : x;
-}
-
 static float clamp01(float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; }
+
+/* The combiner registers as nv2a_combiner.c takes them; rc_load copies them
+ * from s_vsh before a triangle (reference path) or a batch (plan). */
+static Nv2aCombiner s_rc;
+
+static void rc_load(void)
+{
+    memcpy(s_rc.color_icw, s_vsh.rc_cicw, sizeof s_rc.color_icw);
+    memcpy(s_rc.alpha_icw, s_vsh.rc_aicw, sizeof s_rc.alpha_icw);
+    memcpy(s_rc.color_ocw, s_vsh.rc_cocw, sizeof s_rc.color_ocw);
+    memcpy(s_rc.alpha_ocw, s_vsh.rc_aocw, sizeof s_rc.alpha_ocw);
+    memcpy(s_rc.factor0, s_vsh.rc_f0, sizeof s_rc.factor0);
+    memcpy(s_rc.factor1, s_vsh.rc_f1, sizeof s_rc.factor1);
+    s_rc.final0 = s_vsh.rc_fcw0;
+    s_rc.final1 = s_vsh.rc_fcw1;
+    s_rc.final_c0 = s_vsh.rc_sf[0];
+    s_rc.final_c1 = s_vsh.rc_sf[1];
+    s_rc.control = s_vsh.rc_ctl;
+    s_rc.stage_program = s_vsh.shader_prog;
+}
 
 /* General combiners then the final combiner, on r[] (register-code indexed);
  * the result is written to out[4] as r,g,b,a. */
 static void rc_eval(float r[16][4], float out[4])
 {
-    uint32_t stages = s_vsh.rc_ctl & 0xFF, s;
-    int mux_msb = (s_vsh.rc_ctl >> 8) & 1;
-    int uniq0 = (s_vsh.rc_ctl >> 12) & 1, uniq1 = (s_vsh.rc_ctl >> 16) & 1;
-    float nr[16][4], A[3], B[3], C[3], D[3], E[3], F[3];
-    int k;
-
-    if (stages > 8)
-        stages = 8;
-    for (s = 0; s < stages; s++) {
-        uint32_t icw = s_vsh.rc_cicw[s], ocw = s_vsh.rc_cocw[s];
-        uint32_t aicw = s_vsh.rc_aicw[s], aocw = s_vsh.rc_aocw[s];
-        float ab[3], cd[3], sum[3], aab, acd, asum;
-        int sel;
-
-        rc_unpack(s_vsh.rc_f0[uniq0 ? s : 0], r[1]);
-        rc_unpack(s_vsh.rc_f1[uniq1 ? s : 0], r[2]);
-        memcpy(nr, r, sizeof nr);
-        sel = mux_msb ? r[12][3] >= 0.5f
-                      : (((uint32_t)(clamp01(r[12][3]) * 255.0f + 0.5f)) & 1u);
-
-        /* colour */
-        rc_in_rgb(r, icw >> 24, A); rc_in_rgb(r, icw >> 16, B);
-        rc_in_rgb(r, icw >>  8, C); rc_in_rgb(r, icw,       D);
-        if (ocw & (1u << 13)) {
-            float d = A[0]*B[0] + A[1]*B[1] + A[2]*B[2];
-            ab[0] = ab[1] = ab[2] = d;
-        } else {
-            for (k = 0; k < 3; k++) ab[k] = A[k] * B[k];
-        }
-        if (ocw & (1u << 12)) {
-            float d = C[0]*D[0] + C[1]*D[1] + C[2]*D[2];
-            cd[0] = cd[1] = cd[2] = d;
-        } else {
-            for (k = 0; k < 3; k++) cd[k] = C[k] * D[k];
-        }
-        for (k = 0; k < 3; k++) {
-            sum[k] = (ocw & (1u << 14)) ? (sel ? cd[k] : ab[k]) : ab[k] + cd[k];
-            ab[k]  = rc_op(ab[k],  (ocw >> 15) & 7);
-            cd[k]  = rc_op(cd[k],  (ocw >> 15) & 7);
-            sum[k] = rc_op(sum[k], (ocw >> 15) & 7);
-        }
-        if ((ocw >> 4) & 0xF) memcpy(nr[(ocw >> 4) & 0xF], ab, sizeof ab);
-        if ( ocw       & 0xF) memcpy(nr[ ocw       & 0xF], cd, sizeof cd);
-        if ((ocw >> 8) & 0xF) memcpy(nr[(ocw >> 8) & 0xF], sum, sizeof sum);
-
-        /* alpha */
-        aab = rc_in_a(r, aicw >> 24) * rc_in_a(r, aicw >> 16);
-        acd = rc_in_a(r, aicw >>  8) * rc_in_a(r, aicw);
-        /* the alpha word is laid out as the RGB one: mux [14], mapping [17:15] */
-        asum = (aocw & (1u << 14)) ? (sel ? acd : aab) : aab + acd;
-        if ((aocw >> 4) & 0xF) nr[(aocw >> 4) & 0xF][3] = rc_op(aab,  (aocw >> 15) & 7);
-        if ( aocw       & 0xF) nr[ aocw       & 0xF][3] = rc_op(acd,  (aocw >> 15) & 7);
-        if ((aocw >> 8) & 0xF) nr[(aocw >> 8) & 0xF][3] = rc_op(asum, (aocw >> 15) & 7);
-
-        /* blue to alpha overrides the alpha portion's write */
-        if ((ocw & (1u << 19)) && ((ocw >> 4) & 0xF)) nr[(ocw >> 4) & 0xF][3] = ab[2];
-        if ((ocw & (1u << 18)) && (ocw & 0xF))        nr[ocw & 0xF][3] = cd[2];
-        memcpy(r, nr, sizeof nr);
-    }
-
-    /* Final combiner: unsigned inputs, A*B + (1-A)*C + D, alpha from G. */
-    {
-        uint32_t c0 = s_vsh.rc_fcw0, c1 = s_vsh.rc_fcw1;
-        float v1[3], r0[3], G;
-        rc_unpack(s_vsh.rc_sf[0], r[1]);
-        rc_unpack(s_vsh.rc_sf[1], r[2]);
-#define FC_IN(b, v) do { const float *s_ = r[(b) & 0xF]; int k_; \
-        for (k_ = 0; k_ < 3; k_++) { float x_ = clamp01(((b) & 0x10) ? s_[3] : s_[k_]); \
-            (v)[k_] = ((b) & 0x20) ? 1.0f - x_ : x_; } } while (0)
-        FC_IN(c1 >> 24, E);
-        FC_IN(c1 >> 16, F);
-        for (k = 0; k < 3; k++) {
-            /* COMPLEMENT_V1 is 0x40, COMPLEMENT_R0 0x20 (xemu psh_regs.h). */
-            v1[k] = clamp01(r[5][k]);  if (c1 & 0x40) v1[k] = 1.0f - v1[k];
-            r0[k] = clamp01(r[12][k]); if (c1 & 0x20) r0[k] = 1.0f - r0[k];
-            r[14][k] = v1[k] + r0[k];
-            if (c1 & 0x80) r[14][k] = clamp01(r[14][k]);
-            r[15][k] = E[k] * F[k];
-        }
-        r[14][3] = r[15][3] = 0.0f;
-        FC_IN(c0 >> 24, A); FC_IN(c0 >> 16, B);
-        FC_IN(c0 >>  8, C); FC_IN(c0,       D);
-        {
-            uint32_t g = c1 >> 8;
-            const float *sg = r[g & 0xF];
-            G = clamp01((g & 0x10) ? sg[3] : sg[2]);
-            if (g & 0x20) G = 1.0f - G;
-        }
-#undef FC_IN
-        for (k = 0; k < 3; k++)
-            out[k] = clamp01(A[k] * B[k] + (1.0f - A[k]) * C[k] + D[k]);
-        out[3] = G;
-    }
+    nv2a_rc_eval_regs(&s_rc, r, out, NULL);
 }
 
 static int vsh_rc_active(void)
@@ -2729,12 +2679,61 @@ static int alpha_test_pass(float a)
     return nv2a_cmp_test_u(nv2a_cmp_from_gl(s_vsh.atest_func), v, ref);
 }
 
+/* Texel (iu, iv), already wrapped, of `t` as floats; black, opaque, when
+ * the texture cannot be read. */
+static void texel_live(const Texture *t, int iu, int iv, float o[4])
+{
+    uint32_t texel;
+    if (sample_tex(t, (uint32_t)iu, (uint32_t)iv, &texel))
+        rc_unpack(texel, o);
+    else
+        o[0] = o[1] = o[2] = 0.0f, o[3] = 1.0f;
+}
+
+/* The four taps' weights, the same expression for the live and cached
+ * samplers so their results agree bit for bit. */
+static void bilerp(const float c[4][4], float wu, float wv, float o[4])
+{
+    int j;
+    for (j = 0; j < 4; j++)
+        o[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
+             + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
+}
+
+/* Bilinear setup: the top-left tap and the weights, at texel centres. */
+static void tent_setup(int n, float s, float t, int *iu, int *iv, float *wu, float *wv)
+{
+    float fu = s * s_stage_scale[n][0] - 0.5f, fv = t * s_stage_scale[n][1] - 0.5f;
+    *iu = (int)floorf(fu);
+    *iv = (int)floorf(fv);
+    *wu = fu - (float)*iu;
+    *wv = fv - (float)*iv;
+}
+
+/* Stage n's texture `tx` (the stage's own, or one cube face of it) at
+ * normalised (swizzled, DXT) or texel (linear) coordinates s, t. */
+static void stage_sample_2d(int n, const Texture *tx, float s, float t, float o[4])
+{
+    int iu, iv;
+    if (s_stage_tent[n]) {
+        float wu, wv, c[4][4];
+        int k;
+        tent_setup(n, s, t, &iu, &iv, &wu, &wv);
+        for (k = 0; k < 4; k++)
+            texel_live(tx, wrap_signed(iu + (k & 1), tx->width, tx->addr_u),
+                       wrap_signed(iv + (k >> 1), tx->height, tx->addr_v), c[k]);
+        bilerp(c, wu, wv, o);
+        return;
+    }
+    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), tx->width,  tx->addr_u);
+    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), tx->height, tx->addr_v);
+    texel_live(tx, iu, iv, o);
+}
+
 static void stage_sample(int n, const float tc[4], float o[4])
 {
     int mode = s_stage_mode[n];
-    uint32_t texel;
     float s, t;
-    int iu, iv;
 
     if (mode == 0) { o[0] = o[1] = o[2] = o[3] = 0.0f; return; }
     if (mode == 4) {                       /* pass-through: the coordinate */
@@ -2742,16 +2741,17 @@ static void stage_sample(int n, const float tc[4], float o[4])
         for (k = 0; k < 4; k++) o[k] = clamp01(tc[k]);
         return;
     }
+    if (mode == 3 && s_stage_tex[n].face_stride) {   /* cube map */
+        Texture f = s_stage_tex[n];
+        f.offset += nv2a_cube_face(tc, &s, &t) * f.face_stride;
+        stage_sample_2d(n, &f, s, t, o);
+        return;
+    }
     s = tc[0]; t = tc[1];
     if (mode == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {   /* 2D projective */
         s /= tc[3]; t /= tc[3];
     }
-    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), s_stage_tex[n].width,  s_stage_tex[n].addr_u);
-    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), s_stage_tex[n].height, s_stage_tex[n].addr_v);
-    if (sample_tex(&s_stage_tex[n], (uint32_t)iu, (uint32_t)iv, &texel))
-        rc_unpack(texel, o);
-    else
-        o[0] = o[1] = o[2] = 0.0f, o[3] = 1.0f;
+    stage_sample_2d(n, &s_stage_tex[n], s, t, o);
 }
 
 static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
@@ -2790,6 +2790,8 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
     use_z = s_vsh.depth_enable && vsh_zbuf_ready();
     use_s = vsh_stencil_ready();
     use_rc = vsh_rc_active();
+    if (use_rc)
+        rc_load();
 
     minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
     maxx = (int)ceilf (fmaxf(a->x, fmaxf(b->x, c->x)));
@@ -2983,6 +2985,7 @@ typedef struct {
 
 static TexCacheEntry  s_tc[TC_ENTRIES];
 static TexCacheEntry *s_stage_tc[4];
+static int            s_fast_serial;    /* this batch draws on one thread */
 static uint32_t       s_tc_clock;
 static uint64_t       s_tc_tiles_filled, s_tc_refp, s_tc_dropped, s_tc_binds;
 static uint64_t       s_tc_feedback;    /* binds read live: texture is the target */
@@ -3082,7 +3085,51 @@ static TexCacheEntry *tc_bind(const Texture *t)
     return e;
 }
 
+/* A tile's ready flag, read and published across raster threads: the
+ * texels a filled flag guards must be visible before the flag is. */
+#if defined(_MSC_VER) && !defined(__clang__)
+static inline int tile_ready(const uint8_t *f)
+{
+    return ReadAcquire8((const volatile CHAR *)f);    /* winnt.h, any arch */
+}
+static inline void tile_publish(uint8_t *f)
+{
+    WriteRelease8((volatile CHAR *)f, 1);
+}
+#else
+static inline int tile_ready(const uint8_t *f)
+{
+    return __atomic_load_n(f, __ATOMIC_ACQUIRE);
+}
+static inline void tile_publish(uint8_t *f)
+{
+    __atomic_store_n(f, (uint8_t)1, __ATOMIC_RELEASE);
+}
+#endif
+
+/* Tile fills from raster threads take turns; the executor thread alone
+ * binds, drops and resizes entries, between triangles. */
+#if defined(_WIN32)
+static SRWLOCK s_tc_lock = SRWLOCK_INIT;
+#define TC_LOCK()   AcquireSRWLockExclusive(&s_tc_lock)
+#define TC_UNLOCK() ReleaseSRWLockExclusive(&s_tc_lock)
+#else
+static pthread_mutex_t s_tc_lock = PTHREAD_MUTEX_INITIALIZER;
+#define TC_LOCK()   pthread_mutex_lock(&s_tc_lock)
+#define TC_UNLOCK() pthread_mutex_unlock(&s_tc_lock)
+#endif
+
+static void tc_fill_locked(TexCacheEntry *e, const Texture *t, uint32_t tile);
+
 static void tc_fill(TexCacheEntry *e, const Texture *t, uint32_t tile)
+{
+    TC_LOCK();
+    if (!e->tile_ok[tile])                  /* another thread may have */
+        tc_fill_locked(e, t, tile);
+    TC_UNLOCK();
+}
+
+static void tc_fill_locked(TexCacheEntry *e, const Texture *t, uint32_t tile)
 {
     uint32_t x0 = (tile % e->tiles_x) << TC_TILE_LOG;
     uint32_t y0 = (tile / e->tiles_x) << TC_TILE_LOG;
@@ -3097,19 +3144,29 @@ static void tc_fill(TexCacheEntry *e, const Texture *t, uint32_t tile)
             sample_tex(t, x, y, &texel);   /* cacheable formats always decode */
             e->texels[(size_t)y * e->width + x] = texel;
         }
-    e->tile_ok[tile] = 1;
+    tile_publish(&e->tile_ok[tile]);
     s_tc_tiles_filled++;
     s_rt.tex += rt_now() - t0;
 }
 
-/* stage_sample, reading texels from the cache when the stage has an entry. */
+/* Texel (iu, iv), already wrapped, from the cache. */
+static inline void texel_cached(TexCacheEntry *e, int n, int iu, int iv, float o[4])
+{
+    uint32_t tile = ((uint32_t)iv >> TC_TILE_LOG) * e->tiles_x + ((uint32_t)iu >> TC_TILE_LOG);
+    if (!tile_ready(&e->tile_ok[tile]))
+        tc_fill(e, &s_stage_tex[n], tile);
+    rc_unpack_fast(e->texels[(size_t)iv * e->width + (uint32_t)iu], o);
+}
+
+/* stage_sample, reading texels from the cache when the stage has an entry.
+ * A cube stage has none (fast_batch_setup) and samples live. */
 static void stage_sample_fast(int n, const float tc[4], float o[4])
 {
     TexCacheEntry *e = s_stage_tc[n];
+    const Texture *tx = &s_stage_tex[n];
     int mode = s_stage_mode[n];
     float s, t;
     int iu, iv;
-    uint32_t tile;
 
     if (!e || mode == 0 || mode == 4) {
         stage_sample(n, tc, o);
@@ -3119,335 +3176,56 @@ static void stage_sample_fast(int n, const float tc[4], float o[4])
     if (mode == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {   /* 2D projective */
         s /= tc[3]; t /= tc[3];
     }
-    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), s_stage_tex[n].width,  s_stage_tex[n].addr_u);
-    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), s_stage_tex[n].height, s_stage_tex[n].addr_v);
-    tile = ((uint32_t)iv >> TC_TILE_LOG) * e->tiles_x + ((uint32_t)iu >> TC_TILE_LOG);
-    if (!e->tile_ok[tile])
-        tc_fill(e, &s_stage_tex[n], tile);
-    rc_unpack_fast(e->texels[(size_t)iv * e->width + (uint32_t)iu], o);
+    if (s_stage_tent[n]) {
+        float wu, wv, c[4][4];
+        int k;
+        int u[2], v[2];
+        tent_setup(n, s, t, &iu, &iv, &wu, &wv);
+        u[0] = wrap_signed(iu, tx->width, tx->addr_u);
+        u[1] = wrap_signed(iu + 1, tx->width, tx->addr_u);
+        v[0] = wrap_signed(iv, tx->height, tx->addr_v);
+        v[1] = wrap_signed(iv + 1, tx->height, tx->addr_v);
+        if (u[1] == u[0] + 1 && v[1] == v[0] + 1
+                && (u[0] & 7) != 7 && (v[0] & 7) != 7) {
+            /* all four in one tile: one check, adjacent texels */
+            uint32_t tile = ((uint32_t)v[0] >> TC_TILE_LOG) * e->tiles_x
+                          + ((uint32_t)u[0] >> TC_TILE_LOG);
+            const uint32_t *p0;
+            if (!tile_ready(&e->tile_ok[tile]))
+                tc_fill(e, tx, tile);
+            p0 = &e->texels[(size_t)v[0] * e->width + (uint32_t)u[0]];
+            rc_unpack_fast(p0[0], c[0]);
+            rc_unpack_fast(p0[1], c[1]);
+            rc_unpack_fast(p0[e->width], c[2]);
+            rc_unpack_fast(p0[e->width + 1], c[3]);
+        } else {
+            for (k = 0; k < 4; k++)
+                texel_cached(e, n, u[k & 1], v[k >> 1], c[k]);
+        }
+        bilerp(c, wu, wv, o);
+        return;
+    }
+    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), tx->width,  tx->addr_u);
+    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), tx->height, tx->addr_v);
+    texel_cached(e, n, iu, iv, o);
 }
 
 /* (b) -------------------------------------------------------------------
  *
- * Inputs that read a register no pixel can change -- zero, the stage's two
- * factor constants, fog when nothing writes it -- are mapped once, here, by
- * the same rc_map, and become constants. The rest dispatch on their mapping
- * once per input rather than once per component, and the output mapping once
- * per stage. Values that no output and no sum consumes are not computed. */
-typedef struct {
-    uint8_t reg, alpha, map, cst;
-    float   cv[3];                       /* mapped value when cst */
-} RcIn;
-typedef struct {
-    uint8_t reg, alpha, inv, cst;
-    float   cv[3];
-} FcIn;
-typedef struct {
-    RcIn  rgb[4], a[4];
-    uint8_t ab, cd, sum, dot_ab, dot_cd, mux, op;
-    uint8_t aab, acd, asum, amux, aop, b2a_ab, b2a_cd;
-    uint8_t need_ab, need_cd, need_aab, need_acd, need_sel;
-} RcStage;
-
-static struct {
-    uint32_t stages;
-    int      mux_msb;
-    RcStage  st[8];
-    FcIn     e, f, a, b, c, d, g;
-    int      v1_inv, r0_inv, sum_clamp;
-    float    tmpl[16][4];                /* register file at pixel start */
-    uint32_t dirty;                      /* registers reset between pixels */
-    int      fog_var;                    /* FOG alpha varies per pixel */
-} s_rcp;
-
-/* Registers whose value at a stage's input is the same for every pixel. */
-static const float *rc_const_reg(uint32_t reg, const float f0[4], const float f1[4],
-                                 uint32_t written)
-{
-    if (reg == 0) return s_rcp.tmpl[0];
-    if (reg == 1) return f0;
-    if (reg == 2) return f1;
-    if (reg == 3 && !(written & (1u << 3)) && !s_rcp.fog_var) return s_rcp.tmpl[3];
-    return NULL;
-}
-
-static RcIn rc_dec_in(uint32_t b, int alpha_port, const float f0[4],
-                      const float f1[4], uint32_t written)
-{
-    RcIn i;
-    const float *s;
-    int k;
-    memset(&i, 0, sizeof i);
-    i.reg = (uint8_t)(b & 0xF);
-    i.alpha = (uint8_t)((b & 0x10) != 0);
-    i.map = (uint8_t)((b >> 5) & 7);
-    s = rc_const_reg(i.reg, f0, f1, written);
-    if (s) {
-        i.cst = 1;
-        if (alpha_port)
-            i.cv[0] = rc_map(i.alpha ? s[3] : s[2], i.map);
-        else
-            for (k = 0; k < 3; k++)
-                i.cv[k] = rc_map(i.alpha ? s[3] : s[k], i.map);
-    }
-    return i;
-}
-
-static FcIn fc_dec_in(uint32_t b, const float sf0[4], const float sf1[4],
-                      uint32_t written, int g_port)
-{
-    FcIn i;
-    const float *s;
-    int k;
-    memset(&i, 0, sizeof i);
-    i.reg = (uint8_t)(b & 0xF);
-    i.alpha = (uint8_t)((b & 0x10) != 0);
-    i.inv = (uint8_t)((b & 0x20) != 0);
-    s = rc_const_reg(i.reg, sf0, sf1, written);
-    if (s) {
-        i.cst = 1;
-        if (g_port) {
-            float G = clamp01(i.alpha ? s[3] : s[2]);
-            if (i.inv) G = 1.0f - G;
-            i.cv[0] = G;
-        } else {
-            for (k = 0; k < 3; k++) {
-                float x = clamp01(i.alpha ? s[3] : s[k]);
-                i.cv[k] = i.inv ? 1.0f - x : x;
-            }
-        }
-    }
-    return i;
-}
+ * The combiner plan (nv2a_rc_plan_build, nv2a_combiner.c): decoded once per
+ * batch, evaluated per pixel in place, bit-identical to rc_eval. */
+static Nv2aRcPlan s_rcp;
 
 static void rc_plan_build(void)
 {
-    uint32_t s, k, written = 0;
-    int uniq0 = (s_vsh.rc_ctl >> 12) & 1, uniq1 = (s_vsh.rc_ctl >> 16) & 1;
-    float f0[8][4], f1[8][4], sf0[4], sf1[4];
+    float fog[4];
 
-    memset(&s_rcp, 0, sizeof s_rcp);
-    /* What the reference loop builds before sampling: zeros, and fog in r3. */
-    rc_unpack(s_vsh.fog_color, s_rcp.tmpl[3]);
-    { float t_ = s_rcp.tmpl[3][0]; s_rcp.tmpl[3][0] = s_rcp.tmpl[3][2]; s_rcp.tmpl[3][2] = t_; }
-    s_rcp.tmpl[3][3] = 1.0f;
-    s_rcp.fog_var = s_vsh.fog_enable;
-
-    s_rcp.stages = s_vsh.rc_ctl & 0xFF;
-    if (s_rcp.stages > 8)
-        s_rcp.stages = 8;
-    s_rcp.mux_msb = (s_vsh.rc_ctl >> 8) & 1;
-    /* Everything any stage writes, first, so fog is only folded if it is
-     * never overwritten. */
-    for (s = 0; s < s_rcp.stages; s++) {
-        uint32_t ocw = s_vsh.rc_cocw[s], aocw = s_vsh.rc_aocw[s];
-        written |= (1u << ((ocw >> 4) & 0xF)) | (1u << (ocw & 0xF))
-                 | (1u << ((ocw >> 8) & 0xF)) | (1u << ((aocw >> 4) & 0xF))
-                 | (1u << (aocw & 0xF)) | (1u << ((aocw >> 8) & 0xF));
-        rc_unpack(s_vsh.rc_f0[uniq0 ? s : 0], f0[s]);
-        rc_unpack(s_vsh.rc_f1[uniq1 ? s : 0], f1[s]);
-    }
-    written &= ~1u;
-    s_rcp.dirty = written | (1u << 12) | (1u << 14) | (1u << 15);
-
-    for (s = 0; s < s_rcp.stages; s++) {
-        RcStage *p = &s_rcp.st[s];
-        uint32_t icw = s_vsh.rc_cicw[s], ocw = s_vsh.rc_cocw[s];
-        uint32_t aicw = s_vsh.rc_aicw[s], aocw = s_vsh.rc_aocw[s];
-        for (k = 0; k < 4; k++) {
-            p->rgb[k] = rc_dec_in((icw >> (24 - 8 * k)) & 0xFF, 0, f0[s], f1[s], written);
-            p->a[k]   = rc_dec_in((aicw >> (24 - 8 * k)) & 0xFF, 1, f0[s], f1[s], written);
-        }
-        p->dot_ab = (uint8_t)((ocw >> 13) & 1);
-        p->dot_cd = (uint8_t)((ocw >> 12) & 1);
-        p->mux    = (uint8_t)((ocw >> 14) & 1);
-        p->op     = (uint8_t)((ocw >> 15) & 7);
-        p->ab     = (uint8_t)((ocw >> 4) & 0xF);
-        p->cd     = (uint8_t)( ocw       & 0xF);
-        p->sum    = (uint8_t)((ocw >> 8) & 0xF);
-        p->b2a_ab = (uint8_t)(((ocw >> 19) & 1) && p->ab);
-        p->b2a_cd = (uint8_t)(((ocw >> 18) & 1) && p->cd);
-        p->amux   = (uint8_t)((aocw >> 14) & 1);   /* as the RGB word */
-        p->aop    = (uint8_t)((aocw >> 15) & 7);
-        p->aab    = (uint8_t)((aocw >> 4) & 0xF);
-        p->acd    = (uint8_t)( aocw       & 0xF);
-        p->asum   = (uint8_t)((aocw >> 8) & 0xF);
-        p->need_ab  = p->ab || p->sum;
-        p->need_cd  = p->cd || p->sum;
-        p->need_aab = p->aab || p->asum;
-        p->need_acd = p->acd || p->asum;
-        p->need_sel = (p->sum && p->mux) || (p->asum && p->amux);
-    }
-    {
-        uint32_t c0 = s_vsh.rc_fcw0, c1 = s_vsh.rc_fcw1;
-        rc_unpack(s_vsh.rc_sf[0], sf0);
-        rc_unpack(s_vsh.rc_sf[1], sf1);
-        s_rcp.e = fc_dec_in((c1 >> 24) & 0xFF, sf0, sf1, written, 0);
-        s_rcp.f = fc_dec_in((c1 >> 16) & 0xFF, sf0, sf1, written, 0);
-        s_rcp.g = fc_dec_in((c1 >> 8) & 0xFF, sf0, sf1, written, 1);
-        s_rcp.a = fc_dec_in((c0 >> 24) & 0xFF, sf0, sf1, written, 0);
-        s_rcp.b = fc_dec_in((c0 >> 16) & 0xFF, sf0, sf1, written, 0);
-        s_rcp.c = fc_dec_in((c0 >> 8) & 0xFF, sf0, sf1, written, 0);
-        s_rcp.d = fc_dec_in( c0       & 0xFF, sf0, sf1, written, 0);
-        s_rcp.v1_inv = (c1 & 0x40) != 0;
-        s_rcp.r0_inv = (c1 & 0x20) != 0;
-        s_rcp.sum_clamp = (c1 & 0x80) != 0;
-    }
-}
-
-/* rc_map with the mapping known: the switch inside it folds away. */
-#define RC_MAP_ALL(map, X, N, OUT) do { int k_; switch (map) { \
-    case 0: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 0); break; \
-    case 1: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 1); break; \
-    case 2: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 2); break; \
-    case 3: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 3); break; \
-    case 4: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 4); break; \
-    case 5: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 5); break; \
-    case 6: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 6); break; \
-    default: for (k_ = 0; k_ < (N); k_++) (OUT)[k_] = rc_map((X)[k_], 7); break; \
-    } } while (0)
-
-static inline const float *rc_in_rgb_fast(float r[16][4], const RcIn *in, float v[3])
-{
-    const float *s;
-    float x[3];
-    if (in->cst)
-        return in->cv;
-    s = r[in->reg];
-    if (in->alpha) x[0] = x[1] = x[2] = s[3];
-    else { x[0] = s[0]; x[1] = s[1]; x[2] = s[2]; }
-    RC_MAP_ALL(in->map, x, 3, v);
-    return v;
-}
-
-static inline float rc_in_a_fast(float r[16][4], const RcIn *in)
-{
-    const float *s;
-    float x, v;
-    if (in->cst)
-        return in->cv[0];
-    s = r[in->reg];
-    x = in->alpha ? s[3] : s[2];
-    RC_MAP_ALL(in->map, &x, 1, &v);
-    return v;
-}
-
-/* rc_op on three values, the output mapping known. */
-static inline void rc_op3(float v[3], uint32_t op)
-{
-    int k;
-    switch (op) {
-    case 1:  for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 1); break;
-    case 2:  for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 2); break;
-    case 3:  for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 3); break;
-    case 4:  for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 4); break;
-    case 6:  for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 6); break;
-    default: for (k = 0; k < 3; k++) v[k] = rc_op(v[k], 0); break;
-    }
-}
-
-static inline const float *fc_in_fast(float r[16][4], const FcIn *in, float v[3])
-{
-    const float *s;
-    int k;
-    if (in->cst)
-        return in->cv;
-    s = r[in->reg];
-    for (k = 0; k < 3; k++) {
-        float x = clamp01(in->alpha ? s[3] : s[k]);
-        v[k] = in->inv ? 1.0f - x : x;
-    }
-    return v;
-}
-
-/* rc_eval, on the plan. The same operations on the same values, in place:
- * every input of a stage is read before any of its outputs is written. */
-static void rc_eval_fast(float r[16][4], float out[4])
-{
-    float Ab[3], Bb[3], Cb[3], Db[3], Eb[3], Fb[3];
-    const float *A, *B, *C, *D, *E, *F;
-    uint32_t s;
-    int k;
-
-    for (s = 0; s < s_rcp.stages; s++) {
-        const RcStage *p = &s_rcp.st[s];
-        float ab[3], cd[3], sum[3], aab = 0.0f, acd = 0.0f, asum = 0.0f;
-        int sel = 0;
-
-        if (p->need_sel)
-            sel = s_rcp.mux_msb ? r[12][3] >= 0.5f
-                                : (((uint32_t)(clamp01(r[12][3]) * 255.0f + 0.5f)) & 1u);
-        if (p->need_ab) {
-            A = rc_in_rgb_fast(r, &p->rgb[0], Ab);
-            B = rc_in_rgb_fast(r, &p->rgb[1], Bb);
-            if (p->dot_ab) {
-                float d = A[0]*B[0] + A[1]*B[1] + A[2]*B[2];
-                ab[0] = ab[1] = ab[2] = d;
-            } else {
-                for (k = 0; k < 3; k++) ab[k] = A[k] * B[k];
-            }
-        }
-        if (p->need_cd) {
-            C = rc_in_rgb_fast(r, &p->rgb[2], Cb);
-            D = rc_in_rgb_fast(r, &p->rgb[3], Db);
-            if (p->dot_cd) {
-                float d = C[0]*D[0] + C[1]*D[1] + C[2]*D[2];
-                cd[0] = cd[1] = cd[2] = d;
-            } else {
-                for (k = 0; k < 3; k++) cd[k] = C[k] * D[k];
-            }
-        }
-        if (p->sum) {
-            for (k = 0; k < 3; k++)
-                sum[k] = p->mux ? (sel ? cd[k] : ab[k]) : ab[k] + cd[k];
-            rc_op3(sum, p->op);
-        }
-        if (p->ab) rc_op3(ab, p->op);
-        if (p->cd) rc_op3(cd, p->op);
-
-        /* Alpha inputs are read before any output lands. */
-        if (p->need_aab)
-            aab = rc_in_a_fast(r, &p->a[0]) * rc_in_a_fast(r, &p->a[1]);
-        if (p->need_acd)
-            acd = rc_in_a_fast(r, &p->a[2]) * rc_in_a_fast(r, &p->a[3]);
-        if (p->asum)
-            asum = p->amux ? (sel ? acd : aab) : aab + acd;
-
-        if (p->ab)  memcpy(r[p->ab], ab, sizeof ab);
-        if (p->cd)  memcpy(r[p->cd], cd, sizeof cd);
-        if (p->sum) memcpy(r[p->sum], sum, sizeof sum);
-        if (p->aab)  r[p->aab][3]  = rc_op(aab,  p->aop);
-        if (p->acd)  r[p->acd][3]  = rc_op(acd,  p->aop);
-        if (p->asum) r[p->asum][3] = rc_op(asum, p->aop);
-        if (p->b2a_ab) r[p->ab][3] = ab[2];
-        if (p->b2a_cd) r[p->cd][3] = cd[2];
-    }
-
-    {
-        float v1[3], r0[3], G;
-        E = fc_in_fast(r, &s_rcp.e, Eb);
-        F = fc_in_fast(r, &s_rcp.f, Fb);
-        for (k = 0; k < 3; k++) {
-            v1[k] = clamp01(r[5][k]);  if (s_rcp.v1_inv) v1[k] = 1.0f - v1[k];
-            r0[k] = clamp01(r[12][k]); if (s_rcp.r0_inv) r0[k] = 1.0f - r0[k];
-            r[14][k] = v1[k] + r0[k];
-            if (s_rcp.sum_clamp) r[14][k] = clamp01(r[14][k]);
-            r[15][k] = E[k] * F[k];
-        }
-        r[14][3] = r[15][3] = 0.0f;
-        A = fc_in_fast(r, &s_rcp.a, Ab); B = fc_in_fast(r, &s_rcp.b, Bb);
-        C = fc_in_fast(r, &s_rcp.c, Cb); D = fc_in_fast(r, &s_rcp.d, Db);
-        if (s_rcp.g.cst) {
-            G = s_rcp.g.cv[0];
-        } else {
-            const float *sg = r[s_rcp.g.reg];
-            G = clamp01(s_rcp.g.alpha ? sg[3] : sg[2]);
-            if (s_rcp.g.inv) G = 1.0f - G;
-        }
-        for (k = 0; k < 3; k++)
-            out[k] = clamp01(A[k] * B[k] + (1.0f - A[k]) * C[k] + D[k]);
-        out[3] = G;
-    }
+    /* What the reference loop builds before sampling: fog in r3, RGBA. */
+    rc_load();
+    rc_unpack(s_vsh.fog_color, fog);
+    { float t_ = fog[0]; fog[0] = fog[2]; fog[2] = t_; }
+    fog[3] = 1.0f;
+    nv2a_rc_plan_build(&s_rcp, &s_rc, fog, s_vsh.fog_enable);
 }
 
 /* (c) ------------------------------------------------------------------- */
@@ -3505,65 +3283,46 @@ static void edge_interval(float dx, float p, float dy, float vx, int sign,
     }
 }
 
-static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c,
-                               int textured)
-{
-    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
-    float area, inv_w[3], zscale = 1.0f / vsh_zmax();
-    int minx, maxx, miny, maxy, x, y, use_z, use_s, use_rc, n, unit_w;
+/* Everything a triangle's pixels need, computed once per triangle, so the
+ * pixel loop can run over any subset of rows on any thread. */
+typedef struct {
+    const XfVert *a, *b, *c;
+    uint8_t *mem;
+    uint32_t bpp;
+    float area, inv_w[3], zscale;
     float e0dx, e0dy, e1dx, e1dy, e2dx, e2dy;
+    int minx, maxx, miny, maxy, use_z, use_s, use_rc, textured, unit_w;
+} FastTri;
+
+/* Index of the lowest set bit of a non-zero word. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+static inline int ctz32(uint32_t v)
+{
+    unsigned long i;
+    _BitScanForward(&i, v);
+    return (int)i;
+}
+#else
+static inline int ctz32(uint32_t v) { return __builtin_ctz(v); }
+#endif
+
+/* Rows y0, y0 + step, ... < maxy of triangle T. */
+static void fast_rows(const FastTri *T, int y0, int step)
+{
+    const XfVert *a = T->a, *b = T->b, *c = T->c;
+    const float area = T->area, zscale = T->zscale;
+    const float e0dx = T->e0dx, e0dy = T->e0dy, e1dx = T->e1dx, e1dy = T->e1dy;
+    const float e2dx = T->e2dx, e2dy = T->e2dy;
+    const int minx = T->minx, maxx = T->maxx, use_z = T->use_z, use_s = T->use_s;
+    const int use_rc = T->use_rc;
     float r[16][4];
+    int x, y, n;
 
-    if (bpp != 4 && bpp != 2)
-        return;
-    if (!a->ok || !b->ok || !c->ok) {
-        s_vsh.tris_clipped++;
-        return;
-    }
-    area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
-    if (area == 0.0f)
-        return;
-    if (s_vsh.cull_enable) {
-        int cw = area > 0.0f;
-        int front = (s_vsh.front_face == 0x900) ? cw : !cw;
-        if (recomp_env(RENV_PB_CULL_FLIP))
-            front = !front;
-        if ((s_vsh.cull_face == 0x405 && !front)
-         || (s_vsh.cull_face == 0x404 && front)
-         || s_vsh.cull_face == 0x408) {
-            s_vsh.tris_culled++;
-            return;
-        }
-    }
-    if (!surface_begin_batch(mem))
-        return;
-    use_z = s_vsh.depth_enable && vsh_zbuf_ready();
-    use_s = vsh_stencil_ready();
-    use_rc = vsh_rc_active();
-
-    minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
-    maxx = (int)ceilf (fmaxf(a->x, fmaxf(b->x, c->x)));
-    miny = (int)floorf(fminf(a->y, fminf(b->y, c->y)));
-    maxy = (int)ceilf (fmaxf(a->y, fmaxf(b->y, c->y)));
-    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
-    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
-    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
-    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
-    if (minx >= maxx || miny >= maxy) {
-        s_gpu.tris_skipped_offscreen++;
-        return;
-    }
-
-    inv_w[0] = 1.0f / a->w; inv_w[1] = 1.0f / b->w; inv_w[2] = 1.0f / c->w;
-    unit_w = a->w == 1.0f && b->w == 1.0f && c->w == 1.0f;
-    e0dx = b->x - a->x; e0dy = b->y - a->y;
-    e1dx = c->x - b->x; e1dy = c->y - b->y;
-    e2dx = a->x - c->x; e2dy = a->y - c->y;
     if (use_rc)
         memcpy(r, s_rcp.tmpl, sizeof r);
 
-    for (y = miny; y < maxy; y++) {
+    for (y = y0; y < T->maxy; y += step) {
         float py = (float)y + 0.5f;
         float p0 = py - a->y, p1 = py - b->y, p2 = py - c->y;
         int lo, hi, ga, gb, la_, lb_, ia, ib;
@@ -3617,10 +3376,10 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                     && (zs = zs_early(use_s, use_z, z, zp, sp, &zs_op)) == 1)
                 continue;
 
-            if (unit_w) {
+            if (T->unit_w) {
                 pa = la; pb = lb; pc = lc;           /* x * (1/1) == x */
             } else {
-                pa = la * inv_w[0]; pb = lb * inv_w[1]; pc = lc * inv_w[2];
+                pa = la * T->inv_w[0]; pb = lb * T->inv_w[1]; pc = lc * T->inv_w[2];
             }
             ps = pa + pb + pc;
             if (ps != 0.0f && ps != 1.0f) { pa /= ps; pb /= ps; pc /= ps; }
@@ -3632,7 +3391,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                 float tc[4];
                 uint32_t d = s_rcp.dirty;
                 while (d) {
-                    int reg = __builtin_ctz(d);
+                    int reg = ctz32(d);
                     memcpy(r[reg], s_rcp.tmpl[reg], sizeof r[reg]);
                     d &= d - 1;
                 }
@@ -3649,8 +3408,8 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                     stage_sample_fast(n, tc, r[8 + n]);
                 }
                 r[12][3] = r[8][3];
-                rc_eval_fast(r, col);
-            } else if (textured) {
+                nv2a_rc_plan_eval(&s_rcp, r, col);
+            } else if (T->textured) {
                 float tc[4], tx[4];
                 for (k = 0; k < 4; k++)
                     tc[k] = pa * a->t[0][k] + pb * b->t[0][k] + pc * c->t[0][k];
@@ -3661,7 +3420,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                 }
             }
             if (s_vsh.atest_enable && !alpha_test_pass(col[3])) {
-                s_vsh.a_rejected++;
+                if (t_cnt) t_cnt->a_rejected++; else s_vsh.a_rejected++;
                 continue;
             }
             if (zs == 2) {                 /* failed stencil or depth */
@@ -3676,9 +3435,263 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                  | ((uint32_t)(clamp01(col[0]) * 255.0f + 0.5f) << 16)
                  | ((uint32_t)(clamp01(col[1]) * 255.0f + 0.5f) <<  8)
                  |  (uint32_t)(clamp01(col[2]) * 255.0f + 0.5f);
-            put_pixel(mem, bpp, x, y, argb);
+            put_pixel(T->mem, T->bpp, x, y, argb);
         }
     }
+}
+
+/* Worker threads for big triangles (upstream's xf_rows_parallel, on Win32
+ * and POSIX threads).
+ *
+ * A full-screen pass is two triangles of 300,000 pixels through the
+ * combiners, and it splits cleanly by row: a pixel reads and writes only its
+ * own colour, depth and stencil, so interleaved rows on N threads need no
+ * locking and give the same pixels as one thread. What they share is
+ * handled apart: the counters go to a per-thread RasterCount (t_cnt) merged
+ * afterwards, in the order one thread would have produced them; a texture
+ * cache tile is filled under s_tc_lock and published with a release store.
+ * A batch that samples the surface it draws into reads pixels other rows
+ * write, so it stays on one thread (s_fast_serial), as does the reference
+ * rasteriser. Small triangles stay on the executor thread, where waking
+ * workers would cost more than it saves.
+ * RECOMP_RASTER_THREADS=<n> sets the count (1 = off); the default leaves a
+ * few cores for the title and the host. */
+#define NV_RASTER_MAX_THREADS 16
+#define NV_RASTER_MT_MIN_PIXELS 8192
+
+static struct {
+    int n;                                  /* threads incl. the caller */
+    const FastTri *tri;
+    /* One slot per thread, 128 bytes apart so no two threads' counters
+     * share a cache line however the array happens to be aligned. */
+    union { RasterCount c; char pad[128]; } cnt[NV_RASTER_MAX_THREADS];
+#if defined(_WIN32)
+    HANDLE start[NV_RASTER_MAX_THREADS], done;
+    volatile LONG pending;
+#else
+    pthread_mutex_t mu;
+    pthread_cond_t go, done;
+    unsigned gen;
+    int pending;
+#endif
+} s_pool;
+
+/* Thread k's share: rows miny + k, miny + k + n, ... */
+static void raster_share(int k)
+{
+    RasterCount *cn = &s_pool.cnt[k].c;
+    memset(cn, 0, sizeof *cn);
+    cn->pixel_max = s_gpu.pixel_max;
+    cn->max_y = -1;
+    t_cnt = cn;
+    fast_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n);
+    t_cnt = NULL;
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI raster_worker(LPVOID arg)
+{
+    int k = (int)(intptr_t)arg;
+    for (;;) {
+        WaitForSingleObject(s_pool.start[k], INFINITE);
+        raster_share(k);
+        if (InterlockedDecrement(&s_pool.pending) == 0)
+            SetEvent(s_pool.done);
+    }
+    return 0;
+}
+#else
+static void *raster_worker(void *arg)
+{
+    int k = (int)(intptr_t)arg;
+    unsigned seen = 0;
+    pthread_mutex_lock(&s_pool.mu);
+    for (;;) {
+        while (s_pool.gen == seen)
+            pthread_cond_wait(&s_pool.go, &s_pool.mu);
+        seen = s_pool.gen;
+        pthread_mutex_unlock(&s_pool.mu);
+        raster_share(k);
+        pthread_mutex_lock(&s_pool.mu);
+        if (--s_pool.pending == 0)
+            pthread_cond_signal(&s_pool.done);
+    }
+    return NULL;
+}
+#endif
+
+static int raster_pool_size(void)
+{
+    static int init;
+    if (!init) {
+        const char *e = recomp_env(RENV_RASTER_THREADS);
+        int n, k, ncpu;
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        ncpu = (int)si.dwNumberOfProcessors;
+#else
+        ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+        init = 1;
+        n = e ? atoi(e) : ncpu - 4;
+        if (n < 1) n = 1;
+        if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
+#if defined(_WIN32)
+        if (n > 1 && !(s_pool.done = CreateEventA(NULL, FALSE, FALSE, NULL)))
+            n = 1;
+        if (n > 1) {
+            for (k = 0; k < n - 1; k++) {
+                HANDLE h = NULL;
+                s_pool.start[k] = CreateEventA(NULL, FALSE, FALSE, NULL);
+                if (s_pool.start[k])
+                    h = CreateThread(NULL, 0, raster_worker, (LPVOID)(intptr_t)k, 0, NULL);
+                if (!h) { n = k + 1; break; }   /* workers 0..k-1 and the caller */
+                CloseHandle(h);
+            }
+        }
+#else
+        if (n > 1) {
+            pthread_mutex_init(&s_pool.mu, NULL);
+            pthread_cond_init(&s_pool.go, NULL);
+            pthread_cond_init(&s_pool.done, NULL);
+            for (k = 0; k < n - 1; k++) {
+                pthread_t th;
+                if (pthread_create(&th, NULL, raster_worker, (void *)(intptr_t)k)) {
+                    n = k + 1;
+                    break;
+                }
+                pthread_detach(th);
+            }
+        }
+#endif
+        s_pool.n = n;
+        if (n > 1)
+            fprintf(stderr, "[GPU] raster: %d threads for triangles of %d+ pixels\n",
+                    n, NV_RASTER_MT_MIN_PIXELS);
+    }
+    return s_pool.n;
+}
+
+/* The per-thread counters into the globals, as one thread would have left
+ * them: sums, and the brightest pixel -- the first one, in raster order, of
+ * the brightest colour, which is the one on the lowest row. */
+static void raster_merge(int n)
+{
+    int k, best = -1;
+    for (k = 0; k < n; k++) {
+        const RasterCount *cn = &s_pool.cnt[k].c;
+        s_gpu.pixels += cn->pixels;
+        s_zpass_count += cn->zpass;
+        s_vsh.z_rejected += cn->z_rejected;
+        s_vsh.a_rejected += cn->a_rejected;
+        if (cn->max_y < 0)
+            continue;                      /* never beat the starting value */
+        if (best < 0
+                || (cn->pixel_max & 0x00FFFFFFu) > (s_pool.cnt[best].c.pixel_max & 0x00FFFFFFu)
+                || ((cn->pixel_max & 0x00FFFFFFu) == (s_pool.cnt[best].c.pixel_max & 0x00FFFFFFu)
+                    && cn->max_y < s_pool.cnt[best].c.max_y))
+            best = k;
+    }
+    if (best >= 0)
+        s_gpu.pixel_max = s_pool.cnt[best].c.pixel_max;
+}
+
+static void fast_rows_parallel(const FastTri *T)
+{
+    int n, k;
+    long px = (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+
+    if (s_fast_serial || px < NV_RASTER_MT_MIN_PIXELS
+            || (n = raster_pool_size()) <= 1 || T->maxy - T->miny < n) {
+        fast_rows(T, T->miny, 1);
+        return;
+    }
+    s_pool.tri = T;
+#if defined(_WIN32)
+    s_pool.pending = n - 1;
+    for (k = 0; k < n - 1; k++)
+        SetEvent(s_pool.start[k]);
+    raster_share(n - 1);
+    WaitForSingleObject(s_pool.done, INFINITE);
+#else
+    pthread_mutex_lock(&s_pool.mu);
+    s_pool.pending = n - 1;
+    s_pool.gen++;
+    pthread_cond_broadcast(&s_pool.go);
+    pthread_mutex_unlock(&s_pool.mu);
+    raster_share(n - 1);
+    pthread_mutex_lock(&s_pool.mu);
+    while (s_pool.pending)
+        pthread_cond_wait(&s_pool.done, &s_pool.mu);
+    pthread_mutex_unlock(&s_pool.mu);
+#endif
+    (void)k;
+    raster_merge(n);
+}
+
+static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c,
+                               int textured)
+{
+    FastTri T;
+    float area;
+    int minx, maxx, miny, maxy;
+
+    T.mem = (uint8_t *)xbox_GetMemoryOffset();
+    T.bpp = surface_bpp();
+    if (T.bpp != 4 && T.bpp != 2)
+        return;
+    if (!a->ok || !b->ok || !c->ok) {
+        s_vsh.tris_clipped++;
+        return;
+    }
+    area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
+    if (area == 0.0f)
+        return;
+    if (s_vsh.cull_enable) {
+        int cw = area > 0.0f;
+        int front = (s_vsh.front_face == 0x900) ? cw : !cw;
+        if (recomp_env(RENV_PB_CULL_FLIP))
+            front = !front;
+        if ((s_vsh.cull_face == 0x405 && !front)
+         || (s_vsh.cull_face == 0x404 && front)
+         || s_vsh.cull_face == 0x408) {
+            s_vsh.tris_culled++;
+            return;
+        }
+    }
+    if (!surface_begin_batch(T.mem))
+        return;
+    T.use_z = s_vsh.depth_enable && vsh_zbuf_ready();
+    T.use_s = vsh_stencil_ready();
+    T.use_rc = vsh_rc_active();
+    T.textured = textured;
+    T.zscale = 1.0f / vsh_zmax();
+
+    minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
+    maxx = (int)ceilf (fmaxf(a->x, fmaxf(b->x, c->x)));
+    miny = (int)floorf(fminf(a->y, fminf(b->y, c->y)));
+    maxy = (int)ceilf (fmaxf(a->y, fmaxf(b->y, c->y)));
+    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
+    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
+    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
+    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (minx >= maxx || miny >= maxy) {
+        s_gpu.tris_skipped_offscreen++;
+        return;
+    }
+
+    T.a = a; T.b = b; T.c = c;
+    T.area = area;
+    T.minx = minx; T.maxx = maxx; T.miny = miny; T.maxy = maxy;
+    T.inv_w[0] = 1.0f / a->w; T.inv_w[1] = 1.0f / b->w; T.inv_w[2] = 1.0f / c->w;
+    T.unit_w = a->w == 1.0f && b->w == 1.0f && c->w == 1.0f;
+    T.e0dx = b->x - a->x; T.e0dy = b->y - a->y;
+    T.e1dx = c->x - b->x; T.e1dy = c->y - b->y;
+    T.e2dx = a->x - c->x; T.e2dy = a->y - c->y;
+
+    fast_rows_parallel(&T);
+
     s_vsh.tris++;
     s_gpu.tris_drawn++;
     s_gpu.drawn_offset = s_gpu.color_offset;
@@ -3690,13 +3703,15 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
 static void fast_batch_setup(void)
 {
     int n;
+    s_fast_serial = 0;
     uint32_t lo = s_gpu.color_offset ? dma_resolve(s_gpu.color_offset) : 0;
     uint32_t hi = lo + (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
     fast_init_tables();
     for (n = 0; n < 4; n++) {
         int mode = s_stage_mode[n];
         const Texture *t = &s_stage_tex[n];
-        s_stage_tc[n] = (mode != 0 && mode != 4) ? tc_bind(t) : NULL;
+        s_stage_tc[n] = (mode != 0 && mode != 4 && !(mode == 3 && t->face_stride))
+                      ? tc_bind(t) : NULL;
         /* A stage reading the surface this batch draws into sees its own
          * earlier pixels: the reference sampler reads memory as it changes,
          * a cached copy would not. A title fade can draw the two back
@@ -3708,6 +3723,12 @@ static void fast_batch_setup(void)
             s_stage_tc[n] = NULL;
             s_tc_feedback++;
         }
+        /* Any stage that may read the target -- cached or not -- would see
+         * pixels other rows are writing: draw that batch on one thread. */
+        if (mode != 0 && mode != 4 && lo && t->valid && t->offset < hi
+                && lo < t->offset + (t->face_stride ? 6u * t->face_stride
+                        : nv2a_tex_extent(t->color, t->width, t->height, t->pitch, 1)))
+            s_fast_serial = 1;
     }
     if (vsh_rc_active())
         rc_plan_build();
@@ -5133,6 +5154,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * because the format is only fully known at END. */
         if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
             s_gpu.inline_buf[s_gpu.inline_count++] = param;
+        else if (s_gpu.prim && !s_inline_overflow++)
+            fprintf(stderr, "  [GPU] INLINE_ARRAY batch over %u dwords:"
+                            " the rest is dropped\n", (unsigned)NV_MAX_INLINE);
         break;
 
     case NV097_DRAW_ARRAYS: {

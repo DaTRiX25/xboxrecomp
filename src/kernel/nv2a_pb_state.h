@@ -47,7 +47,10 @@ typedef struct {
 
 #define NV_VERTEX_ATTRS 16
 #define NV_MAX_INDICES  4096
-#define NV_MAX_INLINE   4096            /* dwords of INLINE_ARRAY per batch */
+/* Dwords of INLINE_ARRAY (or immediate-mode vertices) per batch. 4096 held
+ * a few hundred vertices; a batch past it was cut short with no sign. 64K
+ * holds a thousand vertices of all sixteen attributes (upstream 5c3a42c). */
+#define NV_MAX_INLINE   65536
 
 /* Texture stage 0, decoded from what the title programmed.
  *
@@ -62,6 +65,8 @@ typedef struct {
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
     uint32_t palette, pal_len;          /* P8: guest palette (0 none), entries */
+    uint32_t filter;                    /* SET_TEXTURE_FILTER as written */
+    uint32_t face_stride;               /* cube map: bytes between faces, else 0 */
     int      valid;
 } Texture;
 

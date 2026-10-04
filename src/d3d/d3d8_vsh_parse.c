@@ -3,39 +3,17 @@
  */
 
 #include "d3d8_vsh_parse.h"
+#include "../kernel/nv2a_vsh_fields.h"
 #include <string.h>
 
 /* ================================================================
  * NV2A Instruction Fields
  *
  * Each instruction is 128 bits stored as 4 DWORDs (word[0..3]). The field
- * table is xemu's (hw/xbox/nv2a/pgraph/vsh.c), as (word, shift, bits); it is
- * the same table the CPU interpreter uses (src/kernel/nv2a_vsh_cpu.c), which
- * renders the title correctly, so the two decoders must agree. Word 0
- * carries nothing a program needs.
- *
- *   ILU 1,25,3   MAC 1,21,4   CONST 1,13,8   V 1,9,4
- *   A: NEG 1,8,1  SWZ 1,6/4/2/0,2  R 2,28,4  MUX 2,26,2
- *   B: NEG 2,25,1 SWZ 2,23/21/19/17,2  R 2,13,4  MUX 2,11,2
- *   C: NEG 2,10,1 SWZ 2,8/6/4/2,2  R_HIGH 2,0,2  R_LOW 3,30,2  MUX 3,28,2
- *   OUT: MAC_MASK 3,24,4  R 3,20,4  ILU_MASK 3,16,4  O_MASK 3,12,4
- *        ORB 3,11,1  ADDRESS 3,3,8  MUX 3,2,1
- *   A0X 3,1,1   FINAL 3,0,1
- *
- * MUX for a source: 1 = temp R, 2 = input v, 3 = constant c (0 reads zero).
- * The output MUX says which unit writes the output register (0 MAC, 1 ILU);
- * ORB says whether that is an output register (1) or a constant (0).
- * When both units are active the ILU's temp write goes to R1.
- *
- * (An earlier version of this file used a made-up bit table, MSB-first
- * across word boundaries. It compiled and decoded every title program as
- * nothing but v0 reads.)
+ * table lives in src/kernel/nv2a_vsh_fields.h, the one the CPU interpreter
+ * (src/kernel/nv2a_vsh_cpu.c) decodes through too, so the two cannot
+ * disagree. When both units are active the ILU's temp write goes to R1.
  * ================================================================ */
-
-static inline uint32_t vsh_fld(const uint32_t *w, int word, int shift, int bits)
-{
-    return ((uint32_t)w[word] >> shift) & ((1u << bits) - 1u);
-}
 
 /* ================================================================
  * Microcode Parser
@@ -44,48 +22,25 @@ static inline uint32_t vsh_fld(const uint32_t *w, int word, int shift, int bits)
 static void parse_source(const uint32_t *w, int which, int input_index,
                          int const_index, int rel, NV2AVshSrcOperand *src)
 {
-    uint32_t mux, r;
+    struct nv2a_vsh_src s;
 
-    switch (which) {
-    case 0:
-        src->negate    = (int)vsh_fld(w, 1, 8, 1);
-        src->swizzle.x = (uint8_t)vsh_fld(w, 1, 6, 2);
-        src->swizzle.y = (uint8_t)vsh_fld(w, 1, 4, 2);
-        src->swizzle.z = (uint8_t)vsh_fld(w, 1, 2, 2);
-        src->swizzle.w = (uint8_t)vsh_fld(w, 1, 0, 2);
-        r   = vsh_fld(w, 2, 28, 4);
-        mux = vsh_fld(w, 2, 26, 2);
-        break;
-    case 1:
-        src->negate    = (int)vsh_fld(w, 2, 25, 1);
-        src->swizzle.x = (uint8_t)vsh_fld(w, 2, 23, 2);
-        src->swizzle.y = (uint8_t)vsh_fld(w, 2, 21, 2);
-        src->swizzle.z = (uint8_t)vsh_fld(w, 2, 19, 2);
-        src->swizzle.w = (uint8_t)vsh_fld(w, 2, 17, 2);
-        r   = vsh_fld(w, 2, 13, 4);
-        mux = vsh_fld(w, 2, 11, 2);
-        break;
-    default:
-        src->negate    = (int)vsh_fld(w, 2, 10, 1);
-        src->swizzle.x = (uint8_t)vsh_fld(w, 2, 8, 2);
-        src->swizzle.y = (uint8_t)vsh_fld(w, 2, 6, 2);
-        src->swizzle.z = (uint8_t)vsh_fld(w, 2, 4, 2);
-        src->swizzle.w = (uint8_t)vsh_fld(w, 2, 2, 2);
-        r   = (vsh_fld(w, 2, 0, 2) << 2) | vsh_fld(w, 3, 30, 2);
-        mux = vsh_fld(w, 3, 28, 2);
-        break;
-    }
+    nv2a_vsh_src_decode(w, which, &s);
+    src->negate    = (int)s.neg;
+    src->swizzle.x = (uint8_t)NV2A_VSH_SWZ(s.swz, 0);
+    src->swizzle.y = (uint8_t)NV2A_VSH_SWZ(s.swz, 1);
+    src->swizzle.z = (uint8_t)NV2A_VSH_SWZ(s.swz, 2);
+    src->swizzle.w = (uint8_t)NV2A_VSH_SWZ(s.swz, 3);
     src->rel_addr = 0;
-    switch (mux) {
-    case 1:
+    switch (s.mux) {
+    case NV2A_VSH_MUX_R:
         src->reg_type  = NV2A_VSH_REG_TEMP;
-        src->reg_index = (int)r;
+        src->reg_index = (int)s.reg;
         break;
-    case 2:
+    case NV2A_VSH_MUX_V:
         src->reg_type  = NV2A_VSH_REG_INPUT;
         src->reg_index = input_index;
         break;
-    case 3:
+    case NV2A_VSH_MUX_C:
         src->reg_type  = NV2A_VSH_REG_CONST;
         src->reg_index = const_index;
         src->rel_addr  = rel;
@@ -141,22 +96,22 @@ void d3d8_vsh_parse(const uint32_t *microcode, int num_insns,
     for (i = 0; i < num_insns; i++) {
         const uint32_t *w = &microcode[i * 4];
         NV2AVshInstruction *inst = &program->insns[i];
-        uint32_t out_r    = vsh_fld(w, 3, 20, 4);
-        uint32_t mac_mask = vsh_fld(w, 3, 24, 4);
-        uint32_t ilu_mask = vsh_fld(w, 3, 16, 4);
-        uint32_t o_mask   = vsh_fld(w, 3, 12, 4);
-        uint32_t orb      = vsh_fld(w, 3, 11, 1);
-        uint32_t addr     = vsh_fld(w, 3, 3, 8);
-        uint32_t omux     = vsh_fld(w, 3, 2, 1);
-        int rel           = (int)vsh_fld(w, 3, 1, 1);
+        uint32_t out_r    = NV2A_VSH_OUT_R(w);
+        uint32_t mac_mask = NV2A_VSH_MAC_MASK(w);
+        uint32_t ilu_mask = NV2A_VSH_ILU_MASK(w);
+        uint32_t o_mask   = NV2A_VSH_O_MASK(w);
+        uint32_t orb      = NV2A_VSH_ORB(w);
+        uint32_t addr     = NV2A_VSH_O_ADDR(w);
+        uint32_t omux     = NV2A_VSH_O_MUX(w);
+        int rel           = (int)NV2A_VSH_A0X(w);
         int s;
 
-        inst->mac_op = (NV2AVshMacOp)vsh_fld(w, 1, 21, 4);
-        inst->ilu_op = (NV2AVshIluOp)vsh_fld(w, 1, 25, 3);
+        inst->mac_op = (NV2AVshMacOp)NV2A_VSH_MAC(w);
+        inst->ilu_op = (NV2AVshIluOp)NV2A_VSH_ILU(w);
         if (inst->mac_op >= NV2A_VSH_MAC_COUNT)
             inst->mac_op = NV2A_VSH_MAC_NOP;
-        inst->const_index = (int)vsh_fld(w, 1, 13, 8);
-        inst->input_index = (int)vsh_fld(w, 1, 9, 4);
+        inst->const_index = (int)NV2A_VSH_CONST(w);
+        inst->input_index = (int)NV2A_VSH_INPUT(w);
         if (inst->const_index >= NV2A_VS_MAX_CONSTANTS)
             inst->const_index = 0;
 
@@ -199,7 +154,7 @@ void d3d8_vsh_parse(const uint32_t *microcode, int num_insns,
             }
         }
 
-        inst->is_final = (int)vsh_fld(w, 3, 0, 1);
+        inst->is_final = (int)NV2A_VSH_FINAL(w);
 
         for (s = 0; s < 3; s++)
             if (mac_reads(inst->mac_op, s)

@@ -26,6 +26,7 @@ set(KERNEL_SOURCES
     nv2a_pb_exec.c
     nv2a_backend_common.c
     nv2a_vsh_cpu.c
+    nv2a_combiner.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
