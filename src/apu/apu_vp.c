@@ -753,8 +753,10 @@ struct VpVoiceStat {
 };
 static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
 static int s_vstat_on = -1;
-static int s_vdump_voice = -1;
+static int s_vdump_voice = -1;      /* -2: every voice, one file each */
 static FILE *s_vdump;
+static FILE *s_vdump_all[MCPX_HW_MAX_VOICES];
+static char s_vdump_prefix[512];
 
 static void vp_stat_init(void)
 {
@@ -763,6 +765,17 @@ static void vp_stat_init(void)
     e = recomp_env(RENV_APU_VOICE_DUMP);
     if (e && *e) {
         const char *path = recomp_env(RENV_APU_VOICE_DUMP_FILE);
+        if (!strcmp(e, "all")) {
+            /* RECOMP_APU_VOICE_DUMP=all: <file>.<voice>.raw for each voice
+             * that renders anything (voice slots are not stable between
+             * runs, so a sound cannot be picked by number in advance). */
+            s_vdump_voice = -2;
+            snprintf(s_vdump_prefix, sizeof(s_vdump_prefix), "%s",
+                     path && *path ? path : "voice_dump");
+            fprintf(stderr, "[APU] voice dump: every voice -> %s.<voice>.raw\n",
+                    s_vdump_prefix);
+            return;
+        }
         s_vdump_voice = atoi(e);
         s_vdump = fopen(path && *path ? path : "voice_dump.raw", "wb");
         fprintf(stderr, "[APU] voice dump: voice %d -> %s\n", s_vdump_voice,
@@ -775,7 +788,7 @@ static void vp_stat_samples(MCPXAPUState *d, uint32_t v, const float samples[][2
 {
     struct VpVoiceStat *s = &s_vstat[v];
     if (s_vstat_on < 0) vp_stat_init();
-    if (!s_vstat_on && (int)v != s_vdump_voice) return;
+    if (!s_vstat_on && (int)v != s_vdump_voice && s_vdump_voice != -2) return;
     if (n <= 0) return;
     if (s->frames == 0) {
         s->addr = (uint32_t)first_addr;
@@ -789,9 +802,16 @@ static void vp_stat_samples(MCPXAPUState *d, uint32_t v, const float samples[][2
         s->last = x;
     }
     s->frames += (uint32_t)n;
-    if ((int)v == s_vdump_voice && s_vdump) {
+    if (s_vdump_voice == -2 && !s_vdump_all[v]) {
+        char name[600];
+        snprintf(name, sizeof(name), "%s.%u.raw", s_vdump_prefix, (unsigned)v);
+        s_vdump_all[v] = fopen(name, "wb");
+    }
+    {
+        FILE *df = s_vdump_voice == -2 ? s_vdump_all[v]
+                 : (int)v == s_vdump_voice ? s_vdump : NULL;
         int16_t out[NUM_SAMPLES_PER_FRAME * 2];
-        for (int i = 0; i < n && i < NUM_SAMPLES_PER_FRAME; i++) {
+        for (int i = 0; df && i < n && i < NUM_SAMPLES_PER_FRAME; i++) {
             for (int c = 0; c < 2; c++) {
                 float x = samples[i][c] * 32767.0f;
                 if (x > 32767.0f) x = 32767.0f;
@@ -799,7 +819,8 @@ static void vp_stat_samples(MCPXAPUState *d, uint32_t v, const float samples[][2
                 out[2 * i + c] = (int16_t)x;
             }
         }
-        fwrite(out, sizeof(int16_t) * 2, (size_t)(n < NUM_SAMPLES_PER_FRAME ? n : NUM_SAMPLES_PER_FRAME), s_vdump);
+        if (df)
+            fwrite(out, sizeof(int16_t) * 2, (size_t)(n < NUM_SAMPLES_PER_FRAME ? n : NUM_SAMPLES_PER_FRAME), df);
     }
     (void)d;
 }
@@ -828,6 +849,8 @@ static void vp_stat_report(void)
         s->frames = 0; s->zc = 0; s->sq = 0;
     }
     if (s_vdump) fflush(s_vdump);
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++)
+        if (s_vdump_all[v]) fflush(s_vdump_all[v]);
 }
 
 /* ============================================================

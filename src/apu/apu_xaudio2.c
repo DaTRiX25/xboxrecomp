@@ -263,6 +263,15 @@ unsigned xa2_underruns(void)
     return g_xa2_underruns;
 }
 
+uint64_t xa2_samples_played(void)
+{
+    XAUDIO2_VOICE_STATE state;
+
+    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+    return state.SamplesPlayed;
+}
+
 #else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */
 
 typedef int apu_xaudio2_posix_unused;

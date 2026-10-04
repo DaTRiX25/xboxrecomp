@@ -60,4 +60,12 @@ static inline void xa2_pacing_marks(int buf_samples, int count, int period,
 /* Times the voice ran dry after audio started ([XA2] underrun x%u). */
 unsigned xa2_underruns(void);
 
+/* Samples the device has consumed since init: XAudio2's SamplesPlayed, or
+ * on SDL2 everything queued minus what is still queued. Read against the
+ * wall clock this is the host-side starvation measure: while the device
+ * plays, it advances 48000 a second; whatever it falls behind is silence
+ * the device inserted (an underrun the WAV tap, which records submissions,
+ * cannot see). */
+uint64_t xa2_samples_played(void);
+
 #endif /* APU_XAUDIO2_H */
