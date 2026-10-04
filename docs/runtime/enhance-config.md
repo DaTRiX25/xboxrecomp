@@ -7,6 +7,16 @@ from, how the environment overrides it, and the key names.
 
 ## Where the file is read from, and precedence
 
+A title calls `xbox_enhance_init(root, title)` (`src/enhance/enhance.h`) once
+at startup, after `recomp_env_init` and before the guest starts. `root` is
+where the file lives. The file is runtime configuration that belongs to an
+installed game, so a title passes the directory of its executable,
+`recomp_exe_dir()` (`src/platform/recomp_exe_dir.h`: `_NSGetExecutablePath`
+on macOS, `GetModuleFileNameA` on Windows, `/proc/self/exe` on Linux, the
+working directory if none works). During development that is the build
+directory; `RECOMP_ENHANCE_CONFIG=<path>` points anywhere else. A title with
+one executable passes `title = NULL`, so the file is `<root>/enhance.toml`.
+
 For a key, the first of these that has a value wins:
 
 1. The environment variable bound to the key, for example `RECOMP_RENDER_SCALE`
@@ -99,7 +109,9 @@ the stock settings.
 | Key | Type | Values | Default | Env override |
 |---|---|---|---|---|
 | `render.scale` | int | internal resolution factor: 1, 2, 3, ... | `1` | `RECOMP_RENDER_SCALE` |
-| `display.aspect` | string | `"4:3"`, `"16:9"`, `"16:10"`, `"21:9"` | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
+| `display.aspect` | string | `"4:3"` only for now (`"16:9"`, `"16:10"`, `"21:9"` are reported as not implemented, and 4:3 is used) | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
+| `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
+| `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `fps.mode` | string | `"lock30"` (stock), `"lock60"`, `"free"` | `"lock30"` | the game's `RECOMP_FPS` |
 | `aspect.program.<hash>` | string | `"hud"`, `"stretch"`, `"3d"`: a per-shader override of the aspect classifier | none | none |
 
@@ -110,9 +122,52 @@ the key to its own environment variable:
 The input-selection keys (`[input]`) will be added later, when that work is
 done.
 
+### What the render and present keys do
+
+`xbox_enhance_init` reads them once and hands them to the backends and the
+presenter as `nv2a_host_opts` (`src/kernel/nv2a_backend_common.h`). Those
+libraries never link the layer: without it the options are all zero, which
+is stock. One line shows the values in force:
+
+```
+[ENHANCE] render.scale=2 present.filter=integer present.fullscreen=0 (display.aspect=4:3)
+```
+
+- **`render.scale = N`** (1..4; outside that it is clamped, with a line).
+  Metal and D3D11 allocate every colour and depth target at N times its
+  guest size and draw with an N-times viewport. The pixel-to-NDC mapping
+  stays on the guest size, so every vertex program, the pre-transformed
+  HUD ones included, lands where it did, at N times the pixels.
+  Render-to-texture samples the scaled target (supersampled). The frame the
+  guest sees is still guest-sized: Metal box-filters its write-back to
+  guest memory, so `RECOMP_FB_DUMP` and `fb_dump_at` frames stay 640x480.
+  Visibility-test counts are divided by N squared before the title reads
+  them, a non-zero count staying non-zero. The window gets the full-size
+  frame. The CPU rasteriser draws into guest memory at the guest pitch, so
+  it ignores the key and says so once
+  (`[ENHANCE] render.scale=N ignored: ...`).
+  - Known differences from the console: post passes that sample with
+    guest-texel offsets (blurs) cover N times fewer host pixels and look
+    sharper; lines and points stay one host pixel wide.
+  - D3D11 `d3d11_dump` frames of a scaled run are the render target at host
+    size (1280x960 at 2x). Golden frames are compared at the stock size
+    only, and a golden run pins `RECOMP_RENDER_SCALE=1`.
+- **`present.filter`.** `nearest` is the stock letterbox. `linear` is the
+  same letterbox with bilinear filtering. `integer` shows the frame at the
+  largest whole multiple that fits, centred on black; a frame larger than
+  the window (2x in a small window) is fitted with linear filtering instead
+  of cropped. The SDL window (macOS, Linux, every backend) and the D3D11
+  window follow it. The D3D11 window also follows resizes now; at stock it
+  still copies the frame into its 640x480 back buffer, and anything else
+  goes through a scaling blit. The Win32 GDI window of the CPU backend does
+  not follow these keys yet.
+- **`present.fullscreen`.** A borderless window covering the display at
+  start, with no mode change (SDL `FULLSCREEN_DESKTOP`; D3D11 a `WS_POPUP`
+  the primary monitor's size). There is no hotkey yet.
+
 ### Naming rule
 
-- Tables group keys by feature: `[render]`, `[display]`, `[fps]`, `[aspect]`.
+- Tables group keys by feature: `[render]`, `[present]`, `[display]`, `[fps]`, `[aspect]`.
   Key names are lower case, with `_` between words.
 - A key that has an environment override uses the variable `RECOMP_` + the
   dotted key in upper case with `.` replaced by `_`. For example,
@@ -129,6 +184,8 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_ENHANCE_CONFIG` | path of the one file to read, or `none` |
 | `RECOMP_RENDER_SCALE` | overrides `render.scale` |
 | `RECOMP_DISPLAY_ASPECT` | overrides `display.aspect` |
+| `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
+| `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 
 The layer converts an environment value to the type of the key:
 
@@ -168,7 +225,8 @@ Every getter accepts a NULL config and then returns its default.
 `enhance_cfg.h` is the layering that modules use:
 
 ```c
-enhance_cfg_init(data_root, title_dir);          /* once at startup; logs the files */
+xbox_enhance_init(recomp_exe_dir(), NULL);      /* the toolkit's keys: enhance.h */
+enhance_cfg_init(data_root, title_dir);          /* the reader alone; logs the files */
 enhance_cfg_bind_env("fps.mode", RENV_FPS);      /* a game key with an env override */
 int scale = (int)enhance_cfg_int("render.scale", 1);
 int mode  = enhance_cfg_choice("fps.mode", fps, 0);
