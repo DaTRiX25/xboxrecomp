@@ -36,15 +36,11 @@ static void check(int ok, const char *what, const char *detail)
     if (!ok) failures++;
 }
 
-/* What a title's own fault handler does for these registers. */
+/* What a title's own fault handler does: hand the fault to the toolkit's
+ * trapped-MMIO dispatch, which routes it to the OHCI model. */
 static void on_fault(int sig, siginfo_t *si, void *ucv)
 {
-    uintptr_t fault = (uintptr_t)si->si_addr;
-    uint64_t rel = (uint64_t)fault - (uint64_t)s_base;
-
-    if (fault >= s_base && rel < 0x100000000ull
-            && xbox_OhciOwnsAddress((uint32_t)rel)
-            && xbox_OhciHandleMmio(ucv, (uint32_t)rel))
+    if (xbox_PosixMmioFault(ucv, (uintptr_t)si->si_addr))
         return;
     s_unhandled = 1;
     signal(sig, SIG_DFL);           /* re-faults and dies: a FAIL by crash */
