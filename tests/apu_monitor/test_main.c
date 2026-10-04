@@ -40,6 +40,7 @@ int  xa2_is_active(void)     { return 1; }
 int  xa2_get_buffer_size(void) { return 512; }
 int  xa2_get_buffer_count(void) { return 4; }
 unsigned xa2_underruns(void) { return 0; }
+uint64_t xa2_samples_played(void) { return dev_head; }
 int  xa2_queued_samples(void) { return (int)(dev_tail - dev_head); }
 void xa2_expect_drain(void)  {}
 int  xa2_submit_samples(const int16_t *s, int n)
