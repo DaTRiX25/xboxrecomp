@@ -199,7 +199,7 @@ const wchar_t *xbox_LastHostPath(void)
 /* Each partition device's size in 512-byte sectors, matching the table, so a
  * title that asks the device how big it is gets an answer consistent with
  * the table it just read. Partition0 is the whole disk and is not sized. */
-static const unsigned long long s_part_sectors[6] = {
+static const uint64_t s_part_sectors[6] = {
     0,             /* 0: whole disk                   */
     0x00465400ull, /* 1: E: game and saves            */
     0x000FA000ull, /* 2: C: system                    */
