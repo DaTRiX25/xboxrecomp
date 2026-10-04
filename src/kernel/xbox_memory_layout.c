@@ -716,6 +716,100 @@ static void ac97_arm_write_trap(void)
 }
 
 /*
+ * Trapped-MMIO dispatch: one call for a title's fault handler.
+ *
+ * Three models answer hardware registers by faulting on them -- the APU, the
+ * AC'97 bus-master page and the USB OHCI controllers -- and each has its own
+ * handler. A title's fault handler used to call them one by one, and a title
+ * whose handler missed one (OHCI, on POSIX) died at that device's first
+ * register access. These route the fault to whichever model owns the address
+ * and return 1 when it was serviced, so the caller resumes the thread instead
+ * of reporting a crash. They only re-route: each model's own handler does the
+ * work, unchanged.
+ */
+#include "apu/apu.h"
+#include "usb/ohci.h"
+
+#define MMIO_APU_BASE 0xFE800000u   /* what MemoryLayoutInit unmaps for the APU */
+#define MMIO_APU_END  0xFE880000u
+
+extern MCPXAPUState *g_apu_state;   /* apu_mmio_hook.c; NULL until audio is up */
+
+/* The guest VA a host fault address names. Only an address inside the 4 GB
+ * guest window names one: truncating the offset to 32 bits would let a host
+ * address far above it alias into a device range. */
+static int mmio_fault_va(uintptr_t fault, uint32_t *va)
+{
+    uintptr_t base = (uintptr_t)xbox_GetMemoryOffset();
+    uint64_t rel = (uint64_t)fault - (uint64_t)base;
+
+    if (fault < base || rel >= 0x100000000ull)
+        return 0;
+    *va = (uint32_t)rel;
+    return 1;
+}
+
+#if defined(_WIN32)
+extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                                 uint32_t fault_xbox_va, int is_write);
+
+/* Win32: call from the title's VEH for an access violation; on 1, return
+ * EXCEPTION_CONTINUE_EXECUTION. APU, then OHCI. The AC'97 page needs no call
+ * here: its trap is a VEH of its own, installed first, because it single-steps
+ * the write and so has to see the EXCEPTION_SINGLE_STEP that follows. */
+int xbox_VehMmioFault(void *exception_pointers)
+{
+    PEXCEPTION_POINTERS ep = (PEXCEPTION_POINTERS)exception_pointers;
+    uintptr_t fault;
+    uint32_t va;
+
+    if (!ep || ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return 0;
+    fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+    if (!mmio_fault_va(fault, &va))
+        return 0;
+    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
+        return g_apu_state
+            && apu_hook_handle_mmio(ep->ContextRecord, fault, va,
+                   ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0);
+    if (xbox_OhciOwnsAddress(va))
+        return xbox_OhciHandleMmio(ep->ContextRecord, va);
+    return 0;
+}
+#else
+#if defined(__aarch64__)
+extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
+                                       uint32_t fault_xbox_va, int is_write);
+#endif
+
+/* POSIX: call from the title's SIGBUS/SIGSEGV handler (SA_SIGINFO) with its
+ * ucontext_t * and si_addr; on 1, return from the handler and the thread
+ * resumes after the emulated instruction. APU, then AC'97, then OHCI. Only
+ * arm64 hosts have a decoder; elsewhere nothing is trapped and this returns
+ * 0. */
+int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
+{
+#if defined(__aarch64__)
+    uint32_t va;
+
+    if (!mmio_fault_va(fault, &va))
+        return 0;
+    /* The APU decodes the direction from the opcode; is_write is advisory. */
+    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
+        return g_apu_state
+            && apu_hook_handle_mmio_posix(ucv, fault, va, 0);
+    if (xbox_Ac97PosixFault(ucv, fault))
+        return 1;
+    if (xbox_OhciOwnsAddress(va))
+        return xbox_OhciHandleMmio(ucv, va);
+#else
+    (void)ucv; (void)fault;
+#endif
+    return 0;
+}
+#endif
+
+/*
  * Command words the DSP stub completes instantly. A bring-up probe, not a
  * model.
  *

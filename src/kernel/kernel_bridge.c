@@ -3325,6 +3325,21 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h)
         BRIDGE_MEM32(handle_va) = bridge_handle_token(h);
 }
 
+/* An untagged token as a native HANDLE. The guest's pseudo-handles,
+ * NtCurrentProcess() (-1) and NtCurrentThread() (-2), are 32-bit negative
+ * values; zero-extending them gives 0x00000000FFFFFFFF / ...FFFE, which no
+ * 64-bit host treats as "the current process/thread". Windows fails
+ * DuplicateHandle on it, and the POSIX shim dereferences it as an object.
+ * Sign-extend those two so they reach the host as its own pseudo-handles.
+ * Every other untagged value is a synthetic/dummy handle and passes through
+ * unchanged. */
+static HANDLE bridge_untagged_handle(uint32_t token)
+{
+    if (token == 0xFFFFFFFFu || token == 0xFFFFFFFEu)
+        return (HANDLE)(intptr_t)(int32_t)token;
+    return (HANDLE)(uintptr_t)token;
+}
+
 /* Resolve a 32-bit Xbox handle slot back to a native HANDLE. */
 static HANDLE bridge_read_handle(uint32_t va)
 {
@@ -3333,8 +3348,7 @@ static HANDLE bridge_read_handle(uint32_t va)
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
     }
-    /* Untagged value: synthetic/dummy handle -- pass through unchanged. */
-    return (HANDLE)(uintptr_t)token;
+    return bridge_untagged_handle(token);
 }
 
 /* Resolve a token to a HANDLE and release its table slot (for NtClose). */
@@ -3356,8 +3370,7 @@ static HANDLE bridge_resolve_handle(uint32_t token)
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
     }
-    /* Untagged: synthetic/dummy handle -- pass through unchanged. */
-    return (HANDLE)(uintptr_t)token;
+    return bridge_untagged_handle(token);
 }
 
 static HANDLE bridge_take_handle(uint32_t token)
@@ -5702,6 +5715,15 @@ static void bridge_NtDuplicateObject(void)
     if (!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
                          &dup, 0, FALSE, opts)) {
         g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
+        return;
+    }
+    /* A host may hand back the current-process pseudo-handle itself as the
+     * duplicate (the POSIX shim does). It is not a table handle -- the token
+     * allocator would read it as INVALID_HANDLE_VALUE -- so give the guest
+     * its own NtCurrentProcess() value, which resolves back to it. */
+    if (dup == (HANDLE)(intptr_t)-1) {
+        BRIDGE_MEM32(target_va) = 0xFFFFFFFFu;
+        g_eax = 0;
         return;
     }
     BRIDGE_MEM32(target_va) = bridge_handle_token_ex(dup, 1);

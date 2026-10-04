@@ -1020,6 +1020,21 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     int fd;
+    /* A partition device opened as a directory: the volume, for a free-space
+     * query, rather than the image's bytes. As in the Win32 backend, the
+     * directory holding the image answers that. */
+    if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+        struct stat st;
+        if (stat(host_path, &st) == 0 && S_ISREG(st.st_mode)) {
+            char *slash = strrchr(host_path, '/');
+            if (slash && slash != host_path) {
+                *slash = '\0';
+                xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                         "NtCreateFile: directory open of a device image, "
+                         "using its containing directory instead");
+            }
+        }
+    }
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             mkdir(host_path, 0755);   /* EEXIST is fine */

@@ -53,6 +53,9 @@ endif()
 # The watchdog finalises the APU's WAV dump before _exit (apu_wav_close_nowait).
 # Link-only, so xbox_apu follows xbox_kernel on the link line.
 target_link_libraries(xbox_kernel PRIVATE xbox_apu)
+# The trapped-MMIO dispatch (xbox_PosixMmioFault, xbox_VehMmioFault) routes
+# to the APU and to the USB OHCI model.
+target_link_libraries(xbox_kernel PRIVATE xbox_usb)
 
 if(MSVC)
     target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
