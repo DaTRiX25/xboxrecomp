@@ -40,6 +40,14 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_zbuf_cache.h"
+#if defined(_WIN32)
+#include <windows.h>
+#define NV_TLS __declspec(thread)
+#else
+#include <pthread.h>
+#include <unistd.h>
+#define NV_TLS __thread
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -256,6 +264,17 @@ static uint32_t s_sema_last_va, s_sema_last_value;
 #define NV097_GET_REPORT                    0x17D0
 static uint32_t s_zpass_count;           /* since the last CLEAR_REPORT_VALUE */
 static int      s_zpass_enable;
+
+/* The rasteriser's per-pixel counters, when a worker thread draws rows of a
+ * triangle (fast_rows_parallel): each thread counts into its own, merged
+ * into s_gpu, s_vsh and s_zpass_count afterwards. NULL on the executor
+ * thread outside that, where the globals are written directly. */
+typedef struct {
+    uint64_t pixels, z_rejected, a_rejected;
+    uint32_t zpass, pixel_max;
+    int      max_y;                     /* row pixel_max was set on, -1 none */
+} RasterCount;
+static NV_TLS RasterCount *t_cnt;
 static uint32_t s_reports, s_reports_zero;
 uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_sema_releases; }
 uint32_t nv2a_pb_exec_semaphore_last_va(void) { return s_sema_last_va; }
@@ -1213,6 +1232,16 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
 
 static uint64_t s_tex_fail[256];        /* texels refused, by format code */
 
+/* s_tex_fail[k]++, returning the old count: raster threads sample too. */
+static uint64_t tex_fail_count(uint64_t *c)
+{
+#if defined(_WIN32)
+    return (uint64_t)InterlockedIncrement64((volatile LONG64 *)c) - 1u;
+#else
+    return __atomic_fetch_add(c, 1, __ATOMIC_RELAXED);
+#endif
+}
+
 static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -1250,7 +1279,7 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
     /* Magenta, so an undecoded format shows up as itself rather than as the
      * vertex colour (which made P8 and G8B8 surfaces look like
      * plain white boxes). Logged once per format. */
-    if (!s_tex_fail[t->color & 0xFF]++)
+    if (!tex_fail_count(&s_tex_fail[t->color & 0xFF]))
         fprintf(stderr, "  [GPU] texture format 0x%02X has no decoder;"
                         " sampling magenta\n", t->color);
     *argb = NV2A_TEX_MAGENTA;
@@ -1398,12 +1427,24 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     } else {
         row = s_surface + (size_t)y * s_gpu.pitch;
     }
-    s_zpass_count += (uint32_t)s_zpass_enable;   /* passed every test */
-    if (s_gpu.color_keep == 0xFFFFFFFFu)
-        return;                            /* SET_COLOR_MASK: no channel written */
-    s_gpu.pixels++;
-    if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
-        s_gpu.pixel_max = argb;
+    if (t_cnt) {
+        RasterCount *cn = t_cnt;
+        cn->zpass += (uint32_t)s_zpass_enable;
+        if (s_gpu.color_keep == 0xFFFFFFFFu)
+            return;
+        cn->pixels++;
+        if ((argb & 0x00FFFFFFu) > (cn->pixel_max & 0x00FFFFFFu)) {
+            cn->pixel_max = argb;
+            cn->max_y = y;
+        }
+    } else {
+        s_zpass_count += (uint32_t)s_zpass_enable;   /* passed every test */
+        if (s_gpu.color_keep == 0xFFFFFFFFu)
+            return;                        /* SET_COLOR_MASK: no channel written */
+        s_gpu.pixels++;
+        if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
+            s_gpu.pixel_max = argb;
+    }
 
     /* src*srcAlpha + dst*(1-srcAlpha) first, on its own path, because it was
      * the only pair here for a long time and the intro was checked against
@@ -2272,7 +2313,7 @@ static int zs_early(int use_s, int use_z, float z, const float *zp,
     if (use_s && !stencil_pass(*sp))
         *op = s_vsh.stencil_op[0];
     else if (use_z && !depth_pass(z, *zp)) {
-        s_vsh.z_rejected++;
+        if (t_cnt) t_cnt->z_rejected++; else s_vsh.z_rejected++;
         if (!use_s)
             return 1;
         *op = s_vsh.stencil_op[1];
@@ -2970,6 +3011,7 @@ typedef struct {
 
 static TexCacheEntry  s_tc[TC_ENTRIES];
 static TexCacheEntry *s_stage_tc[4];
+static int            s_fast_serial;    /* this batch draws on one thread */
 static uint32_t       s_tc_clock;
 static uint64_t       s_tc_tiles_filled, s_tc_refp, s_tc_dropped, s_tc_binds;
 static uint64_t       s_tc_feedback;    /* binds read live: texture is the target */
@@ -3069,7 +3111,51 @@ static TexCacheEntry *tc_bind(const Texture *t)
     return e;
 }
 
+/* A tile's ready flag, read and published across raster threads: the
+ * texels a filled flag guards must be visible before the flag is. */
+#if defined(_MSC_VER) && !defined(__clang__)
+static inline int tile_ready(const uint8_t *f)
+{
+    return ReadAcquire8((const volatile CHAR *)f);    /* winnt.h, any arch */
+}
+static inline void tile_publish(uint8_t *f)
+{
+    WriteRelease8((volatile CHAR *)f, 1);
+}
+#else
+static inline int tile_ready(const uint8_t *f)
+{
+    return __atomic_load_n(f, __ATOMIC_ACQUIRE);
+}
+static inline void tile_publish(uint8_t *f)
+{
+    __atomic_store_n(f, (uint8_t)1, __ATOMIC_RELEASE);
+}
+#endif
+
+/* Tile fills from raster threads take turns; the executor thread alone
+ * binds, drops and resizes entries, between triangles. */
+#if defined(_WIN32)
+static SRWLOCK s_tc_lock = SRWLOCK_INIT;
+#define TC_LOCK()   AcquireSRWLockExclusive(&s_tc_lock)
+#define TC_UNLOCK() ReleaseSRWLockExclusive(&s_tc_lock)
+#else
+static pthread_mutex_t s_tc_lock = PTHREAD_MUTEX_INITIALIZER;
+#define TC_LOCK()   pthread_mutex_lock(&s_tc_lock)
+#define TC_UNLOCK() pthread_mutex_unlock(&s_tc_lock)
+#endif
+
+static void tc_fill_locked(TexCacheEntry *e, const Texture *t, uint32_t tile);
+
 static void tc_fill(TexCacheEntry *e, const Texture *t, uint32_t tile)
+{
+    TC_LOCK();
+    if (!e->tile_ok[tile])                  /* another thread may have */
+        tc_fill_locked(e, t, tile);
+    TC_UNLOCK();
+}
+
+static void tc_fill_locked(TexCacheEntry *e, const Texture *t, uint32_t tile)
 {
     uint32_t x0 = (tile % e->tiles_x) << TC_TILE_LOG;
     uint32_t y0 = (tile / e->tiles_x) << TC_TILE_LOG;
@@ -3084,7 +3170,7 @@ static void tc_fill(TexCacheEntry *e, const Texture *t, uint32_t tile)
             sample_tex(t, x, y, &texel);   /* cacheable formats always decode */
             e->texels[(size_t)y * e->width + x] = texel;
         }
-    e->tile_ok[tile] = 1;
+    tile_publish(&e->tile_ok[tile]);
     s_tc_tiles_filled++;
     s_rt.tex += rt_now() - t0;
 }
@@ -3093,7 +3179,7 @@ static void tc_fill(TexCacheEntry *e, const Texture *t, uint32_t tile)
 static inline void texel_cached(TexCacheEntry *e, int n, int iu, int iv, float o[4])
 {
     uint32_t tile = ((uint32_t)iv >> TC_TILE_LOG) * e->tiles_x + ((uint32_t)iu >> TC_TILE_LOG);
-    if (!e->tile_ok[tile])
+    if (!tile_ready(&e->tile_ok[tile]))
         tc_fill(e, &s_stage_tex[n], tile);
     rc_unpack_fast(e->texels[(size_t)iv * e->width + (uint32_t)iu], o);
 }
@@ -3131,7 +3217,7 @@ static void stage_sample_fast(int n, const float tc[4], float o[4])
             uint32_t tile = ((uint32_t)v[0] >> TC_TILE_LOG) * e->tiles_x
                           + ((uint32_t)u[0] >> TC_TILE_LOG);
             const uint32_t *p0;
-            if (!e->tile_ok[tile])
+            if (!tile_ready(&e->tile_ok[tile]))
                 tc_fill(e, tx, tile);
             p0 = &e->texels[(size_t)v[0] * e->width + (uint32_t)u[0]];
             rc_unpack_fast(p0[0], c[0]);
@@ -3223,65 +3309,46 @@ static void edge_interval(float dx, float p, float dy, float vx, int sign,
     }
 }
 
-static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c,
-                               int textured)
-{
-    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
-    float area, inv_w[3], zscale = 1.0f / vsh_zmax();
-    int minx, maxx, miny, maxy, x, y, use_z, use_s, use_rc, n, unit_w;
+/* Everything a triangle's pixels need, computed once per triangle, so the
+ * pixel loop can run over any subset of rows on any thread. */
+typedef struct {
+    const XfVert *a, *b, *c;
+    uint8_t *mem;
+    uint32_t bpp;
+    float area, inv_w[3], zscale;
     float e0dx, e0dy, e1dx, e1dy, e2dx, e2dy;
+    int minx, maxx, miny, maxy, use_z, use_s, use_rc, textured, unit_w;
+} FastTri;
+
+/* Index of the lowest set bit of a non-zero word. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+static inline int ctz32(uint32_t v)
+{
+    unsigned long i;
+    _BitScanForward(&i, v);
+    return (int)i;
+}
+#else
+static inline int ctz32(uint32_t v) { return __builtin_ctz(v); }
+#endif
+
+/* Rows y0, y0 + step, ... < maxy of triangle T. */
+static void fast_rows(const FastTri *T, int y0, int step)
+{
+    const XfVert *a = T->a, *b = T->b, *c = T->c;
+    const float area = T->area, zscale = T->zscale;
+    const float e0dx = T->e0dx, e0dy = T->e0dy, e1dx = T->e1dx, e1dy = T->e1dy;
+    const float e2dx = T->e2dx, e2dy = T->e2dy;
+    const int minx = T->minx, maxx = T->maxx, use_z = T->use_z, use_s = T->use_s;
+    const int use_rc = T->use_rc;
     float r[16][4];
+    int x, y, n;
 
-    if (bpp != 4 && bpp != 2)
-        return;
-    if (!a->ok || !b->ok || !c->ok) {
-        s_vsh.tris_clipped++;
-        return;
-    }
-    area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
-    if (area == 0.0f)
-        return;
-    if (s_vsh.cull_enable) {
-        int cw = area > 0.0f;
-        int front = (s_vsh.front_face == 0x900) ? cw : !cw;
-        if (env_cached("RECOMP_PB_CULL_FLIP"))
-            front = !front;
-        if ((s_vsh.cull_face == 0x405 && !front)
-         || (s_vsh.cull_face == 0x404 && front)
-         || s_vsh.cull_face == 0x408) {
-            s_vsh.tris_culled++;
-            return;
-        }
-    }
-    if (!surface_begin_batch(mem))
-        return;
-    use_z = s_vsh.depth_enable && vsh_zbuf_ready();
-    use_s = vsh_stencil_ready();
-    use_rc = vsh_rc_active();
-
-    minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
-    maxx = (int)ceilf (fmaxf(a->x, fmaxf(b->x, c->x)));
-    miny = (int)floorf(fminf(a->y, fminf(b->y, c->y)));
-    maxy = (int)ceilf (fmaxf(a->y, fmaxf(b->y, c->y)));
-    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
-    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
-    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
-    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
-    if (minx >= maxx || miny >= maxy) {
-        s_gpu.tris_skipped_offscreen++;
-        return;
-    }
-
-    inv_w[0] = 1.0f / a->w; inv_w[1] = 1.0f / b->w; inv_w[2] = 1.0f / c->w;
-    unit_w = a->w == 1.0f && b->w == 1.0f && c->w == 1.0f;
-    e0dx = b->x - a->x; e0dy = b->y - a->y;
-    e1dx = c->x - b->x; e1dy = c->y - b->y;
-    e2dx = a->x - c->x; e2dy = a->y - c->y;
     if (use_rc)
         memcpy(r, s_rcp.tmpl, sizeof r);
 
-    for (y = miny; y < maxy; y++) {
+    for (y = y0; y < T->maxy; y += step) {
         float py = (float)y + 0.5f;
         float p0 = py - a->y, p1 = py - b->y, p2 = py - c->y;
         int lo, hi, ga, gb, la_, lb_, ia, ib;
@@ -3335,10 +3402,10 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                     && (zs = zs_early(use_s, use_z, z, zp, sp, &zs_op)) == 1)
                 continue;
 
-            if (unit_w) {
+            if (T->unit_w) {
                 pa = la; pb = lb; pc = lc;           /* x * (1/1) == x */
             } else {
-                pa = la * inv_w[0]; pb = lb * inv_w[1]; pc = lc * inv_w[2];
+                pa = la * T->inv_w[0]; pb = lb * T->inv_w[1]; pc = lc * T->inv_w[2];
             }
             ps = pa + pb + pc;
             if (ps != 0.0f && ps != 1.0f) { pa /= ps; pb /= ps; pc /= ps; }
@@ -3350,7 +3417,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                 float tc[4];
                 uint32_t d = s_rcp.dirty;
                 while (d) {
-                    int reg = __builtin_ctz(d);
+                    int reg = ctz32(d);
                     memcpy(r[reg], s_rcp.tmpl[reg], sizeof r[reg]);
                     d &= d - 1;
                 }
@@ -3368,7 +3435,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                 }
                 r[12][3] = r[8][3];
                 nv2a_rc_plan_eval(&s_rcp, r, col);
-            } else if (textured) {
+            } else if (T->textured) {
                 float tc[4], tx[4];
                 for (k = 0; k < 4; k++)
                     tc[k] = pa * a->t[0][k] + pb * b->t[0][k] + pc * c->t[0][k];
@@ -3379,7 +3446,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                 }
             }
             if (s_vsh.atest_enable && !alpha_test_pass(col[3])) {
-                s_vsh.a_rejected++;
+                if (t_cnt) t_cnt->a_rejected++; else s_vsh.a_rejected++;
                 continue;
             }
             if (zs == 2) {                 /* failed stencil or depth */
@@ -3394,9 +3461,263 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
                  | ((uint32_t)(clamp01(col[0]) * 255.0f + 0.5f) << 16)
                  | ((uint32_t)(clamp01(col[1]) * 255.0f + 0.5f) <<  8)
                  |  (uint32_t)(clamp01(col[2]) * 255.0f + 0.5f);
-            put_pixel(mem, bpp, x, y, argb);
+            put_pixel(T->mem, T->bpp, x, y, argb);
         }
     }
+}
+
+/* Worker threads for big triangles (upstream's xf_rows_parallel, on Win32
+ * and POSIX threads).
+ *
+ * A full-screen pass is two triangles of 300,000 pixels through the
+ * combiners, and it splits cleanly by row: a pixel reads and writes only its
+ * own colour, depth and stencil, so interleaved rows on N threads need no
+ * locking and give the same pixels as one thread. What they share is
+ * handled apart: the counters go to a per-thread RasterCount (t_cnt) merged
+ * afterwards, in the order one thread would have produced them; a texture
+ * cache tile is filled under s_tc_lock and published with a release store.
+ * A batch that samples the surface it draws into reads pixels other rows
+ * write, so it stays on one thread (s_fast_serial), as does the reference
+ * rasteriser. Small triangles stay on the executor thread, where waking
+ * workers would cost more than it saves.
+ * RECOMP_RASTER_THREADS=<n> sets the count (1 = off); the default leaves a
+ * few cores for the title and the host. */
+#define NV_RASTER_MAX_THREADS 16
+#define NV_RASTER_MT_MIN_PIXELS 8192
+
+static struct {
+    int n;                                  /* threads incl. the caller */
+    const FastTri *tri;
+    /* One slot per thread, 128 bytes apart so no two threads' counters
+     * share a cache line however the array happens to be aligned. */
+    union { RasterCount c; char pad[128]; } cnt[NV_RASTER_MAX_THREADS];
+#if defined(_WIN32)
+    HANDLE start[NV_RASTER_MAX_THREADS], done;
+    volatile LONG pending;
+#else
+    pthread_mutex_t mu;
+    pthread_cond_t go, done;
+    unsigned gen;
+    int pending;
+#endif
+} s_pool;
+
+/* Thread k's share: rows miny + k, miny + k + n, ... */
+static void raster_share(int k)
+{
+    RasterCount *cn = &s_pool.cnt[k].c;
+    memset(cn, 0, sizeof *cn);
+    cn->pixel_max = s_gpu.pixel_max;
+    cn->max_y = -1;
+    t_cnt = cn;
+    fast_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n);
+    t_cnt = NULL;
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI raster_worker(LPVOID arg)
+{
+    int k = (int)(intptr_t)arg;
+    for (;;) {
+        WaitForSingleObject(s_pool.start[k], INFINITE);
+        raster_share(k);
+        if (InterlockedDecrement(&s_pool.pending) == 0)
+            SetEvent(s_pool.done);
+    }
+    return 0;
+}
+#else
+static void *raster_worker(void *arg)
+{
+    int k = (int)(intptr_t)arg;
+    unsigned seen = 0;
+    pthread_mutex_lock(&s_pool.mu);
+    for (;;) {
+        while (s_pool.gen == seen)
+            pthread_cond_wait(&s_pool.go, &s_pool.mu);
+        seen = s_pool.gen;
+        pthread_mutex_unlock(&s_pool.mu);
+        raster_share(k);
+        pthread_mutex_lock(&s_pool.mu);
+        if (--s_pool.pending == 0)
+            pthread_cond_signal(&s_pool.done);
+    }
+    return NULL;
+}
+#endif
+
+static int raster_pool_size(void)
+{
+    static int init;
+    if (!init) {
+        const char *e = getenv("RECOMP_RASTER_THREADS");
+        int n, k, ncpu;
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        ncpu = (int)si.dwNumberOfProcessors;
+#else
+        ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+        init = 1;
+        n = e ? atoi(e) : ncpu - 4;
+        if (n < 1) n = 1;
+        if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
+#if defined(_WIN32)
+        if (n > 1 && !(s_pool.done = CreateEventA(NULL, FALSE, FALSE, NULL)))
+            n = 1;
+        if (n > 1) {
+            for (k = 0; k < n - 1; k++) {
+                HANDLE h = NULL;
+                s_pool.start[k] = CreateEventA(NULL, FALSE, FALSE, NULL);
+                if (s_pool.start[k])
+                    h = CreateThread(NULL, 0, raster_worker, (LPVOID)(intptr_t)k, 0, NULL);
+                if (!h) { n = k + 1; break; }   /* workers 0..k-1 and the caller */
+                CloseHandle(h);
+            }
+        }
+#else
+        if (n > 1) {
+            pthread_mutex_init(&s_pool.mu, NULL);
+            pthread_cond_init(&s_pool.go, NULL);
+            pthread_cond_init(&s_pool.done, NULL);
+            for (k = 0; k < n - 1; k++) {
+                pthread_t th;
+                if (pthread_create(&th, NULL, raster_worker, (void *)(intptr_t)k)) {
+                    n = k + 1;
+                    break;
+                }
+                pthread_detach(th);
+            }
+        }
+#endif
+        s_pool.n = n;
+        if (n > 1)
+            fprintf(stderr, "[GPU] raster: %d threads for triangles of %d+ pixels\n",
+                    n, NV_RASTER_MT_MIN_PIXELS);
+    }
+    return s_pool.n;
+}
+
+/* The per-thread counters into the globals, as one thread would have left
+ * them: sums, and the brightest pixel -- the first one, in raster order, of
+ * the brightest colour, which is the one on the lowest row. */
+static void raster_merge(int n)
+{
+    int k, best = -1;
+    for (k = 0; k < n; k++) {
+        const RasterCount *cn = &s_pool.cnt[k].c;
+        s_gpu.pixels += cn->pixels;
+        s_zpass_count += cn->zpass;
+        s_vsh.z_rejected += cn->z_rejected;
+        s_vsh.a_rejected += cn->a_rejected;
+        if (cn->max_y < 0)
+            continue;                      /* never beat the starting value */
+        if (best < 0
+                || (cn->pixel_max & 0x00FFFFFFu) > (s_pool.cnt[best].c.pixel_max & 0x00FFFFFFu)
+                || ((cn->pixel_max & 0x00FFFFFFu) == (s_pool.cnt[best].c.pixel_max & 0x00FFFFFFu)
+                    && cn->max_y < s_pool.cnt[best].c.max_y))
+            best = k;
+    }
+    if (best >= 0)
+        s_gpu.pixel_max = s_pool.cnt[best].c.pixel_max;
+}
+
+static void fast_rows_parallel(const FastTri *T)
+{
+    int n, k;
+    long px = (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+
+    if (s_fast_serial || px < NV_RASTER_MT_MIN_PIXELS
+            || (n = raster_pool_size()) <= 1 || T->maxy - T->miny < n) {
+        fast_rows(T, T->miny, 1);
+        return;
+    }
+    s_pool.tri = T;
+#if defined(_WIN32)
+    s_pool.pending = n - 1;
+    for (k = 0; k < n - 1; k++)
+        SetEvent(s_pool.start[k]);
+    raster_share(n - 1);
+    WaitForSingleObject(s_pool.done, INFINITE);
+#else
+    pthread_mutex_lock(&s_pool.mu);
+    s_pool.pending = n - 1;
+    s_pool.gen++;
+    pthread_cond_broadcast(&s_pool.go);
+    pthread_mutex_unlock(&s_pool.mu);
+    raster_share(n - 1);
+    pthread_mutex_lock(&s_pool.mu);
+    while (s_pool.pending)
+        pthread_cond_wait(&s_pool.done, &s_pool.mu);
+    pthread_mutex_unlock(&s_pool.mu);
+#endif
+    (void)k;
+    raster_merge(n);
+}
+
+static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c,
+                               int textured)
+{
+    FastTri T;
+    float area;
+    int minx, maxx, miny, maxy;
+
+    T.mem = (uint8_t *)xbox_GetMemoryOffset();
+    T.bpp = surface_bpp();
+    if (T.bpp != 4 && T.bpp != 2)
+        return;
+    if (!a->ok || !b->ok || !c->ok) {
+        s_vsh.tris_clipped++;
+        return;
+    }
+    area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
+    if (area == 0.0f)
+        return;
+    if (s_vsh.cull_enable) {
+        int cw = area > 0.0f;
+        int front = (s_vsh.front_face == 0x900) ? cw : !cw;
+        if (env_cached("RECOMP_PB_CULL_FLIP"))
+            front = !front;
+        if ((s_vsh.cull_face == 0x405 && !front)
+         || (s_vsh.cull_face == 0x404 && front)
+         || s_vsh.cull_face == 0x408) {
+            s_vsh.tris_culled++;
+            return;
+        }
+    }
+    if (!surface_begin_batch(T.mem))
+        return;
+    T.use_z = s_vsh.depth_enable && vsh_zbuf_ready();
+    T.use_s = vsh_stencil_ready();
+    T.use_rc = vsh_rc_active();
+    T.textured = textured;
+    T.zscale = 1.0f / vsh_zmax();
+
+    minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
+    maxx = (int)ceilf (fmaxf(a->x, fmaxf(b->x, c->x)));
+    miny = (int)floorf(fminf(a->y, fminf(b->y, c->y)));
+    maxy = (int)ceilf (fmaxf(a->y, fmaxf(b->y, c->y)));
+    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
+    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
+    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
+    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (minx >= maxx || miny >= maxy) {
+        s_gpu.tris_skipped_offscreen++;
+        return;
+    }
+
+    T.a = a; T.b = b; T.c = c;
+    T.area = area;
+    T.minx = minx; T.maxx = maxx; T.miny = miny; T.maxy = maxy;
+    T.inv_w[0] = 1.0f / a->w; T.inv_w[1] = 1.0f / b->w; T.inv_w[2] = 1.0f / c->w;
+    T.unit_w = a->w == 1.0f && b->w == 1.0f && c->w == 1.0f;
+    T.e0dx = b->x - a->x; T.e0dy = b->y - a->y;
+    T.e1dx = c->x - b->x; T.e1dy = c->y - b->y;
+    T.e2dx = a->x - c->x; T.e2dy = a->y - c->y;
+
+    fast_rows_parallel(&T);
+
     s_vsh.tris++;
     s_gpu.tris_drawn++;
     s_gpu.drawn_offset = s_gpu.color_offset;
@@ -3408,6 +3729,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
 static void fast_batch_setup(void)
 {
     int n;
+    s_fast_serial = 0;
     uint32_t lo = s_gpu.color_offset ? dma_resolve(s_gpu.color_offset) : 0;
     uint32_t hi = lo + (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
     fast_init_tables();
@@ -3427,6 +3749,12 @@ static void fast_batch_setup(void)
             s_stage_tc[n] = NULL;
             s_tc_feedback++;
         }
+        /* Any stage that may read the target -- cached or not -- would see
+         * pixels other rows are writing: draw that batch on one thread. */
+        if (mode != 0 && mode != 4 && lo && t->valid && t->offset < hi
+                && lo < t->offset + (t->face_stride ? 6u * t->face_stride
+                        : nv2a_tex_extent(t->color, t->width, t->height, t->pitch, 1)))
+            s_fast_serial = 1;
     }
     if (vsh_rc_active())
         rc_plan_build();
