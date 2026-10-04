@@ -914,7 +914,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     uint32_t last_status = 0;
     unsigned repeats = 0;
     unsigned held_off = 0;
-    int      held_off_warned = 0, held_off_forced = 0;
+    int      held_off_warned = 0, held_off_forced = 0, gated = 0;
     unsigned last_ack = 0;
 
     (void)unused;
@@ -1076,7 +1076,11 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * asserted anyway. The common case still holds the ISR out of the
          * guest's critical section; the pathological case costs a delay
          * instead of the device. */
-        if (xbox_IrqlBlocksInterrupts() && ++held_off <= OHCI_IRQ_HOLDOFF) {
+        /* The one-CPU gate, as the APU model takes it: when free, no thread
+         * at DISPATCH_LEVEL, DPC or KeSynchronizeExecution routine runs
+         * beside the ISR; when held, the hold-off below applies. */
+        gated = xbox_DispatchGateTryEnter();
+        if (!gated && ++held_off <= OHCI_IRQ_HOLDOFF) {
             if (!held_off_warned) {
                 held_off_warned = 1;
                 fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
@@ -1113,6 +1117,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                                 "with no acknowledgement; stopping\n",
                         hc->index, status);
                 fflush(stderr);
+                if (gated)
+                    xbox_DispatchGateLeave();
                 break;
             }
         } else {
@@ -1121,6 +1127,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             repeats     = 0;
         }
         ohci_raise(hc, status);
+        if (gated)
+            xbox_DispatchGateLeave();
     }
     return 0;
 }

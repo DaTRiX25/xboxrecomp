@@ -256,10 +256,12 @@ static void apu_deliver_irq(MCPXAPUState *d)
         tib_ready = 1;
     }
     /* The one-CPU gate (xbox_DispatchGateTryEnter): with it, no thread at
-     * DISPATCH_LEVEL and no DPC runs alongside the routine. A holder at
-     * DISPATCH holds delivery off as before, then it goes ahead without. */
+     * DISPATCH_LEVEL, no DPC and no KeSynchronizeExecution routine runs
+     * alongside the routine. Whoever holds it (the last of these holds it
+     * without raising the IRQL depth) holds delivery off as before, then it
+     * goes ahead without. */
     gated = xbox_DispatchGateTryEnter();
-    if (!gated && xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
+    if (!gated && ++held_off <= 50) {
         apu_irq_stats.held_frames++;
         return;
     }
