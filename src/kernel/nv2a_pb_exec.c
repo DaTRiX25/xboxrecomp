@@ -796,63 +796,80 @@ static void dump_present_bmp(void)
                 path, s_present.w, s_present.h, s_present.offset);
 }
 
-/* RECOMP_FB_DUMP_AT=<flips>: with RECOMP_FB_DUMP, the frame each listed flip
- * presents, as <prefix>flip_NNNNN.bmp named by the flip number (the number
+/* RECOMP_FB_DUMP_AT=<flips>: the frame each listed flip presents, as
+ * <prefix>flip_NNNNN.bmp named by the flip number (the number
  * RECOMP_FLIP_LOG prints), whatever else dumps in between. <flips> is a comma
  * list of numbers and ranges (a-b), up to 64 items. Flip N is the frame
  * RECOMP_D3D11_DUMP writes as present N, so a golden-frame script can ask for
- * dump k as flip 60k+1, or for a window around an event. Needs a
- * backend that writes back (Metal) or the CPU path. */
-static void dump_at_flip(uint32_t flip)
-{
-    static int parsed;
-    static int n;
-    static uint32_t lo[64], hi[64];
-    const char *prefix = recomp_env(RENV_FB_DUMP);
-    char path[512];
-    int i;
+ * dump k as flip 60k+1, or for a window around an event. The CPU path and
+ * backends that write back (Metal) are dumped here, from guest memory, with
+ * the RECOMP_FB_DUMP prefix; a backend that presents from its own surfaces
+ * (D3D11) dumps the listed flips itself (nv2a_pb_dump_at_listed). */
+static int s_dump_at_n = -1;
+static uint32_t s_dump_at_lo[64], s_dump_at_hi[64];
 
-    if (!parsed) {
-        const char *e = recomp_env(RENV_FB_DUMP_AT);
-        parsed = 1;
-        while (e && *e && n < 64) {
-            char *end;
-            unsigned long a = strtoul(e, &end, 10), b = a;
+static void dump_at_parse(void)
+{
+    const char *e = recomp_env(RENV_FB_DUMP_AT);
+    int n = 0;
+
+    while (e && *e && n < 64) {
+        char *end;
+        unsigned long a = strtoul(e, &end, 10), b = a;
+        if (end == e)
+            break;
+        if (*end == '-') {
+            e = end + 1;
+            b = strtoul(e, &end, 10);
             if (end == e)
                 break;
-            if (*end == '-') {
-                e = end + 1;
-                b = strtoul(e, &end, 10);
-                if (end == e)
-                    break;
-            }
-            if (b >= a) {
-                lo[n] = (uint32_t)a;
-                hi[n] = (uint32_t)b;
-                n++;
-            }
-            e = *end == ',' ? end + 1 : end;
-            if (*end != ',')
-                break;
         }
-        if (n) {
-            const struct nv2a_pb_backend *be = nv2a_pb_get_backend();
-            fprintf(stderr, "  [GPU] fb_dump_at: %d flip ranges\n", n);
-            if (!prefix)
+        if (b >= a) {
+            s_dump_at_lo[n] = (uint32_t)a;
+            s_dump_at_hi[n] = (uint32_t)b;
+            n++;
+        }
+        e = *end == ',' ? end + 1 : end;
+        if (*end != ',')
+            break;
+    }
+    s_dump_at_n = n;
+}
+
+int nv2a_pb_dump_at_listed(uint32_t flip)
+{
+    int i;
+
+    if (s_dump_at_n < 0)
+        dump_at_parse();
+    for (i = 0; i < s_dump_at_n; i++)
+        if (flip >= s_dump_at_lo[i] && flip <= s_dump_at_hi[i])
+            return 1;
+    return 0;
+}
+
+static void dump_at_flip(uint32_t flip)
+{
+    static int checked;
+    static int here;    /* this path dumps (CPU, write-back backend) */
+    const char *prefix = recomp_env(RENV_FB_DUMP);
+    char path[512];
+
+    if (!checked) {
+        const struct nv2a_pb_backend *be = nv2a_pb_get_backend();
+        checked = 1;
+        if (s_dump_at_n < 0)
+            dump_at_parse();
+        here = be == nv2a_pb_cpu_backend() || be->writes_back;
+        if (s_dump_at_n) {
+            fprintf(stderr, "  [GPU] fb_dump_at: %d flip ranges%s\n", s_dump_at_n,
+                    here ? "" : ", dumped by the backend");
+            if (here && !prefix)
                 fprintf(stderr, "  [GPU] WARNING: fb_dump_at is set without"
                         " fb_dump; no flips will be dumped\n");
-            else if (be != nv2a_pb_cpu_backend() && !be->writes_back)
-                fprintf(stderr, "  [GPU] WARNING: fb_dump_at with a backend"
-                        " that does not write back (D3D11 presents from its own"
-                        " swap chain): the dumps hold stale guest memory\n");
         }
     }
-    if (!n || !prefix)
-        return;
-    for (i = 0; i < n; i++)
-        if (flip >= lo[i] && flip <= hi[i])
-            break;
-    if (i == n)
+    if (!here || !prefix || !nv2a_pb_dump_at_listed(flip))
         return;
     snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix, flip);
     if (!write_present_bmp(path))
