@@ -36,6 +36,16 @@ add_compile_definitions(
 # the kernel HLE and the graphics/audio/input layers build on.
 add_subdirectory(src/platform)
 
+# Enhancements (render scale, aspect, frame pacing, mods) and their config
+# file, enhance.toml. Opt-in: off by default; a title turns it on and calls it.
+# ON adds the xbox_enhance library and the layer's RECOMP_* config keys
+# (recomp_env.h, RECOMP_ENV_HAVE_ENHANCE_KEYS).
+option(XBOXRECOMP_ENHANCE "Build the opt-in enhancements layer (src/enhance)" OFF)
+if(XBOXRECOMP_ENHANCE)
+    target_compile_definitions(recomp_env PUBLIC RECOMP_ENV_HAVE_ENHANCE_KEYS)
+    add_subdirectory(src/enhance)
+endif()
+
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 
@@ -75,4 +85,7 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_nv2a
     xbox_video
 )
+if(XBOXRECOMP_ENHANCE)
+    target_link_libraries(xboxrecomp INTERFACE xbox_enhance)
+endif()
 

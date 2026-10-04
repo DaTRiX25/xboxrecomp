@@ -50,6 +50,20 @@ extern "C" {
 #define RECOMP_ENV_GAME_KEYS(X)
 #endif
 
+/* The opt-in enhancements layer (src/enhance/, XBOXRECOMP_ENHANCE=ON) adds
+ * its config-tier keys by defining RECOMP_ENV_HAVE_ENHANCE_KEYS on this
+ * target. They mirror keys of the enhancements file (enhance.toml) and win
+ * over it: the variable is RECOMP_ + the dotted key, upper case, '.' -> '_'.
+ * Without the layer they do not exist, so the table is what it always was. */
+#ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS
+#define RECOMP_ENV_ENHANCE_KEYS(X) \
+    X(ENHANCE_CONFIG,    CONFIG, "RECOMP_ENHANCE_CONFIG",    NULL, "enhancements file: a path, or none (default: <root>/<title>/enhance.toml, <root>/enhance.toml)") \
+    X(RENDER_SCALE,      CONFIG, "RECOMP_RENDER_SCALE",      NULL, "enhancements: render.scale, internal resolution factor (1 = stock)") \
+    X(DISPLAY_ASPECT,    CONFIG, "RECOMP_DISPLAY_ASPECT",    NULL, "enhancements: display.aspect, 4:3 (stock), 16:9, 16:10, 21:9")
+#else
+#define RECOMP_ENV_ENHANCE_KEYS(X)
+#endif
+
 /* X(ID, TIER, NAME, LEGACY, HELP)
  *   CONFIG: NAME is the variable; LEGACY an older variable, or NULL.
  *   TRACE / DEBUG: NAME is the key in RECOMP_TRACE / RECOMP_DEBUG; LEGACY
@@ -193,6 +207,8 @@ extern "C" {
     X(PAD_SCRIPT,        DEBUG, "pad_script",      "RECOMP_PAD_SCRIPT",        "=ms:btn[+btn][:hold],... or =@file: timed pad presses") \
     X(PAD_LIVE,          DEBUG, "pad_live",        "RECOMP_PAD_LIVE",          "=file: press each line appended to it (btn[+btn][:hold])") \
     X(PB_REPORT_MS,      TRACE, "pb_report_ms",    "RECOMP_PB_REPORT_MS",      "=ms: [PB] report / fb_dump interval (10000, min 100)") \
+    /* ── the enhancements layer's keys (RECOMP_ENV_ENHANCE_KEYS, below) ── */ \
+    RECOMP_ENV_ENHANCE_KEYS(X) \
     /* ── the game's own keys (RECOMP_ENV_GAME_KEYS, below) ──────────────── */ \
     RECOMP_ENV_GAME_KEYS(X)
 
