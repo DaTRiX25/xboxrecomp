@@ -82,6 +82,10 @@ int xa2_init(void)
     if (recomp_env_on(RENV_HEADLESS))
         SDL_setenv("SDL_AUDIODRIVER", "dummy", 0);
 
+    /* Audio pulls in SDL's event subsystem, which would trap SIGINT and
+     * SIGTERM into SDL_QUIT; nothing pumps events in a headless run, so
+     * Ctrl-C would be swallowed. Keep the process defaults. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_AUDIO)) {
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
             fprintf(stderr, "[SDL2] audio init failed: %s\n", SDL_GetError());

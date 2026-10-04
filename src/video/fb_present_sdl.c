@@ -356,13 +356,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                       ? atof(recomp_env(RENV_WINDOW_QUIT_AFTER)) : 0.0;
     uint32_t shown_flip = 0;
 
+    /* Ctrl-C and SIGTERM keep their default meaning (benches rely on it);
+     * SDL would turn them into SDL_QUIT. Set before the headless return:
+     * audio and input start SDL subsystems in headless runs too. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (recomp_env_on(RENV_HEADLESS))
         return guest_main();
     shot_parse();
 
-    /* Ctrl-C and SIGTERM keep their default meaning (benches rely on it);
-     * SDL would turn them into SDL_QUIT. */
-    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "[PRESENT] SDL video unavailable (%s); running headless\n",
