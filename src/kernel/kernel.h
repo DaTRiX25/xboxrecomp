@@ -792,6 +792,9 @@ KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
 int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
+int     xbox_DispatchGateTryEnter(void);       /* the one-CPU gate: ISR delivery */
+void    xbox_DispatchGateEnter(void);
+void    xbox_DispatchGateLeave(void);
 void    xbox_IrqlLeaveInterrupt(int saved);
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.

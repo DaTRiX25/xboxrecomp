@@ -184,6 +184,8 @@ extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
+extern int  xbox_DispatchGateTryEnter(void);
+extern void xbox_DispatchGateLeave(void);
 #if defined(_MSC_VER)
 #  define APU_TLS __declspec(thread)
 #else
@@ -233,18 +235,11 @@ static void apu_deliver_irq(MCPXAPUState *d)
     static unsigned held_off;
     uint32_t kint, routine, context;
     apu_guest_fn fn;
-    int slot;
+    int slot, gated;
 
     apu_irq_stats_line();
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
         return;
-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
-        apu_irq_stats.held_frames++;
-        return;
-    }
-    if (held_off > 50)
-        apu_irq_stats.forced++;
-    held_off = 0;
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
         return;
@@ -260,9 +255,25 @@ static void apu_deliver_irq(MCPXAPUState *d)
         g_fs_base = tib;
         tib_ready = 1;
     }
-    slot = xbox_worker_stack_alloc();
-    if (slot < 0)
+    /* The one-CPU gate (xbox_DispatchGateTryEnter): with it, no thread at
+     * DISPATCH_LEVEL, no DPC and no KeSynchronizeExecution routine runs
+     * alongside the routine. Whoever holds it (the last of these holds it
+     * without raising the IRQL depth) holds delivery off as before, then it
+     * goes ahead without. */
+    gated = xbox_DispatchGateTryEnter();
+    if (!gated && ++held_off <= 50) {
+        apu_irq_stats.held_frames++;
         return;
+    }
+    if (held_off > 50)
+        apu_irq_stats.forced++;
+    held_off = 0;
+    slot = xbox_worker_stack_alloc();
+    if (slot < 0) {
+        if (gated)
+            xbox_DispatchGateLeave();
+        return;
+    }
 
     qemu_mutex_unlock(&d->lock);
     g_esp = XBOX_WORKER_STACK_TOP(slot);
@@ -274,6 +285,8 @@ static void apu_deliver_irq(MCPXAPUState *d)
     apu_irq_stats.delivered++;
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
+    if (gated)
+        xbox_DispatchGateLeave();
 
     {
         static unsigned n;
