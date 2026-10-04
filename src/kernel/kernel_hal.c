@@ -206,6 +206,37 @@ static BOOL CALLBACK dispatch_gate_init(PINIT_ONCE once, PVOID param, PVOID *ctx
     return TRUE;
 }
 
+static void dispatch_gate_once(void)
+{
+    InitOnceExecuteOnce(&s_dispatch_gate_once, dispatch_gate_init, NULL, NULL);
+}
+
+/* For device models delivering an ISR, and KeSynchronizeExecution. On the
+ * console an ISR runs with the one CPU to itself: the code it interrupted is
+ * frozen. DirectSound counts on that: its DPC raises a counter around each
+ * voice callback and the ISR leaves the voice lists alone while it is set,
+ * a check-then-act that is only safe when the two never run at once. So an
+ * ISR is delivered holding the gate when it is free. When a DISPATCH-level
+ * holder has it, the model keeps its old bounded hold-off and then delivers
+ * without it, because a title may spin at DISPATCH on something only the
+ * ISR does (on hardware the ISR would preempt it). */
+int xbox_DispatchGateTryEnter(void)
+{
+    dispatch_gate_once();
+    return TryEnterCriticalSection(&s_dispatch_gate) ? 1 : 0;
+}
+
+void xbox_DispatchGateEnter(void)
+{
+    dispatch_gate_once();
+    EnterCriticalSection(&s_dispatch_gate);
+}
+
+void xbox_DispatchGateLeave(void)
+{
+    LeaveCriticalSection(&s_dispatch_gate);
+}
+
 static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
                              int gate)
 {
@@ -218,8 +249,7 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
     t_irql_counted = now;
 
     if (now && gate) {
-        InitOnceExecuteOnce(&s_dispatch_gate_once, dispatch_gate_init,
-                            NULL, NULL);
+        dispatch_gate_once();
         EnterCriticalSection(&s_dispatch_gate);
         t_dispatch_gate_held = 1;
     }

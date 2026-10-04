@@ -2363,10 +2363,8 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
  * ran -- the same failure as an unqueued DPC, and just as quiet: the driver
  * asks for exclusive access, is told it did not get it, and skips the work.
  *
- * ponytail: no lock is taken. Nothing else here runs at ISR IRQL, and the one
- * caller that matters is a device model on its own thread; if two of those
- * ever contend, this wants the interrupt object's own lock rather than a
- * global one.
+ * The lock is the one-CPU gate the device models deliver ISRs under (one
+ * for all interrupts, not the interrupt object's own).
  */
 static void bridge_KeSynchronizeExecution(void)
 {
@@ -2388,7 +2386,12 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    /* The ISR's exclusion: device ISRs are delivered holding the one-CPU
+     * gate (xbox_DispatchGateTryEnter), so holding it here keeps the routine
+     * and the ISR apart, as the interrupt's spinlock at DIRQL does. */
+    xbox_DispatchGateEnter();
     fn();
+    xbox_DispatchGateLeave();
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
