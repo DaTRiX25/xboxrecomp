@@ -3,9 +3,10 @@
  * The driver arms FETFORCE1 so that an idle voice traps the front end, and
  * resumes it from its ISR. This checks the device half of that: the trap
  * records the method and latches FETINTSTS, which asserts GINTSTS when IEN
- * allows; an ack while still trapped keeps the line up (level-triggered, so
- * the ISR is owed another call); resuming and acking drops it; a masked trap
- * keeps the line low and an unarmed one does not trap.
+ * allows; the ISR's ack clears it even though the front end is still trapped
+ * (it acks before it resumes, and a re-latched bit would replay the stale
+ * method on the next delivery); nothing after the resume brings it back; a
+ * masked trap keeps the line low and an unarmed one does not trap.
  *
  * A trap only sets set_irq; the frame thread turns that into the line. An
  * ISTS write runs the same update, so a write of 0 (acks nothing) stands in
@@ -63,17 +64,34 @@ int main(void)
     CHECK("FETINTSTS latched", reg(d, NV_PAPU_ISTS) & NV_PAPU_ISTS_FETINTSTS);
     CHECK("line asserted", line(d));
 
-    /* 2. The ISR acks before it resumes the front end: still trapped, so the
-     *    ack re-latches and the line stays up for a second call. */
+    /* 2. The ISR acks before it resumes the front end. The trap was one
+     *    event: the ack clears it although FECTL is still trapped. */
     mcpx_apu_mmio_write(d, NV_PAPU_ISTS, 0xFFFFFFFFu, 4);
-    CHECK("ack while trapped keeps the line", line(d));
+    CHECK("ack while trapped drops the line", !line(d));
+    CHECK("ack while trapped clears FETINTSTS",
+          !(reg(d, NV_PAPU_ISTS) & NV_PAPU_ISTS_FETINTSTS));
 
-    /* 3. Resumed (FECTL free running) and acked: the line drops. */
+    /* 3. Resumed (FECTL free running, trap reason left at REQUESTED, as the
+     *    driver leaves it): a later status update must not bring the old
+     *    trap back, or the ISR handles FEDECPARAM's voice a second time. */
+    mcpx_apu_mmio_write(d, NV_PAPU_FECTL,
+                        NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING
+                            | NV_PAPU_FECTL_FETRAPREASON_REQUESTED, 4);
+    settle(d);
+    CHECK("resume: no stale FETINTSTS",
+          !(reg(d, NV_PAPU_ISTS) & NV_PAPU_ISTS_FETINTSTS));
+    CHECK("resume: line low", !line(d));
+    CHECK("ISTS clear", reg(d, NV_PAPU_ISTS) == 0);
+
+    /* 3b. The driver halting the front end itself is not a trap. */
+    mcpx_apu_mmio_write(d, NV_PAPU_FECTL, NV_PAPU_FECTL_FEMETHMODE_HALTED
+                            | NV_PAPU_FECTL_FETRAPREASON_REQUESTED, 4);
+    settle(d);
+    CHECK("halted: no FETINTSTS",
+          !(reg(d, NV_PAPU_ISTS) & NV_PAPU_ISTS_FETINTSTS));
+    CHECK("halted: line low", !line(d));
     mcpx_apu_mmio_write(d, NV_PAPU_FECTL,
                         NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING, 4);
-    mcpx_apu_mmio_write(d, NV_PAPU_ISTS, 0xFFFFFFFFu, 4);
-    CHECK("resume + ack drops the line", !line(d));
-    CHECK("ISTS clear", reg(d, NV_PAPU_ISTS) == 0);
 
     /* 4. Masked: the trap still latches its status but the line stays low. */
     mcpx_apu_mmio_write(d, NV_PAPU_IEN, 0x00, 4);

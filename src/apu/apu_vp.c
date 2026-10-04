@@ -495,6 +495,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+            /* Latched here, once per trap; update_irq no longer re-derives
+             * it from FECTL (see there). */
+            qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
             d->set_irq = true;
             apu_irq_stats.traps++;
         }

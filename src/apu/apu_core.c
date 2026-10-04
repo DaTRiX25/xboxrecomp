@@ -140,11 +140,24 @@ const char *mcpx_apu_phys_class(uint64_t addr)
  * routine never ran and no voice completion ever reached it. */
 static volatile LONG s_irq_line;
 
+/* FETINTSTS is not derived from FECTL here. It is latched once, where the
+ * front end traps (fe_method), and an ISTS write clears it like any other
+ * status bit.
+ *
+ * This used to OR FETINTSTS back in whenever FECTL's method mode was not
+ * free running (the mask also matches HALTED). The guest's service routine
+ * acks ISTS first and resumes the front end afterwards, so its own ack
+ * re-latched the bit, and FETRAPREASON is left at REQUESTED after the
+ * resume. The next delivery -- a frame later, or the next notification --
+ * found FETINTSTS with a stale trap reason and handled FEDECMETH/FEDECPARAM a
+ * second time. By then the title's threads, which run alongside the
+ * interrupt here, had often released that voice: the routine looked the
+ * stale voice up, got a null object and dereferenced it (a read at
+ * 0xFFFFFFBE). A guest that halts the front end itself and later acks
+ * anything got the same stale replay, plus an unwanted resume. It also made
+ * every trap cost two or three ISR calls instead of one. */
 static void update_irq(MCPXAPUState *d)
 {
-    if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
-        qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
-    }
     if ((d->regs[NV_PAPU_IEN] & NV_PAPU_ISTS_GINTSTS) &&
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
