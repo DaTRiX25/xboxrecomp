@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include "recomp_env.h"
 #include <stdint.h>
+#include <stddef.h>   /* ptrdiff_t */
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
