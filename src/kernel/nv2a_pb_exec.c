@@ -2216,6 +2216,13 @@ static void vsh_transform(uint32_t index, XfVert *xv)
     xv->y = o.o[NV2A_VSH_O_POS][1];
     xv->z = o.o[NV2A_VSH_O_POS][2];
     xv->w = o.o[NV2A_VSH_O_POS][3];
+    /* oPos.w == 0 means a program that never divided by w (x, y, z are
+     * already surface units): use w = 1, as the D3D11/Metal epilogues do and
+     * as xemu's clampAwayZeroInf keeps such a vertex in front of the eye.
+     * 1 rather than xemu's 2^-64: 1/w then cannot overflow the CPU LOD
+     * quotient, and the triangle keeps the unit-w fast path. */
+    if (xv->w == 0.0f)
+        xv->w = 1.0f;
     for (k = 0; k < 4; k++) {
         float c = o.o[NV2A_VSH_O_D0][k], s = o.o[NV2A_VSH_O_D1][k];
         int t;
