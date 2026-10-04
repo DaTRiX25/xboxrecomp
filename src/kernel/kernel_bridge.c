@@ -2580,6 +2580,24 @@ static int kernel_raise_interrupt(uint32_t vector)
  * has read it) and PMC's is left up for the DPC. This thread then waits for
  * the DPC's ack write, the bit coming back, and clears both. It blocks on an
  * event between vblanks, and gives up after 2 ms if no ack comes. */
+/* Milliseconds on the performance counter, for the vblank schedule, the
+ * kernel timers and the vblank ack wait. GetTickCount64 is not good enough
+ * for those under Wine: it reads a tick the wineserver advances in steps of
+ * up to ~16 ms, so a schedule run on it fires vblanks 4-33 ms apart while
+ * still averaging 60 Hz, and a title that does its streaming work once per
+ * vblank misses its deadlines on the long gaps. */
+static long long kernel_clock_ms(void)
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+
+    if (!freq.QuadPart && !QueryPerformanceFrequency(&freq))
+        return (long long)GetTickCount64();
+    QueryPerformanceCounter(&now);
+    return (long long)(now.QuadPart / freq.QuadPart) * 1000
+           + (long long)(now.QuadPart % freq.QuadPart) * 1000 / freq.QuadPart;
+}
+
 static HANDLE g_vbl_ack_event;
 
 static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
@@ -2587,11 +2605,11 @@ static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
     (void)unused;
     xbox_log_thread_role("vblank-ack", 0);
     for (;;) {
-        ULONGLONG until;
+        long long until;
 
         WaitForSingleObject(g_vbl_ack_event, INFINITE);
-        until = GetTickCount64() + 2;
-        while (GetTickCount64() <= until) {
+        until = kernel_clock_ms() + 2;
+        while (kernel_clock_ms() <= until) {
             if (BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &
                 NV2A_PCRTC_INTR_VBLANK) {
                 BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &=
@@ -2641,7 +2659,7 @@ static long kernel_vblank_tick(void)
     if (!enabled)
         return 10;
 
-    now = (long long)GetTickCount64();
+    now = kernel_clock_ms();
     if (!t0)
         t0 = now;
     due = t0 + (long long)(count * 1000ull / 60ull);
@@ -2653,14 +2671,32 @@ static long kernel_vblank_tick(void)
     }
     count++;
     {
-        /* One line per 600 vblanks: should read ~10000 ms. */
+        /* One line per 600 vblanks: should read ~10000 ms. Also the
+         * shortest and longest gap between two, by the performance counter
+         * rather than the tick count the schedule runs on. */
         static unsigned long long total;
         static long long last_ms;
+        static LARGE_INTEGER qf, qlast;
+        static double gap_min = 1e9, gap_max;
+        LARGE_INTEGER q;
 
+        if (!qf.QuadPart)
+            QueryPerformanceFrequency(&qf);
+        QueryPerformanceCounter(&q);
+        if (qlast.QuadPart && qf.QuadPart) {
+            double g = (double)(q.QuadPart - qlast.QuadPart) * 1000.0
+                       / (double)qf.QuadPart;
+            if (g < gap_min) gap_min = g;
+            if (g > gap_max) gap_max = g;
+        }
+        qlast = q;
         if (++total % 600 == 0) {
-            fprintf(stderr, "  [NV2A] vblank %llu: last 600 in %lld ms\n",
-                    total, last_ms ? now - last_ms : 0);
+            fprintf(stderr, "  [NV2A] vblank %llu: last 600 in %lld ms,"
+                    " gap %.1f-%.1f ms\n",
+                    total, last_ms ? now - last_ms : 0, gap_min, gap_max);
             fflush(stderr);
+            gap_min = 1e9;
+            gap_max = 0;
             last_ms = now;
         } else if (total == 1) {
             last_ms = now;
@@ -2999,7 +3035,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         if (wait > 10)
             wait = 10;
         kernel_drain_dpcs();   /* deferred work, before due timers */
-        now = (long long)GetTickCount64();
+        now = kernel_clock_ms();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
             uint32_t dpc, fired_va;
@@ -3056,7 +3092,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     if (free_slot >= 0) {
         g_timers[free_slot].timer_va  = timer_va;
         g_timers[free_slot].dpc_va    = dpc_va;
-        g_timers[free_slot].due_ms    = (long long)GetTickCount64() + delay_ms;
+        g_timers[free_slot].due_ms    = kernel_clock_ms() + delay_ms;
         g_timers[free_slot].period_ms = period_ms;
     }
     LeaveCriticalSection(&g_timer_lock);
