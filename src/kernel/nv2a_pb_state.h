@@ -103,11 +103,9 @@ struct nv2a_pb_gpu {
      * different place to read them from. */
     uint32_t   inline_buf[NV_MAX_INLINE];
     uint32_t   inline_count;
-    /* Current values of the immediate-mode attributes, and how many complete
-     * vertices they have produced in this batch. */
-    float      imm_pos[4];
-    uint32_t   imm_diffuse;
-    float      imm_tex[2];
+    /* Immediate mode (SET_VERTEX_DATA*): how many complete vertices the
+     * batch has produced. Each one is a snapshot of every attribute's
+     * current inline value, nv2a_pb_vsh.inl, as 16 float4 in inline_buf. */
     uint32_t   imm_count;
     int        inline_active;
     uint32_t   draws, verts, nonzero_draws;
