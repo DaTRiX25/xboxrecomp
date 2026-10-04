@@ -40,6 +40,16 @@
  * RECOMP_WINDOW_QUIT_AFTER=<seconds>: post SDL_QUIT then, the event the
  * window's close button produces, so a script can test the close path.
  *
+ * Enhancements (nv2a_host_opts, set by the opt-in layer's
+ * xbox_enhance_init; all zero without it): present.filter = linear sets the
+ * frame texture's scale mode on the same logical-size letterbox; integer
+ * draws the frame at the largest whole multiple that fits, centred
+ * (nv2a_present_rect; a frame larger than the window falls back to a
+ * linear fit, never a crop, which is why SDL_RenderSetIntegerScale is not
+ * used); present.fullscreen opens the window borderless fullscreen on the
+ * desktop. The default (nearest, windowed) runs exactly the code it always
+ * did.
+ *
  * The window title is the title's to choose: call xbox_HostWindowSetTitle()
  * before xbox_HostWindowMain(). Unset, it reads "Xbox Recomp".
  */
@@ -57,6 +67,7 @@
 #include <sys/resource.h>
 
 #include "kernel/nv2a_pb_state.h"
+#include "kernel/nv2a_backend_common.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
@@ -411,6 +422,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     double quit_after = recomp_env(RENV_WINDOW_QUIT_AFTER)
                       ? atof(recomp_env(RENV_WINDOW_QUIT_AFTER)) : 0.0;
     uint32_t shown_flip = 0;
+    const struct nv2a_host_opts *eo = nv2a_host_opts();
+    int filter = eo->present_filter;
+    SDL_Rect dst;                /* integer: where the frame goes */
+    int dst_ok = 0, out_w = 0, out_h = 0;
 
     /* Ctrl-C and SIGTERM keep their default meaning (benches rely on it);
      * SDL would turn them into SDL_QUIT. Set before the headless return:
@@ -430,7 +445,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         scale = 2;
     win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
                            SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale,
-                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+                           | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
     ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
                                    | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0))
               : NULL;
@@ -526,7 +542,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 tex_w = f->w;
                 tex_h = f->h;
                 tex_bpp = f->bpp;
-                SDL_RenderSetLogicalSize(ren, (int)f->w, (int)f->h);
+                if (filter == NV2A_PRESENT_INTEGER) {
+                    dst_ok = 0;          /* new frame size: place it again */
+                } else {
+                    SDL_RenderSetLogicalSize(ren, (int)f->w, (int)f->h);
+                    if (tex && filter == NV2A_PRESENT_LINEAR)
+                        SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
+                }
             }
             if (tex)
                 SDL_UpdateTexture(tex, NULL, f->px, (int)(f->w * f->bpp));
@@ -536,7 +558,28 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         if (dirty) {
             dirty = 0;
             SDL_RenderClear(ren);
-            if (tex)
+            if (tex && filter == NV2A_PRESENT_INTEGER) {
+                int ow = 0, oh = 0;
+                if (SDL_GetRendererOutputSize(ren, &ow, &oh) == 0
+                        && (!dst_ok || ow != out_w || oh != out_h)) {
+                    struct nv2a_rect r;
+                    int whole = nv2a_present_rect(tex_w, tex_h, (uint32_t)ow, (uint32_t)oh,
+                                                  NV2A_PRESENT_INTEGER, &r);
+                    dst.x = r.x;
+                    dst.y = r.y;
+                    dst.w = r.w;
+                    dst.h = r.h;
+                    out_w = ow;
+                    out_h = oh;
+                    dst_ok = 1;
+                    /* A frame that does not fit even at 1x is shrunk:
+                     * linear there, nearest for whole multiples. Set on
+                     * every placement: a new texture starts nearest. */
+                    SDL_SetTextureScaleMode(tex, whole ? SDL_ScaleModeNearest
+                                                       : SDL_ScaleModeLinear);
+                }
+                SDL_RenderCopy(ren, tex, NULL, &dst);
+            } else if (tex)
                 SDL_RenderCopy(ren, tex, NULL, NULL);
             if (shoot) {
                 shoot = 0;
