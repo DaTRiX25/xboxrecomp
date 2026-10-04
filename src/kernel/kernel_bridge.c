@@ -2599,6 +2599,9 @@ static long long kernel_clock_ms(void)
 }
 
 static HANDLE g_vbl_ack_event;
+/* Vblanks whose ack never came within the window: the bit was left for the
+ * next one. Reported, and reset, on the 600-vblank line. */
+static volatile LONG g_vbl_ack_giveups;
 
 static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
 {
@@ -2606,6 +2609,8 @@ static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
     xbox_log_thread_role("vblank-ack", 0);
     for (;;) {
         long long until;
+
+        int acked = 0;
 
         WaitForSingleObject(g_vbl_ack_event, INFINITE);
         until = kernel_clock_ms() + 2;
@@ -2616,10 +2621,13 @@ static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
                     ~NV2A_PCRTC_INTR_VBLANK;
                 BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) &=
                     ~NV2A_PMC_INTR_PCRTC;
+                acked = 1;
                 break;
             }
             SwitchToThread();
         }
+        if (!acked)
+            InterlockedIncrement(&g_vbl_ack_giveups);
     }
     return 0;
 }
@@ -2692,8 +2700,9 @@ static long kernel_vblank_tick(void)
         qlast = q;
         if (++total % 600 == 0) {
             fprintf(stderr, "  [NV2A] vblank %llu: last 600 in %lld ms,"
-                    " gap %.1f-%.1f ms\n",
-                    total, last_ms ? now - last_ms : 0, gap_min, gap_max);
+                    " gap %.1f-%.1f ms, ack give-ups %ld\n",
+                    total, last_ms ? now - last_ms : 0, gap_min, gap_max,
+                    (long)InterlockedExchange(&g_vbl_ack_giveups, 0));
             fflush(stderr);
             gap_min = 1e9;
             gap_max = 0;
