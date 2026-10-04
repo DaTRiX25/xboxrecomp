@@ -538,6 +538,57 @@ Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
 
+### Unreleased
+
+*Burnout 3: Takedown, from its entry point to every game mode playable,
+one and two players. Most of what it needed is general: the XDK's USB and
+DirectSound stacks handing the hardware physical addresses, an x87 that
+honours precision control, and enough of the NV2A to draw a 3D game
+through its own D3D8LTCG.*
+
+**Lifter**
+
+- **x87 results ignored precision control.** Under PC=24 (D3D's default) the
+  significand now rounds to 24 bits (#149)
+- **`lahf` lifted; unordered x87/SSE compares set ZF, PF and CF**, not
+  "greater" (#150)
+- **All eight SSE compare predicates**, 4-lane `sqrtps`/`rsqrtps`/`rcpps`,
+  and bare `cmps`/`scas` (#151)
+- **Switch tables whose displacement is not slot 0**: the CRT memcpy's
+  unaligned-byte dispatch no longer silently skips the copy (#140)
+
+**Kernel, memory and interrupts**
+
+- The RAM mirror span no longer leaks 1.8 GB of reservation on Windows (#138)
+- Physical page 0 is kept for the XDK USB stack (#143)
+- ISRs and DPCs run at their IRQL and restore it; `KPCR.Irql` is published
+  (#148)
+- The DPC queue is locked, and `KDPC.Inserted` is honoured (#155)
+
+**Audio**
+
+- GP/EP DSP memory is left untrapped under `RECOMP_AC97_READY` (#139)
+- The DSP doorbell ack runs whatever the front end is doing (#141)
+- The APU resolves physical addresses into the contiguous window and
+  delivers its interrupt (#147)
+
+**USB**
+
+- OHCI resolves physical descriptor and buffer addresses (#142)
+- `RECOMP_PAD_SCRIPT` and `RECOMP_PAD_LIVE` drive a pad headless (#144)
+- Up to four pads (`RECOMP_USB_PADS`), stick steps in pad scripts, and a
+  rumble transfer no longer ends a control request (#154)
+
+**NV2A**
+
+- Vertex programs, register combiners, four texture stages, visibility
+  reports, near-plane clipping, bilinear filtering, and a threaded
+  rasteriser (#152)
+- P8 textures sample through the stage palette (#145)
+- `RECOMP_PB_REPORT_MS` (#146); `RECOMP_FB_DUMP_FLIPS` dumps every flip for
+  recordings (#156)
+- The window title shows the XBE title, FPS and draws (#153)
+
 ### v0.12.0 — *"Never Taken"* (September 2026)
 
 *Forty-one contributed PRs, and the bug that keeps turning up is a branch that

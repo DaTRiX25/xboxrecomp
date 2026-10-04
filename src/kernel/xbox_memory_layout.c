@@ -1629,7 +1629,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
-                    if (s_nv2a_trace && now_ms - last_report > 10000) {
+                    /* RECOMP_PB_REPORT_MS shortens it: the report is also
+                     * when RECOMP_FB_DUMP writes a frame, and stepping a
+                     * scripted pad through a menu needs a picture per
+                     * press rather than one every ten seconds. */
+                    static long report_ms = -1;
+                    if (report_ms < 0) {
+                        const char *e = recomp_env(RENV_PB_REPORT_MS);
+                        report_ms = e ? atol(e) : 10000;
+                        if (report_ms < 100) report_ms = 100;
+                    }
+                    if (s_nv2a_trace && now_ms - last_report > (uint64_t)report_ms) {
                         last_report = now_ms;
                         nv2a_pb_scan_report();
                     }
@@ -2690,7 +2700,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 #else
         /* Reserve base + mirrors as one range, and map the base at its head.
          * VirtualFree releases just the slice about to be used, so each view
-         * replaces our own reservation rather than racing for free space. */
+         * replaces our own reservation rather than racing for free space.
+         *
+         * POSIX only. Win32 VirtualFree cannot release part of a reservation:
+         * MEM_RELEASE with a nonzero size is ERROR_INVALID_PARAMETER, so both
+         * frees below fail, the base view never maps, and the whole span stays
+         * reserved. At a 64 MB map that is 1.8 GB the OS tends to place at
+         * 0x80000000 -- exactly the host range the contiguous window (guest
+         * 0x80000000) needs, which then fails with error 487 and the first
+         * touch of the kernel page faults. Larger map sizes push the span
+         * above 4 GB, which is why Half-Life 2 (768 MB) never saw it. Doing
+         * this on Windows needs placeholder reservations (VirtualAlloc2).
+         * (Upstream 9547d39 guards this with #ifndef _WIN32; here the whole
+         * branch is already the non-Windows side of the #if above, and
+         * Windows reserves through win_reserve_guest_window.) */
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
         /* Stop below the contiguous window: at 128 MB the span would
          * otherwise run to 0xE8000000 and hold 0x80000000 against it. */
@@ -2865,6 +2888,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         DWORD sect_headers_va = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET);
         DWORD sect_headers_off = sect_headers_va - base_addr;
         int sections_loaded = 0;
+        /* The certificate's title name (UTF-16, 40 chars at +0x0C), for
+         * the framebuffer window's title bar. */
+        DWORD cert_off = *(const DWORD *)(xbe + 0x118) - base_addr;
+        if (cert_off + 0x0C + 80 <= xbe_size) {
+            extern void xbox_FramebufferWindowSetTitle(const uint16_t *, int);
+            xbox_FramebufferWindowSetTitle(
+                (const uint16_t *)(xbe + cert_off + 0x0C), 40);
+        }
         int sections_short = 0;
         size_t total_bytes = 0;
 
@@ -3355,13 +3386,31 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  *
                  * Enabled by the same variable, because neither half is any
                  * use without the other. */
+                /* Registers and the VP only (0x00000-0x2FFFF). The GP and EP
+                 * windows above them (0x30000-0x7FFFF) are the DSPs' own
+                 * X/Y/P memories, which behave as RAM on hardware and which
+                 * the APU model does not implement -- it drops writes there
+                 * and reads back 0. Trapping them bought nothing, and cost a
+                 * fault on any access the MMIO decoder cannot emulate:
+                 * Burnout 3's DirectSound bulk-copies DSP memory with
+                 * rep movsd, which the lifter lowers to a host memcpy, and
+                 * that faulted at 0xFE830B78 with no way to resume. Plain
+                 * memory keeps what the title writes.
+                 *
+                 * Shared with the POSIX hosts: VirtualProtect is the compat
+                 * mprotect there, and the arm64 SIGBUS path
+                 * (apu_hook_handle_mmio_posix) sees only this range. 0x30000
+                 * is a multiple of 16 KB, so macOS arm64 pages split at the
+                 * same place. */
+                enum { APU_TRAP_BYTES = 0x00030000 };
                 DWORD old_protect;
-                if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
+                if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
                 if (g_apu_mmio_trapped)
-                    fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
-                            XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
+                    fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
+                                    " (GP/EP DSP memory left as RAM)\n",
+                            XBOX_MCPX_BASE, XBOX_MCPX_BASE + APU_TRAP_BYTES);
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
@@ -3995,11 +4044,25 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 #define CONTIG_LOW_RESERVE_START ((15u << 20) / CONTIG_PAGE)
 #define CONTIG_LOW_RESERVE_END   ((16u << 20) / CONTIG_PAGE)
 
-static uint8_t  g_contig_used[CONTIG_PAGES];   /* 1 = page belongs to a block */
+/* Physical page 0 is never handed out. The real kernel keeps it, and the
+ * XDK's USB stack relies on that: XPP carves its host controller structures
+ * from a private 0xFE0-byte arena ending at 0x80001000 (sub_00365454 in
+ * Burnout 3), with no allocation call at all. Handing that page to the
+ * title's first MmAllocateContiguousMemory -- XAPI's launch data page --
+ * let whichever wrote last win, and the pad enumerated or not depending on
+ * timing. Page 0 starts marked CONTIG_RESERVED: no allocation, claim or
+ * range request (lowest=0 included) gets it, and the page map still reports
+ * it as window memory, which is what a device resolving XPP's physical
+ * addresses needs. Upstream 423263b; there the bump allocator starts one
+ * page in. */
+#define CONTIG_RESERVED   2u
+
+static uint8_t  g_contig_used[CONTIG_PAGES] = { CONTIG_RESERVED };
+                                               /* 1 = page belongs to a block */
 static uint32_t g_contig_len[CONTIG_PAGES];    /* pages, at a block's first page */
 static uint32_t g_contig_pages_in_use;
-static uint32_t g_contig_high;                 /* high-water mark, bytes */
-static uint32_t g_contig_first_free;           /* no free page below this */
+static uint32_t g_contig_high = CONTIG_PAGE;   /* high-water mark, bytes */
+static uint32_t g_contig_first_free = 1;       /* no free page below this */
 static uint32_t g_contig_allocs, g_contig_frees;
 static uint32_t g_contig_peak_pages;
 static DWORD    g_contig_t0;
@@ -4199,7 +4262,7 @@ uint32_t xbox_ContiguousBlockSize(uint32_t va)
         return 0;
     page = (va - XBOX_CONTIG_BASE) / CONTIG_PAGE;
     contig_lock();
-    if (g_contig_used[page]) {
+    if (g_contig_used[page] == 1) {             /* not the reserved page 0 */
         first = page;
         while (first > 0 && !g_contig_len[first])
             first--;

@@ -90,7 +90,7 @@ void recomp_env_flush_notes(void)
  * is a typo and gets a warning, not silently glued onto a path. */
 static const char *const s_comma_keys[] = {
     "peek", "peek_chain", "px", "px_consts", "dsp_ack", "apu_dsp_ack",
-    "poke", "fb_dump_at", "window_shot",
+    "poke", "fb_dump_at", "window_shot", "pad_script",
 #ifdef RECOMP_ENV_GAME_COMMA_KEYS
     RECOMP_ENV_GAME_COMMA_KEYS
 #endif

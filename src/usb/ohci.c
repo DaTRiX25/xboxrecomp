@@ -180,6 +180,7 @@ static int s_device_hc;
  * MCPX's own hubs have; RECOMP_USB_NDP exists because which slot XAPI gives a
  * pad is decided somewhere in here and the mapping is worth measuring. */
 static unsigned s_ndp = OHCI_PORTS;
+static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
 static int s_trace;
 
@@ -405,8 +406,11 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define TD_CC_STALL    4u
 
 
-static uint32_t g_setup_pending;      /* wLength of the last SETUP seen */
-static UsbSetup g_setup;
+/* Per pad: each device on the bus has its own control pipe state. */
+static uint32_t g_setup_pending_[USB_GAMEPAD_MAX];
+static UsbSetup g_setup_[USB_GAMEPAD_MAX];
+#define g_setup_pending g_setup_pending_[pad]
+#define g_setup         g_setup_[pad]
 
 /* The control transfer's data stage, across however many descriptors it takes.
  *
@@ -417,9 +421,30 @@ static UsbSetup g_setup;
  * again, which is exactly the loop DDS9 sat in -- GET_DESCRIPTOR, SET_ADDRESS,
  * GET_DESCRIPTOR, forever. The answer is computed once per setup packet and
  * then consumed. */
-static uint8_t g_ctrl_buf[64];
-static int     g_ctrl_len = -1;   /* -1 = not answered yet */
-static int     g_ctrl_sent;
+static uint8_t g_ctrl_buf_[USB_GAMEPAD_MAX][64];
+static int     g_ctrl_len_[USB_GAMEPAD_MAX] = {-1, -1, -1, -1};
+static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
+#define g_ctrl_buf  g_ctrl_buf_[pad]
+#define g_ctrl_len  g_ctrl_len_[pad]
+#define g_ctrl_sent g_ctrl_sent_[pad]
+
+/* Pads plugged in so far, in port order. */
+static int s_plugged_pads;
+
+/* Which pad an endpoint descriptor talks to: by its function address, and
+ * address 0 -- the default address a device answers before SET_ADDRESS --
+ * is the plugged pad that has not been given one yet. Pads are plugged one
+ * at a time, each after the previous is configured, so there is never more
+ * than one at address 0. */
+static int ohci_pad_for(uint32_t ed0)
+{
+    uint32_t fa = ed0 & 0x7Fu;
+    int d;
+    for (d = 0; d < s_plugged_pads; d++)
+        if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
+            return d;
+    return -1;
+}
 
 /* Every address below came out of guest memory, so none of them are trusted.
  *
@@ -456,23 +481,73 @@ static int guest_ok(uint32_t va, uint32_t bytes)
     return (uint64_t)va + bytes <= (uint64_t)mapped;
 }
 
+/* A host controller is a bus master: every pointer the driver hands it --
+ * HcHCCA, HcControlHeadED, ED and TD links, buffer pointers -- is a PHYSICAL
+ * address. On hardware physical P and the contiguous window's 0x80000000 + P
+ * are the same bytes. Here the window is separate storage, so a physical
+ * address a driver took from MmGetPhysicalAddress names nothing it wrote.
+ *
+ * Burnout 3's XPP does exactly that: it builds its descriptors in
+ * MmAllocateContiguousMemory at 0x825B50C0, converts, and writes 0x025B50C0.
+ * Read as RAM, every ED came back all zeroes, the controller saw an empty
+ * list, and enumeration waited forever for a transfer that never moved.
+ * (DDS9's driver writes window addresses directly, which guest_ok already
+ * accepts, so it never needed this.)
+ *
+ * Resolved the way the pushbuffer executor resolves surface offsets
+ * (dma_resolve in nv2a_pb_exec.c): below the contiguous allocator's
+ * high-water mark an address is memory some MmAllocateContiguousMemory call
+ * returned, and its bytes live in the window.
+ *
+ * Except inside the loaded image. A driver also points transfers at its own
+ * statics -- Burnout 3's first GET_DESCRIPTOR reads into 0x0041A904, in .data
+ * -- and MmGetPhysicalAddress passes those through unchanged. A real kernel
+ * never hands out contiguous memory that overlaps the image, so an address
+ * inside it is the image. Sending that one to the window delivered the
+ * descriptor where the driver never looked, and it reset the port and asked
+ * again, forever.
+ *
+ * The contiguous allocator here is a first-fit page allocator (frees and
+ * reuses pages), so its page map is asked first, in the order mcpx_apu_phys
+ * (apu_core.c) uses: a page it handed out -- or the reserved page 0, where
+ * XPP keeps its private arena -- is the window, even inside the image's
+ * physical range; then the image; then the high-water mark, for a page that
+ * was contiguous memory once and has since been freed. */
+static uint32_t bus_resolve(uint32_t addr)
+{
+    if (addr && addr < (64u << 20) && xbox_ContiguousPageMap()[addr >> 12])
+        return OHCI_CONTIG_BASE + addr;
+    if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
+        return addr;
+    if (addr && addr < xbox_ContiguousAllocatedBytes())
+        return OHCI_CONTIG_BASE + addr;
+    return addr;
+}
+
 static uint32_t rd32(uint32_t va)
 {
+    va = bus_resolve(va);
     if (!guest_ok(va, 4))
         return 0;
     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
 }
 static void wr32(uint32_t va, uint32_t v)
 {
+    va = bus_resolve(va);
     if (!guest_ok(va, 4))
         return;
     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
+    va = bus_resolve(va);
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }
+
+/* Transfer counts for RECOMP_USB_STATS: input reports served, control
+ * transfer stages, and OUT packets (rumble) by endpoint. */
+static unsigned long s_n_report, s_n_ctrl, s_n_out_ep0, s_n_out_other;
 
 /* Move one transfer descriptor. Returns the condition code to report. */
 static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
@@ -484,6 +559,10 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     int      len  = (cbp && be >= cbp) ? (int)(be - cbp + 1) : 0;
     uint32_t endpoint = (ed0 >> 7) & 0xFu;
     int      moved = 0;
+    int      pad = ohci_pad_for(ed0);
+
+    if (pad < 0)
+        return TD_CC_NOERROR;   /* no device at that address: ignore */
 
     if (s_trace) {
         static unsigned n;
@@ -496,6 +575,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     }
     if (dp == TD_DP_SETUP) {
         /* Eight bytes of setup, kept for the data stage that follows. */
+        s_n_ctrl++;
         if (len >= 8) {
             const uint8_t *p = guest_ptr(cbp, 8);
             if (!p) return TD_CC_NOERROR;
@@ -525,7 +605,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             if (!g_setup_pending)
                 return TD_CC_NOERROR;
             if (g_ctrl_len < 0) {
-                g_ctrl_len = usb_gamepad_control(&g_setup, g_ctrl_buf,
+                g_ctrl_len = usb_gamepad_control(pad, &g_setup, g_ctrl_buf,
                                                  (int)sizeof g_ctrl_buf);
                 if (g_ctrl_len < 0) {
                     /* Worth saying out loud. A stall here halts the
@@ -562,7 +642,8 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
         } else {
             /* The pad's report, on its interrupt endpoint. */
             uint8_t rep[32];
-            int n = usb_gamepad_report(rep, (int)sizeof rep);
+            s_n_report++;
+            int n = usb_gamepad_report(pad, rep, (int)sizeof rep);
             if (n > len) n = len;
             if (n > 0 && guest_ptr(cbp, (uint32_t)n))
                 memcpy(guest_ptr(cbp, (uint32_t)n), rep, (size_t)n);
@@ -570,9 +651,19 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
         }
     } else {
         /* OUT: the status stage of an IN control transfer, or rumble. Both
-         * are accepted and discarded. */
+         * are accepted and discarded -- but only the control pipe's ends a
+         * control transfer. A rumble packet on endpoint 2 used to clear the
+         * pending setup too, so a force-feedback write landing between a
+         * control request's stages broke that request; Burnout 3 starts its
+         * engine-rev rumble on the Crash countdown and then paused with the
+         * pad unresponsive. */
         moved = len;
-        g_setup_pending = 0;
+        if (endpoint == 0) {
+            g_setup_pending = 0;
+            s_n_out_ep0++;
+        } else {
+            s_n_out_other++;
+        }
     }
 
     /* CBP is zero when everything asked for moved, and otherwise points past
@@ -715,8 +806,10 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
             int nseen = 0, i;
             last = now;
             fprintf(stderr, "  [OHCI%d] stats: %u periodic transfers; "
+                    "reports %lu setups %lu out0 %lu outN %lu; "
                     "ctl=%08X ien=%08X ists=%08X irql-depth=%d",
-                    hc->index, total, hc->reg[HcControl / 4],
+                    hc->index, total, s_n_report, s_n_ctrl, s_n_out_ep0,
+                    s_n_out_other, hc->reg[HcControl / 4],
                     hc->reg[HcInterruptEnable / 4],
                     hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount());
             {
@@ -927,6 +1020,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     unsigned held_off = 0;
     int      held_off_warned = 0, held_off_forced = 0, gated = 0;
     unsigned last_ack = 0;
+    unsigned first_port = 0, settle = 0;
 
     (void)unused;
     {
@@ -975,9 +1069,29 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             plugged = 1;
+            s_plugged_pads = 1;
+            first_port = port;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
                             "arriving on port 1\n", waited * 20);
             fflush(stderr);
+        }
+
+        /* More pads, one at a time: each arrives after the previous one is
+         * configured, on the next port, so the driver enumerates them in
+         * turn and there is only ever one device at the default address.
+         * RECOMP_USB_PADS sets how many (1-4). */
+        if (plugged && s_plugged_pads < s_npads
+            && usb_gamepad_configured(s_plugged_pads - 1)) {
+            if (++settle > 50) {                 /* ~1 s after the last */
+                unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
+                hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+                hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+                fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
+                        s_plugged_pads + 1, port + 1, 10);
+                fflush(stderr);
+                s_plugged_pads++;
+                settle = 0;
+            }
         }
 
         /* The frame clock.
@@ -1164,10 +1278,17 @@ void xbox_OhciInit(void)
         const char *hcspec = recomp_env(RENV_USB_HC);
         const char *ndpspec = recomp_env(RENV_USB_NDP);
         s_device_hc = (hcspec && atoi(hcspec) == 1) ? 1 : 0;
+        const char *padspec = recomp_env(RENV_USB_PADS);
         if (ndpspec) {
             int n = atoi(ndpspec);
             if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
         }
+        if (padspec) {
+            int n = atoi(padspec);
+            if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n;
+        }
+        if ((unsigned)s_npads > s_ndp)
+            s_ndp = (unsigned)s_npads;      /* a port for every pad */
     }
 #if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX_A64)
     /* No decoder for this host's instructions, so a trapped access could not

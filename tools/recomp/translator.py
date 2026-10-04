@@ -323,6 +323,27 @@ _FLAG_WRITERS = frozenset({
 })
 
 
+
+def load_label_db(labels_json_path):
+    """addr -> name from labels.json, for naming call targets and functions.
+
+    String-reference labels are left out. They name data (str_<text>), the
+    same text at two addresses gets the same name, and a function recovered
+    at such an address -- data that decodes and ends in a ret -- was emitted
+    twice under one name: Steel Battalion's two "MAIN_L" strings gave two
+    `void str_MAIN_L(void)` bodies and the build stopped at C2084. Such a
+    target falls back to sub_XXXXXXXX, which is unique by construction.
+    """
+    label_db = {}
+    if labels_json_path and os.path.exists(labels_json_path):
+        with open(labels_json_path, "r") as f:
+            labels = json.load(f)
+        for lbl in labels:
+            if lbl.get("type") == "string_ref":
+                continue
+            label_db[int(lbl["address"], 16)] = lbl["name"]
+    return label_db
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
@@ -1153,6 +1174,13 @@ class FunctionTranslator:
 
         backward = scan(-1, 1)
         forward = scan(1, 0)
+        if not forward and len(backward) < 2:
+            # Slot 0 is not an arm when the index can never be 0: MSVC's CRT
+            # memcpy does `and eax, 3` on a path where eax is 1..3 and jumps
+            # through [eax*4 + LeadUpVec - 4], so the displacement points at
+            # the jmp's own bytes. See lifter._analyze_switch_table.
+            forward = scan(1, 1)
+            backward = []
         if len(backward) + len(forward) < 2:
             return []
         backward.reverse()
@@ -2112,9 +2140,12 @@ class FunctionTranslator:
             lines.append("    ebp = g_ebp;  /* frameless: caller's frame */")
 
         # Add _flags variable if function has conditional instructions
+        # String compares write _flags themselves (the rep forms, and since
+        # they are lifted, the bare ones), with or without a jcc after them.
         has_conditionals = any(
             insn.is_cond_jump or insn.mnemonic.startswith("set")
             or insn.mnemonic.startswith("cmov")
+            or "cmps" in insn.mnemonic or "scas" in insn.mnemonic
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
@@ -2470,13 +2501,7 @@ class BatchTranslator:
             self.func_db[addr] = func
 
         # Load labels
-        self.label_db = {}
-        if labels_json_path and os.path.exists(labels_json_path):
-            with open(labels_json_path, "r") as f:
-                labels = json.load(f)
-            for lbl in labels:
-                addr = int(lbl["address"], 16)
-                self.label_db[addr] = lbl["name"]
+        self.label_db = load_label_db(labels_json_path)
 
         # Load classifications
         self.classification_db = {}
