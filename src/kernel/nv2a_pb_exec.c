@@ -1926,6 +1926,7 @@ static int vsh_method(uint32_t method, uint32_t param)
     case 0x02A0: s_vsh.fog_gen = param; return 1;           /* SET_FOG_GEN_MODE */
     case 0x09C0: case 0x09C4: case 0x09C8:          /* SET_FOG_PARAMS */
         s_vsh.fog_param[(method - 0x09C0) / 4] = u2f(param); return 1;
+    case 0x17F8: s_vsh.clip_plane_mode = param; return 1; /* SET_SHADER_CLIP_PLANE_MODE */
     default: break;
     }
     if (method >= NV097_SET_TRANSFORM_PROGRAM_M
@@ -2723,7 +2724,7 @@ static void vsh_build_stages(void)
         s_stage_tent[n] = tex_filter_tent(st.filter);
         s_vsh.stage_mode_seen[n][st.raw_mode]++;
         s_stage_mode[n] = st.mode;
-        if (st.mode != 0 && st.mode != 4)
+        if (st.mode != 0 && st.mode != 4 && st.mode != 5)
             tex_log_note(n, t, r[0x04 / 4], r[0x10 / 4], r[0x1C / 4]);
         from_fmt = nv2a_tex_size_from_format(t->color);
         s_stage_scale[n][0] = from_fmt ? (float)t->width : 1.0f;
@@ -2955,23 +2956,45 @@ static void stage_sample_mip(int n, const LodTri *L, const float tc[4], float q,
 /* Stage n at the interpolated coordinate tc. L and q (the pixel's
  * perspective sum, ps) give a mipmapped stage its LOD; with L NULL it
  * samples level 0. */
-static void stage_sample(int n, const float tc[4], float q, const LodTri *L,
-                         float o[4])
+/* Texture-shader mode 5, CLIPPLANE (xemu psh.c; upstream 13c64d3). The
+ * stage carries no texture: each coordinate component is a user clip plane
+ * distance, and SET_SHADER_CLIP_PLANE_MODE (0x17F8) picks per stage and
+ * component whether the pixel dies at >= 0 or at < 0. Returns 1 if this
+ * pixel is killed; the stage's register reads 0 either way. */
+static int stage_clip_kills(int n, const float tc[4])
+{
+    int j;
+    for (j = 0; j < 4; j++) {
+        int ge = (s_vsh.clip_plane_mode >> (n * 4 + j)) & 1;
+        if (ge ? tc[j] >= 0.0f : tc[j] < 0.0f)
+            return 1;
+    }
+    return 0;
+}
+
+/* Returns 0 when the stage kills the pixel (CLIPPLANE), else 1 with the
+ * stage's value in o. */
+static int stage_sample(int n, const float tc[4], float q, const LodTri *L,
+                        float o[4])
 {
     int mode = s_stage_mode[n];
     float s, t;
 
-    if (mode == 0) { o[0] = o[1] = o[2] = o[3] = 0.0f; return; }
+    if (mode == 0) { o[0] = o[1] = o[2] = o[3] = 0.0f; return 1; }
     if (mode == 4) {                       /* pass-through: the coordinate */
         int k;
         for (k = 0; k < 4; k++) o[k] = clamp01(tc[k]);
-        return;
+        return 1;
+    }
+    if (mode == 5) {                       /* clip plane: no texture */
+        o[0] = o[1] = o[2] = o[3] = 0.0f;
+        return !stage_clip_kills(n, tc);
     }
     if (mode == 3 && s_stage_tex[n].face_stride) {   /* cube map */
         Texture f = s_stage_tex[n];
         f.offset += nv2a_cube_face(tc, &s, &t) * f.face_stride;
         stage_sample_2d(n, &f, s, t, o);
-        return;
+        return 1;
     }
     s = tc[0]; t = tc[1];
     if (mode == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {   /* 2D projective */
@@ -2979,9 +3002,10 @@ static void stage_sample(int n, const float tc[4], float q, const LodTri *L,
     }
     if (L && s_stage_mip[n].mip) {
         stage_sample_mip(n, L, tc, q, s, t, o);
-        return;
+        return 1;
     }
     stage_sample_2d(n, &s_stage_tex[n], s, t, o);
+    return 1;
 }
 
 static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
@@ -3091,8 +3115,11 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
                         continue;
                     for (k = 0; k < 4; k++)
                         tc[k] = pa * a->t[n][k] + pb * b->t[n][k] + pc * c->t[n][k];
-                    stage_sample(n, tc, ps, &lod, r[8 + n]);
+                    if (!stage_sample(n, tc, ps, &lod, r[8 + n]))
+                        break;                 /* CLIPPLANE killed the pixel */
                 }
+                if (n < 4)
+                    continue;
                 r[12][3] = r[8][3];
                 rc_eval(r, col);
             } else if (textured) {
@@ -3100,7 +3127,8 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
                 for (k = 0; k < 4; k++)
                     tc[k] = pa * a->t[0][k] + pb * b->t[0][k] + pc * c->t[0][k];
                 if (s_stage_mode[0]) {
-                    stage_sample(0, tc, ps, &lod, tx);
+                    if (!stage_sample(0, tc, ps, &lod, tx))
+                        continue;
                     for (k = 0; k < 4; k++)
                         col[k] *= tx[k];
                 }
@@ -3479,17 +3507,15 @@ static inline void fast_level(TexCacheEntry *e, int n, uint32_t l, int lin,
 
 /* stage_sample, reading texels from the cache when the stage has an entry.
  * A cube stage has none (fast_batch_setup) and samples live. */
-static void stage_sample_fast(int n, const float tc[4], float q, const LodTri *L,
-                              float o[4])
+static int stage_sample_fast(int n, const float tc[4], float q, const LodTri *L,
+                             float o[4])
 {
     TexCacheEntry *e = s_stage_tc[n];
     int mode = s_stage_mode[n];
     float s, t;
 
-    if (!e || mode == 0 || mode == 4) {
-        stage_sample(n, tc, q, L, o);
-        return;
-    }
+    if (!e || mode == 0 || mode == 4 || mode == 5)
+        return stage_sample(n, tc, q, L, o);
     s = tc[0]; t = tc[1];
     if (mode == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {   /* 2D projective */
         s /= tc[3]; t /= tc[3];
@@ -3505,9 +3531,10 @@ static void stage_sample_fast(int n, const float tc[4], float q, const LodTri *L
             fast_level(e, n, l1, lin, s, t, o1);
             mip_blend(o, o1, f);
         }
-        return;
+        return 1;
     }
     fast_level(e, n, 0, s_stage_tent[n], s, t, o);
+    return 1;
 }
 
 /* (b) -------------------------------------------------------------------
@@ -3706,8 +3733,11 @@ static void fast_rows(const FastTri *T, int y0, int step)
                         continue;
                     for (k = 0; k < 4; k++)
                         tc[k] = pa * a->t[n][k] + pb * b->t[n][k] + pc * c->t[n][k];
-                    stage_sample_fast(n, tc, ps, &T->lod, r[8 + n]);
+                    if (!stage_sample_fast(n, tc, ps, &T->lod, r[8 + n]))
+                        break;                 /* CLIPPLANE killed the pixel */
                 }
+                if (n < 4)
+                    continue;
                 r[12][3] = r[8][3];
                 nv2a_rc_plan_eval(&s_rcp, r, col);
             } else if (T->textured) {
@@ -3715,7 +3745,8 @@ static void fast_rows(const FastTri *T, int y0, int step)
                 for (k = 0; k < 4; k++)
                     tc[k] = pa * a->t[0][k] + pb * b->t[0][k] + pc * c->t[0][k];
                 if (s_stage_mode[0]) {
-                    stage_sample_fast(0, tc, ps, &T->lod, tx);
+                    if (!stage_sample_fast(0, tc, ps, &T->lod, tx))
+                        continue;
                     for (k = 0; k < 4; k++)
                         col[k] *= tx[k];
                 }
@@ -4013,7 +4044,8 @@ static void fast_batch_setup(void)
         int mode = s_stage_mode[n];
         const Texture *t = &s_stage_tex[n];
         uint32_t lv = stage_tc_levels(n);
-        s_stage_tc[n] = (mode != 0 && mode != 4 && !(mode == 3 && t->face_stride))
+        s_stage_tc[n] = (mode != 0 && mode != 4 && mode != 5
+                         && !(mode == 3 && t->face_stride))
                       ? tc_bind(t, lv) : NULL;
         /* A stage reading the surface this batch draws into sees its own
          * earlier pixels: the reference sampler reads memory as it changes,

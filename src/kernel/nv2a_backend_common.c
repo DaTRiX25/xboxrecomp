@@ -173,7 +173,9 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
         mode = n == 0 ? 1 : 0;
     t->raw_mode = mode;
     t->on = on;
-    if (mode != 4 && (!on || !t->valid))
+    /* PASSTHRU and CLIPPLANE have no texture to be valid: they stay. The
+     * GPU backends drop CLIPPLANE to 0 themselves (no per-pixel kill yet). */
+    if (mode != 4 && mode != 5 && (!on || !t->valid))
         mode = 0;
     t->mode = mode;
 }
