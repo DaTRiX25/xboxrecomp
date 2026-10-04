@@ -8,6 +8,7 @@
 #include "recomp_cfg.h"
 #include "recomp_env.h"
 
+#include <locale.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -198,11 +199,121 @@ static void test_errors(void)
     expect_error("a = [1 2]\n", "expected ',' or ']'", 1);
     expect_error("s = \"bad \\q\"\n", "bad escape", 1);
     expect_error("b = True\n", "strings need quotes", 1);
+
+    /* strict pass (review of 409a8e8): each was accepted before */
+    /* 1. '_' only between two digits */
+    expect_error("n = 0x_FF\n", "misplaced '_'", 1);
+    expect_error("n = 1_e5\n", "misplaced '_'", 1);
+    expect_error("n = 1e_5\n", "misplaced '_'", 1);
+    expect_error("n = 1_.5\n", "misplaced '_'", 1);
+    expect_error("n = 1._5\n", "misplaced '_'", 1);
+    expect_error("n = i_nf\n", "strings need quotes", 1);
+    expect_error("n = 0_x10\n", "misplaced '_'", 1);
+    expect_error("n = 0xFF_\n", "misplaced '_'", 1);
+    expect_error("n = 0_1\n", "leading zero", 1);
+    /* 2. one prefix, digits of its base only */
+    expect_error("n = 0x0x1F\n", "invalid number", 1);
+    expect_error("n = 0x\n", "invalid number", 1);
+    expect_error("n = 0o8\n", "invalid number", 1);
+    expect_error("n = 0b102\n", "invalid number", 1);
+    expect_error("n = 0x-1\n", "invalid number", 1);
+    expect_error("n = 1e\n", "invalid number", 1);
+    expect_error("n = 1.5.2\n", "invalid number", 1);
+    expect_error("n = 1e5e5\n", "invalid number", 1);
+    expect_error("d = 1979-05-27\n", "dates and times", 1);
+    /* 3. a table made by a dotted key cannot be reopened by a header, nor a
+     *    header's table extended by a dotted key */
+    expect_error("a.b = 1\n[a]\n", "defined by a dotted key", 2);
+    expect_error("[t]\na.x = 1\n[t.a]\n", "defined by a dotted key", 3);
+    expect_error("[a.b]\nx = 1\n[a]\nb.y = 2\n", "defined by a header", 4);
+    /* 4. \e is TOML 1.1 only */
+    expect_error("s = \"\\e[0m\"\n", "bad escape", 1);
+    /* 6. DEL, control characters and invalid UTF-8 */
+    expect_error("x = 1\ns = \"a\x7f\"\n", "control character in string", 2);
+    expect_error("x = 1\n# bell \x07\n", "control character in comment", 2);
+    expect_error("x = 1\n# del \x7f\n", "control character in comment", 2);
+    expect_error("# cr \r alone\n", "control character in comment", 1);
+    expect_error("x = 1\n\ns = \"\xff\"\n", "invalid UTF-8", 3);
+    expect_error("s = \"\xc0\xaf\"\n", "invalid UTF-8", 1);          /* overlong '/' */
+    expect_error("s = \"\xed\xa0\x80\"\n", "invalid UTF-8", 1);      /* surrogate */
+    expect_error("s = \"\xf4\x90\x80\x80\"\n", "invalid UTF-8", 1); /* > U+10FFFF */
+    expect_error("# \xe2\x82\n", "invalid UTF-8", 1);                  /* truncated */
     {
         char err[256];
         CHECK(recomp_cfg_load_file("ecfg_does_not_exist.toml", err, sizeof err) == NULL);
         CHECK(strstr(err, "cannot open") != NULL);
     }
+}
+
+/* What the strict pass must still accept. */
+static void test_strict_valid(void)
+{
+    static const char text[] =
+        "hex = 0xdead_BEEF\n"
+        "big = 1_000.000_5e1_0\n"
+        "zero = 0\nzf = 0.0\nzexp = 0e0\nneg = -0.5\npos = +1.5\n"
+        "a.b = 1\n"
+        "a.c = 2\n"                      /* a dotted table extended by dotted keys */
+        "[x.y.z]\nk = 1\n"
+        "[x]\nv = 2\n"                  /* implicit (header) table, defined later */
+        "[p]\nq.r = 1\n"
+        "[p.q.s]\nt = 1\n"              /* sub-table of a dotted-defined table */
+        "u = \"caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x8e\xae\"  # \xc3\xa9 ok\n";
+    char err[256];
+    recomp_cfg *c = recomp_cfg_load_string(text, "valid", err, sizeof err);
+    double d;
+    CHECK(c != NULL);
+    if (!c) { fprintf(stderr, "%s\n", err); return; }
+    CHECK(recomp_cfg_int(c, "hex", 0) == 0xdeadbeefLL);
+    CHECK(recomp_cfg_float(c, "big", 0) == 1000.0005e10);
+    CHECK(recomp_cfg_int(c, "zero", 1) == 0);
+    CHECK(recomp_cfg_float(c, "zexp", 1) == 0.0);
+    CHECK(recomp_cfg_float(c, "neg", 0) == -0.5);
+    CHECK(recomp_cfg_float(c, "pos", 0) == 1.5);
+    CHECK(recomp_cfg_int(c, "a.c", 0) == 2);
+    CHECK(recomp_cfg_int(c, "x.v", 0) == 2);
+    CHECK(recomp_cfg_int(c, "p.q.s.t", 0) == 1);
+    CHECK(!strcmp(recomp_cfg_string(c, "p.q.s.u", ""), "caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x8e\xae"));
+    recomp_cfg_free(c);
+
+    CHECK(recomp_cfg_parse_double("2.5", &d) && d == 2.5);
+    CHECK(recomp_cfg_parse_double("-inf", &d) && isinf(d) && d < 0);
+    CHECK(!recomp_cfg_parse_double("2,5", &d));
+    CHECK(!recomp_cfg_parse_double("0x1p3", &d));
+    CHECK(!recomp_cfg_parse_double(" 1", &d));
+    CHECK(!recomp_cfg_parse_double("", &d));
+}
+
+/* 5. Floats do not depend on the locale (a comma-decimal locale used to
+ *    make strtod stop at the '.'). Skipped when no such locale exists. */
+static void test_locale(void)
+{
+    static const char *const names[] = { "de_DE.UTF-8", "de_DE.utf8", "de_DE", "fr_FR.UTF-8",
+                                         "fr_FR.utf8", "German_Germany.1252", NULL };
+    int i;
+    const char *got = NULL;
+    for (i = 0; names[i] && !got; i++)
+        got = setlocale(LC_NUMERIC, names[i]);
+    if (!got || strcmp(localeconv()->decimal_point, ",") != 0) {
+        printf("enhance_cfg: no comma-decimal locale here; locale check skipped\n");
+        setlocale(LC_NUMERIC, "C");
+        return;
+    }
+    {
+        char err[256];
+        double d = 0;
+        recomp_cfg *c = recomp_cfg_load_string("f = 0.25\ng = 1.5e2\n", "loc", err, sizeof err);
+        CHECK(c && recomp_cfg_float(c, "f", 0) == 0.25);
+        CHECK(c && recomp_cfg_float(c, "g", 0) == 150.0);
+        recomp_cfg_free(c);
+        CHECK(recomp_cfg_parse_double("0.75", &d) && d == 0.75);
+        CHECK(!recomp_cfg_parse_double("0,75", &d));
+        recomp_env_set(RENV_RENDER_SCALE, "1.5");
+        CHECK(enhance_cfg_float("render.scale", 0) == 1.5);
+        recomp_env_set(RENV_RENDER_SCALE, NULL);
+        printf("enhance_cfg: locale check ran under %s\n", got);
+    }
+    setlocale(LC_NUMERIC, "C");
 }
 
 /* ── env > title file > root file > default ────────────────────────── */
@@ -328,6 +439,8 @@ int main(void)
 {
     test_subset();
     test_errors();
+    test_strict_valid();
+    test_locale();
     test_layers();
     printf("enhance_cfg: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;

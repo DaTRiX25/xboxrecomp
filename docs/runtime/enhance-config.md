@@ -41,7 +41,7 @@ as `scael = 2` is visible instead of being ignored silently.
 
 ## File format: a subset of TOML
 
-Every file that this reader accepts is valid [TOML](https://toml.io).
+Every file that this reader accepts is valid [TOML](https://toml.io) 1.0. The file must be UTF-8.
 
 ```toml
 # Comments start with '#' and run to the end of the line.
@@ -74,6 +74,17 @@ number:
   need quotes)
 - duplicate keys, a table defined twice, and a key that is used both as a
   value and as a table
+- reopening a table that a dotted key defined (`a.b = 1`, then `[a]`), and
+  using a dotted key to add to a table that a header defined
+- `_` anywhere except between two digits (`1_000` and `0xFF_FF` are fine;
+  `0x_FF` and `1_e5` are not), and a second base prefix (`0x0x1F`)
+- the `\e` escape (TOML 1.1 only)
+- invalid UTF-8, and control characters (DEL included, tab excepted) in
+  strings and comments
+
+Floats are parsed the same way in every locale: a process locale with a comma
+decimal point does not change how `0.5` is read, either in the file or in the
+environment.
 
 Keys are bare (`A-Z a-z 0-9 _ -`) or quoted, with no `.` inside a quoted part.
 A lookup uses the full dotted name, such as `render.scale`. A UTF-8 BOM and
@@ -187,7 +198,7 @@ with a NOTICE entry. Each is several thousand lines, and most of that code is
 grammar this file does not need. Their errors are good, but their API is a
 tree that we would wrap in a getter layer anyway.
 
-The reader here, `recomp_cfg.c`, is about 730 lines including comments. It
+The reader here, `recomp_cfg.c`, is about 900 lines including comments. It
 supports exactly the needed subset:
 
 - tables, dotted keys

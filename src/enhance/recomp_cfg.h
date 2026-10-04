@@ -14,7 +14,7 @@
  *
  * Not supported, and reported as errors with a line number: multi-line
  * strings, inline tables, arrays of tables, nested arrays, dates and times.
- * Every file this reader accepts is valid TOML.
+ * Every file this reader accepts is valid TOML 1.0 (and must be UTF-8).
  *
  * Keys are looked up by their full dotted name ("render.scale"). A getter
  * returns its default when the key is missing or has another type; a float
@@ -48,6 +48,10 @@ recomp_cfg *recomp_cfg_load_file(const char *path, char *err, size_t errlen);
 recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
                                    char *err, size_t errlen);
 void recomp_cfg_free(recomp_cfg *cfg);
+
+/* Parse a C-locale number ("0.5", "-1e3", "inf", "nan"; no hex floats or
+ * spaces) whatever the process locale is. 1 and *out on success. */
+int recomp_cfg_parse_double(const char *s, double *out);
 
 /* Typed getters with defaults. */
 recomp_cfg_type recomp_cfg_type_of(const recomp_cfg *cfg, const char *key);

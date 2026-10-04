@@ -8,6 +8,7 @@
 #include "recomp_cfg.h"
 
 #include <errno.h>
+#include <locale.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -32,6 +33,8 @@ struct recomp_cfg {
     size_t n, cap;
     char **tables;    /* [headers] seen, to refuse a second [render] */
     size_t n_tables, cap_tables;
+    char **dotted;    /* tables made by dotted keys (a.b = 1 makes a) */
+    size_t n_dotted, cap_dotted;
     char *name;
 };
 
@@ -104,22 +107,28 @@ static int is_bare(char c)
            (c >= '0' && c <= '9') || c == '_' || c == '-';
 }
 
-static int is_alnum(char c)
-{
-    return is_bare(c) && c != '_' && c != '-';
-}
-
 static void skip_ws(P *ps)
 {
     while (ps->p < ps->end && (*ps->p == ' ' || *ps->p == '\t'))
         ps->p++;
 }
 
+/* A comment runs to the end of the line; like a string it may not hold
+ * control characters other than tab (a lone CR or a DEL is an error). */
 static void skip_comment(P *ps)
 {
-    if (ps->p < ps->end && *ps->p == '#')
-        while (ps->p < ps->end && *ps->p != '\n')
-            ps->p++;
+    if (ps->p >= ps->end || *ps->p != '#')
+        return;
+    while (ps->p < ps->end && *ps->p != '\n') {
+        unsigned char c = (unsigned char)*ps->p;
+        if (c == '\r' && ps->p + 1 < ps->end && ps->p[1] == '\n')
+            return;
+        if ((c < 0x20 && c != '\t') || c == 0x7F) {
+            fail(ps, "control character in comment");
+            return;
+        }
+        ps->p++;
+    }
 }
 
 /* Consume a newline (\n or \r\n). 1 if one was there. */
@@ -199,7 +208,6 @@ static int parse_string(P *ps, Buf *out)
             case 'n': c = '\n'; break;
             case 'f': c = '\f'; break;
             case 'r': c = '\r'; break;
-            case 'e': c = 0x1B; break;
             case '"': c = '"'; break;
             case '\\': c = '\\'; break;
             case 'u': case 'U': {
@@ -224,7 +232,7 @@ static int parse_string(P *ps, Buf *out)
             default:
                 return fail(ps, "bad escape '\\%c'", e);
             }
-        } else if ((unsigned char)c < 0x20 && c != '\t') {
+        } else if (((unsigned char)c < 0x20 && c != '\t') || c == 0x7F) {
             return fail(ps, "control character in string");
         }
         if (!buf_put(out, &c, 1))
@@ -271,35 +279,65 @@ static int parse_key(P *ps, Buf *out)
 
 /* ── values ────────────────────────────────────────────────────────── */
 
+static int is_dec(char c) { return c >= '0' && c <= '9'; }
+static int is_hex(char c) { return is_dec(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+static int is_oct(char c) { return c >= '0' && c <= '7'; }
+static int is_bin(char c) { return c == '0' || c == '1'; }
+
+/* s[0..n) must be digits of `isd`, with each '_' between two digits.
+ * Appends the digits (no '_') to out at *on. 1 ok, 0 empty or a bad
+ * character, -1 a misplaced '_'. */
+static int take_digits(const char *s, size_t n, int (*isd)(char), char *out, size_t *on)
+{
+    size_t i;
+    if (!n)
+        return 0;
+    for (i = 0; i < n; i++) {
+        if (s[i] == '_') {
+            if (i == 0 || i + 1 == n || !isd(s[i - 1]) || !isd(s[i + 1]))
+                return -1;
+            continue;
+        }
+        if (!isd(s[i]))
+            return 0;
+        out[(*on)++] = s[i];
+    }
+    out[*on] = 0;
+    return 1;
+}
+
+static int bad_number(P *ps, int r, const char *tok)
+{
+    return r < 0 ? fail(ps, "misplaced '_' in '%s'", tok)
+                 : fail(ps, "invalid number '%s'", tok);
+}
+
 static int parse_number(P *ps, Val *v)
 {
-    char tok[128];
-    size_t n = 0;
-    const char *s = ps->p, *t;
-    int sign = 0, is_float = 0;
+    char tok[128], clean[128];
+    size_t n = 0, cn = 0;
+    const char *t, *q, *e;
+    int sign = 0, is_float = 0, r;
     char *endp;
 
     while (ps->p < ps->end && (is_bare(*ps->p) || *ps->p == '+' || *ps->p == '.')) {
-        if (*ps->p != '_') {
-            if (n + 1 >= sizeof tok)
-                return fail(ps, "number too long");
-            tok[n++] = *ps->p;
-        } else if (ps->p == s || !is_alnum(ps->p[-1]) ||
-                   ps->p + 1 >= ps->end || !is_alnum(ps->p[1])) {
-            return fail(ps, "misplaced '_' in number");
-        }
-        ps->p++;
+        if (n + 1 >= sizeof tok)
+            return fail(ps, "number too long");
+        tok[n++] = *ps->p++;
     }
     tok[n] = 0;
-    if (ps->p < ps->end && *ps->p == ':')
+    if ((ps->p < ps->end && *ps->p == ':') ||
+        (n >= 10 && is_dec(tok[0]) && is_dec(tok[3]) && tok[4] == '-' && tok[7] == '-'))
         return fail(ps, "dates and times are not supported");
     if (n == 0)
         return ps->p < ps->end ? fail(ps, "expected a value, found '%c'", *ps->p)
                                : fail(ps, "expected a value");
 
     t = tok;
-    if (*t == '+' || *t == '-')
-        sign = *t++ == '-' ? -1 : 1;
+    if (*t == '+' || *t == '-') {
+        sign = *t == '-' ? -1 : 1;
+        clean[cn++] = *t++;
+    }
     if (!strcmp(t, "inf") || !strcmp(t, "nan")) {
         v->type = RCFG_FLOAT;
         v->v.f = t[0] == 'i' ? (sign < 0 ? -HUGE_VAL : HUGE_VAL) : NAN;
@@ -310,37 +348,68 @@ static int parse_number(P *ps, Val *v)
         unsigned long long u;
         if (sign)
             return fail(ps, "sign on a 0%c integer", t[1]);
-        if (!t[2])
-            return fail(ps, "invalid number '%s'", tok);
+        r = take_digits(t + 2, strlen(t + 2), base == 16 ? is_hex : base == 8 ? is_oct : is_bin,
+                        clean, &cn);
+        if (r <= 0)
+            return bad_number(ps, r, tok);
         errno = 0;
-        u = strtoull(t + 2, &endp, base);
-        if (*endp || t[2] == '-' || t[2] == '+')
-            return fail(ps, "invalid number '%s'", tok);
-        if (errno == ERANGE || u > (unsigned long long)9223372036854775807LL)
+        u = strtoull(clean, &endp, base);   /* clean is digits only */
+        if (*endp || errno == ERANGE || u > (unsigned long long)9223372036854775807LL)
             return fail(ps, "integer out of range '%s'", tok);
         v->type = RCFG_INT;
         v->v.i = (long long)u;
         return 1;
     }
-    if (!(t[0] >= '0' && t[0] <= '9'))
+    if (!is_dec(t[0]))
         return fail(ps, "invalid value '%s' (strings need quotes)", tok);
-    is_float = strpbrk(t, ".eE") != NULL;
-    if (t[0] == '0' && t[1] >= '0' && t[1] <= '9')
-        return fail(ps, "leading zero in '%s'", tok);
-    errno = 0;
-    if (is_float) {
-        const char *dot = strchr(t, '.');
-        if (dot && !(dot[1] >= '0' && dot[1] <= '9'))
-            return fail(ps, "invalid number '%s'", tok);
-        v->type = RCFG_FLOAT;
-        v->v.f = strtod(tok, &endp);
-    } else {
-        v->type = RCFG_INT;
-        v->v.i = strtoll(tok, &endp, 10);
+
+    /* dec-int [ '.' digits ] [ (e|E) [+-] digits ] */
+    for (q = t; *q && *q != '.' && *q != 'e' && *q != 'E'; q++)
+        ;
+    {
+        size_t int_at = cn;
+        r = take_digits(t, (size_t)(q - t), is_dec, clean, &cn);
+        if (r <= 0)
+            return bad_number(ps, r, tok);
+        if (clean[int_at] == '0' && cn - int_at > 1)
+            return fail(ps, "leading zero in '%s'", tok);
     }
+    if (*q == '.') {
+        is_float = 1;
+        clean[cn++] = '.';
+        for (e = ++q; *e && *e != 'e' && *e != 'E'; e++)
+            ;
+        r = take_digits(q, (size_t)(e - q), is_dec, clean, &cn);
+        if (r <= 0)
+            return bad_number(ps, r, tok);
+        q = e;
+    }
+    if (*q == 'e' || *q == 'E') {
+        is_float = 1;
+        clean[cn++] = 'e';
+        q++;
+        if (*q == '+' || *q == '-')
+            clean[cn++] = *q++;
+        r = take_digits(q, strlen(q), is_dec, clean, &cn);
+        if (r <= 0)
+            return bad_number(ps, r, tok);
+    } else if (*q) {
+        return fail(ps, "invalid number '%s'", tok);
+    }
+    clean[cn] = 0;
+
+    if (is_float) {
+        v->type = RCFG_FLOAT;
+        if (!recomp_cfg_parse_double(clean, &v->v.f))
+            return fail(ps, "invalid number '%s'", tok);
+        return 1;
+    }
+    errno = 0;
+    v->type = RCFG_INT;
+    v->v.i = strtoll(clean, &endp, 10);
     if (*endp)
         return fail(ps, "invalid number '%s'", tok);
-    if (errno == ERANGE && !is_float)
+    if (errno == ERANGE)
         return fail(ps, "integer out of range '%s'", tok);
     return 1;
 }
@@ -431,6 +500,51 @@ static Entry *entry_get(const recomp_cfg *cfg, const char *key)
     return i < 0 ? NULL : &cfg->e[i];
 }
 
+static int list_has(char *const *l, size_t n, const char *s, size_t len)
+{
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (strlen(l[i]) == len && !strncmp(l[i], s, len))
+            return 1;
+    return 0;
+}
+
+static int list_add(char ***l, size_t *n, size_t *cap, const char *s, size_t len)
+{
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 8;
+        char **nl = (char **)realloc(*l, nc * sizeof *nl);
+        if (!nl)
+            return 0;
+        *l = nl;
+        *cap = nc;
+    }
+    if (!((*l)[*n] = dup_n(s, len)))
+        return 0;
+    (*n)++;
+    return 1;
+}
+
+/* TOML 1.0: a dotted key defines each table before its last part; such a
+ * table may not be reopened with a [header], and a dotted key may not
+ * reach into a table a [header] defined. `from` is where the key's own
+ * parts start (past the current [table] prefix). */
+static int note_dotted(P *ps, const char *key, size_t from)
+{
+    recomp_cfg *c = ps->cfg;
+    const char *d;
+    for (d = strchr(key + from, '.'); d; d = strchr(d + 1, '.')) {
+        size_t len = (size_t)(d - key);
+        if (list_has(c->tables, c->n_tables, key, len))
+            return fail(ps, "table [%.*s] was defined by a header; a dotted key cannot add to it",
+                        (int)len, key);
+        if (!list_has(c->dotted, c->n_dotted, key, len) &&
+            !list_add(&c->dotted, &c->n_dotted, &c->cap_dotted, key, len))
+            return fail(ps, "out of memory");
+    }
+    return 1;
+}
+
 /* A key may not repeat, may not sit under a key that holds a value, and may
  * not be a table that already has keys under it. */
 static int check_key(P *ps, const char *key)
@@ -466,21 +580,15 @@ static int parse_table_header(P *ps, Buf *table)
     for (i = 0; i < ps->cfg->n_tables; i++)
         if (!strcmp(ps->cfg->tables[i], table->b))
             return fail(ps, "table [%s] defined twice", table->b);
+    if (list_has(ps->cfg->dotted, ps->cfg->n_dotted, table->b, table->n))
+        return fail(ps, "table [%s] was already defined by a dotted key", table->b);
     for (i = 0; i < ps->cfg->n; i++)
         if (is_prefix(ps->cfg->e[i].key, table->b))
             return fail(ps, "'%s' is a value (line %d), not a table",
                         ps->cfg->e[i].key, ps->cfg->e[i].line);
-    if (ps->cfg->n_tables == ps->cfg->cap_tables) {
-        size_t nc = ps->cfg->cap_tables ? ps->cfg->cap_tables * 2 : 8;
-        char **nt = (char **)realloc(ps->cfg->tables, nc * sizeof *nt);
-        if (!nt)
-            return fail(ps, "out of memory");
-        ps->cfg->tables = nt;
-        ps->cfg->cap_tables = nc;
-    }
-    if (!(ps->cfg->tables[ps->cfg->n_tables] = dup_n(table->b, table->n)))
+    if (!list_add(&ps->cfg->tables, &ps->cfg->n_tables, &ps->cfg->cap_tables,
+                  table->b, table->n))
         return fail(ps, "out of memory");
-    ps->cfg->n_tables++;
     return expect_eol(ps);
 }
 
@@ -501,7 +609,7 @@ static int parse_keyval(P *ps, const Buf *table)
     }
     ps->p++;
     skip_ws(ps);
-    if (!check_key(ps, key.b))
+    if (!check_key(ps, key.b) || !note_dotted(ps, key.b, table->n ? table->n + 1 : 0))
         goto bad;
     if (ps->p < ps->end && *ps->p == '[') {
         e.val.type = RCFG_ARRAY;
@@ -538,6 +646,35 @@ bad:
     return 0;
 }
 
+/* The first byte of a malformed UTF-8 sequence (overlong, surrogate,
+ * above U+10FFFF, truncated), or NULL when the text is valid. */
+static const char *utf8_invalid(const char *s, const char *end)
+{
+    const unsigned char *p = (const unsigned char *)s, *e = (const unsigned char *)end;
+    while (p < e) {
+        unsigned c = *p;
+        unsigned long cp;
+        int n, k;
+        if (c < 0x80) { p++; continue; }
+        if (c >= 0xC2 && c <= 0xDF) { n = 1; cp = c & 0x1F; }
+        else if (c >= 0xE0 && c <= 0xEF) { n = 2; cp = c & 0x0F; }
+        else if (c >= 0xF0 && c <= 0xF4) { n = 3; cp = c & 0x07; }
+        else return (const char *)p;
+        if (e - p <= n)
+            return (const char *)p;
+        for (k = 1; k <= n; k++) {
+            if ((p[k] & 0xC0) != 0x80)
+                return (const char *)p;
+            cp = (cp << 6) | (p[k] & 0x3F);
+        }
+        if ((n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000) || cp > 0x10FFFF ||
+            (cp >= 0xD800 && cp <= 0xDFFF))
+            return (const char *)p;
+        p += n + 1;
+    }
+    return NULL;
+}
+
 /* ── loading ───────────────────────────────────────────────────────── */
 
 recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
@@ -564,6 +701,15 @@ recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
     ps.errlen = errlen;
     if (ps.end - ps.p >= 3 && !memcmp(ps.p, "\xEF\xBB\xBF", 3))
         ps.p += 3;   /* UTF-8 byte-order mark */
+    {
+        const char *bad = utf8_invalid(ps.p, ps.end);
+        if (bad) {
+            const char *q;
+            for (q = ps.p; q < bad; q++)
+                ps.line += *q == '\n';
+            fail(&ps, "invalid UTF-8");
+        }
+    }
     buf_put(&table, "", 0);
 
     while (ps.p < ps.end && !ps.failed) {
@@ -633,9 +779,59 @@ void recomp_cfg_free(recomp_cfg *cfg)
     for (i = 0; i < cfg->n_tables; i++)
         free(cfg->tables[i]);
     free(cfg->tables);
+    for (i = 0; i < cfg->n_dotted; i++)
+        free(cfg->dotted[i]);
+    free(cfg->dotted);
     free(cfg->e);
     free(cfg->name);
     free(cfg);
+}
+
+int recomp_cfg_parse_double(const char *s, double *out)
+{
+    char buf[128];
+    const char *dp, *q;
+    size_t dl, n = 0;
+    char *end;
+    double d;
+
+    if (!s || !out)
+        return 0;
+    q = s + (*s == '+' || *s == '-');
+    if (!*q)
+        return 0;
+    for (; *q; q++)   /* digits . e E + - only: no hex floats, spaces, ',' */
+        if (!(is_dec(*q) || *q == '.' || *q == 'e' || *q == 'E' || *q == '+' || *q == '-'))
+            break;
+    if (*q) {
+        q = s + (*s == '+' || *s == '-');
+        if (strcmp(q, "inf") && strcmp(q, "nan") && strcmp(q, "infinity"))
+            return 0;
+        d = q[0] == 'n' ? NAN : (*s == '-' ? -HUGE_VAL : HUGE_VAL);
+        *out = d;
+        return 1;
+    }
+    /* strtod reads the locale's decimal point; hand it that instead of '.'. */
+    dp = localeconv()->decimal_point;
+    dl = dp && *dp ? strlen(dp) : 1;
+    for (q = s; *q; q++) {
+        if (*q == '.') {
+            if (n + dl >= sizeof buf)
+                return 0;
+            memcpy(buf + n, dp && *dp ? dp : ".", dl);
+            n += dl;
+        } else {
+            if (n + 1 >= sizeof buf)
+                return 0;
+            buf[n++] = *q;
+        }
+    }
+    buf[n] = 0;
+    d = strtod(buf, &end);
+    if (end == buf || *end)
+        return 0;
+    *out = d;
+    return 1;
 }
 
 /* ── getters ───────────────────────────────────────────────────────── */
