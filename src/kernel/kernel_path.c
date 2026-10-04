@@ -183,12 +183,11 @@ const wchar_t *xbox_LastHostPath(void)
  * The raw disk device, \Device\Harddisk0\Partition0, and the partition
  * devices after it. Both backends back them with image files in the save dir.
  *
- * A title opens Partition0 to read the Xbox partition table at sector 4
- * (offset 0x800) and find the cache partitions behind X:, Y: and Z: -- XAPI's
- * utility-drive mount does exactly that, and some titles call
- * HalReturnToFirmware when the read fails. A directory cannot answer a
- * 512-byte read at a file offset, so the device is backed by an image file
- * instead.
+ * A title opens it to read the Xbox partition table at sector 4 (offset 0x800)
+ * and find the cache partitions behind X:, Y: and Z: -- XAPI's utility-drive
+ * mount does exactly that, and DSTEAL_JP calls HalReturnToFirmware when the
+ * read fails. A directory cannot answer a 512-byte read at a file offset, so
+ * the device is backed by an image file instead.
  *
  * The table is the standard retail geometry. This is emulating a device that
  * has to be there, not fabricating anything the title owns.
