@@ -2737,8 +2737,17 @@ static void dump_frame(void)
         checked = 1;
         prefix = recomp_env(RENV_D3D11_DUMP);
     }
-    if (!prefix)
+    if (!prefix) {
+        /* fb_dump_at leaves the listed flips to this backend, which writes
+         * them only next to its d3d11_dump frames. */
+        static int warned;
+        if (!warned && nv2a_pb_dump_at_listed((uint32_t)s_presents)) {
+            warned = 1;
+            fprintf(stderr, LOGP "WARNING: fb_dump_at is set without d3d11_dump;"
+                    " no flips will be dumped\n");
+        }
         return;
+    }
     n = strlen(prefix);
     dir = n && (prefix[n - 1] == '/' || prefix[n - 1] == '\\');
     if ((s_presents % 60) == 1) {
