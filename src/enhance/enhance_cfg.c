@@ -266,9 +266,8 @@ double enhance_cfg_float(const char *key, double def)
     const char *v = env_of(key, &b);
     int f;
     if (v) {
-        char *end;
-        double d = strtod(v, &end);
-        if (end != v && !*end)
+        double d;
+        if (recomp_cfg_parse_double(v, &d))
             return d;
         env_bad(b, v, "a number");
     }
