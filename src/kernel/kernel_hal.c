@@ -173,7 +173,41 @@ void xbox_IrqlDumpHolders(void)
  * taken off a count it was never on. */
 static XBOX_THREAD_LOCAL int t_irql_counted;
 
-static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+/* The single-processor DISPATCH_LEVEL guarantee: while one thread (or a DPC)
+ * is at DISPATCH_LEVEL or above, no other thread and no DPC runs on the
+ * console's one CPU. Titles build their locks on that. DirectSound's lock
+ * takes a critical section at PASSIVE_LEVEL and then raises, and its DPC
+ * (BLiNX 2 sub_00334BDF) skips the critical section because it is at
+ * DISPATCH_LEVEL: the raise is what keeps the DPC out of the voice lists a
+ * thread is editing, and keeps a thread out while the DPC walks them.
+ *
+ * Here threads run in parallel and the level is only a number, so the DPC
+ * (on the timer thread) walked a voice list a thread was relinking, found a
+ * node pointing back into the list, and looped there forever at DISPATCH:
+ * the IRQL depth stuck at one, every APU interrupt sat out the hold-off, the
+ * front end stayed trapped and the stage-1 load never finished (Proton, 1 in
+ * ~20 stage1 runs once the ADX threads woke on every vblank).
+ *
+ * So the transition to DISPATCH_LEVEL takes one process-wide gate and the
+ * transition back releases it: thread raises and DPCs are serialized, as on
+ * the console. Device interrupt service routines (entered above DISPATCH by
+ * the device models) do not take it: on hardware they preempt DISPATCH-level
+ * code, and the models already hold delivery off while the depth is raised.
+ * Recursive, so a thread already through it (a DPC that raises again) never
+ * waits on itself. */
+static CRITICAL_SECTION s_dispatch_gate;
+static INIT_ONCE s_dispatch_gate_once = INIT_ONCE_STATIC_INIT;
+static XBOX_THREAD_LOCAL int t_dispatch_gate_held;
+
+static BOOL CALLBACK dispatch_gate_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&s_dispatch_gate);
+    return TRUE;
+}
+
+static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
+                             int gate)
 {
     int now = (new_level >= DISPATCH_LEVEL);
     LONG d;
@@ -183,6 +217,12 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
         return;
     t_irql_counted = now;
 
+    if (now && gate) {
+        InitOnceExecuteOnce(&s_dispatch_gate_once, dispatch_gate_init,
+                            NULL, NULL);
+        EnterCriticalSection(&s_dispatch_gate);
+        t_dispatch_gate_held = 1;
+    }
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
     InterlockedIncrement(&s_transitions);
@@ -190,6 +230,10 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
         irql_holder_add(ra);
     else
         irql_holder_drop();
+    if (!now && t_dispatch_gate_held) {
+        t_dispatch_gate_held = 0;
+        LeaveCriticalSection(&s_dispatch_gate);
+    }
 
     /* RECOMP_IRQL_TRACE prints the first few transitions. The pairing is what
      * matters: a raise to 2 followed by a lower from 2 nets out, and a lower
@@ -203,6 +247,11 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
                 now ? "raise" : "lower", old_level, new_level, (long)d);
         fflush(stderr);
     }
+}
+
+static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+{
+    irql_track_gated(old_level, new_level, ra, 1);
 }
 
 /* Bracket a host-delivered ISR or DPC.
@@ -220,7 +269,10 @@ int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
     if (g_current_irql != (KIRQL)level) {
-        irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
+        /* A DPC (DISPATCH_LEVEL) goes through the gate; a device ISR does
+         * not (see s_dispatch_gate). */
+        irql_track_gated(g_current_irql, (KIRQL)level, IRQL_CALLER(),
+                         level <= DISPATCH_LEVEL);
         g_current_irql = (KIRQL)level;
         irql_publish();
     }
