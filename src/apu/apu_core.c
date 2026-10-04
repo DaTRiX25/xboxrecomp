@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "recomp_env.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_wav.h"
@@ -198,7 +199,7 @@ static void apu_irq_stats_line(void)
     uint64_t now;
 
     if (trace < 0)
-        trace = getenv("RECOMP_APU_TRACE") != NULL;
+        trace = recomp_env(RENV_APU_TRACE) != NULL;
     if (!trace)
         return;
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -412,8 +413,8 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     /* RECOMP_AUDIO_WAV=<path>: dump exactly what the device is given. */
     {
-        const char *wav = getenv("RECOMP_AUDIO_WAV");
-        const char *secs = getenv("RECOMP_AUDIO_WAV_SECS");
+        const char *wav = recomp_env(RENV_AUDIO_WAV);
+        const char *secs = recomp_env(RENV_AUDIO_WAV_SECS);
         if (wav && *wav)
             apu_wav_open(wav, secs ? atof(secs) : 0.0);
     }
@@ -861,10 +862,10 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     g_state = d;
     d->ram_ptr = ram_ptr;
 
-    /* RECOMP_APU_SOLO=<voice>: mute every other voice in the mix, for
+    /* RECOMP_DEBUG=apu_solo=<voice>: mute every other voice in the mix, for
      * telling which voice a sound (or a noise) comes from. */
     {
-        const char *solo = getenv("RECOMP_APU_SOLO");
+        const char *solo = recomp_env(RENV_APU_SOLO);
         if (solo && *solo) {
             g_dbg_voice_monitor = atoi(solo);
             fprintf(stderr, "[APU] solo: only voice %d is mixed\n",

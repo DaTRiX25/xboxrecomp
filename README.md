@@ -100,7 +100,7 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | **xbox_kernel** | Custom | Xbox kernel → Win32 (170 of the kernel's 371 ordinals routed, 169 with dedicated bridge functions: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
 | **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
-| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
+| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF). On by default (`RECOMP_AC97_READY`) on x86-64 Windows/Proton (XAudio2) and on macOS/Linux arm64 (SDL2, A64 MMIO decoder); off on x86-64 POSIX |
 | **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
 | **xbox_input** | Custom | Xbox gamepad → XInput |
 | **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture, plus a window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
@@ -1377,8 +1377,8 @@ one title's WMV decoder as no-op comments.
   chain, without a run per level.
 - `RECOMP_WATCH_VA` — hardware watchpoint on a guest address, generalised from a
   single hardcoded one.
-- `RECOMP_PB_SCAN` / `RECOMP_PB_EXEC` — survey a title's NV2A pushbuffer and
-  execute its surface and clear methods. The survey ranks what is *not*
+- `RECOMP_TRACE=pb_scan` / `RECOMP_PB_EXEC` (on by default; `=0` turns it
+  off) — survey a title's NV2A pushbuffer and execute it. The survey ranks what is *not*
   implemented, so the remaining work is a list rather than a guess.
 - `RECOMP_FB_WINDOW` — a window on the guest framebuffer. Nothing else scans it
   out, so however much of the GPU works, none of it is observable without this.

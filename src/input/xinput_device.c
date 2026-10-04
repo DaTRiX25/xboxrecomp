@@ -10,6 +10,7 @@
  */
 
 #include "input_backend.h"
+#include "recomp_env.h"
 #include "input_map.h"
 #include <stddef.h>
 #include <stdlib.h>
@@ -50,7 +51,7 @@ static BOOL keyboard_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *v = getenv("RECOMP_KEYBOARD");
+        const char *v = recomp_env(RENV_KEYBOARD);
         on = (v && *v && *v != '0') ? 1 : 0;
     }
     return on ? TRUE : FALSE;

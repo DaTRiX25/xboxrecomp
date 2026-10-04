@@ -13,6 +13,7 @@
  */
 
 #include "kernel.h"
+#include "recomp_env.h"
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -376,7 +377,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     /* RECOMP_SAVE_DIR: the root for the title's UDATA and TDATA, created if
      * missing. Absolute; under Wine a DOS path (Z:\home\...) is safest. */
     {
-        const char *ov = getenv("RECOMP_SAVE_DIR");
+        const char *ov = recomp_env(RENV_SAVE_DIR);
         /* Room for the longest suffix the rules append (UDATA\<title id>\
          * <save>\<file>); a longer root would only truncate later. */
         int n = (ov && ov[0])
@@ -577,7 +578,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     /* RECOMP_SAVE_DIR: the root for the title's UDATA and TDATA, created if
      * missing, so a scripted run can start from an empty save. */
     {
-        const char* ov = getenv("RECOMP_SAVE_DIR");
+        const char* ov = recomp_env(RENV_SAVE_DIR);
         if (ov && ov[0]) {
             snprintf(s_user_dir, sizeof(s_user_dir), "%s", ov);
             strip_trailing_slash(s_user_dir);

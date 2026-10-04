@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
+#include "recomp_env.h"
 
 #if !defined(_WIN32)
 
@@ -48,21 +49,12 @@ static unsigned  g_underruns;
 static int       g_dry;
 static int64_t   g_underrun_logged_ms;
 
-static int env_int(const char *name, int def, int lo, int hi)
+static int env_int(recomp_env_id id, int def, int lo, int hi)
 {
-    const char *e = getenv(name);
-    int v;
-    if (!e || !*e) return def;
-    v = atoi(e);
+    int v = recomp_env_int(id, def);
     if (v < lo) v = lo;
     if (v > hi) v = hi;
     return v;
-}
-
-static int env_on(const char *name)
-{
-    const char *e = getenv(name);
-    return e && *e && *e != '0';
 }
 
 static int64_t now_ms(void)
@@ -79,14 +71,15 @@ int xa2_init(void)
 
     if (g_initialized) return 1;
 
-    g_buf_samples = env_int("RECOMP_AUDIO_BUF_SAMPLES", SDLA_BUF_SAMPLES_DEFAULT,
+    g_buf_samples = env_int(RENV_AUDIO_BUF_SAMPLES, SDLA_BUF_SAMPLES_DEFAULT,
                             SDLA_BUF_SAMPLES_MIN, SDLA_BUF_SAMPLES_MAX);
-    g_num_bufs = env_int("RECOMP_AUDIO_BUF_COUNT", SDLA_NUM_BUFS_DEFAULT,
+    g_num_bufs = env_int(RENV_AUDIO_BUF_COUNT, SDLA_NUM_BUFS_DEFAULT,
                          SDLA_NUM_BUFS_MIN, SDLA_NUM_BUFS_MAX);
 
     /* Headless: no speakers unless the caller names a driver. Must be set
-     * before the audio subsystem starts; 0 keeps an existing value. */
-    if (env_on("RECOMP_HEADLESS"))
+     * before the audio subsystem starts; 0 keeps an existing value.
+     * SDL_AUDIODRIVER is SDL's own variable, not one of ours. */
+    if (recomp_env_on(RENV_HEADLESS))
         SDL_setenv("SDL_AUDIODRIVER", "dummy", 0);
 
     if (!SDL_WasInit(SDL_INIT_AUDIO)) {

@@ -20,8 +20,18 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # declares its own project().
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
+# recomp_env: every environment variable the runtime reads, read once
+# (recomp_env.h). A real library on every host; platform carries it to all
+# of the runtime's libraries.
+add_library(recomp_env STATIC recomp_env.c)
+target_include_directories(recomp_env PUBLIC
+    ${XBOXRECOMP_SRC_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 if(WIN32)
     add_library(platform INTERFACE)
+    target_link_libraries(platform INTERFACE recomp_env)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
 else()
     add_library(platform STATIC win32_compat.c)
@@ -30,6 +40,6 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     find_package(Threads REQUIRED)
-    target_link_libraries(platform PUBLIC Threads::Threads)
+    target_link_libraries(platform PUBLIC Threads::Threads recomp_env)
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()

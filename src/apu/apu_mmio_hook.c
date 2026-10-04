@@ -7,6 +7,7 @@
  */
 
 #include "apu.h"
+#include "recomp_env.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -110,7 +111,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
  * exception round trip around it is not visible from here (see
  * apu_hook_fault_bench). */
 #define APU_HIST_SLOTS (APU_MMIO_SIZE / 4)
-static int s_trace = -1;               /* getenv once, not per access */
+static int s_trace = -1;               /* looked up once, not per access */
 static volatile LONG s_hist_r[APU_HIST_SLOTS], s_hist_w[APU_HIST_SLOTS];
 static volatile uint32_t s_hist_lastw[APU_HIST_SLOTS];
 static volatile LONG64 s_tot_r, s_tot_w, s_handler_ticks;
@@ -160,7 +161,7 @@ static DWORD WINAPI apu_trace_reporter(LPVOID unused)
 static int apu_trace_on(void)
 {
     if (s_trace < 0) {
-        s_trace = getenv("RECOMP_APU_TRACE") != NULL;
+        s_trace = recomp_env(RENV_APU_TRACE) != NULL;
         QueryPerformanceFrequency(&s_qpf);
     }
     return s_trace;
@@ -314,7 +315,7 @@ void apu_hook_trace_start(void)
     static int started;
     pthread_t th;
     if (s_trace < 0)
-        s_trace = getenv("RECOMP_APU_TRACE") != NULL;
+        s_trace = recomp_env_on(RENV_APU_TRACE);
     if (!s_trace || started)
         return;
     started = 1;
@@ -337,7 +338,7 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
     if (!g_apu_state || off >= APU_MMIO_SIZE)
         return false;
     if (s_trace < 0)
-        s_trace = getenv("RECOMP_APU_TRACE") != NULL;
+        s_trace = recomp_env_on(RENV_APU_TRACE);
     trace = s_trace && !g_apu_hook_bench_active;
     if (trace)
         a = s_now_ns();
