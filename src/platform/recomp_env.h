@@ -41,7 +41,7 @@ extern "C" {
  *   #define RECOMP_ENV_GAME_COMMA_KEYS "mem_dump",
  * A game can also give a toolkit key a default, used when neither its new
  * nor its old spelling is set, with RECOMP_ENV_GAME_DEFAULTS(D):
- *   #define RECOMP_ENV_GAME_DEFAULTS(D) D(APU_DSP_ACK, "0x80A1C810")
+ *   #define RECOMP_ENV_GAME_DEFAULTS(D) D(APU_DSP_ACK, "auto")
  */
 #ifdef RECOMP_ENV_HAVE_GAME_KEYS
 #include "recomp_env_game.h"
@@ -139,7 +139,7 @@ extern "C" {
     X(FORCE_RETURN,      DEBUG, "force_return",    "RECOMP_FORCE_RETURN",      "honour forced returns in the build") \
     X(TRAP_NULL,         DEBUG, "trap_null",       "RECOMP_TRAP_NULL",         "guest page zero faults") \
     X(DSP_ACK,           DEBUG, "dsp_ack",         "RECOMP_DSP_ACK",           "=va,...: zero these words (no APU)") \
-    X(APU_DSP_ACK,       DEBUG, "apu_dsp_ack",     "RECOMP_APU_DSP_ACK",       "=va,...: APU DSP acks these words") \
+    X(APU_DSP_ACK,       DEBUG, "apu_dsp_ack",     "RECOMP_APU_DSP_ACK",       "=auto|va,...: APU DSP acks the GP doorbell (from GPSADDR) or these words") \
     X(APU_SOLO,          DEBUG, "apu_solo",        "RECOMP_APU_SOLO",          "=voice: mix only this APU voice") \
     X(APU_VOICE_DUMP,    DEBUG, "apu_voice_dump",  "RECOMP_APU_VOICE_DUMP",    "=voice|all: raw samples of one APU voice (all: every voice) to a file") \
     X(APU_VOICE_DUMP_FILE, DEBUG, "apu_voice_dump_file", "RECOMP_APU_VOICE_DUMP_FILE", "=path: apu_voice_dump output, default voice_dump.raw") \
