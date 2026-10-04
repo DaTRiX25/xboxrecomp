@@ -674,6 +674,10 @@ static inline uint32_t nv2a_blend_factor_u8(uint32_t bf, uint32_t src,
     case NV2A_BF_INV_CONST_COLOR: return 255 - ((constant >> sh) & 0xFF);
     case NV2A_BF_CONST_ALPHA:     return constant >> 24;
     case NV2A_BF_INV_CONST_ALPHA: return 255 - (constant >> 24);
+    case NV2A_BF_SRC_ALPHA_SAT: {         /* min(As, 1 - Ad); 1 for alpha */
+        uint32_t sa = src >> 24, ida = 255 - (dst >> 24);
+        return sh == 24 ? 255 : (sa < ida ? sa : ida);
+    }
     default:                      return 255 - ((dst >> sh) & 0xFF);
     }
 }

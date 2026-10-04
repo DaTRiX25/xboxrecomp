@@ -1385,11 +1385,13 @@ static int surface_begin_batch(const uint8_t *mem)
     return 1;
 }
 
-/* A GL blend factor the CPU blender computes as GL does (not SRC_ALPHA_SAT). */
+/* A GL blend factor the CPU blender computes as GL does. SRC_ALPHA_SATURATE
+ * included (upstream 0e9cff9): nv2a_blend_factor_u8 gives min(As, 1 - Ad)
+ * for the colour channels and 1 for alpha; excluded, the pair was written
+ * opaque. */
 static int blend_known(uint32_t f)
 {
-    uint32_t bf = nv2a_blend_from_gl(f);
-    return bf != NV2A_BF_UNKNOWN && bf != NV2A_BF_SRC_ALPHA_SAT;
+    return nv2a_blend_from_gl(f) != NV2A_BF_UNKNOWN;
 }
 
 /* A GL blend factor for the channel at bit `sh` of an ARGB word, 0..255. */
@@ -1481,7 +1483,14 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
                         + ((dst >>  8) & 0xFF) * (255u - sa) + 127u) / 255u;
             uint32_t b = (((argb      ) & 0xFF) * sa
                         + ((dst      ) & 0xFF) * (255u - sa) + 127u) / 255u;
-            argb = 0xFF000000u | (r << 16) | (g << 8) | b;
+            /* Alpha blends with the same factors, as GL and the GPU backends
+             * do: As*As + Ad*(1-As). It used to be written 0xFF, and a later
+             * pass reading DST_ALPHA (the shadow volumes) saw the wrong
+             * value (upstream 0e9cff9). A 16-bit target has no destination
+             * alpha and reads it as 1. */
+            uint32_t da = bpp == 4 ? dst >> 24 : 255u;
+            uint32_t a = (sa * sa + da * (255u - sa) + 127u) / 255u;
+            argb = (a << 24) | (r << 16) | (g << 8) | b;
         }
     } else if (s_gpu.blend_enable
                && (blend_eq() == 3 || blend_eq() == 4      /* MIN/MAX: no factors */
