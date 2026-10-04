@@ -1388,29 +1388,11 @@ static D3D11_TEXTURE_ADDRESS_MODE address_mode(uint32_t m)
  * between two levels, 7 convolution on level 0 (taken as linear). MAG: 1
  * nearest, 2 linear, 4 convolution (linear). The LOD range is CONTROL0's
  * clamps, as xemu's sampler: 0..0 when MIN does not mipmap. RECOMP_D3D11_POINT=1
- * forces nearest texels (the CPU path's sampling) for every stage. */
-static int filter_linear(uint32_t f, int mag)
-{
-    uint32_t m = mag ? (f >> 24) & 0xF : (f >> 16) & 0x3F;
-    if (mag)
-        return m == 2 || m == 4;
-    return m == 2 || m == 4 || m == 6 || m == 7;
-}
-
-/* 0: level 0 only, 1: nearest level, 2: blend two levels. */
-static int filter_mip(uint32_t f)
-{
-    uint32_t m = (f >> 16) & 0x3F;
-    return m == 3 || m == 4 ? 1 : m == 5 || m == 6 ? 2 : 0;
-}
-
-static float lod_bias(uint32_t f)
-{
-    int b = (int)(f & 0x1FFFu);
-    if (b & 0x1000)
-        b -= 0x2000;
-    return (float)b / 256.0f;
-}
+ * forces nearest texels (the CPU path with RECOMP_PB_BILINEAR=0) for every
+ * stage. */
+#define filter_linear nv2a_tex_filter_linear   /* nv2a_backend_common.h */
+#define filter_mip    nv2a_tex_filter_mip
+#define lod_bias      nv2a_tex_lod_bias
 
 #define SMP_MAX 256
 static struct { uint64_t key; ID3D11SamplerState *s; } s_smp[SMP_MAX];

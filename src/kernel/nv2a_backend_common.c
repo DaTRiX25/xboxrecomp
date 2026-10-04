@@ -27,6 +27,15 @@ uint32_t nv2a_tex_extent(uint32_t fmt, uint32_t w, uint32_t h,
     return pitch * (h - 1u) + w * tb;
 }
 
+uint32_t nv2a_tex_face_stride(uint32_t fmt, uint32_t w, uint32_t h,
+                              uint32_t pitch, uint32_t levels)
+{
+    uint32_t n = nv2a_tex_size_from_format(fmt)
+               ? nv2a_tex_extent(fmt, w, h, pitch, levels ? levels : 1u)
+               : pitch * h;
+    return (n + 127u) & ~127u;
+}
+
 uint64_t nv2a_tex_hash(const uint8_t *p, uint32_t n, uint64_t h)
 {
     uint64_t l[4] = { h, h ^ 1u, h ^ 2u, h ^ 3u };
@@ -131,6 +140,10 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
     t->addr_u =  r[0x08 / 4]       & 0xF;
     t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
     t->filter = r[0x14 / 4];
+    t->cube = (int)((fmt >> 2) & 1u);
+    t->fmt_levels = (fmt >> 16) & 0xFu;
+    if (!t->fmt_levels)
+        t->fmt_levels = 1;
     /* P8: SET_TEXTURE_PALETTE (0x1B20). */
     if (t->color == NV2A_TEX_P8)
         nv2a_tex_palette_decode(r[0x20 / 4], resolve, &t->palette, &t->pal_len);

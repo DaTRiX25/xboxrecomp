@@ -97,6 +97,62 @@ static inline uint32_t nv2a_tex_level_dim(uint32_t d, uint32_t l)
  * cannot be decoded. Swizzled and DXT levels are packed one after another;
  * a linear texture is one level at `pitch` bytes per row. The caller checks
  * validity and its own size limit first. */
+/* SET_TEXTURE_FILTER, as every path reads it: MIN in bits 16-21, MAG in
+ * 24-27, the LOD bias in 0-12. MIN: 1 nearest and 2 linear on level 0, 3/4
+ * nearest/linear within the nearest level, 5/6 nearest/linear blended
+ * between two levels, 7 convolution on level 0 (taken as linear). MAG: 1
+ * nearest, 2 linear, 4 convolution (linear). */
+static inline int nv2a_tex_filter_linear(uint32_t f, int mag)
+{
+    uint32_t m = mag ? (f >> 24) & 0xF : (f >> 16) & 0x3F;
+    if (mag)
+        return m == 2 || m == 4;
+    return m == 2 || m == 4 || m == 6 || m == 7;
+}
+
+/* 0: level 0 only, 1: nearest level, 2: blend two levels. */
+static inline int nv2a_tex_filter_mip(uint32_t f)
+{
+    uint32_t m = (f >> 16) & 0x3F;
+    return m == 3 || m == 4 ? 1 : m == 5 || m == 6 ? 2 : 0;
+}
+
+/* The mip LOD bias, signed 5.8 fixed point. */
+static inline float nv2a_tex_lod_bias(uint32_t f)
+{
+    int b = (int)(f & 0x1FFFu);
+    if (b & 0x1000)
+        b -= 0x2000;
+    return (float)b / 256.0f;
+}
+
+/* Cube-map face and its 2D coordinates for direction `c` (xemu, and the
+ * D3D face order +X -X +Y -Y +Z -Z); s, t in [0,1] on the face. */
+static inline uint32_t nv2a_cube_face(const float c[3], float *s, float *t)
+{
+    float x = c[0], y = c[1], z = c[2];
+    float ax = fabsf(x), ay = fabsf(y), az = fabsf(z), ma, sc, tc;
+    uint32_t face;
+    if (ax >= ay && ax >= az) {
+        face = x > 0 ? 0 : 1; ma = ax; sc = x > 0 ? -z : z; tc = -y;
+    } else if (ay >= az) {
+        face = y > 0 ? 2 : 3; ma = ay; sc = x; tc = y > 0 ? z : -z;
+    } else {
+        face = z > 0 ? 4 : 5; ma = az; sc = z > 0 ? x : -x; tc = -y;
+    }
+    if (ma == 0.0f)
+        ma = 1.0f;
+    *s = (sc / ma + 1.0f) * 0.5f;
+    *t = (tc / ma + 1.0f) * 0.5f;
+    return face;
+}
+
+/* Bytes from one cube-map face to the next: a face with all `levels` of
+ * its levels, rounded up to the NV2A's 128-byte face alignment (xemu
+ * texture.c). A linear face is `pitch` * h. */
+uint32_t nv2a_tex_face_stride(uint32_t fmt, uint32_t w, uint32_t h,
+                              uint32_t pitch, uint32_t levels);
+
 uint32_t nv2a_tex_extent(uint32_t fmt, uint32_t w, uint32_t h,
                          uint32_t pitch, uint32_t levels);
 
@@ -283,6 +339,9 @@ struct nv2a_stage {
     uint32_t levels;            /* mip levels (1 for linear, or without
                                  * NV2A_STAGE_MIPS) */
     uint32_t lod_min, lod_max;  /* CONTROL0 LOD clamps, within levels    */
+    uint32_t fmt_levels;        /* FORMAT's MIPMAP_LEVELS as stored (>= 1):
+                                 * the memory layout, whatever is sampled */
+    int      cube;              /* FORMAT CUBEMAP_ENABLE: six faces      */
     int      valid;
     int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
     int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */

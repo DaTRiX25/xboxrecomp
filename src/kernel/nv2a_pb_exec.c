@@ -1191,8 +1191,8 @@ static void clear_surface(uint32_t param)
  * format samples nothing and the caller keeps the vertex colour, which is
  * visibly wrong rather than quietly wrong.
  *
- * ponytail: nearest texel, no filtering, whatever SET_TEXTURE_FILTER asked
- * for. Bilinear when a title's output actually depends on it.
+ * Filtering is the stage sampler's (stage_sample_2d): nearest, or bilinear
+ * when SET_TEXTURE_FILTER asks for TENT.
  */
 /* Off the edge of the texture, the way the title asked for.
  *
@@ -2387,6 +2387,7 @@ void nv2a_pb_perf_scan_end(void)
 static Texture s_stage_tex[4];
 static int     s_stage_mode[4];         /* 0 none, 1 2D, 4 pass-through, other */
 static float   s_stage_scale[4][2];     /* normalised -> texels */
+static int     s_stage_tent[4];         /* bilinear: SET_TEXTURE_FILTER asks TENT */
 
 /* RECOMP_TEX_LOG=1: every distinct texture a program-mode batch samples,
  * per stage, with the raw format word decoded (dimensionality, cube map, mip
@@ -2561,6 +2562,22 @@ static void tex_log_report(void)
                     (unsigned long long)s_tex_fail[k]);
 }
 
+/* Bilinear when SET_TEXTURE_FILTER asks for a linear filter, magnifying or
+ * minifying (as upstream 13c64d3; linear as the GPU backends read it,
+ * nv2a_tex_filter_linear). A 64x32 sky gradient stretched over the screen
+ * is blocks with nearest texels and a gradient with four.
+ * ponytail: level 0 only, no mip selection -- minified textures shimmer.
+ * RECOMP_PB_BILINEAR=0 samples nearest whatever the filter says. */
+static int tex_filter_tent(uint32_t filter)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_BILINEAR");
+        on = !(e && e[0] == '0');
+    }
+    return on && (nv2a_tex_filter_linear(filter, 1) || nv2a_tex_filter_linear(filter, 0));
+}
+
 static void vsh_build_stages(void)
 {
     int n;
@@ -2582,7 +2599,11 @@ static void vsh_build_stages(void)
         t->addr_v = st.addr_v;
         t->palette = st.palette;
         t->pal_len = st.pal_len;
+        t->filter = st.filter;
+        t->face_stride = st.cube ? nv2a_tex_face_stride(st.color, st.width, st.height,
+                                                        st.pitch, st.fmt_levels) : 0;
         t->valid  = st.valid;
+        s_stage_tent[n] = tex_filter_tent(st.filter);
         s_vsh.stage_mode_seen[n][st.raw_mode]++;
         s_stage_mode[n] = st.mode;
         if (st.mode != 0 && st.mode != 4)
@@ -2643,12 +2664,61 @@ static int alpha_test_pass(float a)
     return nv2a_cmp_test_u(nv2a_cmp_from_gl(s_vsh.atest_func), v, ref);
 }
 
+/* Texel (iu, iv), already wrapped, of `t` as floats; black, opaque, when
+ * the texture cannot be read. */
+static void texel_live(const Texture *t, int iu, int iv, float o[4])
+{
+    uint32_t texel;
+    if (sample_tex(t, (uint32_t)iu, (uint32_t)iv, &texel))
+        rc_unpack(texel, o);
+    else
+        o[0] = o[1] = o[2] = 0.0f, o[3] = 1.0f;
+}
+
+/* The four taps' weights, the same expression for the live and cached
+ * samplers so their results agree bit for bit. */
+static void bilerp(const float c[4][4], float wu, float wv, float o[4])
+{
+    int j;
+    for (j = 0; j < 4; j++)
+        o[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
+             + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
+}
+
+/* Bilinear setup: the top-left tap and the weights, at texel centres. */
+static void tent_setup(int n, float s, float t, int *iu, int *iv, float *wu, float *wv)
+{
+    float fu = s * s_stage_scale[n][0] - 0.5f, fv = t * s_stage_scale[n][1] - 0.5f;
+    *iu = (int)floorf(fu);
+    *iv = (int)floorf(fv);
+    *wu = fu - (float)*iu;
+    *wv = fv - (float)*iv;
+}
+
+/* Stage n's texture `tx` (the stage's own, or one cube face of it) at
+ * normalised (swizzled, DXT) or texel (linear) coordinates s, t. */
+static void stage_sample_2d(int n, const Texture *tx, float s, float t, float o[4])
+{
+    int iu, iv;
+    if (s_stage_tent[n]) {
+        float wu, wv, c[4][4];
+        int k;
+        tent_setup(n, s, t, &iu, &iv, &wu, &wv);
+        for (k = 0; k < 4; k++)
+            texel_live(tx, wrap_signed(iu + (k & 1), tx->width, tx->addr_u),
+                       wrap_signed(iv + (k >> 1), tx->height, tx->addr_v), c[k]);
+        bilerp(c, wu, wv, o);
+        return;
+    }
+    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), tx->width,  tx->addr_u);
+    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), tx->height, tx->addr_v);
+    texel_live(tx, iu, iv, o);
+}
+
 static void stage_sample(int n, const float tc[4], float o[4])
 {
     int mode = s_stage_mode[n];
-    uint32_t texel;
     float s, t;
-    int iu, iv;
 
     if (mode == 0) { o[0] = o[1] = o[2] = o[3] = 0.0f; return; }
     if (mode == 4) {                       /* pass-through: the coordinate */
@@ -2656,16 +2726,17 @@ static void stage_sample(int n, const float tc[4], float o[4])
         for (k = 0; k < 4; k++) o[k] = clamp01(tc[k]);
         return;
     }
+    if (mode == 3 && s_stage_tex[n].face_stride) {   /* cube map */
+        Texture f = s_stage_tex[n];
+        f.offset += nv2a_cube_face(tc, &s, &t) * f.face_stride;
+        stage_sample_2d(n, &f, s, t, o);
+        return;
+    }
     s = tc[0]; t = tc[1];
     if (mode == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {   /* 2D projective */
         s /= tc[3]; t /= tc[3];
     }
-    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), s_stage_tex[n].width,  s_stage_tex[n].addr_u);
-    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), s_stage_tex[n].height, s_stage_tex[n].addr_v);
-    if (sample_tex(&s_stage_tex[n], (uint32_t)iu, (uint32_t)iv, &texel))
-        rc_unpack(texel, o);
-    else
-        o[0] = o[1] = o[2] = 0.0f, o[3] = 1.0f;
+    stage_sample_2d(n, &s_stage_tex[n], s, t, o);
 }
 
 static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
@@ -3018,14 +3089,24 @@ static void tc_fill(TexCacheEntry *e, const Texture *t, uint32_t tile)
     s_rt.tex += rt_now() - t0;
 }
 
-/* stage_sample, reading texels from the cache when the stage has an entry. */
+/* Texel (iu, iv), already wrapped, from the cache. */
+static inline void texel_cached(TexCacheEntry *e, int n, int iu, int iv, float o[4])
+{
+    uint32_t tile = ((uint32_t)iv >> TC_TILE_LOG) * e->tiles_x + ((uint32_t)iu >> TC_TILE_LOG);
+    if (!e->tile_ok[tile])
+        tc_fill(e, &s_stage_tex[n], tile);
+    rc_unpack_fast(e->texels[(size_t)iv * e->width + (uint32_t)iu], o);
+}
+
+/* stage_sample, reading texels from the cache when the stage has an entry.
+ * A cube stage has none (fast_batch_setup) and samples live. */
 static void stage_sample_fast(int n, const float tc[4], float o[4])
 {
     TexCacheEntry *e = s_stage_tc[n];
+    const Texture *tx = &s_stage_tex[n];
     int mode = s_stage_mode[n];
     float s, t;
     int iu, iv;
-    uint32_t tile;
 
     if (!e || mode == 0 || mode == 4) {
         stage_sample(n, tc, o);
@@ -3035,12 +3116,38 @@ static void stage_sample_fast(int n, const float tc[4], float o[4])
     if (mode == 1 && tc[3] != 0.0f && tc[3] != 1.0f) {   /* 2D projective */
         s /= tc[3]; t /= tc[3];
     }
-    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), s_stage_tex[n].width,  s_stage_tex[n].addr_u);
-    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), s_stage_tex[n].height, s_stage_tex[n].addr_v);
-    tile = ((uint32_t)iv >> TC_TILE_LOG) * e->tiles_x + ((uint32_t)iu >> TC_TILE_LOG);
-    if (!e->tile_ok[tile])
-        tc_fill(e, &s_stage_tex[n], tile);
-    rc_unpack_fast(e->texels[(size_t)iv * e->width + (uint32_t)iu], o);
+    if (s_stage_tent[n]) {
+        float wu, wv, c[4][4];
+        int k;
+        int u[2], v[2];
+        tent_setup(n, s, t, &iu, &iv, &wu, &wv);
+        u[0] = wrap_signed(iu, tx->width, tx->addr_u);
+        u[1] = wrap_signed(iu + 1, tx->width, tx->addr_u);
+        v[0] = wrap_signed(iv, tx->height, tx->addr_v);
+        v[1] = wrap_signed(iv + 1, tx->height, tx->addr_v);
+        if (u[1] == u[0] + 1 && v[1] == v[0] + 1
+                && (u[0] & 7) != 7 && (v[0] & 7) != 7) {
+            /* all four in one tile: one check, adjacent texels */
+            uint32_t tile = ((uint32_t)v[0] >> TC_TILE_LOG) * e->tiles_x
+                          + ((uint32_t)u[0] >> TC_TILE_LOG);
+            const uint32_t *p0;
+            if (!e->tile_ok[tile])
+                tc_fill(e, tx, tile);
+            p0 = &e->texels[(size_t)v[0] * e->width + (uint32_t)u[0]];
+            rc_unpack_fast(p0[0], c[0]);
+            rc_unpack_fast(p0[1], c[1]);
+            rc_unpack_fast(p0[e->width], c[2]);
+            rc_unpack_fast(p0[e->width + 1], c[3]);
+        } else {
+            for (k = 0; k < 4; k++)
+                texel_cached(e, n, u[k & 1], v[k >> 1], c[k]);
+        }
+        bilerp(c, wu, wv, o);
+        return;
+    }
+    iu = wrap_signed((int)floorf(s * s_stage_scale[n][0]), tx->width,  tx->addr_u);
+    iv = wrap_signed((int)floorf(t * s_stage_scale[n][1]), tx->height, tx->addr_v);
+    texel_cached(e, n, iu, iv, o);
 }
 
 /* (b) -------------------------------------------------------------------
@@ -3307,7 +3414,8 @@ static void fast_batch_setup(void)
     for (n = 0; n < 4; n++) {
         int mode = s_stage_mode[n];
         const Texture *t = &s_stage_tex[n];
-        s_stage_tc[n] = (mode != 0 && mode != 4) ? tc_bind(t) : NULL;
+        s_stage_tc[n] = (mode != 0 && mode != 4 && !(mode == 3 && t->face_stride))
+                      ? tc_bind(t) : NULL;
         /* A stage reading the surface this batch draws into sees its own
          * earlier pixels: the reference sampler reads memory as it changes,
          * a cached copy would not. A title fade can draw the two back

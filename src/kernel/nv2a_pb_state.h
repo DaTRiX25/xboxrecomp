@@ -65,6 +65,8 @@ typedef struct {
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
     uint32_t palette, pal_len;          /* P8: guest palette (0 none), entries */
+    uint32_t filter;                    /* SET_TEXTURE_FILTER as written */
+    uint32_t face_stride;               /* cube map: bytes between faces, else 0 */
     int      valid;
 } Texture;
 

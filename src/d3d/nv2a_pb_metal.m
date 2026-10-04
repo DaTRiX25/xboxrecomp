@@ -927,28 +927,9 @@ static MTLSamplerAddressMode address_mode(uint32_t m)
 
 /* SET_TEXTURE_FILTER as the D3D11 backend reads it (filter_linear,
  * filter_mip there). RECOMP_METAL_POINT=1 forces nearest texels. */
-static int filter_linear(uint32_t f, int mag)
-{
-    uint32_t m = mag ? (f >> 24) & 0xF : (f >> 16) & 0x3F;
-    if (mag)
-        return m == 2 || m == 4;
-    return m == 2 || m == 4 || m == 6 || m == 7;
-}
-
-static int filter_mip(uint32_t f)
-{
-    uint32_t m = (f >> 16) & 0x3F;
-    return m == 3 || m == 4 ? 1 : m == 5 || m == 6 ? 2 : 0;
-}
-
-/* SET_TEXTURE_FILTER [12:0]: the mip LOD bias, signed 5.8 fixed point. */
-static float lod_bias(uint32_t f)
-{
-    int b = (int)(f & 0x1FFFu);
-    if (b & 0x1000)
-        b -= 0x2000;
-    return (float)b / 256.0f;
-}
+#define filter_linear nv2a_tex_filter_linear   /* nv2a_backend_common.h */
+#define filter_mip    nv2a_tex_filter_mip
+#define lod_bias      nv2a_tex_lod_bias
 
 #define SMP_MAX 128
 static struct { uint64_t key; id<MTLSamplerState> s; } s_smp[SMP_MAX];
