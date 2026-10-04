@@ -2668,6 +2668,13 @@ static void kernel_vblank_arm_ack(void)
  *
  * Returns the milliseconds until the next one is due (10 when disabled), so
  * the timer thread can sleep exactly that long. */
+static volatile LONG g_vblank_total;
+
+uint32_t xbox_VblankCount(void)
+{
+    return (uint32_t)g_vblank_total;
+}
+
 static long kernel_vblank_tick(void)
 {
     static int enabled = -1;
@@ -2692,6 +2699,7 @@ static long kernel_vblank_tick(void)
         count = 0;
     }
     count++;
+    InterlockedIncrement(&g_vblank_total);
     {
         /* One line per 600 vblanks: should read ~10000 ms. Also the
          * shortest and longest gap between two, by the performance counter

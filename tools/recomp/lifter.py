@@ -1671,6 +1671,31 @@ class Lifter:
                 "  /* rdtsc */",
             ]
 
+        # ── Port I/O ──
+        #
+        # `in`/`out` reach the MCPX's I/O space: the ACPI block at 0x8000,
+        # SMBus at 0xC000. Lifted as no-ops, an `in` left the accumulator
+        # holding whatever it held before, which is a value, just not the
+        # port's. D3D's vblank ISR reads the TV encoder's field pin from
+        # 0x80C0 bit 5 into [device+0x1DF8]; the stale register always read
+        # as "odd field", and the XMV player, which starts its clock only on
+        # an even field, never started (Burnout 3's EA intro). The runtime
+        # answers the ports it models and logs the rest.
+        if m in ("in", "out") and len(ops) == 2:
+            data, port = (ops[0], ops[1]) if m == "in" else (ops[1], ops[0])
+            width = _operand_width(data) or 1
+            if data.type != "reg" or port.type not in ("reg", "imm"):
+                return self._unimplemented(insn, m)
+            port_c = (f"0x{port.imm & 0xFF:02X}u" if port.type == "imm"
+                      else "(edx & 0xFFFFu)")
+            if m == "in":
+                return [_fmt_set_reg(data.reg,
+                                     f"xbox_PortIn({port_c}, {width})")
+                        + f" /* {m} {insn.op_str} */"]
+            return [f"xbox_PortOut({port_c}, (uint32_t)"
+                    f"({_fmt_operand_read(data)}), {width}); /* {m} "
+                    f"{insn.op_str} */"]
+
         # ── Bit scan ──
         # Index of the lowest (bsf) or highest (bsr) set bit. When the source
         # is zero the destination is left untouched and ZF is set; that is the

@@ -1106,6 +1106,11 @@ unsigned long xbox_log_ms(void);
  * pad waiting for a movie, say) installs it before the game starts. */
 extern void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
 
+/* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off).
+ * Interlaced output shows one field per vblank, so its low bit is the field
+ * parity that the field pin (port 0x80C0) reports. */
+uint32_t xbox_VblankCount(void);
+
 #ifdef __cplusplus
 }
 #endif
