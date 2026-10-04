@@ -2675,24 +2675,18 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 /* RECOMP_D3D11_DUMP=<prefix>: every 60th presented frame as <prefix>NNNN.bmp,
  * read back from the swap chain's buffer. Proof of what reached the screen.
  * The prefix is prepended to the file name as is; one ending in / or \ is a
- * directory, and the files in it are named frame_NNNN.bmp. */
-static void dump_frame(void)
+ * directory, and the files in it are named frame_NNNN.bmp. The flips listed
+ * in RECOMP_FB_DUMP_AT are written too, as <prefix>flip_NNNNN.bmp named by
+ * present number (= flip number), so a golden run can pick its frames by an
+ * event's flip rather than every 60th present. */
+static void dump_back_buffer(const char *path)
 {
-    static const char *prefix;
-    static int checked;
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D *st = NULL;
     D3D11_MAPPED_SUBRESOURCE m;
-    char path[MAX_PATH];
     FILE *f;
     UINT y;
 
-    if (!checked) {
-        checked = 1;
-        prefix = recomp_env(RENV_D3D11_DUMP);
-    }
-    if (!prefix || (s_presents % 60) != 1)
-        return;
     ID3D11Texture2D_GetDesc(s_back, &td);
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;
@@ -2704,10 +2698,6 @@ static void dump_frame(void)
                                      (ID3D11Resource *)s_back);
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
                                           D3D11_MAP_READ, 0, &m))) {
-        size_t n = strlen(prefix);
-        int dir = n && (prefix[n - 1] == '/' || prefix[n - 1] == '\\');
-        snprintf(path, sizeof path, "%s%s%04u.bmp", prefix, dir ? "frame_" : "",
-                 (unsigned)(s_presents / 60));
         f = fopen(path, "wb");
         if (f) {
             BITMAPFILEHEADER fh;
@@ -2733,6 +2723,34 @@ static void dump_frame(void)
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
     }
     ID3D11Texture2D_Release(st);
+}
+
+static void dump_frame(void)
+{
+    static const char *prefix;
+    static int checked;
+    char path[MAX_PATH];
+    size_t n;
+    int dir;
+
+    if (!checked) {
+        checked = 1;
+        prefix = recomp_env(RENV_D3D11_DUMP);
+    }
+    if (!prefix)
+        return;
+    n = strlen(prefix);
+    dir = n && (prefix[n - 1] == '/' || prefix[n - 1] == '\\');
+    if ((s_presents % 60) == 1) {
+        snprintf(path, sizeof path, "%s%s%04u.bmp", prefix, dir ? "frame_" : "",
+                 (unsigned)(s_presents / 60));
+        dump_back_buffer(path);
+    }
+    if (nv2a_pb_dump_at_listed((uint32_t)s_presents)) {
+        snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix,
+                 (unsigned)s_presents);
+        dump_back_buffer(path);
+    }
 }
 
 static struct nv2a_occ s_occ;           /* see "Visibility tests" below */
