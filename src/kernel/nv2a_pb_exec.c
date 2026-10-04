@@ -41,6 +41,7 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_zbuf_cache.h"
+#include "../video/video_player.h"   /* xbox_FramebufferWindowFrameStats */
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -5650,6 +5651,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                       : s_gpu.color_offset,
                                    s_gpu.pitch);
             s_perf.flip += rt_now() - t0;   /* Present, for the [PB-PERF] line */
+        }
+        /* The window title's FPS and draws: one call per flip, with the
+         * draws of the frame just finished. */
+        {
+            static uint32_t last_draws;
+            xbox_FramebufferWindowFrameStats(s_gpu.draws - last_draws);
+            last_draws = s_gpu.draws;
         }
         dump_at_flip(s_gpu.flips);
         /* RECOMP_FB_DUMP_FLIPS=<n>: with RECOMP_FB_DUMP, the finished frame
