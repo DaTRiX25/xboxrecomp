@@ -5374,6 +5374,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 fprintf(stderr, "  [GPU] RECOMP_PB_BACKEND=null: walker only, nothing drawn\n");
             }
         }
+        /* render.scale is a GPU-backend feature: the CPU rasteriser draws
+         * into guest memory at the guest pitch, so it stays 1x. Said once,
+         * so a shared enhance.toml is not a silent no-op here. */
+        if (nv2a_host_render_scale() > 1
+                && (s_backend == &s_cpu_backend || s_backend == &s_null_backend))
+            fprintf(stderr, "[ENHANCE] render.scale=%u ignored: the CPU rasteriser"
+                    " draws into guest memory at the guest size\n",
+                    nv2a_host_render_scale());
     }
     s_perf.methods++;
     /* Bring-up: the first parameters each surface method carries. A wrong

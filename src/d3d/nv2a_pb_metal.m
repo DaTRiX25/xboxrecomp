@@ -76,6 +76,9 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 #endif
 
 #define LOGP "[metal] "
+/* Render targets at render.scale stay within Metal's 2D texture limit on
+ * Apple GPUs (nv2a_host_size lowers the factor for a larger surface). */
+#define METAL_MAX_DIM 16384u
 
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch);
@@ -219,6 +222,7 @@ static uint64_t s_presents, s_clears, s_draws, s_draws_skipped, s_draws_prog,
 #define DT_MAX 4
 typedef struct {
     uint32_t       zeta, w, h;
+    uint32_t       hw, hh;     /* host size: w x h at render.scale */
     id<MTLTexture> tex;
     uint64_t       last_use;
     int            fresh;      /* contents undefined: the next pass clears */
@@ -228,7 +232,8 @@ typedef struct {
 typedef struct {
     uint32_t       offset;     /* color_offset, as the title set it */
     uint32_t       addr;       /* its guest address (nv2a_pb_dma_resolve) */
-    uint32_t       w, h;
+    uint32_t       w, h;       /* guest size: the cache key, the mapping */
+    uint32_t       hw, hh;     /* host size: the texture (render.scale) */
     id<MTLTexture> tex;
     uint64_t       last_use;
     DepthTarget   *dt;         /* the depth buffer its passes attach, or NULL */
@@ -449,8 +454,9 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
         [e->tex release];
         memset(e, 0, sizeof *e);
     }
+    nv2a_host_size(w, h, nv2a_host_render_scale(), METAL_MAX_DIM, &e->hw, &e->hh);
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
-                                                            width:w height:h mipmapped:NO];
+                                                            width:e->hw height:e->hh mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget;
     td.storageMode = MTLStorageModePrivate;
     e->tex = [s_dev newTextureWithDescriptor:td];
@@ -461,7 +467,11 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
     e->h = h;
     e->last_use = s_tick;
     e->fresh = 1;
-    fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer\n", zeta, w, h);
+    if (e->hw != w)
+        fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer (%ux%u host)\n",
+                zeta, w, h, e->hw, e->hh);
+    else
+        fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer\n", zeta, w, h);
     return e;
 }
 
@@ -475,6 +485,7 @@ static RenderTarget *surface(void)
     uint32_t w = g->clip_x + g->clip_w, h = g->clip_y + g->clip_h;
     RenderTarget *free_rt = NULL, *lru = &s_rt[0];
     MTLTextureDescriptor *td;
+    uint32_t hw, hh;
     int i;
 
     if (!g->color_offset || !w || !h || w > 4096 || h > 4096)
@@ -495,8 +506,9 @@ static RenderTarget *surface(void)
         free_rt = lru;
         rt_free(free_rt);
     }
+    nv2a_host_size(w, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                            width:w height:h
+                                                            width:hw height:hh
                                                         mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     /* Managed only for a discrete GPU (Intel Macs); deprecated on 27. */
@@ -511,15 +523,33 @@ static RenderTarget *surface(void)
     free_rt->addr = nv2a_pb_dma_resolve(g->color_offset);
     free_rt->w = w;
     free_rt->h = h;
+    free_rt->hw = hw;
+    free_rt->hh = hh;
     free_rt->last_use = s_tick;
     if (g->pitch >= w * 4u) {
         const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset()
                            + nv2a_pb_dma_resolve(g->color_offset);
-        [free_rt->tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
-                          withBytes:src bytesPerRow:g->pitch];
+        if (hw == w) {
+            [free_rt->tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+                              withBytes:src bytesPerRow:g->pitch];
+        } else {
+            /* Scaled: the guest bytes, each pixel an n x n block. */
+            unsigned n = hw / w;
+            uint8_t *up = (uint8_t *)malloc((size_t)hw * hh * 4u);
+            if (up) {
+                nv2a_upscale_nearest32(src, g->pitch, w, h, n, up, hw * 4u);
+                [free_rt->tex replaceRegion:MTLRegionMake2D(0, 0, hw, hh) mipmapLevel:0
+                                  withBytes:up bytesPerRow:hw * 4u];
+                free(up);
+            }
+        }
     }
-    fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target\n",
-            g->color_offset, w, h);
+    if (hw != w)
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
+                g->color_offset, w, h, hw, hh);
+    else
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target\n",
+                g->color_offset, w, h);
     return free_rt;
 }
 
@@ -1257,10 +1287,12 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
     }
     if (!self)
         return NULL;
-    if (!s_self.tex || s_self.w != self->w || s_self.h != self->h) {
+    /* copyFromTexture:toTexture: wants equal sizes: the source's host size. */
+    if (!s_self.tex || s_self.w != self->w || s_self.h != self->h
+            || s_self.hw != self->hw || s_self.hh != self->hh) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                         width:self->w height:self->h mipmapped:NO];
+                                         width:self->hw height:self->hh mipmapped:NO];
         td.usage = MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModePrivate;
         [s_self.tex release];
@@ -1269,6 +1301,8 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
             return NULL;
         s_self.w = self->w;
         s_self.h = self->h;
+        s_self.hw = self->hw;
+        s_self.hh = self->hh;
     }
     {
         id<MTLBlitCommandEncoder> b;
@@ -1467,7 +1501,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 s_draws_z++;
         }
         {
-            MTLViewport vp = {0.0, 0.0, (double)rt->w, (double)rt->h, 0.0, 1.0};
+            MTLViewport vp = {0.0, 0.0, (double)rt->hw, (double)rt->hh, 0.0, 1.0};
             [s_enc setViewport:vp];
         }
         [s_enc setFrontFacingWinding:v->front_face != 0x900
@@ -1543,6 +1577,63 @@ static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
             uint16_t *o = (uint16_t *)(dst + (size_t)y * pitch);
             [rt->tex getBytes:row bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, y, w, 1)
                   mipmapLevel:0];
+            for (x = 0; x < w; x++) {
+                uint32_t c = row[x];
+                o[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0)
+                                  | ((c >> 3) & 0x001F));
+            }
+        }
+    } else {
+        return;
+    }
+    s_writebacks++;
+}
+
+/* A scaled rt (render.scale > 1) read back once at the flip, hw x hh BGRA8
+ * tightly packed: the window shows it as it is and the write-back boxes it
+ * down to guest size, so one getBytes serves both. NULL on no memory. */
+static const uint8_t *host_readback(RenderTarget *rt)
+{
+    static uint8_t *px;
+    static size_t cap;
+    size_t need = (size_t)rt->hw * rt->hh * 4u;
+    if (cap < need) {
+        uint8_t *n = (uint8_t *)realloc(px, need);
+        if (!n)
+            return NULL;
+        px = n;
+        cap = need;
+    }
+    [rt->tex getBytes:px bytesPerRow:rt->hw * 4u
+           fromRegion:MTLRegionMake2D(0, 0, rt->hw, rt->hh) mipmapLevel:0];
+    return px;
+}
+
+/* write_back for a scaled rt: the host pixels (host_readback) averaged over
+ * each n x n block, so the guest -- RECOMP_FB_DUMP, fb_dump_at, the title --
+ * sees a w x h frame at its pitch, 32-bit or R5G6B5 as write_back writes. */
+static void write_back_scaled(RenderTarget *rt, const uint8_t *px, uint32_t addr,
+                              uint32_t pitch)
+{
+    uint8_t *dst = (uint8_t *)xbox_GetMemoryOffset() + addr;
+    uint32_t bpp = pitch / rt->w, w = rt->w, n = rt->hw / rt->w, y, x;
+
+    if (bpp >= 4) {
+        nv2a_downscale_box32(px, rt->hw * 4u, w, rt->h, n, dst, pitch);
+    } else if (bpp == 2) {
+        static uint32_t *row;
+        static uint32_t row_cap;
+        if (row_cap < w) {
+            uint32_t *nr = (uint32_t *)realloc(row, (size_t)w * 4);
+            if (!nr)
+                return;
+            row = nr;
+            row_cap = w;
+        }
+        for (y = 0; y < rt->h; y++) {
+            uint16_t *o = (uint16_t *)(dst + (size_t)y * pitch);
+            nv2a_downscale_box32(px + (size_t)y * n * rt->hw * 4u, rt->hw * 4u, w, 1, n,
+                                 (uint8_t *)row, w * 4u);
             for (x = 0; x < w; x++) {
                 uint32_t c = row[x];
                 o[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0)
@@ -1869,6 +1960,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     RenderTarget *rt = NULL;
     uint32_t addr = surface_offset ? nv2a_pb_dma_resolve(surface_offset) : 0;
+    const uint8_t *hpx = NULL;   /* a scaled rt's host pixels (host_readback) */
 
     if (init()) {
         @autoreleasepool {
@@ -1886,8 +1978,18 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 [b endEncoding];
             }
             flush(1);
-            if (rt && addr && pitch && pitch >= rt->w * 2u)
-                write_back(rt, addr, pitch);
+            /* The host-size readback only when something reads it: the
+             * write-back below or the window. */
+            if (rt && rt->hw != rt->w
+                    && ((addr && pitch && pitch >= rt->w * 2u)
+                        || xbox_FramebufferWindowRunning()))
+                hpx = host_readback(rt);
+            if (rt && addr && pitch && pitch >= rt->w * 2u) {
+                if (rt->hw == rt->w)
+                    write_back(rt, addr, pitch);
+                else if (hpx)
+                    write_back_scaled(rt, hpx, addr, pitch);
+            }
         }
     }
     s_presents++;
@@ -1922,7 +2024,13 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
      * about 1.2 MB each way per 640x480 frame. It reads the texture, not
      * the guest bytes. A surface the backend never drew (guest bytes) goes
      * as the CPU path presents it. A zero-copy CAMetalLayer blit is 4.9. */
-    if (rt && xbox_FramebufferWindowRunning()) {
+    if (rt && hpx && xbox_FramebufferWindowRunning()) {
+        /* Scaled: the host-size frame read above, as it is. */
+        xbox_FramebufferWindowPresentPixels(hpx, rt->hw, rt->hh, rt->hw * 4u, 4u);
+        s_window_presents++;
+        return;
+    }
+    if (rt && rt->hw == rt->w && xbox_FramebufferWindowRunning()) {
         static uint8_t *px;
         static size_t cap;
         size_t need = (size_t)rt->w * rt->h * 4u;

@@ -841,6 +841,9 @@ struct nv2a_occ {
      * included), late fallbacks, superseded, and microseconds waited in
      * sync mode. */
     uint64_t reports, vis, late, super, sync_us;
+    /* Render scale of the targets counted (0 or 1 = guest size): a count
+     * is samples, N*N of them per guest pixel, so it is divided back. */
+    unsigned scale;
 };
 
 void nv2a_occ_init(struct nv2a_occ *o, const struct nv2a_occ_ops *ops,
@@ -850,6 +853,58 @@ void nv2a_occ_zpass_clear(struct nv2a_occ *o);
 /* GET_REPORT at va; sync waits (up to NV2A_OCC_LATE_US) for the result. */
 void nv2a_occ_report(struct nv2a_occ *o, uint32_t va, int sync);
 void nv2a_occ_poll(struct nv2a_occ *o, int flush);
+/* nv2a_occ_init takes the scale from nv2a_host_opts(); this overrides it. */
+void nv2a_occ_set_scale(struct nv2a_occ *o, unsigned scale);
+/* A summed sample count at `scale` as the guest-size count: / scale^2,
+ * rounded, a non-zero count staying >= 1 (visible never turns hidden),
+ * saturated to 32 bits. */
+uint32_t nv2a_occ_scale_count(uint64_t samples, unsigned scale);
+
+/* ---- Host options: enhancements the backends and the presenter honour ----
+ *
+ * Filled once by the opt-in enhancements layer (src/enhance, xbox_enhance_init)
+ * before the guest starts, read-only afterwards. All zero is stock: guest-size
+ * targets, nearest letterbox, windowed. Without the layer nothing sets them. */
+enum nv2a_present_filter {
+    NV2A_PRESENT_NEAREST = 0,   /* stock: letterbox, nearest */
+    NV2A_PRESENT_LINEAR,        /* letterbox, bilinear */
+    NV2A_PRESENT_INTEGER        /* largest whole multiple that fits, centred */
+};
+
+struct nv2a_host_opts {
+    unsigned render_scale;      /* 0 or 1 = guest size; 2..4 */
+    int      present_filter;    /* enum nv2a_present_filter */
+    int      fullscreen;        /* borderless desktop fullscreen at start */
+};
+
+void nv2a_host_opts_set(const struct nv2a_host_opts *o);
+const struct nv2a_host_opts *nv2a_host_opts(void);
+/* render_scale as a factor: 1 when unset. */
+unsigned nv2a_host_render_scale(void);
+
+/* Host size of a guest w x h target at `scale`: w*N x h*N, N lowered for
+ * this target until both fit max_dim. Returns the N used (>= 1). */
+unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim,
+                        uint32_t *hw, uint32_t *hh);
+
+/* Where a src_w x src_h frame goes in a dst_w x dst_h output (device
+ * pixels). NEAREST/LINEAR: the largest rectangle of the frame's aspect that
+ * fits, centred. INTEGER: the largest whole multiple that fits, centred; if
+ * 1x does not fit, the NEAREST/LINEAR fit. Returns 1 when the result is the
+ * integer placement, 0 for a fit (the caller filters a downscaled fit
+ * linearly). A zero size gives an empty rectangle. */
+struct nv2a_rect { int32_t x, y, w, h; };
+int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
+                      int filter, struct nv2a_rect *r);
+
+/* 32-bit pixels: nearest N x upscale of a w x h image (src_pitch bytes a
+ * row) into dst (w*n x h*n, dst_pitch bytes a row), and the box filter back:
+ * each n x n block of src (w*n x h*n) averaged per byte channel, rounded,
+ * into dst (w x h). */
+void nv2a_upscale_nearest32(const uint8_t *src, uint32_t src_pitch, uint32_t w, uint32_t h,
+                            unsigned n, uint8_t *dst, uint32_t dst_pitch);
+void nv2a_downscale_box32(const uint8_t *src, uint32_t src_pitch, uint32_t w, uint32_t h,
+                          unsigned n, uint8_t *dst, uint32_t dst_pitch);
 
 #ifdef __cplusplus
 }

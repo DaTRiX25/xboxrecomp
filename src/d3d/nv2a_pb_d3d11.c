@@ -62,6 +62,15 @@ static ID3D11DeviceContext    *s_ctx;
 static IDXGISwapChain         *s_swap;
 static ID3D11Texture2D        *s_back;
 static UINT                    s_back_w, s_back_h;
+/* The swap chain size init() created, before any WM_SIZE resize. */
+static UINT                    s_made_w, s_made_h;
+/* Present (E1, nv2a_host_opts): the client size WM_SIZE last reported (0 =
+ * none since init); the back buffer's view, made for the scaling blit only;
+ * whether the frame being dumped is the present RT rather than the back
+ * buffer (the blit path: the dump stays the frame, not the window). */
+static volatile UINT           s_client_w, s_client_h;
+static ID3D11RenderTargetView *s_back_rtv;
+static int                     s_dump_rt;
 static compile_fn              s_compile;
 
 static ID3D11Buffer           *s_cb_consts;     /* b1: c[192]            */
@@ -171,10 +180,14 @@ static uint64_t s_draws_prog, s_draws_tex;   /* with a vertex program / a textur
 /* ---- render targets: one per guest surface ------------------------------ */
 
 #define RT_MAX 8
+/* render.scale keeps targets inside D3D11's 2D limit at feature level 11
+ * (nv2a_host_size lowers the factor for a larger surface). */
+#define D3D11_MAX_DIM 16384u
 typedef struct {
     uint32_t                offset;     /* color_offset, as the title set it */
     uint32_t                addr;       /* ... resolved to a guest address */
-    UINT                    w, h;
+    UINT                    w, h;       /* guest size: the key, the mapping */
+    UINT                    hw, hh;     /* host size: the texture (render.scale) */
     ID3D11Texture2D        *tex;
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv;      /* for render-to-texture, made lazily */
@@ -224,6 +237,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     if (m == WM_CLOSE) {
         /* Closing the window ends the run, like the CPU path's window. */
         ExitProcess(0);
+    }
+    if (m == WM_SIZE && w != SIZE_MINIMIZED && LOWORD(l) && HIWORD(l)) {
+        /* Recorded only: the flip (this thread, which pumps the window)
+         * resizes the swap chain before its next present. */
+        s_client_w = LOWORD(l);
+        s_client_h = HIWORD(l);
     }
     return DefWindowProcA(h, m, w, l);
 }
@@ -348,6 +367,8 @@ static int init(void)
     HRESULT hr;
     WNDCLASSA wc;
     RECT r = {0, 0, 640, 480};
+    int full = nv2a_host_opts()->fullscreen;
+    UINT bw = 640, bh = 480;
 
     if (tried)
         return !s_failed;
@@ -368,20 +389,37 @@ static int init(void)
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.lpszClassName = "RecompNv2aD3D11";
     RegisterClassA(&wc);
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    s_hwnd = CreateWindowA(wc.lpszClassName, "recomp (NV2A via D3D11)",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                           CW_USEDEFAULT, CW_USEDEFAULT,
-                           r.right - r.left, r.bottom - r.top,
-                           NULL, NULL, wc.hInstance, NULL);
+    if (full) {
+        /* present.fullscreen: borderless over the primary monitor (no HWND
+         * yet to ask MonitorFromWindow), no exclusive mode. */
+        bw = (UINT)GetSystemMetrics(SM_CXSCREEN);
+        bh = (UINT)GetSystemMetrics(SM_CYSCREEN);
+        if (!bw || !bh) {
+            bw = 640;
+            bh = 480;
+            full = 0;
+        }
+    }
+    if (full) {
+        s_hwnd = CreateWindowA(wc.lpszClassName, "recomp (NV2A via D3D11)",
+                               WS_POPUP | WS_VISIBLE, 0, 0, (int)bw, (int)bh,
+                               NULL, NULL, wc.hInstance, NULL);
+    } else {
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+        s_hwnd = CreateWindowA(wc.lpszClassName, "recomp (NV2A via D3D11)",
+                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                               CW_USEDEFAULT, CW_USEDEFAULT,
+                               r.right - r.left, r.bottom - r.top,
+                               NULL, NULL, wc.hInstance, NULL);
+    }
     if (!s_hwnd) {
         fprintf(stderr, LOGP "CreateWindow failed (%lu)\n", GetLastError());
         return 0;
     }
 
     memset(&sd, 0, sizeof sd);
-    sd.BufferDesc.Width = 640;
-    sd.BufferDesc.Height = 480;
+    sd.BufferDesc.Width = bw;
+    sd.BufferDesc.Height = bh;
     sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -398,8 +436,8 @@ static int init(void)
         return 0;
     }
     IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&s_back);
-    s_back_w = 640;
-    s_back_h = 480;
+    s_back_w = s_made_w = bw;
+    s_back_h = s_made_h = bh;
 
     s_cb_consts = make_buffer(NV2A_VSH_CONSTANTS * 16, D3D11_BIND_CONSTANT_BUFFER);
     s_cb_vp     = make_buffer(80, D3D11_BIND_CONSTANT_BUFFER);
@@ -456,8 +494,8 @@ static int init(void)
     }
 
     create_black_texture();
-    fprintf(stderr, LOGP "device up: feature level 0x%X, swap chain 640x480\n",
-            (unsigned)fl);
+    fprintf(stderr, LOGP "device up: feature level 0x%X, swap chain %ux%u\n",
+            (unsigned)fl, s_back_w, s_back_h);
     s_failed = 0;
     return 1;
 }
@@ -495,11 +533,13 @@ static RenderTarget *surface(void)
         ID3D11Texture2D_Release(free_rt->tex);
         memset(free_rt, 0, sizeof *free_rt);
     }
+    nv2a_host_size(w, h, nv2a_host_render_scale(), D3D11_MAX_DIM,
+                   &free_rt->hw, &free_rt->hh);
     {
         D3D11_TEXTURE2D_DESC td;
         memset(&td, 0, sizeof td);
-        td.Width = w;
-        td.Height = h;
+        td.Width = free_rt->hw;
+        td.Height = free_rt->hh;
         td.MipLevels = 1;
         td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -520,8 +560,12 @@ static RenderTarget *surface(void)
     free_rt->w = w;
     free_rt->h = h;
     free_rt->last_use = s_tick;
-    fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target\n",
-            g->color_offset, w, h);
+    if (free_rt->hw != w)
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
+                g->color_offset, w, h, free_rt->hw, free_rt->hh);
+    else
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target\n",
+                g->color_offset, w, h);
     return free_rt;
 }
 
@@ -534,7 +578,8 @@ static RenderTarget *surface(void)
 #define DT_MAX 4
 typedef struct {
     uint32_t                zeta;
-    UINT                    w, h;
+    UINT                    w, h;       /* guest size, as its colour target's */
+    UINT                    hw, hh;     /* host size (render.scale) */
     ID3D11Texture2D        *tex;
     ID3D11DepthStencilView *dsv;
     uint64_t                last_use;
@@ -570,9 +615,10 @@ static DepthTarget *depth_target(UINT w, UINT h)
         ID3D11Texture2D_Release(e->tex);
         memset(e, 0, sizeof *e);
     }
+    nv2a_host_size(w, h, nv2a_host_render_scale(), D3D11_MAX_DIM, &e->hw, &e->hh);
     memset(&td, 0, sizeof td);
-    td.Width = w;
-    td.Height = h;
+    td.Width = e->hw;
+    td.Height = e->hh;
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
@@ -1606,7 +1652,8 @@ static uint64_t         s_self_copies;
 
 static RenderTarget *rt_self_copy(RenderTarget *rt)
 {
-    if (s_self.tex && (s_self.w != rt->w || s_self.h != rt->h)) {
+    if (s_self.tex && (s_self.w != rt->w || s_self.h != rt->h
+                       || s_self.hw != rt->hw || s_self.hh != rt->hh)) {
         if (s_self.srv) ID3D11ShaderResourceView_Release(s_self.srv);
         ID3D11Texture2D_Release(s_self.tex);
         s_self.tex = NULL;
@@ -1627,6 +1674,8 @@ static RenderTarget *rt_self_copy(RenderTarget *rt)
         }
         s_self.w = rt->w;
         s_self.h = rt->h;
+        s_self.hw = rt->hw;     /* GetDesc gave the copy the source's size */
+        s_self.hh = rt->hh;
     }
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_self.tex,
                                      (ID3D11Resource *)rt->tex);
@@ -1886,6 +1935,10 @@ static uint32_t read_pixel(RenderTarget *rt, int x, int y)
 
     if (x < 0 || y < 0 || (UINT)x >= rt->w || (UINT)y >= rt->h)
         return px;
+    /* Guest coordinates; a scaled target holds the pixel's first sample at
+     * N times them. */
+    x *= (int)(rt->hw / rt->w);
+    y *= (int)(rt->hh / rt->h);
     if (!st) {
         D3D11_TEXTURE2D_DESC td;
         memset(&td, 0, sizeof td);
@@ -2276,7 +2329,9 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
 
     if (!px_shader(0) || !px_shader(1))
         return;
-    if (!tex[0] || tw != rt->w || th != rt->h) {
+    /* At the target's host size: they are bound with its depth view, and
+     * D3D11 wants every attachment the same size. */
+    if (!tex[0] || tw != rt->hw || th != rt->hh) {
         D3D11_TEXTURE2D_DESC td;
         for (k = 0; k < 8; k++) {
             if (rtv[k]) ID3D11RenderTargetView_Release(rtv[k]);
@@ -2285,8 +2340,8 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
             tex[k] = NULL;
         }
         memset(&td, 0, sizeof td);
-        td.Width = rt->w;
-        td.Height = rt->h;
+        td.Width = rt->hw;
+        td.Height = rt->hh;
         td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         td.SampleDesc.Count = 1;
@@ -2297,8 +2352,8 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
                     || FAILED(ID3D11Device_CreateRenderTargetView(
                         s_dev, (ID3D11Resource *)tex[k], NULL, &rtv[k])))
                 return;
-        tw = rt->w;
-        th = rt->h;
+        tw = rt->hw;
+        th = rt->hh;
     }
     if (!st) {
         D3D11_TEXTURE2D_DESC td;
@@ -2335,8 +2390,8 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
             if (s_px_x[n] < 0 || s_px_y[n] < 0
                     || (UINT)s_px_x[n] >= rt->w || (UINT)s_px_y[n] >= rt->h)
                 continue;
-            b.left = (UINT)s_px_x[n]; b.right = b.left + 1;
-            b.top = (UINT)s_px_y[n]; b.bottom = b.top + 1;
+            b.left = (UINT)s_px_x[n] * (rt->hw / rt->w); b.right = b.left + 1;
+            b.top = (UINT)s_px_y[n] * (rt->hh / rt->h); b.bottom = b.top + 1;
             b.front = 0; b.back = 1;
             for (k = 0; k < 8; k++)
                 ID3D11DeviceContext_CopySubresourceRegion(
@@ -2576,8 +2631,8 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         ID3D11Buffer *cbs[3];
         vp.TopLeftX = 0;
         vp.TopLeftY = 0;
-        vp.Width = (float)rt->w;
-        vp.Height = (float)rt->h;
+        vp.Width = (float)rt->hw;
+        vp.Height = (float)rt->hh;
         vp.MinDepth = 0;
         vp.MaxDepth = 1;
         cbs[0] = NULL;
@@ -2679,15 +2734,25 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
  * in RECOMP_FB_DUMP_AT are written too, as <prefix>flip_NNNNN.bmp named by
  * present number (= flip number), so a golden run can pick its frames by an
  * event's flip rather than every 60th present. */
+/* The frame of this flip as a BMP: the back buffer after the direct copy
+ * (the stock path, as always), or the present RT itself when the flip went
+ * through the scaling blit, so a window size or a filter never reaches the
+ * dump (under render.scale the RT is host-sized: dumps are hw x hh). */
 static void dump_back_buffer(const char *path)
 {
     D3D11_TEXTURE2D_DESC td;
-    ID3D11Texture2D *st = NULL;
+    ID3D11Texture2D *st = NULL, *src = s_back;
     D3D11_MAPPED_SUBRESOURCE m;
     FILE *f;
     UINT y;
 
-    ID3D11Texture2D_GetDesc(s_back, &td);
+    if (s_dump_rt && s_drawn && s_drawn->tex)
+        src = s_drawn->tex;
+    if (!src) {
+        /* No back buffer after a failed resize (d3d11_on_flip said so). */
+        return;
+    }
+    ID3D11Texture2D_GetDesc(src, &td);
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -2695,7 +2760,7 @@ static void dump_back_buffer(const char *path)
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
         return;
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st,
-                                     (ID3D11Resource *)s_back);
+                                     (ID3D11Resource *)src);
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
                                           D3D11_MAP_READ, 0, &m))) {
         f = fopen(path, "wb");
@@ -2832,6 +2897,142 @@ static void flip_log(uint32_t surface_offset)
     p_occ_late = s_occ.late; p_occ_super = s_occ.super;
 }
 
+/* ---- present: the scaling blit and the resize (E1) ------------------------
+ *
+ * Stock (render.scale 1, nearest, the window as created) presents by copy,
+ * as it always did. Anything else -- a scaled frame, a resized or
+ * fullscreen window, linear or integer filtering -- draws the present RT
+ * into nv2a_present_rect's rectangle of a cleared back buffer with one
+ * full-screen triangle. */
+static const char s_blit_vs_src[] =
+    "struct VO { float4 p : SV_Position; float2 t : TEXCOORD0; };\n"
+    "VO main(uint i : SV_VertexID) {\n"
+    "    VO o;\n"
+    "    o.t = float2((i << 1) & 2, i & 2);\n"
+    "    o.p = float4(o.t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+    "    return o;\n"
+    "}\n";
+static const char s_blit_ps_src[] =
+    "Texture2D t0 : register(t0); SamplerState s0 : register(s0);\n"
+    "float4 main(float4 p : SV_Position, float2 t : TEXCOORD0) : SV_Target {\n"
+    "    return float4(t0.Sample(s0, t).rgb, 1);\n"
+    "}\n";
+static ID3D11VertexShader *s_blit_vs;
+static ID3D11PixelShader  *s_blit_ps;
+static ID3D11SamplerState *s_blit_smp[2];   /* point, linear */
+static int                 s_blit_failed;
+
+static int blit_init(void)
+{
+    ID3DBlob *code = NULL;
+    D3D11_SAMPLER_DESC sd;
+    int k;
+
+    if (s_blit_ps || s_blit_failed)
+        return s_blit_ps != NULL;
+    s_blit_failed = 1;
+    if (!compile("nv2a_present_vs", s_blit_vs_src, "vs_5_0", &code))
+        return 0;
+    ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                    ID3D10Blob_GetBufferSize(code), NULL, &s_blit_vs);
+    ID3D10Blob_Release(code);
+    if (!s_blit_vs || !compile("nv2a_present_ps", s_blit_ps_src, "ps_5_0", &code))
+        return 0;
+    ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                   ID3D10Blob_GetBufferSize(code), NULL, &s_blit_ps);
+    ID3D10Blob_Release(code);
+    for (k = 0; k < 2; k++) {
+        memset(&sd, 0, sizeof sd);
+        sd.Filter = k ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        ID3D11Device_CreateSamplerState(s_dev, &sd, &s_blit_smp[k]);
+        if (!s_blit_smp[k])
+            return 0;
+    }
+    if (!s_blit_ps)
+        return 0;
+    s_blit_failed = 0;
+    return 1;
+}
+
+/* WM_SIZE recorded a client size the swap chain does not have: resize it
+ * (FLIP_DISCARD keeps no contents worth keeping). */
+static void present_resize(void)
+{
+    UINT cw = s_client_w, ch = s_client_h;
+    HRESULT hr;
+
+    if (!cw || !ch || (cw == s_back_w && ch == s_back_h))
+        return;
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    if (s_back_rtv) {
+        ID3D11RenderTargetView_Release(s_back_rtv);
+        s_back_rtv = NULL;
+    }
+    if (s_back) {
+        ID3D11Texture2D_Release(s_back);
+        s_back = NULL;
+    }
+    hr = IDXGISwapChain_ResizeBuffers(s_swap, 0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr))
+        fprintf(stderr, LOGP "ResizeBuffers %ux%u hr=0x%08lX\n", cw, ch, (unsigned long)hr);
+    IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&s_back);
+    if (s_back) {
+        D3D11_TEXTURE2D_DESC td;
+        ID3D11Texture2D_GetDesc(s_back, &td);
+        s_back_w = td.Width;
+        s_back_h = td.Height;
+    }
+    fprintf(stderr, LOGP "window resized: swap chain %ux%u\n", s_back_w, s_back_h);
+}
+
+/* rt into the back buffer at nv2a_present_rect's place, filtered. */
+static void present_blit(RenderTarget *rt, int filter)
+{
+    static const float black[4] = {0, 0, 0, 1};
+    ID3D11ShaderResourceView *none = NULL;
+    struct nv2a_rect r;
+    D3D11_VIEWPORT vp;
+    int whole;
+
+    if (!s_back || !blit_init())
+        return;
+    if (!s_back_rtv && FAILED(ID3D11Device_CreateRenderTargetView(
+                s_dev, (ID3D11Resource *)s_back, NULL, &s_back_rtv)))
+        return;
+    if (!rt->srv && FAILED(ID3D11Device_CreateShaderResourceView(
+                s_dev, (ID3D11Resource *)rt->tex, NULL, &rt->srv)))
+        return;
+    whole = nv2a_present_rect(rt->hw, rt->hh, s_back_w, s_back_h, filter, &r);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+    vp.TopLeftX = (float)r.x;
+    vp.TopLeftY = (float)r.y;
+    vp.Width = (float)r.w;
+    vp.Height = (float)r.h;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs[0][0]);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
+    /* Point for nearest and whole multiples; linear for linear and for an
+     * integer frame that had to shrink to fit. */
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1,
+        &s_blit_smp[filter == NV2A_PRESENT_LINEAR
+                    || (filter == NV2A_PRESENT_INTEGER && !whole)]);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    /* Every binding above went behind the draw path's state shadow. */
+    s_sc_init = 0;
+}
+
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     HRESULT hr;
@@ -2841,9 +3042,29 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     pump();
     if (s_occ.ops)
         nv2a_occ_poll(&s_occ, 0);
+    present_resize();
     s_drawn = present_target(surface_offset);
+    s_dump_rt = 0;
     if (s_drawn) {
-        if (s_drawn->w == s_back_w && s_drawn->h == s_back_h) {
+        static int said;
+        const struct nv2a_host_opts *eo = nv2a_host_opts();
+        /* Stock: the frame as the guest drew it, a copy into the unresized
+         * windowed back buffer (whole or, for another size, its overlap). */
+        int stock = nv2a_host_render_scale() == 1
+                 && eo->present_filter == NV2A_PRESENT_NEAREST
+                 && !eo->fullscreen
+                 && s_back_w == s_made_w && s_back_h == s_made_h;
+        int same = s_drawn->hw == s_back_w && s_drawn->hh == s_back_h;
+        int blit = !stock && !(same && eo->present_filter != NV2A_PRESENT_LINEAR);
+        if (!s_back) {
+            /* A failed ResizeBuffers/GetBuffer left no back buffer. */
+            static int said_nb;
+            if (!said_nb++)
+                fprintf(stderr, LOGP "no back buffer (resize failed): frame not shown\n");
+        } else if (blit) {
+            present_blit(s_drawn, eo->present_filter);
+            s_dump_rt = 1;
+        } else if (same) {
             ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_back,
                                              (ID3D11Resource *)s_drawn->tex);
         } else {
@@ -2858,6 +3079,11 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                 s_ctx, (ID3D11Resource *)s_back, 0, 0, 0, 0,
                 (ID3D11Resource *)s_drawn->tex, 0, &b);
         }
+        if (s_back && !said++)
+            fprintf(stderr, LOGP "first present: back buffer %ux%u, frame %ux%u"
+                    " (%ux%u host), %s\n", s_back_w, s_back_h, s_drawn->w, s_drawn->h,
+                    s_drawn->hw, s_drawn->hh,
+                    blit ? "scaling blit" : same ? "copy" : "overlap copy");
     }
     s_presents++;
     dump_frame();

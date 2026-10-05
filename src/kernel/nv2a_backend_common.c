@@ -366,6 +366,25 @@ void nv2a_occ_init(struct nv2a_occ *o, const struct nv2a_occ_ops *ops,
     memset(o, 0, sizeof *o);
     o->ops = ops;
     o->mem = mem;
+    o->scale = nv2a_host_render_scale();
+}
+
+void nv2a_occ_set_scale(struct nv2a_occ *o, unsigned scale)
+{
+    o->scale = scale;
+}
+
+uint32_t nv2a_occ_scale_count(uint64_t samples, unsigned scale)
+{
+    if (scale > 1 && samples) {
+        uint64_t d = (uint64_t)scale * scale;
+        /* Rounded to nearest; a few samples of a sliver still mean
+         * "visible", so a non-zero count never rounds to 0. */
+        samples = (samples + d / 2) / d;
+        if (!samples)
+            samples = 1;
+    }
+    return samples > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)samples;
 }
 
 static void occ_begin(struct nv2a_occ *o)
@@ -402,7 +421,7 @@ static int occ_ready(struct nv2a_occ *o, const struct nv2a_occ_report *p,
             return 0;
         sum += v;
     }
-    *count = sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sum;
+    *count = nv2a_occ_scale_count(sum, o->scale);
     return 1;
 }
 
@@ -516,4 +535,107 @@ void nv2a_occ_report(struct nv2a_occ *o, uint32_t va, int sync)
     }
     if (o->en)
         occ_begin(o);
+}
+
+/* ---- Host options (enhancements) ------------------------------------------ */
+
+static struct nv2a_host_opts s_host_opts;   /* zero: stock */
+
+void nv2a_host_opts_set(const struct nv2a_host_opts *o)
+{
+    s_host_opts = *o;
+}
+
+const struct nv2a_host_opts *nv2a_host_opts(void)
+{
+    return &s_host_opts;
+}
+
+unsigned nv2a_host_render_scale(void)
+{
+    return s_host_opts.render_scale > 1 ? s_host_opts.render_scale : 1;
+}
+
+unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim,
+                        uint32_t *hw, uint32_t *hh)
+{
+    unsigned n = scale > 1 ? scale : 1;
+    while (n > 1 && ((uint64_t)w * n > max_dim || (uint64_t)h * n > max_dim))
+        n--;
+    *hw = w * n;
+    *hh = h * n;
+    return n;
+}
+
+int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
+                      int filter, struct nv2a_rect *r)
+{
+    uint64_t fw, fh;
+
+    r->x = r->y = r->w = r->h = 0;
+    if (!src_w || !src_h || !dst_w || !dst_h)
+        return 0;
+    if (filter == NV2A_PRESENT_INTEGER) {
+        uint32_t k = dst_w / src_w, kh = dst_h / src_h;
+        if (kh < k)
+            k = kh;
+        if (k >= 1) {
+            r->w = (int32_t)(src_w * k);
+            r->h = (int32_t)(src_h * k);
+            r->x = (int32_t)(dst_w - (uint32_t)r->w) / 2;
+            r->y = (int32_t)(dst_h - (uint32_t)r->h) / 2;
+            return 1;
+        }
+    }
+    /* Fit: the axis that limits gets the whole output, the other the
+     * frame's aspect, rounded to the nearest pixel. */
+    if ((uint64_t)dst_w * src_h <= (uint64_t)dst_h * src_w) {
+        fw = dst_w;
+        fh = ((uint64_t)dst_w * src_h + src_w / 2) / src_w;
+    } else {
+        fh = dst_h;
+        fw = ((uint64_t)dst_h * src_w + src_h / 2) / src_h;
+    }
+    r->w = (int32_t)fw;
+    r->h = (int32_t)fh;
+    r->x = (int32_t)((dst_w - fw) / 2);
+    r->y = (int32_t)((dst_h - fh) / 2);
+    return 0;
+}
+
+void nv2a_upscale_nearest32(const uint8_t *src, uint32_t src_pitch, uint32_t w, uint32_t h,
+                            unsigned n, uint8_t *dst, uint32_t dst_pitch)
+{
+    uint32_t x, y;
+    unsigned i, j;
+    for (y = 0; y < h; y++) {
+        const uint32_t *s = (const uint32_t *)(const void *)(src + (size_t)y * src_pitch);
+        uint32_t *d = (uint32_t *)(void *)(dst + (size_t)y * n * dst_pitch);
+        for (x = 0; x < w; x++)
+            for (i = 0; i < n; i++)
+                d[(size_t)x * n + i] = s[x];
+        for (j = 1; j < n; j++)
+            memcpy(dst + ((size_t)y * n + j) * dst_pitch, d, (size_t)w * n * 4u);
+    }
+}
+
+void nv2a_downscale_box32(const uint8_t *src, uint32_t src_pitch, uint32_t w, uint32_t h,
+                          unsigned n, uint8_t *dst, uint32_t dst_pitch)
+{
+    uint32_t x, y, nn = n * n, half = nn / 2;
+    unsigned i, j, c;
+    for (y = 0; y < h; y++) {
+        uint8_t *d = dst + (size_t)y * dst_pitch;
+        for (x = 0; x < w; x++) {
+            uint32_t sum[4] = {0, 0, 0, 0};
+            for (j = 0; j < n; j++) {
+                const uint8_t *s = src + ((size_t)y * n + j) * src_pitch + (size_t)x * n * 4u;
+                for (i = 0; i < n; i++, s += 4)
+                    for (c = 0; c < 4; c++)
+                        sum[c] += s[c];
+            }
+            for (c = 0; c < 4; c++)
+                d[(size_t)x * 4u + c] = (uint8_t)((sum[c] + half) / nn);
+        }
+    }
 }

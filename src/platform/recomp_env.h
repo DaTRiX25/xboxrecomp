@@ -59,7 +59,9 @@ extern "C" {
 #define RECOMP_ENV_ENHANCE_KEYS(X) \
     X(ENHANCE_CONFIG,    CONFIG, "RECOMP_ENHANCE_CONFIG",    NULL, "enhancements file: a path, or none (default: <root>/<title>/enhance.toml, <root>/enhance.toml)") \
     X(RENDER_SCALE,      CONFIG, "RECOMP_RENDER_SCALE",      NULL, "enhancements: render.scale, internal resolution factor (1 = stock)") \
-    X(DISPLAY_ASPECT,    CONFIG, "RECOMP_DISPLAY_ASPECT",    NULL, "enhancements: display.aspect, 4:3 (stock), 16:9, 16:10, 21:9")
+    X(DISPLAY_ASPECT,    CONFIG, "RECOMP_DISPLAY_ASPECT",    NULL, "enhancements: display.aspect, 4:3 (stock), 16:9, 16:10, 21:9") \
+    X(PRESENT_FILTER,    CONFIG, "RECOMP_PRESENT_FILTER",    NULL, "enhancements: present.filter, nearest (stock), linear, integer") \
+    X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)")
 #else
 #define RECOMP_ENV_ENHANCE_KEYS(X)
 #endif

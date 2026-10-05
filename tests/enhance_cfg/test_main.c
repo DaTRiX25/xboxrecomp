@@ -1,18 +1,22 @@
 /*
  * enhance_cfg test: the TOML subset (recomp_cfg.c), its errors with line
  * numbers, and the env > title file > root file > default layering
- * (enhance_cfg.c). Runs in its working directory, where it writes small
+ * (enhance_cfg.c), xbox_enhance_init (enhance.c) and recomp_exe_dir. Runs in its working directory, where it writes small
  * files under ecfg_root/.
  */
+#include "enhance.h"
 #include "enhance_cfg.h"
+#include "nv2a_backend_common.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
+#include "recomp_exe_dir.h"
 
 #include <locale.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
 #define MKDIR(p) _mkdir(p)
@@ -435,6 +439,103 @@ static void test_layers(void)
     CHECK(enhance_cfg_int("render.scale", 1) == 1);
 }
 
+/* ── xbox_enhance_init: the toolkit's keys into nv2a_host_opts ─────── */
+
+static void enhance_reset_env(void)
+{
+    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    recomp_env_set(RENV_RENDER_SCALE, NULL);
+    recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
+    recomp_env_set(RENV_PRESENT_FILTER, NULL);
+    recomp_env_set(RENV_PRESENT_FULLSCREEN, NULL);
+}
+
+static void test_enhance_init(void)
+{
+    const struct nv2a_host_opts *o = nv2a_host_opts();
+
+    /* No file, no env: stock. */
+    enhance_reset_env();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    CHECK(o->render_scale == 1 && o->present_filter == NV2A_PRESENT_NEAREST && o->fullscreen == 0);
+    CHECK(nv2a_host_render_scale() == 1);
+
+    /* The file answers. */
+    write_file("ecfg_init.toml",
+               "[render]\nscale = 2\n[present]\nfilter = \"integer\"\nfullscreen = true\n");
+    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_init.toml");
+    CHECK(xbox_enhance_init(".", NULL) == 0);
+    CHECK(o->render_scale == 2 && o->present_filter == NV2A_PRESENT_INTEGER && o->fullscreen == 1);
+
+    /* Env over file, every key; bool spellings. */
+    recomp_env_set(RENV_RENDER_SCALE, "3");
+    recomp_env_set(RENV_PRESENT_FILTER, "linear");
+    recomp_env_set(RENV_PRESENT_FULLSCREEN, "off");
+    CHECK(xbox_enhance_init(".", NULL) == 0);
+    CHECK(o->render_scale == 3 && o->present_filter == NV2A_PRESENT_LINEAR && o->fullscreen == 0);
+    recomp_env_set(RENV_PRESENT_FULLSCREEN, "Yes");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->fullscreen == 1);
+
+    /* An invalid filter is reported and the file answers (integer); with
+     * no file, nearest. */
+    recomp_env_set(RENV_PRESENT_FILTER, "bicubic");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->present_filter == NV2A_PRESENT_INTEGER);
+    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->present_filter == NV2A_PRESENT_NEAREST);
+    write_file("ecfg_bad.toml", "[present]\nfilter = \"sharp\"\n");
+    recomp_env_set(RENV_PRESENT_FILTER, NULL);
+    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_bad.toml");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->present_filter == NV2A_PRESENT_NEAREST);
+
+    /* Scale out of range clamps to 1..4. */
+    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    recomp_env_set(RENV_RENDER_SCALE, "9");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->render_scale == 4);
+    recomp_env_set(RENV_RENDER_SCALE, "0");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->render_scale == 1);
+    recomp_env_set(RENV_RENDER_SCALE, "-2");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->render_scale == 1);
+
+    /* A non-4:3 aspect is reported, nothing else changes. */
+    recomp_env_set(RENV_RENDER_SCALE, NULL);
+    recomp_env_set(RENV_DISPLAY_ASPECT, "16:9");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->render_scale == 1);
+
+    /* A file that does not parse: -1, stock. */
+    write_file("ecfg_broken.toml", "[render]\nscale = \n");
+    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_broken.toml");
+    CHECK(xbox_enhance_init(".", NULL) == -1 && o->render_scale == 1);
+
+    enhance_reset_env();
+    recomp_env_set(RENV_ENHANCE_CONFIG, NULL);
+    enhance_cfg_shutdown();
+}
+
+/* ── recomp_exe_dir ────────────────────────────────────────────────── */
+
+static void test_exe_dir(void)
+{
+    const char *d = recomp_exe_dir();
+    struct stat st;
+    CHECK(d && *d);
+    CHECK(stat(d, &st) == 0 && (st.st_mode & S_IFDIR));
+    CHECK(recomp_exe_dir() == d);          /* cached */
+    {
+        /* This test's own binary sits in that directory. */
+        char p[4096];
+        FILE *f;
+#ifdef _WIN32
+        snprintf(p, sizeof p, "%s/enhance_cfg_test.exe", d);
+#else
+        snprintf(p, sizeof p, "%s/enhance_cfg_test", d);
+#endif
+        f = fopen(p, "rb");
+        CHECK(f != NULL);
+        if (f)
+            fclose(f);
+    }
+}
+
 int main(void)
 {
     test_subset();
@@ -442,6 +543,8 @@ int main(void)
     test_strict_valid();
     test_locale();
     test_layers();
+    test_enhance_init();
+    test_exe_dir();
     printf("enhance_cfg: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;
 }

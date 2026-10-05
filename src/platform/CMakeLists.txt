@@ -23,7 +23,7 @@ get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOL
 # recomp_env: every environment variable the runtime reads, read once
 # (recomp_env.h). A real library on every host; platform carries it to all
 # of the runtime's libraries.
-add_library(recomp_env STATIC recomp_env.c)
+add_library(recomp_env STATIC recomp_env.c recomp_exe_dir.c)
 target_include_directories(recomp_env PUBLIC
     ${XBOXRECOMP_SRC_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
