@@ -585,8 +585,9 @@ through its own D3D8LTCG.*
   reports, near-plane clipping, bilinear filtering, and a threaded
   rasteriser (#152)
 - P8 textures sample through the stage palette (#145)
-- `RECOMP_PB_REPORT_MS` (#146); `RECOMP_FB_DUMP_FLIPS` dumps every flip for
-  recordings (#156)
+- `RECOMP_PB_REPORT_MS` (#146); `RECOMP_FB_DUMP_FLIPS=<n>` (with
+  `RECOMP_FB_DUMP`) dumps the finished frame at every nth flip that drew
+  something, up to 200 frames, for recordings (#156)
 - The window title shows the XBE title, FPS and draws (#153)
 
 ### v0.12.0 — *"Never Taken"* (September 2026)
