@@ -1227,6 +1227,10 @@ class FunctionTranslator:
                 cc = m[3:]
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
+            elif m in ("pushfd", "lahf"):
+                # Both copy CF out of the tracked setter, through _cf when
+                # that setter keeps its carry there.
+                cc = "b"
             if (cc in FunctionTranslator._CARRY_CC
                     and (last_setter in CF_TRACKED
                          or last_setter in ("inc", "dec")
@@ -1240,7 +1244,8 @@ class FunctionTranslator:
                 # after one needs it declared. Anything else starting "rep"
                 # (movs/stos) leaves the flags and the setter alone.
                 last_setter = "rep-compare"
-            elif m in _FLAGS_UNDEFINED:
+            elif m in _FLAGS_UNDEFINED or m == "popfd":
+                # A carry test after popfd reads g_eflags, not _cf.
                 last_setter = None
         return False
 

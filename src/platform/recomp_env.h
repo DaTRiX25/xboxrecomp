@@ -165,6 +165,7 @@ extern "C" {
     X(CS_MODE,           DEBUG, "cs_mode",         "RECOMP_CS_MODE",           "=single: one lock for every guest lock") \
     X(ASYNC_IO,          DEBUG, "async_io",        "RECOMP_ASYNC_IO",          "asynchronous file I/O") \
     X(UNIMPL_TRAP,       DEBUG, "unimpl_trap",     "RECOMP_UNIMPL_TRAP",       "stop at an unimplemented instruction") \
+    X(CPUID_MMX,         DEBUG, "cpuid_mmx",       NULL,                       "=1: cpuid reports MMX/FXSR/SSE (D3DX JPEG takes its MMX IDCT); default masked") \
     X(D3D11_MEMO,        DEBUG, "d3d11_memo",      "RECOMP_D3D11_MEMO",        "=0: no D3D11 state memo") \
     X(D3D11_NO_CULL,     DEBUG, "d3d11_no_cull",   "RECOMP_D3D11_NO_CULL",     "D3D11 culls nothing") \
     X(D3D11_CULL_FLIP,   DEBUG, "d3d11_cull_flip", "RECOMP_D3D11_CULL_FLIP",   "D3D11 culls the other winding") \

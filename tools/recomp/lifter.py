@@ -396,15 +396,13 @@ _EFLAGS_SETTERS = frozenset({
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
-    "rdtsc", "cpuid",      # Special instructions
+    "rdtsc",               # Special instructions
     "lock xadd",           # Lock prefix - complex flag behavior
-    # popfd REPLACES every flag with whatever was pushed. Its flags are not
-    # architecturally undefined -- they are simply not knowable from the
-    # instruction stream -- but the tracking action is the same: whatever the
-    # last comparison left is gone, and a jcc after it must not be resolved
-    # from that comparison. It used to sit in _EFLAGS_PRESERVE, next to
-    # pushfd, which does read-and-preserve and does belong there.
-    "popfd",
+    # popfd is in neither set. It REPLACES every flag with whatever was
+    # pushed, so the last comparison is gone, but the new flags are known at
+    # run time: popfd is its own setter and a jcc after it reads g_eflags.
+    # It used to sit in _EFLAGS_PRESERVE, next to pushfd, which does
+    # read-and-preserve and does belong there.
 })
 
 # SSE compare predicates, by the CMPPS/CMPSS immediate. The named forms
@@ -433,8 +431,11 @@ _EFLAGS_PRESERVE = frozenset({
     # loop still answers the jcc after it.
     "loop", "loope", "loopne",
     # pushfd READS the flags and leaves them alone, so it belongs here.
-    # popfd does NOT -- see _FLAGS_UNDEFINED.
+    # popfd does NOT: it replaces every flag and is its own setter (see the
+    # note in _FLAGS_UNDEFINED and the popfd arm of _make_condition).
     "pushfd", "pushal",
+    # cpuid writes eax..edx and no flags.
+    "cpuid",
     "sgdt", "ljmp", "sfence",
     # SSE scalar float
     "movss", "movsd",
@@ -560,6 +561,34 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # _fa is zero-extended, so (int32_t)_fa is never negative for an 8- or
     # 16-bit result. Sign tests read _fas, the same snapshot sign-extended.
     slhs = "_fas" if lhs == "_fa" else f"(int32_t){lhs}"
+
+    # ── stc/clc/cmc: CF is _cf; the other flags are not tracked ──
+    if flag_setter == "__cf_only":
+        if jcc in ("jb", "jnae", "jc"):
+            return "_cf", desc
+        if jcc in ("jae", "jnb", "jnc"):
+            return "!_cf", desc
+        return None
+
+    # ── popfd: the flags are whatever image it loaded into g_eflags ──
+    if flag_setter == "popfd":
+        cf, pf, zf = "(g_eflags & 0x001u)", "(g_eflags & 0x004u)", "(g_eflags & 0x040u)"
+        sf, of = "(g_eflags & 0x080u)", "(g_eflags & 0x800u)"
+        lt = "(((g_eflags >> 7) ^ (g_eflags >> 11)) & 1u)"   # SF != OF
+        popfd_map = {
+            "je": zf, "jz": zf, "jne": f"!{zf}", "jnz": f"!{zf}",
+            "jb": cf, "jnae": cf, "jc": cf,
+            "jae": f"!{cf}", "jnb": f"!{cf}", "jnc": f"!{cf}",
+            "jbe": f"({cf} || {zf})", "jna": f"({cf} || {zf})",
+            "ja": f"!({cf} || {zf})", "jnbe": f"!({cf} || {zf})",
+            "js": sf, "jns": f"!{sf}", "jo": of, "jno": f"!{of}",
+            "jp": pf, "jpe": pf, "jnp": f"!{pf}", "jpo": f"!{pf}",
+            "jl": lt, "jnge": lt, "jge": f"!{lt}", "jnl": f"!{lt}",
+            "jle": f"({zf} || {lt})", "jng": f"({zf} || {lt})",
+            "jg": f"!({zf} || {lt})", "jnle": f"!({zf} || {lt})",
+        }
+        expr = popfd_map.get(jcc)
+        return (f"{expr} /* popfd */", desc) if expr else None
 
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
@@ -1670,6 +1699,43 @@ class Lifter:
                 "  eax = (uint32_t)_tsc; edx = (uint32_t)(_tsc >> 32); }"
                 "  /* rdtsc */",
             ]
+
+        # ── CPU identification ──
+        #
+        # The runtime answers as the Xbox CPU, a Coppermine-class Pentium III
+        # (see xbox_Cpuid). Lifted as a no-op, eax..edx kept whatever they
+        # held, so a feature test read a register the guest had just loaded
+        # with something else -- an EFLAGS.ID + CPUID feature probe decided
+        # on stale registers.
+        if m == "cpuid":
+            return ["{ uint32_t _id[4]; xbox_Cpuid(eax, ecx, _id);"
+                    " eax = _id[0]; ebx = _id[1]; ecx = _id[2];"
+                    " edx = _id[3]; } /* cpuid */"]
+
+        # ── EFLAGS to and from the stack ──
+        #
+        # Both were no-ops, which unbalanced the stack: every pushfd/popfd
+        # pair left esp 4 bytes off, and the CPUID-support idiom
+        # (pushfd; pop; xor 0x200000; push; popfd; pushfd; pop) popped the
+        # caller's saved registers instead, so an EFLAGS.ID + CPUID feature
+        # probe returned with the caller's callee-saved registers swapped.
+        #
+        # The arithmetic flags are lazy here -- a jcc rebuilds them from the
+        # instruction that set them -- so there is no EFLAGS word to push.
+        # g_eflags holds the last image popfd loaded (the system bits: IF,
+        # IOPL, AC and the ID bit the CPUID probe toggles); recomp_pushfd
+        # overlays the flags lift_basic_block can rebuild and DF. This arm is
+        # the case where nothing is tracked, so everything comes from
+        # g_eflags. popfd loads it and becomes the flag setter for the jcc
+        # after it (see _make_condition).
+        if m == "pushfd":
+            return ["PUSH32(esp, recomp_pushfd(0u, 0u)); /* pushfd */"]
+        if m == "popfd":
+            out = ["{ uint32_t _efl; POP32(esp, _efl); recomp_popfd(_efl); }"
+                   " /* popfd */"]
+            if self.needs_cf:
+                out.append("_cf = (int)(g_eflags & 1u); /* popfd: CF */")
+            return out
 
         # ── Port I/O ──
         #
@@ -3912,6 +3978,38 @@ def lift_basic_block(lifter, bb, flag_state=None):
             i += 1
             continue
 
+        # PUSHFD with a tracked setter: the flags that setter can answer come
+        # from the same conditions lahf and the jcc forms use, the rest of the
+        # word from g_eflags (see the pushfd arm of lift_instruction). AF is
+        # not modelled and, as for lahf, reads 0. A CF/PF/ZF/SF/OF the setter
+        # has no rule for also reads 0, and the site carries a RECOMP_UNIMPL
+        # naming those flags, so the gap is visible at run time and in the
+        # translator's tally. After stc/clc/cmc only CF is known. After popfd,
+        # g_eflags already holds every flag.
+        if (curr.mnemonic == "pushfd" and last_flag_setter
+                and last_flag_setter != "popfd"):
+            known, bits, missing = 0x010, [], []
+            for jcc, bit, name in (("jb", 0x001, "CF"), ("jp", 0x004, "PF"),
+                                   ("je", 0x040, "ZF"), ("js", 0x080, "SF"),
+                                   ("jo", 0x800, "OF")):
+                known |= bit
+                probe = _make_condition(jcc, last_flag_setter, last_flag_ops)
+                if probe:
+                    bits.append(f"(({probe[0]}) ? 0x{bit:03X}u : 0u)")
+                else:
+                    missing.append(name)
+            if missing:
+                text = (f"pushfd: {','.join(missing)} not rebuilt from "
+                        f"{last_flag_setter}, read as 0")
+                lifter.unimplemented.setdefault("pushfd (flags)", []).append(
+                    curr.address)
+                stmts.append(f'RECOMP_UNIMPL("{text}", 0x{curr.address:08X}u);')
+            stmts.append(f"PUSH32(esp, recomp_pushfd(0x{known:03X}u, "
+                         + (" | ".join(bits) if bits else "0u")
+                         + f")); /* pushfd ({last_flag_setter}) */")
+            i += 1
+            continue
+
         # Check if this instruction uses flags (jcc, setcc, cmovcc)
         if curr.is_cond_jump and last_flag_setter:
             result = _make_condition(
@@ -4001,6 +4099,14 @@ def lift_basic_block(lifter, bb, flag_state=None):
         elif curr.mnemonic in FLAG_SETTERS:
             last_flag_setter, last_flag_ops = normalise_zero_test(
                 curr.mnemonic, list(curr.operands))
+        elif curr.mnemonic in ("stc", "clc", "cmc"):
+            # CF is now _cf (the lift writes it); nothing else is tracked.
+            last_flag_setter = "__cf_only"
+            last_flag_ops = []
+        elif curr.mnemonic == "popfd":
+            # Every flag now comes from the image popfd loaded.
+            last_flag_setter = "popfd"
+            last_flag_ops = []
         elif curr.mnemonic in _FLAGS_UNDEFINED:
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
