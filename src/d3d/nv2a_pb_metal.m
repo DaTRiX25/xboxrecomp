@@ -1978,7 +1978,11 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 [b endEncoding];
             }
             flush(1);
-            if (rt && rt->hw != rt->w)
+            /* The host-size readback only when something reads it: the
+             * write-back below or the window. */
+            if (rt && rt->hw != rt->w
+                    && ((addr && pitch && pitch >= rt->w * 2u)
+                        || xbox_FramebufferWindowRunning()))
                 hpx = host_readback(rt);
             if (rt && addr && pitch && pitch >= rt->w * 2u) {
                 if (rt->hw == rt->w)
