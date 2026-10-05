@@ -198,12 +198,66 @@ class FunctionDetector:
         off = 0
         while off < limit:
             for pad in self._PADDING:
+                # `mov edi, edi` is also the first instruction of a hot-patch
+                # function. As table padding it fills exactly two bytes up to
+                # a dword boundary, so it only sits 2 bytes past one. A
+                # function start is aligned, so the two never coincide.
+                if pad == b"\x8b\xff" and (addr + off) % 4 != 2:
+                    continue
                 if data.startswith(pad, off):
                     off += len(pad)
                     break
             else:
                 break
         return addr + off
+
+    # Frame setups that end an index-table walk early: `push ebp; mov ebp,
+    # esp`, with or without the hot-patch pad in front.
+    _FRAME_STARTS = (bytes.fromhex("558bec"), bytes.fromhex("8bff558bec"))
+
+    def _index_table_end(self, addr: int, arms: int) -> Optional[int]:
+        """End of the byte index table at `addr` feeding `arms` dword entries,
+        or None when it cannot be sized safely.
+
+        The bound check in front of the load gives the length exactly; see
+        engine.index_table_length. Without it, the entries are known only to
+        be below `arms`, and the first byte that is not marks the end. That is
+        safe only when no opcode that starts a function is below `arms`. For a
+        switch of 16 arms or fewer it is: such bytes are `add` and `or`. For a
+        larger one a walk can run into the next function. A 96-arm switch
+        walks over `push ebp` (0x55) and starts the function one byte late,
+        without its frame. So a large walk also stops at a frame setup or a
+        known start, and otherwise is trusted only when padding or another
+        dword table follows it.
+        """
+        data = self.image.read_bytes_at_va(addr, 1024) or b""
+        length = self.engine.index_table_length(addr)
+        if length is not None:
+            if length == 0 or length > len(data):
+                return None
+            if any(b >= arms for b in data[:length]):
+                return None                 # not the table the bound guards
+            return addr + length
+        off = 0
+        stopped = False
+        while off < len(data) and data[off] < arms:
+            if arms > 0x0F and off and (
+                    any(data.startswith(f, off) for f in self._FRAME_STARTS)
+                    or addr + off in self._candidates):
+                stopped = True
+                break
+            off += 1
+        if off == 0:
+            return None
+        end = addr + off
+        if arms <= 0x0F or stopped:
+            return end
+        if self._skip_padding(end) != end:
+            return end
+        if end % 4 == 0 and (end in self.engine.jump_tables
+                             or self.engine.is_jump_table_ref(end)):
+            return end
+        return None
 
     def _past_switch_data(self, addr: int, arms: int) -> Optional[int]:
         """Skip the padding and switch tables that follow a measured table.
@@ -238,12 +292,10 @@ class FunctionDetector:
                     return None
                 addr += arms * 4
                 continue
-            data = self.image.read_bytes_at_va(addr, 1024) or b""
-            # Entries are arm numbers, so all below `arms`. The first byte
-            # that is not is past the end. Code after the table starts with
-            # an opcode, and opcodes that small (`add`, `or`) do not start
-            # functions. Two such bytes in a row are a table even when no
-            # instruction names it: a switch whose lowest case is not 0 folds
+            data = self.image.read_bytes_at_va(addr, 2) or b""
+            # An index table: one a load names, or two bytes below `arms`
+            # when nothing does. Those are a table even when no instruction
+            # names them: a switch whose lowest case is not 0 folds
             # the bias into the displacement, so the reference points a few
             # bytes before the table instead of at it.
             #
@@ -253,12 +305,10 @@ class FunctionDetector:
             if addr in self.engine.byte_tables or (
                     arms <= 0x0F and len(data) >= 2
                     and data[0] < arms and data[1] < arms):
-                off = 0
-                while off < len(data) and data[off] < arms:
-                    off += 1
-                if off == 0:
+                end = self._index_table_end(addr, arms)
+                if end is None:
                     return None
-                addr += off
+                addr = end
                 continue
             return addr
         return None

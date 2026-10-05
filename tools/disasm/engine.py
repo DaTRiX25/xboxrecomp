@@ -98,9 +98,9 @@ class DisasmEngine:
         # Byte-sized tables read through an index, `movzx eax, byte ptr
         # [eax + disp]`. MSVC's two-level switch maps a sparse case value to a
         # dense arm number this way and parks the byte table straight after
-        # the dword table it feeds. Never measured, only remembered, so that
-        # nothing mistakes the bytes after a jump table for code.
-        self.byte_tables: Set[int] = set()
+        # the dword table it feeds. disp -> addresses of the reads, so that
+        # index_table_length() can find the bound check in front of one.
+        self.byte_tables: Dict[int, List[int]] = {}
 
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
         """Convert a Capstone instruction to our Instruction type."""
@@ -151,16 +151,18 @@ class DisasmEngine:
                         insn.jump_table = disp
                         self._jt_candidates.add(disp)
 
-            if not (insn.is_call or insn.is_branch):
-                for operand in operands:
-                    if (operand.type == CS_OP_MEM and operand.size == 1
-                            and (operand.mem.index != 0
-                                 or operand.mem.base != 0)):
-                        disp = operand.mem.disp & 0xFFFFFFFF
-                        if self.image.base_address <= disp < (
-                                self.image.base_address
-                                + self.image.image_size):
-                            self.byte_tables.add(disp)
+            # Only the widening loads. `cmp byte ptr [esi + disp], 0` reads a
+            # byte field of a static struct, not an index table.
+            if mnemonic in ("movzx", "movsx") and len(operands) == 2:
+                src = operands[1]
+                if (src.type == CS_OP_MEM and src.size == 1
+                        and (src.mem.index != 0 or src.mem.base != 0)):
+                    disp = src.mem.disp & 0xFFFFFFFF
+                    if self.image.base_address <= disp < (
+                            self.image.base_address
+                            + self.image.image_size):
+                        self.byte_tables.setdefault(disp, []).append(
+                            insn.address)
 
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:
@@ -308,6 +310,43 @@ class DisasmEngine:
             resynced += 1
 
         return resynced
+
+    def index_table_length(self, table: int) -> Optional[int]:
+        """Entries in the byte index table at `table`, read from the bound
+        check in front of a load from it, or None when there is none.
+
+        MSVC guards the load with the switch range:
+
+            cmp  eax, N
+            ja   default
+            movzx eax, byte ptr [eax + table]
+            jmp  dword ptr [eax*4 + arms]
+
+        so the index is 0..N and the table holds N + 1 bytes.
+        """
+        for site in self.byte_tables.get(table, ()):
+            ja = self._instruction_ending_at(site)
+            if ja is None or ja.mnemonic.lower() not in ("ja", "jae"):
+                continue
+            cmp = self._instruction_ending_at(ja.address)
+            if cmp is None or cmp.mnemonic.lower() != "cmp":
+                continue
+            _, _, imm = cmp.op_str.replace(" ", "").partition(",")
+            try:
+                bound = int(imm, 0)
+            except ValueError:
+                continue
+            if bound < 0:
+                continue
+            return bound + 1 if ja.mnemonic.lower() == "ja" else bound
+        return None
+
+    def _instruction_ending_at(self, addr: int) -> Optional[Instruction]:
+        for back in range(1, 16):
+            insn = self.instructions.get(addr - back)
+            if insn is not None and insn.end_address == addr:
+                return insn
+        return None
 
     def is_jump_table_ref(self, addr: int) -> bool:
         """Does some `jmp [reg*4 + disp]` name `addr` as its table, measured
