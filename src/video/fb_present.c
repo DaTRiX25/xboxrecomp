@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "video_player.h"   /* the xbox_FramebufferWindow* prototypes */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -277,6 +278,31 @@ void xbox_HostWindowSetTitle(const char *title)
         SetWindowTextA(h, s_title);
 }
 
+/* The title bar text: "<name> | FPS: n | draws: n". For a window that
+ * refreshes it once a second -- this file's, and the D3D11 backend's own,
+ * which the flip counts reach only through here. *t0 and *f0 are that
+ * window's last refresh (zero before the first); 0 means not due yet. */
+int xbox_FramebufferWindowTitleText(wchar_t *tb, int n, uint32_t *t0, uint32_t *f0)
+{
+    DWORD now = GetTickCount();
+    LONG f = s_flips;
+    double fps;
+
+    if (n < 1 || (*t0 && now - *t0 < 1000))
+        return 0;
+    fps = *t0 ? (uint32_t)(f - (LONG)*f0) * 1000.0 / (now - *t0) : 0.0;
+    if (s_host_title_set)
+        _snwprintf(tb, n - 1, L"%hs | FPS: %.1f | draws: %ld",
+                   s_title, fps, (long)s_frame_draws);
+    else
+        _snwprintf(tb, n - 1, L"%ls | FPS: %.1f | draws: %ld",
+                   s_xbe_title, fps, (long)s_frame_draws);
+    tb[n - 1] = 0;
+    *t0 = now ? now : 1;
+    *f0 = (uint32_t)f;
+    return 1;
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     xbox_log_thread_role("fb-present", 0);
@@ -374,23 +400,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             }
         }
         {
-            static DWORD t0;
-            static LONG f0;
-            DWORD now = GetTickCount();
-            if (now - t0 >= 1000) {
-                LONG f = s_flips;
-                wchar_t tb[128];
-                double fps = t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0;
-                if (s_host_title_set)
-                    _snwprintf(tb, 127, L"%hs | FPS: %.1f | draws: %ld",
-                               s_title, fps, (long)s_frame_draws);
-                else
-                    _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld",
-                               s_xbe_title, fps, (long)s_frame_draws);
-                tb[127] = 0;
+            static uint32_t t0, f0;
+            wchar_t tb[128];
+            if (xbox_FramebufferWindowTitleText(tb, 128, &t0, &f0))
                 SetWindowTextW(hwnd, tb);
-                t0 = now; f0 = f;
-            }
         }
         Sleep(16);
     }

@@ -143,6 +143,7 @@ extern "C" {
     X(PB_FAST,           DEBUG, "pb_fast",         "RECOMP_PB_FAST",           "=0: CPU raster without fast paths") \
     X(PB_FAST_AB,        DEBUG, "pb_fast_ab",      "RECOMP_PB_FAST_AB",        "compare fast and slow raster per batch") \
     X(PB_BILINEAR,       DEBUG, "pb_bilinear",     "RECOMP_PB_BILINEAR",       "=0: CPU raster samples nearest, whatever the filter") \
+    X(PB_MIPS,           DEBUG, "pb_mips",         "RECOMP_PB_MIPS",           "=0: CPU raster samples mip level 0 only") \
     X(PB_CLIP,           DEBUG, "pb_clip",         "RECOMP_PB_CLIP",           "=0: no near-plane clipping") \
     X(PB_CULL_FLIP,      DEBUG, "pb_cull_flip",    "RECOMP_PB_CULL_FLIP",      "CPU raster culls the other winding") \
     X(PB_VSH_AB,         DEBUG, "pb_vsh_ab",       "RECOMP_PB_VSH_AB",         "compare vertex-program paths per batch") \
@@ -203,9 +204,7 @@ extern "C" {
     X(WATCH_DEPTH,       DEBUG, "watch_depth",     "RECOMP_WATCH_DEPTH",       "=n: watch stack depth (14)") \
     X(WATCH_LEN,         DEBUG, "watch_len",       "RECOMP_WATCH_LEN",         "=bytes: watch range") \
     X(WATCHDOG_SECS,     DEBUG, "watchdog",        "RECOMP_WATCHDOG_SECS",     "=s: dump and exit after s seconds") \
-    /* appended, so the other keys' indices stay as they were */ \
-    X(PB_MIPS,           DEBUG, "pb_mips",         "RECOMP_PB_MIPS",           "=0: CPU raster samples mip level 0 only") \
-    /* from upstream (merge of origin/main 1409a7d), appended likewise */ \
+    /* from upstream (merge of origin/main 1409a7d), appended */ \
     X(USB_PADS,          CONFIG, "RECOMP_USB_PADS",          NULL, "emulated USB pads plugged in, 1..4 (default 1)") \
     X(PAD_SCRIPT,        DEBUG, "pad_script",      "RECOMP_PAD_SCRIPT",        "=ms:btn[+btn][:hold],... or =@file: timed pad presses") \
     X(PAD_LIVE,          DEBUG, "pad_live",        "RECOMP_PAD_LIVE",          "=file: press each line appended to it (btn[+btn][:hold])") \

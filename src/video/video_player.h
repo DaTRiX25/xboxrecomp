@@ -10,6 +10,7 @@
 #ifndef XBOXRECOMP_VIDEO_PLAYER_H
 #define XBOXRECOMP_VIDEO_PLAYER_H
 
+#include <stddef.h>   /* wchar_t */
 #include <stdint.h>
 
 /* Initialize/shutdown Media Foundation (call once at app start/end) */
@@ -70,6 +71,12 @@ int  xbox_FramebufferDumpBmp(const char *path);
  * UTF-16 title (40 chars max); the stats come from each flip. */
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
+#if defined(_WIN32)
+/* That title bar text, for a Win32 window that refreshes it once a second
+ * (the D3D11 backend's): fills tb (n wide chars) and returns 1 when due.
+ * *t0 and *f0 are the window's own, zero to start. */
+int xbox_FramebufferWindowTitleText(wchar_t *tb, int n, uint32_t *t0, uint32_t *f0);
+#endif
 
 /* The host window's title. The title sets it, before the window opens or at
  * any time after; unset, it reads "Xbox Recomp". */

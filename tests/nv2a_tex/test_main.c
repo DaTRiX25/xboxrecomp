@@ -6,6 +6,8 @@
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 #define NEAR(a, b) ((a) - (b) < 1e-6f && (b) - (a) < 1e-6f)
 
+static uint32_t resolve_id(uint32_t offset) { return offset; }
+
 int main(void)
 {
     static const float dir[6][3] = {
@@ -93,6 +95,25 @@ int main(void)
         CHECK(l0 == 0 && l1 == 1 && w == 0.0f);
         nv2a_tex_mip_levels(0, 3.0f, 8, &l0, &l1, &w);
         CHECK(l0 == 0 && l1 == 0);
+    }
+
+    {   /* FORMAT's DIMENSIONALITY [7:4] and CUBEMAP [2]: the CPU sampler
+         * mipmaps neither a cube map nor a volume (its level offsets assume
+         * a 2D chain). A8R8G8B8 (0x06), 3 levels, log2 sizes 4 x 4. */
+        uint32_t r[16] = { 0 };
+        uint8_t set[16] = { 0 };
+        struct nv2a_stage st;
+        r[0] = 0x1000;
+        r[0x0C / 4] = (1u << 30) | (7u << 6);           /* enabled, LOD max 7 */
+        r[0x04 / 4] = (4u << 24) | (4u << 20) | (3u << 16) | (0x06u << 8) | (2u << 4);
+        nv2a_stage_decode(0, r, set, 0, 0, resolve_id, NV2A_STAGE_MIPS, &st);
+        CHECK(st.dims == 2 && !st.cube && st.levels == 3 && st.valid);
+        r[0x04 / 4] = (r[0x04 / 4] & ~0xF0u) | (3u << 4);
+        nv2a_stage_decode(0, r, set, 0, 0, resolve_id, NV2A_STAGE_MIPS, &st);
+        CHECK(st.dims == 3 && !st.cube);
+        r[0x04 / 4] = (r[0x04 / 4] & ~0xF0u) | (2u << 4) | (1u << 2);
+        nv2a_stage_decode(0, r, set, 0, 0, resolve_id, NV2A_STAGE_MIPS, &st);
+        CHECK(st.dims == 2 && st.cube);
     }
 
     puts("nv2a_tex: all passed");

@@ -386,6 +386,7 @@ struct nv2a_stage {
     uint32_t fmt_levels;        /* FORMAT's MIPMAP_LEVELS as stored (>= 1):
                                  * the memory layout, whatever is sampled */
     int      cube;              /* FORMAT CUBEMAP_ENABLE: six faces      */
+    uint32_t dims;              /* FORMAT DIMENSIONALITY: 1, 2 or 3      */
     int      valid;
     int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
     int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
