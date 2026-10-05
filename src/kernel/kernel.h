@@ -1116,6 +1116,10 @@ uint32_t xbox_VblankCount(void);
 uint32_t xbox_PortIn(uint32_t port, int width);
 void     xbox_PortOut(uint32_t port, uint32_t value, int width);
 
+/* cpuid for lifted code (kernel_hal.c): the Xbox's Pentium III. Also declared
+ * in templates/runtime/recomp_types.h for generated code. */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+
 #ifdef __cplusplus
 }
 #endif

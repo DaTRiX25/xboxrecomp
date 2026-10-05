@@ -1203,3 +1203,57 @@ void xbox_PortOut(uint32_t port, uint32_t value, int width)
         fflush(stderr);
     }
 }
+
+/* =========================================================================
+ * cpuid
+ *
+ * The Xbox CPU is a 733 MHz Coppermine-based Pentium III. Leaf 1 eax 0x683
+ * is family 6, model 8 (Coppermine), stepping 3: the cB0 stepping's
+ * signature in Intel's Pentium III Processor Specification Update.
+ * The max basic leaf is 2 and there are no extended leaves. Leaf 1's edx is
+ * the P3 feature set (FPU..CMOV, PAT, PSE-36, MMX, FXSR, SSE). Leaf 2 gives
+ * the Coppermine Celeron's descriptors (128 KB 4-way L2, 16 KB L1s, TLBs).
+ *
+ * A leaf above the maximum, extended ones included, returns the highest
+ * basic leaf's data: Intel SDM vol. 2A, CPUID, "If a value entered for
+ * CPUID.EAX is higher than the maximum input value for basic or extended
+ * function for that processor then the data for the highest basic
+ * information leaf is returned." So 0x80000000 reads eax 0x03020101, below
+ * 0x80000001, which is how software learns there are no extended leaves.
+ *
+ * MMX is masked unless RECOMP_DEBUG=cpuid_mmx is set. D3DX's JPEG decoder
+ * takes an MMX IDCT when the bit is set, and that path has never run in a
+ * lifted title. Masking only bit 23 would describe a CPU with SSE but no
+ * MMX, which never existed: SSE's integer extensions operate on the MMX
+ * registers, and FXSAVE/FXRSTOR (FXSR) arrived alongside SSE to save that
+ * state. So the masked CPU drops MMX, FXSR and SSE together (bits 23-25)
+ * and reads as a plain P6 feature set -- self-consistent, if not the
+ * family/model leaf 1 eax still names.
+ * ========================================================================= */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
+{
+    const char *mmx = recomp_env(RENV_CPUID_MMX);
+
+    (void)subleaf;
+    out[0] = out[1] = out[2] = out[3] = 0;
+    if (leaf > 2)
+        leaf = 2;
+    switch (leaf) {
+    case 0:
+        out[0] = 2;
+        out[1] = 0x756E6547u;   /* "Genu" */
+        out[3] = 0x49656E69u;   /* "ineI" */
+        out[2] = 0x6C65746Eu;   /* "ntel" */
+        break;
+    case 1:
+        out[0] = 0x00000683u;
+        out[3] = 0x0383F9FFu;
+        if (!(mmx && *mmx && *mmx != '0'))
+            out[3] &= ~0x03800000u;     /* MMX, FXSR, SSE */
+        break;
+    default:
+        out[0] = 0x03020101u;
+        out[3] = 0x0C040841u;
+        break;
+    }
+}

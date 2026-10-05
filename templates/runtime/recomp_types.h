@@ -250,6 +250,37 @@ extern RECOMP_TLS uint32_t g_ebp;
 extern RECOMP_TLS int g_df;
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
+/* EFLAGS as pushfd and popfd see it.
+ *
+ * The arithmetic flags are lazy: a jcc rebuilds them from the instruction
+ * that set them, so no EFLAGS word exists until pushfd needs one. g_eflags is
+ * the last image popfd loaded, masked to the bits a P3 lets ring 0 write
+ * (CF PF AF ZF SF TF IF DF OF IOPL NT AC ID), with bit 1 always set. The ID
+ * bit (21) round-trips, which is how code learns the CPU has cpuid; a jcc
+ * right after popfd reads its flags from here.
+ *
+ * recomp_pushfd(known, bits) builds the word: the flags in `known` from
+ * `bits` (what the lifter rebuilt from the tracked setter), DF from g_df, the
+ * rest from g_eflags. Thread-local like g_df.
+ *
+ * Only popfd writes g_eflags. cli and sti do not update its IF bit (they
+ * have no lift that touches it), so a pushfd after them reports the IF of
+ * the last popfd image -- set, unless the guest popped it clear. */
+extern RECOMP_TLS uint32_t g_eflags;
+#define RECOMP_EFL_WRITABLE 0x00247FD5u
+static inline uint32_t recomp_pushfd(uint32_t known, uint32_t bits) {
+    return (g_eflags & ~(known | 0x400u)) | (bits & known) | 0x2u
+         | (g_df ? 0x400u : 0u);
+}
+static inline void recomp_popfd(uint32_t v) {
+    g_eflags = (v & RECOMP_EFL_WRITABLE) | 0x2u;
+    g_df = (int)((v >> 10) & 1u);
+}
+
+/* cpuid: out[0..3] = eax, ebx, ecx, edx for leaf `leaf` (subleaf unused).
+ * The runtime answers as the Xbox's Coppermine-class Pentium III. */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
