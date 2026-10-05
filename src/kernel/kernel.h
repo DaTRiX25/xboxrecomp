@@ -1111,6 +1111,11 @@ extern void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
  * parity that the field pin (port 0x80C0) reports. */
 uint32_t xbox_VblankCount(void);
 
+/* x86 port I/O for lifted `in`/`out` (kernel_hal.c); width is 1, 2 or 4.
+ * Also declared in templates/runtime/recomp_types.h for generated code. */
+uint32_t xbox_PortIn(uint32_t port, int width);
+void     xbox_PortOut(uint32_t port, uint32_t value, int width);
+
 #ifdef __cplusplus
 }
 #endif
