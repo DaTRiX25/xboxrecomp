@@ -2854,7 +2854,11 @@ class Lifter:
             step, acc = (4, "MEM32") if wide else (2, "MEM16")
             value = "eax" if wide else "LO16(eax)"
             return self._rep_compare(m, value, f"{acc}(edi)", step, False)
-        return [f"/* {m} */"]
+        # Anything else -- rep ins*/outs* (port block transfers), a rep
+        # prefix on something that is not a string op -- has no translation.
+        # A bare comment here made it vanish without a trace; the marker at
+        # least says, at run time, that it was reached.
+        return self._unimplemented(insn, m)
 
     def _rep_compare(self, m, first, second, step, uses_esi):
         """REPE/REPNE CMPS and SCAS: compare element by element.
