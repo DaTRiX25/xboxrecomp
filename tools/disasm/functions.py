@@ -67,6 +67,12 @@ class FunctionDetector:
     until the next function or a terminal instruction.
     """
 
+    # Instruction budgets for probing a code pointer read out of a data
+    # section; see _pass_data_ptr_targets.
+    DATA_PTR_PROBE_INSNS = 64
+    DATA_PTR_TABLE_PROBE_INSNS = 512
+    DATA_PTR_MIN_NEIGHBOURS = 1
+
     def __init__(self, engine: DisasmEngine, image: BinaryImage,
                  xrefs: XRefTracker, labels: LabelManager):
         self.engine = engine
@@ -146,6 +152,11 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # A function that begins immediately after an embedded switch table.
+        if self._pass_jump_table_followers(sections):
+            self.functions.clear()
+            self._build_functions(sections)
+
         # A function that begins immediately after a ret, with no padding.
         if self._pass_gap_prologues(sections):
             self.functions.clear()
@@ -170,6 +181,200 @@ class FunctionDetector:
         self._build_call_graph()
 
         return len(self.functions)
+
+    # MSVC's alignment fillers: int3, nop, `mov edi, edi`, and `lea r, [r]`
+    # in its 3-, 4-, 6- and 7-byte encodings.
+    _PADDING = (bytes.fromhex("8da42400000000"), bytes.fromhex("8d9b00000000"),
+                bytes.fromhex("8d642400"), bytes.fromhex("8d4900"),
+                bytes.fromhex("8bff"), b"\xcc", b"\x90")
+
+    def _skip_padding(self, addr: int, limit: int = 16) -> int:
+        """First address at or after `addr` that is not alignment padding.
+
+        Reads bytes rather than decoded instructions: after a table the
+        sweep's decode is often out of phase, and an instruction that starts
+        inside the table can swallow the padding."""
+        data = self.image.read_bytes_at_va(addr, limit + 7) or b""
+        off = 0
+        while off < limit:
+            for pad in self._PADDING:
+                if data.startswith(pad, off):
+                    off += len(pad)
+                    break
+            else:
+                break
+        return addr + off
+
+    def _past_switch_data(self, addr: int, arms: int) -> Optional[int]:
+        """Skip the padding and switch tables that follow a measured table.
+
+        The tables of several switches in one function sit together after
+        its last ret. Each dword table may have a byte index table after it,
+        and padding goes between them. Some dword tables have fewer than 3
+        entries, so resync_jump_tables did not measure them, but a
+        `jmp [reg*4 + disp]` still names them. Returns the first address past
+        all of that, or None when the bytes cannot be sized.
+        """
+        for _ in range(16):
+            addr = self._skip_padding(addr)
+            if addr in self.engine.jump_tables:
+                end = self.engine.jump_tables[addr]
+                arms = (end - addr) // 4
+                addr = end
+                continue
+            if self.engine.is_jump_table_ref(addr):
+                section = self.image.get_section_at_va(addr)
+                if section is None:
+                    return None
+                lo = section.virtual_addr
+                hi = lo + section.virtual_size
+                arms = 0
+                while arms < 512:
+                    value = self.image.read_u32_at_va(addr + arms * 4)
+                    if value is None or not (lo <= value < hi):
+                        break
+                    arms += 1
+                if arms == 0:
+                    return None
+                addr += arms * 4
+                continue
+            data = self.image.read_bytes_at_va(addr, 1024) or b""
+            # Entries are arm numbers, so all below `arms`. The first byte
+            # that is not is past the end. Code after the table starts with
+            # an opcode, and opcodes that small (`add`, `or`) do not start
+            # functions. Two such bytes in a row are a table even when no
+            # instruction names it: a switch whose lowest case is not 0 folds
+            # the bias into the displacement, so the reference points a few
+            # bytes before the table instead of at it.
+            #
+            # Only for a small switch, though: a byte below `arms` has to be
+            # implausible as the start of a function, and 0x0F and 0x33
+            # (`movzx`, `xor eax, eax`) are not.
+            if addr in self.engine.byte_tables or (
+                    arms <= 0x0F and len(data) >= 2
+                    and data[0] < arms and data[1] < arms):
+                off = 0
+                while off < len(data) and data[off] < arms:
+                    off += 1
+                if off == 0:
+                    return None
+                addr += off
+                continue
+            return addr
+        return None
+
+    def _pads_into_jump_table(self, addr: int) -> bool:
+        """Is `addr` padding that runs straight into a measured switch table?"""
+        tables = self.engine.jump_tables
+        if not tables:
+            return False
+        after = self._skip_padding(addr)
+        return after != addr and after in tables
+
+    def _tail_calls_known_function(self, addr: int) -> bool:
+        """Does the straight-line body at `addr` end in a direct jmp to the
+        exact start of a function already built?"""
+        target = self.engine.probe_tail_call(addr)
+        return (target is not None and target != addr
+                and target in self.functions)
+
+    def _follows_a_boundary(self, addr: int) -> bool:
+        """Does a ret, an unconditional jmp or int3 padding end exactly at
+        `addr`? Those are the places the previous function can stop."""
+        for back in range(1, 16):
+            insn = self.engine.instructions.get(addr - back)
+            if insn is None or insn.end_address != addr:
+                continue
+            if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
+                return True
+            if insn.mnemonic.lower() == "int3":
+                return True
+        return False
+
+    def _pass_jump_table_followers(self, sections: List[SectionInfo]) -> bool:
+        """A function that starts right after an embedded switch table.
+
+        MSVC parks a function's jump table after its last ret, aligned with
+        int3 or `mov edi, edi`, and the linker packs the next function straight
+        after the table. Nothing marks that start. _pass_cc_boundaries wants
+        a ret or jmp in front of an int3 run, and finds a table instead;
+        _pass_gap_prologues looks only after a ret. A function whose address
+        is only ever stored into a callback slot is reached by no call or jmp
+        either. BLiNX 2's 0x000AEC20 is that shape: frameless, after
+        sub_000ADF80's four-entry table, and it needed a hand seed.
+
+        The address is the first byte past the table and anything packed
+        after it: padding, further dword tables, and byte index tables. It
+        becomes a start when it is in a gap, is not a switch arm, and decodes
+        to a terminator, the same test a realigned call target gets. The gap
+        is the important test. A table in the middle of a function is followed
+        by more of that function, and that function's body already covers the
+        address. The data is the main risk: index tables decode as `add` and
+        reach a `retf` soon enough. They are stepped over or refused, never
+        probed.
+
+        On BLiNX 2 this finds 37 starts. 35 were reachable before only as
+        aliases inside a false function that _pass_gap_prologues had started
+        on the `mov edi, edi` in front of a table.
+
+        Returns whether anything was added, so the caller can rebuild.
+        """
+        if not self.engine.jump_tables:
+            return False
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+        code_ranges = [(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections]
+
+        def in_a_gap(addr: int) -> bool:
+            i = bisect.bisect_right(starts, addr) - 1
+            return not (i >= 0 and addr < bounds[i][1])
+
+        # A switch arm is code of the function that dispatches to it, and
+        # MSVC's memcpy keeps arms straight after a table. A start there
+        # clamps the function it belongs to, so arms are never followers.
+        arms = set()
+        for tbl in self.engine.jump_tables:
+            arms.update(self.engine.jump_table_entries(tbl))
+
+        found = 0
+        for tbl, end in sorted(self.engine.jump_tables.items()):
+            addr = self._past_switch_data(end, (end - tbl) // 4)
+            if addr is None or addr in arms:
+                continue
+            # Opcodes 0x00-0x0E are `add`, `or` and segment pushes. No function
+            # starts with one, but every index table does, because its bytes
+            # are small arm numbers. This catches the ones the walk above could
+            # not size.
+            first = self.image.read_bytes_at_va(addr, 1)
+            if not first or first[0] < 0x0F:
+                continue
+            if addr in self._candidates or addr in self.functions:
+                continue
+            if not any(lo <= addr < hi for lo, hi in code_ranges):
+                continue
+            if not in_a_gap(addr):
+                continue
+            # The sweep may have decoded the tables as code and run across
+            # this address. A decode that starts inside the tables says
+            # nothing. One that starts before them does, as it does for an
+            # immediate.
+            covering = self.engine.instruction_covering(addr)
+            if (covering is not None and covering.address < tbl
+                    and not self.engine.probes_as_prologue(addr)):
+                continue
+            if not self.engine.probes_as_function_body(addr):
+                continue
+            if addr not in self.engine.instructions \
+                    and not self.engine.decode_at(addr):
+                continue
+            self._add_candidate(addr, config.CONFIDENCE_CC_BOUNDARY,
+                                "jump_table_follower")
+            found += 1
+
+        if found:
+            print(f"  {found} function(s) found right after a switch table")
+        return found > 0
 
     def _pass_gap_prologues(self, sections: List[SectionInfo]) -> bool:
         """A function that starts right after a ret, with no padding between.
@@ -216,6 +421,13 @@ class FunctionDetector:
                 continue
             if not in_a_gap(nxt):
                 continue                    # an out-of-line tail, not a start
+            # `mov edi, edi` is also what MSVC pads with to align a switch
+            # table parked after the ret. Taking it for a hot-patch prologue
+            # starts a function on the padding, and _find_function_end then
+            # steps over the table and swallows whatever follows it: BLiNX 2's
+            # sub_000AEC0E ate the frameless callback at 0x000AEC20.
+            if self._pads_into_jump_table(nxt):
+                continue
             # A prologue, or a whole small function.
             #
             # MSVC packs runs of constant-returning accessors -- "mov eax,
@@ -577,8 +789,18 @@ class FunctionDetector:
             # dispatches through the vtable and is gone. Those are taken by
             # address and passed around as values, so an immediate is exactly
             # how they show up.
+            #
+            # ...or a body that ends by tail-jumping to the exact start of a
+            # known function. "return f(...)" compiles to that, and so does
+            # every C++ EH handler thunk, `mov eax, <FuncInfo>; jmp
+            # __CxxFrameHandler`, whose address the function's SEH prologue
+            # pushes as an immediate. A stray jmp decoded out of data almost
+            # never lands precisely on a function start, so the destination is
+            # the corroboration the missing ret would have been. BLiNX 2 lost
+            # three such thunks and a frameless 79-byte callback this way.
             if not (self.engine.probes_as_returning_body(target)
-                    or self.engine.probes_as_vcall_thunk(target)):
+                    or self.engine.probes_as_vcall_thunk(target)
+                    or self._tail_calls_known_function(target)):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
@@ -701,6 +923,8 @@ class FunctionDetector:
         # nowhere else. Excluding them left those constructors with no body at
         # all, and _initterm silently skipped every one.
         targets = set()
+        # Where each target was read, for the table-context test below.
+        seen_at: Dict[int, List[Tuple[bytes, int]]] = {}
         for sec in self.image.sections:
             if sec.name in code_names:
                 continue                    # scan data, not code
@@ -711,6 +935,31 @@ class FunctionDetector:
                 value = int.from_bytes(data[off:off + 4], "little")
                 if in_code_section(value):
                     targets.add(value)
+                    seen_at.setdefault(value, []).append((data, off))
+
+        def known_neighbours(target: int) -> int:
+            """Known function starts beside `target` in its own table.
+
+            Walks out from each place the target was stored, through the
+            contiguous run of code pointers it sits in, up to four entries
+            each way."""
+            best = 0
+            for data, off in seen_at.get(target, ()):
+                n = 0
+                for step in (-4, 4):
+                    pos = off + step
+                    for _ in range(4):
+                        if not (0 <= pos <= len(data) - 4):
+                            break
+                        value = int.from_bytes(data[pos:pos + 4], "little")
+                        if not in_code_section(value):
+                            break
+                        if value in self.functions and value not in \
+                                self._alias_entries:
+                            n += 1
+                        pos += step
+                best = max(best, n)
+            return best
 
         # Alias entries, not candidates.
         #
@@ -767,8 +1016,27 @@ class FunctionDetector:
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
                     continue
+                # The walk is capped because a data word is weak evidence and
+                # a long walk through junk eventually finds a jmp. 64 is
+                # enough for most functions, but not all: BLiNX 2's
+                # 0x00158BE0 needs 67 instructions to reach its first ret.
+                # Raising the cap for everyone is not the answer. At 128,
+                # BLiNX gained 87 aliases, and nearly all of them were runs of
+                # odd addresses in zero-filled data that happened to fall in
+                # a code section.
+                #
+                # So the longer walk needs two more pieces of evidence. First,
+                # the word sits beside a known function start in its own
+                # table. Second, the address is where a function could start:
+                # straight after a ret, a tail jmp or int3 padding. 0x00158BE0
+                # has both, with 0x001589F0 beside it in .data and a ret in
+                # front of it. Junk that falls in a code section has neither.
+                budget = self.DATA_PTR_PROBE_INSNS
+                if (known_neighbours(target) >= self.DATA_PTR_MIN_NEIGHBOURS
+                        and self._follows_a_boundary(target)):
+                    budget = self.DATA_PTR_TABLE_PROBE_INSNS
                 if not self.engine.probes_as_function_body(target,
-                                                           max_insns=64):
+                                                           max_insns=budget):
                     continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)
