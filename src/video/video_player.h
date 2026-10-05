@@ -10,6 +10,7 @@
 #ifndef XBOXRECOMP_VIDEO_PLAYER_H
 #define XBOXRECOMP_VIDEO_PLAYER_H
 
+#include <stddef.h>   /* wchar_t */
 #include <stdint.h>
 
 /* Initialize/shutdown Media Foundation (call once at app start/end) */
@@ -71,7 +72,6 @@ int  xbox_FramebufferDumpBmp(const char *path);
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
 #if defined(_WIN32)
-#include <stddef.h>
 /* That title bar text, for a Win32 window that refreshes it once a second
  * (the D3D11 backend's): fills tb (n wide chars) and returns 1 when due.
  * *t0 and *f0 are the window's own, zero to start. */

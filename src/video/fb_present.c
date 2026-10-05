@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "video_player.h"   /* the xbox_FramebufferWindow* prototypes */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
