@@ -141,6 +141,7 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
     t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
     t->filter = r[0x14 / 4];
     t->cube = (int)((fmt >> 2) & 1u);
+    t->dims = (fmt >> 4) & 0xFu;
     t->fmt_levels = (fmt >> 16) & 0xFu;
     if (!t->fmt_levels)
         t->fmt_levels = 1;

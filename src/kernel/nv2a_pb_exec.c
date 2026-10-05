@@ -2454,7 +2454,8 @@ static int     s_stage_tent[4];         /* bilinear: SET_TEXTURE_FILTER asks TEN
 /* Mip selection, per stage (stage_lod). A stage mipmaps when its texture
  * has more than one level (nv2a_stage_decode with NV2A_STAGE_MIPS, as the
  * GPU paths count them) and MIN asks for a mip mode; it is never a cube
- * map. Level 0 of such a stage is the same texture s_stage_tex holds. */
+ * map or a volume. Level 0 of such a stage is the same texture
+ * s_stage_tex holds. */
 #define MIP_MAX_LEVELS 16
 typedef struct {
     int      mip;                       /* 0 off, 1 nearest level, 2 blend two */
@@ -2687,7 +2688,11 @@ static void stage_mip_build(int n, const struct nv2a_stage *st)
     uint32_t l;
 
     m->mip = 0;
-    if (!pb_mips() || st->levels < 2 || st->cube || st->mode == 0 || st->mode == 4
+    /* nv2a_tex_level_offset walks a 2D chain; a volume texture's levels
+     * are each a stack of slices, so its offsets past level 0 would land
+     * mid-slice. Such a stage samples level 0, as before mips. */
+    if (!pb_mips() || st->levels < 2 || st->cube || st->dims == 3
+            || st->mode == 0 || st->mode == 4
             || !nv2a_tex_size_from_format(st->color))
         return;
     m->mip = nv2a_tex_filter_mip(st->filter);
@@ -3310,18 +3315,29 @@ static TexCacheEntry *tc_bind(const Texture *t, uint32_t levels)
         return NULL;
     t0 = rt_now();
     s_tc_binds++;
+    /* The level count is not part of the key: an entry holds level 0 first,
+     * so one with the whole chain also serves a level-0-only bind of the
+     * same texture (a stage that stops mipmapping, or another stage that
+     * never did). One that holds fewer levels than asked is rebuilt in its
+     * own slot, so the texture never has two entries duplicating level 0. */
     for (i = 0; i < TC_ENTRIES; i++) {
         TexCacheEntry *c = &s_tc[i];
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
-                && c->pitch == t->pitch && c->levels == levels) {
-            e = c;
+                && c->pitch == t->pitch) {
+            if (c->levels >= levels)
+                e = c;
+            else
+                victim = c;
             break;
         }
         if (!c->live || (victim->live && c->used < victim->used))
             victim = c;
     }
     if (e) {
+        /* Re-check every level the entry holds, not only those asked for:
+         * its fingerprint covers them all. */
+        bytes = tc_extent(t, e->levels);
         if (e->gen != gen
                 || surf_written_since(t->offset, t->offset + bytes) > e->wseq) {
             uint64_t fp = tc_fingerprint(t, bytes);
