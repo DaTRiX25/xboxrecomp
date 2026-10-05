@@ -62,6 +62,8 @@ static ID3D11DeviceContext    *s_ctx;
 static IDXGISwapChain         *s_swap;
 static ID3D11Texture2D        *s_back;
 static UINT                    s_back_w, s_back_h;
+/* The swap chain size init() created, before any WM_SIZE resize. */
+static UINT                    s_made_w, s_made_h;
 /* Present (E1, nv2a_host_opts): the client size WM_SIZE last reported (0 =
  * none since init); the back buffer's view, made for the scaling blit only;
  * whether the frame being dumped is the present RT rather than the back
@@ -434,8 +436,8 @@ static int init(void)
         return 0;
     }
     IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&s_back);
-    s_back_w = bw;
-    s_back_h = bh;
+    s_back_w = s_made_w = bw;
+    s_back_h = s_made_h = bh;
 
     s_cb_consts = make_buffer(NV2A_VSH_CONSTANTS * 16, D3D11_BIND_CONSTANT_BUFFER);
     s_cb_vp     = make_buffer(80, D3D11_BIND_CONSTANT_BUFFER);
@@ -2746,6 +2748,10 @@ static void dump_back_buffer(const char *path)
 
     if (s_dump_rt && s_drawn && s_drawn->tex)
         src = s_drawn->tex;
+    if (!src) {
+        /* No back buffer after a failed resize (d3d11_on_flip said so). */
+        return;
+    }
     ID3D11Texture2D_GetDesc(src, &td);
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;
@@ -3042,20 +3048,23 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (s_drawn) {
         static int said;
         const struct nv2a_host_opts *eo = nv2a_host_opts();
-        /* Stock: the frame as the guest drew it, a copy into an unresized
-         * 640x480 back buffer (whole or, for another size, its overlap). */
+        /* Stock: the frame as the guest drew it, a copy into the unresized
+         * windowed back buffer (whole or, for another size, its overlap). */
         int stock = nv2a_host_render_scale() == 1
                  && eo->present_filter == NV2A_PRESENT_NEAREST
-                 && s_back_w == 640 && s_back_h == 480;
-        if (!said++)
-            fprintf(stderr, LOGP "first present: back buffer %ux%u, frame %ux%u"
-                    " (%ux%u host), %s\n", s_back_w, s_back_h, s_drawn->w, s_drawn->h,
-                    s_drawn->hw, s_drawn->hh, stock ? "copy" : "scaling blit");
-        if (!stock && !(s_drawn->hw == s_back_w && s_drawn->hh == s_back_h
-                        && eo->present_filter != NV2A_PRESENT_LINEAR)) {
+                 && !eo->fullscreen
+                 && s_back_w == s_made_w && s_back_h == s_made_h;
+        int same = s_drawn->hw == s_back_w && s_drawn->hh == s_back_h;
+        int blit = !stock && !(same && eo->present_filter != NV2A_PRESENT_LINEAR);
+        if (!s_back) {
+            /* A failed ResizeBuffers/GetBuffer left no back buffer. */
+            static int said_nb;
+            if (!said_nb++)
+                fprintf(stderr, LOGP "no back buffer (resize failed): frame not shown\n");
+        } else if (blit) {
             present_blit(s_drawn, eo->present_filter);
             s_dump_rt = 1;
-        } else if (s_drawn->hw == s_back_w && s_drawn->hh == s_back_h) {
+        } else if (same) {
             ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_back,
                                              (ID3D11Resource *)s_drawn->tex);
         } else {
@@ -3070,6 +3079,11 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                 s_ctx, (ID3D11Resource *)s_back, 0, 0, 0, 0,
                 (ID3D11Resource *)s_drawn->tex, 0, &b);
         }
+        if (s_back && !said++)
+            fprintf(stderr, LOGP "first present: back buffer %ux%u, frame %ux%u"
+                    " (%ux%u host), %s\n", s_back_w, s_back_h, s_drawn->w, s_drawn->h,
+                    s_drawn->hw, s_drawn->hh,
+                    blit ? "scaling blit" : same ? "copy" : "overlap copy");
     }
     s_presents++;
     dump_frame();
