@@ -2659,6 +2659,14 @@ static void kernel_vblank_arm_ack(void)
     SetEvent(g_vbl_ack_event);
 }
 
+/* Vblanks raised since start, for the field pin (xbox_PortIn, port 0x80C0). */
+static volatile LONG g_vblank_total;
+
+uint32_t xbox_VblankCount(void)
+{
+    return (uint32_t)g_vblank_total;
+}
+
 /* Vblank N is due at t0 + N * 1000 / 60 ms: an absolute schedule, so the
  * rate is 60 Hz however coarse the caller's tick. It used to be "now + 16"
  * checked on a 10 ms tick, which fired every 20 ms -- 50 Hz -- and the movie's
@@ -2668,13 +2676,6 @@ static void kernel_vblank_arm_ack(void)
  *
  * Returns the milliseconds until the next one is due (10 when disabled), so
  * the timer thread can sleep exactly that long. */
-static volatile LONG g_vblank_total;
-
-uint32_t xbox_VblankCount(void)
-{
-    return (uint32_t)g_vblank_total;
-}
-
 static long kernel_vblank_tick(void)
 {
     static int enabled = -1;

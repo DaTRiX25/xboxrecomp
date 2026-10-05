@@ -1181,6 +1181,8 @@ uint32_t xbox_PortIn(uint32_t port, int width)
         uint32_t n = xbox_VblankCount();
         if (!n)
             n = (uint32_t)InterlockedIncrement(&reads);
+        /* Which parity reads as odd is not verified against hardware;
+         * D3D and the XMV player only need the field to alternate. */
         v = (n & 1u) << 5;
         return v;
     }
