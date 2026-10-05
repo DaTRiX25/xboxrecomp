@@ -141,6 +141,8 @@ is stock. One line shows the values in force:
   Render-to-texture samples the scaled target (supersampled). The frame the
   guest sees is still guest-sized: Metal box-filters its write-back to
   guest memory, so `RECOMP_FB_DUMP` and `fb_dump_at` frames stay 640x480.
+  The box filter averages the stored (gamma-encoded) values, not linear
+  light, the same as xemu's downscale.
   Visibility-test counts are divided by N squared before the title reads
   them, a non-zero count staying non-zero. The window gets the full-size
   frame. The CPU rasteriser draws into guest memory at the guest pitch, so
