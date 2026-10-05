@@ -45,6 +45,7 @@
 #include "nv2a_backend_common.h"
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
+#include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
 
 #define LOGP "[d3d11] "
 
@@ -3040,6 +3041,14 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (!init())
         return;
     pump();
+    {
+        /* This window is not fb_present.c's, whose thread keeps the title
+         * bar's FPS and draws; refresh ours from the same counts. */
+        static uint32_t t0, f0;
+        wchar_t tb[128];
+        if (xbox_FramebufferWindowTitleText(tb, 128, &t0, &f0))
+            SetWindowTextW(s_hwnd, tb);
+    }
     if (s_occ.ops)
         nv2a_occ_poll(&s_occ, 0);
     present_resize();
