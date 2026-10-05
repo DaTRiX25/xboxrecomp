@@ -507,18 +507,23 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * descriptor where the driver never looked, and it reset the port and asked
  * again, forever.
  *
- * The contiguous allocator here is a first-fit page allocator (frees and
- * reuses pages), so its page map is asked first, in the order mcpx_apu_phys
- * (apu_core.c) uses: a page it handed out -- or the reserved page 0, where
- * XPP keeps its private arena -- is the window, even inside the image's
- * physical range; then the image; then the high-water mark, for a page that
- * was contiguous memory once and has since been freed. */
+ * The image therefore comes first. The contiguous allocator here does hand
+ * out physical numbers inside the image's range (its window is separate
+ * storage, so nothing collides there), and asking its page map first, as
+ * mcpx_apu_phys (apu_core.c) does, sent 0x0041A904 to the window again:
+ * Burnout 3's boot allocates 0x803E7000..0x805E7000 before XPP enumerates,
+ * so page 0x41A is "contiguous", and enumeration retried the descriptor for
+ * ever with the pad never attached. Outside the image the page map is asked
+ * next: a page the first-fit allocator handed out -- or the reserved page 0,
+ * where XPP keeps its private arena -- is the window; then the high-water
+ * mark, for a page that was contiguous memory once and has since been
+ * freed. */
 static uint32_t bus_resolve(uint32_t addr)
 {
-    if (addr && addr < (64u << 20) && xbox_ContiguousPageMap()[addr >> 12])
-        return OHCI_CONTIG_BASE + addr;
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
+    if (addr && addr < (64u << 20) && xbox_ContiguousPageMap()[addr >> 12])
+        return OHCI_CONTIG_BASE + addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())
         return OHCI_CONTIG_BASE + addr;
     return addr;

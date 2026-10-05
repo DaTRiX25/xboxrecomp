@@ -1134,3 +1134,72 @@ uint64_t xbox_ReadTimeStampCounter(void)
              + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
     }
 }
+
+/* =========================================================================
+ * x86 port I/O
+ *
+ * The lifter turns `in`/`out` into these. The MCPX decodes I/O space: its
+ * ACPI/PM block sits at 0x8000 and SMBus at 0xC000, and the kernel exports
+ * cover SMBus, so a title touches ports directly only for the odd pin.
+ *
+ * 0x80C0 is the first GPIO register of the ACPI block. Bit 5 is the field pin
+ * of the video encoder: D3D's vblank ISR stores !bit5 in [device+0x1DF8], and
+ * D3DDevice_GetDisplayFieldStatus reports D3DFIELD_ODD while that is set.
+ * Interlaced output alternates fields every vblank, so the pin follows the
+ * parity of the vblank count. A constant answer says "odd field" for ever,
+ * and the XDK's XMV player only starts its clock on an even one: Burnout 3's
+ * EA intro waited on its loading screen indefinitely.
+ *
+ * Without vblanks (RECOMP_VBLANK off) the count stays 0, so the pin toggles
+ * per read instead; then it at least alternates.
+ *
+ * Every other port reads 0 and is logged on first use, once per port.
+ * ========================================================================= */
+static int port_first_use(uint32_t port, int is_out)
+{
+    static uint32_t seen[32];
+    static volatile LONG nseen;
+    uint32_t key = (port & 0xFFFFu) | (is_out ? 0x10000u : 0u);
+    LONG i, n = nseen;
+
+    for (i = 0; i < n && i < 32; i++)
+        if (seen[i] == key)
+            return 0;
+    i = InterlockedIncrement(&nseen) - 1;
+    if (i < 32)
+        seen[i] = key;
+    return i < 32;
+}
+
+uint32_t xbox_PortIn(uint32_t port, int width)
+{
+    uint32_t v = 0;
+
+    port &= 0xFFFFu;
+    if (port == 0x80C0u) {
+        static volatile LONG reads;
+        uint32_t n = xbox_VblankCount();
+        if (!n)
+            n = (uint32_t)InterlockedIncrement(&reads);
+        /* Which parity reads as odd is not verified against hardware;
+         * D3D and the XMV player only need the field to alternate. */
+        v = (n & 1u) << 5;
+        return v;
+    }
+    if (port_first_use(port, 0)) {
+        fprintf(stderr, "  [PORT] in%c 0x%04X -> 0 (not modelled)\n",
+                width == 1 ? 'b' : width == 2 ? 'w' : 'd', port);
+        fflush(stderr);
+    }
+    return v;
+}
+
+void xbox_PortOut(uint32_t port, uint32_t value, int width)
+{
+    port &= 0xFFFFu;
+    if (port_first_use(port, 1)) {
+        fprintf(stderr, "  [PORT] out%c 0x%04X = 0x%X (ignored)\n",
+                width == 1 ? 'b' : width == 2 ? 'w' : 'd', port, value);
+        fflush(stderr);
+    }
+}

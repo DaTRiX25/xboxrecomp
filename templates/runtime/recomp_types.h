@@ -391,6 +391,12 @@ void recomp_icall_not_code_log(uint32_t va);
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
 
+/* x86 port I/O (`in`/`out`). width is 1, 2 or 4 bytes. The runtime models
+ * the ports titles are known to read (the field pin at 0x80C0) and logs the
+ * first access to any other. */
+uint32_t xbox_PortIn(uint32_t port, int width);
+void     xbox_PortOut(uint32_t port, uint32_t value, int width);
+
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);

@@ -61,8 +61,15 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
-/* Physical addresses, resolved the way every other bus master here does it
- * (dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c).
+/* Physical addresses, resolved much as the other bus masters here do it
+ * (dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c) -- but not in
+ * the same order. The contiguous allocator hands out physical numbers inside
+ * the image's range, so a page there can be both an image page and a window
+ * page. The APU asks the page map first (below: BLiNX 2's voice array is
+ * contiguous memory inside its image). The OHCI asks the image first:
+ * Burnout 3's XPP reads its first descriptor into .data at 0x0041A904, a
+ * page the boot has also allocated as contiguous memory, and the window copy
+ * is not where the driver looks.
  *
  * DirectSound builds its voice, SGE and notifier structures in
  * MmAllocateContiguousMemory and hands the APU their physical addresses.
@@ -103,7 +110,8 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
         return g_apu_ram_ptr + (a & 0x03FFFFFFu);
     }
     /* A page the contiguous allocator handed out is the window, even where
-     * it overlaps the image's physical range: BLiNX 2's image runs to
+     * it overlaps the image's physical range (the OHCI resolves the other
+     * way round; see the comment above this function): BLiNX 2's image runs to
      * 0x0303AC20 (its BSS), and DirectSound's voice array sits at physical
      * 0x009E8000, inside it. Resolved to RAM, the VP never saw the driver
      * take an idle voice off its list and re-trapped it every frame. */

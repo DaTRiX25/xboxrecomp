@@ -2659,6 +2659,14 @@ static void kernel_vblank_arm_ack(void)
     SetEvent(g_vbl_ack_event);
 }
 
+/* Vblanks raised since start, for the field pin (xbox_PortIn, port 0x80C0). */
+static volatile LONG g_vblank_total;
+
+uint32_t xbox_VblankCount(void)
+{
+    return (uint32_t)g_vblank_total;
+}
+
 /* Vblank N is due at t0 + N * 1000 / 60 ms: an absolute schedule, so the
  * rate is 60 Hz however coarse the caller's tick. It used to be "now + 16"
  * checked on a 10 ms tick, which fired every 20 ms -- 50 Hz -- and the movie's
@@ -2692,6 +2700,7 @@ static long kernel_vblank_tick(void)
         count = 0;
     }
     count++;
+    InterlockedIncrement(&g_vblank_total);
     {
         /* One line per 600 vblanks: should read ~10000 ms. Also the
          * shortest and longest gap between two, by the performance counter
