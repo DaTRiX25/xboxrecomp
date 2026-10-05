@@ -124,6 +124,11 @@ int main(void)
     CHECK(nv2a_occ_scale_count(6, 2) == 2);          /* 1.5 rounds up */
     CHECK(nv2a_occ_scale_count(4000, 2) == 1000);
     CHECK(nv2a_occ_scale_count(9 * 307200ull, 3) == 307200);
+    CHECK(nv2a_occ_scale_count(4, 3) == 1);          /* (4+4)/9 rounds to 0 */
+    for (uint64_t n = 1; n <= 8; n++)
+        CHECK(nv2a_occ_scale_count(n, 3) != 0);
+    for (uint64_t n = 1; n <= 15; n++)
+        CHECK(nv2a_occ_scale_count(n, 4) != 0);
     CHECK(nv2a_occ_scale_count(0x400000000ull, 1) == 0xFFFFFFFFu);
     CHECK(nv2a_occ_scale_count(0x400000000ull, 2) == 0xFFFFFFFFu);
     CHECK(nv2a_occ_scale_count(0x400000000ull, 4) == 0x40000000u);

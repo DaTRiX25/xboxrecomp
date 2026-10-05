@@ -378,8 +378,11 @@ uint32_t nv2a_occ_scale_count(uint64_t samples, unsigned scale)
 {
     if (scale > 1 && samples) {
         uint64_t d = (uint64_t)scale * scale;
-        /* A few samples of a sliver still mean "visible". */
-        samples = samples < d / 2 ? 1 : (samples + d / 2) / d;
+        /* Rounded to nearest; a few samples of a sliver still mean
+         * "visible", so a non-zero count never rounds to 0. */
+        samples = (samples + d / 2) / d;
+        if (!samples)
+            samples = 1;
     }
     return samples > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)samples;
 }
