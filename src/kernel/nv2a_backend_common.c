@@ -53,6 +53,46 @@ uint64_t nv2a_tex_hash(const uint8_t *p, uint32_t n, uint64_t h)
     return (l[0] ^ (l[1] << 1) ^ (l[2] << 2) ^ (l[3] << 3)) * 0x100000001B3ull;
 }
 
+static _Atomic uint64_t s_rt_hashes;
+
+static uint64_t rt_own_hash(const uint8_t *mem, uint32_t addr, uint32_t pitch, uint32_t h)
+{
+    /* The end of the window addr lies in; an address in neither (a test's
+     * own surface) is read as the seed and a write-back would read it. */
+    uint64_t top = addr >= NV2A_RT_CONTIG_BASE
+                       ? (uint64_t)NV2A_RT_CONTIG_BASE + NV2A_RT_CONTIG_SIZE
+                 : addr < NV2A_RT_WINDOW ? NV2A_RT_WINDOW : 0x100000000ull;
+    uint64_t n = (uint64_t)pitch * h;
+    if (n > top - addr)
+        n = top - addr;
+    atomic_fetch_add_explicit(&s_rt_hashes, 1, memory_order_relaxed);
+    return nv2a_tex_hash(mem + addr, (uint32_t)n, NV2A_TEX_HASH_SEED);
+}
+
+void nv2a_rt_own_reset(struct nv2a_rt_own *o, const uint8_t *mem, uint32_t addr,
+                       uint32_t pitch, uint32_t h, uint32_t flip)
+{
+    o->mem_hash = rt_own_hash(mem, addr, pitch, h);
+    /* Knowledge of this instant, not a check for the flip: a title write
+     * later in the same flip (a CPU fill before its next draw) must still
+     * be seen by the next check. */
+    o->checked_flip = flip - 1u;
+}
+
+int nv2a_rt_own_stale(struct nv2a_rt_own *o, const uint8_t *mem, uint32_t addr,
+                      uint32_t pitch, uint32_t h, uint32_t flip)
+{
+    if (o->draw_flip == flip || o->checked_flip == flip)
+        return 0;
+    o->checked_flip = flip;
+    return rt_own_hash(mem, addr, pitch, h) != o->mem_hash;
+}
+
+uint64_t nv2a_rt_own_hashes(void)
+{
+    return atomic_load_explicit(&s_rt_hashes, memory_order_relaxed);
+}
+
 size_t nv2a_tex_texels(uint32_t w, uint32_t h, uint32_t levels)
 {
     size_t n = 0;

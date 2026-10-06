@@ -263,6 +263,7 @@ typedef struct {
     uint32_t       pitch;      /* the guest pitch it was made with */
     int            dirty;      /* drawn since its last write-back */
     int            presented;  /* ever picked by present_target */
+    struct nv2a_rt_own own;    /* is the guest memory under it still its own */
 } RenderTarget;
 
 static RenderTarget  s_rt[RT_MAX];
@@ -271,6 +272,7 @@ static DepthTarget  *s_enc_dt;   /* and its depth attachment, or NULL */
 static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
+static uint64_t      s_stale_drops, s_retired;
 
 /* Visibility tests (see "Visibility tests" below): the slot counting on the
  * open pass, opened by begin_pass and closed here. */
@@ -291,7 +293,7 @@ static int s_prof = -1;
 static id<MTLCommandBuffer> s_prof_cmd[PROF_CMDS];
 static int s_prof_ncmd;
 static struct {
-    uint64_t n, flip, wait, gpu, hostrb, wb, winrb, winpush, blit, ncmd;
+    uint64_t n, flip, wait, gpu, hostrb, wb, winrb, winpush, blit, ncmd, hash;
 } s_pa;
 
 /* The last committed command buffer: a sync between flips waits for it when
@@ -391,6 +393,7 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     end_encoder();
     ensure_cmd();
     rt->dirty = 1;
+    nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = rt->tex;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -505,11 +508,76 @@ static int init(void)
 /* ---- surfaces --------------------------------------------------------------- */
 
 static void rt_sync(RenderTarget *rt, uint32_t pitch);
+static void rt_free(RenderTarget *rt);
+
+/* ---- render-target ownership (nv2a_backend_common.h) -------------------------
+ *
+ * A target is the title's surface only while the guest memory under it holds
+ * what the backend last knew there. A title that frees a target's memory and
+ * loads something else into it (BLiNX 2's hub leaves two 512x512 targets
+ * whose megabytes stage 1 refills with textures and tables) would otherwise
+ * get the old image sampled in place of its texels, or written back over
+ * them. A stale target is dropped without a write-back. A/B:
+ * RECOMP_DEBUG=rt_alias_check=0. */
+static int alias_check_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_RT_ALIAS_CHECK);
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static void rt_own_reset(RenderTarget *rt)
+{
+    uint64_t t;
+    if (!alias_check_on() || !rt->pitch)
+        return;
+    guard_open();   /* our own read, not a title read */
+    t = prof_t();
+    nv2a_rt_own_reset(&rt->own, (const uint8_t *)xbox_GetMemoryOffset(), rt->addr,
+                      rt->pitch, rt->h, (uint32_t)s_presents);
+    prof_add(&s_pa.hash, t);
+}
+
+/* Drop rt when the title has rewritten its memory; 1 if it was dropped.
+ * `why` names the caller for the log: bind, sync, evict, overlap, reuse. */
+static int rt_drop_if_stale(RenderTarget *rt, const char *why)
+{
+    static int said;
+    uint64_t t;
+    int stale;
+
+    if (!alias_check_on() || !rt->tex || !rt->pitch)
+        return 0;
+    guard_open();
+    t = prof_t();
+    stale = nv2a_rt_own_stale(&rt->own, (const uint8_t *)xbox_GetMemoryOffset(), rt->addr,
+                              rt->pitch, rt->h, (uint32_t)s_presents);
+    prof_add(&s_pa.hash, t);
+    if (!stale)
+        return 0;
+    s_stale_drops++;
+    if (said < 20 || recomp_env(RENV_METAL_TRACE)) {
+        said++;
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target dropped (%s): the title"
+                " rewrote its %u bytes; last drawn at flip %u, now %llu%s\n",
+                rt->offset, rt->w, rt->h, why, rt->pitch * rt->h, rt->own.draw_flip,
+                (unsigned long long)s_presents, said == 20 ? " (further drops: the"
+                " present summary)" : "");
+    }
+    rt->dirty = 0;   /* the title's bytes win: no write-back */
+    rt_free(rt);
+    return 1;
+}
 
 static void rt_free(RenderTarget *rt)
 {
     /* A presented target's bytes are what a new target at that surface seeds
      * from, as when every flip wrote it back; off-screen ones never were. */
+    if (rt->dirty && rt->presented && rt_drop_if_stale(rt, "evict"))
+        return;
     if (rt->dirty && rt->presented)
         rt_sync(rt, rt->pitch);
     if (s_enc_rt == rt)
@@ -588,9 +656,36 @@ static RenderTarget *surface(void)
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (rt->tex && rt->offset == g->color_offset && rt->w == w && rt->h == h) {
+            /* First use this flip of a target the title may have rewritten:
+             * a stale one is made again from the title's bytes, which the
+             * GPU would draw over. */
+            if (rt_drop_if_stale(rt, "reuse"))
+                break;
             rt->last_use = s_tick;
             return rt;
         }
+    }
+    /* No two live targets share memory: one the new target overlaps is
+     * written back first (the seed below then reads what was drawn) or,
+     * if the title rewrote it, dropped. */
+    if (alias_check_on()) {
+        uint32_t addr = nv2a_pb_dma_resolve(g->color_offset);
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            if (!rt->tex || !nv2a_rt_overlap(rt->addr, rt->pitch * rt->h, addr, g->pitch * h))
+                continue;
+            if (rt_drop_if_stale(rt, "overlap"))
+                continue;
+            rt_sync(rt, rt->pitch);
+            if (s_retired++ < 20)
+                fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target retired:"
+                        " 0x%08X %ux%u overlaps it\n", rt->offset, rt->w, rt->h,
+                        g->color_offset, w, h);
+            rt_free(rt);
+        }
+    }
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
         if (!rt->tex && !free_rt)
             free_rt = rt;
         if (rt->last_use < lru->last_use)
@@ -621,6 +716,7 @@ static RenderTarget *surface(void)
     free_rt->hh = hh;
     free_rt->pitch = g->pitch;
     free_rt->last_use = s_tick;
+    rt_own_reset(free_rt);   /* the bytes the seed reads, or would */
     if (g->pitch >= w * 4u) {
         const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset()
                            + nv2a_pb_dma_resolve(g->color_offset);
@@ -989,7 +1085,15 @@ static id<MTLTexture> tex_bind(const Stage *t)
             uint32_t rlo = rt->addr & 0x07FFFFFFu;
             if (rt->tex && rt->dirty && rt->pitch
                     && lo < rlo + rt->pitch * rt->h && rlo < hi) {
+                if (rt_drop_if_stale(rt, "sync"))
+                    continue;
                 s_decode_syncs++;
+                if (recomp_env(RENV_METAL_TRACE))
+                    fprintf(stderr, LOGP "decode sync: target 0x%08X %ux%u (%u bytes) for"
+                            " texture 0x%08X fmt 0x%02X %ux%u (%u bytes), flip %llu\n",
+                            rt->offset, rt->w, rt->h, rt->pitch * rt->h, t->offset,
+                            t->color, t->width, t->height, bytes,
+                            (unsigned long long)s_presents);
                 rt_sync(rt, rt->pitch);
             }
         }
@@ -1393,6 +1497,8 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
         RenderTarget *rt = &s_rt[i];
         if (!rt->tex || ((rt->addr ^ t->offset) & 0x07FFFFFFu))
             continue;
+        if (rt_drop_if_stale(rt, "bind"))
+            continue;   /* the texture decodes from the title's bytes */
         if (rt == cur) {
             self = rt;
             continue;
@@ -1821,6 +1927,7 @@ static void rt_sync(RenderTarget *rt, uint32_t pitch)
         else if ((px = host_readback(rt)) != NULL)
             write_back_scaled(rt, px, rt->addr, pitch);
         rt->dirty = 0;
+        rt_own_reset(rt);
     }
 }
 
@@ -1847,7 +1954,7 @@ static void metal_sync_guest(uint32_t offset, uint32_t pitch, uint32_t w, uint32
                 rt = c;
         }
     }
-    if (rt)
+    if (rt && !rt_drop_if_stale(rt, "sync"))
         rt_sync(rt, pitch);
 }
 
@@ -2325,13 +2432,14 @@ static void prof_flip_end(uint64_t t_flip0)
         double n = (double)s_pa.n;
         fprintf(stderr, LOGP "prof %llu flips: on_flip %.3f ms = wait %.3f + hostrb %.3f"
                 " + wb %.3f + winrb %.3f + winpush %.3f + blit %.3f (+rest); gpu %.3f ms"
-                " over %.1f cmd buffers/flip; %llu write-backs, %llu decode syncs\n",
+                " over %.1f cmd buffers/flip; %llu write-backs, %llu decode syncs;"
+                " rt ownership hashes %.3f ms/flip\n",
                 (unsigned long long)s_presents,
                 s_pa.flip / n / 1e6, s_pa.wait / n / 1e6, s_pa.hostrb / n / 1e6,
                 s_pa.wb / n / 1e6, s_pa.winrb / n / 1e6, s_pa.winpush / n / 1e6,
                 s_pa.blit / n / 1e6, s_pa.gpu / n / 1e6, s_pa.ncmd / n,
                 (unsigned long long)(s_writebacks - p_wb),
-                (unsigned long long)(s_decode_syncs - p_ds));
+                (unsigned long long)(s_decode_syncs - p_ds), s_pa.hash / n / 1e6);
         p_wb = s_writebacks;
         p_ds = s_decode_syncs;
         memset(&s_pa, 0, sizeof s_pa);
@@ -2400,6 +2508,8 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                     write_back_scaled(rt, hpx, addr, pitch);
                 rt->dirty = 0;
                 prof_add(&s_pa.wb, t);
+                if (addr == rt->addr && pitch == rt->pitch)
+                    rt_own_reset(rt);
             }
         }
     }
@@ -2409,7 +2519,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (%s), %llu clears,"
                 " %llu draws (%llu vertex-program), %llu skipped, %llu culled,"
                 " %llu texture uploads, %llu rehashes, %llu write-backs (%s),"
-                " %llu decode syncs;"
+                " %llu decode syncs, %llu stale drops;"
                 " shaders %llu vs + %llu fs, %llu compile errors;"
                 " %llu z-clears, %llu depth draws, %llu rt binds (%llu self copies);"
                 " %llu window presents (%s); %llu flushes,"
@@ -2421,7 +2531,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_draws_culled,
                 (unsigned long long)s_tex_uploads, (unsigned long long)s_tex_rehash,
                 (unsigned long long)s_writebacks, always ? "always" : "lazy",
-                (unsigned long long)s_decode_syncs,
+                (unsigned long long)s_decode_syncs, (unsigned long long)s_stale_drops,
                 (unsigned long long)s_vs_compiled, (unsigned long long)s_fs_compiled,
                 (unsigned long long)s_compile_errors,
                 (unsigned long long)s_zclears, (unsigned long long)s_draws_z,

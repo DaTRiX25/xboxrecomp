@@ -9,6 +9,9 @@
  * through four register-combiner stages with the title's final combiner,
  * three overlapping quads with depth tests, and a stencil mask, and a
  * mipmapped texture drawn at three sizes.
+ * Then render-target ownership (rt-stale-alias): a target whose guest
+ * memory the title rewrote from the CPU is sampled as the new texels, and
+ * one left alone still as its rendered image.
  * With RECOMP_PB_BACKEND=d3d11 that reaches ClearRenderTargetView, a draw
  * and Present in src/d3d/nv2a_pb_d3d11.c.
  *
@@ -27,6 +30,7 @@
 #include "../kernel/nv2a_pb_state.h"
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+uint32_t nv2a_pb_d3d11_pixel(uint32_t offset, int x, int y);
 
 /* The kernel library expects these from the title's generated code. */
 void *recomp_lookup(ULONG address) { (void)address; abort(); }
@@ -74,10 +78,17 @@ static void vertex_z(float x, float y, float z, uint32_t argb)
 /* Guest memory for the texture: the runtime's memory offset is 0 here, so a
  * guest address is a host address, and it has to fit in 32 bits. */
 #define TEX_GUEST 0x10000000u
-#define OFFSCREEN 0x01800000u   /* a 320x240 render target */
+/* The surfaces: two 640x480 buffers and a 320x240 render target
+ * (OFFSCREEN) at SURF_BASE + 0x800000, all committed, since the backend
+ * reads the guest bytes under a target. 16 MB, or a higher block when Wine
+ * already uses that range. */
+static uint32_t s_surf_base = 0x01000000u;
+#define OFFSCREEN (s_surf_base + 0x00800000u)
 #define P8_GUEST  (TEX_GUEST + 0x8000u)
 #define PAL_GUEST (TEX_GUEST + 0x9000u)
 #define MIP_GUEST (TEX_GUEST + 0xA000u)  /* 32x32 A8R8G8B8, 6 levels */
+#define RTT_A     0x10100000u   /* 64x64 render-to-texture targets, pitch 256 */
+#define RTT_B     0x10110000u
 #define TEX_LOG2  6                            /* 64x64 */
 /* Four 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
  * the first free 64 KB below 16 MB. */
@@ -165,11 +176,89 @@ static int make_texture(void)
     return 1;
 }
 
+/* A 32-bit surface at buf, w x h, pitch w * 4, cleared to argb. */
+static void surf_clear(uint32_t buf, uint32_t w, uint32_t h, uint32_t argb)
+{
+    M(0x0200, w << 16);
+    M(0x0204, h << 16);
+    M(0x0208, 0x00000128u);
+    M(0x020C, w * 4u);
+    M(0x0210, buf);
+    M(0x0214, 0x02400000u);
+    M(0x1B0C, 0);
+    M(0x1D90, argb);
+    M(0x1D94, 0xF0);
+}
+
+/* buf (640x480) with a quad at (100,100)-(164,164) sampling the 64x64
+ * linear A8R8G8B8 texture at tex; returns the quad's centre, then flips. */
+static uint32_t sample_rtt(uint32_t buf, uint32_t other, uint32_t tex)
+{
+    static const float uv[4][2] = {{0, 0}, {64, 0}, {64, 64}, {0, 64}};
+    uint32_t c;
+    int a, k;
+
+    surf_clear(buf, 640, 480, 0xFF0000FFu);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : a == 9 ? 0x22u : 0x02u);
+    M(0x1B00, tex);
+    M(0x1B04, (0x12u << 8) | (1u << 4) | (2u << 0));
+    M(0x1B08, 0x00000303u);
+    M(0x1B0C, 0x40000000u);
+    M(0x1B10, 256u << 16);
+    M(0x1B1C, (64u << 16) | 64u);
+    M(0x17FC, 8);
+    for (k = 0; k < 4; k++)
+        vertex_uv(k == 1 || k == 2 ? 164.0f : 100.0f, k >= 2 ? 164.0f : 100.0f,
+                  0xFFFFFFFFu, uv[k]);
+    M(0x17FC, 0);
+    M(0x1B0C, 0);
+    M(0x1760 + 4 * 9, 0x02u);
+    c = nv2a_pb_d3d11_pixel(buf, 132, 132);
+    M(0x0210, other);
+    M(0x0130, 0);
+    return c;
+}
+
+/* Render-target ownership; returns the failures. */
+static int alias_cases(const uint32_t *buf)
+{
+    uint32_t c, i;
+    int f = 0;
+
+    if (!VirtualAlloc((void *)(uintptr_t)RTT_A, 0x20000, MEM_RESERVE | MEM_COMMIT,
+                      PAGE_READWRITE)) {
+        fprintf(stderr, "[backend-smoke] rt alias: no memory at 0x%08X\n", RTT_A);
+        return 1;
+    }
+    /* Drawn red, then the title writes green over its memory. */
+    surf_clear(RTT_A, 64, 64, 0xFFFF0000u);
+    surf_clear(buf[0], 640, 480, 0xFF000000u);
+    M(0x0210, buf[1]);
+    M(0x0130, 0);
+    for (i = 0; i < 64 * 64; i++)
+        ((uint32_t *)(uintptr_t)RTT_A)[i] = 0xFF00FF00u;
+    c = sample_rtt(buf[0], buf[1], RTT_A);
+    fprintf(stderr, "[backend-smoke] rt alias: rewritten target samples 0x%08X (want"
+            " 0xFF00FF00) %s\n", c, c == 0xFF00FF00u ? "PASS" : "FAIL");
+    f += c != 0xFF00FF00u;
+    /* Drawn red and left alone: render-to-texture as before. */
+    surf_clear(RTT_B, 64, 64, 0xFFFF0000u);
+    surf_clear(buf[0], 640, 480, 0xFF000000u);
+    M(0x0210, buf[1]);
+    M(0x0130, 0);
+    c = sample_rtt(buf[0], buf[1], RTT_B);
+    fprintf(stderr, "[backend-smoke] rt alias: untouched target samples 0x%08X (want"
+            " 0xFFFF0000) %s\n", c, c == 0xFFFF0000u ? "PASS" : "FAIL");
+    f += c != 0xFFFF0000u;
+    return f;
+}
+
 int main(int argc, char **argv)
 {
     const char *log = recomp_env(RENV_STDIO_LOG);
     int frames = argc > 1 ? atoi(argv[1]) : 180;
-    uint32_t buf[2] = {0x01000000u, 0x0112C000u};
+    uint32_t buf[2];
     int f, a;
 
     if (log)
@@ -214,6 +303,22 @@ int main(int argc, char **argv)
         fprintf(stderr, "[backend-smoke] no report memory below 16 MB\n");
     if (!make_texture())
         fprintf(stderr, "[backend-smoke] no texture memory at 0x%08X\n", TEX_GUEST);
+    {
+        static const uint32_t bases[] = {0x01000000u, 0x12000000u, 0x22000000u, 0x32000000u};
+        unsigned i;
+        for (i = 0; i < sizeof bases / sizeof bases[0]; i++)
+            if (VirtualAlloc((void *)(uintptr_t)bases[i], 0x900000, MEM_RESERVE | MEM_COMMIT,
+                             PAGE_READWRITE))
+                break;
+        if (i == sizeof bases / sizeof bases[0]) {
+            fprintf(stderr, "[backend-smoke] FAIL: no 9 MB block for the surfaces\n");
+            return 1;
+        }
+        s_surf_base = bases[i];
+        buf[0] = s_surf_base;
+        buf[1] = s_surf_base + 0x12C000u;
+        fprintf(stderr, "[backend-smoke] surfaces at 0x%08X\n", s_surf_base);
+    }
 
     for (f = 0; f < frames; f++) {
         float t = (float)(f % 120) / 120.0f;
@@ -664,6 +769,10 @@ int main(int argc, char **argv)
                     " ran\n");
             return 2;
         }
+    }
+    if (alias_cases(buf)) {
+        fprintf(stderr, "[backend-smoke] FAIL: render-target ownership\n");
+        return 3;
     }
     fprintf(stderr, "[backend-smoke] done\n");
     return 0;

@@ -19,6 +19,13 @@
  * flip, so it needs its own process): a read of the present surface after a
  * lazy flip switches the run to writing back at every flip.
  *
+ * Then render-target ownership (rt-stale-alias, Metal): a target the title
+ * rewrote from the CPU samples the new texels and is not written back; one
+ * left alone still samples its rendered image; a new target overlapping a
+ * dirty one writes that one back first and seeds from it. With the argument
+ * "noalias" the same cases run under rt_alias_check=0 and the first must
+ * fail, which shows the cases catch the stale target.
+ *
  * Scenes:
  *   clear_quad   colour clear + a solid quad (pre-transformed, INLINE_ARRAY)
  *   checker      + a swizzled A8R8G8B8 checker, stage 0, wrap addressing
@@ -67,6 +74,8 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define BUF1      0x0112C000u
 #define BUF2      0x01258000u   /* the render.scale 2 case: a new target */
 #define TEX_GUEST 0x02800000u   /* 64x64 swizzled A8R8G8B8, then YUY2 64x32 */
+#define RTT0      0x01400000u   /* 64x64 render-to-texture targets, pitch 256 */
+#define RTT1      0x01500000u
 #define TEX_LOG2  6
 
 static uint8_t *guest(uint32_t va)
@@ -371,6 +380,115 @@ static int writeback_cases(const struct nv2a_pb_backend *b, const uint32_t *ref,
     return f;
 }
 
+/* A 32-bit surface at buf, w x h, pitch w * 4; with `clear`, cleared to argb. */
+static void surf(uint32_t buf, uint32_t w, uint32_t h, int clear, uint32_t argb)
+{
+    M(0x0200, w << 16);
+    M(0x0204, h << 16);
+    M(0x0208, 0x00000128u);
+    M(0x020C, w * 4u);
+    M(0x0210, buf);
+    M(0x0214, 0x02400000u);
+    M(0x0304, 0);
+    M(0x1B0C, 0);
+    if (clear) {
+        M(0x1D90, argb);
+        M(0x1D94, 0xF0);
+    }
+}
+
+/* The present surface drawn, then the flip: the flip count is what tells a
+ * target drawn now from one drawn before. */
+static void flip_buf0(void)
+{
+    surf(BUF0, W, H, 1, 0xFF000000u);
+    M(0x0210, BUF1);
+    M(0x0130, 0);
+}
+
+static uint32_t px_at(uint32_t buf, uint32_t pitch, uint32_t x, uint32_t y)
+{
+    return *(const uint32_t *)(guest(buf) + y * pitch + x * 4u) | 0xFF000000u;
+}
+
+/* BUF0 with a quad at (100,100)-(164,164) sampling the 64x64 linear
+ * A8R8G8B8 texture at tex, then the flip; returns the quad's centre. */
+static uint32_t sample_rtt(const struct nv2a_pb_backend *b, uint32_t tex)
+{
+    static const uint32_t white[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    static const float uv[4][2] = {{0, 0}, {64, 0}, {64, 64}, {0, 64}};
+    const struct nv2a_pb_present *p;
+    int a;
+
+    surf(BUF0, W, H, 1, 0xFF0000FFu);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : a == 9 ? 0x22u : 0x02u);
+    M(0x1B00, tex);
+    M(0x1B04, (0x12u << 8) | (1u << 4) | (2u << 0));   /* linear A8R8G8B8 */
+    M(0x1B08, 0x00000303u);
+    M(0x1B0C, 0x40000000u);
+    M(0x1B10, 256u << 16);
+    M(0x1B1C, (64u << 16) | 64u);
+    quad_uv(100.0f, 100.0f, 164.0f, 164.0f, white, uv);
+    M(0x1B0C, 0);
+    M(0x1760 + 4 * 9, 0x02u);
+    M(0x0210, BUF1);
+    M(0x0130, 0);
+    p = nv2a_pb_present_state();
+    b->sync_guest(p->offset, p->pitch, p->w, p->h);
+    return px_at(BUF0, W * 4u, 132, 132);
+}
+
+/* Render-target ownership. Returns the failures. */
+static int alias_cases(const struct nv2a_pb_backend *b)
+{
+    uint64_t n0;
+    uint32_t i, c;
+    int f = 0;
+
+    nv2a_pb_set_backend(b);
+
+    /* Drawn red, then the title writes green over its memory: the texture
+     * is the green, and the red is never written back over it. */
+    surf(RTT0, 64, 64, 1, 0xFFFF0000u);
+    flip_buf0();
+    for (i = 0; i < 64 * 64; i++)
+        ((uint32_t *)guest(RTT0))[i] = 0xFF00FF00u;
+    n0 = nv2a_pb_metal_writebacks();
+    c = sample_rtt(b, RTT0);
+    f += check(c == 0xFF00FF00u && px_at(RTT0, 256, 10, 10) == 0xFF00FF00u
+               && nv2a_pb_metal_writebacks() == n0 + 1,
+               "rewritten target: the title's texels, no write-back");
+
+    /* Drawn red and left alone: render-to-texture as before. */
+    surf(RTT1, 64, 64, 1, 0xFFFF0000u);
+    flip_buf0();
+    c = sample_rtt(b, RTT1);
+    f += check(c == 0xFFFF0000u, "untouched target: its rendered image");
+
+    /* A 64x32 target over the lower half of the dirty RTT1: RTT1 is written
+     * back first, so the new target's seed is the red RTT1 drew. */
+    surf(RTT1, 64, 64, 1, 0xFF00FFFFu);   /* dirty again, cyan, memory still red */
+    n0 = nv2a_pb_metal_writebacks();
+    {
+        static const uint32_t blue[4] = {0xFF0000FFu, 0xFF0000FFu, 0xFF0000FFu, 0xFF0000FFu};
+        int a;
+        surf(RTT1 + 32u * 256u, 64, 32, 0, 0);
+        for (a = 0; a < 16; a++)
+            M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+        quad_uv(0.0f, 0.0f, 8.0f, 8.0f, blue, NULL);
+    }
+    flip_buf0();
+    b->sync_guest(RTT1 + 32u * 256u, 256, 64, 32);
+    f += check(px_at(RTT1, 256, 10, 10) == 0xFF00FFFFu
+               && px_at(RTT1 + 32u * 256u, 256, 40, 20) == 0xFF00FFFFu
+               && px_at(RTT1 + 32u * 256u, 256, 2, 2) == 0xFF0000FFu
+               && nv2a_pb_metal_writebacks() == n0 + 2,
+               "overlapping target: the old one written back, then seeded");
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+
 /* metal_fb_guard: the surface is PROT_NONE after a lazy flip; a read faults,
  * the next flip reports it and switches to always, and the flip after that
  * writes back. Returns the failures. */
@@ -420,6 +538,7 @@ int main(int argc, char **argv)
     uint32_t *cpu_px, *gpu_px;
     int sc, k = 0, failures = 0;
     int guard = argc > 1 && !strcmp(argv[1], "guard");
+    int noalias = argc > 1 && !strcmp(argv[1], "noalias");
 
     setvbuf(stderr, NULL, _IONBF, 0);
     if (!which)
@@ -451,8 +570,17 @@ int main(int argc, char **argv)
         fprintf(stderr, "[backend-smoke] %s: fb_guard\n", failures ? "FAIL" : "done");
         return failures ? 1 : 0;
     }
+    if (noalias) {
+        /* The cases without the check: the rewritten target must fail. */
+        recomp_env_set(RENV_RT_ALIAS_CHECK, "0");
+        failures = alias_cases(gpu);
+        fprintf(stderr, "[backend-smoke] rt_alias_check=0: %d case(s) fail, as expected"
+                " when at least 1\n", failures);
+        return failures ? 0 : 1;
+    }
 #else
     (void)guard;
+    (void)noalias;
 #endif
 
     for (sc = 0; sc < SC_COUNT; sc++) {
@@ -477,6 +605,10 @@ int main(int argc, char **argv)
         int f = writeback_cases(gpu, cpu_px, gpu_px);
         if (f)
             fprintf(stderr, "[backend-smoke] FAIL: %d write-back checks\n", f);
+        failures += f;
+        f = alias_cases(gpu);
+        if (f)
+            fprintf(stderr, "[backend-smoke] FAIL: %d render-target ownership checks\n", f);
         failures += f;
     }
 #endif

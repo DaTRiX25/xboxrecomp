@@ -205,6 +205,56 @@ static inline void nv2a_tex_mip_levels(int mip, float lod, uint32_t levels,
 #define NV2A_TEX_HASH_SEED 0xCBF29CE484222325ull
 uint64_t nv2a_tex_hash(const uint8_t *p, uint32_t n, uint64_t h);
 
+/* Render-target ownership. A GPU backend keeps a target per surface the
+ * title draws into, but the title owns that memory: it can free it and load
+ * a stage's textures, vertices or tables there, and the old image must then
+ * neither be sampled nor written back over them. Recompiled stores go
+ * straight to guest memory, so there is no write tracking to ask; a target
+ * keeps instead the hash of its guest bytes (pitch x h at its resolved
+ * address, the bytes the seed reads and a write-back writes, clamped to the
+ * window it lies in) as of the last time the backend knew them: its
+ * creation and each write-back. A target not drawn in the current flip whose
+ * bytes no longer hash the same was overwritten by the title and is stale.
+ * One check per target per flip at most (checked_flip caches a good
+ * result), plus one after each reset. */
+#define NV2A_RT_WINDOW 0x08000000u   /* address compares use the low 27 bits */
+/* The windows a resolved address lies in, as kernel.h's XBOX_CONTIG_BASE and
+ * XBOX_CONTIG_SIZE and the 128 MB low mapping (this header takes no kernel
+ * headers). */
+#define NV2A_RT_CONTIG_BASE 0x80000000u
+#define NV2A_RT_CONTIG_SIZE 0x04000000u
+struct nv2a_rt_own {
+    uint64_t mem_hash;
+    uint32_t draw_flip;      /* the flip of the last draw or clear into it */
+    uint32_t checked_flip;   /* the flip of the last hash */
+};
+
+/* Hash now: the bytes are the target's (creation, write-back). */
+void nv2a_rt_own_reset(struct nv2a_rt_own *o, const uint8_t *mem, uint32_t addr,
+                       uint32_t pitch, uint32_t h, uint32_t flip);
+
+static inline void nv2a_rt_own_drawn(struct nv2a_rt_own *o, uint32_t flip)
+{
+    o->draw_flip = flip;
+}
+
+/* 1 when the title has rewritten the target's bytes: never for a target
+ * drawn this flip, nor rehashed twice in one flip. */
+int nv2a_rt_own_stale(struct nv2a_rt_own *o, const uint8_t *mem, uint32_t addr,
+                      uint32_t pitch, uint32_t h, uint32_t flip);
+
+/* Hashes taken so far by the two above (tests and the profile). */
+uint64_t nv2a_rt_own_hashes(void);
+
+/* Whether [a, a + an) and [b, b + bn) share a byte, through the low 27 bits
+ * (the backends' rule for "the same memory through either window"). */
+static inline int nv2a_rt_overlap(uint32_t a, uint32_t an, uint32_t b, uint32_t bn)
+{
+    a &= NV2A_RT_WINDOW - 1u;
+    b &= NV2A_RT_WINDOW - 1u;
+    return an && bn && a < b + bn && b < a + an;
+}
+
 static inline uint8_t nv2a_clamp255(int x)
 {
     return (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);

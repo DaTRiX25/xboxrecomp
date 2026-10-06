@@ -14,5 +14,6 @@ target_include_directories(nv2a_backend_smoke PRIVATE
 enable_testing()
 add_test(NAME nv2a_backend_smoke COMMAND nv2a_backend_smoke)
 add_test(NAME nv2a_backend_smoke_guard COMMAND nv2a_backend_smoke guard)
-set_tests_properties(nv2a_backend_smoke nv2a_backend_smoke_guard
+add_test(NAME nv2a_backend_smoke_noalias COMMAND nv2a_backend_smoke noalias)
+set_tests_properties(nv2a_backend_smoke nv2a_backend_smoke_guard nv2a_backend_smoke_noalias
     PROPERTIES SKIP_RETURN_CODE 77)

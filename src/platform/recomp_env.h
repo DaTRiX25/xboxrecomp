@@ -97,6 +97,7 @@ extern "C" {
     X(PRESENT_TRACE,     TRACE, "present",         "RECOMP_PRESENT_TRACE",     "present-surface choices") \
     X(PRESENT_STATS,     TRACE, "present_stats",   "RECOMP_PRESENT_STATS",     "SDL host present statistics") \
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
+    X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip") \
     X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \
     X(VSH_ZLOG,          TRACE, "zlog",            "RECOMP_VSH_ZLOG",          "depth clears and z-buffer use") \
     X(TEX_LOG,           TRACE, "tex",             "RECOMP_TEX_LOG",           "texture format survey; =2 also every texture") \
@@ -186,6 +187,7 @@ extern "C" {
     X(METAL_WRITEBACK,   DEBUG, "metal_writeback", NULL,                       "=lazy|always: Metal writes guest memory when a dump reads it (default) or at every flip") \
     X(METAL_FB_GUARD,    DEBUG, "metal_fb_guard",  NULL,                       "trap title reads of the last Metal present surface; a read switches to metal_writeback=always") \
     X(METAL_OCC,         DEBUG, "metal_occ",       "RECOMP_METAL_OCC",         "=sync|fixed: Metal occlusion mode") \
+    X(RT_ALIAS_CHECK,    DEBUG, "rt_alias_check",  NULL,                       "=0: Metal and D3D11 keep render targets whose guest memory the title rewrote (before rt-stale-alias)") \
     X(FB_VA,             DEBUG, "fb_va",           "RECOMP_FB_VA",             "=va: framebuffer window shows that address") \
     X(USB,               DEBUG, "ohci",            "RECOMP_USB",               "emulated OHCI/XID USB (unused path)") \
     X(USB_PORT,          DEBUG, "usb_port",        "RECOMP_USB_PORT",          "=n: USB pad port") \

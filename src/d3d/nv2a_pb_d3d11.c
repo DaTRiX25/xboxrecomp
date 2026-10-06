@@ -207,6 +207,8 @@ typedef struct {
     ID3D11ShaderResourceView *srv;      /* for render-to-texture, made lazily */
     uint64_t                last_use;
     uint64_t                last_draw, last_clear;  /* s_seq at the last one */
+    uint32_t                pitch;      /* the guest pitch it was made with */
+    struct nv2a_rt_own      own;        /* is the guest memory under it still its own */
 } RenderTarget;
 
 typedef struct nv2a_stage Stage;
@@ -555,6 +557,56 @@ static int init(void)
 
 /* ---- surfaces ------------------------------------------------------------- */
 
+static void rt_release(RenderTarget *rt)
+{
+    if (s_drawn == rt)
+        s_drawn = NULL;
+    if (rt->srv)
+        ID3D11ShaderResourceView_Release(rt->srv);
+    ID3D11RenderTargetView_Release(rt->rtv);
+    ID3D11Texture2D_Release(rt->tex);
+    memset(rt, 0, sizeof *rt);
+}
+
+/* ---- render-target ownership (nv2a_backend_common.h) ----------------------
+ *
+ * A target is the title's surface only while the guest memory under it holds
+ * what it held when the target was made. A title that frees a target's
+ * memory and loads something else there (BLiNX 2's hub leaves two 512x512
+ * targets whose megabytes stage 1 refills with textures) would otherwise get
+ * the old image bound in place of the new texels. This backend never writes
+ * guest memory, so a stale target is only dropped. The Metal backend's rule;
+ * A/B: RECOMP_DEBUG=rt_alias_check=0. */
+static uint64_t s_stale_drops, s_retired;
+
+static int alias_check_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_RT_ALIAS_CHECK);
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* Drop rt when the title has rewritten its memory; 1 if it was dropped. */
+static int rt_drop_if_stale(RenderTarget *rt, const char *why)
+{
+    static int said;
+    if (!alias_check_on() || !rt->tex || !rt->pitch
+            || !nv2a_rt_own_stale(&rt->own, (const uint8_t *)xbox_GetMemoryOffset(),
+                                  rt->addr, rt->pitch, rt->h, (uint32_t)s_presents))
+        return 0;
+    s_stale_drops++;
+    if (said++ < 20)
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target dropped (%s): the title"
+                " rewrote its %u bytes; last drawn at flip %u, now %llu\n",
+                rt->offset, rt->w, rt->h, why, rt->pitch * rt->h, rt->own.draw_flip,
+                (unsigned long long)s_presents);
+    rt_release(rt);
+    return 1;
+}
+
 static RenderTarget *surface(void)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -568,9 +620,32 @@ static RenderTarget *surface(void)
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (rt->tex && rt->offset == g->color_offset && rt->w == w && rt->h == h) {
+            /* First use this flip of a target the title may have rewritten:
+             * a stale one is made again. */
+            if (rt_drop_if_stale(rt, "reuse"))
+                break;
             rt->last_use = s_tick;
+            nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
             return rt;
         }
+    }
+    /* No two live targets share memory: one the new target overlaps is
+     * dropped (this backend has nothing to write back). */
+    if (alias_check_on()) {
+        uint32_t addr = nv2a_pb_dma_resolve(g->color_offset);
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            if (rt->tex && nv2a_rt_overlap(rt->addr, rt->pitch * rt->h, addr, g->pitch * h)) {
+                if (s_retired++ < 20)
+                    fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target retired:"
+                            " 0x%08X %ux%u overlaps it\n", rt->offset, rt->w, rt->h,
+                            g->color_offset, w, h);
+                rt_release(rt);
+            }
+        }
+    }
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
         if (!rt->tex && !free_rt)
             free_rt = rt;
         if (rt->last_use < lru->last_use)
@@ -578,13 +653,7 @@ static RenderTarget *surface(void)
     }
     if (!free_rt) {
         free_rt = lru;
-        if (s_drawn == free_rt)
-            s_drawn = NULL;
-        if (free_rt->srv)
-            ID3D11ShaderResourceView_Release(free_rt->srv);
-        ID3D11RenderTargetView_Release(free_rt->rtv);
-        ID3D11Texture2D_Release(free_rt->tex);
-        memset(free_rt, 0, sizeof *free_rt);
+        rt_release(free_rt);
     }
     nv2a_host_size(w, h, nv2a_host_render_scale(), D3D11_MAX_DIM,
                    &free_rt->hw, &free_rt->hh);
@@ -612,7 +681,12 @@ static RenderTarget *surface(void)
     free_rt->addr = nv2a_pb_dma_resolve(g->color_offset);
     free_rt->w = w;
     free_rt->h = h;
+    free_rt->pitch = g->pitch;
     free_rt->last_use = s_tick;
+    if (alias_check_on() && free_rt->pitch)
+        nv2a_rt_own_reset(&free_rt->own, (const uint8_t *)xbox_GetMemoryOffset(),
+                          free_rt->addr, free_rt->pitch, h, (uint32_t)s_presents);
+    nv2a_rt_own_drawn(&free_rt->own, (uint32_t)s_presents);
     if (free_rt->hw != w)
         fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
                 g->color_offset, w, h, free_rt->hw, free_rt->hh);
@@ -1764,6 +1838,8 @@ static RenderTarget *rt_texture(const Stage *t)
         /* Low 27 bits: the same memory through either window. */
         if (!rt->tex || ((rt->addr ^ t->offset) & 0x07FFFFFFu))
             continue;
+        if (rt_drop_if_stale(rt, "bind"))
+            continue;   /* the texture decodes from the title's bytes */
         if (rt == s_cur) {
             self = rt;
             continue;
@@ -3157,7 +3233,8 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (walker said 0x%08X),"
                 " %llu clears, %llu draws, %llu skipped, %llu culled, %llu texture uploads,"
                 " %llu rehashes, %llu combiner shaders, %llu zclears,"
-                " %llu depth-tested draws, %llu render-target textures\n",
+                " %llu depth-tested draws, %llu render-target textures,"
+                " %llu stale drops\n",
                 (unsigned long long)s_presents,
                 s_drawn ? s_drawn->offset : 0, surface_offset,
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
@@ -3167,7 +3244,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_tex_rehash,
                 (unsigned long long)s_rc_compiles,
                 (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
-                (unsigned long long)s_rtt_binds);
+                (unsigned long long)s_rtt_binds, (unsigned long long)s_stale_drops);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "blend: %llu draws with a constant factor,"
                 " %u SET_BLEND_COLOR writes (last 0x%08X)\n",
@@ -3331,6 +3408,17 @@ static const struct nv2a_pb_backend s_d3d11_backend = {
     d3d11_on_report,
     d3d11_on_poll,
 };
+
+/* For tests/d3d11_backend_smoke: the pixel at guest (x, y) of the target
+ * at a colour offset, 0xAARRGGBB, or 0xDEADBEEF when there is none. */
+uint32_t nv2a_pb_d3d11_pixel(uint32_t offset, int x, int y)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex && s_rt[i].offset == offset)
+            return read_pixel(&s_rt[i], x, y);
+    return 0xDEADBEEFu;
+}
 
 const struct nv2a_pb_backend *nv2a_pb_d3d11_backend(void)
 {
