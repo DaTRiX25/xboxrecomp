@@ -49,6 +49,7 @@
 #include "video/window_title.h"
 
 #define LOGP "[d3d11] "
+#define D3D11_WND_CLASS "RecompNv2aD3D11"   /* RegisterClassA, then CreateWindowW as L"" D3D11_WND_CLASS */
 
 typedef HRESULT (WINAPI *compile_fn)(LPCVOID, SIZE_T, LPCSTR,
                                      const D3D_SHADER_MACRO *, ID3DInclude *,
@@ -59,6 +60,16 @@ typedef HRESULT (WINAPI *compile_fn)(LPCVOID, SIZE_T, LPCSTR,
 
 static int                     s_failed;        /* init failed: draw nothing */
 static HWND                    s_hwnd;
+/* This window is not fb_present.c's, which keeps the title bar's name (and,
+ * with RECOMP_TRACE=title, FPS and draws); ours comes from the same place.
+ * One clock for the creation title and the per-flip refresh, so the window
+ * opens with the game's name and the first flip has nothing to rewrite. */
+static struct xbox_title_clock s_title_clock;
+/* Present's sync interval. Stock D3D11 presents without waiting for the
+ * display (0): the guest's vblank clock paces the frames. RECOMP_PRESENT_VSYNC
+ * is the SDL window's knob (default on there); here only a value that turns
+ * it on changes anything, so an unset key keeps the stock behaviour. */
+static UINT                    s_sync_interval;
 static ID3D11Device           *s_dev;
 static ID3D11DeviceContext    *s_ctx;
 static IDXGISwapChain         *s_swap;
@@ -368,6 +379,7 @@ static int init(void)
     D3D_FEATURE_LEVEL fl;
     HRESULT hr;
     WNDCLASSA wc;
+    wchar_t title[192];
     RECT r = {0, 0, 640, 480};
     int full = nv2a_host_opts()->fullscreen;
     UINT bw = 640, bh = 480;
@@ -389,8 +401,10 @@ static int init(void)
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = GetModuleHandleA(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = "RecompNv2aD3D11";
+    wc.lpszClassName = D3D11_WND_CLASS;
     RegisterClassA(&wc);
+    if (!xbox_FramebufferWindowTitleText(title, 192, &s_title_clock))
+        title[0] = 0;
     if (full) {
         /* present.fullscreen: borderless over the primary monitor (no HWND
          * yet to ask MonitorFromWindow), no exclusive mode. */
@@ -403,12 +417,12 @@ static int init(void)
         }
     }
     if (full) {
-        s_hwnd = CreateWindowA(wc.lpszClassName, "recomp (NV2A via D3D11)",
+        s_hwnd = CreateWindowW(L"" D3D11_WND_CLASS, title,
                                WS_POPUP | WS_VISIBLE, 0, 0, (int)bw, (int)bh,
                                NULL, NULL, wc.hInstance, NULL);
     } else {
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-        s_hwnd = CreateWindowA(wc.lpszClassName, "recomp (NV2A via D3D11)",
+        s_hwnd = CreateWindowW(L"" D3D11_WND_CLASS, title,
                                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                CW_USEDEFAULT, CW_USEDEFAULT,
                                r.right - r.left, r.bottom - r.top,
@@ -418,6 +432,10 @@ static int init(void)
         fprintf(stderr, LOGP "CreateWindow failed (%lu)\n", GetLastError());
         return 0;
     }
+    s_sync_interval = recomp_env_on(RENV_PRESENT_VSYNC) ? 1 : 0;
+    if (recomp_env(RENV_PRESENT_VSYNC))
+        fprintf(stderr, LOGP "present vsync %s (RECOMP_PRESENT_VSYNC=%s)\n",
+                s_sync_interval ? "on" : "off", recomp_env(RENV_PRESENT_VSYNC));
 
     memset(&sd, 0, sizeof sd);
     sd.BufferDesc.Width = bw;
@@ -3045,13 +3063,8 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
         return;
     pump();
     {
-        /* This window is not fb_present.c's, which keeps the title bar's
-         * name (and, with RECOMP_TRACE=title, FPS and draws); take ours
-         * from the same place. The first flip replaces the creation
-         * title with the game's name. */
-        static struct xbox_title_clock tc;
         wchar_t tb[192];
-        if (xbox_FramebufferWindowTitleText(tb, 192, &tc))
+        if (xbox_FramebufferWindowTitleText(tb, 192, &s_title_clock))
             SetWindowTextW(s_hwnd, tb);
     }
     if (s_occ.ops)
@@ -3101,7 +3114,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     }
     s_presents++;
     dump_frame();
-    hr = IDXGISwapChain_Present(s_swap, 0, 0);
+    hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
     if (FAILED(hr) && s_presents < 4)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own

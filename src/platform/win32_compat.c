@@ -1081,15 +1081,32 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
 /* Virtual memory                                                        */
 /* ===================================================================== */
 
+/* The guest's PAGE_EXECUTE* requests map without PROT_EXEC. Static
+ * recompilation never runs guest bytes: the title's code is host code in the
+ * executable, and nothing here generates code at run time. Asking for exec
+ * only costs: Apple silicon refuses a writable+executable mapping without
+ * MAP_JIT (macOS and iOS alike), so a guest PAGE_EXECUTE_READWRITE used to
+ * come back NULL. The read/write sense is kept; on x86 an executable page is
+ * always readable, so PAGE_EXECUTE alone is read-only. Logged once. */
+static void exec_dropped(DWORD protect)
+{
+    static int said;
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[win32_compat] guest asked for executable memory "
+                "(protect 0x%02X); mapped without execute, since recompiled "
+                "code never runs guest pages (logged once)\n",
+                (unsigned)(protect & 0xFF));
+}
+
 static int prot_from_page(DWORD protect)
 {
     switch (protect & 0xFF) {
     case PAGE_NOACCESS:          return PROT_NONE;
     case PAGE_READONLY:          return PROT_READ;
     case PAGE_READWRITE:         return PROT_READ | PROT_WRITE;
-    case PAGE_EXECUTE:           return PROT_EXEC;
-    case PAGE_EXECUTE_READ:      return PROT_READ | PROT_EXEC;
-    case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE | PROT_EXEC;
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:      exec_dropped(protect); return PROT_READ;
+    case PAGE_EXECUTE_READWRITE: exec_dropped(protect); return PROT_READ | PROT_WRITE;
     default:                     return PROT_READ | PROT_WRITE;
     }
 }
