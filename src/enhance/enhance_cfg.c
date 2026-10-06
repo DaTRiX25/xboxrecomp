@@ -37,6 +37,7 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("display.aspect", RENV_DISPLAY_ASPECT);
     enhance_cfg_bind_env("present.filter", RENV_PRESENT_FILTER);
     enhance_cfg_bind_env("present.fullscreen", RENV_PRESENT_FULLSCREEN);
+    enhance_cfg_bind_env("present.pacing", RENV_PRESENT_PACING);
 #endif
 }
 
@@ -71,12 +72,20 @@ static Bind *bind_of(const char *key)
 }
 
 /* The env value for `key`, or NULL (unbound, unset or empty). */
+static int file_of(const char *key, recomp_cfg_type *type);
+
+/* A file key the environment overrides was still read: the user set it, and
+ * an "unused key" line for it would send them looking for a typo. */
 static const char *env_of(const char *key, Bind **out)
 {
     Bind *b = bind_of(key);
     const char *v = b ? recomp_env(b->id) : NULL;
+    recomp_cfg_type t;
     *out = b;
-    return v && *v ? v : NULL;
+    if (!v || !*v)
+        return NULL;
+    file_of(key, &t);
+    return v;
 }
 
 static void env_bad(Bind *b, const char *v, const char *want)

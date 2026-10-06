@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "kernel_pacing.h"
 #include "recomp_env.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
@@ -328,6 +329,19 @@ void xbox_IrqlLeaveInterrupt(int saved)
         g_current_irql = (KIRQL)saved;
         irql_publish();
     }
+    /* Every host-run ISR and DPC ends here, on whichever thread ran it: the
+     * point where what it wrote to guest memory is done, so a sleeping spin
+     * wait (kernel_pacing.c) re-reads it. One load in spin mode. */
+    xbox_SpinWake();
+}
+
+/* Whether this thread is at DISPATCH_LEVEL or above, or holds the one-CPU
+ * gate: while it is, no DPC can run, so a spin wait here must not sleep for
+ * one (kernel_pacing.c). */
+int xbox_IrqlThisThreadBlocksDpcs(void)
+{
+    return t_irql_counted || t_dispatch_gate_held
+           || g_current_irql >= DISPATCH_LEVEL;
 }
 
 /*

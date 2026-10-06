@@ -32,6 +32,7 @@
 #include <string.h>
 #include <time.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
+#include "kernel_pacing.h"
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
@@ -5767,6 +5768,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         *(volatile uint32_t *)(mem + va) = param;
         s_sema_last_va = va;
         s_sema_last_value = param;
+        xbox_SpinWake();   /* a fence wait may be sleeping on this word */
         if (s_sema_releases++ == 0 || recomp_env(RENV_PB_SEMA_TRACE)) {
             static unsigned shown;
             if (shown++ < 16) {
@@ -5805,6 +5807,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        /* RECOMP_TRACE=pacing: the flip's time, here where every backend
+         * passes, with the draws since the last (CPU and GPU paths). */
+        {
+            static uint32_t prev;
+            uint32_t b = s_gpu.batches_textured + s_gpu.batches_no_uv
+                       + s_gpu.batches_no_tex + s_gpu_backend_batches;
+            xbox_PacingFlip(s_gpu.flips, b - prev);
+            prev = b;
+        }
         /* Present the frame just finished: present_pick says which surface
          * that is, for every backend. Before anything qualifies (no draw or
          * clear yet), the old answer: the last surface drawn, else the

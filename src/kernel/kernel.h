@@ -796,6 +796,8 @@ int     xbox_DispatchGateTryEnter(void);       /* the one-CPU gate: ISR delivery
 void    xbox_DispatchGateEnter(void);
 void    xbox_DispatchGateLeave(void);
 void    xbox_IrqlLeaveInterrupt(int saved);
+/* This thread is at DISPATCH_LEVEL or above, or holds the one-CPU gate. */
+int     xbox_IrqlThisThreadBlocksDpcs(void);
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */

@@ -390,6 +390,9 @@ class FunctionTranslator:
         self.jump_table_entry_starts = set()
         self._recovered_cfg = {}
         self._ownership_ready = False
+        # --spin-waits: a spin_waits.SpinWaitReport, or None (the matcher
+        # does not run and the output is unchanged).
+        self.spin_waits = None
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover function entries from bounded static callback tables."""
@@ -2353,6 +2356,8 @@ class FunctionTranslator:
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
+            if self.spin_waits is not None:
+                stmts = self.spin_waits.consider(start, bb, stmts)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
@@ -2472,7 +2477,8 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None):
+                 icall_sites_json_path=None, spin_waits=None):
+        """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None."""
         self.xbe_path = xbe_path
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
@@ -2533,6 +2539,9 @@ class BatchTranslator:
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
             force_returns=force_returns, icall_sites=self.icall_sites)
+        if spin_waits is not None:
+            from .spin_waits import SpinWaitReport
+            self.translator.spin_waits = SpinWaitReport(spin_waits)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):

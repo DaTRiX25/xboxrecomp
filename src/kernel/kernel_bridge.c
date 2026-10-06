@@ -26,7 +26,9 @@
  */
 
 #include "kernel.h"
+#include "kernel_pacing.h"
 #include "recomp_env.h"
+#include "platform/host_time.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -2792,87 +2794,82 @@ uint32_t xbox_VblankCount(void)
     return (uint32_t)g_vblank_total;
 }
 
-/* Vblank N is due at t0 + N * 1000 / 60 ms: an absolute schedule, so the
- * rate is 60 Hz however coarse the caller's tick. It used to be "now + 16"
- * checked on a 10 ms tick, which fired every 20 ms -- 50 Hz -- and the movie's
- * frame limiter counts these. A host that falls more than 100 ms behind
- * (a debugger stop, a stalled timer thread) restarts the schedule instead of
- * firing a burst.
- *
- * Returns the milliseconds until the next one is due (10 when disabled), so
- * the timer thread can sleep exactly that long. */
-static long kernel_vblank_tick(void)
+/* RECOMP_DEBUG=vblank_clock=ms: the timer loop as it was before the
+ * nanosecond schedule (millisecond grid, Sleep(ms), 10 ms re-poll after a
+ * gate-busy drain), kept for A/B runs and bisecting. */
+static int kernel_vblank_clock_ms(void)
+{
+    static int v = -1;
+
+    if (v < 0) {
+        const char *c = recomp_env(RENV_VBLANK_CLOCK);
+        v = c && strcmp(c, "ms") == 0;
+        if (v) {
+            fprintf(stderr, "  [NV2A] vblank clock: millisecond schedule"
+                            " (vblank_clock=ms)\n");
+            fflush(stderr);
+        }
+    }
+    return v;
+}
+
+static int kernel_vblank_enabled(void)
 {
     static int enabled = -1;
-    static long long t0;
-    static unsigned long long count;
-    long long now, due;
-    long wait;
 
     if (enabled < 0)
         enabled = recomp_env(RENV_VBLANK) != NULL;
-    if (!enabled)
-        return 10;
+    return enabled;
+}
 
-    now = kernel_clock_ms();
-    if (!t0)
-        t0 = now;
-    due = t0 + (long long)(count * 1000ull / 60ull);
-    if (now < due)
-        return (long)(due - now);
-    if (now - due > 100) {
-        t0 = now;
-        count = 0;
-        if (xbox_ProfOn())
-            xbox_ProfCount(XBOX_PROF_SCHED_RESTART, now - due);
-    }
-    count++;
+/* Count one vblank, and once per 600 print the line bench and golden read:
+ * should read ~10000 ms. Also the shortest and longest gap between two, by
+ * the performance counter rather than the clock the schedule runs on. */
+static void kernel_vblank_count(long long now)
+{
+    static unsigned long long total;
+    static long long last_ms;
+    static LARGE_INTEGER qf, qlast;
+    static double gap_min = 1e9, gap_max;
+    LARGE_INTEGER q;
+
     InterlockedIncrement(&g_vblank_total);
-    {
-        /* One line per 600 vblanks: should read ~10000 ms. Also the
-         * shortest and longest gap between two, by the performance counter
-         * rather than the tick count the schedule runs on. */
-        static unsigned long long total;
-        static long long last_ms;
-        static LARGE_INTEGER qf, qlast;
-        static double gap_min = 1e9, gap_max;
-        LARGE_INTEGER q;
-
-        if (!qf.QuadPart)
-            QueryPerformanceFrequency(&qf);
-        QueryPerformanceCounter(&q);
-        if (qlast.QuadPart && qf.QuadPart) {
-            double g = (double)(q.QuadPart - qlast.QuadPart) * 1000.0
-                       / (double)qf.QuadPart;
-            if (g < gap_min) gap_min = g;
-            if (g > gap_max) gap_max = g;
-        }
-        qlast = q;
-        if (++total % 600 == 0) {
-            fprintf(stderr, "  [NV2A] vblank %llu: last 600 in %lld ms,"
-                    " gap %.1f-%.1f ms, ack give-ups %ld, late acks %ld"
-                    " (max %ld ms), declined %ld\n",
-                    total, last_ms ? now - last_ms : 0, gap_min, gap_max,
-                    (long)InterlockedExchange(&g_vbl_ack_giveups, 0),
-                    (long)InterlockedExchange(&g_vbl_ack_late, 0),
-                    (long)InterlockedExchange(&g_vbl_ack_late_max, 0),
-                    (long)InterlockedExchange(&g_vbl_declined, 0));
-            fflush(stderr);
-            if (xbox_ProfOn())
-                xbox_ProfReport();
-            gap_min = 1e9;
-            gap_max = 0;
-            last_ms = now;
-        } else if (total == 1) {
-            last_ms = now;
-        }
+    if (!qf.QuadPart)
+        QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&q);
+    if (qlast.QuadPart && qf.QuadPart) {
+        double g = (double)(q.QuadPart - qlast.QuadPart) * 1000.0
+                   / (double)qf.QuadPart;
+        if (g < gap_min) gap_min = g;
+        if (g > gap_max) gap_max = g;
     }
-    wait = (long)(t0 + (long long)(count * 1000ull / 60ull) - now);
-    if (wait < 1)
-        wait = 1;
+    qlast = q;
+    if (++total % 600 == 0) {
+        fprintf(stderr, "  [NV2A] vblank %llu: last 600 in %lld ms,"
+                " gap %.1f-%.1f ms, ack give-ups %ld, late acks %ld"
+                " (max %ld ms), declined %ld\n",
+                total, last_ms ? now - last_ms : 0, gap_min, gap_max,
+                (long)InterlockedExchange(&g_vbl_ack_giveups, 0),
+                (long)InterlockedExchange(&g_vbl_ack_late, 0),
+                (long)InterlockedExchange(&g_vbl_ack_late_max, 0),
+                (long)InterlockedExchange(&g_vbl_declined, 0));
+        fflush(stderr);
+        if (xbox_ProfOn())
+            xbox_ProfReport();
+        gap_min = 1e9;
+        gap_max = 0;
+        last_ms = now;
+    } else if (total == 1) {
+        last_ms = now;
+    }
+}
 
+/* Raise one vblank: the PCRTC and PMC bits, then the ISR, then the ack
+ * watch. */
+static void kernel_vblank_raise(void)
+{
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
-        return wait;
+        return;
 
     /* PCRTC_INTR_EN_0: D3D enables the vblank interrupt once it has
      * connected its ISR. Until then the hardware raises nothing. */
@@ -2881,7 +2878,7 @@ static long kernel_vblank_tick(void)
         static int said;
         if (!said++)
             fprintf(stderr, "  [NV2A] vblank held: PCRTC_INTR_EN_0 off\n");
-        return wait;
+        return;
     }
 
     InterlockedExchange(&g_vbl_tick_busy, 1);
@@ -2914,13 +2911,80 @@ static long kernel_vblank_tick(void)
                     claimed ? "claimed it" : "declined it");
         fflush(stderr);
     }
+}
+
+/* Vblank N is due at t0 + N * 1000 / 60 ms: an absolute schedule, so the
+ * rate is 60 Hz however coarse the caller's tick. It used to be "now + 16"
+ * checked on a 10 ms tick, which fired every 20 ms -- 50 Hz -- and the movie's
+ * frame limiter counts these. A host that falls more than 100 ms behind
+ * (a debugger stop, a stalled timer thread) restarts the schedule instead of
+ * firing a burst.
+ *
+ * Returns the milliseconds until the next one is due (10 when disabled), so
+ * the timer thread can sleep exactly that long. The vblank_clock=ms loop
+ * only; the default loop runs kernel_vblank_tick_ns. */
+static long kernel_vblank_tick(void)
+{
+    static long long t0;
+    static unsigned long long count;
+    long long now, due;
+    long wait;
+
+    if (!kernel_vblank_enabled())
+        return 10;
+
+    now = kernel_clock_ms();
+    if (!t0)
+        t0 = now;
+    due = t0 + (long long)(count * 1000ull / 60ull);
+    if (now < due)
+        return (long)(due - now);
+    if (now - due > 100) {
+        t0 = now;
+        count = 0;
+        if (xbox_ProfOn())
+            xbox_ProfCount(XBOX_PROF_SCHED_RESTART, now - due);
+    }
+    count++;
+    kernel_vblank_count(now);
+    xbox_PacingVblank(xbox_HostNowNs());
+    wait = (long)(t0 + (long long)(count * 1000ull / 60ull) - now);
+    if (wait < 1)
+        wait = 1;
+    kernel_vblank_raise();
     return wait;
 }
 
-/* Run whatever is queued. Called from the timer thread, which has the guest
- * stack and TIB that a deferred routine needs. */
-static void kernel_drain_dpcs(void)
+/* The same schedule on the nanosecond grid (kernel_pacing.c). Whole
+ * milliseconds put each vblank up to a millisecond off its edge, and the
+ * title counts vblanks from the top of each frame, so that error went
+ * straight into the flip interval (3D flips p5 26 / p95 41 ms around 33.3 on
+ * Metal). Returns 1 when it raised one; *next_due_ns is the next edge, 0
+ * when vblanks are off. */
+static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
 {
+    static XboxVblankSchedule sched;
+    uint64_t late;
+
+    *next_due_ns = 0;
+    if (!kernel_vblank_enabled())
+        return 0;
+    if (!xbox_VblankSchedule(&sched, now_ns, next_due_ns, &late))
+        return 0;
+    if (late && xbox_ProfOn())
+        xbox_ProfCount(XBOX_PROF_SCHED_RESTART, (long long)(late / 1000000u));
+    kernel_vblank_count(kernel_clock_ms());
+    xbox_PacingVblank(now_ns);
+    kernel_vblank_raise();
+    return 1;
+}
+
+/* Run whatever is queued. Called from the timer thread, which has the guest
+ * stack and TIB that a deferred routine needs. Returns 1 when it stopped on
+ * a busy gate with DPCs still queued; *ran counts the DPCs it ran. */
+static int kernel_drain_dpcs(int *ran)
+{
+    *ran = 0;
     for (;;) {
         PendingDpc d;
         /* A DPC runs only while the one-CPU gate is free (no thread at
@@ -2932,13 +2996,15 @@ static void kernel_drain_dpcs(void)
         if (!xbox_DispatchGateTryEnter()) {
             if (xbox_ProfOn())
                 xbox_ProfCount(XBOX_PROF_DRAIN_BUSY, 1);
-            break;
+            /* An unlocked look: a DPC queued just after is picked up by the
+             * next pass anyway. */
+            return g_dpc_head != g_dpc_tail;
         }
         dpc_lock();
         if (g_dpc_head == g_dpc_tail) {
             LeaveCriticalSection(&g_dpc_lock);
             xbox_DispatchGateLeave();
-            break;
+            return 0;
         }
         if (xbox_ProfOn())
             xbox_ProfCount(XBOX_PROF_DPCQ_DEPTH,
@@ -2951,8 +3017,8 @@ static void kernel_drain_dpcs(void)
         if (d.dpc)
             BRIDGE_MEM8(d.dpc + 2) = 0;
         LeaveCriticalSection(&g_dpc_lock);
-        if (d.dpc)
-            kernel_run_dpc(d.dpc, d.arg1, d.arg2, XBOX_PROF_DPC_QUEUE);
+        if (d.dpc && kernel_run_dpc(d.dpc, d.arg1, d.arg2, XBOX_PROF_DPC_QUEUE))
+            (*ran)++;
         xbox_DispatchGateLeave();
     }
 }
@@ -3189,10 +3255,145 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+/* Fire every kernel timer due at now_ms. Returns how many fired;
+ * *next_due_ms is the earliest still armed, -1 when none. */
+static int kernel_fire_timers(long long now, long long *next_due_ms)
+{
+    int i, fired = 0;
+
+    *next_due_ms = -1;
+    for (i = 0; i < XBOX_MAX_TIMERS; i++) {
+        uint32_t dpc, fired_va;
+
+        EnterCriticalSection(&g_timer_lock);
+        if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
+            if (g_timers[i].timer_va
+                && (*next_due_ms < 0 || g_timers[i].due_ms < *next_due_ms))
+                *next_due_ms = g_timers[i].due_ms;
+            LeaveCriticalSection(&g_timer_lock);
+            continue;
+        }
+        fired_va = g_timers[i].timer_va;
+        dpc = g_timers[i].dpc_va;
+        if (g_timers[i].period_ms > 0) {
+            g_timers[i].due_ms = now + g_timers[i].period_ms;
+            if (*next_due_ms < 0 || g_timers[i].due_ms < *next_due_ms)
+                *next_due_ms = g_timers[i].due_ms;
+        } else {
+            g_timers[i].timer_va = 0;      /* one-shot, done */
+        }
+        LeaveCriticalSection(&g_timer_lock);
+        fired++;
+
+        /* Outside the lock: the routine can set or cancel timers. */
+        if (dpc)
+            kernel_run_dpc(dpc, 0, 0, XBOX_PROF_DPC_TIMER);
+
+        /* Wake anyone parked on the timer's shadow event; a timer with no
+         * DPC is just a kernel sleep. */
+        {
+            HANDLE ev = ke_shadow_lookup(fired_va);
+            if (ev) {
+                SetEvent(ev);
+                BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
+            }
+        }
+    }
+    return fired;
+}
+
+/* The loop before the nanosecond schedule (vblank_clock=ms), unchanged. */
+static void kernel_timer_loop_ms(void)
+{
+    long wait = 10;
+
+    for (;;) {
+        long long now, next_due;
+        int ran;
+
+        /* Until the next vblank, at most the 10 ms timer tick. */
+        if (xbox_ProfOn()) {
+            long long t0 = xbox_ProfNowUs();
+            Sleep((DWORD)(wait < 1 ? 1 : wait));
+            xbox_ProfCount(XBOX_PROF_SLEEP_OVER, xbox_ProfNowUs() - t0
+                           - (long long)(wait < 1 ? 1 : wait) * 1000);
+            xbox_ProfCount(XBOX_PROF_N_LOOPS, 1);
+        } else {
+            Sleep((DWORD)(wait < 1 ? 1 : wait));
+        }
+        wait = kernel_vblank_tick();  /* the GPU's frame clock */
+        if (wait > 10)
+            wait = 10;
+        kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
+        now = kernel_clock_ms();
+        kernel_fire_timers(now, &next_due);
+        xbox_SpinWake();
+    }
+}
+
+/* The timer thread's loop: sleep to the earliest of the next vblank edge,
+ * the next kernel timer and a 10 ms cap, on the nanosecond clock, then
+ * raise what is due, drain DPCs and fire timers.
+ *
+ * A drain that finds the one-CPU gate busy leaves its DPCs queued (it never
+ * waits for the gate: this thread is the frame clock, and a guest parked at
+ * DISPATCH must not stop it). It used to find them again only at the next
+ * vblank or the 10 ms tick, and the title's vblank callback, which runs in
+ * such a DPC, came up to 10 ms late -- the flip landed late with it. Now the
+ * next pass comes within 1 ms while DPCs wait on the gate. */
+static void kernel_timer_loop_ns(void)
+{
+    const uint64_t ms = 1000000u;
+    uint64_t wait = 10 * ms;
+
+    xbox_HostTimerThreadInit();
+    for (;;) {
+        uint64_t now, vbl_next, target;
+        long long now_ms, timer_due;
+        int raised, ran, busy, fired;
+
+        if (xbox_ProfOn()) {
+            long long t0 = xbox_ProfNowUs();
+            xbox_HostSleepNs(wait);
+            xbox_ProfCount(XBOX_PROF_SLEEP_OVER, xbox_ProfNowUs() - t0
+                           - (long long)(wait / 1000u));
+            xbox_ProfCount(XBOX_PROF_N_LOOPS, 1);
+        } else {
+            xbox_HostSleepNs(wait);
+        }
+        raised = kernel_vblank_tick_ns(xbox_HostNowNs(), &vbl_next);
+        busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
+        now_ms = kernel_clock_ms();
+        fired = kernel_fire_timers(now_ms, &timer_due);
+        /* A declined or not-callable vblank ran no DPC, but its PCRTC bits
+         * changed all the same. */
+        if (raised || ran || fired)
+            xbox_SpinWake();
+
+        now = xbox_HostNowNs();
+        target = now + 10 * ms;
+        if (vbl_next) {
+            /* Behind the grid (a late pass): catch up one vblank per
+             * millisecond, as the millisecond loop did, not in a burst. */
+            uint64_t v = vbl_next > now ? vbl_next : now + ms;
+            if (v < target)
+                target = v;
+        }
+        if (timer_due >= 0) {
+            uint64_t t = now + (timer_due > now_ms
+                                ? (uint64_t)(timer_due - now_ms) * ms : 0);
+            if (t < target)
+                target = t;
+        }
+        if (busy && now + ms < target)
+            target = now + ms;
+        wait = target > now ? target - now : 0;
+    }
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
-    long wait = 10;
 
     (void)unused;
     xbox_log_thread_role("kernel-timer", 0);
@@ -3220,7 +3421,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
 #ifdef _WIN32
     /* Sleep(1) is 15.6 ms on native Windows without this, which would make
-     * the vblank schedule below run at 32 Hz. Wine needs nothing. */
+     * the vblank_clock=ms schedule run at 32 Hz; the nanosecond loop sleeps
+     * on a high-resolution waitable timer, and also wants it for the
+     * fallback. Wine needs nothing. */
     {
         typedef unsigned (WINAPI *tbp_fn)(unsigned);
         HMODULE winmm = LoadLibraryA("winmm.dll");
@@ -3232,57 +3435,11 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     }
 #endif
 
-    for (;;) {
-        long long now;
-        int i;
-
-        /* Until the next vblank, at most the 10 ms timer tick. */
-        if (xbox_ProfOn()) {
-            long long t0 = xbox_ProfNowUs();
-            Sleep((DWORD)(wait < 1 ? 1 : wait));
-            xbox_ProfCount(XBOX_PROF_SLEEP_OVER, xbox_ProfNowUs() - t0
-                           - (long long)(wait < 1 ? 1 : wait) * 1000);
-            xbox_ProfCount(XBOX_PROF_N_LOOPS, 1);
-        } else {
-            Sleep((DWORD)(wait < 1 ? 1 : wait));
-        }
-        wait = kernel_vblank_tick();  /* the GPU's frame clock */
-        if (wait > 10)
-            wait = 10;
-        kernel_drain_dpcs();   /* deferred work, before due timers */
-        now = kernel_clock_ms();
-
-        for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-            uint32_t dpc, fired_va;
-
-            EnterCriticalSection(&g_timer_lock);
-            if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
-                LeaveCriticalSection(&g_timer_lock);
-                continue;
-            }
-            fired_va = g_timers[i].timer_va;
-            dpc = g_timers[i].dpc_va;
-            if (g_timers[i].period_ms > 0)
-                g_timers[i].due_ms = now + g_timers[i].period_ms;
-            else
-                g_timers[i].timer_va = 0;      /* one-shot, done */
-            LeaveCriticalSection(&g_timer_lock);
-
-            /* Outside the lock: the routine can set or cancel timers. */
-            if (dpc)
-                kernel_run_dpc(dpc, 0, 0, XBOX_PROF_DPC_TIMER);
-
-            /* Wake anyone parked on the timer's shadow event; a timer with no
-             * DPC is just a kernel sleep. */
-            {
-                HANDLE ev = ke_shadow_lookup(fired_va);
-                if (ev) {
-                    SetEvent(ev);
-                    BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
-                }
-            }
-        }
-    }
+    if (kernel_vblank_clock_ms())
+        kernel_timer_loop_ms();
+    else
+        kernel_timer_loop_ns();
+    return 0;
 }
 
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */

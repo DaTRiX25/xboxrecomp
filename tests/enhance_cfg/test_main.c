@@ -441,6 +441,12 @@ static void test_layers(void)
 
 /* ── xbox_enhance_init: the toolkit's keys into nv2a_host_opts ─────── */
 
+/* The kernel's pacing switch (kernel_pacing.c), which this test does not
+ * link: record what the layer hands it. */
+static int s_pacing_mode = -1;
+void xbox_PacingSetMode(int mode);
+void xbox_PacingSetMode(int mode) { s_pacing_mode = mode; }
+
 static void enhance_reset_env(void)
 {
     recomp_env_set(RENV_ENHANCE_CONFIG, "none");
@@ -448,6 +454,7 @@ static void enhance_reset_env(void)
     recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
     recomp_env_set(RENV_PRESENT_FILTER, NULL);
     recomp_env_set(RENV_PRESENT_FULLSCREEN, NULL);
+    recomp_env_set(RENV_PRESENT_PACING, NULL);
 }
 
 static void test_enhance_init(void)
@@ -500,6 +507,26 @@ static void test_enhance_init(void)
     recomp_env_set(RENV_RENDER_SCALE, NULL);
     recomp_env_set(RENV_DISPLAY_ASPECT, "16:9");
     CHECK(xbox_enhance_init(".", NULL) == 0 && o->render_scale == 1);
+
+    /* present.pacing: spin by default, from the file, env over file, and a
+     * bad value reported with the file answering. */
+    recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
+    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    s_pacing_mode = -1;
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 0);
+    write_file("ecfg_pacing.toml", "[present]\npacing = \"sleep\"\n");
+    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_pacing.toml");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
+    recomp_env_set(RENV_PRESENT_PACING, "spin");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 0);
+    CHECK(enhance_cfg_report_unused() == 0);    /* overridden, not unused */
+    recomp_env_set(RENV_PRESENT_PACING, "nap");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
+    recomp_env_set(RENV_PRESENT_PACING, NULL);
+    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    recomp_env_set(RENV_PRESENT_PACING, "sleep");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
+    recomp_env_set(RENV_PRESENT_PACING, NULL);
 
     /* A file that does not parse: -1, stock. */
     write_file("ecfg_broken.toml", "[render]\nscale = \n");

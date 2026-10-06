@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"
 #include "recomp_env.h"
 #include "kernel.h"
+#include "kernel_pacing.h"
 #include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
 #include <stdio.h>
 #include <stdlib.h>
@@ -1322,8 +1323,10 @@ static void pgraph_fence_tick(volatile uint32_t *regs)
 
     if (!fence_completed(&v))
         return;
-    if (((*r ^ (v << 2)) & 0x7Cu) != 0)
+    if (((*r ^ (v << 2)) & 0x7Cu) != 0) {
         *r = (*r & ~0x7Cu) | ((v << 2) & 0x7Cu);
+        xbox_SpinWake();   /* the wait-for-idle above may be sleeping */
+    }
 }
 
 static int s_nv2a_trace = 0;

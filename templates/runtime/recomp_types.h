@@ -422,6 +422,17 @@ void recomp_icall_not_code_log(uint32_t va);
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
 
+/* A guest busy-wait loop, lowered by tools.recomp --spin-waits: the back
+ * edge of a loop that only reads memory and branches back calls this once
+ * the condition was seen still true. In the "spin" pacing mode (the default)
+ * it does nothing and the loop spins as on the console; in "sleep" the
+ * thread blocks until the kernel signals a state change or 1 ms passes
+ * (src/kernel/kernel_pacing.h). */
+extern volatile int g_xbox_spin_sleep;
+void xbox_SpinWait(uint32_t va);
+#define RECOMP_SPIN_WAIT(va) \
+    do { if (g_xbox_spin_sleep) xbox_SpinWait(va); } while (0)
+
 /* x86 port I/O (`in`/`out`). width is 1, 2 or 4 bytes. The runtime models
  * the ports titles are known to read (the field pin at 0x80C0) and logs the
  * first access to any other. */

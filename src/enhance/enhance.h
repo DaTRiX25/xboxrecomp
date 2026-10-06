@@ -13,11 +13,17 @@
  *   render.scale        1..4, internal resolution factor (Metal, D3D11)
  *   present.filter      nearest | linear | integer
  *   present.fullscreen  borderless desktop fullscreen at start
+ *   present.pacing      spin | sleep: how lowered guest spin waits wait
+ *                       (kernel_pacing.h); spin is stock
  *   display.aspect      only 4:3 so far; anything else is reported
  *
  * Logs one line with the values in force, e.g.
- *   [ENHANCE] render.scale=2 present.filter=linear present.fullscreen=0 (display.aspect=4:3)
+ *   [ENHANCE] render.scale=2 present.filter=linear present.fullscreen=0 present.pacing=spin (display.aspect=4:3)
  * which scripts/golden.py reads to refuse a non-stock golden run.
+ *
+ * It does not report unused keys: the title reads its own keys after this
+ * and then calls enhance_cfg_report_unused() (enhance_cfg.h), so a title
+ * key in enhance.toml is not reported as unused.
  */
 #ifndef XBOX_ENHANCE_H
 #define XBOX_ENHANCE_H

@@ -258,7 +258,25 @@ def main():
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
+    parser.add_argument("--spin-waits", metavar="JSON",
+                        help="Lower guest busy-wait loops to RECOMP_SPIN_WAIT "
+                             "(the runtime sleeps in them when its pacing "
+                             "mode is sleep): {\"auto\": bool, \"sites\": "
+                             "[{\"va\": ...}], \"exclude\": [...]}. Writes "
+                             "spin_waits.json (every candidate) to -o. Without "
+                             "it nothing is matched and the output is "
+                             "unchanged")
+
     args = parser.parse_args()
+
+    spin_waits = None
+    if args.spin_waits:
+        from .spin_waits import SpinWaitConfig
+        try:
+            spin_waits = SpinWaitConfig.load(args.spin_waits)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"ERROR: --spin-waits {args.spin_waits}: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # Boundary repair is destructive: an interior function start disappears
     # once it is coalesced into its owner. Load hand-written entry points before
@@ -324,6 +342,7 @@ def main():
         icall_sites_json_path=args.icall_sites or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "output",
             "icall_sites.json"),
+        spin_waits=spin_waits,
     )
 
     t_load = time.time() - t0
@@ -515,6 +534,29 @@ def main():
         os.path.dirname(__file__), "output")
     summary_path = write_summary(stats, output_dir)
     print(f"\nSummary: {summary_path}", file=sys.stderr)
+
+    if translator.translator.spin_waits is not None:
+        _finish_spin_waits(translator.translator.spin_waits, output_dir)
+
+
+def _finish_spin_waits(report, output_dir):
+    """Write the candidate report; a listed site that did not lower in every
+    body that has it fails the run (the generated files are already written,
+    so the stage's regeneration marker stays and gen/ counts as stale)."""
+    errors = report.finish()
+    doc = report.to_json()
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "spin_waits.json")
+    with open(path, "w", newline="\n") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
+    print(f"Spin waits: {doc['lowered_sites']} sites lowered in "
+          f"{doc['lowered_bodies']} bodies, {doc['candidates']} candidates "
+          f"({path})", file=sys.stderr)
+    if errors:
+        for e in errors:
+            print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

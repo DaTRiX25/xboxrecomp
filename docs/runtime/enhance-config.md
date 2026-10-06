@@ -112,12 +112,15 @@ the stock settings.
 | `display.aspect` | string | `"4:3"` only for now (`"16:9"`, `"16:10"`, `"21:9"` are reported as not implemented, and 4:3 is used) | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
-| `fps.mode` | string | `"lock30"` (stock), `"lock60"`, `"free"` | `"lock30"` | the game's `RECOMP_FPS` |
+| `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
+| `fps.mode` | string | `"lock30"` (stock), `"lock60"`, `"free"` | `"lock30"` | the game's `RECOMP_FPS_MODE` |
 | `aspect.program.<hash>` | string | `"hud"`, `"stretch"`, `"3d"`: a per-shader override of the aspect classifier | none | none |
 
 `fps.mode` belongs to the game. Each title implements it, and the title binds
 the key to its own environment variable:
-`enhance_cfg_bind_env("fps.mode", RENV_FPS)`.
+`enhance_cfg_bind_env("fps.mode", RENV_FPS_MODE)`. A title that offers only
+some of the values reads the key all the same and says in one line which
+value it runs instead (BLiNX 2 runs `lock30` only).
 
 The input-selection keys (`[input]`) will be added later, when that work is
 done.
@@ -130,7 +133,7 @@ libraries never link the layer: without it the options are all zero, which
 is stock. One line shows the values in force:
 
 ```
-[ENHANCE] render.scale=2 present.filter=integer present.fullscreen=0 (display.aspect=4:3)
+[ENHANCE] render.scale=2 present.filter=integer present.fullscreen=0 present.pacing=spin (display.aspect=4:3)
 ```
 
 - **`render.scale = N`** (1..4; outside that it is clamped, with a line).
@@ -166,6 +169,20 @@ is stock. One line shows the values in force:
 - **`present.fullscreen`.** A borderless window covering the display at
   start, with no mode change (SDL `FULLSCREEN_DESKTOP`; D3D11 a `WS_POPUP`
   the primary monitor's size). There is no hotkey yet.
+- **`present.pacing`.** Only for a title generated with
+  `tools.recomp --spin-waits` ([lifting](../pipeline/04-lifting.md#spin-waits)),
+  whose busy-wait loops call `RECOMP_SPIN_WAIT` on their back edge. `spin`
+  (stock) does nothing there: the loop holds a host core as it holds the
+  console's CPU. `sleep` blocks the thread until the kernel signals a state
+  change (a vblank, an ISR or DPC, a fence write) or 1 ms passes
+  (`src/kernel/kernel_pacing.h`), which frees that core. The frames are the
+  guest's own either way; what can move is when the loop sees its exit,
+  by up to the wake latency. Without lowered loops the key changes nothing.
+  `RECOMP_TRACE=pacing` prints the flip intervals, process CPU and, per
+  site, how its waits ended and how its loops left: on a wake, or on the
+  1 ms timeout. A site whose loops keep leaving on the timeout (more than
+  5% of exits) has a writer the kernel never signals; timeouts in the
+  middle of a loop are normal.
 
 ### Naming rule
 
@@ -188,6 +205,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_DISPLAY_ASPECT` | overrides `display.aspect` |
 | `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
+| `RECOMP_PRESENT_PACING` | overrides `present.pacing` |
 
 The layer converts an environment value to the type of the key:
 
@@ -229,12 +247,16 @@ Every getter accepts a NULL config and then returns its default.
 ```c
 xbox_enhance_init(recomp_exe_dir(), NULL);      /* the toolkit's keys: enhance.h */
 enhance_cfg_init(data_root, title_dir);          /* the reader alone; logs the files */
-enhance_cfg_bind_env("fps.mode", RENV_FPS);      /* a game key with an env override */
+enhance_cfg_bind_env("fps.mode", RENV_FPS_MODE); /* a game key with an env override */
 int scale = (int)enhance_cfg_int("render.scale", 1);
 int mode  = enhance_cfg_choice("fps.mode", fps, 0);
 const recomp_cfg *c = enhance_cfg_lookup("render.sizes");   /* arrays: no env tier */
 enhance_cfg_report_unused();                     /* after the modules' init */
 ```
+
+`xbox_enhance_init` does not report unused keys itself: the title calls
+`enhance_cfg_report_unused()` once, after it has read its own keys
+(`fps.mode`), so a game key is never listed as unused.
 
 Read the values during init (one thread) and keep them; the layer is not
 meant to be read per frame. Tests: `tests/enhance_cfg` (ctest
