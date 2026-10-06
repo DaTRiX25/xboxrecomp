@@ -51,7 +51,9 @@
  * did.
  *
  * The window title is the title's to choose: call xbox_HostWindowSetTitle()
- * before xbox_HostWindowMain(). Unset, it reads "Xbox Recomp".
+ * before xbox_HostWindowMain(). Unset, it is the XBE certificate's name, or
+ * "Xbox Recomp" before the loader has read one. RECOMP_TRACE=title appends
+ * FPS and draws, once a second (window_title.h).
  */
 #if !defined(_WIN32)
 
@@ -68,6 +70,7 @@
 
 #include "kernel/nv2a_pb_state.h"
 #include "kernel/nv2a_backend_common.h"
+#include "window_title.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
@@ -248,53 +251,37 @@ static void *guest_thread(void *arg)
     return NULL;
 }
 
-/* Title bar. A title's own xbox_HostWindowSetTitle wins; otherwise the XBE
- * certificate's name, which the loader hands xbox_FramebufferWindowSetTitle;
- * then FPS and, once the executor reports them, draws per frame, as the
- * Win32 window shows them (upstream 331d95b). Written from guest threads,
- * read by the main thread once a second: a torn read shows a stale name for
- * a second, which nobody can tell from a real one. */
+/* Title bar (window_title.h). A title's own xbox_HostWindowSetTitle wins;
+ * otherwise the XBE certificate's name, which the loader hands
+ * xbox_FramebufferWindowSetTitle. RECOMP_TRACE=title adds FPS and, once the
+ * executor reports them, draws per frame, as the Win32 window does
+ * (upstream 331d95b). Written from guest threads, read by the main thread:
+ * a torn read shows a stale name until the next write, and s_name_gen,
+ * bumped after each name change, makes sure there is one. */
 static char s_title[128] = "Xbox Recomp";
 static char s_xbe_title[128];
 static int  s_host_title_set;
 static int  s_have_draws;
 static uint32_t s_frame_draws;
+static unsigned s_name_gen;
 
 void xbox_HostWindowSetTitle(const char *title)
 {
     if (title && *title) {
         snprintf(s_title, sizeof s_title, "%s", title);
         __atomic_store_n(&s_host_title_set, 1, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&s_name_gen, 1, __ATOMIC_RELEASE);
     }
 }
 
-/* UTF-16 name, max_chars at most, to UTF-8 (no surrogate pairs: an XBE
- * title name is 40 BMP characters). */
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
 {
     char buf[sizeof s_xbe_title];
-    size_t o = 0;
-    int i;
 
-    for (i = 0; i < max_chars && name[i]; i++) {
-        unsigned c = name[i];
-        if (c < 0x80) {
-            if (o + 1 >= sizeof buf) break;
-            buf[o++] = (char)c;
-        } else if (c < 0x800) {
-            if (o + 2 >= sizeof buf) break;
-            buf[o++] = (char)(0xC0 | (c >> 6));
-            buf[o++] = (char)(0x80 | (c & 0x3F));
-        } else {
-            if (o + 3 >= sizeof buf) break;
-            buf[o++] = (char)(0xE0 | (c >> 12));
-            buf[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
-            buf[o++] = (char)(0x80 | (c & 0x3F));
-        }
+    if (xbox_title_utf16_to_utf8(buf, sizeof buf, name, max_chars)) {
+        memcpy(s_xbe_title, buf, strlen(buf) + 1);
+        __atomic_add_fetch(&s_name_gen, 1, __ATOMIC_RELEASE);
     }
-    buf[o] = 0;
-    if (o)
-        memcpy(s_xbe_title, buf, o + 1);
 }
 
 /* Draws in the frame just flipped; the executor calls it at the flip. */
@@ -413,7 +400,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     uint32_t tex_w = 0, tex_h = 0, tex_bpp = 0;
     uint64_t shown_seq = 0, presents = 0, dropped_base = 0;
     uint64_t t_start, cpu_start, t_stat, cpu_stat, pres_stat = 0, flips_stat = 0;
-    uint64_t t_title = 0, flips_title = 0;
+    struct xbox_title_clock title_clock = {0};
+    int title_stats = recomp_env_on(RENV_TITLE_STATS);
     uint64_t upload_ns = 0;
     int vsync = !recomp_env(RENV_PRESENT_VSYNC) || recomp_env_on(RENV_PRESENT_VSYNC);
     int stats = recomp_env_on(RENV_PRESENT_STATS);
@@ -589,22 +577,18 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             presents++;
         }
 
-        if (win) {                                  /* title bar, 1 Hz */
-            uint64_t t = now_ns(CLOCK_MONOTONIC);
-            if (t - t_title >= 1000000000ull) {
-                uint64_t fl = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
+        if (win) {                     /* title bar: name, or 1 Hz stats */
+            double fps;
+            if (xbox_title_due(&title_clock, title_stats,
+                               now_ns(CLOCK_MONOTONIC) / 1000000ull,
+                               __atomic_load_n(&s_flips, __ATOMIC_RELAXED),
+                               __atomic_load_n(&s_name_gen, __ATOMIC_ACQUIRE),
+                               &fps)) {
                 char tb[192];
-                double fps = t_title ? (double)(fl - flips_title) * 1e9
-                                       / (double)(t - t_title) : 0.0;
-                if (__atomic_load_n(&s_have_draws, __ATOMIC_RELAXED))
-                    snprintf(tb, sizeof tb, "%s | FPS: %.1f | draws: %u",
-                             window_name(), fps,
-                             __atomic_load_n(&s_frame_draws, __ATOMIC_RELAXED));
-                else
-                    snprintf(tb, sizeof tb, "%s | FPS: %.1f", window_name(), fps);
+                xbox_title_format(tb, sizeof tb, window_name(), title_stats, fps,
+                                  __atomic_load_n(&s_have_draws, __ATOMIC_RELAXED),
+                                  __atomic_load_n(&s_frame_draws, __ATOMIC_RELAXED));
                 SDL_SetWindowTitle(win, tb);
-                t_title = t;
-                flips_title = fl;
             }
         }
         if (quit_after > 0 && (double)(now_ns(CLOCK_MONOTONIC) - t_start) / 1e9

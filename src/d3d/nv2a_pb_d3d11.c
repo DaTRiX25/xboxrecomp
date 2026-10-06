@@ -46,6 +46,7 @@
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 #include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
+#include "video/window_title.h"
 
 #define LOGP "[d3d11] "
 
@@ -3044,11 +3045,13 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
         return;
     pump();
     {
-        /* This window is not fb_present.c's, whose thread keeps the title
-         * bar's FPS and draws; refresh ours from the same counts. */
-        static uint32_t t0, f0;
-        wchar_t tb[128];
-        if (xbox_FramebufferWindowTitleText(tb, 128, &t0, &f0))
+        /* This window is not fb_present.c's, which keeps the title bar's
+         * name (and, with RECOMP_TRACE=title, FPS and draws); take ours
+         * from the same place. The first flip replaces the creation
+         * title with the game's name. */
+        static struct xbox_title_clock tc;
+        wchar_t tb[192];
+        if (xbox_FramebufferWindowTitleText(tb, 192, &tc))
             SetWindowTextW(s_hwnd, tb);
     }
     if (s_occ.ops)

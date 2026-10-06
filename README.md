@@ -588,7 +588,8 @@ through its own D3D8LTCG.*
 - `RECOMP_PB_REPORT_MS` (#146); `RECOMP_FB_DUMP_FLIPS=<n>` (with
   `RECOMP_FB_DUMP`) dumps the finished frame at every nth flip that drew
   something, up to 200 frames, for recordings (#156)
-- The window title shows the XBE title, FPS and draws (#153)
+- The window title shows the XBE title (or the name the game sets); FPS and
+  draws are added, once a second, only with `RECOMP_TRACE=title` (#153)
 
 ### v0.12.0 — *"Never Taken"* (September 2026)
 

@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "video_player.h"   /* the xbox_FramebufferWindow* prototypes */
+#include "window_title.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -113,20 +114,24 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
  * seen a frame late is indistinguishable from one made a frame later. */
 static volatile unsigned char s_key_down[256];
 
-/* Title bar, the way ps3recomp's window shows it. Written by the flip,
- * read once a second by the window thread; a torn read shows one stale
- * number for a second, which nobody can tell apart from a real one. */
-static wchar_t       s_xbe_title[48] = L"Xbox Recomp";
+/* Title bar (window_title.h): the game's name; with RECOMP_TRACE=title also
+ * FPS and draws, the way ps3recomp's window shows them. The counts are
+ * written by the flip and read once a second by the window thread; a torn
+ * read shows one stale number for a second, which nobody can tell apart
+ * from a real one. The certificate's name is kept as UTF-8, like the SDL
+ * window's, so both format the same text. */
+static char          s_xbe_title[128];
 static volatile LONG s_flips;
 static volatile LONG s_frame_draws;
+static volatile LONG s_name_gen;
 
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
 {
-    int i;
-    for (i = 0; i < max_chars && i < 47 && name[i]; i++)
-        s_xbe_title[i] = (wchar_t)name[i];
-    if (i)
-        s_xbe_title[i] = 0;
+    char buf[sizeof s_xbe_title];
+    if (xbox_title_utf16_to_utf8(buf, sizeof buf, name, max_chars)) {
+        memcpy(s_xbe_title, buf, strlen(buf) + 1);
+        InterlockedIncrement(&s_name_gen);
+    }
 }
 
 void xbox_FramebufferWindowFrameStats(uint32_t draws)
@@ -261,45 +266,43 @@ int xbox_FramebufferDumpBmp(const char *path)
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
 
 /* A title's own name for the window; once set it wins over the XBE
- * certificate's name in the once-a-second title bar below. */
+ * certificate's name in the title bar below. */
 static char          s_title[128] = "Xbox Recomp";
 static volatile LONG s_host_title_set;
-static HWND volatile s_hwnd;
 
 void xbox_HostWindowSetTitle(const char *title)
 {
-    HWND h;
     if (!title || !title[0])
         return;
     snprintf(s_title, sizeof(s_title), "%s", title);
     InterlockedExchange(&s_host_title_set, 1);
-    h = s_hwnd;
-    if (h)
-        SetWindowTextA(h, s_title);
+    /* The window threads pick the new name up on their next pass. */
+    InterlockedIncrement(&s_name_gen);
 }
 
-/* The title bar text: "<name> | FPS: n | draws: n". For a window that
- * refreshes it once a second -- this file's, and the D3D11 backend's own,
- * which the flip counts reach only through here. *t0 and *f0 are that
- * window's last refresh (zero before the first); 0 means not due yet. */
-int xbox_FramebufferWindowTitleText(wchar_t *tb, int n, uint32_t *t0, uint32_t *f0)
+/* The title bar text, for a window that keeps it current: this file's, and
+ * the D3D11 backend's own, which the flip counts and the name reach only
+ * through here. Returns 1, with the text in tb (n wide chars), when the
+ * window should write it: once a second with RECOMP_TRACE=title, otherwise
+ * only when the name has changed since c's last write. */
+int xbox_FramebufferWindowTitleText(wchar_t *tb, int n, struct xbox_title_clock *c)
 {
-    DWORD now = GetTickCount();
-    LONG f = s_flips;
+    static int stats = -1;
+    char u8[192];
     double fps;
+    const char *name;
 
-    if (n < 1 || (*t0 && now - *t0 < 1000))
+    if (stats < 0)
+        stats = recomp_env_on(RENV_TITLE_STATS);
+    if (n < 1 || !xbox_title_due(c, stats, GetTickCount64(),
+                                 (uint32_t)s_flips, (unsigned)s_name_gen, &fps))
         return 0;
-    fps = *t0 ? (uint32_t)(f - (LONG)*f0) * 1000.0 / (now - *t0) : 0.0;
-    if (s_host_title_set)
-        _snwprintf(tb, n - 1, L"%hs | FPS: %.1f | draws: %ld",
-                   s_title, fps, (long)s_frame_draws);
-    else
-        _snwprintf(tb, n - 1, L"%ls | FPS: %.1f | draws: %ld",
-                   s_xbe_title, fps, (long)s_frame_draws);
+    name = s_host_title_set ? s_title : s_xbe_title[0] ? s_xbe_title : s_title;
+    xbox_title_format(u8, sizeof u8, name, stats, fps, 1,
+                      (uint32_t)s_frame_draws);
+    if (!MultiByteToWideChar(CP_UTF8, 0, u8, -1, tb, n))
+        tb[0] = 0;
     tb[n - 1] = 0;
-    *t0 = now ? now : 1;
-    *f0 = (uint32_t)f;
     return 1;
 }
 
@@ -333,7 +336,6 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
-    s_hwnd = hwnd;
     hdc = GetDC(hwnd);
 
     memset(&bi, 0, sizeof(bi));
@@ -400,15 +402,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             }
         }
         {
-            static uint32_t t0, f0;
-            wchar_t tb[128];
-            if (xbox_FramebufferWindowTitleText(tb, 128, &t0, &f0))
+            static struct xbox_title_clock tc;
+            wchar_t tb[192];
+            if (xbox_FramebufferWindowTitleText(tb, 192, &tc))
                 SetWindowTextW(hwnd, tb);
         }
         Sleep(16);
     }
 
-    s_hwnd = NULL;
     ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);
     free(s_rgb);
