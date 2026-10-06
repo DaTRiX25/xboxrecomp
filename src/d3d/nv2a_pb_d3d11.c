@@ -1231,7 +1231,7 @@ static void build_stages(void)
         mode = t->raw_mode;
         if (mode && mode != 4 && (!t->on || !t->valid)) {
             /* The program asks for a texture this stage cannot give: it
-             * reads 0 now. Said once per stage, mode and format, since a
+             * reads (0, 0, 0, 1) now, as a NONE stage. Said once per stage, mode and format, since a
              * world drawn in flat vertex colour starts exactly here. */
             static uint8_t said[4][32][32];
             uint8_t bit = (uint8_t)(1u << (t->color & 7));
@@ -1856,7 +1856,9 @@ static ID3D11PixelShader *setup_pixel(void)
             /* Only 2D textures are bound: other sampling modes read 2D at
              * (s, t), as the CPU path does. */
             uint32_t m = (uint32_t)s_stage[n].mode;
-            if (m && m != 4) m = 1;
+            if (s_stage[n].raw_mode == 5)
+                m = 5;      /* CLIPPLANE reads 0, not NONE's (0, 0, 0, 1) */
+            else if (m && m != 4) m = 1;
             modes |= m << (5 * n);
         }
         /* The registers and modes that make the state: the same as the last

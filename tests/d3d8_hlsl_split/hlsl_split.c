@@ -26,8 +26,8 @@
 #define NPROG 400
 #define NCOMB 400
 #define NCASE (2 * NPROG + NCOMB)
-#define EXPECTED_HASH 0x2dabfbb4u      /* all cases, one FNV-1a */
-#define EXPECTED_CHARS 7284684u        /* re-recorded: alpha OCW mux [14], map [17:15] */
+#define EXPECTED_HASH 0x48a2fd4cu      /* all cases, one FNV-1a */
+#define EXPECTED_CHARS 7275473u        /* re-recorded: a NONE stage reads (0, 0, 0, 1) */
 
 #include "expected.h"   /* s_expect[NCASE], or HLSL_NO_EXPECT */
 
@@ -89,6 +89,33 @@ static int write_expect(const char *path)
     return 1;
 }
 
+/* Texture-shader modes the hashes above would only catch as "changed": a
+ * NONE stage reads (0, 0, 0, 1), as xemu, and CLIPPLANE reads 0 with no
+ * texture bound. Stage 0 2D, 1 NONE, 2 CLIPPLANE, 3 NONE. */
+static int texmode_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    NV2ACombinerState st;
+    int bad = 0;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u,
+                             1u | 0u << 5 | 5u << 10 | 0u << 15, &st);
+    if (d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (!strstr(text, "x9 = float4(0.0, 0.0, 0.0, 1.0);")
+            || !strstr(text, "x11 = float4(0.0, 0.0, 0.0, 1.0);")) {
+        printf("FAIL: a NONE stage does not read (0, 0, 0, 1)\n");
+        bad = 1;
+    }
+    if (strstr(text, "\n    x10 =") || strstr(text, "Texture2D tex2") || strstr(text, "tex2.Sample")) {
+        printf("FAIL: the CLIPPLANE stage is sampled or written\n");
+        bad = 1;
+    }
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -148,6 +175,8 @@ int main(void)
     printf("FAIL: no expected.h table\n");
     return 1;
 #endif
+    if (texmode_check())
+        return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (HLSL_DUMP=<file> writes the text)\n",
                s_bad, NCASE);

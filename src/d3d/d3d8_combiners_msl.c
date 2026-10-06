@@ -88,7 +88,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
          "                        constant PsConsts &pc [[buffer(0)]]");
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         int m = (int)state->tex_mode[i];
-        if (m == NV2A_TEXMODE_NONE || m == NV2A_TEXMODE_PASSTHRU)
+        if (m == NV2A_TEXMODE_NONE || m == NV2A_TEXMODE_PASSTHRU
+                || m == NV2A_TEXMODE_CLIPPLANE)
             continue;
         EMIT(",\n                        %s tex%d [[texture(%d)]], sampler samp%d [[sampler(%d)]]",
              m == NV2A_TEXMODE_3D ? "texture3d<float>" :
@@ -108,7 +109,12 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     /* ---- Texture stages ---- */
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         int m = (int)state->tex_mode[i];
-        if (m == NV2A_TEXMODE_NONE)
+        if (m == NV2A_TEXMODE_NONE) {
+            /* (0, 0, 0, 1), as xemu: see NV2ATextureMode */
+            EMIT("    x%d = float4(0.0, 0.0, 0.0, 1.0);\n", 8 + i);
+            continue;
+        }
+        if (m == NV2A_TEXMODE_CLIPPLANE)
             continue;
         if (m == NV2A_TEXMODE_PASSTHRU) {
             EMIT("    x%d = saturate(i.t%d);\n", 8 + i, i);

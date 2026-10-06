@@ -105,6 +105,33 @@ static int write_expect(const char *path)
     return 1;
 }
 
+/* Texture-shader modes the hashes above would only catch as "changed": a
+ * NONE stage reads (0, 0, 0, 1), as xemu, and CLIPPLANE reads 0 with no
+ * texture bound. Stage 0 2D, 1 NONE, 2 CLIPPLANE, 3 NONE. */
+static int texmode_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    NV2ACombinerState st;
+    int bad = 0;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u,
+                             1u | 0u << 5 | 5u << 10 | 0u << 15, &st);
+    if (d3d8_combiners_generate_msl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (!strstr(text, "x9 = float4(0.0, 0.0, 0.0, 1.0);")
+            || !strstr(text, "x11 = float4(0.0, 0.0, 0.0, 1.0);")) {
+        printf("FAIL: a NONE stage does not read (0, 0, 0, 1)\n");
+        bad = 1;
+    }
+    if (strstr(text, "\n    x10 =") || strstr(text, "texture2d<float> tex2") || strstr(text, "tex2.sample")) {
+        printf("FAIL: the CLIPPLANE stage is sampled or written\n");
+        bad = 1;
+    }
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -173,6 +200,8 @@ int main(void)
     if (s_compile)
         printf("msl_split: compiled %d cases with Metal, %d failed\n", NCASE, s_compile_bad);
     if (s_compile_bad)
+        return 1;
+    if (texmode_check())
         return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (MSL_DUMP=<file> writes the text)\n",

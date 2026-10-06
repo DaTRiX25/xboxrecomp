@@ -131,7 +131,7 @@ extern "C" {
     X(FIND_NAN,          TRACE, "find_nan",        "RECOMP_FIND_NAN",          "scan for NaN matrices at reports") \
     X(FIND_QUAD,         TRACE, "find_quad",       "RECOMP_FIND_QUAD",         "scan for quad vertices once") \
     X(D3D11_VERBOSE,     TRACE, "d3d11_verbose",   "RECOMP_D3D11_VERBOSE",     "D3D11 shader sources") \
-    X(D3D11_PX,          TRACE, "px",              "RECOMP_D3D11_PX",          "=x,y[;x,y]: D3D11 draws touching a pixel") \
+    X(D3D11_PX,          TRACE, "px",              "RECOMP_D3D11_PX",          "=x,y[;x,y]: D3D11/CPU draws touching a pixel") \
     X(D3D11_PX_FLIPS,    TRACE, "px_flips",        "RECOMP_D3D11_PX_FLIPS",    "=a[-b]: px only in those flips") \
     X(D3D11_PX_MAX,      TRACE, "px_max",          "RECOMP_D3D11_PX_MAX",      "=n: px line limit (400)") \
     X(D3D11_PX_CONSTS,   TRACE, "px_consts",       "RECOMP_D3D11_PX_CONSTS",   "=a-b,c: px also prints these constants") \

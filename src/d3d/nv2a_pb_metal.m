@@ -1147,7 +1147,9 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
         return s_fs_basic;
     for (n = 0; n < 4; n++) {
         uint32_t m = (uint32_t)s_stage[n].mode;
-        if (m && m != 4) m = 1;
+        if (s_stage[n].raw_mode == 5)
+            m = 5;          /* CLIPPLANE reads 0, not NONE's (0, 0, 0, 1) */
+        else if (m && m != 4) m = 1;
         modes |= m << (5 * n);
     }
     memcpy(key, v->rc_cicw, 32);

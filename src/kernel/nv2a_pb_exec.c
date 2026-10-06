@@ -2993,7 +2993,11 @@ static int stage_sample(int n, const float tc[4], float q, const LodTri *L,
     int mode = s_stage_mode[n];
     float s, t;
 
-    if (mode == 0) { o[0] = o[1] = o[2] = o[3] = 0.0f; return 1; }
+    /* No texture reads (0, 0, 0, 1), as xemu's psh.c (and GL's unbound
+     * sampler, for a stage whose texture is off): titles use its alpha as a
+     * constant 1, e.g. a water combiner weighting its reflections by the
+     * alpha of a stage left off goes black at 0. CLIPPLANE still reads 0. */
+    if (mode == 0) { o[0] = o[1] = o[2] = 0.0f; o[3] = 1.0f; return 1; }
     if (mode == 4) {                       /* pass-through: the coordinate */
         int k;
         for (k = 0; k < 4; k++) o[k] = clamp01(tc[k]);
@@ -3124,8 +3128,12 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
                 r[3][3] = s_vsh.fog_enable
                         ? clamp01(pa * a->fog + pb * b->fog + pc * c->fog) : 1.0f;
                 for (n = 0; n < 4; n++) {
-                    if (!s_stage_mode[n])
+                    if (!s_stage_mode[n]) {
+                        /* NONE reads (0, 0, 0, 1): see stage_sample */
+                        r[8 + n][0] = r[8 + n][1] = r[8 + n][2] = 0.0f;
+                        r[8 + n][3] = 1.0f;
                         continue;
+                    }
                     for (k = 0; k < 4; k++)
                         tc[k] = pa * a->t[n][k] + pb * b->t[n][k] + pc * c->t[n][k];
                     if (!stage_sample(n, tc, ps, &lod, r[8 + n]))
@@ -3753,8 +3761,12 @@ static void fast_rows(const FastTri *T, int y0, int step)
                 if (s_rcp.fog_var)
                     r[3][3] = clamp01(pa * a->fog + pb * b->fog + pc * c->fog);
                 for (n = 0; n < 4; n++) {
-                    if (!s_stage_mode[n])
+                    if (!s_stage_mode[n]) {
+                        /* NONE reads (0, 0, 0, 1): see stage_sample */
+                        r[8 + n][0] = r[8 + n][1] = r[8 + n][2] = 0.0f;
+                        r[8 + n][3] = 1.0f;
                         continue;
+                    }
                     for (k = 0; k < 4; k++)
                         tc[k] = pa * a->t[n][k] + pb * b->t[n][k] + pc * c->t[n][k];
                     if (!stage_sample_fast(n, tc, ps, &T->lod, r[8 + n]))
@@ -5029,6 +5041,116 @@ const uint8_t  *nv2a_pb_tex_regs_set(void)        { return s_tex_set; }
 uint32_t nv2a_pb_dma_resolve(uint32_t offset)     { return dma_resolve(offset); }
 const struct nv2a_pb_present *nv2a_pb_present_state(void) { return &s_present; }
 
+/* RECOMP_TRACE=px=x,y[;x,y],px_flips=a-b,px_max=n on the CPU path: each batch
+ * that changes one of the pixels prints its colour and depth before and
+ * after, with the state the backends read (blend, depth, stencil, alpha test,
+ * fog, texture-shader and clip-plane modes, the combiner registers and every
+ * enabled stage's registers). The D3D11 backend has its own probe on the same
+ * keys; this one is the reference to hold it, and Metal, against. Flips are
+ * the walker's count, the "[GPU] flip N" number. */
+static int s_cpx_n = -1, s_cpx_x[4], s_cpx_y[4], s_cpx_max;
+static uint32_t s_cpx_f0, s_cpx_f1;
+
+static int cpu_px_on(void)
+{
+    if (s_cpx_n < 0) {
+        const char *e = recomp_env(RENV_D3D11_PX), *f = recomp_env(RENV_D3D11_PX_FLIPS);
+        const char *m = recomp_env(RENV_D3D11_PX_MAX);
+        s_cpx_n = 0;
+        while (e && *e && s_cpx_n < 4) {
+            int x, y;
+            if (sscanf(e, "%d,%d", &x, &y) != 2)
+                break;
+            s_cpx_x[s_cpx_n] = x;
+            s_cpx_y[s_cpx_n] = y;
+            s_cpx_n++;
+            e = strchr(e, ';');
+            if (e) e++;
+        }
+        if (f) {
+            unsigned a = 0, b = 0;
+            int k = sscanf(f, "%u-%u", &a, &b);
+            s_cpx_f0 = a;
+            s_cpx_f1 = k == 2 ? b : a;
+        }
+        s_cpx_max = m ? atoi(m) : 400;
+    }
+    return s_cpx_n > 0 && s_cpx_max > 0 && s_backend == &s_cpu_backend
+        && s_gpu.flips >= s_cpx_f0 && s_gpu.flips <= s_cpx_f1;
+}
+
+static uint32_t cpu_px_read(int n)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = surface_bpp();
+    uint32_t x = (uint32_t)s_cpx_x[n], y = (uint32_t)s_cpx_y[n];
+    const uint8_t *p;
+    size_t at;
+
+    if (!s_gpu.color_offset || (bpp != 2 && bpp != 4)
+            || x >= s_gpu.clip_x + s_gpu.clip_w || y >= s_gpu.clip_y + s_gpu.clip_h)
+        return 0xDEADBEEFu;
+    if (surface_swizzled()) {       /* a swizzled target has no rows */
+        long i = surface_swizzle_index((int)x, (int)y);
+        if (i < 0)
+            return 0xDEADBEEFu;
+        at = (size_t)i * bpp;
+    } else {
+        if (!s_gpu.pitch)
+            return 0xDEADBEEFu;
+        at = (size_t)y * s_gpu.pitch + (size_t)x * bpp;
+    }
+    p = mem + dma_resolve(s_gpu.color_offset) + at;
+    return bpp == 4 ? *(const uint32_t *)p : *(const uint16_t *)p;
+}
+
+static float cpu_px_z(int n)
+{
+    uint32_t x = (uint32_t)s_cpx_x[n], y = (uint32_t)s_cpx_y[n];
+    if (!s_zbuf || x >= s_zbuf_w || y >= s_zbuf_h)
+        return -1.0f;
+    return s_zbuf[(size_t)y * s_zbuf_w + x];
+}
+
+static void cpu_px_report(const uint32_t before[4], const float zb[4])
+{
+    int n, st;
+    uint32_t k;
+
+    for (n = 0; n < s_cpx_n; n++) {
+        uint32_t after = cpu_px_read(n);
+        if (after == before[n] || s_cpx_max <= 0)
+            continue;
+        s_cpx_max--;
+        fprintf(stderr, "[CPU-PX] flip %u batch %u px (%d,%d) %08X -> %08X z %.6f -> %.6f"
+                        " | surf 0x%08X fmt 0x%X | prim %u n %u prog %d start %u"
+                        " | blend %d %X/%X eq %X keep %08X | z %d func %X mask %d"
+                        " zeta 0x%X | sten %d | atest %d %X %u | cull %d %X | fog %d %X"
+                        " | shader 0x%X clip 0x%X ctl 0x%X fcw %08X/%08X | ctl0 %X\n",
+                s_gpu.flips, s_gpu.draws, s_cpx_x[n], s_cpx_y[n], before[n], after,
+                zb[n], cpu_px_z(n), s_gpu.color_offset, s_gpu.format, s_gpu.prim,
+                s_gpu.idx_count, vsh_batch_active(), s_vsh.start, s_gpu.blend_enable,
+                s_gpu.blend_sfactor, s_gpu.blend_dfactor, s_gpu.blend_equation,
+                s_gpu.color_keep, s_vsh.depth_enable, s_vsh.depth_func, s_vsh.depth_mask,
+                s_vsh.zeta_offset, s_vsh.stencil_enable, s_vsh.atest_enable,
+                s_vsh.atest_func, s_vsh.atest_ref, s_vsh.cull_enable, s_vsh.cull_face,
+                s_vsh.fog_enable, s_vsh.fog_mode, s_vsh.shader_prog, s_vsh.clip_plane_mode,
+                s_vsh.rc_ctl, s_vsh.rc_fcw0, s_vsh.rc_fcw1, s_vsh.control0);
+        for (k = 0; k < (s_vsh.rc_ctl & 0xF) && k < 8; k++)
+            fprintf(stderr, "[CPU-PX]   rc%u ci %08X ai %08X co %08X ao %08X f0 %08X f1 %08X\n",
+                    k, s_vsh.rc_cicw[k], s_vsh.rc_aicw[k], s_vsh.rc_cocw[k],
+                    s_vsh.rc_aocw[k], s_vsh.rc_f0[k], s_vsh.rc_f1[k]);
+        for (st = 0; st < 4; st++) {
+            const uint32_t *r = &s_tex_reg[(0x40u * st) / 4];
+            if (!(r[3] & 0x40000000u))      /* CONTROL0 enable */
+                continue;
+            fprintf(stderr, "[CPU-PX]   stage %d off %08X fmt %08X addr %08X ctl0 %08X"
+                            " ctl1 %08X filt %08X rect %08X\n",
+                    st, r[0], r[1], r[2], r[3], r[4], r[5], r[7]);
+        }
+    }
+}
+
 /* What a batch actually contains. Before anything can be rasterised, the
  * question is what space attribute 0 arrives in: a title running a vertex
  * program hands over object-space positions that mean nothing without running
@@ -5076,7 +5198,18 @@ static void draw_primitive(void)
         d.inline_buf   = s_gpu.inline_buf;
         d.inline_bytes = s_gpu.inline_count * 4;
         d.program      = vsh_batch_active();
-        s_backend->on_draw(&d);
+        if (cpu_px_on()) {
+            uint32_t before[4] = {0};
+            float zb[4] = {0};
+            int n;
+            for (n = 0; n < s_cpx_n; n++) {
+                before[n] = cpu_px_read(n);
+                zb[n] = cpu_px_z(n);
+            }
+            s_backend->on_draw(&d);
+            cpu_px_report(before, zb);
+        } else
+            s_backend->on_draw(&d);
         s_perf.draw += rt_now() - t0;
         if (s_backend->writes_back)
             s_gpu_backend_batches++;

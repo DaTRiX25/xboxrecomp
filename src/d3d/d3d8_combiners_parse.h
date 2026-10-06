@@ -98,16 +98,23 @@ typedef enum NV2AOutputMapping {
 
 /**
  * Texture-shader mode per stage: the hardware's SET_SHADER_STAGE_PROGRAM
- * field, which is also the XDK's PS_TEXTUREMODES value. Modes above 4 (dot
+ * field, which is also the XDK's PS_TEXTUREMODES value. Modes above 5 (dot
  * products, bump mapping, ...) are sampled as 2D at (s, t), as the CPU path
  * does.
+ *
+ * A stage with no texture is not zero: xemu's psh.c gives a NONE stage
+ * (0, 0, 0, 1), as GL does for an unbound sampler, and titles read its
+ * alpha as a constant 1: a water combiner that weights its reflections by
+ * the alpha of a stage left off draws them black at 0. CLIPPLANE reads 0.
  */
 typedef enum NV2ATextureMode {
-    NV2A_TEXMODE_NONE     = 0,  /* No texture: the stage reads zero */
+    NV2A_TEXMODE_NONE     = 0,  /* No texture: the stage reads (0, 0, 0, 1) */
     NV2A_TEXMODE_2D       = 1,  /* PROJECT2D */
     NV2A_TEXMODE_3D       = 2,  /* PROJECT3D: volume texture */
     NV2A_TEXMODE_CUBEMAP  = 3,  /* Cube map */
     NV2A_TEXMODE_PASSTHRU = 4,  /* The coordinate itself, clamped */
+    NV2A_TEXMODE_CLIPPLANE = 5, /* No texture, reads zero; the coordinate is
+                                 * clip distances (the CPU path kills there) */
 } NV2ATextureMode;
 
 /* ================================================================
