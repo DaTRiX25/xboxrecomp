@@ -8,6 +8,8 @@ add_library(xbox_video STATIC
 # the process main thread (fb_present_sdl.c, xbox_HostWindowMain).
 if(WIN32)
     target_sources(xbox_video PRIVATE fb_present.c)
+    # The GDI window records keys in src/input's key table.
+    target_link_libraries(xbox_video PUBLIC xbox_input)
 else()
     find_package(SDL2 REQUIRED)
     target_sources(xbox_video PRIVATE fb_present_sdl.c)

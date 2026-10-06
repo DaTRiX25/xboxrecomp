@@ -221,6 +221,7 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
 /* The host's own pad, through the layer that already maps one to XInput.
  * A real controller plugged into the PC drives this emulated one. */
 #include "../input/xinput_xbox.h"
+#include "../input/keyboard.h"   /* xbox_FramebufferKeyDown */
 
 /*
  * The Xbox report is 20 bytes and fixed:
@@ -588,7 +589,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
         if (diag < 0)
             diag = recomp_env(RENV_INPUT_DIAG) != NULL;
         if (diag) {
-            extern int xbox_FramebufferKeyDown(int vk);
             static unsigned long last;
             unsigned long now = (unsigned long)GetTickCount();
             if (now - last > 1000) {

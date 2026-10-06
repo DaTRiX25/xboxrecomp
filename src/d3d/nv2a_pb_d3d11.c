@@ -245,8 +245,38 @@ static int        s_blend_n;
 
 /* ------------------------------------------------------------------------- */
 
+/* The pad stand-in's key table (src/input/keyboard.c); declared here rather
+ * than included so this file keeps no dependency on src/input's headers. */
+extern void xbox_InputKeySet(int vk, int down);
+extern void xbox_InputKeysClear(void);
+
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    switch (m) {
+    /* Keys for RECOMP_KEYBOARD, as the GDI window (fb_present.c) records
+     * them. This window is the only one a D3D11 run has, so without these
+     * the keyboard is a port-0 pad that never presses anything. */
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        xbox_InputKeySet((int)w, 1);
+        if (recomp_env(RENV_KEY_TRACE)) {
+            static unsigned n;
+            if (n++ < 40) {
+                fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)w);
+                fflush(stderr);
+            }
+        }
+        /* System keys still go to Windows, or Alt+F4 stops closing us. */
+        return m == WM_SYSKEYDOWN ? DefWindowProcA(h, m, w, l) : 0;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        xbox_InputKeySet((int)w, 0);
+        return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
+    /* Alt-tabbing away with a key held would leave it held for ever. */
+    case WM_KILLFOCUS:
+        xbox_InputKeysClear();
+        return 0;
+    }
     if (m == WM_CLOSE) {
         /* Closing the window ends the run, like the CPU path's window. */
         ExitProcess(0);

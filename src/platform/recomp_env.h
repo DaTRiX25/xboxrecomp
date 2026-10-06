@@ -123,7 +123,7 @@ extern "C" {
     X(USB_TRACE,         TRACE, "usb",             "RECOMP_USB_TRACE",         "OHCI trace") \
     X(USB_STATS,         TRACE, "usb_stats",       "RECOMP_USB_STATS",         "OHCI summary line every 5 s") \
     X(INPUT_DIAG,        TRACE, "input_diag",      "RECOMP_INPUT_DIAG",        "input chain probe once a second") \
-    X(KEY_TRACE,         TRACE, "key",             "RECOMP_KEY_TRACE",         "window key-down events") \
+    X(KEY_TRACE,         TRACE, "key",             "RECOMP_KEY_TRACE",         "key-down events, every window") \
     X(TITLE_STATS,       TRACE, "title",           NULL,                       "window title also shows FPS and draws, once a second") \
     X(CS_TRACE_CRT,      TRACE, "cs_crt",          "RECOMP_CS_TRACE_CRT",      "CRT critical sections; =all every one") \
     X(CS_WATCH,          TRACE, "cs_watch",        "RECOMP_CS_WATCH",          "=va: critical section at that address") \

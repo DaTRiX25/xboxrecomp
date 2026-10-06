@@ -101,18 +101,16 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     InterlockedExchange(&s_present_idx, next);
 }
 
-/* Which keys are down, for the pad stand-in in src/input.
+/* Which keys are down, for the pad stand-in in src/input: this window
+ * records them in the shared key table (src/input/keyboard.c).
  *
  * GetAsyncKeyState looked like the cheaper way to ask and does not work
  * here: it reads a state Wine keeps for the X server, and a guest process
  * drawing through GDI never sees it change. The window that has the focus
  * is the thing that receives the keys, so that is what has to remember
- * them.
- *
- * Reading this needs no lock. Each entry is written only by the window
- * thread and read only by the USB thread, one byte at a time, and a press
- * seen a frame late is indistinguishable from one made a frame later. */
-static volatile unsigned char s_key_down[256];
+ * them. Declared rather than included, as src/input does for this side. */
+extern void xbox_InputKeySet(int vk, int down);
+extern void xbox_InputKeysClear(void);
 
 /* Title bar (window_title.h): the game's name; with RECOMP_TRACE=title also
  * FPS and draws, the way ps3recomp's window shows them. The counts are
@@ -140,13 +138,6 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
     InterlockedExchange(&s_frame_draws, (LONG)draws);
 }
 
-int xbox_FramebufferKeyDown(int vk)
-{
-    if ((unsigned)vk > 255)
-        return 0;
-    return s_key_down[vk] != 0;
-}
-
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -157,8 +148,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-        if ((unsigned)w < 256)
-            s_key_down[w] = 1;
+        xbox_InputKeySet((int)w, 1);
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
          *
          * The obvious diagnostic -- sampling which keys are held, once a
@@ -179,13 +169,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
-        if ((unsigned)w < 256)
-            s_key_down[w] = 0;
+        xbox_InputKeySet((int)w, 0);
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
-        memset((void *)s_key_down, 0, sizeof s_key_down);
+        xbox_InputKeysClear();
         return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -438,7 +427,6 @@ void xbox_FramebufferWindowStart(void)
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 #endif

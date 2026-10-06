@@ -85,6 +85,7 @@
 #include <strings.h>
 #include "fb_present_metal.h"
 #endif
+#include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
@@ -130,9 +131,6 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 }
 
 void xbox_FramebufferWindowStart(void) {}
-
-/* No keyboard path on POSIX: the keyboard pad (xinput_device.c) is Win32-only. */
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 
 static void present_copy(uint32_t fb_va, uint32_t pitch);
 static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
@@ -610,6 +608,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     s_frame_event = s_guest_done_event + 1;
     s_guest_main = guest_main;
     xbox_InputSetMainPump(1);
+    xbox_InputSdlInit();
     xbox_log_thread_role("sdl-main", 0);
     s_running = 1;
     if (!start_guest()) {
@@ -633,6 +632,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
          * xinput_device.c then only reads. */
         if (SDL_WaitEventTimeout(&ev, 100)) {
             do {
+                /* Keys for the pad stand-in, and the window events that
+                 * release them; it only reads the event. */
+                xbox_InputSdlEvent(&ev);
                 if (ev.type == SDL_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)

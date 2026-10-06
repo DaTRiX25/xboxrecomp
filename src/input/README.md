@@ -11,6 +11,8 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 | `input_core.c` | The public API: connection cache, probe backoff, keyboard merge, shutdown |
 | `input_backend.h` | The seam between `input_core.c` and a host backend (tests swap it) |
 | `xinput_device.c` | Host backends: XInput (Windows, Proton) and SDL2 GameController |
+| `keyboard.c` | The key table and the one key map, every host |
+| `keyboard_sdl.c` | The SDL window's key and focus events into that table (POSIX) |
 
 ## Quick Start
 
@@ -159,6 +161,58 @@ and fails if the table below and the code disagree. Regenerate it with
 | Right stick X | `sThumbRX` | -32768..32767, right positive | `sThumbRX` | `RIGHTX` |
 | Right stick Y | `sThumbRY` | -32768..32767, up positive | `sThumbRY` | `RIGHTY` as `-1 - v` |
 <!-- input_map:end -->
+
+### Keyboard → Xbox mapping
+
+With `RECOMP_KEYBOARD=1` (and the host pad on) the keyboard is a pad on
+port 0, merged on top of a controller there: a real pad keeps working and
+the keys only add. One map in `keyboard.c` serves every host: the Win32
+windows (GDI and D3D11, under Proton too) record Windows virtual-key codes,
+and the SDL window on macOS and Linux turns SDL keycodes into the same codes
+(`keyboard_sdl.c`). `tests/input_keyboard` checks every row and fails if the
+table below and the code disagree; regenerate it with
+`INPUT_KEYBOARD_README_OUT=<file>` set when running the test.
+
+- Keys are read only while the game's window has the focus. Losing the
+  focus (and on SDL, hiding or minimising the window) releases every key.
+- Letters follow the keyboard layout (the key labelled Z), not the
+  physical position. The digits differ between hosts: on AZERTY the top-row
+  keys labelled 1 and 3 give SDL the keycodes for `&` and `"` (an SDL
+  keycode ignores Shift), so the 1 and 3 trigger keys do nothing in the
+  SDL window there, while Win32 reports the same keys as VK `1` and `3`. Auto-repeat is ignored, and on macOS Cmd+key is left to
+  the system (Cmd going down releases the held keys).
+- Face buttons, shoulders and triggers read 255 held, 0 released; stick keys
+  give full deflection, and opposite keys cancel.
+- `RECOMP_KEY_TRACE=1` logs the first 40 key-downs as `[KEY] down vk=0x..`.
+
+<!-- keyboard_map:begin (generated from src/input/keyboard.c; tests/input_keyboard checks it) -->
+| Key | Guest control |
+|---|---|
+| Up arrow | D-pad up |
+| Down arrow | D-pad down |
+| Left arrow | D-pad left |
+| Right arrow | D-pad right |
+| Enter | START |
+| Backspace | BACK |
+| Shift | Left stick click |
+| Ctrl | Right stick click |
+| Z | A |
+| X | B |
+| C | X |
+| V | Y |
+| Q | White |
+| E | Black |
+| 1 | Left trigger |
+| 3 | Right trigger |
+| W or keypad 8 | Left stick up |
+| S or keypad 2 | Left stick down |
+| A or keypad 4 | Left stick left |
+| D or keypad 6 | Left stick right |
+| I | Right stick up |
+| K | Right stick down |
+| J | Right stick left |
+| L | Right stick right |
+<!-- keyboard_map:end -->
 
 ## Connection state and rumble
 
