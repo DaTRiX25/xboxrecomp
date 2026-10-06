@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"
 #include "recomp_env.h"
 #include "kernel.h"
+#include "kernel_missing.h"
 #include "kernel_pacing.h"
 #include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
 #include <stdio.h>
@@ -2591,6 +2592,16 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * its last second is past the header. Bounded, in case the frame
      * thread is wedged inside a write. */
     apu_wav_close_nowait(500);
+    /* Counts only, without the report's lock: the thread being reported
+     * on may be wedged anywhere, inside that lock included. */
+    {
+        uint32_t hi, lo;
+        xbox_missing_counts(&hi, &lo, NULL);
+        if (hi + lo)
+            fprintf(stderr, "  [FILE] missing at watchdog: %u high, %u low\n",
+                    (unsigned)hi, (unsigned)lo);
+        fflush(stderr);
+    }
     _exit(3);
     return 0;
 }

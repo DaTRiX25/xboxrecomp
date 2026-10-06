@@ -170,8 +170,7 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
 /* ======================================================================== */
 /* Shared by both backends, for the same reason as xbox_LastFileError: the
  * bridge calls it unconditionally, and a _WIN32-only definition breaks every
- * POSIX link. The Win32 backend fills this during translation; the POSIX one
- * does not yet, so it reads empty there. */
+ * POSIX link. Both backends fill it at the end of a rule translation. */
 static XBOX_THREAD_LOCAL wchar_t s_last_host_path_shared[MAX_PATH];
 
 const wchar_t *xbox_LastHostPath(void)
@@ -271,6 +270,58 @@ static int xbox_partition_device_digit(const char *xbox_path)
     if (*rest == '\\' || *rest == '/')
         rest++;
     return *rest == '\0' ? digit : 0;
+}
+
+/*
+ * The tree a guest path lands in, for the missing-file report.
+ *
+ * It walks the same links and the same rules, in the same order, as
+ * xbox_translate_path, so the two cannot disagree about where a path goes --
+ * but it prints no [PATH] line and creates no directory, which translating a
+ * second time would (both backends make the save and cache directories on
+ * every call). Shared by both backends: the table, resolve_symlink and the
+ * partition-device test are.
+ */
+int xbox_path_tree(const char *xbox_path)
+{
+    char linked[2][512];
+    const char *p = xbox_path;
+    int i, hop;
+
+    if (!p || !p[0])
+        return XBOX_TREE_UNKNOWN;
+    /* Relative to a RootDirectory handle (XDeleteSaveGame opens each child
+     * of a save directory that way): no rule ever sees it. */
+    if (p[0] != '\\' && !(isalpha((unsigned char)p[0]) && p[1] == ':'))
+        return XBOX_TREE_UNKNOWN;
+
+    /* xbox_translate_path recurses once per link; a title can chain them. */
+    for (hop = 0; hop < 8; hop++) {
+        if (!resolve_symlink(p, linked[hop & 1], sizeof linked[0]))
+            break;
+        p = linked[hop & 1];
+    }
+
+    if (xbox_partition_device_digit(p))
+        return XBOX_TREE_DEVICE;
+    {
+        const char *d = p;
+        int n;
+        if (match_prefix(d, "\\??\\"))
+            d += 4;
+        n = match_prefix(d, "\\Device\\CdRom0");
+        if (n && d[n] == '\\' && d[n + 1] == '\0')
+            n++;
+        if (n && d[n] == '\0')
+            return XBOX_TREE_DEVICE;
+    }
+
+    for (i = 0; i < PATH_RULE_COUNT; i++) {
+        if (match_prefix(p, s_rules[i].prefix))
+            return s_rules[i].to_save == 2 ? XBOX_TREE_USER
+                 : s_rules[i].to_save     ? XBOX_TREE_HDD : XBOX_TREE_GAME;
+    }
+    return XBOX_TREE_UNKNOWN;
 }
 
 #if defined(_WIN32)
@@ -743,6 +794,17 @@ translate:
         }
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+        /* As the Win32 backend does: the bridge reads back the host path
+         * the call it just made translated (the missing-file report, the
+         * FMV hook). Bytes widen one to one; the readers narrow them the
+         * same way, so ASCII host paths survive and others are out of
+         * scope on both backends. */
+        {
+            size_t k;
+            for (k = 0; k + 1 < MAX_PATH && host_path_buf[k]; k++)
+                s_last_host_path_shared[k] = (wchar_t)(unsigned char)host_path_buf[k];
+            s_last_host_path_shared[k] = 0;
+        }
         return TRUE;
     }
 }

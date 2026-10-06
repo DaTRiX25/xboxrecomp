@@ -30,6 +30,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include "recomp_env.h"
+#include "recomp_exit_hook.h"
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
@@ -278,7 +279,9 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
     if (m == WM_CLOSE) {
-        /* Closing the window ends the run, like the CPU path's window. */
+        /* Closing the window ends the run, like the CPU path's window.
+         * ExitProcess skips atexit, where the missing-file summary prints. */
+        recomp_exit_hook_run("window");
         ExitProcess(0);
     }
     if (m == WM_SIZE && w != SIZE_MINIMIZED && LOWORD(l) && HIWORD(l)) {

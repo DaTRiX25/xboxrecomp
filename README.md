@@ -564,6 +564,11 @@ through its own D3D8LTCG.*
 - ISRs and DPCs run at their IRQL and restore it; `KPCR.Irql` is published
   (#148)
 - The DPC queue is locked, and `KDPC.Inserted` is honoured (#155)
+- A game file the dump lacks is named once, `[FILE] missing <guest> ->
+  <host>`, with a summary at exit; repeats of its FAILED line are counted,
+  not printed. `RECOMP_TRACE=missing=all` also lists probes and every
+  attempt, `=0` turns it off. NtOpenFile and IoCreateFile log their opens,
+  and POSIX returns PATH_NOT_FOUND for a missing directory, as Win32 does
 
 **Audio**
 

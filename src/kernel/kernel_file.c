@@ -59,8 +59,8 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  * with an undefined symbol -- invisible until something links an executable,
  * because a static archive never resolves its own references.
  *
- * The POSIX backend does not populate this yet, so it reads 0 there; that is a
- * missing detail rather than a missing symbol, and it is visible here. */
+ * Both backends set it on a failed open: the Win32 error, or on POSIX the
+ * Win32 code its errno corresponds to (NtCreateFile only). */
 uint32_t g_xbox_last_file_error;
 
 uint32_t xbox_LastFileError(void)
@@ -187,6 +187,31 @@ static void overwrite_settle(HANDLE h)
 {
     if (overwrite_take(h))
         truncate_to_zero(h);
+}
+
+/* The missing-file report's high/low split: a miss under a directory that
+ * exists is a file the dump lacks; one under a directory that does not is
+ * usually a title probing a loose-file layout it never shipped. Same answer
+ * as the POSIX version below for the same tree. */
+int xbox_host_parent_exists(const xbox_host_char *host_path)
+{
+    WCHAR dir[MAX_PATH];
+    const WCHAR *cut;
+    DWORD attrs;
+
+    if (!host_path)
+        return 0;
+    cut = wcsrchr(host_path, L'\\');
+    {
+        const WCHAR *fwd = wcsrchr(host_path, L'/');
+        if (fwd && (!cut || fwd > cut)) cut = fwd;
+    }
+    if (!cut || cut == host_path || (size_t)(cut - host_path) >= MAX_PATH)
+        return 0;
+    memcpy(dir, host_path, (size_t)(cut - host_path) * sizeof(WCHAR));
+    dir[cut - host_path] = 0;
+    attrs = GetFileAttributesW(dir);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
@@ -988,6 +1013,23 @@ static ULONG mode_to_xbox_attrs(mode_t m)
     return a;
 }
 
+/* See the Win32 version: the same test, the same answer. */
+int xbox_host_parent_exists(const xbox_host_char *host_path)
+{
+    char dir[MAX_PATH];
+    const char *cut;
+    struct stat st;
+
+    if (!host_path)
+        return 0;
+    cut = strrchr(host_path, '/');
+    if (!cut || cut == host_path || (size_t)(cut - host_path) >= sizeof dir)
+        return 0;
+    memcpy(dir, host_path, (size_t)(cut - host_path));
+    dir[cut - host_path] = '\0';
+    return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 static NTSTATUS errno_to_status(int e)
 {
     switch (e) {
@@ -1057,12 +1099,25 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (fd < 0) {
         int e = errno;
+        NTSTATUS st = errno_to_status(e);
+        /* ENOENT covers a missing file and a missing directory alike. The
+         * console and the Win32 backend (ERROR_PATH_NOT_FOUND) tell them
+         * apart, and a title may branch on which, so POSIX does too. */
+        int no_dir = e == ENOTDIR || (e == ENOENT && !xbox_host_parent_exists(host_path));
+        if (no_dir)
+            st = STATUS_OBJECT_PATH_NOT_FOUND;
+        /* The Win32 code, as the Win32 backend keeps it, for the bridge's
+         * FAILED line: it read win32 err=0 on every POSIX failure. */
+        g_xbox_last_file_error = no_dir ? 3u
+                               : e == ENOENT ? 2u
+                               : (e == EACCES || e == EPERM) ? 5u
+                               : e == EEXIST ? 80u : 0u;
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
             IoStatusBlock->Information = 0;
         }
-        return errno_to_status(e);
+        return st;
     }
 
     *FileHandle = w32_open_handle(fd, host_path);

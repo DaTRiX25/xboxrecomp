@@ -559,6 +559,25 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+/*
+ * Which tree a guest path lands in, from the same rule that translates it
+ * (after the title's own drive links). Prints nothing and creates nothing,
+ * so the missing-file report can ask without side effects. A name that is
+ * not absolute (relative to a RootDirectory handle) is UNKNOWN: no rule
+ * translates it.
+ */
+enum {
+    XBOX_TREE_UNKNOWN = 0,
+    XBOX_TREE_GAME,     /* the game files directory: D:, CdRom0, E:, C:, Y: */
+    XBOX_TREE_HDD,      /* the HDD root: T:, U:, Z:, the cache partitions   */
+    XBOX_TREE_USER,     /* the UDATA/TDATA saves                            */
+    XBOX_TREE_DEVICE,   /* a bare device: CdRom0, a PartitionN image        */
+};
+int xbox_path_tree(const char *xbox_path);
+
+/* 1 when the directory holding host_path exists (kernel_file.c, per backend). */
+int xbox_host_parent_exists(const xbox_host_char *host_path);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */
