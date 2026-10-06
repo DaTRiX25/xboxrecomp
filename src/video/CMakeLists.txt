@@ -12,6 +12,14 @@ else()
     find_package(SDL2 REQUIRED)
     target_sources(xbox_video PRIVATE fb_present_sdl.c)
     target_link_libraries(xbox_video PUBLIC SDL2::SDL2 xbox_input)
+    if(APPLE)
+        # The window's CAMetalLayer present for the Metal backend (manual
+        # retain/release, like nv2a_pb_metal.m).
+        target_sources(xbox_video PRIVATE fb_present_metal.m)
+        target_link_libraries(xbox_video PUBLIC
+            "-framework Metal" "-framework QuartzCore" "-framework CoreGraphics"
+            "-framework Foundation")
+    endif()
 endif()
 target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

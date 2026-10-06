@@ -296,11 +296,17 @@ struct nv2a_pb_backend {
     void (*on_zpass_clear)(void);
     int  (*on_report)(uint32_t va);
     void (*on_poll)(void);
-    /* Capabilities. writes_back: on_flip leaves the finished frame in the
-     * guest present surface (Metal), so the walker's guest-memory dumps
-     * (RECOMP_FB_DUMP_FLIPS) see what it drew; D3D11 presents from its own
-     * swap chain and the null backend draws nothing. */
+    /* Capabilities. writes_back: the backend's frames are dumped from guest
+     * memory (RECOMP_FB_DUMP, fb_dump_at, RECOMP_FB_DUMP_FLIPS), after
+     * sync_guest when it has one (Metal); D3D11 presents and dumps from its
+     * own swap chain and the null backend draws nothing. */
     int  writes_back;
+    /* sync_guest (optional): the executor is about to read the guest bytes
+     * of the surface at colour offset `offset`, w x h at `pitch` (a frame
+     * dump); a backend that keeps the surface on the GPU writes it back now.
+     * Called on the ack thread only, like on_flip. NULL: guest memory is
+     * already current (CPU) or never read (D3D11 dumps itself). */
+    void (*sync_guest)(uint32_t offset, uint32_t pitch, uint32_t w, uint32_t h);
 };
 
 /* Route the executor's events to `backend`. NULL restores the CPU rasteriser.

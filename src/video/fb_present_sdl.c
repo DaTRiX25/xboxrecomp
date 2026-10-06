@@ -22,6 +22,15 @@
  * same bytes RECOMP_FB_DUMP writes (bpp from pitch / width, 2 = R5G6B5,
  * 4 = X8R8G8B8), so the window shows what the dump shows.
  *
+ * With RECOMP_PB_BACKEND=metal the window is a CAMetalLayer instead
+ * (fb_present_metal.m; metal_present=readback keeps the SDL renderer): the
+ * presenter owns the Metal device and queue and the backend adopts them
+ * (xbox_FramebufferWindowMetal), so a frame drawn on the GPU reaches the
+ * window by a blit into the back slot's texture
+ * (xbox_FramebufferWindowBackTexture, then PublishTexture, inside the same
+ * s_in_present handshake) and never through guest memory. Guest-bytes frames are uploaded into a slot. When the
+ * layer cannot be set up, the window is re-created with the SDL renderer.
+ *
  * RECOMP_HEADLESS=1 (or no display, or SDL video failing to start) skips all
  * of it: the guest runs on the main thread exactly as before.
  *
@@ -32,10 +41,11 @@
  * RECOMP_WINDOW_SHOT=<flip>[,<flip>...]: read back what the renderer drew for
  * the frame of that walker flip count (the number RECOMP_FB_DUMP_FLIPS and
  * RECOMP_FLIP_LOG print), at the window's pixel size, with
- * SDL_RenderReadPixels, into <prefix>win_flip<NNNNN>.bmp. <prefix> is
- * RECOMP_WINDOW_SHOT_PREFIX, else RECOMP_FB_DUMP, else "window_". A flip the
- * window dropped is shot at the next frame it shows, under that frame's own
- * flip number. Only the process's own pixels are read.
+ * SDL_RenderReadPixels (the layer: a blit of the drawable), into
+ * <prefix>win_flip<NNNNN>.bmp. <prefix> is RECOMP_WINDOW_SHOT_PREFIX, else
+ * RECOMP_FB_DUMP, else "window_". A flip the window dropped is shot at the
+ * next frame it shows, under that frame's own flip number. Only the
+ * process's own pixels are read.
  *
  * RECOMP_WINDOW_QUIT_AFTER=<seconds>: post SDL_QUIT then, the event the
  * window's close button produces, so a script can test the close path.
@@ -71,6 +81,10 @@
 #include "kernel/nv2a_pb_state.h"
 #include "kernel/nv2a_backend_common.h"
 #include "window_title.h"
+#if defined(__APPLE__)
+#include <strings.h>
+#include "fb_present_metal.h"
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
@@ -94,6 +108,10 @@ static volatile int    s_running;            /* window up: flips copy */
 static Uint32          s_frame_event;        /* wakes the main loop */
 static volatile int    s_wake_pending;
 static volatile int    s_in_present;         /* ack thread inside Present */
+/* Layer mode (macOS, Metal backend): the window has a CAMetalLayer and no
+ * SDL_Renderer, and a slot is a GPU texture in fb_present_metal.m (indexed by
+ * slot number) rather than bytes. Set once before the guest starts. */
+static int             s_layer;
 
 /* Ack-thread side counters, read by the stats line. */
 static uint64_t s_flips, s_copy_ns;          /* relaxed atomics */
@@ -185,32 +203,16 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
 /* The copy and the publish, from any w x h image of `bpp` bytes a pixel,
  * `pitch` bytes a row: guest memory for present_copy, a GPU backend's own
  * readback for xbox_FramebufferWindowPresentPixels. */
-static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
-                           uint32_t pitch, uint32_t bpp, uint64_t t0)
+/* The back slot is filled: make it the ready one. An unshown ready frame is
+ * overwritten (dropped), never waited for. */
+static void publish(uint32_t w, uint32_t h, uint32_t bpp, uint64_t t0)
 {
-    struct fb_slot *s;
-    size_t need;
-    uint32_t y;
+    struct fb_slot *s = &s_slot[s_back];   /* only this thread touches s_back */
 
-    s = &s_slot[s_back];               /* only this thread touches s_back */
-    need = (size_t)w * h * bpp;
-    if (s->cap < need) {
-        uint8_t *n = (uint8_t *)realloc(s->px, need);
-        if (!n)
-            return;
-        s->px = n;
-        s->cap = need;
-    }
-    for (y = 0; y < h; y++)
-        memcpy(s->px + (size_t)y * w * bpp, src + (size_t)y * pitch,
-               (size_t)w * bpp);
     s->w = w;
     s->h = h;
     s->bpp = bpp;
     s->flip = nv2a_pb_gpu_state()->flips;
-
-    /* Publish: the finished slot becomes the ready one. An unshown ready
-     * frame is overwritten (dropped), never waited for. */
     pthread_mutex_lock(&s_lock);
     {
         int t = s_ready;
@@ -230,6 +232,96 @@ static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
 
     __atomic_add_fetch(&s_flips, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&s_copy_ns, now_ns(CLOCK_MONOTONIC) - t0, __ATOMIC_RELAXED);
+}
+
+/* The copy and the publish, from any w x h image of `bpp` bytes a pixel,
+ * `pitch` bytes a row: guest memory for present_copy, a GPU backend's own
+ * readback for xbox_FramebufferWindowPresentPixels. In layer mode the image
+ * is uploaded into the back slot's texture instead. */
+static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
+                           uint32_t pitch, uint32_t bpp, uint64_t t0)
+{
+    struct fb_slot *s;
+    size_t need;
+    uint32_t y;
+
+#if defined(__APPLE__)
+    if (s_layer) {
+        if (fbm_upload(s_back, src, w, h, pitch, bpp))
+            publish(w, h, 4, t0);
+        return;
+    }
+#endif
+    s = &s_slot[s_back];               /* only this thread touches s_back */
+    need = (size_t)w * h * bpp;
+    if (s->cap < need) {
+        uint8_t *n = (uint8_t *)realloc(s->px, need);
+        if (!n)
+            return;
+        s->px = n;
+        s->cap = need;
+    }
+    for (y = 0; y < h; y++)
+        memcpy(s->px + (size_t)y * w * bpp, src + (size_t)y * pitch,
+               (size_t)w * bpp);
+    publish(w, h, bpp, t0);
+}
+
+/* ── Layer mode: the Metal backend's side (nv2a-ack thread) ─────────────── */
+
+/* 1 with the layer's device and queue when the window presents GPU slot
+ * textures; the Metal backend adopts them at its init. 0 otherwise
+ * (headless, the renderer window, not macOS). */
+int xbox_FramebufferWindowMetal(void **device, void **queue)
+{
+#if defined(__APPLE__)
+    if (s_layer) {
+        fbm_get(device, queue);
+        return 1;
+    }
+#endif
+    (void)device;
+    (void)queue;
+    return 0;
+}
+
+/* The back slot's id<MTLTexture> at w x h, for the backend to blit its frame
+ * into, or NULL (no layer, window closing). A non-NULL return must be
+ * followed by xbox_FramebufferWindowPublishTexture: the ack thread counts as
+ * inside a present from here to there (the close path's handshake). */
+static uint64_t s_tex_t0;
+void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h)
+{
+#if defined(__APPLE__)
+    void *t;
+    if (!s_layer || !__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !w || !h)
+        return NULL;
+    __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST)) {
+        __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+        return NULL;
+    }
+    s_tex_t0 = now_ns(CLOCK_MONOTONIC);
+    t = fbm_slot(s_back, w, h);
+    if (!t) {
+        __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+        return NULL;
+    }
+    s_slot[s_back].w = w;
+    s_slot[s_back].h = h;
+    return t;
+#else
+    (void)w;
+    (void)h;
+    return NULL;
+#endif
+}
+
+/* The back slot's blit is committed: publish it. */
+void xbox_FramebufferWindowPublishTexture(void)
+{
+    publish(s_slot[s_back].w, s_slot[s_back].h, 4, s_tex_t0);
+    __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
 }
 
 /* ── The guest thread ─────────────────────────────────────────────────── */
@@ -364,24 +456,30 @@ static int shot_due(uint32_t flip)
     return 0;
 }
 
-/* Between RenderCopy and RenderPresent: the back buffer is what is shown. */
-static void shot_save(SDL_Renderer *ren, uint32_t flip)
+static void shot_path(char *path, size_t n, uint32_t flip)
 {
     const char *prefix = recomp_env(RENV_WINDOW_SHOT_PREFIX);
-    SDL_Surface *surf;
-    char path[512];
-    int w = 0, h = 0;
 
     if (!prefix)
         prefix = recomp_env(RENV_FB_DUMP);
     if (!prefix)
         prefix = "window_";
+    snprintf(path, n, "%swin_flip%05u.bmp", prefix, flip);
+}
+
+/* Between RenderCopy and RenderPresent: the back buffer is what is shown. */
+static void shot_save(SDL_Renderer *ren, uint32_t flip)
+{
+    SDL_Surface *surf;
+    char path[512];
+    int w = 0, h = 0;
+
     if (SDL_GetRendererOutputSize(ren, &w, &h) != 0 || w <= 0 || h <= 0)
         return;
     surf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 24, SDL_PIXELFORMAT_BGR24);
     if (!surf)
         return;
-    snprintf(path, sizeof path, "%swin_flip%05u.bmp", prefix, flip);
+    shot_path(path, sizeof path, flip);
     if (SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_BGR24, surf->pixels,
                              surf->pitch) == 0 && SDL_SaveBMP(surf, path) == 0)
         fprintf(stderr, "[PRESENT] window shot: %s (%dx%d, flip %u)\n",
@@ -392,10 +490,24 @@ static void shot_save(SDL_Renderer *ren, uint32_t flip)
     SDL_FreeSurface(surf);
 }
 
+/* The renderer, or the layer's resources; the window goes after. */
+static void close_present(SDL_Renderer *ren)
+{
+#if defined(__APPLE__)
+    if (s_layer) {
+        fbm_destroy();
+        s_layer = 0;
+        return;
+    }
+#endif
+    if (ren)
+        SDL_DestroyRenderer(ren);
+}
+
 int xbox_HostWindowMain(int (*guest_main)(void))
 {
     SDL_Window *win;
-    SDL_Renderer *ren;
+    SDL_Renderer *ren = NULL;
     SDL_Texture *tex = NULL;
     uint32_t tex_w = 0, tex_h = 0, tex_bpp = 0;
     uint64_t shown_seq = 0, presents = 0, dropped_base = 0;
@@ -431,35 +543,66 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     }
     if (scale < 1 || scale > 8)
         scale = 2;
-    win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
-                           SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale,
-                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
-                           | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
-    ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
-                                   | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0))
-              : NULL;
-    if (!ren) {
-        fprintf(stderr, "[PRESENT] SDL window/renderer failed (%s); running headless\n",
-                SDL_GetError());
-        if (win)
-            SDL_DestroyWindow(win);
-        SDL_QuitSubSystem(SDL_INIT_VIDEO);
-        return guest_main();
-    }
     {
+        Uint32 wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+                      | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+#if defined(__APPLE__)
+        /* The Metal backend's frames stay on the GPU: a CAMetalLayer window
+         * the backend blits into (fb_present_metal.m), unless
+         * metal_present=readback asks for the renderer and readback. */
+        const char *be = recomp_env(RENV_PB_BACKEND);
+        const char *mp = recomp_env(RENV_METAL_PRESENT);
+        if (be && !strcasecmp(be, "metal") && !(mp && !strcasecmp(mp, "readback"))) {
+            char why[256] = "";
+            win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
+                                   SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale,
+                                   wflags | SDL_WINDOW_METAL);
+            if (!win)
+                snprintf(why, sizeof why, "%s", SDL_GetError());
+            else if (fbm_create(win, vsync, s_shot_n > 0, why, sizeof why))
+                s_layer = dirty = 1;   /* paint black before the first frame */
+            if (!s_layer) {
+                fbm_destroy();
+                if (win)
+                    SDL_DestroyWindow(win);
+                fprintf(stderr, "[PRESENT] window up: CAMetalLayer unavailable (%s);"
+                        " SDL renderer, readback present\n", why);
+            }
+        }
+#endif
+        if (!s_layer) {
+            win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
+                                   SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale, wflags);
+            ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
+                                           | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0))
+                      : NULL;
+            if (!ren) {
+                fprintf(stderr, "[PRESENT] SDL window/renderer failed (%s); running headless\n",
+                        SDL_GetError());
+                if (win)
+                    SDL_DestroyWindow(win);
+                SDL_QuitSubSystem(SDL_INIT_VIDEO);
+                return guest_main();
+            }
+        }
+    }
+    if (s_layer) {
+        fprintf(stderr, "[PRESENT] window up: CAMetalLayer (zero-copy), vsync %s;"
+                " guest runs on a pthread\n", vsync ? "on" : "off");
+    } else {
         SDL_RendererInfo ri;
         if (SDL_GetRendererInfo(ren, &ri) == 0)
             fprintf(stderr, "[PRESENT] window up: SDL %s renderer, vsync %s;"
                     " guest runs on a pthread\n", ri.name, vsync ? "on" : "off");
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        SDL_RenderPresent(ren);
     }
-    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-    SDL_RenderClear(ren);
-    SDL_RenderPresent(ren);
 
     s_guest_done_event = SDL_RegisterEvents(2);
     if (s_guest_done_event == (Uint32)-1) {
         fprintf(stderr, "[PRESENT] SDL_RegisterEvents failed; running headless\n");
-        SDL_DestroyRenderer(ren);
+        close_present(ren);
         SDL_DestroyWindow(win);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
         return guest_main();
@@ -473,7 +616,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         fprintf(stderr, "[PRESENT] cannot start the guest thread; running headless\n");
         s_running = 0;
         xbox_InputSetMainPump(0);
-        SDL_DestroyRenderer(ren);
+        close_present(ren);
         SDL_DestroyWindow(win);
         return guest_main();
     }
@@ -512,7 +655,16 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
         pthread_mutex_unlock(&s_lock);
 
-        if (seq != shown_seq) {
+        if (seq != shown_seq && s_layer) {
+            /* Layer mode: the slot is already a GPU texture. */
+            dropped_base += seq - shown_seq - 1;
+            shown_flip = s_slot[s_front].flip;
+            /* A shot still pending (no drawable yet) is taken of this frame,
+             * under its own flip number, as for a dropped flip. */
+            shoot |= s_shot_n && shot_due(shown_flip);
+            shown_seq = seq;
+            dirty = 1;
+        } else if (seq != shown_seq) {
             struct fb_slot *f = &s_slot[s_front];
             uint64_t t0 = now_ns(CLOCK_MONOTONIC);
 
@@ -543,7 +695,29 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
             dirty = 1;
         }
-        if (dirty) {
+#if defined(__APPLE__)
+        /* Not while minimised or hidden: nextDrawable then blocks for up to
+         * its 1 s timeout, and the event pump and pad poll with it. */
+        if (dirty && s_layer
+                && !(SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))) {
+            /* Before the first frame this paints the window black. */
+            struct fb_slot *f = &s_slot[s_front];
+            uint64_t t0 = now_ns(CLOCK_MONOTONIC);
+            char path[512];
+            if (shoot)
+                shot_path(path, sizeof path, shown_flip);
+            if (fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
+                            filter, shoot ? path : NULL, shown_flip)) {
+                dirty = 0;
+                shoot = 0;
+                presents++;
+            }
+            /* else no drawable (display asleep, window occluded): try again
+             * at the next event or the 100 ms wake. */
+            upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
+        }
+#endif
+        if (dirty && !s_layer) {
             dirty = 0;
             SDL_RenderClear(ren);
             if (tex && filter == NV2A_PRESENT_INTEGER) {
@@ -627,10 +801,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         uint64_t t = now_ns(CLOCK_MONOTONIC), cpu = now_ns(CLOCK_THREAD_CPUTIME_ID);
         double dt = (double)(t - t_start) / 1e9;
         uint64_t fl = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
-        fprintf(stderr, "[PRESENT] %s after %.1f s: %llu flips copied (%.1f/s),"
+        fprintf(stderr, "[PRESENT] %s after %.1f s (%s): %llu flips copied (%.1f/s),"
                 " %llu presents (%.1f/s), %llu dropped, main thread %.1f%% of a"
                 " core, upload %.3f ms/frame, ack copy %.3f ms/flip\n",
                 quit ? "window closed" : "guest returned", dt,
+                s_layer ? "CAMetalLayer" : "SDL renderer",
                 (unsigned long long)fl, dt > 0 ? (double)fl / dt : 0.0,
                 (unsigned long long)presents, dt > 0 ? (double)presents / dt : 0.0,
                 (unsigned long long)dropped_base,
@@ -650,7 +825,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * game controllers, so with one open SDL stays up and exit() reclaims it. */
     if (tex)
         SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(ren);
+    close_present(ren);
     SDL_DestroyWindow(win);
     /* The main pump flag stays set: guest and OHCI threads keep running
      * until exit(), and must not start calling SDL_GameControllerUpdate

@@ -784,9 +784,14 @@ static int write_present_bmp(const char *path)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = s_present.w ? s_present.pitch / s_present.w : 0;
+    const struct nv2a_pb_backend *be;
 
     if (!s_present.offset || (bpp != 2 && bpp != 4))
         return 0;
+    /* The backend makes guest memory current first (sync_guest). */
+    be = nv2a_pb_get_backend();
+    if (be->sync_guest)
+        be->sync_guest(s_present.offset, s_present.pitch, s_present.w, s_present.h);
     return write_bmp_at(path, mem + dma_resolve(s_present.offset), s_present.pitch,
                         s_present.w, s_present.h, bpp, 0);
 }
@@ -908,6 +913,12 @@ static void dump_surface_bmp(void)
 
     if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !s_gpu.color_offset)
         return;
+    {
+        const struct nv2a_pb_backend *be = nv2a_pb_get_backend();
+        if (be->sync_guest)
+            be->sync_guest(s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset,
+                           s_gpu.pitch, s_gpu.clip_x + w, s_gpu.clip_y + h);
+    }
 
     row_bytes = w * 3;
     pad = (4 - (row_bytes & 3)) & 3;

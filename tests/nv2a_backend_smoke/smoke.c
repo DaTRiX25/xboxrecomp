@@ -7,8 +7,17 @@
  * (surface, clear, quads, FLIP_STALL) sent to nv2a_pb_exec_method() twice:
  * once with the CPU rasteriser, once with the backend under test. Both leave
  * the presented frame in guest memory -- the CPU path draws there, a GPU
- * backend writes its present surface back at the flip -- so the comparison
- * is the same bytes RECOMP_FB_DUMP and the SDL2 window read.
+ * backend writes its present surface back when asked (sync_guest, as the
+ * executor's dumps ask) -- so the comparison is the same bytes RECOMP_FB_DUMP
+ * reads.
+ *
+ * Then the write-back itself (Metal): nothing is written at a flip under the
+ * default metal_writeback=lazy, sync_guest writes the frame once and a second
+ * call finds it clean, render.scale 2 writes the box-filtered host pixels,
+ * and metal_writeback=always writes at the flip as before. With the argument
+ * "guard" it runs metal_fb_guard alone (the guard is decided at the first
+ * flip, so it needs its own process): a read of the present surface after a
+ * lazy flip switches the run to writing back at every flip.
  *
  * Scenes:
  *   clear_quad   colour clear + a solid quad (pre-transformed, INLINE_ARRAY)
@@ -35,10 +44,14 @@
 #include "d3d8_swizzle.h"
 #include "nv2a_pb_state.h"
 #include "xbox_memory_layout.h"
+#include "nv2a_backend_common.h"
+#include "recomp_env.h"
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 #ifdef __APPLE__
 const struct nv2a_pb_backend *nv2a_pb_metal_backend(void);
+uint64_t nv2a_pb_metal_writebacks(void);
+const uint8_t *nv2a_pb_metal_host_pixels(uint32_t offset, uint32_t *hw, uint32_t *hh);
 #endif
 
 /* The kernel library expects these from the title's generated code. */
@@ -52,6 +65,7 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define H 480u
 #define BUF0      0x01000000u
 #define BUF1      0x0112C000u
+#define BUF2      0x01258000u   /* the render.scale 2 case: a new target */
 #define TEX_GUEST 0x02800000u   /* 64x64 swizzled A8R8G8B8, then YUY2 64x32 */
 #define TEX_LOG2  6
 
@@ -241,6 +255,8 @@ static int run(const struct nv2a_pb_backend *b, int sc, uint32_t *out, int k)
                 s_scene_name[sc], p->offset, buf);
         return 0;
     }
+    if (b->sync_guest)
+        b->sync_guest(p->offset, p->pitch, p->w, p->h);
     memcpy(out, g, W * H * 4);
     return 1;
 }
@@ -275,6 +291,114 @@ static int compare(const char *name, const uint32_t *a, const uint32_t *b)
     return ok;
 }
 
+#ifdef __APPLE__
+static int all_pattern(const uint32_t *g)
+{
+    uint32_t i;
+    for (i = 0; i < W * H; i++)
+        if (g[i] != 0xFFFF00FFu)
+            return 0;
+    return 1;
+}
+
+static int check(int ok, const char *what)
+{
+    fprintf(stderr, "[backend-smoke] write-back: %-58s %s\n", what, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* The write-back on demand (metal-zero-copy-present), with clear_quad. `ref`
+ * is the CPU rasteriser's clear_quad frame. Returns the failures. */
+static int writeback_cases(const struct nv2a_pb_backend *b, const uint32_t *ref,
+                           uint32_t *tmp)
+{
+    const struct nv2a_pb_present *p;
+    uint32_t *g;
+    uint64_t n0;
+    int f = 0;
+    uint32_t i;
+
+    nv2a_pb_set_backend(b);
+
+    /* lazy: the flip leaves guest memory alone. */
+    g = (uint32_t *)guest(BUF0);
+    for (i = 0; i < W * H; i++)
+        g[i] = 0xFFFF00FFu;
+    n0 = nv2a_pb_metal_writebacks();
+    scene(SC_CLEAR_QUAD, BUF0, BUF1);
+    p = nv2a_pb_present_state();
+    f += check(all_pattern(g) && nv2a_pb_metal_writebacks() == n0,
+               "lazy flip: guest untouched, no write-back");
+    b->sync_guest(p->offset, p->pitch, p->w, p->h);
+    f += check(!memcmp(g, ref, W * H * 4) && nv2a_pb_metal_writebacks() == n0 + 1,
+               "sync_guest: the CPU frame, one write-back");
+    b->sync_guest(p->offset, p->pitch, p->w, p->h);
+    f += check(nv2a_pb_metal_writebacks() == n0 + 1, "sync_guest again: clean, no write-back");
+
+    /* always: written at the flip, before any sync. */
+    recomp_env_set(RENV_METAL_WRITEBACK, "always");
+    for (i = 0; i < W * H; i++)
+        g[i] = 0xFFFF00FFu;
+    scene(SC_CLEAR_QUAD, BUF0, BUF1);
+    f += check(!memcmp(g, ref, W * H * 4), "metal_writeback=always: the CPU frame at the flip");
+    recomp_env_set(RENV_METAL_WRITEBACK, NULL);
+
+    /* render.scale 2 on a new target: the box filter of the host pixels. */
+    {
+        struct nv2a_host_opts o;
+        const uint8_t *hp;
+        uint32_t hw = 0, hh = 0;
+        memset(&o, 0, sizeof o);
+        o.render_scale = 2;
+        nv2a_host_opts_set(&o);
+        g = (uint32_t *)guest(BUF2);
+        for (i = 0; i < W * H; i++)
+            g[i] = 0xFFFF00FFu;
+        scene(SC_CLEAR_QUAD, BUF2, BUF0);
+        p = nv2a_pb_present_state();
+        n0 = nv2a_pb_metal_writebacks();
+        b->sync_guest(p->offset, p->pitch, p->w, p->h);
+        hp = nv2a_pb_metal_host_pixels(BUF2, &hw, &hh);
+        if (hp && hw == 2 * W && hh == 2 * H)
+            nv2a_downscale_box32(hp, hw * 4u, W, H, 2, (uint8_t *)tmp, W * 4u);
+        f += check(hp && hw == 2 * W && !memcmp(g, tmp, W * H * 4)
+                   && nv2a_pb_metal_writebacks() == n0 + 1,
+                   "render.scale 2: the box-filtered host pixels");
+        memset(&o, 0, sizeof o);
+        nv2a_host_opts_set(&o);
+    }
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+
+/* metal_fb_guard: the surface is PROT_NONE after a lazy flip; a read faults,
+ * the next flip reports it and switches to always, and the flip after that
+ * writes back. Returns the failures. */
+static int guard_case(const struct nv2a_pb_backend *b, const uint32_t *ref)
+{
+    volatile uint32_t *g = (volatile uint32_t *)guest(BUF0);
+    uint32_t i, v;
+    int f = 0;
+
+    nv2a_pb_set_backend(b);
+    for (i = 0; i < W * H; i++)
+        g[i] = 0xFFFF00FFu;
+    scene(SC_CLEAR_QUAD, BUF0, BUF1);   /* armed after this flip */
+    v = g[0];                           /* the title read: faults once */
+    f += check(v == 0xFFFF00FFu, "fb_guard: the read proceeds (stale seed)");
+    for (i = 0; i < W * H; i++)
+        g[i] = 0xFFFF00FFu;
+    scene(SC_CLEAR_QUAD, BUF0, BUF1);   /* reports the read, switches */
+    for (i = 0; i < W * H; i++)
+        g[i] = 0xFFFF00FFu;
+    scene(SC_CLEAR_QUAD, BUF0, BUF1);   /* written back at the flip */
+    f += check(!memcmp((const void *)g, ref, W * H * 4),
+               "fb_guard: after a read, the CPU frame at the flip");
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+#endif
+
 static void build_xbe(uint8_t *xbe, size_t n)
 {
     uint32_t v;
@@ -287,7 +411,7 @@ static void build_xbe(uint8_t *xbe, size_t n)
     v = 0x00010800u ^ 0x5B6D40B6u; memcpy(xbe + 0x158, &v, 4); /* empty thunks */
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     static uint8_t xbe[0x1000];
     const char *which = getenv("RECOMP_SMOKE_BACKEND");
@@ -295,6 +419,7 @@ int main(void)
     const struct nv2a_pb_backend *gpu = NULL;
     uint32_t *cpu_px, *gpu_px;
     int sc, k = 0, failures = 0;
+    int guard = argc > 1 && !strcmp(argv[1], "guard");
 
     setvbuf(stderr, NULL, _IONBF, 0);
     if (!which)
@@ -317,6 +442,18 @@ int main(void)
     if (!cpu_px || !gpu_px)
         return 1;
     make_textures();
+#ifdef __APPLE__
+    if (guard) {
+        recomp_env_set(RENV_METAL_FB_GUARD, "1");
+        if (!run(nv2a_pb_cpu_backend(), SC_CLEAR_QUAD, cpu_px, 0))
+            return 1;
+        failures = guard_case(gpu, cpu_px);
+        fprintf(stderr, "[backend-smoke] %s: fb_guard\n", failures ? "FAIL" : "done");
+        return failures ? 1 : 0;
+    }
+#else
+    (void)guard;
+#endif
 
     for (sc = 0; sc < SC_COUNT; sc++) {
         char path[512];
@@ -335,6 +472,14 @@ int main(void)
             failures++;
     }
     nv2a_pb_set_backend(NULL);
+#ifdef __APPLE__
+    if (gpu == nv2a_pb_metal_backend() && run(nv2a_pb_cpu_backend(), SC_CLEAR_QUAD, cpu_px, 0)) {
+        int f = writeback_cases(gpu, cpu_px, gpu_px);
+        if (f)
+            fprintf(stderr, "[backend-smoke] FAIL: %d write-back checks\n", f);
+        failures += f;
+    }
+#endif
     if (failures) {
         fprintf(stderr, "[backend-smoke] FAIL: %d of %d scenes\n", failures, SC_COUNT);
         return 1;

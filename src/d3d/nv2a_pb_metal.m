@@ -14,12 +14,19 @@
  *                combiners as MSL (d3d8_combiners_msl.c) when they are
  *                programmed, else MODULATE. Four stages, textured from the
  *                shared decode (nv2a_backend_common.h).
- *   on_flip   -> commit, wait, read the surface the walker picked for this flip
- *                (nv2a_pb_present_state) back into guest memory (RECOMP_FB_DUMP
- *                and the title read those bytes), and, when the window is up,
- *                read the same texture back again for it
- *                (xbox_FramebufferWindowPresentPixels; a readback, not
- *                zero-copy); RECOMP_WINDOW_SHOT reads back what the window drew.
+ *   on_flip   -> commit and wait; with the CAMetalLayer window up
+ *                (fb_present_metal.m, whose device and queue this backend
+ *                adopts), blit the surface the walker picked for this flip
+ *                (nv2a_pb_present_state) into the window's back slot and
+ *                publish it: no CPU copy. Under metal_present=readback the
+ *                texture is read back for the SDL renderer window
+ *                (xbox_FramebufferWindowPresentPixels) as before.
+ *   sync_guest -> write a surface back to guest memory when the executor
+ *                dumps it (RECOMP_FB_DUMP and the report): the write-back is
+ *                on demand (metal_writeback=lazy, default), since the title
+ *                never reads its present surface; metal_writeback=always,
+ *                metal_no_rtt or a read caught by metal_fb_guard write it at
+ *                every flip.
  *
  * Opt-in: RECOMP_PB_BACKEND=metal (nv2a_pb_metal_register_from_env). The CPU
  * rasteriser stays the default and the oracle.
@@ -33,9 +40,11 @@
  *  - Encoders begin lazily (first clear or draw on a surface) and end
  *    explicitly on a render-target change, before a readback and at the flip;
  *    every pass loads (loadAction Load) unless it starts with a clear.
- *  - Only the present surface is written back to guest memory, at the flip.
+ *  - Only the present surface is written back to guest memory, on demand
+ *    (sync_guest, a texture decode that overlaps it, its eviction), or at
+ *    every flip under metal_writeback=always.
  *  - Guest memory is touched on the executor's thread only: no completion
- *    handlers; the flip waits for the command buffer and then copies.
+ *    handlers; a write-back waits for the command buffer and then copies.
  *
  * Depth/stencil and render-to-texture as the D3D11 backend (M2); visibility
  * tests (GET_REPORT) from Metal visibility results through the shared
@@ -63,6 +72,11 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
@@ -85,7 +99,16 @@ extern void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch);
 extern int  xbox_FramebufferWindowRunning(void);
 extern void xbox_FramebufferWindowPresentPixels(const void *px, uint32_t w, uint32_t h,
                                                 uint32_t pitch, uint32_t bpp);
-static uint64_t s_window_presents;   /* frames sent to the window by texture readback */
+/* The CAMetalLayer window (fb_present_metal.m): its device and queue, which
+ * this backend adopts so the slot textures and the present pass share them,
+ * and the back slot a frame is blitted into. */
+extern int   xbox_FramebufferWindowMetal(void **device, void **queue);
+extern void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h);
+extern void  xbox_FramebufferWindowPublishTexture(void);
+static int s_layer;                  /* the window takes GPU slot textures */
+static void guard_open(void);        /* metal_fb_guard: open the pages before we touch them */
+static int wb_always(void);
+static uint64_t s_window_presents;   /* frames sent to the window (slot or readback) */
 
 /* ---- shader ABI ------------------------------------------------------------
  *
@@ -237,6 +260,9 @@ typedef struct {
     id<MTLTexture> tex;
     uint64_t       last_use;
     DepthTarget   *dt;         /* the depth buffer its passes attach, or NULL */
+    uint32_t       pitch;      /* the guest pitch it was made with */
+    int            dirty;      /* drawn since its last write-back */
+    int            presented;  /* ever picked by present_target */
 } RenderTarget;
 
 static RenderTarget  s_rt[RT_MAX];
@@ -254,6 +280,50 @@ static void occ_after_wait(void);
 static id<MTLBuffer> s_vis;      /* visibility result slots, 8 bytes each */
 static struct OccQuery *s_occ_q;     /* the query counting now, or NULL */
 static int s_occ_slot = -1;          /* its slot on s_enc */
+
+/* RECOMP_TRACE=metal_prof: where on_flip's time goes, averaged over 300
+ * flips: the wait for the frame's last command buffer, the GPU time of every
+ * command buffer committed since the last flip, the host readback (scale > 1),
+ * the guest write-back, the readback-mode window copy and hand-off, and the
+ * layer-mode slot blit. Prints only. */
+static int s_prof = -1;
+#define PROF_CMDS 128
+static id<MTLCommandBuffer> s_prof_cmd[PROF_CMDS];
+static int s_prof_ncmd;
+static struct {
+    uint64_t n, flip, wait, gpu, hostrb, wb, winrb, winpush, blit, ncmd;
+} s_pa;
+
+/* The last committed command buffer: a sync between flips waits for it when
+ * nothing is open (a GET_REPORT commit may still be running). */
+static id<MTLCommandBuffer> s_last_cmd;
+static uint64_t s_decode_syncs;
+
+static uint64_t prof_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int prof_on(void)
+{
+    if (s_prof < 0)
+        s_prof = recomp_env(RENV_METAL_PROF) != NULL;
+    return s_prof;
+}
+
+/* A flip-phase timer: no clock reads unless metal_prof is on. */
+static uint64_t prof_t(void)
+{
+    return prof_on() ? prof_now() : 0;
+}
+
+static void prof_add(uint64_t *acc, uint64_t t0)
+{
+    if (prof_on())
+        *acc += prof_now() - t0;
+}
 
 static void end_encoder(void)
 {
@@ -281,6 +351,8 @@ static void flush(int wait)
         return;
     }
     [s_cmd commit];
+    [s_last_cmd release];
+    s_last_cmd = [s_cmd retain];
     if (wait) {
         [s_cmd waitUntilCompleted];
         if ([s_cmd status] == MTLCommandBufferStatusError) {
@@ -292,6 +364,8 @@ static void flush(int wait)
         s_vb_pos = 0;
         s_ib_pos = 0;
     }
+    if (prof_on() && s_prof_ncmd < PROF_CMDS)
+        s_prof_cmd[s_prof_ncmd++] = [s_cmd retain];
     [s_cmd release];
     s_cmd = nil;
     s_flushes++;
@@ -316,6 +390,7 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     DepthTarget *dt = rt->dt;
     end_encoder();
     ensure_cmd();
+    rt->dirty = 1;
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = rt->tex;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -362,13 +437,24 @@ static int init(void)
     s_failed = 1;
 
     @autoreleasepool {
-        s_dev = MTLCreateSystemDefaultDevice();
-        if (!s_dev) {
+        void *wdev = NULL, *wq = NULL;
+        /* The layer window was made before the guest started, with its own
+         * device and queue: one device so its slots take this backend's
+         * blits, one queue so a present pass runs after the blit it shows. */
+        if (xbox_FramebufferWindowMetal(&wdev, &wq) && wdev && wq) {
+            s_dev = [(id<MTLDevice>)wdev retain];
+            s_queue = [(id<MTLCommandQueue>)wq retain];
+            s_layer = 1;
+        } else {
+            s_dev = MTLCreateSystemDefaultDevice();
+            if (s_dev)
+                s_queue = [s_dev newCommandQueue];
+        }
+        if (!s_dev || !s_queue) {
             fprintf(stderr, LOGP "no Metal device\n");
             return 0;
         }
         s_unified = [s_dev hasUnifiedMemory] ? 1 : 0;
-        s_queue = [s_dev newCommandQueue];
 
         opts = [[MTLCompileOptions alloc] init];
         /* Fast math off: the CPU path is IEEE; reassociation and flushed
@@ -407,8 +493,10 @@ static int init(void)
             fprintf(stderr, LOGP "buffer creation failed\n");
             return 0;
         }
-        fprintf(stderr, LOGP "device up: %s (unified memory %d), fast math off\n",
-                [[s_dev name] UTF8String], s_unified);
+        fprintf(stderr, LOGP "device up: %s (unified memory %d), fast math off; present %s,"
+                " write-back %s\n", [[s_dev name] UTF8String], s_unified,
+                s_layer ? "CAMetalLayer slots" : "texture readback",
+                wb_always() ? "every flip" : "on demand");
     }
     s_failed = 0;
     return 1;
@@ -416,8 +504,14 @@ static int init(void)
 
 /* ---- surfaces --------------------------------------------------------------- */
 
+static void rt_sync(RenderTarget *rt, uint32_t pitch);
+
 static void rt_free(RenderTarget *rt)
 {
+    /* A presented target's bytes are what a new target at that surface seeds
+     * from, as when every flip wrote it back; off-screen ones never were. */
+    if (rt->dirty && rt->presented)
+        rt_sync(rt, rt->pitch);
     if (s_enc_rt == rt)
         end_encoder();
     [rt->tex release];
@@ -525,10 +619,12 @@ static RenderTarget *surface(void)
     free_rt->h = h;
     free_rt->hw = hw;
     free_rt->hh = hh;
+    free_rt->pitch = g->pitch;
     free_rt->last_use = s_tick;
     if (g->pitch >= w * 4u) {
         const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset()
                            + nv2a_pb_dma_resolve(g->color_offset);
+        guard_open();   /* our own read of the seed is not a title read */
         if (hw == w) {
             [free_rt->tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
                               withBytes:src bytesPerRow:g->pitch];
@@ -882,6 +978,22 @@ static id<MTLTexture> tex_bind(const Stage *t)
 
     if (t->valid && (uint64_t)t->width * t->height <= TEX_MAX_TEXELS)
         bytes = nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
+    /* The guest bytes are about to be hashed and decoded: a render target
+     * over them that rt_texture did not bind (another format, no_rtt, an
+     * evicted name) is written back first, so the decode sees what was
+     * drawn there. */
+    if (bytes) {
+        uint32_t lo = t->offset & 0x07FFFFFFu, hi = lo + bytes;
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            uint32_t rlo = rt->addr & 0x07FFFFFFu;
+            if (rt->tex && rt->dirty && rt->pitch
+                    && lo < rlo + rt->pitch * rt->h && rlo < hi) {
+                s_decode_syncs++;
+                rt_sync(rt, rt->pitch);
+            }
+        }
+    }
     if (!bytes) {
         static uint8_t said[256];
         if ((uint64_t)t->width * t->height > TEX_MAX_TEXELS)
@@ -1548,8 +1660,10 @@ static RenderTarget *present_target(uint32_t surface_offset)
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (rt->tex && surface_offset && rt->offset == surface_offset
-                && (!p->offset || (rt->w == p->w && rt->h == p->h)))
+                && (!p->offset || (rt->w == p->w && rt->h == p->h))) {
+            rt->presented = 1;
             return rt;
+        }
     }
     return NULL;
 }
@@ -1646,6 +1760,237 @@ static void write_back_scaled(RenderTarget *rt, const uint8_t *px, uint32_t addr
         return;
     }
     s_writebacks++;
+}
+
+/* ---- write-back on demand ---------------------------------------------------
+ *
+ * Guest memory under a render target is written only when something is about
+ * to read it: the executor's dumps (sync_guest), a texture decode over it
+ * (tex_bind), the eviction of a presented target (rt_free). The title itself
+ * was never seen reading its framebuffer (metal-zero-copy-present, design),
+ * and D3D11 never writes back at all. metal_writeback=always, or
+ * metal_no_rtt, writes the present surface at every flip as before. */
+static int s_guard_always;   /* metal_fb_guard saw a title read */
+
+static int wb_always(void)
+{
+    const char *e = recomp_env(RENV_METAL_WRITEBACK);
+    return (e && !strcasecmp(e, "always")) || recomp_env(RENV_METAL_NO_RTT) != NULL
+           || s_guard_always;
+}
+
+/* rt into guest memory now, at `pitch`, if drawn since the last write-back.
+ * Waits for the GPU; the ring positions survive the wait, since a draw may
+ * have placed its vertices already (tex_bind runs inside on_draw). */
+/* Managed storage (a discrete GPU): queue the copy back of the GPU's
+ * contents, which the next wait completes. Nothing on unified memory. */
+static void rt_managed_sync(RenderTarget *rt)
+{
+    id<MTLBlitCommandEncoder> b;
+
+    if (s_unified)
+        return;
+    end_encoder();
+    ensure_cmd();
+    b = [s_cmd blitCommandEncoder];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    [b synchronizeResource:rt->tex];
+#pragma clang diagnostic pop
+    [b endEncoding];
+}
+
+static void rt_sync(RenderTarget *rt, uint32_t pitch)
+{
+    NSUInteger vb = s_vb_pos, ib = s_ib_pos;
+    const uint8_t *px;
+
+    if (!rt->tex || !rt->dirty || !pitch || pitch < rt->w * 2u)
+        return;
+    guard_open();
+    @autoreleasepool {
+        rt_managed_sync(rt);
+        if (s_cmd)
+            flush(1);
+        else if (s_last_cmd && [s_last_cmd status] < MTLCommandBufferStatusCompleted)
+            [s_last_cmd waitUntilCompleted];
+        s_vb_pos = vb;
+        s_ib_pos = ib;
+        if (rt->hw == rt->w)
+            write_back(rt, rt->addr, pitch);
+        else if ((px = host_readback(rt)) != NULL)
+            write_back_scaled(rt, px, rt->addr, pitch);
+        rt->dirty = 0;
+    }
+}
+
+/* nv2a_pb_backend.sync_guest: the target present_target would pick for this
+ * surface (offset, guest w x h), else the most recently used one at its
+ * address (a surface dump of a target drawn at another clip). */
+static void metal_sync_guest(uint32_t offset, uint32_t pitch, uint32_t w, uint32_t h)
+{
+    RenderTarget *rt = NULL;
+    uint32_t addr = nv2a_pb_dma_resolve(offset) & 0x07FFFFFFu;
+    int i;
+
+    guard_open();
+    if (s_failed)
+        return;
+    for (i = 0; i < RT_MAX && !rt; i++)
+        if (s_rt[i].tex && s_rt[i].offset == offset && s_rt[i].w == w && s_rt[i].h == h)
+            rt = &s_rt[i];
+    if (!rt) {
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *c = &s_rt[i];
+            if (c->tex && (c->addr & 0x07FFFFFFu) == addr
+                    && (!rt || c->last_use > rt->last_use))
+                rt = c;
+        }
+    }
+    if (rt)
+        rt_sync(rt, pitch);
+}
+
+/* For tests/nv2a_backend_smoke: write-backs so far, and the host pixels
+ * (hw x hh BGRA8, tightly packed) of the target at a colour offset, read
+ * back now, so a test can box-filter them itself. */
+uint64_t nv2a_pb_metal_writebacks(void) { return s_writebacks; }
+const uint8_t *nv2a_pb_metal_host_pixels(uint32_t offset, uint32_t *hw, uint32_t *hh)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (rt->tex && rt->offset == offset) {
+            rt_managed_sync(rt);
+            if (s_cmd)
+                flush(1);
+            *hw = rt->hw;
+            *hh = rt->hh;
+            return host_readback(rt);
+        }
+    }
+    return NULL;
+}
+
+/* ---- metal_fb_guard ----------------------------------------------------------
+ *
+ * After each lazy flip the present surface's pages are PROT_NONE; the first
+ * access from any thread is recorded by the handler, which opens the pages
+ * again and lets it proceed. A title READ then switches the run to
+ * metal_writeback=always (that read saw the last write-back, or the seed); a
+ * write needs nothing from the GPU (the allocator's bzero on re-allocation is
+ * one) and is logged once. Debug only: PROT_NONE turns a kernel-side access to
+ * those pages (read() into re-allocated memory) into EFAULT. */
+static struct {
+    uintptr_t plo, phi;          /* the page span made PROT_NONE */
+    uint32_t addr;
+    volatile int armed, hit;
+    uintptr_t far, pc;
+    uint32_t write;
+    char th[24];
+    struct sigaction prev_bus, prev_segv;
+} s_guard;
+
+static void guard_handler(int sig, siginfo_t *si, void *ucv)
+{
+    uintptr_t f = (uintptr_t)si->si_addr;
+    struct sigaction *prev;
+
+    if (s_guard.armed && f >= s_guard.plo && f < s_guard.phi) {
+        uint32_t esr = 0;
+        uintptr_t pc = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+        {
+            ucontext_t *uc = (ucontext_t *)ucv;
+            esr = uc->uc_mcontext->__es.__esr;
+            pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+        }
+#endif
+        if (!s_guard.hit) {
+            s_guard.far = f;
+            s_guard.pc = pc;
+            s_guard.write = (esr >> 6) & 1u;   /* ESR WnR */
+            s_guard.th[0] = 0;
+            pthread_getname_np(pthread_self(), s_guard.th, sizeof s_guard.th);
+            s_guard.hit = 1;
+        }
+        mprotect((void *)s_guard.plo, s_guard.phi - s_guard.plo, PROT_READ | PROT_WRITE);
+        s_guard.armed = 0;
+        return;   /* re-executes the access */
+    }
+    prev = sig == SIGBUS ? &s_guard.prev_bus : &s_guard.prev_segv;
+    if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction) {
+            prev->sa_sigaction(sig, si, ucv);
+            return;
+        }
+    } else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+        prev->sa_handler(sig);
+        return;
+    }
+    signal(sig, SIG_DFL);
+}
+
+/* Open the pages before this thread reads or writes them itself. */
+static void guard_open(void)
+{
+    if (s_guard.armed) {
+        s_guard.armed = 0;
+        mprotect((void *)s_guard.plo, s_guard.phi - s_guard.plo, PROT_READ | PROT_WRITE);
+    }
+}
+
+/* At the flip: report what the last span saw, then close the new one. */
+static void guard_flip(uint32_t addr, uint32_t len)
+{
+    static int on = -1, said_write;
+    uintptr_t pg = (uintptr_t)getpagesize(), lo;
+
+    if (on < 0) {
+        on = recomp_env(RENV_METAL_FB_GUARD) != NULL;
+        if (on) {
+            /* Installed now, after the title's own fault handlers, and
+             * chained to them for every fault outside the span. */
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = guard_handler;
+            sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+            sigemptyset(&sa.sa_mask);
+            sigaction(SIGBUS, &sa, &s_guard.prev_bus);
+            sigaction(SIGSEGV, &sa, &s_guard.prev_segv);
+            fprintf(stderr, LOGP "fb_guard: armed; a title read of the present surface"
+                    " switches to metal_writeback=always\n");
+        }
+    }
+    if (!on)
+        return;
+    guard_open();
+    if (s_guard.hit) {
+        Dl_info di;
+        const char *sym = dladdr((void *)s_guard.pc, &di) && di.dli_sname ? di.dli_sname : "?";
+        unsigned long off = sym[0] != '?' ? (unsigned long)(s_guard.pc - (uintptr_t)di.dli_saddr)
+                                          : (unsigned long)s_guard.pc;
+        uint32_t ga = (uint32_t)(s_guard.far - (uintptr_t)xbox_GetMemoryOffset());
+        if (!s_guard.write) {
+            fprintf(stderr, LOGP "fb_guard: guest READ of present surface 0x%08X (at 0x%08X)"
+                    " by '%s' pc %s+0x%lX; switching to metal_writeback=always\n",
+                    s_guard.addr, ga, s_guard.th, sym, off);
+            s_guard_always = 1;
+        } else if (!said_write++) {
+            fprintf(stderr, LOGP "fb_guard: guest WRITE of present surface 0x%08X (at 0x%08X)"
+                    " by '%s' pc %s+0x%lX; ignored\n", s_guard.addr, ga, s_guard.th, sym, off);
+        }
+        s_guard.hit = 0;
+    }
+    if (s_guard_always || !addr || !len)
+        return;
+    lo = (uintptr_t)xbox_GetMemoryOffset() + addr;
+    s_guard.addr = addr;
+    s_guard.plo = lo & ~(pg - 1);
+    s_guard.phi = (lo + len + pg - 1) & ~(pg - 1);
+    __atomic_store_n(&s_guard.armed, 1, __ATOMIC_SEQ_CST);
+    if (mprotect((void *)s_guard.plo, s_guard.phi - s_guard.plo, PROT_NONE) != 0)
+        s_guard.armed = 0;
 }
 
 /* ---- Visibility tests: Metal visibility-result counting ---------------------
@@ -1958,39 +2303,103 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
     p_fl = s_flushes;
 }
 
+static void prof_flip_end(uint64_t t_flip0)
+{
+    static uint64_t p_wb, p_ds;
+    int i;
+    if (!prof_on())
+        return;
+    for (i = 0; i < s_prof_ncmd; i++) {
+        id<MTLCommandBuffer> c = s_prof_cmd[i];
+        if ([c status] == MTLCommandBufferStatusCompleted) {
+            CFTimeInterval a = [c GPUStartTime], b = [c GPUEndTime];
+            if (b > a)
+                s_pa.gpu += (uint64_t)((b - a) * 1e9);
+        }
+        [c release];
+    }
+    s_pa.ncmd += (uint64_t)s_prof_ncmd;
+    s_prof_ncmd = 0;
+    s_pa.flip += prof_now() - t_flip0;
+    if (++s_pa.n == 300) {
+        double n = (double)s_pa.n;
+        fprintf(stderr, LOGP "prof %llu flips: on_flip %.3f ms = wait %.3f + hostrb %.3f"
+                " + wb %.3f + winrb %.3f + winpush %.3f + blit %.3f (+rest); gpu %.3f ms"
+                " over %.1f cmd buffers/flip; %llu write-backs, %llu decode syncs\n",
+                (unsigned long long)s_presents,
+                s_pa.flip / n / 1e6, s_pa.wait / n / 1e6, s_pa.hostrb / n / 1e6,
+                s_pa.wb / n / 1e6, s_pa.winrb / n / 1e6, s_pa.winpush / n / 1e6,
+                s_pa.blit / n / 1e6, s_pa.gpu / n / 1e6, s_pa.ncmd / n,
+                (unsigned long long)(s_writebacks - p_wb),
+                (unsigned long long)(s_decode_syncs - p_ds));
+        p_wb = s_writebacks;
+        p_ds = s_decode_syncs;
+        memset(&s_pa, 0, sizeof s_pa);
+    }
+}
+
 static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     RenderTarget *rt = NULL;
     uint32_t addr = surface_offset ? nv2a_pb_dma_resolve(surface_offset) : 0;
     const uint8_t *hpx = NULL;   /* a scaled rt's host pixels (host_readback) */
+    uint64_t t_flip0 = prof_on() ? prof_now() : 0, t;
+    int always = wb_always(), win = 0, layer = 0;
 
+    guard_open();
     if (init()) {
         @autoreleasepool {
+            int wb;
+            id<MTLTexture> slot = nil;
             rt = present_target(surface_offset);
-            if (rt && !s_unified) {
-                /* Managed storage: bring the GPU's copy back first. */
-                id<MTLBlitCommandEncoder> b;
-                end_encoder();
-                ensure_cmd();
-                b = [s_cmd blitCommandEncoder];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-                [b synchronizeResource:rt->tex];
-#pragma clang diagnostic pop
-                [b endEncoding];
-            }
+            win = rt && xbox_FramebufferWindowRunning();
+            /* Layer mode: the frame goes to the window as a GPU copy into the
+             * presenter's back slot (fb_present_metal.m), below. */
+            layer = win && s_layer;
+            wb = rt && addr && pitch && pitch >= rt->w * 2u && always;
+            if (rt && (wb || (win && !layer)))
+                rt_managed_sync(rt);
+            t = prof_t();
             flush(1);
+            prof_add(&s_pa.wait, t);
+            if (layer) {
+                /* After the wait, in a command buffer of its own that nobody
+                 * waits for: the flip's wait never includes the copy, nor a
+                 * present pass still reading the slot (tracked hazards order
+                 * the two on the GPU). Published once committed, so the main
+                 * thread's pass that shows it is committed after it. */
+                t = prof_t();
+                slot = (id<MTLTexture>)xbox_FramebufferWindowBackTexture(rt->hw, rt->hh);
+                if (slot) {
+                    id<MTLBlitCommandEncoder> b;
+                    ensure_cmd();
+                    b = [s_cmd blitCommandEncoder];
+                    [b copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0
+                          sourceOrigin:MTLOriginMake(0, 0, 0)
+                            sourceSize:MTLSizeMake(rt->hw, rt->hh, 1)
+                             toTexture:slot destinationSlice:0 destinationLevel:0
+                     destinationOrigin:MTLOriginMake(0, 0, 0)];
+                    [b endEncoding];
+                    flush(0);
+                    xbox_FramebufferWindowPublishTexture();
+                    s_window_presents++;
+                }
+                prof_add(&s_pa.blit, t);
+            }
             /* The host-size readback only when something reads it: the
-             * write-back below or the window. */
-            if (rt && rt->hw != rt->w
-                    && ((addr && pitch && pitch >= rt->w * 2u)
-                        || xbox_FramebufferWindowRunning()))
+             * write-back below or the readback-mode window. */
+            t = prof_t();
+            if (rt && rt->hw != rt->w && (wb || (win && !layer)))
                 hpx = host_readback(rt);
-            if (rt && addr && pitch && pitch >= rt->w * 2u) {
+            prof_add(&s_pa.hostrb, t);
+            if (wb) {
+                t = prof_t();
                 if (rt->hw == rt->w)
                     write_back(rt, addr, pitch);
                 else if (hpx)
                     write_back_scaled(rt, hpx, addr, pitch);
+                rt->dirty = 0;
+                prof_add(&s_pa.wb, t);
             }
         }
     }
@@ -1999,10 +2408,11 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (%s), %llu clears,"
                 " %llu draws (%llu vertex-program), %llu skipped, %llu culled,"
-                " %llu texture uploads, %llu rehashes, %llu write-backs;"
+                " %llu texture uploads, %llu rehashes, %llu write-backs (%s),"
+                " %llu decode syncs;"
                 " shaders %llu vs + %llu fs, %llu compile errors;"
                 " %llu z-clears, %llu depth draws, %llu rt binds (%llu self copies);"
-                " %llu window presents (texture readback); %llu flushes,"
+                " %llu window presents (%s); %llu flushes,"
                 " %llu at GET_REPORT\n",
                 (unsigned long long)s_presents, surface_offset,
                 rt ? "drawn here" : "guest bytes",
@@ -2010,29 +2420,38 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_draws_prog, (unsigned long long)s_draws_skipped,
                 (unsigned long long)s_draws_culled,
                 (unsigned long long)s_tex_uploads, (unsigned long long)s_tex_rehash,
-                (unsigned long long)s_writebacks,
+                (unsigned long long)s_writebacks, always ? "always" : "lazy",
+                (unsigned long long)s_decode_syncs,
                 (unsigned long long)s_vs_compiled, (unsigned long long)s_fs_compiled,
                 (unsigned long long)s_compile_errors,
                 (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
                 (unsigned long long)s_rtt_binds, (unsigned long long)s_self_copies,
                 (unsigned long long)s_window_presents,
+                s_layer ? "CAMetalLayer slots" : "texture readback",
                 (unsigned long long)s_flushes, (unsigned long long)s_report_commits);
-    if (!pitch || !addr)
-        return;
-    xbox_FramebufferWindowSet(addr, pitch);
-    /* Present (4.5): a surface drawn here reaches the window by readback,
-     * not zero-copy: getBytes of rt->tex after the flip's wait (GPU->CPU),
-     * a copy into the window's slot, then SDL_UpdateTexture (CPU->GPU),
-     * about 1.2 MB each way per 640x480 frame. It reads the texture, not
-     * the guest bytes. A surface the backend never drew (guest bytes) goes
-     * as the CPU path presents it. A zero-copy CAMetalLayer blit is 4.9. */
-    if (rt && hpx && xbox_FramebufferWindowRunning()) {
-        /* Scaled: the host-size frame read above, as it is. */
-        xbox_FramebufferWindowPresentPixels(hpx, rt->hw, rt->hh, rt->hw * 4u, 4u);
-        s_window_presents++;
+    if (!always && rt && addr && pitch)
+        guard_flip(addr, pitch * rt->h);
+    if (!pitch || !addr || layer) {
+        prof_flip_end(t_flip0);
         return;
     }
-    if (rt && rt->hw == rt->w && xbox_FramebufferWindowRunning()) {
+    xbox_FramebufferWindowSet(addr, pitch);
+    /* Readback mode (metal_present=readback, or no CAMetalLayer window): a
+     * surface drawn here reaches the window by readback, getBytes of rt->tex
+     * after the flip's wait, a copy into the window's slot, then
+     * SDL_UpdateTexture. It reads the texture, not the guest bytes. A surface
+     * the backend never drew (guest bytes) goes as the CPU path presents it,
+     * in either mode. */
+    if (rt && hpx && win) {
+        /* Scaled: the host-size frame read above, as it is. */
+        t = prof_t();
+        xbox_FramebufferWindowPresentPixels(hpx, rt->hw, rt->hh, rt->hw * 4u, 4u);
+        prof_add(&s_pa.winpush, t);
+        s_window_presents++;
+        prof_flip_end(t_flip0);
+        return;
+    }
+    if (rt && rt->hw == rt->w && win) {
         static uint8_t *px;
         static size_t cap;
         size_t need = (size_t)rt->w * rt->h * 4u;
@@ -2044,14 +2463,24 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
             }
         }
         if (cap >= need) {
+            t = prof_t();
             [rt->tex getBytes:px bytesPerRow:rt->w * 4u
                    fromRegion:MTLRegionMake2D(0, 0, rt->w, rt->h) mipmapLevel:0];
+            prof_add(&s_pa.winrb, t);
+            t = prof_t();
             xbox_FramebufferWindowPresentPixels(px, rt->w, rt->h, rt->w * 4u, 4u);
+            prof_add(&s_pa.winpush, t);
             s_window_presents++;
+            prof_flip_end(t_flip0);
             return;
         }
     }
+    /* Guest bytes go to the window: our read, not the title's (the guard
+     * may have armed this surface above). Headless, nothing reads them. */
+    if (xbox_FramebufferWindowRunning())
+        guard_open();
     xbox_FramebufferWindowPresent(addr, pitch);
+    prof_flip_end(t_flip0);
 }
 
 /* ---- registration ---------------------------------------------------------- */
@@ -2065,7 +2494,8 @@ static const struct nv2a_pb_backend s_metal_backend = {
     metal_on_zpass_clear,
     metal_on_report,
     metal_on_poll,
-    1,                  /* writes_back: on_flip reads the RT into guest memory */
+    1,                  /* writes_back: dumps read guest memory, after sync_guest */
+    metal_sync_guest,
 };
 
 const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)

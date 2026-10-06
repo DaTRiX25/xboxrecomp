@@ -13,4 +13,6 @@ target_include_directories(nv2a_backend_smoke PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../../src/kernel)
 enable_testing()
 add_test(NAME nv2a_backend_smoke COMMAND nv2a_backend_smoke)
-set_tests_properties(nv2a_backend_smoke PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME nv2a_backend_smoke_guard COMMAND nv2a_backend_smoke guard)
+set_tests_properties(nv2a_backend_smoke nv2a_backend_smoke_guard
+    PROPERTIES SKIP_RETURN_CODE 77)
