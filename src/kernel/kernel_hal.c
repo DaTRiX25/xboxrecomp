@@ -229,6 +229,12 @@ int xbox_DispatchGateTryEnter(void)
 void xbox_DispatchGateEnter(void)
 {
     dispatch_gate_once();
+    if (xbox_ProfOn()) {
+        long long t0 = xbox_ProfNowUs();
+        EnterCriticalSection(&s_dispatch_gate);
+        xbox_ProfWait(XBOX_PROF_WAIT_GATE, xbox_ProfNowUs() - t0);
+        return;
+    }
     EnterCriticalSection(&s_dispatch_gate);
 }
 
@@ -250,7 +256,13 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
 
     if (now && gate) {
         dispatch_gate_once();
-        EnterCriticalSection(&s_dispatch_gate);
+        if (xbox_ProfOn()) {
+            long long t0 = xbox_ProfNowUs();
+            EnterCriticalSection(&s_dispatch_gate);
+            xbox_ProfWait(XBOX_PROF_WAIT_GATE, xbox_ProfNowUs() - t0);
+        } else {
+            EnterCriticalSection(&s_dispatch_gate);
+        }
         t_dispatch_gate_held = 1;
     }
     d = now ? InterlockedIncrement(&g_irql_raised_count)
@@ -504,6 +516,8 @@ VOID __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds)
     do {
         QueryPerformanceCounter(&now);
     } while ((now.QuadPart - start.QuadPart) < target_counts);
+    if (xbox_ProfOn())
+        xbox_ProfWait(XBOX_PROF_WAIT_STALL, (long long)MicroSeconds);
 }
 
 /* ============================================================================

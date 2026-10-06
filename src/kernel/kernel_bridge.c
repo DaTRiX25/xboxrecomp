@@ -2319,7 +2319,8 @@ static void bridge_HalReadSMCTrayState(void)
  *
  * Returns 1 if the routine was found and called.
  */
-static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
+                          int prof_kind)
 {
     uint32_t routine, context;
     recomp_func_t fn;
@@ -2348,6 +2349,16 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    if (xbox_ProfOn()) {
+        /* Begin before the raise: the gate wait inside it is the routine's. */
+        void *prev = xbox_ProfBegin(prof_kind, routine);
+        int _irql = xbox_IrqlEnterInterrupt(2);
+        long long t0 = xbox_ProfNowUs();
+        fn();
+        xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
+        xbox_IrqlLeaveInterrupt(_irql);
+        return 1;
+    }
     { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     return 1;
 }
@@ -2390,6 +2401,16 @@ static void bridge_KeSynchronizeExecution(void)
      * their ISRs holding the one-CPU gate when it is free
      * (xbox_DispatchGateTryEnter), so holding it here keeps the routine and
      * those ISRs apart, as the interrupt's spinlock at DIRQL does. */
+    if (xbox_ProfOn()) {
+        void *prev = xbox_ProfBegin(XBOX_PROF_SYNC, routine);
+        long long t0;
+        xbox_DispatchGateEnter();
+        t0 = xbox_ProfNowUs();
+        fn();
+        xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
+        xbox_DispatchGateLeave();
+        return;
+    }
     xbox_DispatchGateEnter();
     fn();
     xbox_DispatchGateLeave();
@@ -2546,7 +2567,14 @@ static int kernel_raise_interrupt(uint32_t vector)
          * hardware). */
         int gated = xbox_DispatchGateTryEnter();
         int _irql = xbox_IrqlEnterInterrupt(16);
-        fn();
+        if (xbox_ProfOn()) {
+            void *prev = xbox_ProfBegin(XBOX_PROF_ISR_VBLANK, routine);
+            long long t0 = xbox_ProfNowUs();
+            fn();
+            xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
+        } else {
+            fn();
+        }
         xbox_IrqlLeaveInterrupt(_irql);
         if (gated)
             xbox_DispatchGateLeave();
@@ -2578,22 +2606,9 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PMC_INTR_PCRTC    (1u << 24)
 #define NV2A_PCRTC_INTR_0      0x00600100u
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
+#define NV2A_PCRTC_INTR_EN_0   0x00600140u
 #define NV2A_VECTOR            3u
 
-/* The vblank acknowledgement, done when the guest gives it.
- *
- * PMC_INTR_0 and PCRTC_INTR_0 are write-1-to-clear. An XDK vblank DPC reads
- * PMC_INTR_0 to see what is pending, acks with PCRTC_INTR_0 = 1, and then
- * spins until PMC_INTR_0 shows PCRTC clear. Against plain RAM
- * only the nv2a-ack thread cleared that bit, once per pass. At Sleep(0) that
- * was immediate. At Sleep(1), with the push-buffer executor making each pass
- * take milliseconds, every vblank held the timer thread for the rest of a
- * pass: 35-43% of a core under Proton, 6.5% on macOS.
- *
- * So after a claimed ISR, PCRTC_INTR_0's vblank bit is taken down (the ISR
- * has read it) and PMC's is left up for the DPC. This thread then waits for
- * the DPC's ack write, the bit coming back, and clears both. It blocks on an
- * event between vblanks, and gives up after 2 ms if no ack comes. */
 /* Milliseconds on the performance counter, for the vblank schedule, the
  * kernel timers and the vblank ack wait. GetTickCount64 is not good enough
  * for those under Wine: it reads a tick the wineserver advances in steps of
@@ -2612,50 +2627,160 @@ static long long kernel_clock_ms(void)
            + (long long)(now.QuadPart % freq.QuadPart) * 1000 / freq.QuadPart;
 }
 
+/* The vblank acknowledgement, done when the guest gives it.
+ *
+ * PMC_INTR_0 and PCRTC_INTR_0 are write-1-to-clear. An XDK vblank DPC reads
+ * PMC_INTR_0 to see what is pending, acks with PCRTC_INTR_0 = 1, and then
+ * spins until PMC_INTR_0 shows PCRTC clear. Against plain RAM
+ * only the nv2a-ack thread cleared that bit, once per pass. At Sleep(0) that
+ * was immediate. At Sleep(1), with the push-buffer executor making each pass
+ * take milliseconds, every vblank held the timer thread for the rest of a
+ * pass: 35-43% of a core under Proton, 6.5% on macOS.
+ *
+ * So after the ISR, PCRTC_INTR_0's vblank bit is taken down (the ISR
+ * has read it) and PMC's is left up for the DPC. This thread then waits for
+ * the DPC's ack write, the bit coming back, and clears both. It blocks on an
+ * event between vblanks.
+ *
+ * It used to give up after 2 ms. The DPC is queued, though, and the timer
+ * thread runs it only once the one-CPU gate is free, so whenever a title
+ * thread sat at DISPATCH across the vblank the DPC came late, acked into a
+ * window nobody watched any more, and spun at DISPATCH until the nv2a-ack
+ * pass came round. With a heavy push buffer a pass is hundreds of
+ * milliseconds: the D3D vblank DPC then held the timer thread for a quarter
+ * of the time, vblanks slowed to 45 Hz and audio streaming starved. So after
+ * the first 2 ms of yielding the watch goes on at 1 ms waits, and past a
+ * second at 16 ms ones, for as long as PMC_INTR_0's PCRTC bit is up: until
+ * the ack comes, the next vblank re-arms it, or the bit goes down some other
+ * way (the nv2a-ack backstop, xbox_VblankAckHeld).
+ *
+ * While the timer thread is between setting the two bits and the ISR's
+ * return (tick_busy), PCRTC_INTR_0's bit is the new vblank, not an ack:
+ * taking it then would ack the vblank before the ISR saw it. The bits are
+ * changed with interlocked operations, since the guest and the nv2a-ack
+ * thread write the same words. */
+enum { VBL_ACK_FAST_MS = 2, VBL_ACK_LATE_MS = 1000, VBL_ACK_SLOW_STEP_MS = 16 };
+
+int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
+                       volatile LONG *tick_busy, HANDLE rearm, long *late_ms)
+{
+    long long start = kernel_clock_ms(), now = start;
+
+    *late_ms = 0;
+    for (;;) {
+        DWORD step;
+
+        if (!*tick_busy && (*pcrtc_intr & NV2A_PCRTC_INTR_VBLANK)) {
+            InterlockedAnd((volatile LONG *)pcrtc_intr,
+                           (LONG)~NV2A_PCRTC_INTR_VBLANK);
+            InterlockedAnd((volatile LONG *)pmc_intr,
+                           (LONG)~NV2A_PMC_INTR_PCRTC);
+            if (now - start <= VBL_ACK_FAST_MS)
+                return XBOX_VBL_ACK_ON_TIME;
+            *late_ms = (long)(now - start);
+            return XBOX_VBL_ACK_LATE;
+        }
+        if (!*tick_busy && !(*pmc_intr & NV2A_PMC_INTR_PCRTC))
+            return XBOX_VBL_ACK_NONE;   /* nobody is waiting on it */
+        if (now - start <= VBL_ACK_FAST_MS) {
+            SwitchToThread();
+            now = kernel_clock_ms();
+            continue;
+        }
+        step = now - start <= VBL_ACK_LATE_MS ? 1 : VBL_ACK_SLOW_STEP_MS;
+        if (WaitForSingleObject(rearm, step) == WAIT_OBJECT_0) {
+            /* The next vblank: it is that one's ack now. */
+            return XBOX_VBL_ACK_REARMED;
+        }
+        now = kernel_clock_ms();
+    }
+}
+
 static HANDLE g_vbl_ack_event;
-/* Vblanks whose ack never came within the window: the bit was left for the
- * next one. Reported, and reset, on the 600-vblank line. */
+/* Vblanks whose ack never came: the bit was left for the next one. Acks
+ * that came after the 2 ms yield, and the latest of them. Reported, and
+ * reset, on the 600-vblank line. */
 static volatile LONG g_vbl_ack_giveups;
+static volatile LONG g_vbl_ack_late, g_vbl_ack_late_max;
+/* Vblanks the ISR declined: with the XDK ISR, ones that came while its DPC
+ * had the interrupt masked. */
+static volatile LONG g_vbl_declined;
+/* Set by the timer thread from just before it raises the vblank bits until
+ * the ISR has returned and the watch is re-armed. */
+static volatile LONG g_vbl_tick_busy;
+/* When the vblank-ack thread last saw the PCRTC bit acked or down: the low
+ * 32 bits of kernel_clock_ms(), compared by unsigned difference. */
+static volatile LONG g_vbl_ack_seen_ms;
 
 static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
 {
+    int r = XBOX_VBL_ACK_ON_TIME;
+
     (void)unused;
     xbox_log_thread_role("vblank-ack", 0);
     for (;;) {
-        long long until;
+        long late_ms;
 
-        int acked = 0;
-
-        WaitForSingleObject(g_vbl_ack_event, INFINITE);
-        until = kernel_clock_ms() + 2;
-        while (kernel_clock_ms() <= until) {
-            if (BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &
-                NV2A_PCRTC_INTR_VBLANK) {
-                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &=
-                    ~NV2A_PCRTC_INTR_VBLANK;
-                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) &=
-                    ~NV2A_PMC_INTR_PCRTC;
-                acked = 1;
-                break;
-            }
-            SwitchToThread();
-        }
-        if (!acked)
+        if (r != XBOX_VBL_ACK_REARMED)
+            WaitForSingleObject(g_vbl_ack_event, INFINITE);
+        r = xbox_VblankAckWait(
+            &BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
+            &BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+            &g_vbl_tick_busy, g_vbl_ack_event, &late_ms);
+        if (r != XBOX_VBL_ACK_REARMED)
+            InterlockedExchange(&g_vbl_ack_seen_ms, (LONG)(uint32_t)kernel_clock_ms());
+        if (r == XBOX_VBL_ACK_LATE) {
+            InterlockedIncrement(&g_vbl_ack_late);
+            if (late_ms > g_vbl_ack_late_max)
+                InterlockedExchange(&g_vbl_ack_late_max, late_ms);
+        } else if (r != XBOX_VBL_ACK_ON_TIME) {
             InterlockedIncrement(&g_vbl_ack_giveups);
+        }
     }
     return 0;
+}
+
+static volatile LONG g_vbl_ack_owned;
+
+/* The nv2a-ack thread's backstop. While the vblank-ack thread runs it owns
+ * the two vblank bits, and nv2a-ack leaves them, unless no ack has come for
+ * VBL_ACK_LATE_MS with no vblank being raised: then the guest is not acking
+ * the XDK way (or its ack was lost), and nv2a-ack clears them each pass as it
+ * did before the watch, so a DPC spinning on PMC_INTR_0 is let go. */
+int xbox_VblankAckHeld(void)
+{
+    if (!g_vbl_ack_owned)
+        return 0;
+    if (g_vbl_tick_busy)
+        return 1;
+    return (uint32_t)kernel_clock_ms() - (uint32_t)g_vbl_ack_seen_ms
+           <= VBL_ACK_LATE_MS;
 }
 
 static void kernel_vblank_arm_ack(void)
 {
     if (!g_vbl_ack_event) {
+        HANDLE t;
+
         g_vbl_ack_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-        if (!g_vbl_ack_event)
+        if (!g_vbl_ack_event) {
+            InterlockedExchange(&g_vbl_tick_busy, 0);
             return;
-        CloseHandle(CreateThread(NULL, 0, kernel_vblank_ack_thread, NULL, 0,
-                                 NULL));
+        }
+        InterlockedExchange(&g_vbl_ack_seen_ms, (LONG)(uint32_t)kernel_clock_ms());
+        t = CreateThread(NULL, 0, kernel_vblank_ack_thread, NULL, 0, NULL);
+        if (!t) {
+            CloseHandle(g_vbl_ack_event);
+            g_vbl_ack_event = NULL;
+            InterlockedExchange(&g_vbl_tick_busy, 0);
+            return;
+        }
+        CloseHandle(t);
+        InterlockedExchange(&g_vbl_ack_owned, 1);
     }
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &= ~NV2A_PCRTC_INTR_VBLANK;
+    InterlockedAnd((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
+                   (LONG)~NV2A_PCRTC_INTR_VBLANK);
+    InterlockedExchange(&g_vbl_tick_busy, 0);
     SetEvent(g_vbl_ack_event);
 }
 
@@ -2698,6 +2823,8 @@ static long kernel_vblank_tick(void)
     if (now - due > 100) {
         t0 = now;
         count = 0;
+        if (xbox_ProfOn())
+            xbox_ProfCount(XBOX_PROF_SCHED_RESTART, now - due);
     }
     count++;
     InterlockedIncrement(&g_vblank_total);
@@ -2723,10 +2850,16 @@ static long kernel_vblank_tick(void)
         qlast = q;
         if (++total % 600 == 0) {
             fprintf(stderr, "  [NV2A] vblank %llu: last 600 in %lld ms,"
-                    " gap %.1f-%.1f ms, ack give-ups %ld\n",
+                    " gap %.1f-%.1f ms, ack give-ups %ld, late acks %ld"
+                    " (max %ld ms), declined %ld\n",
                     total, last_ms ? now - last_ms : 0, gap_min, gap_max,
-                    (long)InterlockedExchange(&g_vbl_ack_giveups, 0));
+                    (long)InterlockedExchange(&g_vbl_ack_giveups, 0),
+                    (long)InterlockedExchange(&g_vbl_ack_late, 0),
+                    (long)InterlockedExchange(&g_vbl_ack_late_max, 0),
+                    (long)InterlockedExchange(&g_vbl_declined, 0));
             fflush(stderr);
+            if (xbox_ProfOn())
+                xbox_ProfReport();
             gap_min = 1e9;
             gap_max = 0;
             last_ms = now;
@@ -2741,15 +2874,40 @@ static long kernel_vblank_tick(void)
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return wait;
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    /* PCRTC_INTR_EN_0: D3D enables the vblank interrupt once it has
+     * connected its ISR. Until then the hardware raises nothing. */
+    if (!(BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_EN_0)
+          & NV2A_PCRTC_INTR_VBLANK)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [NV2A] vblank held: PCRTC_INTR_EN_0 off\n");
+        return wait;
+    }
+
+    InterlockedExchange(&g_vbl_tick_busy, 1);
+    InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
+                  (LONG)NV2A_PCRTC_INTR_VBLANK);
+    InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+                  (LONG)NV2A_PMC_INTR_PCRTC);
 
     {
         static unsigned n;
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
 
-        if (claimed > 0)
+        /* Armed for a declined vblank too. The XDK ISR masks PMC_INTR_EN_0
+         * and queues its DPC, which unmasks when it is done; until then
+         * every vblank finds the mask down and is declined, but its status
+         * bit stays latched in PMC_INTR_0, as on hardware. The DPC, run late
+         * behind the one-CPU gate, then sees it, acks it and spins on it --
+         * and with the watch armed only on a claim, nothing cleared it
+         * until the nv2a-ack pass, hundreds of milliseconds under a heavy
+         * push buffer. */
+        if (claimed >= 0)
             kernel_vblank_arm_ack();
+        else
+            InterlockedExchange(&g_vbl_tick_busy, 0);
+        if (claimed == 0)
+            InterlockedIncrement(&g_vbl_declined);
         if (n++ < 3)
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
@@ -2771,14 +2929,21 @@ static void kernel_drain_dpcs(void)
          * source, which a guest parked at DISPATCH must not stop. What is
          * queued stays queued for the next tick, as DPCs wait on hardware
          * until the processor drops below DISPATCH. */
-        if (!xbox_DispatchGateTryEnter())
+        if (!xbox_DispatchGateTryEnter()) {
+            if (xbox_ProfOn())
+                xbox_ProfCount(XBOX_PROF_DRAIN_BUSY, 1);
             break;
+        }
         dpc_lock();
         if (g_dpc_head == g_dpc_tail) {
             LeaveCriticalSection(&g_dpc_lock);
             xbox_DispatchGateLeave();
             break;
         }
+        if (xbox_ProfOn())
+            xbox_ProfCount(XBOX_PROF_DPCQ_DEPTH,
+                           (g_dpc_tail - g_dpc_head + XBOX_MAX_PENDING_DPC)
+                           % XBOX_MAX_PENDING_DPC);
         d = g_dpc_queue[g_dpc_head];
         g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
         /* Cleared before the routine runs, as the kernel does: the routine
@@ -2787,7 +2952,7 @@ static void kernel_drain_dpcs(void)
             BRIDGE_MEM8(d.dpc + 2) = 0;
         LeaveCriticalSection(&g_dpc_lock);
         if (d.dpc)
-            kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+            kernel_run_dpc(d.dpc, d.arg1, d.arg2, XBOX_PROF_DPC_QUEUE);
         xbox_DispatchGateLeave();
     }
 }
@@ -3072,7 +3237,15 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
 
         /* Until the next vblank, at most the 10 ms timer tick. */
-        Sleep((DWORD)(wait < 1 ? 1 : wait));
+        if (xbox_ProfOn()) {
+            long long t0 = xbox_ProfNowUs();
+            Sleep((DWORD)(wait < 1 ? 1 : wait));
+            xbox_ProfCount(XBOX_PROF_SLEEP_OVER, xbox_ProfNowUs() - t0
+                           - (long long)(wait < 1 ? 1 : wait) * 1000);
+            xbox_ProfCount(XBOX_PROF_N_LOOPS, 1);
+        } else {
+            Sleep((DWORD)(wait < 1 ? 1 : wait));
+        }
         wait = kernel_vblank_tick();  /* the GPU's frame clock */
         if (wait > 10)
             wait = 10;
@@ -3097,7 +3270,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
             /* Outside the lock: the routine can set or cancel timers. */
             if (dpc)
-                kernel_run_dpc(dpc, 0, 0);
+                kernel_run_dpc(dpc, 0, 0, XBOX_PROF_DPC_TIMER);
 
             /* Wake anyone parked on the timer's shadow event; a timer with no
              * DPC is just a kernel sleep. */
@@ -9966,6 +10139,8 @@ static void kernel_thunk_dispatch(void)
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+    if (xbox_ProfOn())
+        xbox_ProfKernelCall(ordinal);
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the

@@ -801,6 +801,8 @@ void    xbox_IrqlLeaveInterrupt(int saved);
  * A depth that is non-zero while this stops moving is stuck, not busy. */
 int     xbox_IrqlTransitions(void);
 void    xbox_IrqlDumpHolders(void);
+
+#include "kernel_prof.h"            /* RECOMP_TRACE=dpc */
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 
@@ -1110,6 +1112,22 @@ extern void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
  * Interlaced output shows one field per vblank, so its low bit is the field
  * parity that the field pin (port 0x80C0) reports. */
 uint32_t xbox_VblankCount(void);
+
+/* One vblank's acknowledgement (kernel_bridge.c, the vblank-ack thread):
+ * waits for the DPC's write of the PCRTC_INTR_0 vblank bit and clears it and
+ * PMC_INTR_0's PCRTC bit. Yields for 2 ms, then waits on `rearm` in 1 ms
+ * steps, and past a second in 16 ms ones, for as long as the PMC bit is up.
+ * While *tick_busy is set the PCRTC bit is a vblank being raised, not an
+ * ack, and is left. late_ms is how late a late ack came. Not static so
+ * tests/vblank_ack can drive it against plain words. */
+enum { XBOX_VBL_ACK_ON_TIME, XBOX_VBL_ACK_LATE, XBOX_VBL_ACK_REARMED,
+       XBOX_VBL_ACK_NONE };
+int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
+                       volatile LONG *tick_busy, HANDLE rearm, long *late_ms);
+/* Whether the nv2a-ack thread should leave PMC_INTR_0's PCRTC bit and
+ * PCRTC_INTR_0's vblank bit to the vblank-ack thread: it runs, and an ack
+ * has come (or a vblank is being raised) within the last second. */
+int xbox_VblankAckHeld(void);
 
 /* x86 port I/O for lifted `in`/`out` (kernel_hal.c); width is 1, 2 or 4.
  * Also declared in templates/runtime/recomp_types.h for generated code. */

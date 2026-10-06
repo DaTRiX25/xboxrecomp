@@ -1512,6 +1512,12 @@ static void xbox_Nv2aKickStart(void *regs)
         g_nv2a_kick_thread = CreateThread(NULL, 0, nv2a_kick_thread, regs, 0, NULL);
 }
 
+/* The vblank's two status bits, which the vblank-ack thread owns. */
+#define NV2A_ACK_PMC_INTR_0         0x000100u
+#define NV2A_ACK_PMC_INTR_PCRTC     (1u << 24)
+#define NV2A_ACK_PCRTC_INTR_0       0x600100u
+#define NV2A_ACK_PCRTC_INTR_VBLANK  (1u << 0)
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     xbox_log_thread_role("nv2a-ack", 0);
@@ -1520,10 +1526,25 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            uint32_t mask = NV2A_ACK[i].busy_mask;
             if (NV2A_ACK[i].offset == NV2A_KICK_REG && g_kick_fast)
                 continue;               /* kick_ack, below */
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
+            /* Once the vblank is delivered its two bits belong to the
+             * vblank-ack thread (kernel_bridge.c), which clears them on the
+             * DPC's ack. Cleared here too, a pass that landed between the
+             * vblank and the DPC's read of PMC_INTR_0 took the vblank away
+             * from the DPC: no ack, no count, and the title's present at
+             * vblank slipped a frame. */
+            if (xbox_VblankAckHeld()) {
+                if (NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0)
+                    mask &= ~NV2A_ACK_PMC_INTR_PCRTC;
+                else if (NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0)
+                    mask &= ~NV2A_ACK_PCRTC_INTR_VBLANK;
+            }
+            /* Interlocked: the vblank-ack thread and the guest change other
+             * bits of the same word meanwhile. */
+            if (*r & mask) {
+                InterlockedAnd((volatile LONG *)r, (LONG)~mask);
                 if (NV2A_ACK[i].offset == NV2A_KICK_REG)
                     kick_cleared(nv2a_pb_now_ns());
             }
