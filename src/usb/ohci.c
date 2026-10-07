@@ -931,9 +931,11 @@ static int ohci_call_isr(OhciController *hc)
 /* The gate holder's run of a posted USB interrupt (kernel_hal.c has put it
  * on a worker stack). The status bits were set by the controller thread;
  * if the driver has cleared them since, the ISR declines. */
+static volatile int s_posting_hc;       /* the controller that posted, for logs */
+
 static void ohci_isr_on_holder(void)
 {
-    ohci_isr_call(-1);
+    ohci_isr_call(s_posting_hc);
 }
 
 /* Set the status bits and, if the driver has unmasked them, call the ISR.
@@ -1236,6 +1238,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * (xbox_IrqPost) and this pass goes on. The line stays up, so the
          * next pass posts again (coalesced) until the ISR has run. */
         xbox_IrqSetHandler(XBOX_IRQ_OHCI, ohci_isr_on_holder);
+        s_posting_hc = hc->index;
         if (xbox_IrqSafePointsOn()) {
             int how = xbox_IrqPost(XBOX_IRQ_OHCI);
             if (how == XBOX_IRQ_POSTED)

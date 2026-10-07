@@ -17,6 +17,9 @@
  *  - three posts of one line run once;
  *  - a holder that releases between the poster's first try and its post:
  *    the poster's second try delivers;
+ *  - a post that lands inside the lower that gives the gate back, after its
+ *    safe point and before the leave: the release point runs it on the
+ *    holder once the new level is written, not at the poster's next try;
  *  - a holder that reaches no safe point: logged at irq_safe_ms, never run;
  *    with irq_safe_force=1 delivered beside it after irq_safe_ms;
  *  - 100k rounds of edits and random posts leave the list intact.
@@ -41,6 +44,7 @@ extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
 extern RECOMP_TLS uint32_t g_ebp;
 extern RECOMP_TLS RecompXmm g_xmm0;
 extern uint32_t g_xbox_stack_size;
+extern ptrdiff_t g_xbox_mem_offset;
 
 #define MS 1000000ull
 
@@ -440,6 +444,48 @@ static void lost_post(void)
           "lost-post window: the poster's second try delivers it");
 }
 
+/* The lower's window: the hook runs on the holder inside the lower, after
+ * its safe point and before the gate is left, and lets the poster post. */
+static void window_hook(void)
+{
+    SetEvent(ev_a);
+    WaitForSingleObject(ev_b, 10000);
+}
+
+static DWORD WINAPI window_holder(LPVOID p)
+{
+    int *after = (int *)p, saved;
+
+    g_fs_base = 0;
+    after[2] = (int)GetCurrentThreadId();
+    saved = xbox_IrqlEnterInterrupt(DISPATCH_LEVEL);
+    xbox_IrqSetReleaseHook(window_hook);
+    xbox_IrqlLeaveInterrupt(saved);         /* the window is in here */
+    xbox_IrqSetReleaseHook(NULL);
+    after[0] = (int)s_runs;
+    after[1] = xbox_IrqlCurrent();
+    return 0;
+}
+
+static void lower_window(void)
+{
+    int after[3] = {-1, -1, 0};
+    HANDLE t;
+    int how;
+
+    reset_counts();
+    t = CreateThread(NULL, 0, window_holder, after, 0, NULL);
+    WaitForSingleObject(ev_a, 10000);       /* holder is inside its lower */
+    how = deliver(XBOX_IRQ_APU);
+    SetEvent(ev_b);
+    WaitForSingleObject(t, 10000);
+    CloseHandle(t);
+    check(how == XBOX_IRQ_POSTED, "lower window: posted while the gate is still held");
+    check(after[0] == 1 && s_run_tid == (unsigned long)after[2],
+          "lower window: run by the release point, on the holder");
+    check(after[1] == PASSIVE_LEVEL, "lower window: the holder ends at its new level");
+}
+
 static void wait_and_log(void)
 {
     Holder h = {0};
@@ -544,6 +590,12 @@ int main(void)
 {
     g_fs_base = 0;
     g_xbox_stack_size = 8u * 1024 * 1024;   /* worker stack slices to hand out */
+    /* Guest memory only where the worker stacks are: a routine run from
+     * PASSIVE_LEVEL (the lower window) raises to 16 there, and the raise
+     * records the guest return address at its esp. */
+    g_xbox_mem_offset = (ptrdiff_t)(uintptr_t)calloc(
+        XBOX_WORKER_STACK_COUNT, XBOX_WORKER_STACK_SIZE)
+        - (ptrdiff_t)XBOX_WORKER_STACK_BASE;
     ev_a = CreateEventW(NULL, FALSE, FALSE, NULL);
     ev_b = CreateEventW(NULL, FALSE, FALSE, NULL);
     xbox_IrqSetHandler(XBOX_IRQ_APU, apu_routine);
@@ -558,6 +610,7 @@ int main(void)
     nesting();
     coalescing();
     lost_post();
+    lower_window();
     wait_and_log();
     stress();
     printf("%s\n", failures ? "FAILED" : "all passed");

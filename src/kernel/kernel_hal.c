@@ -59,11 +59,18 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * guest memory on its behalf uses the same one. */
 extern ptrdiff_t g_xbox_mem_offset;
 
+/* Set by the lower that gave the one-CPU gate back (irql_track_gated): the
+ * release point runs once the new level is written, below. */
+static XBOX_THREAD_LOCAL int t_release_due;
+static void irql_release_due(void);
+
 static void irql_publish(void)
 {
     if (g_fs_base)
         *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base
                               + 0x24) = (uint8_t)g_current_irql;
+    if (t_release_due)
+        irql_release_due();
 }
 
 /* How many threads are holding IRQL at or above DISPATCH_LEVEL.
@@ -323,6 +330,7 @@ static void (*volatile s_irq_run[XBOX_IRQ_LINES])(void);
 static uint64_t s_irq_post_ns[XBOX_IRQ_LINES]; /* when the bit went up */
 static XBOX_THREAD_LOCAL int t_in_isr;
 static void (*s_irq_post_hook)(int line);
+static void (*s_irq_release_hook)(void);   /* tests: the lower's window */
 static int s_irq_mode = -1;                    /* irq_safe_points */
 static int s_irq_force;
 static uint64_t s_irq_wait_ns;
@@ -379,6 +387,11 @@ void xbox_IrqSetPostHook(void (*hook)(int line))
     s_irq_post_hook = hook;
 }
 
+void xbox_IrqSetReleaseHook(void (*hook)(void))
+{
+    s_irq_release_hook = hook;
+}
+
 static void irq_note_wait(int line, uint64_t posted_ns)
 {
     long us = (long)((xbox_HostNowNs() - posted_ns) / 1000u);
@@ -393,7 +406,8 @@ static void irq_note_wait(int line, uint64_t posted_ns)
  * before the bridge reads its arguments, and one at a spin-wait yield sits
  * in the middle of a guest loop, so everything the generated code keeps in
  * these across a call or an instruction is put back. g_fs_base stays: the
- * routine runs on the holder's TIB, as on the console's one CPU. */
+ * routine runs on the holder's TIB, as on the console's one CPU (a device
+ * model's thread as holder: see irq_release_point). */
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp;
 extern RECOMP_TLS uint32_t g_seh_ebp, g_eflags;
 extern RECOMP_TLS int g_df, g_fp_top, g_fp_cmp;
@@ -516,7 +530,16 @@ void xbox_IrqSafePoint(void)
 /* After a full release: a post that landed between the release's safe point
  * and the leave saw the gate held, and its poster's second try may have come
  * before the leave too. Take the gate back and run it. Once, so a line that
- * cannot run (no worker stack) does not spin here. */
+ * cannot run (no worker stack) does not spin here.
+ *
+ * The releasing thread can be a device model's (the APU frame thread or the
+ * OHCI controller thread, after a gated delivery of their own), and then
+ * the routine runs on that thread's TIB. That is no different from the
+ * models' own deliveries, which have always run ISRs on a TIB of the
+ * delivering thread (xbox_AllocThreadTib), and from the vblank on the timer
+ * thread: an ISR here never had a guest-scheduled TIB, and no XDK ISR reads
+ * thread-local state. The holder rule is what matters, and this thread holds
+ * the gate while the routine runs. */
 static void irq_release_point(void)
 {
     if (!s_irq_pending || t_in_isr || g_current_irql > DISPATCH_LEVEL)
@@ -525,6 +548,12 @@ static void irq_release_point(void)
         return;                         /* the new holder has it now */
     irq_run_pending();
     gate_leave_raw();
+}
+
+static void irql_release_due(void)
+{
+    t_release_due = 0;
+    irq_release_point();
 }
 
 /* The holder has reached no safe point for irq_safe_ms with something
@@ -537,6 +566,7 @@ static void irq_wait_check(uint64_t now)
     uint64_t oldest = 0;
     unsigned long tid;
     char names[64];
+    size_t used = 0;
     int line, i;
 
     if (!p)
@@ -546,9 +576,8 @@ static void irq_wait_check(uint64_t now)
         if (p & (1L << line)) {
             if (!oldest || s_irq_post_ns[line] < oldest)
                 oldest = s_irq_post_ns[line];
-            if (names[0])
-                strcat(names, ",");
-            strcat(names, s_irq_names[line]);
+            used += (size_t)snprintf(names + used, sizeof names - used, "%s%s",
+                                     used ? "," : "", s_irq_names[line]);
         }
     if (!oldest || now - oldest < s_irq_wait_ns)
         return;
@@ -713,10 +742,17 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
         irql_holder_drop();
     if (!now && t_dispatch_gate_held) {
         t_dispatch_gate_held = 0;
-        /* No release point after this leave: the IRQL is not written back
-         * yet. A post caught in the window is taken by its poster's next
-         * try (every model retries while its line is up). */
+        if (s_irq_release_hook)
+            s_irq_release_hook();
+        /* A post caught between the safe point above and this leave saw the
+         * gate held twice. The release point that takes it runs only once
+         * the caller has written the new level back (irql_publish): run
+         * here, the routine's own raise to 16 would be counted against a
+         * level that is still the old one. Without it the vblank waited for
+         * its next tick, up to 16.7 ms. */
         gate_leave_raw();
+        if (!t_gate_depth)
+            t_release_due = 1;
     }
 
     /* RECOMP_IRQL_TRACE prints the first few transitions. The pairing is what

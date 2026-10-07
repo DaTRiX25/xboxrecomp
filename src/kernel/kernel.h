@@ -870,6 +870,9 @@ void    xbox_IrqStatsGet(XboxIrqStats *out, int reset);
  * the poster's first try and its post (the lost-post window). */
 void    xbox_IrqReloadConfig(void);
 void    xbox_IrqSetPostHook(void (*hook)(int line));
+/* Tests: a hook run inside the lower that gives the gate back, after its
+ * safe point and before the leave (the window the release point covers). */
+void    xbox_IrqSetReleaseHook(void (*hook)(void));
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */
