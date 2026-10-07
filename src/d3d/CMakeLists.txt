@@ -78,6 +78,13 @@ endif()
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# The CPU rasteriser's texture cache, driven by a synthetic stream (POSIX:
+# the Proton test set does not run it).
+if(NOT WIN32)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_tex_cache
+                     ${CMAKE_CURRENT_BINARY_DIR}/pb_tex_cache)
+endif()
+
 # The HLSL the parse -> generate pipeline emits, against recorded hashes
 # (every host: the emitters are API-free).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_hlsl_split

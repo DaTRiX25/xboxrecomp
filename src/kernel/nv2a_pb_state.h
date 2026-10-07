@@ -330,6 +330,16 @@ const struct nv2a_pb_backend *nv2a_pb_get_backend(void);
 /* The CPU rasteriser, so another backend can fall back to it or A/B against it. */
 const struct nv2a_pb_backend *nv2a_pb_cpu_backend(void);
 
+/* The CPU rasteriser's decoded-texture cache (fast path), for tests: live
+ * entries, and since startup the binds, the binds an entry served (hits),
+ * the entries built or rebuilt for a bind that missed, and the entries whose
+ * guest bytes changed (their decoded tiles dropped). Walker thread only. */
+struct nv2a_pb_tc_stats {
+    uint32_t entries;
+    uint64_t binds, hits, builds, dropped;
+};
+void nv2a_pb_exec_tc_stats(struct nv2a_pb_tc_stats *out);
+
 #ifdef __cplusplus
 }
 #endif

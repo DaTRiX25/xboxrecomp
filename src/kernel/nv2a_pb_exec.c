@@ -3282,7 +3282,8 @@ static void rc_unpack_fast(uint32_t c, float o[4])
 #define TC_MAX_TEXELS (2048u * 2048u)
 
 typedef struct {
-    uint32_t offset, color, width, height, pitch, levels;   /* key */
+    uint32_t offset, color, width, height, pitch;   /* key */
+    uint32_t levels;                    /* held, not keyed: see tc_bind */
     uint32_t gen, used;
     uint32_t wseq;                      /* s_surf_wr_seq when last validated */
     uint64_t fp;
@@ -3302,6 +3303,7 @@ static TexCacheEntry *s_stage_tc[4];
 static int            s_fast_serial;    /* this batch draws on one thread */
 static uint32_t       s_tc_clock;
 static uint64_t       s_tc_tiles_filled, s_tc_refp, s_tc_dropped, s_tc_binds;
+static uint64_t       s_tc_builds;      /* entries (re)built: a bind that missed */
 static uint64_t       s_tc_feedback;    /* binds read live: texture is the target */
 
 /* Bytes the sampler can read for this texture's first `levels` levels, 0
@@ -3389,6 +3391,7 @@ static TexCacheEntry *tc_bind(const Texture *t, uint32_t levels)
     } else {
         e = victim;
         e->live = 0;
+        s_tc_builds++;
         texels = tiles = 0;
         for (l = 0; l < levels; l++) {
             uint32_t w = nv2a_tex_level_dim(t->width, l), h = nv2a_tex_level_dim(t->height, l);
@@ -3424,6 +3427,19 @@ static TexCacheEntry *tc_bind(const Texture *t, uint32_t levels)
     e->used = ++s_tc_clock;
     s_rt.tex += rt_now() - t0;
     return e;
+}
+
+void nv2a_pb_exec_tc_stats(struct nv2a_pb_tc_stats *out)
+{
+    uint32_t i;
+    memset(out, 0, sizeof *out);
+    for (i = 0; i < TC_ENTRIES; i++)
+        out->entries += s_tc[i].live != 0;
+    out->binds = s_tc_binds;
+    out->builds = s_tc_builds;
+    /* Every counted bind either found an entry or built one. */
+    out->hits = s_tc_binds - s_tc_builds;
+    out->dropped = s_tc_dropped;
 }
 
 /* A tile's ready flag, read and published across raster threads: the
