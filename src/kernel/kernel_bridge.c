@@ -3894,11 +3894,15 @@ void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
 /* Every guest open -- NtCreateFile, NtOpenFile, IoCreateFile -- comes through
  * here, so this is where each attempt is logged and where the missing-file
  * report (kernel_missing.c) sees it. NtOpenFile and IoCreateFile used to
- * print nothing at all. */
+ * print nothing at all. Their failures print now, since the report needs
+ * them; their successes only under RECOMP_TRACE=missing=all, because a
+ * title that streams through IoCreateFile (Burnout 3) would otherwise log
+ * every open by default. ntcreate: the caller is NtCreateFile, whose
+ * success line has always printed. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
     uint32_t iostatus_va, ULONG file_attrs, ULONG share,
-    ULONG disposition, ULONG options)
+    ULONG disposition, ULONG options, int ntcreate)
 {
     XBOX_ANSI_STRING name;
     NTSTATUS st = bridge_create_file_open(handle_va, access, obj_attrs_va,
@@ -3938,7 +3942,7 @@ static NTSTATUS bridge_create_file_impl(
             if (name.Buffer)
                 xbox_missing_note(gpath, status, (uint32_t)access,
                                   (uint32_t)disposition, (uint32_t)options, 0);
-        } else
+        } else if (ntcreate || xbox_missing_verbose())
             fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
                     gpath, (unsigned)disposition, options,
                     g_xbox_kernel_caller, status);
@@ -4044,7 +4048,7 @@ static void bridge_NtCreateFile(void)
      * ntdll and no recompiled frame to blame. */
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
-        file_attrs, share, disposition, options);
+        file_attrs, share, disposition, options, 1);
 
     /* FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT. Neither set
      * means the caller wants asynchronous completion on this handle. */
@@ -4099,7 +4103,7 @@ static void bridge_NtOpenFile(void)
     /* NtOpenFile = NtCreateFile with FILE_OPEN disposition */
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
-        0, share, 1 /* FILE_OPEN */, options);
+        0, share, 1 /* FILE_OPEN */, options, 0);
 }
 
 /*
@@ -4735,7 +4739,7 @@ static void bridge_IoCreateFile(void)
 
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
-        file_attrs, share, disposition, options);
+        file_attrs, share, disposition, options, 0);
 }
 
 /* -- NtDeviceIoControlFile (ordinal 196, 10 args = 40 bytes) ----

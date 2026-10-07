@@ -165,6 +165,7 @@ static void test_default(void)
 
     printf("default mode\n");
     mode(NULL);
+    check(xbox_missing_verbose() == 0, "the default is not verbose");
     recomp_env_set(RENV_MISSING_LIST, g_list);
 
     fail("D:\\adx\\song_TITLE.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
@@ -222,14 +223,19 @@ static void test_default(void)
     snprintf(want, sizeof want, "high 10 D:\\adx\\song_TITLE.adx %s" SEP "adx" SEP "song_TITLE.adx\n", g_game);
     check(strstr(list, want) != NULL, "missing_list: the high path with its attempts");
     check(strstr(list, "low 2 d:\\media\\event\\EVCAMST0101_005.CAM ") != NULL, "missing_list: the low path");
+    /* A second exit (POSIX firmware, then atexit) leaves the list alone. */
     fail("D:\\adx\\other.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     xbox_missing_summary("exit");
     read_file(g_list, list, sizeof list);
-    {
-        const char *a = strstr(list, "song_TITLE.adx ");
-        check(strstr(list, "other.adx") != NULL && a && !strstr(a + 1, "song_TITLE.adx "),
-              "missing_list is rewritten, not appended, at each summary");
-    }
+    check(strstr(list, "other.adx") == NULL && strstr(list, "song_TITLE.adx ") != NULL,
+          "missing_list is written once, by the first summary");
+    /* A new run (reset) rewrites it rather than appending. */
+    xbox_missing_reset();
+    fail("D:\\adx\\other.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    xbox_missing_summary("exit");
+    read_file(g_list, list, sizeof list);
+    check(strstr(list, "other.adx") != NULL && strstr(list, "song_TITLE.adx") == NULL,
+          "missing_list is rewritten, not appended");
     recomp_env_set(RENV_MISSING_LIST, NULL);
 }
 
@@ -252,6 +258,7 @@ static void test_all(void)
 
     printf("RECOMP_TRACE=missing=all\n");
     mode("all");
+    check(xbox_missing_verbose() == 1, "all is verbose: NtOpenFile and IoCreateFile successes print");
     for (i = 0; i < 5; i++)
         fail("D:\\adx\\song_R1tomtom.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     check(g_printed == 5, "every FAILED line prints, repeats included");
@@ -286,6 +293,7 @@ static void test_off(void)
     int lines;
     printf("RECOMP_TRACE=missing=0\n");
     mode("0");
+    check(xbox_missing_verbose() == 0, "0 is not verbose");
     lines = log_count("[FILE]");
     fail("D:\\adx\\song_TITLE.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     fail("D:\\adx\\song_TITLE.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);

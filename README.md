@@ -567,8 +567,9 @@ through its own D3D8LTCG.*
 - A game file the dump lacks is named once, `[FILE] missing <guest> ->
   <host>`, with a summary at exit; repeats of its FAILED line are counted,
   not printed. `RECOMP_TRACE=missing=all` also lists probes and every
-  attempt, `=0` turns it off. NtOpenFile and IoCreateFile log their opens,
-  and POSIX returns PATH_NOT_FOUND for a missing directory, as Win32 does
+  attempt, `=0` turns it off. NtOpenFile and IoCreateFile log their failed
+  opens (and, under `all`, their successes), and POSIX returns
+  PATH_NOT_FOUND for a missing directory, as Win32 does
 
 **Audio**
 

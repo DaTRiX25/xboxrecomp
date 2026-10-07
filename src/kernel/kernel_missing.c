@@ -56,7 +56,7 @@ static volatile LONG s_high, s_low, s_other, s_probe;
 static volatile LONG s_attempts;    /* failed game-tree opens, D1 1-7 */
 static volatile LONG s_repeats;     /* FAILED lines left out */
 static volatile LONG s_unnamed;     /* misses past the table */
-static volatile LONG s_cap_said, s_summary_done, s_atexit_set;
+static volatile LONG s_cap_said, s_summary_done, s_list_done, s_atexit_set;
 /* Read and set without a lock: every thread computes the same value from
  * the same environment, so a racing first read only repeats the work. */
 static volatile int s_mode = MODE_UNREAD;
@@ -135,6 +135,11 @@ static const char *tree_name(int tree)
 static void at_exit(void)
 {
     xbox_missing_summary("exit");
+}
+
+int xbox_missing_verbose(void)
+{
+    return mode() == MODE_ALL;
 }
 
 int xbox_missing_is_reported(const char *guest_path)
@@ -316,8 +321,11 @@ void xbox_missing_summary(const char *why)
 
     if (m == MODE_OFF)
         return;
+    /* Once, by whichever exit gets here first: on POSIX a firmware exit
+     * also runs atexit, and a window close can race the main thread's
+     * exit, and two "w" opens of one file would interleave. */
     list = recomp_env(RENV_MISSING_LIST);
-    if (list && *list)
+    if (list && *list && InterlockedExchange(&s_list_done, 1) == 0)
         write_list(list);
 
     hi = load(&s_high); lo = load(&s_low); ot = load(&s_other);
@@ -373,5 +381,6 @@ void xbox_missing_reset(void)
     InterlockedExchange(&s_unnamed, 0);
     InterlockedExchange(&s_cap_said, 0);
     InterlockedExchange(&s_summary_done, 0);
+    InterlockedExchange(&s_list_done, 0);
     s_mode = MODE_UNREAD;
 }

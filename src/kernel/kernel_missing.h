@@ -36,6 +36,10 @@ void xbox_missing_note(const char *guest_path, uint32_t status,
  * repeat. Always 0 under missing=all and missing=0. */
 int xbox_missing_is_reported(const char *guest_path);
 
+/* 1 under RECOMP_TRACE=missing=all: the bridge then also logs the opens
+ * it is quiet about by default. */
+int xbox_missing_verbose(void);
+
 /* The summary line, at most once per run whoever calls first, and the
  * missing_list file. why ("exit", "firmware", "window", "bugcheck")
  * ends the line under missing=all, so a verbose log says which exit printed it. */

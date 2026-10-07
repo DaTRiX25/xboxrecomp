@@ -220,8 +220,8 @@ extern "C" {
     X(DPC_PROF,          TRACE, "dpc",             NULL,                       "[DPCPROF] time per host-run DPC/ISR routine and its waits, under the 600-vblank line") \
     X(PACING_TRACE,      TRACE, "pacing",          NULL,                       "[PACING] flip intervals, vblank gaps, CPU and spin-wait sites every 600 flips; =all also every flip") \
     X(VBLANK_CLOCK,      DEBUG, "vblank_clock",    NULL,                       "=ms: the old millisecond vblank schedule and timer loop (A/B)") \
-    X(MISSING,           TRACE, "missing",         NULL,                       "missing game files, one line each and an exit summary; default on, =0 off, =all also absent directories, other trees, probes and every FAILED repeat") \
-    X(MISSING_LIST,      DEBUG, "missing_list",    NULL,                       "=path: the unique missing files with their attempt counts, written at each summary") \
+    X(MISSING,           TRACE, "missing",         NULL,                       "missing game files, one line each and an exit summary; default on, =0 off, =all also absent directories, other trees, probes, every FAILED repeat and NtOpenFile/IoCreateFile successes") \
+    X(MISSING_LIST,      DEBUG, "missing_list",    NULL,                       "=path: the unique missing files with their attempt counts, written once by the first summary") \
     X(IRQ_SAFE_POINTS,   DEBUG, "irq_safe_points", NULL,                       "=0: device interrupts run beside the one-CPU gate holder after a hold-off, as before (default: posted, run by the holder at its next kernel call, spin-wait yield or gate release)") \
     X(IRQ_SAFE_MS,       DEBUG, "irq_safe_ms",     NULL,                       "=ms: how long a posted interrupt waits for the holder's safe point before the [IRQ] wait log (default 250; again every second)") \
     X(IRQ_SAFE_FORCE,    DEBUG, "irq_safe_force",  NULL,                       "=1: past irq_safe_ms, deliver beside the holder (A/B; reinstates the race)") \
