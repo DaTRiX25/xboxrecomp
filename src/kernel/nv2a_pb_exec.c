@@ -195,6 +195,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
+#define NV097_ARRAY_ELEMENT32             0x1808
 /* Draw a run of vertices straight out of the arrays, with no index list:
  * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
  * appear several times inside one BEGIN_END to draw a longer run. */
@@ -240,6 +241,19 @@ static struct nv2a_pb_gpu s_gpu;
  * them to decide whether its mirror is still needed; both run on the NV2A ack
  * thread, which is also the thread that drives this executor. */
 static uint32_t s_inline_overflow;      /* INLINE_ARRAY dwords past NV_MAX_INLINE */
+static uint32_t s_idx_overflow;         /* index words and runs dropped past NV_MAX_INDICES */
+static uint32_t s_idx_max;              /* largest idx_count drawn */
+static uint32_t s_idx_start_hi;         /* DRAW_ARRAYS runs reaching past index 0xFFFF */
+static uint32_t s_xv_fail;              /* program batches dropped: no scratch */
+
+/* Indices past NV_MAX_INDICES are dropped, which cuts the far end off a big
+ * mesh with no other sign: say so once, and count. */
+static void note_idx_overflow(void)
+{
+    if (!s_idx_overflow++)
+        fprintf(stderr, "  [GPU] index batch over %u indices: the rest is dropped\n",
+                (unsigned)NV_MAX_INDICES);
+}
 static uint32_t s_sema_releases;
 static uint32_t s_sema_last_va, s_sema_last_value;
 
@@ -4339,10 +4353,23 @@ static void clip_tri(const XfVert *a, const XfVert *b, const XfVert *c,
 
 static void raster_batch_vsh_one(void)
 {
-    static XfVert xv[NV_MAX_INDICES];
+    /* One transformed vertex per index, grown to the largest batch so far
+     * rather than sized to NV_MAX_INDICES (60 MB at 120 bytes an index). */
+    static XfVert *xv;
+    static uint32_t xv_cap;
     uint32_t i, n = s_gpu.idx_count, a;
     uint32_t before = s_gpu.tris_drawn, plen;
     int textured, fast = pb_fast();
+
+    if (n > xv_cap) {
+        XfVert *grown = (XfVert *)realloc(xv, (size_t)n * sizeof *xv);
+        if (!grown) {
+            s_xv_fail++;
+            return;
+        }
+        xv = grown;
+        xv_cap = n;
+    }
 
     s_vsh.batches_prog++;
     surf_log_note();
@@ -5175,6 +5202,8 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
+    if (s_gpu.idx_count > s_idx_max)
+        s_idx_max = s_gpu.idx_count;
     /* ~14 lines a second at 2.8k batches a frame, each a locked write to
      * stderr from the walker: verbose only. */
     if ((s_gpu.draws % 200) == 0 && recomp_env(RENV_PB_EXEC_VERBOSE))
@@ -5698,8 +5727,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
         if (!s_gpu.prim)
             break;
+        /* The hardware faults on a start past 0xFFFF, so no title sends one:
+         * a count here is a decode bug, not a title to support. */
+        if (start + count - 1u > 0xFFFFu)
+            s_idx_start_hi++;
         for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+        if (i < count)
+            note_idx_overflow();
         break;
     }
 
@@ -5708,7 +5743,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+        } else if (s_gpu.prim) {
+            note_idx_overflow();
         }
+        break;
+    case NV097_ARRAY_ELEMENT32:
+        /* One index per word: the XDK sends the last index of an odd-count
+         * DrawIndexedVertices this way, and without it the batch loses its
+         * last primitive. 16 bits is the hardware's vertex range. */
+        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)param;
+        else if (s_gpu.prim)
+            note_idx_overflow();
         break;
     case NV097_SET_TEXTURE_OFFSET:
         /* A texture offset is a DMA-object offset, exactly like a surface or a
@@ -6184,6 +6230,14 @@ void nv2a_pb_exec_report(void)
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
+    /* Whether a title ever needs a big batch, without a probe. */
+    fprintf(stderr, "[GPU] index batches: max %u, %u overflowed", s_idx_max,
+            s_idx_overflow);
+    if (s_idx_start_hi)
+        fprintf(stderr, ", %u starts over 0xFFFF", s_idx_start_hi);
+    if (s_xv_fail)
+        fprintf(stderr, ", %u dropped for scratch", s_xv_fail);
+    fputc('\n', stderr);
     vsh_report();
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. The last flip's

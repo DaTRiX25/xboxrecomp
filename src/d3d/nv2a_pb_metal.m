@@ -486,8 +486,12 @@ static int init(void)
             return 0;
         }
 
+        /* The vertex ring is bounded by the 16-bit vertex range (65536
+         * vertices are 1 MB per float4 stream); the index ring by the cap,
+         * so any batch the walker accepts fits: three 32-bit list entries
+         * per index at most. */
         s_vb_size = 16u << 20;
-        s_ib_size = 4u << 20;
+        s_ib_size = NV_MAX_INDICES * 3u * 4u;
         s_vb = [s_dev newBufferWithLength:s_vb_size options:MTLResourceStorageModeShared];
         s_ib = [s_dev newBufferWithLength:s_ib_size options:MTLResourceStorageModeShared];
         s_vis = [s_dev newBufferWithLength:VIS_SLOTS * 8u
@@ -1547,7 +1551,11 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
 
 static void metal_on_draw(const struct nv2a_pb_draw *d)
 {
-    static uint32_t idx[NV_MAX_INDICES * 3];
+    /* The expanded list: at most three entries per index (a fan or a quad
+     * strip), grown to the largest batch so far rather than sized to
+     * NV_MAX_INDICES. */
+    static uint32_t *idx;
+    static uint32_t idx_cap;
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     enum nv2a_topology topo;
@@ -1616,6 +1624,15 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             if (d->idx[i] > hi) hi = d->idx[i];
         }
         count = hi - lo + 1;
+        if (d->idx_count * 3u > idx_cap) {
+            uint32_t *grown = (uint32_t *)realloc(idx, (size_t)d->idx_count * 12u);
+            if (!grown) {
+                s_draws_skipped++;
+                return;
+            }
+            idx = grown;
+            idx_cap = d->idx_count * 3u;
+        }
         nidx = nv2a_prim_to_list(d->prim, d->idx, d->idx_count, lo, idx, &topo);
         if (!nidx) {
             s_draws_skipped++;

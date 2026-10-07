@@ -46,7 +46,16 @@ typedef struct {
 } VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
-#define NV_MAX_INDICES  4096
+/* Indices per BEGIN/END batch. The NV2A sets no limit a title would meet:
+ * an Xbox 1.0 takes a batch of at least 0x0FFFFF elements, and retail titles
+ * send at least 0x410FA in one draw (xemu's NV2A_MAX_BATCH_LENGTH, raised
+ * from 0x1FFFF to 0x07FFFF when one did). At 4096, BLiNX 2's stage-1 water
+ * grid (4592 indices, 1148 quads) lost its farthest rows, which left the
+ * hard-edged horizon split. 0x80000 is xemu's bound as a power of two; a
+ * longer batch is still cut, with one warning. idx stays 16-bit: the hardware
+ * faults on a DRAW_ARRAYS start above 0xFFFF, so no batch references more
+ * than 65536 vertices. */
+#define NV_MAX_INDICES  0x80000u
 /* Dwords of INLINE_ARRAY (or immediate-mode vertices) per batch. 4096 held
  * a few hundred vertices; a batch past it was cut short with no sign. 64K
  * holds a thousand vertices of all sixteen attributes (upstream 5c3a42c). */

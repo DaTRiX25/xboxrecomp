@@ -32,6 +32,16 @@
  *   yuy2         + a linear YUY2 ramp (the movie texture's format), clamp
  *   blend        + an alpha-blended quad over the checker (SRC_ALPHA,
  *                  ONE_MINUS_SRC_ALPHA)
+ *   bigidx       a grid of 1200 quads from vertex arrays in guest memory,
+ *                indexed by 4800 ARRAY_ELEMENT16 indices in one batch: the
+ *                quads from index 4096 on have their own colour
+ *   elem32       a triangle list whose last (odd) index is an
+ *                ARRAY_ELEMENT32
+ *
+ * The CPU and GPU paths both draw the walker's index list, so a batch the
+ * walker cut short gives two identical, equally wrong frames. bigidx and
+ * elem32 therefore also check the colour of a pixel inside a quad past
+ * index 4096 and inside the last triangle, on both paths.
  *
  * Pass: per scene, an exact match. Every scene is screen-space with nearest
  * sampling, so the two paths compute the same bytes; the golden-limit
@@ -77,6 +87,7 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define RTT0      0x01400000u   /* 64x64 render-to-texture targets, pitch 256 */
 #define RTT1      0x01500000u
 #define TEX_LOG2  6
+#define VB_GUEST  0x02000000u   /* bigidx and elem32 vertex arrays */
 
 static uint8_t *guest(uint32_t va)
 {
@@ -142,8 +153,94 @@ static void make_textures(void)
         }
 }
 
-enum { SC_CLEAR_QUAD, SC_CHECKER, SC_YUY2, SC_BLEND, SC_COUNT };
-static const char *const s_scene_name[SC_COUNT] = {"clear_quad", "checker", "yuy2", "blend"};
+enum { SC_CLEAR_QUAD, SC_CHECKER, SC_YUY2, SC_BLEND, SC_BIGIDX, SC_ELEM32, SC_COUNT };
+static const char *const s_scene_name[SC_COUNT] = {"clear_quad", "checker", "yuy2", "blend",
+                                                   "bigidx", "elem32"};
+
+/* bigidx: 40 x 30 cells of 16 pixels, a 12-pixel quad in each, one batch. */
+#define GRID_COLS  40u
+#define GRID_QUADS 1200u
+#define COL_LOW    0xFF2080E0u          /* quads before index 4096 */
+#define COL_HIGH   0xFFE0C020u          /* quads from index 4096 on */
+#define COL_TRI    0xFF40E040u          /* elem32's last triangle */
+
+/* Pixels whose colour each path must show (x, y, expected X8R8G8B8). */
+struct probe { uint32_t x, y, argb; };
+static const struct probe s_probe_bigidx[] = {
+    {20 * 16 + 8, 27 * 16 + 8, COL_HIGH},   /* quad 1100: index 4400 */
+    {10 * 16 + 8,  0 * 16 + 8, COL_LOW},    /* quad 10 */
+};
+static const struct probe s_probe_elem32[] = {
+    {470, 370, COL_TRI},                    /* the last triangle's corner */
+    {150, 330, 0xFFE02020u},                /* the red rectangle */
+};
+
+/* Vertex arrays at VB_GUEST: attr0 float4 position (pixels, w 1) and attr3
+ * D3DCOLOR, interleaved with a 20-byte stride. */
+static void vb_vertex(uint32_t i, float x, float y, uint32_t argb)
+{
+    uint8_t *v = guest(VB_GUEST) + i * 20u;
+    float p[4] = {x, y, 0.0f, 1.0f};
+    memcpy(v, p, 16);
+    memcpy(v + 16, &argb, 4);
+}
+
+static void vb_arrays(void)
+{
+    int a;
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? (20u << 8) | 0x42u : a == 3 ? (20u << 8) | 0x40u : 0x02u);
+    M(0x1720 + 4 * 0, VB_GUEST);           /* VERTEX_DATA_ARRAY_OFFSET */
+    M(0x1720 + 4 * 3, VB_GUEST + 16u);
+}
+
+/* One quad list of GRID_QUADS * 4 indices, sent as ARRAY_ELEMENT16 pairs. */
+static void scene_bigidx(void)
+{
+    uint32_t q, i;
+
+    for (q = 0; q < GRID_QUADS; q++) {
+        float x = (float)((q % GRID_COLS) * 16u + 2u), y = (float)((q / GRID_COLS) * 16u + 2u);
+        uint32_t c = q * 4u >= 4096u ? COL_HIGH : COL_LOW;
+        vb_vertex(q * 4u + 0u, x, y, c);
+        vb_vertex(q * 4u + 1u, x + 12.0f, y, c);
+        vb_vertex(q * 4u + 2u, x + 12.0f, y + 12.0f, c);
+        vb_vertex(q * 4u + 3u, x, y + 12.0f, c);
+    }
+    vb_arrays();
+    M(0x17FC, 8);                          /* BEGIN_END: QUADS */
+    for (i = 0; i < GRID_QUADS * 4u; i += 2)
+        M(0x1800, i | ((i + 1u) << 16));   /* ARRAY_ELEMENT16 */
+    M(0x17FC, 0);
+}
+
+/* Five triangles, fifteen indices: two rectangles of two triangles each
+ * and a degenerate one between them, so the count is odd and every visible
+ * edge is axis-aligned (the paths agree exactly only there). Seven
+ * ARRAY_ELEMENT16 words, then the fifteenth index as ARRAY_ELEMENT32, as
+ * the XDK sends an odd count. Without it the green rectangle loses its
+ * bottom-left half. */
+static void scene_elem32(void)
+{
+    static const uint16_t list[15] = {0, 1, 2, 0, 2, 3, 4, 4, 4, 5, 6, 7, 5, 7, 8};
+    uint32_t k;
+
+    vb_vertex(0, 100, 280, 0xFFE02020u);   /* red rectangle */
+    vb_vertex(1, 220, 280, 0xFFE02020u);
+    vb_vertex(2, 220, 380, 0xFFE02020u);
+    vb_vertex(3, 100, 380, 0xFFE02020u);
+    vb_vertex(4, 300, 300, 0xFFE02020u);   /* the degenerate triangle */
+    vb_vertex(5, 450, 280, COL_TRI);       /* green rectangle */
+    vb_vertex(6, 570, 280, COL_TRI);
+    vb_vertex(7, 570, 380, COL_TRI);
+    vb_vertex(8, 450, 380, COL_TRI);
+    vb_arrays();
+    M(0x17FC, 5);                          /* BEGIN_END: TRIANGLES */
+    for (k = 0; k < 14; k += 2)
+        M(0x1800, list[k] | ((uint32_t)list[k + 1] << 16));
+    M(0x1808, list[14]);                   /* ARRAY_ELEMENT32 */
+    M(0x17FC, 0);
+}
 
 static void stage0_checker(void)
 {
@@ -176,6 +273,18 @@ static void scene(int sc, uint32_t buf, uint32_t other)
     M(0x1B0C, 0);                          /* stage 0 off */
     for (a = 0; a < 16; a++)               /* VERTEX_DATA_ARRAY_FORMAT */
         M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+
+    if (sc == SC_BIGIDX || sc == SC_ELEM32) {
+        if (sc == SC_BIGIDX)
+            scene_bigidx();
+        else
+            scene_elem32();
+        for (a = 0; a < 16; a++)
+            M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+        M(0x0210, other);
+        M(0x0130, 0);
+        return;
+    }
 
     quad_uv(80.0f, 120.0f, 240.0f, 360.0f, solid, NULL);
     /* Fractional edges: a half-pixel offset in either rasteriser (pixel
@@ -529,6 +638,27 @@ static void build_xbe(uint8_t *xbe, size_t n)
     v = 0x00010800u ^ 0x5B6D40B6u; memcpy(xbe + 0x158, &v, 4); /* empty thunks */
 }
 
+/* The absolute checks of bigidx and elem32, on one path's frame. */
+static int probes_ok(int sc, const char *path, const uint32_t *px)
+{
+    const struct probe *p = sc == SC_BIGIDX ? s_probe_bigidx : s_probe_elem32;
+    uint32_t n = sc == SC_BIGIDX ? sizeof s_probe_bigidx / sizeof *p
+                                 : sizeof s_probe_elem32 / sizeof *p, i;
+    int ok = 1;
+
+    if (sc != SC_BIGIDX && sc != SC_ELEM32)
+        return 1;
+    for (i = 0; i < n; i++) {
+        uint32_t got = px[p[i].y * W + p[i].x] & 0x00FFFFFFu;
+        int hit = got == (p[i].argb & 0x00FFFFFFu);
+        fprintf(stderr, "[backend-smoke] %-10s %s pixel (%u,%u) %06X want %06X %s\n",
+                s_scene_name[sc], path, p[i].x, p[i].y, got, p[i].argb & 0x00FFFFFFu,
+                hit ? "PASS" : "FAIL");
+        ok &= hit;
+    }
+    return ok;
+}
+
 int main(int argc, char **argv)
 {
     static uint8_t xbe[0x1000];
@@ -596,8 +726,12 @@ int main(int argc, char **argv)
             snprintf(path, sizeof path, "%s%s_gpu.bmp", dump, s_scene_name[sc]);
             write_bmp(path, gpu_px);
         }
-        if (!compare(s_scene_name[sc], cpu_px, gpu_px))
-            failures++;
+        {
+            int same = compare(s_scene_name[sc], cpu_px, gpu_px);
+            int pc = probes_ok(sc, "cpu", cpu_px), pg = probes_ok(sc, "gpu", gpu_px);
+            if (!same || !pc || !pg)
+                failures++;
+        }
     }
     nv2a_pb_set_backend(NULL);
 #ifdef __APPLE__

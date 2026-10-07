@@ -499,7 +499,7 @@ static int init(void)
     s_cb_ps     = make_buffer(sizeof(PsConsts), D3D11_BIND_CONSTANT_BUFFER);
     s_vb_size   = 8u << 20;
     s_vb        = make_buffer(s_vb_size, D3D11_BIND_VERTEX_BUFFER);
-    s_ib_size   = 1u << 20;
+    s_ib_size   = NV_MAX_INDICES * 3u * 4u;  /* any accepted batch fits */
     s_ib        = make_buffer(s_ib_size, D3D11_BIND_INDEX_BUFFER);
     if (!s_cb_consts || !s_cb_vp || !s_cb_ps || !s_vb || !s_ib) {
         fprintf(stderr, LOGP "buffer creation failed\n");
@@ -2664,7 +2664,10 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
 
 static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 {
-    static uint32_t idx[NV_MAX_INDICES * 3];
+    /* As Metal's: at most three list entries per index, grown to the
+     * largest batch so far rather than sized to NV_MAX_INDICES. */
+    static uint32_t *idx;
+    static uint32_t idx_cap;
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     D3D11_PRIMITIVE_TOPOLOGY topo;
@@ -2691,6 +2694,15 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         if (d->idx[i] > hi) hi = d->idx[i];
     }
     count = hi - lo + 1;
+    if (d->idx_count * 3u > idx_cap) {
+        uint32_t *grown = (uint32_t *)realloc(idx, (size_t)d->idx_count * 12u);
+        if (!grown) {
+            s_draws_skipped++;
+            return;
+        }
+        idx = grown;
+        idx_cap = d->idx_count * 3u;
+    }
     nidx = convert_indices(d, lo, idx, &topo);
     rs = rasterizer_state(&cull_all);
     if (!nidx) {

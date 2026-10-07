@@ -12,6 +12,10 @@
  * Then render-target ownership (rt-stale-alias): a target whose guest
  * memory the title rewrote from the CPU is sampled as the new texels, and
  * one left alone still as its rendered image.
+ * Then index batches (pb-index-batch-cap), as nv2a_backend_smoke's bigidx
+ * and elem32: a quad list of 4800 ARRAY_ELEMENT16 indices whose quads from
+ * index 4096 on have their own colour, and a triangle list whose odd last
+ * index is an ARRAY_ELEMENT32; a pixel inside each must be drawn.
  * With RECOMP_PB_BACKEND=d3d11 that reaches ClearRenderTargetView, a draw
  * and Present in src/d3d/nv2a_pb_d3d11.c.
  *
@@ -89,6 +93,7 @@ static uint32_t s_surf_base = 0x01000000u;
 #define MIP_GUEST (TEX_GUEST + 0xA000u)  /* 32x32 A8R8G8B8, 6 levels */
 #define RTT_A     0x10100000u   /* 64x64 render-to-texture targets, pitch 256 */
 #define RTT_B     0x10110000u
+#define VB_GUEST  0x10200000u   /* index cases: vertex arrays, 96000 bytes */
 #define TEX_LOG2  6                            /* 64x64 */
 /* Four 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
  * the first free 64 KB below 16 MB. */
@@ -251,6 +256,105 @@ static int alias_cases(const uint32_t *buf)
     fprintf(stderr, "[backend-smoke] rt alias: untouched target samples 0x%08X (want"
             " 0xFFFF0000) %s\n", c, c == 0xFFFF0000u ? "PASS" : "FAIL");
     f += c != 0xFFFF0000u;
+    return f;
+}
+
+/* Index batches: the same grid and triangle list as nv2a_backend_smoke's
+ * bigidx and elem32. Vertex arrays at VB_GUEST: attr0 float4 position
+ * (pixels, w 1) and attr3 D3DCOLOR, 20-byte stride. */
+#define GRID_COLS  40u
+#define GRID_QUADS 1200u
+#define COL_LOW    0xFF2080E0u
+#define COL_HIGH   0xFFE0C020u
+#define COL_TRI    0xFF40E040u
+
+static void vb_vertex(uint32_t i, float x, float y, uint32_t argb)
+{
+    uint8_t *v = (uint8_t *)(uintptr_t)VB_GUEST + i * 20u;
+    float p[4] = {x, y, 0.0f, 1.0f};
+    memcpy(v, p, 16);
+    memcpy(v + 16, &argb, 4);
+}
+
+static void vb_arrays(void)
+{
+    int a;
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? (20u << 8) | 0x42u : a == 3 ? (20u << 8) | 0x40u : 0x02u);
+    M(0x1720 + 4 * 0, VB_GUEST);
+    M(0x1720 + 4 * 3, VB_GUEST + 16u);
+}
+
+static int index_probe(uint32_t buf, const char *what, int x, int y, uint32_t want)
+{
+    uint32_t c = nv2a_pb_d3d11_pixel(buf, x, y);
+    int ok = (c & 0x00FFFFFFu) == (want & 0x00FFFFFFu);
+    fprintf(stderr, "[backend-smoke] index batch: %-34s 0x%08X (want 0x%08X) %s\n",
+            what, c, want, ok ? "PASS" : "FAIL");
+    return !ok;
+}
+
+/* Returns the failures. */
+static int index_cases(const uint32_t *buf)
+{
+    static const uint16_t list[15] = {0, 1, 2, 0, 2, 3, 4, 4, 4, 5, 6, 7, 5, 7, 8};
+    uint32_t q, i;
+    int a, f = 0;
+
+    if (!VirtualAlloc((void *)(uintptr_t)VB_GUEST, 0x20000, MEM_RESERVE | MEM_COMMIT,
+                      PAGE_READWRITE)) {
+        fprintf(stderr, "[backend-smoke] index batch: no memory at 0x%08X\n", VB_GUEST);
+        return 1;
+    }
+    M(0x0304, 0);                              /* no blend, depth or stencil */
+    M(0x030C, 0);
+    M(0x035C, 0);
+    M(0x032C, 0);
+
+    /* bigidx: 1200 quads, one batch of 4800 indices. */
+    for (q = 0; q < GRID_QUADS; q++) {
+        float x = (float)((q % GRID_COLS) * 16u + 2u), y = (float)((q / GRID_COLS) * 16u + 2u);
+        uint32_t c = q * 4u >= 4096u ? COL_HIGH : COL_LOW;
+        vb_vertex(q * 4u + 0u, x, y, c);
+        vb_vertex(q * 4u + 1u, x + 12.0f, y, c);
+        vb_vertex(q * 4u + 2u, x + 12.0f, y + 12.0f, c);
+        vb_vertex(q * 4u + 3u, x, y + 12.0f, c);
+    }
+    surf_clear(buf[0], 640, 480, 0xFF603010u);
+    vb_arrays();
+    M(0x17FC, 8);                              /* QUADS */
+    for (i = 0; i < GRID_QUADS * 4u; i += 2)
+        M(0x1800, i | ((i + 1u) << 16));       /* ARRAY_ELEMENT16 */
+    M(0x17FC, 0);
+    f += index_probe(buf[0], "quad 1100 (index 4400)", 20 * 16 + 8, 27 * 16 + 8, COL_HIGH);
+    f += index_probe(buf[0], "quad 10", 10 * 16 + 8, 8, COL_LOW);
+    M(0x0210, buf[1]);
+    M(0x0130, 0);
+
+    /* elem32: two rectangles and a degenerate triangle, the fifteenth index
+     * as ARRAY_ELEMENT32. */
+    vb_vertex(0, 100, 280, 0xFFE02020u);
+    vb_vertex(1, 220, 280, 0xFFE02020u);
+    vb_vertex(2, 220, 380, 0xFFE02020u);
+    vb_vertex(3, 100, 380, 0xFFE02020u);
+    vb_vertex(4, 300, 300, 0xFFE02020u);
+    vb_vertex(5, 450, 280, COL_TRI);
+    vb_vertex(6, 570, 280, COL_TRI);
+    vb_vertex(7, 570, 380, COL_TRI);
+    vb_vertex(8, 450, 380, COL_TRI);
+    surf_clear(buf[0], 640, 480, 0xFF603010u);
+    vb_arrays();
+    M(0x17FC, 5);                              /* TRIANGLES */
+    for (i = 0; i < 14; i += 2)
+        M(0x1800, list[i] | ((uint32_t)list[i + 1] << 16));
+    M(0x1808, list[14]);                       /* ARRAY_ELEMENT32 */
+    M(0x17FC, 0);
+    f += index_probe(buf[0], "last triangle (ARRAY_ELEMENT32)", 470, 370, COL_TRI);
+    f += index_probe(buf[0], "first rectangle", 150, 330, 0xFFE02020u);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+    M(0x0210, buf[1]);
+    M(0x0130, 0);
     return f;
 }
 
@@ -773,6 +877,10 @@ int main(int argc, char **argv)
     if (alias_cases(buf)) {
         fprintf(stderr, "[backend-smoke] FAIL: render-target ownership\n");
         return 3;
+    }
+    if (index_cases(buf)) {
+        fprintf(stderr, "[backend-smoke] FAIL: index batches\n");
+        return 4;
     }
     fprintf(stderr, "[backend-smoke] done\n");
     return 0;
