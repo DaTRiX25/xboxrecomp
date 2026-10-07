@@ -607,6 +607,67 @@ static int rt_drop_if_stale(RenderTarget *rt, const char *why)
     return 1;
 }
 
+/* rt made w x h (guest pixels), what it holds kept at its top left. The new
+ * area starts black: this backend has no guest bytes behind it to seed. */
+static int rt_grow(RenderTarget *rt, UINT w, UINT h)
+{
+    static const float black[4] = {0, 0, 0, 0};
+    static int said;
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D *tex = NULL;
+    ID3D11RenderTargetView *rtv = NULL;
+    D3D11_BOX b;
+    UINT hw, hh;
+
+    nv2a_host_size(w, h, nv2a_host_render_scale(), D3D11_MAX_DIM, &hw, &hh);
+    memset(&td, 0, sizeof td);
+    td.Width = hw;
+    td.Height = hh;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &tex)))
+        return 0;
+    if (FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)tex,
+                                                   NULL, &rtv))) {
+        ID3D11Texture2D_Release(tex);
+        return 0;
+    }
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rtv, black);
+    b.left = 0;
+    b.top = 0;
+    b.front = 0;
+    b.right = rt->hw < hw ? rt->hw : hw;
+    b.bottom = rt->hh < hh ? rt->hh : hh;
+    b.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)tex, 0, 0, 0, 0,
+                                              (ID3D11Resource *)rt->tex, 0, &b);
+    if (said++ < 20)
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target grown to %ux%u\n",
+                rt->offset, rt->w, rt->h, w, h);
+    if (rt->srv) {
+        ID3D11ShaderResourceView_Release(rt->srv);
+        rt->srv = NULL;
+    }
+    ID3D11RenderTargetView_Release(rt->rtv);
+    ID3D11Texture2D_Release(rt->tex);
+    rt->tex = tex;
+    rt->rtv = rtv;
+    rt->w = w;
+    rt->h = h;
+    rt->hw = hw;
+    rt->hh = hh;
+    if (alias_check_on() && rt->pitch)
+        nv2a_rt_own_reset(&rt->own, (const uint8_t *)xbox_GetMemoryOffset(),
+                          rt->addr, rt->pitch, h, (uint32_t)s_presents);
+    /* The draw path's state shadow may name the released view. */
+    s_sc_init = 0;
+    return 1;
+}
+
 static RenderTarget *surface(void)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -628,6 +689,28 @@ static RenderTarget *surface(void)
             nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
             return rt;
         }
+    }
+    /* The same surface under another clip extent: one target per surface,
+     * as large as any clip it was drawn with. Burnout 3 draws its 640x480
+     * back buffer with clips of 640x464, 623x401, 159x344 and more in one
+     * frame; a target per extent split the frame across textures, the
+     * overlap rule below dropped each in turn (this backend writes nothing
+     * back), and the flip found no target of the frame's size: a black
+     * title screen and a frozen race. Draws map guest pixels to NDC through
+     * rt->w/h, so a larger target keeps every position. */
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->tex || rt->offset != g->color_offset || rt->pitch != g->pitch)
+            continue;
+        if (rt_drop_if_stale(rt, "reuse"))
+            break;
+        if ((rt->w >= w && rt->h >= h)
+                || rt_grow(rt, rt->w > w ? rt->w : w, rt->h > h ? rt->h : h)) {
+            rt->last_use = s_tick;
+            nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
+            return rt;
+        }
+        break;
     }
     /* No two live targets share memory: one the new target overlaps is
      * dropped (this backend has nothing to write back). */
@@ -2972,7 +3055,7 @@ static RenderTarget *present_target(uint32_t surface_offset)
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (rt->tex && surface_offset && rt->offset == surface_offset
-                && (!p->offset || (rt->w == p->w && rt->h == p->h)))
+                && (!p->offset || (rt->w >= p->w && rt->h >= p->h)))
             return rt;
     }
     return s_drawn;
