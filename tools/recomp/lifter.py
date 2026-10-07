@@ -281,6 +281,8 @@ def _operand_width(op):
         return getattr(op, "mem_size", None) or 4
     if op.type == "reg":
         return _REG_WIDTH.get(str(op.reg).lower(), 4)
+    if op.type == "expr":
+        return op.mem_size or None
     return None
 
 
@@ -292,6 +294,8 @@ def _fmt_operand_read(op):
         return _fmt_imm(op.imm)
     elif op.type == "mem":
         return _fmt_mem_read(op)
+    elif op.type == "expr":
+        return op.expr
     return "/* unknown operand */"
 
 
@@ -512,6 +516,16 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
     cmp_macro, test_macro, desc = cond_info
 
+    # Compares of different widths met at a join (translator
+    # _merge_flag_states). Each edge masked and sign-extended its own
+    # operands into _fa/_fb/_fas/_fbs, so ZF, CF, the unsigned and signed
+    # orders and PF read the same from either edge. SF and OF are the top bit
+    # of the difference at the edge's width, which the consumer cannot know.
+    if flag_setter == "cmp_mixed":
+        if jcc in ("js", "jns", "jo", "jno"):
+            return None
+        flag_setter = "cmp"
+
     # A join whose predecessors disagree on which instruction set the flags,
     # but agree that the zero flag came from the same destination register.
     #
@@ -698,6 +712,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return (f"(({_sf_utype})(({_sf_utype})({a}) - ({_sf_utype})({b}))"
                 f" >> {_sf_top})")
 
+    # OF of a - b: the operands differ in sign and the result's sign differs
+    # from a's. Unsigned at the operand's width, for the same reason as SF.
+    def _of_of_difference(a, b):
+        t = _sf_utype
+        return (f"(({t})((({t})({a}) ^ ({t})({b}))"
+                f" & (({t})({a}) ^ ({t})(({t})({a}) - ({t})({b}))))"
+                f" >> {_sf_top})")
+
     # ── bsf/bsr: ZF is the only flag they define ──
     #
     # ZF is set when the SOURCE was zero, not from any subtraction, and the
@@ -723,6 +745,12 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"RECOMP_PARITY8(({lhs}) - ({rhs}))", desc
         if jcc == "jnp":
             return f"(!RECOMP_PARITY8(({lhs}) - ({rhs})))", desc
+        # Every test is a cmp against zero now (normalise_zero_test), so this
+        # arm also answers `test; jo`, which reads 0 here as it must.
+        if jcc == "jo":
+            return f"({_of_of_difference(lhs, rhs)} != 0)", desc
+        if jcc == "jno":
+            return f"({_of_of_difference(lhs, rhs)} == 0)", desc
         return None
 
     # ── test: flags from (a & b), operands unchanged ──
@@ -1292,13 +1320,27 @@ def normalise_zero_test(mnemonic, ops):
     Normalising here is what makes that merge legal rather than forcing one
     through. After it the two predecessors really are the same operation on
     the same width, which is what the merge was asking for.
+
+    The same holds for every `test a, b`, not only the same-register form:
+    it is `cmp (a & b), 0`. Both leave ZF, SF and PF from the AND and clear
+    CF and OF, so every condition reads the same answer from either. BLiNX
+    2's stage 1 talk zone joins `cmp eax, 0` with `test esi, 0x100` in front
+    of one je; refused, the je never fired and a wait-for-A state advanced
+    every frame, freezing the player once every four. The AND is carried as
+    an `expr` operand at the test's width, so the snapshot holds it in _fa
+    with _fb = 0 and the comment still names the test.
     """
-    if (mnemonic == "test" and len(ops) == 2
-            and ops[0].type == "reg" and ops[1].type == "reg"
+    if mnemonic != "test" or len(ops) != 2:
+        return mnemonic, ops
+    if (ops[0].type == "reg" and ops[1].type == "reg"
             and ops[0].reg and ops[0].reg == ops[1].reg):
         return "cmp", [ops[0], Operand(type="imm", imm=0,
                                        mem_size=ops[0].mem_size)]
-    return mnemonic, ops
+    width = _operand_width(ops[0]) or _operand_width(ops[1]) or 4
+    a, b = _fmt_operand_read(ops[0]), _fmt_operand_read(ops[1])
+    return "cmp", [Operand(type="expr", expr=f"({a}) & ({b})",
+                           expr_src=f"test {a}, {b}", mem_size=width),
+                   Operand(type="imm", imm=0, mem_size=width)]
 
 
 class Lifter:
@@ -2313,10 +2355,12 @@ class Lifter:
         sx = self._SNAP_SX[size]
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
+        what = (ops[0].expr_src if ops[0].type == "expr"
+                else f"{kind} {lhs}, {rhs}")
         out = [
             f"_fa = (uint32_t)({lhs}) & {mask}; _fb = (uint32_t)({rhs}) & {mask};",
             f"_fas = (int32_t){sx}(_fa); _fbs = (int32_t){sx}(_fb);"
-            f" /* {kind} {lhs}, {rhs} ({size*8}-bit) */",
+            f" /* {what} ({size*8}-bit) */",
         ]
         # A cmp sets the carry flag too, and sbb/adc/setc/rcl read it directly
         # rather than through _fa/_fb. Leaving CF alone here let those pick up

@@ -186,7 +186,10 @@ class TextTest(unittest.TestCase):
                       'read as 0"', out)
         cmp_ = _insn("cmp", [_reg("eax"), _reg("ebx")])
         lifter, out, _ = _lift_block([cmp_, _insn("pushfd")])
-        self.assertIn('RECOMP_UNIMPL("pushfd: OF not rebuilt from cmp', out)
+        # cmp answers jo/jno exactly (the AND of a test is a cmp against
+        # zero now, so the cmp arm has to), which rebuilds OF here too.
+        self.assertNotIn("RECOMP_UNIMPL", out)
+        self.assertIn("0x800u", out)
 
     def test_cpuid_writes_all_four_and_keeps_the_flags(self):
         out = "".join(Lifter().lift_instruction(_insn("cpuid")))

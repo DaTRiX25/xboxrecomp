@@ -258,6 +258,10 @@ def main():
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
+    parser.add_argument("--seeds", metavar="JSON", action="append",
+                        default=[],
+                        help="seed_functions.json; the flag-fallback report "
+                             "lists its sites in the seeds marked observed")
     parser.add_argument("--spin-waits", metavar="JSON",
                         help="Lower guest busy-wait loops to RECOMP_SPIN_WAIT "
                              "(the runtime sleeps in them when its pacing "
@@ -344,6 +348,7 @@ def main():
             "icall_sites.json"),
         spin_waits=spin_waits,
     )
+    translator.observed_seeds = _load_observed_seeds(args.seeds)
 
     t_load = time.time() - t0
     print(f"Loaded {len(translator.func_db)} functions, "
@@ -534,9 +539,39 @@ def main():
         os.path.dirname(__file__), "output")
     summary_path = write_summary(stats, output_dir)
     print(f"\nSummary: {summary_path}", file=sys.stderr)
+    if "flag_fallbacks" in stats:
+        _write_flag_fallbacks(translator, output_dir)
 
     if translator.translator.spin_waits is not None:
         _finish_spin_waits(translator.translator.spin_waits, output_dir)
+
+
+def _load_observed_seeds(paths):
+    """Starts of the seeds marked `"observed": true` (seen at runtime)."""
+    starts = set()
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as fh:
+            for entry in json.load(fh):
+                if isinstance(entry, dict) and entry.get("observed"):
+                    starts.add(int(str(entry["start"]), 16))
+    return starts
+
+
+def _write_flag_fallbacks(translator, output_dir):
+    """flag_fallbacks.json and one summary line (flag_fallbacks.py says why
+    this is a report and not an error)."""
+    report = translator.translator.flag_fallbacks
+    doc = report.to_json(translator.observed_seeds)
+    path = os.path.join(output_dir, "flag_fallbacks.json")
+    with open(path, "w", newline="\n") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
+    print(f"Flag fallbacks: {doc['unique_sites']} unique sites "
+          f"({doc['emitted']} emitted), {doc['joins']} at joins ({path})",
+          file=sys.stderr)
+    if doc["observed_functions"]:
+        print("  in observed seeds: " + ", ".join(doc["observed_functions"]),
+              file=sys.stderr)
 
 
 def _finish_spin_waits(report, output_dir):

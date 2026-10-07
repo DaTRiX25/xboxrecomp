@@ -23,6 +23,7 @@ import sys
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
+from .flag_fallbacks import FlagFallbacks
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width)
@@ -41,14 +42,28 @@ def _merge_flag_states(states):
     first = states[0]
     if all(state == first for state in states[1:]):
         return first
+    if any(s[0] == "cmp_mixed" for s in states):
+        # A mixed join flowing on (a loop head, a second join): still cmp
+        # snapshots everywhere, so it stays mixed.
+        if all(s[0] in ("cmp", "cmp_mixed") and len(s[1]) == 2
+               for s in states):
+            return ("cmp_mixed", first[1])
+        return None
     if first[0] in ("cmp", "test") and len(first[1]) == 2:
         width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+        mixed = False
         for kind, ops in states[1:]:
             if kind != first[0] or len(ops) != 2:
                 return None
             if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
-                return None
-        return first
+                mixed = True
+        if not mixed:
+            return first
+        # Compares of different widths: every condition but the sign and
+        # overflow ones still reads right from either edge's snapshot
+        # (_make_condition's cmp_mixed arm). A raw test never reaches here
+        # from the lifter, which normalises it to cmp.
+        return ("cmp_mixed", first[1]) if first[0] == "cmp" else None
     return _merge_zero_flag(states)
 
 
@@ -393,6 +408,8 @@ class FunctionTranslator:
         # --spin-waits: a spin_waits.SpinWaitReport, or None (the matcher
         # does not run and the output is unchanged).
         self.spin_waits = None
+        # Every `_flags` fallback emitted, with why (flag_fallbacks.py).
+        self.flag_fallbacks = FlagFallbacks()
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover function entries from bounded static callback tables."""
@@ -2356,6 +2373,9 @@ class FunctionTranslator:
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
+            self.flag_fallbacks.note_block(
+                start, name, bb, stmts, preds[bb.start], settled_state,
+                bb.start == start, incoming)
             if self.spin_waits is not None:
                 stmts = self.spin_waits.consider(start, bb, stmts)
             for stmt in stmts:
@@ -2480,6 +2500,9 @@ class BatchTranslator:
                  icall_sites_json_path=None, spin_waits=None):
         """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None."""
         self.xbe_path = xbe_path
+        # Starts of the seeds a run saw (--seeds, `"observed": true`): the
+        # flag-fallback report names its sites in these functions.
+        self.observed_seeds = set()
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
         self.icall_sites = {}
@@ -2826,6 +2849,10 @@ class BatchTranslator:
             m: list(addrs)
             for m, addrs in self.translator.lifter.unimplemented.items()
         }
+        fallbacks = getattr(self.translator, "flag_fallbacks", None)
+        if fallbacks is not None:
+            stats["flag_fallbacks"] = fallbacks.summary(
+                getattr(self, "observed_seeds", ()))
 
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)

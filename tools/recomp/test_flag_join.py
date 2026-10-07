@@ -33,7 +33,11 @@ def test_mixed_operations_are_not_guessed():
     b = Operand(type='reg', reg='edx')
     assert _merge_flag_states([('cmp', [a, b]), ('test', [a, b])]) is None
 
-def test_mixed_widths_are_not_guessed():
+def test_mixed_widths_merge_but_not_for_sign_or_overflow():
+    from tools.recomp.lifter import _make_condition
     wide = [Operand(type='reg', reg='eax'), Operand(type='reg', reg='edx')]
     narrow = [Operand(type='reg', reg='al'), Operand(type='reg', reg='dl')]
-    assert _merge_flag_states([('cmp', wide), ('cmp', narrow)]) is None
+    merged = _merge_flag_states([('cmp', wide), ('cmp', narrow)])
+    assert merged[0] == 'cmp_mixed'
+    assert _make_condition('jne', *merged) is not None
+    assert _make_condition('js', *merged) is None
