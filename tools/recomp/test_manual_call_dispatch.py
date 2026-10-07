@@ -197,3 +197,25 @@ def test_wrapped_guarded_icall_arm_names_the_wrapper():
 
     assert f"RECOMP_ABI_CALL(0x{g.A:08X}u, sub_{g.A:08X}); }}" in c, c
     assert f"sub_{g.A:08X}_gen" not in c, c
+
+
+def test_wrapped_conditional_tail_names_the_wrapper():
+    compare = Instruction(0x00120000, 2, "cmp", "eax, ecx", "39c8")
+    compare.operands = [
+        Operand(type="reg", reg="eax"),
+        Operand(type="reg", reg="ecx"),
+    ]
+    jump = Instruction(
+        0x00120002, 6, "je", f"0x{TARGET:x}", "0f8400000000")
+    jump.jump_target = TARGET
+    lifter = Lifter(
+        func_db={TARGET: {"name": "sub_001E9100_gen"}}, wrapped_functions={TARGET})
+    lifter.func_start = 0x00120000
+    lifter.func_end = 0x00120100
+
+    generated, _ = lift_basic_block(
+        lifter, BasicBlock(start=0x00120000, instructions=[compare, jump]))
+    output = "\n".join(generated)
+
+    assert "sub_001E9100(); return; }" in output
+    assert "sub_001E9100_gen" not in output
