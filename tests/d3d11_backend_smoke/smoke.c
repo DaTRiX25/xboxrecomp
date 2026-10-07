@@ -95,7 +95,7 @@ static uint32_t s_surf_base = 0x01000000u;
 #define MIP_GUEST (TEX_GUEST + 0xA000u)  /* 32x32 A8R8G8B8, 6 levels */
 #define RTT_A     0x10100000u   /* 64x64 render-to-texture targets, pitch 256 */
 #define RTT_B     0x10110000u
-#define VB_GUEST  0x10200000u   /* index cases: vertex arrays, 96000 bytes */
+#define VB_GUEST  0x10200000u   /* index cases: 96000 bytes of vertex arrays, 0x20000 committed */
 #define TEX_LOG2  6                            /* 64x64 */
 /* Four 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
  * the first free 64 KB below 16 MB. */

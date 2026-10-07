@@ -38,6 +38,12 @@
  *   elem32       a triangle list whose last (odd) index is an
  *                ARRAY_ELEMENT32
  *
+ * Then the walker's index limit (overflow): a batch past NV_MAX_INDICES
+ * warns, counts one overflowed batch and keeps the first NV_MAX_INDICES; with
+ * one slot left an ARRAY_ELEMENT16 word still lands its first half; an
+ * ARRAY_ELEMENT32 index past 0xFFFF is counted. Read back through
+ * nv2a_pb_exec_idx_stats, the summary line's counters.
+ *
  * The CPU and GPU paths both draw the walker's index list, so a batch the
  * walker cut short gives two identical, equally wrong frames. bigidx and
  * elem32 therefore also check the colour of a pixel inside a quad past
@@ -638,6 +644,65 @@ static void build_xbe(uint8_t *xbe, size_t n)
     v = 0x00010800u ^ 0x5B6D40B6u; memcpy(xbe + 0x158, &v, 4); /* empty thunks */
 }
 
+/* The index limit, on the CPU path: every index is vertex 0, so the
+ * 0x80000-index batches are degenerate triangles and rasterise nothing.
+ * Returns the failures. */
+static int overflow_case(void)
+{
+    uint32_t max0, ov0, ff0, max, ov, ff, i, n;
+    int f = 0;
+
+    nv2a_pb_set_backend(nv2a_pb_cpu_backend());
+    vb_vertex(0, 10.0f, 10.0f, 0xFFFFFFFFu);
+    vb_arrays();
+    nv2a_pb_exec_idx_stats(&max0, &ov0, &ff0);
+
+    /* One word past the cap: NV_MAX_INDICES / 2 + 1 ARRAY_ELEMENT16 words. */
+    M(0x17FC, 5);                          /* TRIANGLES */
+    for (i = 0; i < NV_MAX_INDICES / 2u + 1u; i++)
+        M(0x1800, 0);
+    n = nv2a_pb_gpu_state()->idx_count;
+    M(0x17FC, 0);
+    nv2a_pb_exec_idx_stats(&max, &ov, &ff);
+    fprintf(stderr, "[backend-smoke] overflow: batch past the cap keeps %u, max %u,"
+            " %u overflowed (want %u, %u, %u) %s\n", n, max, ov - ov0,
+            (unsigned)NV_MAX_INDICES, (unsigned)NV_MAX_INDICES, 1u,
+            n == NV_MAX_INDICES && max == NV_MAX_INDICES && ov - ov0 == 1u ? "PASS" : "FAIL");
+    f += !(n == NV_MAX_INDICES && max == NV_MAX_INDICES && ov - ov0 == 1u);
+
+    /* One slot left: an odd count from ARRAY_ELEMENT32, then 16-bit pairs. */
+    M(0x17FC, 5);
+    M(0x1808, 0);
+    for (i = 0; i < NV_MAX_INDICES / 2u; i++)
+        M(0x1800, 0);
+    n = nv2a_pb_gpu_state()->idx_count;
+    M(0x17FC, 0);
+    nv2a_pb_exec_idx_stats(NULL, &ov, NULL);
+    fprintf(stderr, "[backend-smoke] overflow: one slot left keeps the first half: %u"
+            " indices, %u overflowed (want %u, %u) %s\n", n, ov - ov0,
+            (unsigned)NV_MAX_INDICES, 2u,
+            n == NV_MAX_INDICES && ov - ov0 == 2u ? "PASS" : "FAIL");
+    f += !(n == NV_MAX_INDICES && ov - ov0 == 2u);
+
+    /* A 32-bit index past 0xFFFF: counted, the batch not overflowed. */
+    M(0x17FC, 5);
+    M(0x1800, 0);
+    M(0x1808, 0x00010000u);
+    M(0x17FC, 0);
+    nv2a_pb_exec_idx_stats(NULL, &ov, &ff);
+    fprintf(stderr, "[backend-smoke] overflow: ARRAY_ELEMENT32 0x10000 counts %u over"
+            " 0xFFFF, %u overflowed (want 1, 2) %s\n", ff - ff0, ov - ov0,
+            ff - ff0 == 1u && ov - ov0 == 2u ? "PASS" : "FAIL");
+    f += !(ff - ff0 == 1u && ov - ov0 == 2u);
+
+    {
+        int a;
+        for (a = 0; a < 16; a++)
+            M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+    }
+    return f;
+}
+
 /* The absolute checks of bigidx and elem32, on one path's frame. */
 static int probes_ok(int sc, const char *path, const uint32_t *px)
 {
@@ -732,6 +797,10 @@ int main(int argc, char **argv)
             if (!same || !pc || !pg)
                 failures++;
         }
+    }
+    if (overflow_case()) {
+        fprintf(stderr, "[backend-smoke] FAIL: index limit\n");
+        failures++;
     }
     nv2a_pb_set_backend(NULL);
 #ifdef __APPLE__

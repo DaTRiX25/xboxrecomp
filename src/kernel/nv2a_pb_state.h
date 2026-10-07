@@ -228,6 +228,10 @@ struct nv2a_pb_vsh {
 
 /* Read-only views of the executor's state. */
 const struct nv2a_pb_gpu *nv2a_pb_gpu_state(void);
+/* The index-batch counters of the [GPU] summary line: the largest batch,
+ * the batches that lost indices past NV_MAX_INDICES, and the indices past
+ * 0xFFFF truncated to 16 bits. For the backend smoke test. */
+void nv2a_pb_exec_idx_stats(uint32_t *max, uint32_t *overflowed, uint32_t *over_ffff);
 const struct nv2a_pb_vsh *nv2a_pb_vsh_state(void);
 const uint32_t *nv2a_pb_tex_regs(void);       /* NV_TEX_REGS words */
 const uint8_t  *nv2a_pb_tex_regs_set(void);   /* 1 where the title wrote one */

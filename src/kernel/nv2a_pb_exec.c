@@ -243,18 +243,29 @@ static struct nv2a_pb_gpu s_gpu;
  * them to decide whether its mirror is still needed; both run on the NV2A ack
  * thread, which is also the thread that drives this executor. */
 static uint32_t s_inline_overflow;      /* INLINE_ARRAY dwords past NV_MAX_INLINE */
-static uint32_t s_idx_overflow;         /* index words and runs dropped past NV_MAX_INDICES */
+static uint32_t s_idx_overflow;         /* batches that lost indices past NV_MAX_INDICES */
+static int      s_idx_cut;              /* the open batch has lost some */
 static uint32_t s_idx_max;              /* largest idx_count drawn */
-static uint32_t s_idx_start_hi;         /* DRAW_ARRAYS runs reaching past index 0xFFFF */
+static uint32_t s_idx_over_ffff;        /* indices past 0xFFFF, truncated to 16 bits */
 static uint32_t s_xv_fail;              /* program batches dropped: no scratch */
 
 /* Indices past NV_MAX_INDICES are dropped, which cuts the far end off a big
- * mesh with no other sign: say so once, and count. */
+ * mesh with no other sign: say so once, and count the batch at its END. */
 static void note_idx_overflow(void)
 {
-    if (!s_idx_overflow++)
+    static int warned;
+    s_idx_cut = 1;
+    if (!warned++)
         fprintf(stderr, "  [GPU] index batch over %u indices: the rest is dropped\n",
                 (unsigned)NV_MAX_INDICES);
+}
+
+/* For the backend smoke test: the counters the summary line prints. */
+void nv2a_pb_exec_idx_stats(uint32_t *max, uint32_t *overflowed, uint32_t *over_ffff)
+{
+    if (max) *max = s_idx_max;
+    if (overflowed) *overflowed = s_idx_overflow;
+    if (over_ffff) *over_ffff = s_idx_over_ffff;
 }
 static uint32_t s_sema_releases;
 static uint32_t s_sema_last_va, s_sema_last_value;
@@ -5710,6 +5721,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (param) {
             s_gpu.prim = param;
             s_gpu.idx_count = 0;
+            s_idx_cut = 0;
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
         } else {
@@ -5722,6 +5734,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 draw_inline_array();
             else
                 draw_primitive();
+            if (s_idx_cut)
+                s_idx_overflow++;
+            s_idx_cut = 0;
             s_gpu.prim = 0;
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
@@ -5756,7 +5771,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* The hardware faults on a start past 0xFFFF, so no title sends one:
          * a count here is a decode bug, not a title to support. */
         if (start + count - 1u > 0xFFFFu)
-            s_idx_start_hi++;
+            s_idx_over_ffff++;
         for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
         if (i < count)
@@ -5765,22 +5780,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 
     case NV097_ARRAY_ELEMENT16:
-        /* Two 16-bit indices per parameter word. */
+        /* Two 16-bit indices per parameter word. DRAW_ARRAYS and
+         * ARRAY_ELEMENT32 can leave the count odd, so with one slot left the
+         * first half still goes in. */
         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
         } else if (s_gpu.prim) {
+            if (s_gpu.idx_count < NV_MAX_INDICES)
+                s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
             note_idx_overflow();
         }
         break;
     case NV097_ARRAY_ELEMENT32:
         /* One index per word: the XDK sends the last index of an odd-count
          * DrawIndexedVertices this way, and without it the batch loses its
-         * last primitive. 16 bits is the hardware's vertex range. */
-        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
+         * last primitive. The word may carry a wider index; idx is 16-bit
+         * (the vertex range DRAW_ARRAYS faults past), so one past 0xFFFF is
+         * truncated and counted rather than silently aliased. */
+        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES) {
+            if (param > 0xFFFFu)
+                s_idx_over_ffff++;
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)param;
-        else if (s_gpu.prim)
+        } else if (s_gpu.prim) {
             note_idx_overflow();
+        }
         break;
     case NV097_SET_TEXTURE_OFFSET:
         /* A texture offset is a DMA-object offset, exactly like a surface or a
@@ -6259,8 +6283,8 @@ void nv2a_pb_exec_report(void)
     /* Whether a title ever needs a big batch, without a probe. */
     fprintf(stderr, "[GPU] index batches: max %u, %u overflowed", s_idx_max,
             s_idx_overflow);
-    if (s_idx_start_hi)
-        fprintf(stderr, ", %u starts over 0xFFFF", s_idx_start_hi);
+    if (s_idx_over_ffff)
+        fprintf(stderr, ", %u indices over 0xFFFF", s_idx_over_ffff);
     if (s_xv_fail)
         fprintf(stderr, ", %u dropped for scratch", s_xv_fail);
     fputc('\n', stderr);
