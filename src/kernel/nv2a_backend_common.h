@@ -255,6 +255,36 @@ static inline int nv2a_rt_overlap(uint32_t a, uint32_t an, uint32_t b, uint32_t 
     return an && bn && a < b + bn && b < a + an;
 }
 
+/* What a colour clear covers, in guest pixels, box = {x0, y0, x1, y1} with
+ * x1/y1 exclusive: the surface clip, bounded by the clear rect once the title
+ * has set one (inclusive max, as xemu reads it), clamped to a w x h target.
+ * 0 when nothing is left. One box for every path: since a GPU target serves
+ * every clip of its surface (Burnout 3 clears 159x344 regions of its 640x480
+ * back buffer), a whole-target clear would wipe what another clip drew. */
+static inline int nv2a_clear_box(const struct nv2a_pb_gpu *g, uint32_t w, uint32_t h,
+                                 uint32_t box[4])
+{
+    uint32_t ax = g->clip_x, ay = g->clip_y;
+    uint32_t bx = g->clip_x + g->clip_w, by = g->clip_y + g->clip_h;
+    if (g->clear_rect_set) {
+        uint32_t rx0 = g->clear_rect_h & 0xFFFFu, rx1 = (g->clear_rect_h >> 16) + 1u;
+        uint32_t ry0 = g->clear_rect_v & 0xFFFFu, ry1 = (g->clear_rect_v >> 16) + 1u;
+        if (rx0 > ax) ax = rx0;
+        if (ry0 > ay) ay = ry0;
+        if (rx1 < bx) bx = rx1;
+        if (ry1 < by) by = ry1;
+    }
+    if (bx > w) bx = w;
+    if (by > h) by = h;
+    if (ax >= bx || ay >= by)
+        return 0;
+    box[0] = ax;
+    box[1] = ay;
+    box[2] = bx;
+    box[3] = by;
+    return 1;
+}
+
 static inline uint8_t nv2a_clamp255(int x)
 {
     return (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);

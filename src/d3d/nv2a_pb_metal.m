@@ -7,7 +7,9 @@
  * this file answers them with Metal instead of the CPU rasteriser:
  *
  *   on_clear  -> a render pass with loadAction Clear on the surface at
- *                color_offset (one MTLTexture per guest surface)
+ *                color_offset (one MTLTexture per guest surface, grown to
+ *                its largest clip); a clear of part of it (clip, clear
+ *                rect) is a scissored draw of the clear colour
  *   on_draw   -> vertex-program batches through the program as MSL
  *                (d3d8_vsh_msl.c), pre-transformed (screen-space) ones through
  *                a pass-through vertex function; pixels through the register
@@ -213,13 +215,25 @@ static const char s_msl[] =
     "        if (!ok) discard_fragment();\n"
     "    }\n"
     "    return c;\n"
-    "}\n";
+    "}\n"
+    /* A colour clear of part of a target (metal_on_clear): a full-screen
+     * triangle under a scissor, the clear colour as it is. */
+    "struct ClearV { float4 pos [[position]]; };\n"
+    "vertex ClearV vs_clear(uint vid [[vertex_id]]) {\n"
+    "    float2 t = float2((vid << 1) & 2, vid & 2);\n"
+    "    ClearV o;\n"
+    "    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+    "    return o;\n"
+    "}\n"
+    "fragment float4 fs_clear(constant float4 &c [[buffer(0)]]) { return c; }\n";
 
 /* ---- device ---------------------------------------------------------------- */
 
 static id<MTLDevice>               s_dev;
 static id<MTLCommandQueue>         s_queue;
 static id<MTLFunction>             s_vs_pass, s_fs_basic;
+static id<MTLFunction>             s_vs_clear, s_fs_clear;
+static id<MTLRenderPipelineState>  s_clear_pso[2];   /* partial clears: without, with depth */
 static MTLCompileOptions          *s_opts;     /* fast math off, kept for M2's shaders */
 static id<MTLCommandBuffer>        s_cmd;      /* the frame's, begun lazily */
 static id<MTLRenderCommandEncoder> s_enc;      /* open pass, or nil */
@@ -273,6 +287,7 @@ static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
 static uint64_t      s_stale_drops, s_retired;
+static uint64_t      s_grows, s_partial_clears;   /* rt_grow, metal_on_clear */
 
 /* Visibility tests (see "Visibility tests" below): the slot counting on the
  * open pass, opened by begin_pass and closed here. */
@@ -480,8 +495,10 @@ static int init(void)
         }
         s_vs_pass = [lib newFunctionWithName:@"vs_pass"];
         s_fs_basic = [lib newFunctionWithName:@"fs_basic"];
+        s_vs_clear = [lib newFunctionWithName:@"vs_clear"];
+        s_fs_clear = [lib newFunctionWithName:@"fs_clear"];
         [lib release];
-        if (!s_vs_pass || !s_fs_basic) {
+        if (!s_vs_pass || !s_fs_basic || !s_vs_clear || !s_fs_clear) {
             fprintf(stderr, LOGP "MSL functions missing\n");
             return 0;
         }
@@ -641,16 +658,124 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
     return e;
 }
 
-/* The render target for the surface at color_offset, the size of its clip
- * extent (the D3D11 backend's rule), made on first use. A new one starts from
- * the guest's bytes when the surface is 32-bit, as the CPU path draws over
- * whatever memory holds. */
+/* A BGRA8 colour texture of hw x hh host pixels, as every target is made. */
+static id<MTLTexture> rt_texture_new(uint32_t hw, uint32_t hh)
+{
+    MTLTextureDescriptor *td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:hw height:hh
+                                                       mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    /* Managed only for a discrete GPU (Intel Macs); deprecated on 27. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    td.storageMode = s_unified ? MTLStorageModeShared : MTLStorageModeManaged;
+#pragma clang diagnostic pop
+    return [s_dev newTextureWithDescriptor:td];
+}
+
+/* tex (w x h guest, hw x hh host) from the guest's bytes at addr when the
+ * surface is 32-bit, as the CPU path draws over whatever memory holds; 0 when
+ * it is not (the texture is left as made). */
+static int rt_seed(id<MTLTexture> tex, uint32_t addr, uint32_t pitch, uint32_t w,
+                    uint32_t h, uint32_t hw, uint32_t hh)
+{
+    const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset() + addr;
+
+    if (pitch < w * 4u)
+        return 0;
+    guard_open();   /* our own read of the seed is not a title read */
+    if (hw == w) {
+        [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+                 withBytes:src bytesPerRow:pitch];
+    } else {
+        /* Scaled: the guest bytes, each pixel an n x n block. */
+        unsigned n = hw / w;
+        uint8_t *up = (uint8_t *)malloc((size_t)hw * hh * 4u);
+        if (up) {
+            nv2a_upscale_nearest32(src, pitch, w, h, n, up, hw * 4u);
+            [tex replaceRegion:MTLRegionMake2D(0, 0, hw, hh) mipmapLevel:0
+                     withBytes:up bytesPerRow:hw * 4u];
+            free(up);
+        }
+    }
+    return 1;
+}
+
+/* rt made w x h (guest pixels), what it holds kept at its top left: the
+ * D3D11 backend's rt_grow. The new area is seeded from the guest bytes, as a
+ * new target is; replaceRegion runs now and the blit of the old contents
+ * later on the GPU, so the blit wins where both write. A blit cannot
+ * rescale: when the larger size takes another host factor (past
+ * METAL_MAX_DIM), rt is written back first and the whole texture seeded. */
+static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
+{
+    static int said;
+    id<MTLTexture> tex;
+    uint32_t hw, hh;
+    unsigned n;
+    int keep;
+
+    n = nv2a_host_size(w, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
+    keep = rt->hw == rt->w * n && rt->hh == rt->h * n;
+    if (!keep)
+        rt_sync(rt, rt->pitch);
+    /* An encoder must not outlive its attachment's swap, and the passes
+     * below need none open. */
+    end_encoder();
+    tex = rt_texture_new(hw, hh);
+    if (!tex)
+        return 0;
+    if (!rt_seed(tex, rt->addr, rt->pitch, w, h, hw, hh)) {
+        /* A new texture's contents are undefined: a 16-bit surface's margin
+         * starts black, as D3D11's does. */
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        id<MTLRenderCommandEncoder> e;
+        rp.colorAttachments[0].texture = tex;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        ensure_cmd();
+        e = [s_cmd renderCommandEncoderWithDescriptor:rp];
+        [e endEncoding];
+    }
+    if (keep) {
+        id<MTLBlitCommandEncoder> b;
+        ensure_cmd();
+        b = [s_cmd blitCommandEncoder];
+        [b copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0
+              sourceOrigin:MTLOriginMake(0, 0, 0)
+                sourceSize:MTLSizeMake(rt->hw, rt->hh, 1)
+                 toTexture:tex destinationSlice:0 destinationLevel:0
+         destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [b endEncoding];
+    }
+    if (said++ < 20)
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target grown to %ux%u\n",
+                rt->offset, rt->w, rt->h, w, h);
+    [rt->tex release];   /* an encoded command keeps its own reference */
+    rt->tex = tex;
+    rt->w = w;
+    rt->h = h;
+    rt->hw = hw;
+    rt->hh = hh;
+    /* The cached depth buffer is the old size; begin_pass would attach it to
+     * the larger colour texture. The next depth draw attaches one at the
+     * grown size (depth_target), fresh. */
+    rt->dt = NULL;
+    rt_own_reset(rt);
+    s_grows++;
+    return 1;
+}
+
+/* The render target for the surface at color_offset, at least the size of
+ * its clip extent (the D3D11 backend's rule), made on first use. A new one
+ * starts from the guest's bytes (rt_seed). */
 static RenderTarget *surface(void)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     uint32_t w = g->clip_x + g->clip_w, h = g->clip_y + g->clip_h;
     RenderTarget *free_rt = NULL, *lru = &s_rt[0];
-    MTLTextureDescriptor *td;
     uint32_t hw, hh;
     int i;
 
@@ -668,6 +793,31 @@ static RenderTarget *surface(void)
             rt->last_use = s_tick;
             return rt;
         }
+    }
+    /* The same surface under another clip extent: one target per surface,
+     * as large as any clip it was drawn with (D3D11's rule, toolkit
+     * 4773a01). Burnout 3 draws its 640x480 back buffer with clips of
+     * 640x464, 623x401, 159x344 and more in one frame; a target per extent
+     * made the overlap rule below write back and retire one at every clip
+     * change (a GPU wait, and at render.scale > 1 the box filter's loss),
+     * and a flip found no target of the frame's size. Draws map guest pixels
+     * to NDC through rt->w/h, so a larger target keeps every position; a
+     * clear covers only its clip and clear rect (metal_on_clear) and a flip
+     * shows only the frame's extent (present_extent). Another pitch at the
+     * same offset is a new allocation, not another clip: it gets a target of
+     * its own and the overlap rule retires this one. */
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->tex || rt->offset != g->color_offset || rt->pitch != g->pitch)
+            continue;
+        if (rt_drop_if_stale(rt, "reuse"))
+            break;
+        if ((rt->w >= w && rt->h >= h)
+                || rt_grow(rt, rt->w > w ? rt->w : w, rt->h > h ? rt->h : h)) {
+            rt->last_use = s_tick;
+            return rt;
+        }
+        break;
     }
     /* No two live targets share memory: one the new target overlaps is
      * written back first (the seed below then reads what was drawn) or,
@@ -700,16 +850,7 @@ static RenderTarget *surface(void)
         rt_free(free_rt);
     }
     nv2a_host_size(w, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
-    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                            width:hw height:hh
-                                                        mipmapped:NO];
-    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    /* Managed only for a discrete GPU (Intel Macs); deprecated on 27. */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    td.storageMode = s_unified ? MTLStorageModeShared : MTLStorageModeManaged;
-#pragma clang diagnostic pop
-    free_rt->tex = [s_dev newTextureWithDescriptor:td];
+    free_rt->tex = rt_texture_new(hw, hh);
     if (!free_rt->tex)
         return NULL;
     free_rt->offset = g->color_offset;
@@ -721,25 +862,7 @@ static RenderTarget *surface(void)
     free_rt->pitch = g->pitch;
     free_rt->last_use = s_tick;
     rt_own_reset(free_rt);   /* the bytes the seed reads, or would */
-    if (g->pitch >= w * 4u) {
-        const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset()
-                           + nv2a_pb_dma_resolve(g->color_offset);
-        guard_open();   /* our own read of the seed is not a title read */
-        if (hw == w) {
-            [free_rt->tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
-                              withBytes:src bytesPerRow:g->pitch];
-        } else {
-            /* Scaled: the guest bytes, each pixel an n x n block. */
-            unsigned n = hw / w;
-            uint8_t *up = (uint8_t *)malloc((size_t)hw * hh * 4u);
-            if (up) {
-                nv2a_upscale_nearest32(src, g->pitch, w, h, n, up, hw * 4u);
-                [free_rt->tex replaceRegion:MTLRegionMake2D(0, 0, hw, hh) mipmapLevel:0
-                                  withBytes:up bytesPerRow:hw * 4u];
-                free(up);
-            }
-        }
-    }
+    rt_seed(free_rt->tex, free_rt->addr, g->pitch, w, h, hw, hh);
     if (hw != w)
         fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
                 g->color_offset, w, h, hw, hh);
@@ -749,24 +872,104 @@ static RenderTarget *surface(void)
     return free_rt;
 }
 
+static id<MTLDepthStencilState> depth_state(int depth, int stencil);
+
+/* The partial-clear pipeline for a pass with (dt) or without a depth
+ * attachment, made on first use; nil if it cannot be made. */
+static id<MTLRenderPipelineState> clear_pso(int dt)
+{
+    static int failed[2];
+    MTLRenderPipelineDescriptor *pd;
+    NSError *err = nil;
+
+    if (s_clear_pso[dt] || failed[dt])
+        return s_clear_pso[dt];
+    pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.vertexFunction = s_vs_clear;
+    pd.fragmentFunction = s_fs_clear;
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pd.colorAttachments[0].writeMask = MTLColorWriteMaskAll;
+    if (dt) {
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    }
+    s_clear_pso[dt] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    [pd release];
+    if (!s_clear_pso[dt]) {
+        failed[dt] = 1;
+        fprintf(stderr, LOGP "partial-clear pipeline failed (%s): a partial clear clears"
+                " the whole target\n", err ? [[err localizedDescription] UTF8String] : "?");
+    }
+    return s_clear_pso[dt];
+}
+
+/* A colour clear covers its clip and clear rect only (nv2a_clear_box), as on
+ * D3D11 and the CPU path: one target serves every clip of its surface
+ * (rt_grow). A load action clears a whole attachment, so a box that is the
+ * whole target keeps it, and a smaller one is a full-screen triangle of the
+ * clear colour under a scissor, in a loading pass. */
 static void metal_on_clear(uint32_t param)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     RenderTarget *rt;
     double c[4];
+    uint32_t b[4];
+    id<MTLRenderPipelineState> pso;
 
     if (!(param & 0xF0) || !init())
         return;
     @autoreleasepool {
         rt = surface();
-        if (!rt)
+        if (!rt || !nv2a_clear_box(g, rt->w, rt->h, b))
             return;
         c[0] = (double)((g->clear_color >> 16) & 0xFF) / 255.0;
         c[1] = (double)((g->clear_color >> 8) & 0xFF) / 255.0;
         c[2] = (double)(g->clear_color & 0xFF) / 255.0;
         c[3] = (double)(g->clear_color >> 24) / 255.0;
-        begin_encoder(rt, 1, c);
         s_clears++;
+        if (b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
+            begin_encoder(rt, 1, c);
+            return;
+        }
+        if (!s_enc || s_enc_rt != rt)
+            begin_encoder(rt, 0, NULL);
+        pso = clear_pso(s_enc_dt ? 1 : 0);
+        if (!pso) {
+            begin_encoder(rt, 1, c);
+            return;
+        }
+        {
+            /* byte/255: BGRA8Unorm stores the bytes the CPU path writes. */
+            float fc[4] = {(float)c[0], (float)c[1], (float)c[2], (float)c[3]};
+            MTLViewport vp = {0.0, 0.0, (double)rt->hw, (double)rt->hh, 0.0, 1.0};
+            MTLScissorRect sr;
+            sr.x = (NSUInteger)((uint64_t)b[0] * rt->hw / rt->w);
+            sr.y = (NSUInteger)((uint64_t)b[1] * rt->hh / rt->h);
+            sr.width = (NSUInteger)((uint64_t)b[2] * rt->hw / rt->w) - sr.x;
+            sr.height = (NSUInteger)((uint64_t)b[3] * rt->hh / rt->h) - sr.y;
+            [s_enc setRenderPipelineState:pso];
+            if (s_enc_dt)
+                [s_enc setDepthStencilState:depth_state(0, 0)];
+            [s_enc setCullMode:MTLCullModeNone];
+            [s_enc setViewport:vp];
+            [s_enc setScissorRect:sr];
+            [s_enc setFragmentBytes:fc length:sizeof fc atIndex:0];
+            /* A clear is not a zpass sample: no counting for this draw. */
+            if (s_occ_slot >= 0)
+                [s_enc setVisibilityResultMode:MTLVisibilityResultModeDisabled
+                                        offset:(NSUInteger)s_occ_slot * 8u];
+            [s_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            if (s_occ_slot >= 0)
+                [s_enc setVisibilityResultMode:MTLVisibilityResultModeCounting
+                                        offset:(NSUInteger)s_occ_slot * 8u];
+            /* Draws never set a scissor: the whole target again. */
+            sr.x = 0;
+            sr.y = 0;
+            sr.width = rt->hw;
+            sr.height = rt->hh;
+            [s_enc setScissorRect:sr];
+        }
+        s_partial_clears++;
     }
 }
 
@@ -1772,9 +1975,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
 
 /* ---- flip ---------------------------------------------------------------------- */
 
-/* The render target for the surface the walker picked: its offset, and its
- * size when the walker knows it. NULL when this backend never drew there;
- * the guest's own bytes are presented then. */
+/* The render target for the surface the walker picked: its offset, and at
+ * least its size when the walker knows it (a grown target covers smaller
+ * frames, rt_grow). NULL when this backend never drew there; the guest's own
+ * bytes are presented then. */
 static RenderTarget *present_target(uint32_t surface_offset)
 {
     const struct nv2a_pb_present *p = nv2a_pb_present_state();
@@ -1783,13 +1987,30 @@ static RenderTarget *present_target(uint32_t surface_offset)
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (rt->tex && surface_offset && rt->offset == surface_offset
-                && (!p->offset || (rt->w == p->w && rt->h == p->h))) {
+                && (!p->offset || (rt->w >= p->w && rt->h >= p->h))) {
             rt->presented = 1;
             return rt;
         }
     }
     return NULL;
 }
+
+/* The part of rt a flip shows, in guest pixels: the walker's present extent
+ * when it names this surface (D3D11's present_extent). A target grown for a
+ * larger clip (rt_grow) can be bigger than the frame; the rest of it is not
+ * the frame. */
+static void present_extent(const RenderTarget *rt, uint32_t *w, uint32_t *h)
+{
+    const struct nv2a_pb_present *p = nv2a_pb_present_state();
+    *w = rt->w;
+    *h = rt->h;
+    if (p->offset && p->offset == rt->offset && p->w && p->h) {
+        if (p->w < *w) *w = p->w;
+        if (p->h < *h) *h = p->h;
+    }
+}
+
+static uint32_t s_shown_w, s_shown_h;   /* the last flip's present extent */
 
 /* rt's pixels into the guest surface at `addr`, `pitch` bytes a row: 32-bit
  * as they are (BGRA8 is X8R8G8B8's byte order), 16-bit as R5G6B5. Runs after
@@ -1949,7 +2170,7 @@ static void rt_sync(RenderTarget *rt, uint32_t pitch)
 }
 
 /* nv2a_pb_backend.sync_guest: the target present_target would pick for this
- * surface (offset, guest w x h), else the most recently used one at its
+ * surface (offset, covering guest w x h), else the most recently used one at its
  * address (a surface dump of a target drawn at another clip). */
 static void metal_sync_guest(uint32_t offset, uint32_t pitch, uint32_t w, uint32_t h)
 {
@@ -1961,7 +2182,7 @@ static void metal_sync_guest(uint32_t offset, uint32_t pitch, uint32_t w, uint32
     if (s_failed)
         return;
     for (i = 0; i < RT_MAX && !rt; i++)
-        if (s_rt[i].tex && s_rt[i].offset == offset && s_rt[i].w == w && s_rt[i].h == h)
+        if (s_rt[i].tex && s_rt[i].offset == offset && s_rt[i].w >= w && s_rt[i].h >= h)
             rt = &s_rt[i];
     if (!rt) {
         for (i = 0; i < RT_MAX; i++) {
@@ -1979,6 +2200,24 @@ static void metal_sync_guest(uint32_t offset, uint32_t pitch, uint32_t w, uint32
  * (hw x hh BGRA8, tightly packed) of the target at a colour offset, read
  * back now, so a test can box-filter them itself. */
 uint64_t nv2a_pb_metal_writebacks(void) { return s_writebacks; }
+
+/* For tests/nv2a_backend_smoke: the size of the target at a colour offset
+ * and the part of it the last flip showed, 0 when there is none (the shape
+ * of nv2a_pb_d3d11_shown). */
+int nv2a_pb_metal_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
+                        uint32_t *sw, uint32_t *sh)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex && s_rt[i].offset == offset) {
+            *tw = s_rt[i].w;
+            *th = s_rt[i].h;
+            *sw = s_shown_w;
+            *sh = s_shown_h;
+            return 1;
+        }
+    return 0;
+}
 const uint8_t *nv2a_pb_metal_host_pixels(uint32_t offset, uint32_t *hw, uint32_t *hh)
 {
     int i;
@@ -2470,6 +2709,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
     const uint8_t *hpx = NULL;   /* a scaled rt's host pixels (host_readback) */
     uint64_t t_flip0 = prof_on() ? prof_now() : 0, t;
     int always = wb_always(), win = 0, layer = 0;
+    uint32_t cw = 0, ch = 0, hcw = 0, hch = 0;   /* the frame, guest and host */
 
     guard_open();
     if (init()) {
@@ -2477,6 +2717,13 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
             int wb;
             id<MTLTexture> slot = nil;
             rt = present_target(surface_offset);
+            if (rt) {
+                present_extent(rt, &cw, &ch);
+                hcw = (uint32_t)((uint64_t)cw * rt->hw / rt->w);
+                hch = (uint32_t)((uint64_t)ch * rt->hh / rt->h);
+                s_shown_w = cw;
+                s_shown_h = ch;
+            }
             win = rt && xbox_FramebufferWindowRunning();
             /* Layer mode: the frame goes to the window as a GPU copy into the
              * presenter's back slot (fb_present_metal.m), below. */
@@ -2494,14 +2741,14 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                  * the two on the GPU). Published once committed, so the main
                  * thread's pass that shows it is committed after it. */
                 t = prof_t();
-                slot = (id<MTLTexture>)xbox_FramebufferWindowBackTexture(rt->hw, rt->hh);
+                slot = (id<MTLTexture>)xbox_FramebufferWindowBackTexture(hcw, hch);
                 if (slot) {
                     id<MTLBlitCommandEncoder> b;
                     ensure_cmd();
                     b = [s_cmd blitCommandEncoder];
                     [b copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0
                           sourceOrigin:MTLOriginMake(0, 0, 0)
-                            sourceSize:MTLSizeMake(rt->hw, rt->hh, 1)
+                            sourceSize:MTLSizeMake(hcw, hch, 1)
                              toTexture:slot destinationSlice:0 destinationLevel:0
                      destinationOrigin:MTLOriginMake(0, 0, 0)];
                     [b endEncoding];
@@ -2536,7 +2783,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (%s), %llu clears,"
                 " %llu draws (%llu vertex-program), %llu skipped, %llu culled,"
                 " %llu texture uploads, %llu rehashes, %llu write-backs (%s),"
-                " %llu decode syncs, %llu stale drops;"
+                " %llu decode syncs, %llu stale drops, %llu grows, %llu partial clears;"
                 " shaders %llu vs + %llu fs, %llu compile errors;"
                 " %llu z-clears, %llu depth draws, %llu rt binds (%llu self copies);"
                 " %llu window presents (%s); %llu flushes,"
@@ -2549,6 +2796,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_tex_uploads, (unsigned long long)s_tex_rehash,
                 (unsigned long long)s_writebacks, always ? "always" : "lazy",
                 (unsigned long long)s_decode_syncs, (unsigned long long)s_stale_drops,
+                (unsigned long long)s_grows, (unsigned long long)s_partial_clears,
                 (unsigned long long)s_vs_compiled, (unsigned long long)s_fs_compiled,
                 (unsigned long long)s_compile_errors,
                 (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
@@ -2570,9 +2818,9 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
      * the backend never drew (guest bytes) goes as the CPU path presents it,
      * in either mode. */
     if (rt && hpx && win) {
-        /* Scaled: the host-size frame read above, as it is. */
+        /* Scaled: the frame's part of the host-size readback above. */
         t = prof_t();
-        xbox_FramebufferWindowPresentPixels(hpx, rt->hw, rt->hh, rt->hw * 4u, 4u);
+        xbox_FramebufferWindowPresentPixels(hpx, hcw, hch, rt->hw * 4u, 4u);
         prof_add(&s_pa.winpush, t);
         s_window_presents++;
         prof_flip_end(t_flip0);
@@ -2581,7 +2829,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (rt && rt->hw == rt->w && win) {
         static uint8_t *px;
         static size_t cap;
-        size_t need = (size_t)rt->w * rt->h * 4u;
+        size_t need = (size_t)cw * ch * 4u;
         if (cap < need) {
             uint8_t *n = (uint8_t *)realloc(px, need);
             if (n) {
@@ -2591,11 +2839,11 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
         }
         if (cap >= need) {
             t = prof_t();
-            [rt->tex getBytes:px bytesPerRow:rt->w * 4u
-                   fromRegion:MTLRegionMake2D(0, 0, rt->w, rt->h) mipmapLevel:0];
+            [rt->tex getBytes:px bytesPerRow:cw * 4u
+                   fromRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0];
             prof_add(&s_pa.winrb, t);
             t = prof_t();
-            xbox_FramebufferWindowPresentPixels(px, rt->w, rt->h, rt->w * 4u, 4u);
+            xbox_FramebufferWindowPresentPixels(px, cw, ch, cw * 4u, 4u);
             prof_add(&s_pa.winpush, t);
             s_window_presents++;
             prof_flip_end(t_flip0);

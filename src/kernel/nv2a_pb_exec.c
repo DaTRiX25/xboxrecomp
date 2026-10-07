@@ -1083,7 +1083,7 @@ static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
-    uint32_t y, x;
+    uint32_t y, x, b[4];
 
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
@@ -1097,17 +1097,19 @@ static void clear_surface(uint32_t param)
             return;
         s_gpu.color_base = base;
     }
+    /* The clip, bounded by SET_CLEAR_RECT (nv2a_clear_box), as the GPU
+     * backends clear: Burnout 3 clears 159x344 regions of its back buffer. */
+    if (!nv2a_clear_box(&s_gpu, s_gpu.clip_x + s_gpu.clip_w, s_gpu.clip_y + s_gpu.clip_h, b))
+        b[0] = b[1] = b[2] = b[3] = 0;   /* nothing to fill; still a clear */
 
-    for (y = 0; y < s_gpu.clip_h; y++) {
-        uint8_t *row = mem + s_gpu.color_base
-                     + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+    for (y = b[1]; y < b[3]; y++) {
+        uint8_t *row = mem + s_gpu.color_base + (size_t)y * s_gpu.pitch;
         if (surface_swizzled()) {
             /* A clear of part of a swizzled target has to find each pixel;
              * a whole-surface clear lands the same either way. */
             uint8_t *base = mem + s_gpu.color_base;
-            for (x = 0; x < s_gpu.clip_w; x++) {
-                long i = surface_swizzle_index((int)(s_gpu.clip_x + x),
-                                               (int)(s_gpu.clip_y + y));
+            for (x = b[0]; x < b[2]; x++) {
+                long i = surface_swizzle_index((int)x, (int)y);
                 if (i < 0)
                     continue;
                 if (bpp == 4)
@@ -1121,8 +1123,8 @@ static void clear_surface(uint32_t param)
             continue;
         }
         if (bpp == 4) {
-            uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
-            for (x = 0; x < s_gpu.clip_w; x++)
+            uint32_t *p = (uint32_t *)row;
+            for (x = b[0]; x < b[2]; x++)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
             /* The clear value is always given as A8R8G8B8; a 16-bit surface
@@ -1130,8 +1132,8 @@ static void clear_surface(uint32_t param)
             uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
                                   | ((s_gpu.clear_color >> 5) & 0x07E0)
                                   | ((s_gpu.clear_color >> 3) & 0x001F));
-            uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
-            for (x = 0; x < s_gpu.clip_w; x++)
+            uint16_t *p = (uint16_t *)row;
+            for (x = b[0]; x < b[2]; x++)
                 p[x] = v;
         }
     }

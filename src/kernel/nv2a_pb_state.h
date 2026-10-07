@@ -129,8 +129,9 @@ struct nv2a_pb_gpu {
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
     /* SET_CLEAR_RECT_HORIZONTAL/VERTICAL: (max << 16) | min, both inclusive,
-     * as xemu reads them; clear_rect_set is 0 until the title sends one. The
-     * CPU clear still fills the surface clip; D3D11 bounds its clear by both. */
+     * as xemu reads them; clear_rect_set is 0 until the title sends one.
+     * Every path bounds a colour clear by the clip and this rect
+     * (nv2a_clear_box). */
     uint32_t clear_rect_h, clear_rect_v;
     int      clear_rect_set;
     uint32_t clears, unhandled_total;

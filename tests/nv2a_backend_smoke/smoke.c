@@ -19,6 +19,12 @@
  * flip, so it needs its own process): a read of the present surface after a
  * lazy flip switches the run to writing back at every flip.
  *
+ * Then the clip extents (metal-present-mirror, D3D11's clip_cases), each on
+ * the CPU path and on Metal, the whole frame compared: a clear bounded by its
+ * clip, one bounded by SET_CLEAR_RECT, a target grown from 320x240 to
+ * 640x480 (contents kept, margin seeded from the guest bytes, at scale 1 and
+ * 2), and a flip of a grown target showing only the 320x240 frame.
+ *
  * Then render-target ownership (rt-stale-alias, Metal): a target the title
  * rewrote from the CPU samples the new texels and is not written back; one
  * left alone still samples its rendered image; a new target overlapping a
@@ -75,6 +81,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 const struct nv2a_pb_backend *nv2a_pb_metal_backend(void);
 uint64_t nv2a_pb_metal_writebacks(void);
 const uint8_t *nv2a_pb_metal_host_pixels(uint32_t offset, uint32_t *hw, uint32_t *hh);
+int nv2a_pb_metal_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
+                        uint32_t *sw, uint32_t *sh);
 #endif
 
 /* The kernel library expects these from the title's generated code. */
@@ -89,6 +97,8 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define BUF0      0x01000000u
 #define BUF1      0x0112C000u
 #define BUF2      0x01258000u   /* the render.scale 2 case: a new target */
+#define BUF3      0x01600000u   /* clip_cases' grow: clear of every other buffer */
+#define BUF4      0x01740000u   /* and its render.scale 2 twin */
 #define TEX_GUEST 0x02800000u   /* 64x64 swizzled A8R8G8B8, then YUY2 64x32 */
 #define RTT0      0x01400000u   /* 64x64 render-to-texture targets, pitch 256 */
 #define RTT1      0x01500000u
@@ -604,6 +614,194 @@ static int alias_cases(const struct nv2a_pb_backend *b)
     return f;
 }
 
+/* ---- clip extents (metal-present-mirror) ------------------------------------ */
+
+#define PATTERN 0xFFFF00FFu
+
+/* A 32-bit surface at buf with a w x h clip and the 640-pixel pitch every
+ * clip case keeps (another pitch is another surface). */
+static void surf_clip(uint32_t buf, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    M(0x0200, (w << 16) | x);
+    M(0x0204, (h << 16) | y);
+    M(0x0208, 0x00000128u);
+    M(0x020C, W * 4u);
+    M(0x0210, buf);
+    M(0x0214, 0x02400000u);
+    M(0x0304, 0);
+    M(0x1B0C, 0);
+}
+
+static void clear_to(uint32_t argb)
+{
+    M(0x1D90, argb);
+    M(0x1D94, 0xF0);
+}
+
+/* SET_CLEAR_RECT (x0, y0)-(x1, y1), both inclusive. */
+static void clear_rect(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+{
+    M(0x1D98, (x1 << 16) | x0);
+    M(0x1D9C, (y1 << 16) | y0);
+}
+
+enum { CC_CLIP, CC_RECT, CC_GROW, CC_GROW2 };
+
+static void clip_stream(int cc)
+{
+    switch (cc) {
+    case CC_CLIP:   /* red over 640x480, then a 160x120 clip at (100,100) blue */
+        surf_clip(BUF0, 0, 0, W, H);
+        clear_to(0xFFFF0000u);
+        surf_clip(BUF0, 100, 100, 160, 120);
+        clear_to(0xFF0000FFu);
+        break;
+    case CC_RECT:   /* red, then the whole clip with a clear rect, green */
+        surf_clip(BUF0, 0, 0, W, H);
+        clear_to(0xFFFF0000u);
+        clear_rect(300, 300, 339, 339);
+        clear_to(0xFF00FF00u);
+        clear_rect(0, 0, W - 1, H - 1);
+        break;
+    default: {      /* 320x240 red, then 640x480 with its lower right green */
+        uint32_t buf = cc == CC_GROW ? BUF3 : BUF4;
+        surf_clip(buf, 0, 0, 320, 240);
+        clear_to(0xFFFF0000u);
+        surf_clip(buf, 0, 0, W, H);
+        clear_rect(320, 240, W - 1, H - 1);
+        clear_to(0xFF00FF00u);
+        clear_rect(0, 0, W - 1, H - 1);
+        break;
+    }
+    }
+}
+
+static void fill(uint32_t buf, uint32_t argb)
+{
+    uint32_t *g = (uint32_t *)guest(buf), i;
+    for (i = 0; i < W * H; i++)
+        g[i] = argb;
+}
+
+/* The pixels each clip case must show, on both paths. */
+static const struct probe s_clip_probe[4][4] = {
+    {{50, 50, 0xFFFF0000u}, {150, 150, 0xFF0000FFu}, {300, 300, 0xFFFF0000u}, {0}},
+    {{320, 320, 0xFF00FF00u}, {350, 350, 0xFFFF0000u}, {299, 320, 0xFFFF0000u}, {0}},
+    {{100, 100, 0xFFFF0000u}, {400, 300, 0xFF00FF00u}, {400, 100, PATTERN}, {100, 300, PATTERN}},
+    {{100, 100, 0xFFFF0000u}, {400, 300, 0xFF00FF00u}, {400, 100, PATTERN}, {100, 300, PATTERN}},
+};
+static const char *const s_clip_name[4] = {"clip clear", "clear rect", "grow", "grow x2"};
+
+static int clip_probes(int cc, const char *path, const uint32_t *px)
+{
+    int k, ok = 1;
+    for (k = 0; k < 4 && s_clip_probe[cc][k].argb; k++) {
+        const struct probe *p = &s_clip_probe[cc][k];
+        uint32_t got = px[p->y * W + p->x] | 0xFF000000u;
+        int hit = got == p->argb;
+        fprintf(stderr, "[backend-smoke] %-10s %s pixel (%u,%u) 0x%08X want 0x%08X %s\n",
+                s_clip_name[cc], path, p->x, p->y, got, p->argb, hit ? "PASS" : "FAIL");
+        ok &= hit;
+    }
+    return ok;
+}
+
+/* Each case's stream on the CPU path (guest memory) and on Metal (its host
+ * pixels, box-filtered at scale 2; no flip, so nothing is written back),
+ * compared whole. The grow cases' guest bytes are the pattern before each
+ * run, so Metal's seed reads the pattern, not the CPU frame. Then the crop.
+ * Returns the failures. */
+static int clip_cases(const struct nv2a_pb_backend *b, uint32_t *cpu, uint32_t *gpu)
+{
+    uint32_t tw = 0, th = 0, sw = 0, sh = 0;
+    int cc, f = 0, k;
+
+    for (cc = CC_CLIP; cc <= CC_GROW2; cc++) {
+        uint32_t buf = cc == CC_GROW ? BUF3 : cc == CC_GROW2 ? BUF4 : BUF0;
+        const uint8_t *hp;
+        uint32_t hw = 0, hh = 0;
+        unsigned n = cc == CC_GROW2 ? 2u : 1u;
+        int ok;
+
+        fill(buf, PATTERN);
+        nv2a_pb_set_backend(nv2a_pb_cpu_backend());
+        clip_stream(cc);
+        memcpy(cpu, guest(buf), W * H * 4);
+        fill(buf, PATTERN);
+        nv2a_pb_set_backend(b);
+        if (n > 1) {
+            struct nv2a_host_opts o;
+            memset(&o, 0, sizeof o);
+            o.render_scale = n;
+            nv2a_host_opts_set(&o);
+        }
+        clip_stream(cc);
+        if (n > 1) {
+            struct nv2a_host_opts o;
+            memset(&o, 0, sizeof o);
+            nv2a_host_opts_set(&o);
+        }
+        hp = nv2a_pb_metal_host_pixels(buf, &hw, &hh);
+        ok = hp && hw == W * n && hh == H * n;
+        if (ok && n == 1)
+            memcpy(gpu, hp, W * H * 4);
+        else if (ok)
+            nv2a_downscale_box32(hp, hw * 4u, W, H, n, (uint8_t *)gpu, W * 4u);
+        if (!ok) {
+            fprintf(stderr, "[backend-smoke] %s: Metal target %ux%u (want %ux%u) FAIL\n",
+                    s_clip_name[cc], hw, hh, W * n, H * n);
+            f++;
+            continue;
+        }
+        ok = compare(s_clip_name[cc], cpu, gpu);
+        ok &= clip_probes(cc, "cpu", cpu);
+        ok &= clip_probes(cc, "gpu", gpu);
+        if (!nv2a_pb_metal_shown(buf, &tw, &th, &sw, &sh) || tw != W || th != H) {
+            fprintf(stderr, "[backend-smoke] %s: one target of %ux%u (want %ux%u) FAIL\n",
+                    s_clip_name[cc], tw, th, W, H);
+            ok = 0;
+        }
+        f += !ok;
+    }
+
+    /* The frame is 320x240 of BUF0's 640x480 target: the flip shows
+     * 320x240. The walker presents the largest fresh surface, so the 640x480
+     * entries must first go stale: more than PRESENT_STALE_FLIPS (120)
+     * flips drawing only the 320x240 clip. The walker counts a flip at
+     * FLIP_INCREMENT_WRITE, as the XDK's swap pushes it, not at FLIP_STALL
+     * alone. Metal first (the CPU path's clears would rewrite BUF0 and make
+     * Metal's target stale), then the CPU path, whose present state is the
+     * cross-check. */
+    for (k = 0; k < 2; k++) {
+        const struct nv2a_pb_present *p;
+        int i;
+        nv2a_pb_set_backend(k ? nv2a_pb_cpu_backend() : b);
+        surf_clip(BUF0, 0, 0, 320, 240);
+        for (i = 0; i < 122; i++) {
+            clear_to(0xFF000000u);
+            M(0x012C, 0);                       /* FLIP_INCREMENT_WRITE */
+            M(0x0130, 0);                       /* FLIP_STALL */
+        }
+        p = nv2a_pb_present_state();
+        if (k) {
+            int ok = p->offset == BUF0 && p->w == 320 && p->h == 240;
+            fprintf(stderr, "[backend-smoke] crop: cpu present 0x%08X %ux%u (want 0x%08X"
+                    " 320x240) %s\n", p->offset, p->w, p->h, BUF0, ok ? "PASS" : "FAIL");
+            f += !ok;
+        } else if (!nv2a_pb_metal_shown(BUF0, &tw, &th, &sw, &sh) || tw != W || th != H
+                   || sw != 320 || sh != 240) {
+            fprintf(stderr, "[backend-smoke] crop: target %ux%u, shown %ux%u (want 640x480,"
+                    " 320x240) FAIL\n", tw, th, sw, sh);
+            f++;
+        } else {
+            fprintf(stderr, "[backend-smoke] crop: target 640x480, shown 320x240 PASS\n");
+        }
+    }
+    surf_clip(BUF0, 0, 0, W, H);
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+
 /* metal_fb_guard: the surface is PROT_NONE after a lazy flip; a read faults,
  * the next flip reports it and switches to always, and the flip after that
  * writes back. Returns the failures. */
@@ -807,6 +1005,12 @@ int main(int argc, char **argv)
     }
     nv2a_pb_set_backend(NULL);
 #ifdef __APPLE__
+    if (gpu == nv2a_pb_metal_backend()) {
+        int f = clip_cases(gpu, cpu_px, gpu_px);
+        if (f)
+            fprintf(stderr, "[backend-smoke] FAIL: %d clip-extent cases\n", f);
+        failures += f;
+    }
     if (gpu == nv2a_pb_metal_backend() && run(nv2a_pb_cpu_backend(), SC_CLEAR_QUAD, cpu_px, 0)) {
         int f = writeback_cases(gpu, cpu_px, gpu_px);
         if (f)

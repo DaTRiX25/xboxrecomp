@@ -945,39 +945,18 @@ static void d3d11_on_zclear(uint32_t param)
         s_zclears++;
 }
 
-/* What a colour clear covers, in guest pixels: the surface clip (what the CPU
- * path fills), bounded by the clear rect once the title has set one (inclusive
- * max, as xemu reads it). Since one target serves every clip of a surface
- * (rt_grow), a whole-target clear would wipe the parts of the frame another
- * clip drew: Burnout 3 clears 159x344 regions of its 640x480 back buffer. */
-static int clear_box(const RenderTarget *rt, const struct nv2a_pb_gpu *g,
-                     UINT *x0, UINT *y0, UINT *x1, UINT *y1)
-{
-    UINT ax = g->clip_x, ay = g->clip_y;
-    UINT bx = g->clip_x + g->clip_w, by = g->clip_y + g->clip_h;
-    if (g->clear_rect_set) {
-        UINT rx0 = g->clear_rect_h & 0xFFFFu, rx1 = (g->clear_rect_h >> 16) + 1u;
-        UINT ry0 = g->clear_rect_v & 0xFFFFu, ry1 = (g->clear_rect_v >> 16) + 1u;
-        if (rx0 > ax) ax = rx0;
-        if (ry0 > ay) ay = ry0;
-        if (rx1 < bx) bx = rx1;
-        if (ry1 < by) by = ry1;
-    }
-    if (bx > rt->w) bx = rt->w;
-    if (by > rt->h) by = rt->h;
-    if (ax >= bx || ay >= by)
-        return 0;
-    *x0 = ax; *y0 = ay; *x1 = bx; *y1 = by;
-    return 1;
-}
-
 static void clear_region(RenderTarget *rt, const struct nv2a_pb_gpu *g, const float c[4])
 {
+    uint32_t b[4];
     UINT x0, y0, x1, y1;
     D3D11_RECT r;
 
-    if (!clear_box(rt, g, &x0, &y0, &x1, &y1))
+    /* The clip and clear rect (nv2a_clear_box): one target serves every
+     * clip of its surface (rt_grow), so a whole-target clear would wipe the
+     * parts of the frame another clip drew. */
+    if (!nv2a_clear_box(g, rt->w, rt->h, b))
         return;
+    x0 = b[0]; y0 = b[1]; x1 = b[2]; y1 = b[3];
     if ((x0 == 0 && y0 == 0 && x1 == rt->w && y1 == rt->h) || !s_ctx1) {
         static int said;
         if (!s_ctx1 && !said++ && !(x0 == 0 && y0 == 0 && x1 == rt->w && y1 == rt->h))
