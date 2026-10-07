@@ -267,6 +267,7 @@ void nv2a_pb_exec_idx_stats(uint32_t *max, uint32_t *overflowed, uint32_t *over_
     if (overflowed) *overflowed = s_idx_overflow;
     if (over_ffff) *over_ffff = s_idx_over_ffff;
 }
+
 static uint32_t s_sema_releases;
 static uint32_t s_sema_last_va, s_sema_last_value;
 

@@ -743,13 +743,20 @@ int main(int argc, char **argv)
         fprintf(stderr, "[backend-smoke] FAIL: guest memory init\n");
         return 1;
     }
+    /* The index limit is the walker's alone (CPU path), so it runs before
+     * the backend check: a host without a GPU backend still checks it. */
+    if (!guard && !noalias && overflow_case()) {
+        fprintf(stderr, "[backend-smoke] FAIL: index limit\n");
+        failures++;
+    }
 #ifdef __APPLE__
     if (!strcasecmp(which, "metal"))
         gpu = nv2a_pb_metal_backend();
 #endif
     if (!gpu) {
-        fprintf(stderr, "[backend-smoke] no backend '%s' on this host: skipped\n", which);
-        return 77;
+        fprintf(stderr, "[backend-smoke] no backend '%s' on this host: GPU scenes"
+                " skipped\n", which);
+        return failures ? 1 : 77;
     }
     cpu_px = (uint32_t *)malloc(W * H * 4);
     gpu_px = (uint32_t *)malloc(W * H * 4);
@@ -797,10 +804,6 @@ int main(int argc, char **argv)
             if (!same || !pc || !pg)
                 failures++;
         }
-    }
-    if (overflow_case()) {
-        fprintf(stderr, "[backend-smoke] FAIL: index limit\n");
-        failures++;
     }
     nv2a_pb_set_backend(NULL);
 #ifdef __APPLE__
