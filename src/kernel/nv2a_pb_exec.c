@@ -169,6 +169,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_SURFACE_PITCH           0x020C
 #define NV097_SET_SURFACE_COLOR_OFFSET    0x0210
 #define NV097_SET_COLOR_CLEAR_VALUE       0x1D90
+#define NV097_SET_CLEAR_RECT_HORIZONTAL   0x1D98
+#define NV097_SET_CLEAR_RECT_VERTICAL     0x1D9C
 #define NV097_CLEAR_SURFACE               0x1D94
 #define NV097_SET_VERTEX_DATA_ARRAY_OFFSET 0x1720   /* +i*4, 16 attributes */
 #define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760   /* +i*4 */
@@ -5645,6 +5647,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
         s_gpu.clear_color = param;
+        break;
+    case NV097_SET_CLEAR_RECT_HORIZONTAL:
+        s_gpu.clear_rect_h = param;
+        s_gpu.clear_rect_set = 1;
+        break;
+    case NV097_SET_CLEAR_RECT_VERTICAL:
+        s_gpu.clear_rect_v = param;
+        s_gpu.clear_rect_set = 1;
         break;
     case NV097_SET_BLEND_ENABLE:
         s_gpu.blend_enable = param;

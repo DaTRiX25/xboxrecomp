@@ -32,6 +32,7 @@
 #include "recomp_env.h"
 #include "recomp_exit_hook.h"
 #include <d3d11.h>
+#include <d3d11_1.h>   /* ID3D11DeviceContext1::ClearView, for a partial clear */
 #include <dxgi.h>
 #include <d3dcompiler.h>
 #include <stdint.h>
@@ -73,6 +74,7 @@ static struct xbox_title_clock s_title_clock;
 static UINT                    s_sync_interval;
 static ID3D11Device           *s_dev;
 static ID3D11DeviceContext    *s_ctx;
+static ID3D11DeviceContext1   *s_ctx1;   /* NULL below D3D 11.1: partial clears clear it all */
 static IDXGISwapChain         *s_swap;
 static ID3D11Texture2D        *s_back;
 static UINT                    s_back_w, s_back_h;
@@ -491,6 +493,9 @@ static int init(void)
         return 0;
     }
     IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&s_back);
+    if (FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1,
+                                                  (void **)&s_ctx1)))
+        s_ctx1 = NULL;
     s_back_w = s_made_w = bw;
     s_back_h = s_made_h = bh;
 
@@ -608,7 +613,8 @@ static int rt_drop_if_stale(RenderTarget *rt, const char *why)
 }
 
 /* rt made w x h (guest pixels), what it holds kept at its top left. The new
- * area starts black: this backend has no guest bytes behind it to seed. */
+ * area starts black: the guest bytes are there, but this backend never seeds
+ * a target from guest memory (the title clears or draws it first). */
 static int rt_grow(RenderTarget *rt, UINT w, UINT h)
 {
     static const float black[4] = {0, 0, 0, 0};
@@ -697,7 +703,11 @@ static RenderTarget *surface(void)
      * overlap rule below dropped each in turn (this backend writes nothing
      * back), and the flip found no target of the frame's size: a black
      * title screen and a frozen race. Draws map guest pixels to NDC through
-     * rt->w/h, so a larger target keeps every position. */
+     * rt->w/h, so a larger target keeps every position. What that asks of
+     * the rest: a clear covers only its clip and clear rect (clear_region),
+     * and a flip shows only the frame's extent (present_extent). Another
+     * pitch at the same offset is a new allocation, not another clip: it
+     * gets a target of its own and the overlap rule retires this one. */
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (!rt->tex || rt->offset != g->color_offset || rt->pitch != g->pitch)
@@ -935,6 +945,55 @@ static void d3d11_on_zclear(uint32_t param)
         s_zclears++;
 }
 
+/* What a colour clear covers, in guest pixels: the surface clip (what the CPU
+ * path fills), bounded by the clear rect once the title has set one (inclusive
+ * max, as xemu reads it). Since one target serves every clip of a surface
+ * (rt_grow), a whole-target clear would wipe the parts of the frame another
+ * clip drew: Burnout 3 clears 159x344 regions of its 640x480 back buffer. */
+static int clear_box(const RenderTarget *rt, const struct nv2a_pb_gpu *g,
+                     UINT *x0, UINT *y0, UINT *x1, UINT *y1)
+{
+    UINT ax = g->clip_x, ay = g->clip_y;
+    UINT bx = g->clip_x + g->clip_w, by = g->clip_y + g->clip_h;
+    if (g->clear_rect_set) {
+        UINT rx0 = g->clear_rect_h & 0xFFFFu, rx1 = (g->clear_rect_h >> 16) + 1u;
+        UINT ry0 = g->clear_rect_v & 0xFFFFu, ry1 = (g->clear_rect_v >> 16) + 1u;
+        if (rx0 > ax) ax = rx0;
+        if (ry0 > ay) ay = ry0;
+        if (rx1 < bx) bx = rx1;
+        if (ry1 < by) by = ry1;
+    }
+    if (bx > rt->w) bx = rt->w;
+    if (by > rt->h) by = rt->h;
+    if (ax >= bx || ay >= by)
+        return 0;
+    *x0 = ax; *y0 = ay; *x1 = bx; *y1 = by;
+    return 1;
+}
+
+static void clear_region(RenderTarget *rt, const struct nv2a_pb_gpu *g, const float c[4])
+{
+    UINT x0, y0, x1, y1;
+    D3D11_RECT r;
+
+    if (!clear_box(rt, g, &x0, &y0, &x1, &y1))
+        return;
+    if ((x0 == 0 && y0 == 0 && x1 == rt->w && y1 == rt->h) || !s_ctx1) {
+        static int said;
+        if (!s_ctx1 && !said++ && !(x0 == 0 && y0 == 0 && x1 == rt->w && y1 == rt->h))
+            fprintf(stderr, LOGP "no D3D 11.1 context: a partial clear clears the"
+                    " whole target\n");
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
+        return;
+    }
+    /* Host pixels: the target is rt->hw x rt->hh for rt->w x rt->h. */
+    r.left = (LONG)((uint64_t)x0 * rt->hw / rt->w);
+    r.top = (LONG)((uint64_t)y0 * rt->hh / rt->h);
+    r.right = (LONG)((uint64_t)x1 * rt->hw / rt->w);
+    r.bottom = (LONG)((uint64_t)y1 * rt->hh / rt->h);
+    ID3D11DeviceContext1_ClearView(s_ctx1, (ID3D11View *)rt->rtv, c, &r, 1);
+}
+
 static void d3d11_on_clear(uint32_t param)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -950,7 +1009,7 @@ static void d3d11_on_clear(uint32_t param)
     c[1] = (float)((g->clear_color >> 8) & 0xFF) / 255.0f;
     c[2] = (float)(g->clear_color & 0xFF) / 255.0f;
     c[3] = (float)(g->clear_color >> 24) / 255.0f;
-    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
+    clear_region(rt, g, c);
     rt->last_clear = ++s_seq;
     s_clears++;
 }
@@ -3132,10 +3191,12 @@ static void flip_log(uint32_t surface_offset)
  * full-screen triangle. */
 static const char s_blit_vs_src[] =
     "struct VO { float4 p : SV_Position; float2 t : TEXCOORD0; };\n"
+    "cbuffer C : register(b0) { float4 uv_scale; };\n"
     "VO main(uint i : SV_VertexID) {\n"
     "    VO o;\n"
     "    o.t = float2((i << 1) & 2, i & 2);\n"
     "    o.p = float4(o.t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+    "    o.t *= uv_scale.xy;\n"
     "    return o;\n"
     "}\n";
 static const char s_blit_ps_src[] =
@@ -3146,6 +3207,7 @@ static const char s_blit_ps_src[] =
 static ID3D11VertexShader *s_blit_vs;
 static ID3D11PixelShader  *s_blit_ps;
 static ID3D11SamplerState *s_blit_smp[2];   /* point, linear */
+static ID3D11Buffer       *s_blit_cb;       /* b0: the share of the target shown */
 static int                 s_blit_failed;
 
 static int blit_init(void)
@@ -3176,7 +3238,8 @@ static int blit_init(void)
         if (!s_blit_smp[k])
             return 0;
     }
-    if (!s_blit_ps)
+    s_blit_cb = make_buffer(16, D3D11_BIND_CONSTANT_BUFFER);
+    if (!s_blit_ps || !s_blit_cb)
         return 0;
     s_blit_failed = 0;
     return 1;
@@ -3213,13 +3276,30 @@ static void present_resize(void)
     fprintf(stderr, LOGP "window resized: swap chain %ux%u\n", s_back_w, s_back_h);
 }
 
-/* rt into the back buffer at nv2a_present_rect's place, filtered. */
+/* The part of rt a flip shows, in guest pixels: the walker's present extent
+ * when it names this surface. A target grown for a larger clip (rt_grow) can
+ * be bigger than the frame; the rest of it, and its black grow margin, is not
+ * the frame. */
+static void present_extent(const RenderTarget *rt, UINT *w, UINT *h)
+{
+    const struct nv2a_pb_present *p = nv2a_pb_present_state();
+    *w = rt->w;
+    *h = rt->h;
+    if (p->offset && p->offset == rt->offset && p->w && p->h) {
+        if (p->w < *w) *w = p->w;
+        if (p->h < *h) *h = p->h;
+    }
+}
+
+/* rt's present extent into the back buffer at nv2a_present_rect's place,
+ * filtered. */
 static void present_blit(RenderTarget *rt, int filter)
 {
     static const float black[4] = {0, 0, 0, 1};
     ID3D11ShaderResourceView *none = NULL;
     struct nv2a_rect r;
     D3D11_VIEWPORT vp;
+    UINT cw, ch, hcw, hch;
     int whole;
 
     if (!s_back || !blit_init())
@@ -3230,7 +3310,19 @@ static void present_blit(RenderTarget *rt, int filter)
     if (!rt->srv && FAILED(ID3D11Device_CreateShaderResourceView(
                 s_dev, (ID3D11Resource *)rt->tex, NULL, &rt->srv)))
         return;
-    whole = nv2a_present_rect(rt->hw, rt->hh, s_back_w, s_back_h, filter, &r);
+    present_extent(rt, &cw, &ch);
+    hcw = (UINT)((uint64_t)cw * rt->hw / rt->w);
+    hch = (UINT)((uint64_t)ch * rt->hh / rt->h);
+    whole = nv2a_present_rect(hcw, hch, s_back_w, s_back_h, filter, &r);
+    {
+        D3D11_MAPPED_SUBRESOURCE m;
+        float uv[4] = {(float)cw / (float)rt->w, (float)ch / (float)rt->h, 0, 0};
+        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
+                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            return;
+        memcpy(m.pData, uv, sizeof uv);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
+    }
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
     vp.TopLeftX = (float)r.x;
@@ -3246,6 +3338,7 @@ static void present_blit(RenderTarget *rt, int filter)
     ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
     /* Point for nearest and whole multiples; linear for linear and for an
@@ -3258,6 +3351,8 @@ static void present_blit(RenderTarget *rt, int filter)
     /* Every binding above went behind the draw path's state shadow. */
     s_sc_init = 0;
 }
+
+static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
 
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
@@ -3285,7 +3380,13 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                  && eo->present_filter == NV2A_PRESENT_NEAREST
                  && !eo->fullscreen
                  && s_back_w == s_made_w && s_back_h == s_made_h;
-        int same = s_drawn->hw == s_back_w && s_drawn->hh == s_back_h;
+        UINT cw, ch;
+        int same;
+        present_extent(s_drawn, &cw, &ch);
+        s_shown_w = cw;
+        s_shown_h = ch;
+        same = cw == s_drawn->w && ch == s_drawn->h
+            && s_drawn->hw == s_back_w && s_drawn->hh == s_back_h;
         int blit = !stock && !(same && eo->present_filter != NV2A_PRESENT_LINEAR);
         if (!s_back) {
             /* A failed ResizeBuffers/GetBuffer left no back buffer. */
@@ -3303,8 +3404,8 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
             b.left = 0;
             b.top = 0;
             b.front = 0;
-            b.right = s_drawn->w < s_back_w ? s_drawn->w : s_back_w;
-            b.bottom = s_drawn->h < s_back_h ? s_drawn->h : s_back_h;
+            b.right = cw < s_back_w ? cw : s_back_w;
+            b.bottom = ch < s_back_h ? ch : s_back_h;
             b.back = 1;
             ID3D11DeviceContext_CopySubresourceRegion(
                 s_ctx, (ID3D11Resource *)s_back, 0, 0, 0, 0,
@@ -3503,6 +3604,23 @@ static const struct nv2a_pb_backend s_d3d11_backend = {
     d3d11_on_report,
     d3d11_on_poll,
 };
+
+/* For tests/d3d11_backend_smoke: the size of the target at a colour offset
+ * and the part of it the last flip showed, 0 when there is none. */
+int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
+                        uint32_t *sw, uint32_t *sh)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex && s_rt[i].offset == offset) {
+            *tw = s_rt[i].w;
+            *th = s_rt[i].h;
+            *sw = s_shown_w;
+            *sh = s_shown_h;
+            return 1;
+        }
+    return 0;
+}
 
 /* For tests/d3d11_backend_smoke: the pixel at guest (x, y) of the target
  * at a colour offset, 0xAARRGGBB, or 0xDEADBEEF when there is none. */

@@ -35,6 +35,8 @@
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 uint32_t nv2a_pb_d3d11_pixel(uint32_t offset, int x, int y);
+int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
+                        uint32_t *sw, uint32_t *sh);
 
 /* The kernel library expects these from the title's generated code. */
 void *recomp_lookup(ULONG address) { (void)address; abort(); }
@@ -355,6 +357,72 @@ static int index_cases(const uint32_t *buf)
         M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
     M(0x0210, buf[1]);
     M(0x0130, 0);
+    return f;
+}
+
+/* One back buffer drawn under two clip extents in a frame (Burnout 3's
+ * 640x480 buffer with 159x344 and smaller clips): one target, grown to the
+ * largest; a clear bounded by its clip and clear rect leaves the rest; and a
+ * flip whose frame is smaller than the target shows only the frame. Returns
+ * the failures. */
+static int clip_cases(const uint32_t *buf)
+{
+    uint32_t c[4], tw = 0, th = 0, sw = 0, sh = 0;
+    int f = 0, k;
+
+    /* Red over the whole 640x480, then a 160x120 clip at (100,100) cleared
+     * blue: only the clip turns blue. */
+    surf_clear(buf[0], 640, 480, 0xFFFF0000u);
+    M(0x0200, (160u << 16) | 100u);
+    M(0x0204, (120u << 16) | 100u);
+    M(0x1D90, 0xFF0000FFu);
+    M(0x1D94, 0xF0);
+    /* The whole clip again, with a clear rect of (300,300)-(339,339): green
+     * there and nowhere else. */
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
+    M(0x1D98, (339u << 16) | 300u);
+    M(0x1D9C, (339u << 16) | 300u);
+    M(0x1D90, 0xFF00FF00u);
+    M(0x1D94, 0xF0);
+    M(0x1D98, (639u << 16) | 0u);   /* back to the whole surface */
+    M(0x1D9C, (479u << 16) | 0u);
+    c[0] = nv2a_pb_d3d11_pixel(buf[0], 50, 50);      /* red: outside both */
+    c[1] = nv2a_pb_d3d11_pixel(buf[0], 150, 150);    /* blue: inside the clip */
+    c[2] = nv2a_pb_d3d11_pixel(buf[0], 320, 320);    /* green: the clear rect */
+    c[3] = nv2a_pb_d3d11_pixel(buf[0], 350, 350);    /* red: past it */
+    {
+        static const uint32_t want[4] = {0xFFFF0000u, 0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u};
+        for (k = 0; k < 4; k++) {
+            fprintf(stderr, "[backend-smoke] clip clear %d: 0x%08X (want 0x%08X) %s\n", k,
+                    c[k], want[k], c[k] == want[k] ? "PASS" : "FAIL");
+            f += c[k] != want[k];
+        }
+    }
+    /* The frame is 320x240 of that grown target: the flip shows 320x240.
+     * The walker presents the largest fresh surface, so the 640x480 entries
+     * (this clip's and the frames' above) must first go stale: more than
+     * PRESENT_STALE_FLIPS (120) flips drawing only the 320x240 clip. The
+     * walker counts a flip at FLIP_INCREMENT_WRITE, as the XDK's swap
+     * pushes it, not at FLIP_STALL alone. */
+    M(0x0200, 320u << 16);
+    M(0x0204, 240u << 16);
+    for (k = 0; k < 122; k++) {
+        M(0x1D90, 0xFF000000u);
+        M(0x1D94, 0xF0);
+        M(0x012C, 0);                       /* FLIP_INCREMENT_WRITE */
+        M(0x0130, 0);
+    }
+    if (!nv2a_pb_d3d11_shown(buf[0], &tw, &th, &sw, &sh) || tw != 640 || th != 480
+            || sw != 320 || sh != 240) {
+        fprintf(stderr, "[backend-smoke] crop: target %ux%u, shown %ux%u (want 640x480,"
+                " 320x240) FAIL\n", tw, th, sw, sh);
+        f++;
+    } else {
+        fprintf(stderr, "[backend-smoke] crop: target 640x480, shown 320x240 PASS\n");
+    }
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
     return f;
 }
 
@@ -873,6 +941,10 @@ int main(int argc, char **argv)
                     " ran\n");
             return 2;
         }
+    }
+    if (clip_cases(buf)) {
+        fprintf(stderr, "[backend-smoke] FAIL: clip extents (clear, present crop)\n");
+        return 5;
     }
     if (alias_cases(buf)) {
         fprintf(stderr, "[backend-smoke] FAIL: render-target ownership\n");
