@@ -167,3 +167,33 @@ def test_split_translation_declares_and_dispatches_wrapper():
     assert "(recomp_func_t)sub_001E9100 }" in dispatch
     assert "sub_001E9100_gen }" not in dispatch
     assert stats["unresolved_stubs"] == 0
+
+
+def test_wrapped_tail_jump_names_the_wrapper():
+    lifter = Lifter(
+        func_db={TARGET: {"name": "sub_001E9100_gen"}}, wrapped_functions={TARGET})
+    lifter.func_start = 0x00120000
+    lifter.func_end = 0x00120100
+
+    generated = "\n".join(lifter.lift_instruction(_tail_jump()))
+
+    assert "sub_001E9100(); return;" in generated
+    assert "sub_001E9100_gen" not in generated
+
+
+def test_wrapped_guarded_icall_arm_names_the_wrapper():
+    # A recorded indirect-call site whose one target is wrapped: the guarded
+    # arm calls the wrapper, and the fallback still reaches it through the
+    # dispatch table (which test_split_translation_declares_and_dispatches_wrapper
+    # covers).
+    from tools.recomp import test_icall_guarded as g
+    from tools.recomp.translator import FunctionTranslator
+
+    img, db = g._image(), g._db()
+    db[g.A]["name"] = f"sub_{g.A:08X}_gen"
+    tr = FunctionTranslator(img, db, icall_sites={g.SITE: [g.A]})
+    tr.lifter.wrapped_functions = {g.A}
+    c = tr.translate_function(g.BASE, db[g.BASE])
+
+    assert f"RECOMP_ABI_CALL(0x{g.A:08X}u, sub_{g.A:08X}); }}" in c, c
+    assert f"sub_{g.A:08X}_gen" not in c, c
