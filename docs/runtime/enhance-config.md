@@ -114,6 +114,8 @@ the stock settings.
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
 | `fps.mode` | string | `"lock30"` (stock), `"lock60"`, `"free"` | `"lock30"` | the game's `RECOMP_FPS_MODE` |
+| `fx.glow` | string | `"on"` (stock), `"off"` (BLiNX 2: its post-mode-3 glow pass) | `"on"` | the game's `RECOMP_GLOW` |
+| `fx.glow_intensity` | float | `0.0` to `2.0`, a scale of that glow layer (BLiNX 2) | `1.0` | the game's `RECOMP_GLOW_INTENSITY` |
 | `aspect.program.<hash>` | string | `"hud"`, `"stretch"`, `"3d"`: a per-shader override of the aspect classifier | none | none |
 
 `fps.mode` belongs to the game. Each title implements it, and the title binds
@@ -121,6 +123,10 @@ the key to its own environment variable:
 `enhance_cfg_bind_env("fps.mode", RENV_FPS_MODE)`. A title that offers only
 some of the values reads the key all the same and says in one line which
 value it runs instead (BLiNX 2 runs `lock30` only).
+
+`fx.glow` and `fx.glow_intensity` are BLiNX 2's own keys, read and applied by
+the title the same way. They change only that game's glow pass and leave the
+toolkit's backends alone, so every backend sees the same guest values.
 
 The input-selection keys (`[input]`) will be added later, when that work is
 done.

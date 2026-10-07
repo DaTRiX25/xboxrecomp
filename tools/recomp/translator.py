@@ -2760,7 +2760,8 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False, manual=None):
+                              prefix="recomp", verbose=False, manual=None,
+                              wrapped=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -2777,6 +2778,11 @@ class BatchTranslator:
         is how a game replaces a recompiled XDK routine (a D3D8 entry point,
         say) with one that drives the host runtime instead of the hardware.
 
+        wrapped: addresses the project wraps. Their bodies are emitted under
+        their func_db name (sub_X_gen, set by the caller), while calls and the
+        dispatch entry name sub_X, the hand-written wrapper, which is declared
+        here like a manual function.
+
         Returns dict with stats and list of generated files.
         """
         import sys
@@ -2791,6 +2797,9 @@ class BatchTranslator:
         # the override only took effect through a function pointer, and
         # every direct caller silently reached the generated body.
         self.translator.lifter.manual_functions = manual
+        wrapped = set(wrapped or ())
+        self.translator.lifter.wrapped_functions = wrapped
+        wrapper_names = {a: f"sub_{a:08X}" for a in wrapped}
         manual_decls = {}
 
         # Translate all functions first, collecting results
@@ -2834,6 +2843,7 @@ class BatchTranslator:
         # translated chunks.
         defined = {name for _, name, _ in translations}
         defined |= set(manual_decls.values())   # hand-written, but defined
+        defined |= set(wrapper_names.values())  # likewise the wrappers
         unresolved = {
             addr: name
             for addr, name in self.translator.lifter.referenced_calls.items()
@@ -2879,6 +2889,14 @@ class BatchTranslator:
             for addr in sorted(manual_decls):
                 header_lines.append(
                     f"void {manual_decls[addr]}(void);  /* 0x{addr:08X} */")
+
+        if wrapper_names:
+            header_lines.append("")
+            header_lines.append("/* Hand-written wrappers (defined by the project;"
+                                " the body is sub_X_gen) */")
+            for addr in sorted(wrapper_names):
+                header_lines.append(
+                    f"void {wrapper_names[addr]}(void);  /* 0x{addr:08X} */")
 
         if unresolved:
             header_lines.append("")
@@ -3074,8 +3092,9 @@ class BatchTranslator:
         # Sorted by address: recomp_lookup binary-searches this array, so an
         # appended entry would silently break every lookup past it.
         dispatch_entries = sorted(
-            list(translations) + [(addr, name, None)
-                                  for addr, name in manual_decls.items()],
+            [(addr, wrapper_names.get(addr, name), code)
+             for addr, name, code in translations]
+            + [(addr, name, None) for addr, name in manual_decls.items()],
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
         self._write_dispatch_table(dispatch_entries, dispatch_path, header_name)

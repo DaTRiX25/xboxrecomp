@@ -1348,7 +1348,8 @@ class Lifter:
 
     def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
                  seh_prolog=None, seh_epilog=None,
-                 setjmp_fn=None, longjmp_fn=None, manual_functions=None):
+                 setjmp_fn=None, longjmp_fn=None, manual_functions=None,
+                 wrapped_functions=None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
@@ -1356,12 +1357,15 @@ class Lifter:
         xbe_data: raw XBE file bytes (for reading jump tables)
         seh_prolog/seh_epilog: override the detected __SEH_prolog/__SEH_epilog
         manual_functions: addresses replaced through recomp_lookup_manual
+        wrapped_functions: addresses the project wraps: it defines sub_X and
+            calls the generated body, emitted as sub_X_gen. Calls name sub_X.
         """
         self.func_db = func_db or {}
         self.label_db = label_db or {}
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
         self.manual_functions = set(manual_functions or ())
+        self.wrapped_functions = set(wrapped_functions or ())
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -1423,7 +1427,12 @@ class Lifter:
         function any naming pass had touched. Labels still cover call targets
         that are not known function starts.
         """
-        if addr in self.func_db:
+        if addr in self.wrapped_functions:
+            # The body is renamed sub_X_gen; every call, direct or guarded,
+            # must reach the project's wrapper, or the wrap only ever sees
+            # calls through a function pointer.
+            name = f"sub_{addr:08X}"
+        elif addr in self.func_db:
             name = self.func_db[addr].get("name", f"sub_{addr:08X}")
         elif addr in self.label_db:
             name = self.label_db[addr]

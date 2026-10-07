@@ -124,3 +124,46 @@ def test_split_translation_passes_manual_set_to_lifter():
             functions, output_dir, manual={TARGET})
 
     assert batch.translator.seen_manual == {TARGET}
+
+
+def test_wrapped_direct_call_names_the_wrapper():
+    # The body is renamed sub_X_gen in func_db; a direct call must still
+    # reach the project's sub_X, or the wrap never sees it.
+    lifter = Lifter(
+        func_db={TARGET: {"name": "sub_001E9100_gen"}}, wrapped_functions={TARGET})
+    generated = "\n".join(lifter.lift_instruction(_direct_call()))
+
+    assert "RECOMP_ABI_CALL(0x001E9100u, sub_001E9100);" in generated
+    assert "sub_001E9100_gen" not in generated
+
+
+def test_split_translation_declares_and_dispatches_wrapper():
+    class FakeTranslator:
+        def __init__(self):
+            self.owned_function_starts = set()
+            self.lifter = Lifter(func_db={TARGET: {"name": "sub_001E9100_gen"}})
+
+        def translate_function(self, addr, func_info):
+            if addr == 0x00120000:
+                self.lifter._call_target_name(TARGET)
+            return f"void {func_info['name']}(void) {{}}"
+
+    batch = BatchTranslator.__new__(BatchTranslator)
+    batch.translator = FakeTranslator()
+    functions = [
+        (0x00120000, {"name": "sub_00120000"}),
+        (TARGET, {"name": "sub_001E9100_gen"}),
+    ]
+
+    with tempfile.TemporaryDirectory() as output_dir:
+        stats = batch.translate_batch_split(functions, output_dir, wrapped={TARGET})
+        header = open(f"{output_dir}/recomp_funcs.h").read()
+        dispatch = open(f"{output_dir}/recomp_dispatch.c").read()
+        bodies = "".join(
+            open(f).read() for f in stats["files"] if "recomp_0" in f)
+
+    assert "void sub_001E9100_gen(void)" in bodies
+    assert "void sub_001E9100(void);  /* 0x001E9100 */" in header
+    assert "(recomp_func_t)sub_001E9100 }" in dispatch
+    assert "sub_001E9100_gen }" not in dispatch
+    assert stats["unresolved_stubs"] == 0
