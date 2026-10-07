@@ -32,6 +32,7 @@
 
 #include "d3d8_swizzle.h"
 #include "../kernel/nv2a_pb_state.h"
+#include "../kernel/nv2a_backend_common.h"
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 uint32_t nv2a_pb_d3d11_pixel(uint32_t offset, int x, int y);
@@ -91,6 +92,9 @@ static void vertex_z(float x, float y, float z, uint32_t argb)
  * already uses that range. */
 static uint32_t s_surf_base = 0x01000000u;
 #define OFFSCREEN (s_surf_base + 0x00800000u)
+/* clip_cases' render.scale 2 crop: a 640x480 buffer of its own, since a
+ * target's host size is fixed when it is made. */
+#define CROP2     (s_surf_base + 0x00400000u)
 #define P8_GUEST  (TEX_GUEST + 0x8000u)
 #define PAL_GUEST (TEX_GUEST + 0x9000u)
 #define MIP_GUEST (TEX_GUEST + 0xA000u)  /* 32x32 A8R8G8B8, 6 levels */
@@ -361,6 +365,56 @@ static int index_cases(const uint32_t *buf)
     return f;
 }
 
+/* Present a 320x240 frame of a 640x480 target (buf, bound): red whole
+ * frames first, into both swap-chain buffers, then more than
+ * PRESENT_STALE_FLIPS flips of a blue 320x240 clip, so the walker's present
+ * extent is the frame. Back-buffer (100,100) must be the frame's blue. At
+ * stock (400,300) is the band outside the frame and must be black, which a
+ * flip-discard buffer (DXVK) would still hold red from the whole frames; at
+ * a render.scale the blit's crop puts guest (200,150) there, blue (see the
+ * caller). A copy that is lost or mis-sized fails one probe or the other.
+ * Returns the failures. */
+static int crop_flips(uint32_t buf)
+{
+    static const int px[2] = {100, 400}, py[2] = {100, 300};
+    uint32_t got[2];
+    unsigned scale = nv2a_host_render_scale();
+    int f = 0, k, i;
+
+    M(0x0210, buf);
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
+    for (k = 0; k < 2; k++) {
+        M(0x1D90, 0xFFFF0000u);
+        M(0x1D94, 0xF0);
+        M(0x012C, 0);                       /* FLIP_INCREMENT_WRITE */
+        M(0x0130, 0);
+    }
+    M(0x0200, 320u << 16);
+    M(0x0204, 240u << 16);
+    /* The probe reads one pixel per flip: the first point through the
+     * next-to-last flip, the second at the last. */
+    nv2a_pb_d3d11_back_pixel(px[0], py[0]);
+    for (k = 0; k < 122; k++) {
+        if (k == 121)
+            got[0] = nv2a_pb_d3d11_back_pixel(px[1], py[1]);
+        M(0x1D90, 0xFF0000FFu);
+        M(0x1D94, 0xF0);
+        M(0x012C, 0);
+        M(0x0130, 0);
+    }
+    got[1] = nv2a_pb_d3d11_back_pixel(px[1], py[1]);
+    nv2a_pb_d3d11_back_pixel(-1, -1);       /* off: no read per flip after */
+    for (i = 0; i < 2; i++) {
+        uint32_t want = i == 0 || scale > 1 ? 0xFF0000FFu : 0xFF000000u;
+        fprintf(stderr, "[backend-smoke] crop x%u: back buffer (%d,%d) 0x%08X (want"
+                " 0x%08X) %s\n", scale, px[i], py[i], got[i], want,
+                got[i] == want ? "PASS" : "FAIL");
+        f += got[i] != want;
+    }
+    return f;
+}
+
 /* One back buffer drawn under two clip extents in a frame (Burnout 3's
  * 640x480 buffer with 159x344 and smaller clips): one target, grown to the
  * largest; a clear bounded by its clip and clear rect leaves the rest; and a
@@ -409,26 +463,8 @@ static int clip_cases(const uint32_t *buf)
      * walker counts a flip at FLIP_INCREMENT_WRITE, as the XDK's swap
      * pushes it, not at FLIP_STALL alone.
      *
-     * Red whole frames first, into both swap-chain buffers: the band a
-     * cropped present leaves outside its frame must then come out black,
-     * not the red a flip-discard buffer (DXVK) still holds. */
-    M(0x0200, 640u << 16);
-    M(0x0204, 480u << 16);
-    for (k = 0; k < 2; k++) {
-        M(0x1D90, 0xFFFF0000u);
-        M(0x1D94, 0xF0);
-        M(0x012C, 0);                       /* FLIP_INCREMENT_WRITE */
-        M(0x0130, 0);
-    }
-    M(0x0200, 320u << 16);
-    M(0x0204, 240u << 16);
-    nv2a_pb_d3d11_back_pixel(400, 300);     /* in the band, read at each flip */
-    for (k = 0; k < 122; k++) {
-        M(0x1D90, 0xFF000000u);
-        M(0x1D94, 0xF0);
-        M(0x012C, 0);
-        M(0x0130, 0);
-    }
+     * The present itself is checked by back_probes. */
+    f += crop_flips(buf[0]);
     if (!nv2a_pb_d3d11_shown(buf[0], &tw, &th, &sw, &sh) || tw != 640 || th != 480
             || sw != 320 || sh != 240) {
         fprintf(stderr, "[backend-smoke] crop: target %ux%u, shown %ux%u (want 640x480,"
@@ -437,12 +473,22 @@ static int clip_cases(const uint32_t *buf)
     } else {
         fprintf(stderr, "[backend-smoke] crop: target 640x480, shown 320x240 PASS\n");
     }
-    c[0] = nv2a_pb_d3d11_back_pixel(400, 300);
-    fprintf(stderr, "[backend-smoke] crop: back buffer outside the frame 0x%08X (want"
-            " 0xFF000000) %s\n", c[0], c[0] == 0xFF000000u ? "PASS" : "FAIL");
-    f += c[0] != 0xFF000000u;
+    /* At render.scale 2 the present is the blit, and its uv_scale does the
+     * crop: the 640x480-host frame fills the 640x480 window, so there is no
+     * band, but back-buffer (400,300) samples guest (200,150) of the frame,
+     * blue. Without the crop the whole 1280x960 target is squeezed in and
+     * (400,300) samples guest (400,300), red. */
+    {
+        struct nv2a_host_opts o = *nv2a_host_opts(), stock = o;
+        o.render_scale = 2;
+        nv2a_host_opts_set(&o);
+        surf_clear(CROP2, 640, 480, 0xFFFF0000u);
+        f += crop_flips(CROP2);
+        nv2a_host_opts_set(&stock);
+    }
     M(0x0200, 640u << 16);
     M(0x0204, 480u << 16);
+    M(0x0210, buf[0]);
     return f;
 }
 

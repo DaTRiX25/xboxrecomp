@@ -583,6 +583,7 @@ static void rt_release(RenderTarget *rt)
  * guest memory, so a stale target is only dropped. The Metal backend's rule;
  * A/B: RECOMP_DEBUG=rt_alias_check=0. */
 static uint64_t s_stale_drops, s_retired;
+static uint64_t s_grows, s_partial_clears;   /* rt_grow, clear_region (as Metal's) */
 
 static int alias_check_on(void)
 {
@@ -651,6 +652,7 @@ static int rt_grow(RenderTarget *rt, UINT w, UINT h)
     b.back = 1;
     ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)tex, 0, 0, 0, 0,
                                               (ID3D11Resource *)rt->tex, 0, &b);
+    s_grows++;
     if (said++ < 20)
         fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target grown to %ux%u\n",
                 rt->offset, rt->w, rt->h, w, h);
@@ -971,6 +973,7 @@ static void clear_region(RenderTarget *rt, const struct nv2a_pb_gpu *g, const fl
     r.right = (LONG)((uint64_t)x1 * rt->hw / rt->w);
     r.bottom = (LONG)((uint64_t)y1 * rt->hh / rt->h);
     ID3D11DeviceContext1_ClearView(s_ctx1, (ID3D11View *)rt->rtv, c, &r, 1);
+    s_partial_clears++;
 }
 
 static void d3d11_on_clear(uint32_t param)
@@ -3429,7 +3432,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                 " %llu clears, %llu draws, %llu skipped, %llu culled, %llu texture uploads,"
                 " %llu rehashes, %llu combiner shaders, %llu zclears,"
                 " %llu depth-tested draws, %llu render-target textures,"
-                " %llu stale drops\n",
+                " %llu stale drops, %llu target grows, %llu partial clears\n",
                 (unsigned long long)s_presents,
                 s_drawn ? s_drawn->offset : 0, surface_offset,
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
@@ -3439,7 +3442,8 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_tex_rehash,
                 (unsigned long long)s_rc_compiles,
                 (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
-                (unsigned long long)s_rtt_binds, (unsigned long long)s_stale_drops);
+                (unsigned long long)s_rtt_binds, (unsigned long long)s_stale_drops,
+                (unsigned long long)s_grows, (unsigned long long)s_partial_clears);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "blend: %llu draws with a constant factor,"
                 " %u SET_BLEND_COLOR writes (last 0x%08X)\n",
@@ -3621,14 +3625,15 @@ int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
     return 0;
 }
 
-/* For tests/d3d11_backend_smoke: the back-buffer pixel at (x, y) the last
- * flip presented, 0xAARRGGBB, or 0xDEADBEEF before a flip has read it; the
- * call also sets the pixel the next flips read. */
+/* For tests/d3d11_backend_smoke: the back-buffer pixel the last flip read,
+ * 0xAARRGGBB, at the point the previous call set (0xDEADBEEF before a flip
+ * has read one there); then (x, y) is the point the next flips read, and
+ * (-1, -1) stops the reads (each is a copy and a Map stall per flip). */
 uint32_t nv2a_pb_d3d11_back_pixel(int x, int y)
 {
     uint32_t px = s_probe_px;
     if (x != s_probe_x || y != s_probe_y)
-        px = 0xDEADBEEFu;
+        s_probe_px = 0xDEADBEEFu;
     s_probe_x = x;
     s_probe_y = y;
     return px;
