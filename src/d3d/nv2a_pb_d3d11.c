@@ -2199,19 +2199,13 @@ static ID3D11PixelShader *setup_pixel(void)
  * of the first triangle's centroid before the draw. Lines start
  * "[D3D11-WHITE]", after the investigation it was written for. */
 
-static uint32_t read_pixel(RenderTarget *rt, int x, int y)
+static uint32_t read_tex_pixel(ID3D11Texture2D *tex, UINT x, UINT y)
 {
     static ID3D11Texture2D *st;
     D3D11_MAPPED_SUBRESOURCE m;
     D3D11_BOX b;
     uint32_t px = 0xDEADBEEFu;
 
-    if (x < 0 || y < 0 || (UINT)x >= rt->w || (UINT)y >= rt->h)
-        return px;
-    /* Guest coordinates; a scaled target holds the pixel's first sample at
-     * N times them. */
-    x *= (int)(rt->hw / rt->w);
-    y *= (int)(rt->hh / rt->h);
     if (!st) {
         D3D11_TEXTURE2D_DESC td;
         memset(&td, 0, sizeof td);
@@ -2224,17 +2218,26 @@ static uint32_t read_pixel(RenderTarget *rt, int x, int y)
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
             return px;
     }
-    b.left = (UINT)x; b.right = (UINT)x + 1;
-    b.top = (UINT)y; b.bottom = (UINT)y + 1;
+    b.left = x; b.right = x + 1;
+    b.top = y; b.bottom = y + 1;
     b.front = 0; b.back = 1;
     ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)st, 0, 0, 0, 0,
-                                              (ID3D11Resource *)rt->tex, 0, &b);
+                                              (ID3D11Resource *)tex, 0, &b);
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
                                           D3D11_MAP_READ, 0, &m))) {
         px = *(const uint32_t *)m.pData;   /* B,G,R,A bytes: 0xAARRGGBB */
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
     }
     return px;
+}
+
+static uint32_t read_pixel(RenderTarget *rt, int x, int y)
+{
+    if (x < 0 || y < 0 || (UINT)x >= rt->w || (UINT)y >= rt->h)
+        return 0xDEADBEEFu;
+    /* Guest coordinates; a scaled target holds the pixel's first sample at
+     * N times them. */
+    return read_tex_pixel(rt->tex, (UINT)x * (rt->hw / rt->w), (UINT)y * (rt->hh / rt->h));
 }
 
 /* The first three vertices of the bound batch through the VS, read back by
@@ -3353,6 +3356,10 @@ static void present_blit(RenderTarget *rt, int filter)
 }
 
 static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
+/* nv2a_pb_d3d11_back_pixel: a back-buffer pixel read at each flip before
+ * Present, since FLIP_DISCARD leaves nothing to read after it. */
+static int s_probe_x = -1, s_probe_y;
+static uint32_t s_probe_px = 0xDEADBEEFu;
 
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
@@ -3400,6 +3407,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
             ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_back,
                                              (ID3D11Resource *)s_drawn->tex);
         } else {
+            static const float black[4] = {0, 0, 0, 1};
             D3D11_BOX b;
             b.left = 0;
             b.top = 0;
@@ -3407,6 +3415,14 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
             b.right = cw < s_back_w ? cw : s_back_w;
             b.bottom = ch < s_back_h ? ch : s_back_h;
             b.back = 1;
+            /* FLIP_DISCARD hands back a buffer whose contents are undefined
+             * (DXVK keeps an old frame), so the band the copy leaves -- a
+             * frame cropped smaller than its grown target, or than the
+             * window -- is black, as present_blit leaves it. */
+            if ((b.right < s_back_w || b.bottom < s_back_h)
+                    && (s_back_rtv || SUCCEEDED(ID3D11Device_CreateRenderTargetView(
+                            s_dev, (ID3D11Resource *)s_back, NULL, &s_back_rtv))))
+                ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
             ID3D11DeviceContext_CopySubresourceRegion(
                 s_ctx, (ID3D11Resource *)s_back, 0, 0, 0, 0,
                 (ID3D11Resource *)s_drawn->tex, 0, &b);
@@ -3417,6 +3433,10 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                     s_drawn->hw, s_drawn->hh,
                     blit ? "scaling blit" : same ? "copy" : "overlap copy");
     }
+    if (s_back && s_probe_x >= 0)
+        s_probe_px = (UINT)s_probe_x < s_back_w && (UINT)s_probe_y < s_back_h
+                   ? read_tex_pixel(s_back, (UINT)s_probe_x, (UINT)s_probe_y)
+                   : 0xDEADBEEFu;
     s_presents++;
     dump_frame();
     hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
@@ -3620,6 +3640,19 @@ int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
             return 1;
         }
     return 0;
+}
+
+/* For tests/d3d11_backend_smoke: the back-buffer pixel at (x, y) the last
+ * flip presented, 0xAARRGGBB, or 0xDEADBEEF before a flip has read it; the
+ * call also sets the pixel the next flips read. */
+uint32_t nv2a_pb_d3d11_back_pixel(int x, int y)
+{
+    uint32_t px = s_probe_px;
+    if (x != s_probe_x || y != s_probe_y)
+        px = 0xDEADBEEFu;
+    s_probe_x = x;
+    s_probe_y = y;
+    return px;
 }
 
 /* For tests/d3d11_backend_smoke: the pixel at guest (x, y) of the target

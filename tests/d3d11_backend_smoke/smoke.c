@@ -35,6 +35,7 @@
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 uint32_t nv2a_pb_d3d11_pixel(uint32_t offset, int x, int y);
+uint32_t nv2a_pb_d3d11_back_pixel(int x, int y);
 int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
                         uint32_t *sw, uint32_t *sh);
 
@@ -385,7 +386,9 @@ static int clip_cases(const uint32_t *buf)
     M(0x1D9C, (339u << 16) | 300u);
     M(0x1D90, 0xFF00FF00u);
     M(0x1D94, 0xF0);
-    M(0x1D98, (639u << 16) | 0u);   /* back to the whole surface */
+    /* The clear rect is global state, as on the hardware, and stays set
+     * across surfaces: back to the whole surface for the cases after. */
+    M(0x1D98, (639u << 16) | 0u);
     M(0x1D9C, (479u << 16) | 0u);
     c[0] = nv2a_pb_d3d11_pixel(buf[0], 50, 50);      /* red: outside both */
     c[1] = nv2a_pb_d3d11_pixel(buf[0], 150, 150);    /* blue: inside the clip */
@@ -404,13 +407,26 @@ static int clip_cases(const uint32_t *buf)
      * (this clip's and the frames' above) must first go stale: more than
      * PRESENT_STALE_FLIPS (120) flips drawing only the 320x240 clip. The
      * walker counts a flip at FLIP_INCREMENT_WRITE, as the XDK's swap
-     * pushes it, not at FLIP_STALL alone. */
+     * pushes it, not at FLIP_STALL alone.
+     *
+     * Red whole frames first, into both swap-chain buffers: the band a
+     * cropped present leaves outside its frame must then come out black,
+     * not the red a flip-discard buffer (DXVK) still holds. */
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
+    for (k = 0; k < 2; k++) {
+        M(0x1D90, 0xFFFF0000u);
+        M(0x1D94, 0xF0);
+        M(0x012C, 0);                       /* FLIP_INCREMENT_WRITE */
+        M(0x0130, 0);
+    }
     M(0x0200, 320u << 16);
     M(0x0204, 240u << 16);
+    nv2a_pb_d3d11_back_pixel(400, 300);     /* in the band, read at each flip */
     for (k = 0; k < 122; k++) {
         M(0x1D90, 0xFF000000u);
         M(0x1D94, 0xF0);
-        M(0x012C, 0);                       /* FLIP_INCREMENT_WRITE */
+        M(0x012C, 0);
         M(0x0130, 0);
     }
     if (!nv2a_pb_d3d11_shown(buf[0], &tw, &th, &sw, &sh) || tw != 640 || th != 480
@@ -421,6 +437,10 @@ static int clip_cases(const uint32_t *buf)
     } else {
         fprintf(stderr, "[backend-smoke] crop: target 640x480, shown 320x240 PASS\n");
     }
+    c[0] = nv2a_pb_d3d11_back_pixel(400, 300);
+    fprintf(stderr, "[backend-smoke] crop: back buffer outside the frame 0x%08X (want"
+            " 0xFF000000) %s\n", c[0], c[0] == 0xFF000000u ? "PASS" : "FAIL");
+    f += c[0] != 0xFF000000u;
     M(0x0200, 640u << 16);
     M(0x0204, 480u << 16);
     return f;
