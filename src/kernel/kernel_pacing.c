@@ -152,9 +152,18 @@ static SpinSite *site_for(uint32_t va)
 
 void xbox_SpinWait(uint32_t va)
 {
-    SpinSite *site = site_for(va);
+    SpinSite *site;
     int sample, woke = 0, immediate = 0;
-    uint64_t c0 = 0, now = xbox_HostNowNs();
+    uint64_t c0 = 0, now;
+
+    /* A lowered loop's pass is between two guest instructions: a holder
+     * spinning here at DISPATCH takes a posted interrupt, as a CPU would.
+     * At "spin" pacing the macro calls only for that. */
+    xbox_IrqSafePoint();
+    if (!g_xbox_spin_sleep)
+        return;
+    site = site_for(va);
+    now = xbox_HostNowNs();
 
     /* The previous wait on this thread ended its loop if the thread was
      * away long enough: count how that loop left. */

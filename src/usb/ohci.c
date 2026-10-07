@@ -865,13 +865,12 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
  * Returns what the routine returned: an ISR that does not claim the interrupt
  * returns FALSE, and that is worth seeing rather than assuming.
  */
-static int ohci_call_isr(OhciController *hc)
+static int ohci_isr_call(int index)
 {
     uint32_t kinterrupt = xbox_GetConnectedInterrupt(OHCI_VECTOR);
     uint32_t routine, context;
     recomp_func_t fn;
     uint8_t *mem;
-    int slot;
 
     if (!kinterrupt)
         return -1;                      /* nothing connected yet            */
@@ -885,23 +884,10 @@ static int ohci_call_isr(OhciController *hc)
     fn = recomp_lookup(routine);
     if (!fn) {
         fprintf(stderr, "  [OHCI%d] ISR 0x%08X has no translation\n",
-                hc->index, routine);
+                index, routine);
         fflush(stderr);
         return -1;
     }
-
-    /* One slice for the life of the raise. Sixteen exist and this takes one
-     * only while the routine runs, so a title using them for its own workers
-     * is not starved by a controller that interrupts. */
-    slot = xbox_worker_stack_alloc();
-    if (slot < 0) {
-        fprintf(stderr, "  [OHCI%d] no worker stack for the ISR\n", hc->index);
-        fflush(stderr);
-        return -1;
-    }
-
-    g_esp = XBOX_WORKER_STACK_TOP(slot);
-    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
 
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = context;      /* arg 2 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
@@ -917,9 +903,37 @@ static int ohci_call_isr(OhciController *hc)
     } else {
         int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql);
     }
-
-    xbox_worker_stack_free(slot);
     return (int)(g_eax & 1u);
+}
+
+static int ohci_call_isr(OhciController *hc)
+{
+    int slot, claimed;
+
+    if (!xbox_GetConnectedInterrupt(OHCI_VECTOR))
+        return -1;
+    /* One slice for the life of the raise. Sixteen exist and this takes one
+     * only while the routine runs, so a title using them for its own workers
+     * is not starved by a controller that interrupts. */
+    slot = xbox_worker_stack_alloc();
+    if (slot < 0) {
+        fprintf(stderr, "  [OHCI%d] no worker stack for the ISR\n", hc->index);
+        fflush(stderr);
+        return -1;
+    }
+    g_esp = XBOX_WORKER_STACK_TOP(slot);
+    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+    claimed = ohci_isr_call(hc->index);
+    xbox_worker_stack_free(slot);
+    return claimed;
+}
+
+/* The gate holder's run of a posted USB interrupt (kernel_hal.c has put it
+ * on a worker stack). The status bits were set by the controller thread;
+ * if the driver has cleared them since, the ISR declines. */
+static void ohci_isr_on_holder(void)
+{
+    ohci_isr_call(-1);
 }
 
 /* Set the status bits and, if the driver has unmasked them, call the ISR.
@@ -1205,7 +1219,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (!status)
             continue;
 
-        /* Bounded, because the mask is a model and not the hardware.
+        /* (irq_safe_points=0 only, below.) Bounded, because the mask is a
+         * model and not the hardware.
          *
          * The depth is a count of raise/lower pairs across every thread, and
          * one unmatched raise anywhere leaves the gate shut for the rest of
@@ -1217,25 +1232,41 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * instead of the device. */
         /* The one-CPU gate, as the APU model takes it: when free, no thread
          * at DISPATCH_LEVEL, DPC or KeSynchronizeExecution routine runs
-         * beside the ISR; when held, the hold-off below applies. */
-        gated = xbox_DispatchGateTryEnter();
-        if (!gated && ++held_off <= OHCI_IRQ_HOLDOFF) {
-            if (!held_off_warned) {
-                held_off_warned = 1;
-                fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
-                        "(depth %d, status=0x%02X)\n",
-                        hc->index, xbox_IrqlRaisedCount(), status);
+         * beside the ISR; when held, the interrupt is posted to the holder
+         * (xbox_IrqPost) and this pass goes on. The line stays up, so the
+         * next pass posts again (coalesced) until the ISR has run. */
+        xbox_IrqSetHandler(XBOX_IRQ_OHCI, ohci_isr_on_holder);
+        if (xbox_IrqSafePointsOn()) {
+            int how = xbox_IrqPost(XBOX_IRQ_OHCI);
+            if (how == XBOX_IRQ_POSTED)
+                continue;               /* a post is not a delivery */
+            gated = (how == XBOX_IRQ_GATED);
+            if (!gated)
+                xbox_IrqNoteUngated(XBOX_IRQ_OHCI);
+        } else {
+            /* irq_safe_points=0: the old bounded hold-off, then beside the
+             * holder. */
+            gated = xbox_DispatchGateTryEnter();
+            if (!gated && ++held_off <= OHCI_IRQ_HOLDOFF) {
+                if (!held_off_warned) {
+                    held_off_warned = 1;
+                    fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
+                            "(depth %d, status=0x%02X)\n",
+                            hc->index, xbox_IrqlRaisedCount(), status);
+                    fflush(stderr);
+                }
+                continue;
+            }
+            if (held_off > OHCI_IRQ_HOLDOFF && !held_off_forced) {
+                held_off_forced = 1;
+                fprintf(stderr, "  [OHCI%d] guest IRQL never dropped (depth %d); "
+                        "delivering anyway\n", hc->index, xbox_IrqlRaisedCount());
                 fflush(stderr);
             }
-            continue;
+            if (!gated)
+                xbox_IrqNoteUngated(XBOX_IRQ_OHCI);
+            held_off = 0;
         }
-        if (held_off > OHCI_IRQ_HOLDOFF && !held_off_forced) {
-            held_off_forced = 1;
-            fprintf(stderr, "  [OHCI%d] guest IRQL never dropped (depth %d); "
-                    "delivering anyway\n", hc->index, xbox_IrqlRaisedCount());
-            fflush(stderr);
-        }
-        held_off = 0;
 
         /* A stuck source is one the handler never clears. Repeating the
          * same status value is not that.

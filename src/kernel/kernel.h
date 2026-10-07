@@ -817,6 +817,59 @@ void    xbox_DispatchGateLeave(void);
 void    xbox_IrqlLeaveInterrupt(int saved);
 /* This thread is at DISPATCH_LEVEL or above, or holds the one-CPU gate. */
 int     xbox_IrqlThisThreadBlocksDpcs(void);
+/* This thread's IRQL (KPCR.Irql), for tests and reports. */
+int     xbox_IrqlCurrent(void);
+
+/* Device interrupts on the one-CPU gate holder (kernel_hal.c).
+ *
+ * A device model whose interrupt finds the gate held posts it; the holder
+ * runs it on its own thread at its next safe point (a kernel call, a
+ * spin-wait yield, the gate's release), never alongside. */
+enum {
+    XBOX_IRQ_VBLANK,
+    XBOX_IRQ_APU,
+    XBOX_IRQ_OHCI,
+    XBOX_IRQ_LINES
+};
+/* What xbox_IrqPost tells the device model to do. */
+enum {
+    XBOX_IRQ_POSTED   = 0,  /* left for the holder (or already run) */
+    XBOX_IRQ_GATED    = 1,  /* the caller has the gate: deliver, then
+                               xbox_DispatchGateLeave */
+    XBOX_IRQ_UNGATED  = 2   /* deliver without the gate (irq_safe_force, or
+                               irq_safe_points=0) */
+};
+/* 0 under RECOMP_DEBUG=irq_safe_points=0: the models' old hold-off. */
+int     xbox_IrqSafePointsOn(void);
+/* The routine the holder runs for a line: it finds the connected ISR and
+ * calls it on g_esp (a worker stack the caller set up) at the device IRQL. */
+void    xbox_IrqSetHandler(int line, void (*run)(void));
+int     xbox_IrqPost(int line);
+void    xbox_IrqSafePoint(void);
+/* The [IRQ] summary line, once per 600 vblanks when anything was posted. */
+void    xbox_IrqReport(void);
+/* The thread holding the gate (0 when free), for the ungated-delivery logs. */
+unsigned long xbox_DispatchGateOwner(void);
+/* A model is about to run an ISR without the gate (irq_safe_points=0, or
+ * irq_safe_force): one line naming the holder it runs beside (the first 20
+ * per line), and a count in the [IRQ] summary. */
+void    xbox_IrqNoteUngated(int line);
+
+typedef struct {
+    long posted[XBOX_IRQ_LINES];       /* posts that found the gate held */
+    long on_holder[XBOX_IRQ_LINES];    /* run by the holder at a safe point */
+    long second_try[XBOX_IRQ_LINES];   /* taken back by the poster's retry */
+    long forced[XBOX_IRQ_LINES];       /* irq_safe_force deliveries */
+    long ungated[XBOX_IRQ_LINES];      /* run beside a holder (any mode) */
+    long max_wait_us[XBOX_IRQ_LINES];  /* longest post-to-run wait */
+    long wait_logs;                    /* holder-without-safe-point lines */
+    long refused;                      /* safe points that could not run */
+} XboxIrqStats;
+void    xbox_IrqStatsGet(XboxIrqStats *out, int reset);
+/* Tests: re-read irq_safe_* after recomp_env_set, and a hook run between
+ * the poster's first try and its post (the lost-post window). */
+void    xbox_IrqReloadConfig(void);
+void    xbox_IrqSetPostHook(void (*hook)(int line));
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */

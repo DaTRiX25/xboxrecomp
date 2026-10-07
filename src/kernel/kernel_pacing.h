@@ -52,10 +52,15 @@ enum { XBOX_PACING_SPIN = 0, XBOX_PACING_SLEEP = 1 };
 void xbox_PacingSetMode(int mode);
 int  xbox_PacingMode(void);
 
-/* Read by RECOMP_SPIN_WAIT on every pass of a lowered loop. */
+/* Read by RECOMP_SPIN_WAIT on every pass of a lowered loop, with
+ * g_xbox_irq_pending (kernel_hal.c): a pass with an interrupt posted calls
+ * the wait at any pacing, as the gate holder's safe point. */
 extern volatile int g_xbox_spin_sleep;
+extern volatile int g_xbox_irq_pending;
 
-/* One pass of a lowered loop whose condition was still true. Mode sleep:
+/* One pass of a lowered loop whose condition was still true. First a safe
+ * point (xbox_IrqSafePoint): the gate holder runs what was posted. Mode spin
+ * returns there. Mode sleep:
  * return at once if the wake generation moved since this thread last looked,
  * else block until it moves or 1 ms passes. Never sleeps at DISPATCH level
  * or above, or with the one-CPU gate held: the DPC the loop waits for could

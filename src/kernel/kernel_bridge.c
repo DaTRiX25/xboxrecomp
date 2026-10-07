@@ -2405,9 +2405,11 @@ static void bridge_KeSynchronizeExecution(void)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     /* The ISR's exclusion: the APU and OHCI models and the vblank deliver
-     * their ISRs holding the one-CPU gate when it is free
-     * (xbox_DispatchGateTryEnter), so holding it here keeps the routine and
-     * those ISRs apart, as the interrupt's spinlock at DIRQL does. */
+     * their ISRs holding the one-CPU gate when it is free and post them to
+     * its holder when it is not (xbox_IrqPost), so holding it here keeps the
+     * routine and those ISRs apart, as the interrupt's spinlock at DIRQL
+     * does. The leave is a safe point: what was posted meanwhile runs there,
+     * with the routine's result in g_eax saved around it. */
     if (xbox_ProfOn()) {
         void *prev = xbox_ProfBegin(XBOX_PROF_SYNC, routine);
         long long t0;
@@ -2548,7 +2550,7 @@ static void bridge_KeRemoveQueueDpc(void)
  */
 uint32_t xbox_GetConnectedInterrupt(uint32_t vector);   /* defined below */
 
-static int kernel_raise_interrupt(uint32_t vector)
+static int kernel_call_isr(uint32_t vector)
 {
     uint32_t kint = xbox_GetConnectedInterrupt(vector);
     uint32_t routine, context;
@@ -2569,10 +2571,6 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     {
-        /* Under the one-CPU gate when it is free; never waits for it (this
-         * is the frame clock, and the GPU's ISR preempts DISPATCH code on
-         * hardware). */
-        int gated = xbox_DispatchGateTryEnter();
         int _irql = xbox_IrqlEnterInterrupt(16);
         if (xbox_ProfOn()) {
             void *prev = xbox_ProfBegin(XBOX_PROF_ISR_VBLANK, routine);
@@ -2583,8 +2581,6 @@ static int kernel_raise_interrupt(uint32_t vector)
             fn();
         }
         xbox_IrqlLeaveInterrupt(_irql);
-        if (gated)
-            xbox_DispatchGateLeave();
     }
     return (int)(g_eax & 1u);
 }
@@ -2859,6 +2855,7 @@ static void kernel_vblank_count(long long now)
                 (long)InterlockedExchange(&g_vbl_ack_late_max, 0),
                 (long)InterlockedExchange(&g_vbl_declined, 0));
         fflush(stderr);
+        xbox_IrqReport();
         if (xbox_ProfOn())
             xbox_ProfReport();
         gap_min = 1e9;
@@ -2869,12 +2866,49 @@ static void kernel_vblank_count(long long now)
     }
 }
 
+/* The vblank ISR and what follows it, on whichever thread runs it: the
+ * timer thread with the gate, or the gate holder at a safe point. */
+static void kernel_vblank_deliver(void)
+{
+    static unsigned n;
+    int claimed = kernel_call_isr(NV2A_VECTOR);
+
+    /* Armed for a declined vblank too. The XDK ISR masks PMC_INTR_EN_0
+     * and queues its DPC, which unmasks when it is done; until then
+     * every vblank finds the mask down and is declined, but its status
+     * bit stays latched in PMC_INTR_0, as on hardware. The DPC, run late
+     * behind the one-CPU gate, then sees it, acks it and spins on it --
+     * and with the watch armed only on a claim, nothing cleared it
+     * until the nv2a-ack pass, hundreds of milliseconds under a heavy
+     * push buffer. */
+    if (claimed >= 0)
+        kernel_vblank_arm_ack();
+    else
+        InterlockedExchange(&g_vbl_tick_busy, 0);
+    if (claimed == 0)
+        InterlockedIncrement(&g_vbl_declined);
+    if (n++ < 3) {
+        fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
+                claimed < 0 ? "not callable" :
+                claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+}
+
+/* The holder's run of a posted vblank: kernel_hal.c has put it on a worker
+ * stack at the device IRQL. */
+static void kernel_vblank_on_holder(void)
+{
+    kernel_vblank_deliver();
+}
+
 /* Raise one vblank: the PCRTC and PMC bits, then the ISR, then the ack
  * watch. */
 static void kernel_vblank_raise(void)
 {
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
+    xbox_IrqSetHandler(XBOX_IRQ_VBLANK, kernel_vblank_on_holder);
 
     /* PCRTC_INTR_EN_0: D3D enables the vblank interrupt once it has
      * connected its ISR. Until then the hardware raises nothing. */
@@ -2892,29 +2926,31 @@ static void kernel_vblank_raise(void)
     InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
                   (LONG)NV2A_PMC_INTR_PCRTC);
 
-    {
-        static unsigned n;
-        int claimed = kernel_raise_interrupt(NV2A_VECTOR);
-
-        /* Armed for a declined vblank too. The XDK ISR masks PMC_INTR_EN_0
-         * and queues its DPC, which unmasks when it is done; until then
-         * every vblank finds the mask down and is declined, but its status
-         * bit stays latched in PMC_INTR_0, as on hardware. The DPC, run late
-         * behind the one-CPU gate, then sees it, acks it and spins on it --
-         * and with the watch armed only on a claim, nothing cleared it
-         * until the nv2a-ack pass, hundreds of milliseconds under a heavy
-         * push buffer. */
-        if (claimed >= 0)
-            kernel_vblank_arm_ack();
-        else
-            InterlockedExchange(&g_vbl_tick_busy, 0);
-        if (claimed == 0)
-            InterlockedIncrement(&g_vbl_declined);
-        if (n++ < 3)
-            fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
-                    claimed < 0 ? "not callable" :
-                    claimed ? "claimed it" : "declined it");
-        fflush(stderr);
+    /* Under the one-CPU gate when it is free; never waits for it (this is
+     * the frame clock). Held, the ISR is posted to the holder and runs at
+     * its next safe point: tick_busy stays up until then, since until the
+     * ISR has run PCRTC_INTR_0's bit is this vblank, not an ack. A later
+     * tick while it is pending only advances the counter, as a latched
+     * line coalesces. */
+    switch (xbox_IrqSafePointsOn() ? xbox_IrqPost(XBOX_IRQ_VBLANK)
+                                   : XBOX_IRQ_UNGATED) {
+    case XBOX_IRQ_GATED:
+        kernel_vblank_deliver();
+        xbox_DispatchGateLeave();
+        break;
+    case XBOX_IRQ_UNGATED: {
+        /* irq_safe_points=0 (today's model: beside a holder, if any), or
+         * irq_safe_force past irq_safe_ms. */
+        int gated = xbox_DispatchGateTryEnter();
+        if (!gated)
+            xbox_IrqNoteUngated(XBOX_IRQ_VBLANK);
+        kernel_vblank_deliver();
+        if (gated)
+            xbox_DispatchGateLeave();
+        break;
+    }
+    default:
+        break;                          /* the holder runs it */
     }
 }
 
@@ -10314,6 +10350,12 @@ static void kernel_thunk_dispatch(void)
     int slot = g_kernel_dispatch_slot;
     bridge_func_t bridge;
     ULONG ordinal;
+
+    /* A kernel call is the gate holder's safe point: an interrupt posted
+     * while it held the gate runs here, before the bridge reads its
+     * arguments or takes any lock (xbox_IrqPost). After the slot is read,
+     * since a kernel call in the routine sets it again. */
+    xbox_IrqSafePoint();
 
     if (slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
         fprintf(stderr, "  [KERNEL] bad slot %d\n", slot);

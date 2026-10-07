@@ -547,9 +547,12 @@ extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];
 
 /* RECOMP_APU_TRACE: idle-voice traps against interrupt deliveries. Traps are
- * counted under the APU lock, the rest by the frame thread. */
+ * counted under the APU lock, holder_delivered by the gate holder, the rest
+ * by the frame thread. */
 typedef struct {
     unsigned traps, delivered, held_frames, forced;
+    unsigned posted;            /* found the gate held: left for its holder */
+    unsigned holder_delivered;  /* run by the gate holder at a safe point */
     unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
     unsigned fe_trapped_frames; /* frames that found FECTL trapped */
 } ApuIrqStats;

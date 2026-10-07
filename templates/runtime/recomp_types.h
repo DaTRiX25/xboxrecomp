@@ -429,9 +429,13 @@ uint64_t xbox_ReadTimeStampCounter(void);
  * thread blocks until the kernel signals a state change or 1 ms passes
  * (src/kernel/kernel_pacing.h). */
 extern volatile int g_xbox_spin_sleep;
+/* Non-zero while a device interrupt waits for the one-CPU gate holder: the
+ * wait is then also the holder's safe point to run it, at any pacing
+ * (src/kernel/kernel_hal.c, xbox_IrqPost). */
+extern volatile int g_xbox_irq_pending;
 void xbox_SpinWait(uint32_t va);
 #define RECOMP_SPIN_WAIT(va) \
-    do { if (g_xbox_spin_sleep) xbox_SpinWait(va); } while (0)
+    do { if (g_xbox_spin_sleep | g_xbox_irq_pending) xbox_SpinWait(va); } while (0)
 
 /* x86 port I/O (`in`/`out`). width is 1, 2 or 4 bytes. The runtime models
  * the ports titles are known to read (the field pin at 0x80C0) and logs the
