@@ -14,7 +14,9 @@
  * are identical on both; only the host syscalls differ.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
+#endif
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>

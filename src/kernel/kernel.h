@@ -758,6 +758,13 @@ NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode);
 NTSTATUS __stdcall xbox_NtYieldExecution(void);
 NTSTATUS __stdcall xbox_NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHandle, ULONG Options);
 
+/* The title's threads share one host core, as they shared the console's one
+ * CPU (kernel_thread.c). xbox_GuestCpuMask is the core as a mask, 0 when
+ * RECOMP_GUEST_CPUS=all leaves them on every core; xbox_GuestThreadPin puts
+ * the calling thread on it. */
+DWORD_PTR xbox_GuestCpuMask(void);
+void      xbox_GuestThreadPin(const char *role);
+
 /* ============================================================================
  * Synchronization (kernel_sync.c)
  * ============================================================================ */

@@ -171,6 +171,14 @@ HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
+/* Linux: pthread_setaffinity_np on the thread; a new thread gets the
+ * process's mask, as on Win32, not its creator's. macOS has no thread
+ * affinity: the call does nothing and returns 0 (failure), as Win32 does
+ * for an invalid mask. GetProcessAffinityMask is the mask the process
+ * started with (macOS: every online core). */
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);
+BOOL   GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                              DWORD_PTR *system_mask);
 VOID   SwitchToThread(void);
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 

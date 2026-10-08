@@ -43,4 +43,12 @@ else()
     find_package(Threads REQUIRED)
     target_link_libraries(platform PUBLIC Threads::Threads recomp_env)
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+    # glibc declares pthread_setname_np, pthread_[gs]etaffinity_np, the
+    # CPU_* set macros and dladdr only under _GNU_SOURCE, and a header that
+    # pulls in <pthread.h> first (win32_compat.h) settles it for the whole
+    # file, so a #define in one .c is too late for the others. Every target
+    # that links the platform layer gets it on the command line.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_compile_definitions(platform PUBLIC _GNU_SOURCE)
+    endif()
 endif()

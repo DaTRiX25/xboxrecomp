@@ -759,6 +759,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
 
     xbox_log_thread_role("guest-worker", s->routine);
+    xbox_GuestThreadPin("guest-worker");
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
@@ -910,6 +911,7 @@ static void bridge_PsCreateSystemThreadEx(void)
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
                 xbox_log_thread_role("guest-main", start_routine);
+                xbox_GuestThreadPin("guest-main");
                 /* Its TLS too: the stack is already in use, so the block
                  * comes from the heap, and the main TIB's fs:[0x28] object
                  * gets the TlsData pointer (see bridge_layout_tls). */
@@ -8817,6 +8819,7 @@ static void bridge_PsCreateSystemThread(void)
         if (fn) {
             if (is_first_call) {
                 xbox_log_thread_role("guest-main", start_routine);
+                xbox_GuestThreadPin("guest-main");
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;

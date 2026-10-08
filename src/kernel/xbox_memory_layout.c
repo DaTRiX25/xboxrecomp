@@ -2031,6 +2031,13 @@ static int peek_readable(uint32_t va)
     struct { const void *mapped; uint32_t base; uint64_t size; } win[] = {
         { g_memory_base,   XBOX_BASE_ADDRESS, (uint64_t)g_memory_size },
         { g_contig_memory, XBOX_CONTIG_BASE,  XBOX_CONTIG_SIZE },
+        /* The tiled aperture is the contiguous window again, and the view
+         * D3D hands out for vertex buffers and surfaces: a watch on a
+         * 0xF... address is the only one that sees those writes, since a
+         * protection on one view does not trap writes through another. */
+        { g_tiled_view,    XBOX_TILED_BASE,
+          xbox_TiledApertureSize() < XBOX_CONTIG_SIZE
+              ? (uint64_t)xbox_TiledApertureSize() : XBOX_CONTIG_SIZE },
         { g_nv2a_memory,   XBOX_NV2A_BASE,    XBOX_NV2A_SIZE },
         { g_mcpx_memory,   XBOX_MCPX_BASE,    XBOX_MCPX_SIZE },
         { g_flash_memory,  XBOX_FLASH_BASE,   XBOX_FLASH_SIZE },
@@ -2067,6 +2074,16 @@ static void    *g_watch_page;
 static uint32_t g_watch_last;
 static void    *g_watch_veh;
 static RECOMP_TLS int s_watch_stepping;
+/* The contiguous window and the tiled aperture are two views of one set of
+ * pages, and a title writes a vertex buffer through whichever pointer D3D
+ * gave it. A protection sits on one view only, so the dword's page in the
+ * other view is protected too (Win32). */
+#if defined(_WIN32)
+static void    *g_watch_alias;
+/* Threads between the fault and its single-step, when the pages are open:
+ * the re-arm thread leaves them alone then. */
+static volatile LONG s_watch_open;
+#endif
 
 /* A plausible guest code address: inside the image's executable sections,
  * as recorded from the section headers at load. */
@@ -2116,8 +2133,93 @@ static void watch_report(void)
                     *(const uint32_t *)(mem + slot));
         }
     }
+    /* The RECOMP_PEEK globals, sampled at the write: a writer that stores a
+     * value computed from shared state (a vertex light baked from the light
+     * list) is only explained by what that state held at the moment, and the
+     * chain alone cannot say. */
+    xbox_PeekSample("watch");
     fflush(stderr);
 }
+
+#if defined(_WIN32)
+static int watch_protect_pages(DWORD prot)
+{
+    DWORD old;
+    int ok = VirtualProtect(g_watch_page, 4096, prot, &old) != 0;
+    if (g_watch_alias && !VirtualProtect(g_watch_alias, 4096, prot, &old))
+        ok = 0;
+    return ok;
+}
+
+/* MmSetAddressProtect (D3D sets write-combining on a new vertex buffer) and
+ * a title's own NtProtectVirtualMemory go through VirtualProtect and take
+ * the trap off the page, silently: a watch armed at init then saw none of
+ * the writes that mattered. Put it back every 20 ms, and say so, since a
+ * write in the window went unreported. */
+static DWORD WINAPI watch_rearm_thread(LPVOID unused)
+{
+    static int said, stuck;
+    (void)unused;
+    while (g_watch_page) {
+        void *pages[2];
+        int i, reset = 0;
+        uint32_t now;
+        Sleep(20);
+        /* A write that reached the dword with no trap: through a view the
+         * watch does not cover, or while a faulting thread held the pages
+         * open. Reported without a chain, so it is at least not silent. */
+        now = *(const uint32_t *)((const uint8_t *)g_memory_offset
+                                  + g_watch_va);
+        if (now != g_watch_last) {
+            fprintf(stderr, "[WATCH] [%08X] %08X -> %08X  (untrapped, seen"
+                            " by the re-arm thread; pages %s)\n",
+                    g_watch_va, g_watch_last, now,
+                    s_watch_open ? "open" : "closed");
+            fflush(stderr);
+            g_watch_last = now;
+        }
+        /* A thread between its fault and its step keeps the pages open; one
+         * that never steps (its trap flag lost to a context switch or a
+         * nested exception) would keep them open for good. Close them. */
+        if (s_watch_open) {
+            if (++stuck == 50) {
+                fprintf(stderr, "  WATCH: the pages have been open for 1 s"
+                                " (%ld threads mid-step); closing them\n",
+                        (long)s_watch_open);
+                fflush(stderr);
+                InterlockedExchange(&s_watch_open, 0);
+                stuck = 0;
+            }
+        } else {
+            stuck = 0;
+        }
+        pages[0] = g_watch_page;
+        pages[1] = g_watch_alias;
+        for (i = 0; i < 2; i++) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!pages[i] || s_watch_open)
+                continue;
+            if (VirtualQuery(pages[i], &mbi, sizeof mbi)
+                    && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY
+                                       | PAGE_EXECUTE_READWRITE
+                                       | PAGE_EXECUTE_WRITECOPY))) {
+                DWORD old;
+                if (VirtualProtect(pages[i], 4096, PAGE_READONLY, &old))
+                    reset++;
+            }
+        }
+        if (reset && said++ < 8) {
+            fprintf(stderr, "  WATCH: the page protection was taken off"
+                            " (%d view%s); re-armed, value now %08X\n",
+                    reset, reset > 1 ? "s" : "",
+                    *(const uint32_t *)((const uint8_t *)g_memory_offset
+                                        + g_watch_va));
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+#endif
 
 static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 {
@@ -2131,7 +2233,8 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
     if (code == EXCEPTION_SINGLE_STEP && s_watch_stepping) {
         s_watch_stepping = 0;
         watch_report();
-        VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old);
+        watch_protect_pages(PAGE_READONLY);
+        InterlockedDecrement(&s_watch_open);
         ep->ContextRecord->EFlags &= ~0x100u;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -2140,10 +2243,15 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
             && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
         uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
 
-        if (fault >= (uintptr_t)g_watch_page
-                && fault < (uintptr_t)g_watch_page + 4096) {
-            if (!VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old))
+        if ((fault >= (uintptr_t)g_watch_page
+                && fault < (uintptr_t)g_watch_page + 4096)
+            || (g_watch_alias && fault >= (uintptr_t)g_watch_alias
+                && fault < (uintptr_t)g_watch_alias + 4096)) {
+            InterlockedIncrement(&s_watch_open);
+            if (!watch_protect_pages(PAGE_READWRITE)) {
+                InterlockedDecrement(&s_watch_open);
                 return EXCEPTION_CONTINUE_SEARCH;
+            }
             s_watch_stepping = 1;
             ep->ContextRecord->EFlags |= 0x100u;
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -2443,23 +2551,39 @@ static int watch_arm(uint32_t va)
         return 0;
     }
     return 1;
-#endif
+#else
+    /* The same page in the other view of the contiguous pages. */
+    g_watch_alias = NULL;
+    if (g_tiled_view && g_contig_memory) {
+        uint32_t tiled_size = xbox_TiledApertureSize() < XBOX_CONTIG_SIZE
+                            ? (uint32_t)xbox_TiledApertureSize()
+                            : (uint32_t)XBOX_CONTIG_SIZE;
+        if (va >= XBOX_CONTIG_BASE && va - XBOX_CONTIG_BASE < tiled_size)
+            g_watch_alias = (uint8_t *)g_tiled_view + (va - XBOX_CONTIG_BASE);
+        else if (va >= XBOX_TILED_BASE && va - XBOX_TILED_BASE < tiled_size)
+            g_watch_alias = (uint8_t *)g_contig_memory + (va - XBOX_TILED_BASE);
+        g_watch_alias = (void *)((uintptr_t)g_watch_alias & ~(uintptr_t)4095);
+    }
     g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
-    if (!g_watch_veh
-            || !VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old)) {
+    if (!g_watch_veh || !watch_protect_pages(PAGE_READONLY)) {
         if (g_watch_veh) {
             RemoveVectoredExceptionHandler(g_watch_veh);
             g_watch_veh = NULL;
         }
         g_watch_page = NULL;
+        g_watch_alias = NULL;
         fprintf(stderr, "  WATCH: cannot trap 0x%08X; not armed\n",
                 g_watch_va);
         return 0;
     }
+    (void)old;
     fprintf(stderr, "  WATCH: writes to the page of 0x%08X are trapped "
-                    "(current %08X)\n", g_watch_va, g_watch_last);
+                    "(current %08X%s)\n", g_watch_va, g_watch_last,
+            g_watch_alias ? ", both views of the contiguous pages" : "");
     fflush(stderr);
+    CloseHandle(CreateThread(NULL, 0, watch_rearm_thread, NULL, 0, NULL));
     return 1;
+#endif
 }
 
 /* Print the RECOMP_PEEK globals. Shared, because the two moments worth
