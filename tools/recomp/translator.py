@@ -2184,8 +2184,9 @@ class FunctionTranslator:
         # sub_000EEA10 in Wreckless is exactly `bsf eax, ecx; ret`.
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
+        # sahf snapshots the AH image it loads, for the same reason.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg", "inc", "dec")
+                                 "lock cmpxchg", "inc", "dec", "sahf")
                or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")

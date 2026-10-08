@@ -604,9 +604,29 @@ def _make_condition(jcc, flag_setter, flag_ops):
         expr = popfd_map.get(jcc)
         return (f"{expr} /* popfd */", desc) if expr else None
 
-    # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
+    # ── sahf: the flags are the AH image it loaded, snapshotted in _fa ──
+    # Reading g_fp_cmp here instead (the fcomi map below) answered from the
+    # last compare, so a status word from anything else never reached the
+    # branch: after an unordered compare, the CRT fmod's `fprem; fnstsw ax;
+    # sahf; jp loop` spun forever. For a compare-sourced status the answer is
+    # the same, since RECOMP_FCMP_CC encodes C3/C2/C0 as the hardware does.
+    if flag_setter == "sahf":
+        cf, pf, zf, sf = "(_fa & 0x01u)", "(_fa & 0x04u)", "(_fa & 0x40u)", "(_fa & 0x80u)"
+        sahf_map = {
+            "je": zf, "jz": zf, "jne": f"!{zf}", "jnz": f"!{zf}",
+            "jb": cf, "jnae": cf, "jc": cf,
+            "jae": f"!{cf}", "jnb": f"!{cf}", "jnc": f"!{cf}",
+            "jbe": "(_fa & 0x41u)", "jna": "(_fa & 0x41u)",
+            "ja": "!(_fa & 0x41u)", "jnbe": "!(_fa & 0x41u)",
+            "js": sf, "jns": f"!{sf}",
+            "jp": pf, "jpe": pf, "jnp": f"!{pf}", "jpo": f"!{pf}",
+        }
+        expr = sahf_map.get(jcc)
+        return (f"{expr} /* sahf */", desc) if expr else None
+
+    # ── FPU compare-to-EFLAGS: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
-                        "fucomip", "fcomi", "sahf"):
+                        "fucomip", "fcomi"):
         # g_fp_cmp is -1 less, 0 equal, 1 greater, 2 unordered. An
         # unordered compare sets ZF, PF and CF all three, so it reads as
         # below AND equal AND parity. Comparing g_fp_cmp against 0 made 2 look
@@ -1635,7 +1655,13 @@ class Lifter:
         if m == "lahf":
             return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
         if m == "sahf":
-            return ["/* sahf - store AH to flags */"]
+            # Snapshot AH where sahf runs: the jcc after it reads CF/PF/ZF/SF
+            # from _fa (see _make_condition), so it sees the status word fnstsw
+            # stored -- C2 from fxam, a trig op or fprem as well as a compare.
+            out = ["_fa = (eax >> 8) & 0xFFu; /* sahf */"]
+            if self.needs_cf:
+                out.append("_cf = (int)(_fa & 1u);")
+            return out
         if m == "shld":
             return self._lift_shld(insn, ops)
         if m == "shrd":
@@ -1660,7 +1686,8 @@ class Lifter:
                 address = "ebx + LO8(eax)"
             return [f"SET_LO8(eax, MEM8({address})); /* xlatb */"]
         if m in ("sete", "setne", "setb", "setae", "setbe", "seta",
-                 "setl", "setge", "setle", "setg", "sets", "setns"):
+                 "setl", "setge", "setle", "setg", "sets", "setns",
+                 "setp", "setnp"):
             return self._lift_setcc(insn, ops, m)
         if m in ("cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
                  "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns"):
@@ -3770,22 +3797,33 @@ class Lifter:
         # valid_real_matrix4x3: the matrix was built out of tangents that were
         # never computed, so it held whatever had been in those globals before.
         #
-        # These are exact-enough mappings onto libm. The 80-bit intermediates of
-        # real x87 are not reproduced -- fp_stack is double -- which is the same
-        # approximation every other op here already makes.
+        # The trig ops go through runtime helpers (recomp_types.h, "x87 FSIN,
+        # FCOS, FSINCOS and FPTAN") rather than libm: the x87 reduces with a
+        # 66-bit pi, so for |x| > pi/4 it returns f(x * pi / pi66), which drifts
+        # from libm's f(x) as x grows (cos(1e10) differs in the 11th digit), and
+        # for |x| >= 2^63 it leaves st0 alone, pushes nothing and sets C2. The
+        # helpers write C2 and return whether the op completed, so the FSINCOS
+        # and FPTAN pushes are conditional at run time. No RECOMP_FP_PC here,
+        # unlike fsqrt above: precision control narrows only add, sub, mul,
+        # div and sqrt, and the transcendentals always deliver 64 bits. The
+        # 80-bit intermediates are not reproduced -- fp_stack is double -- which
+        # is the same approximation every other op here makes.
         if m == "fsin":
-            return [f"fp_top() = sin(fp_top()); /* fsin */"]
+            return ["recomp_x87_fsin(&fp_top(), &g_fp_cc); /* fsin */"]
         if m == "fcos":
-            return [f"fp_top() = cos(fp_top()); /* fcos */"]
+            return ["recomp_x87_fcos(&fp_top(), &g_fp_cc); /* fcos */"]
         if m == "fsincos":
             # Replaces st0 with sin, then pushes cos. Order matters: the push
             # must see the sine already stored.
-            return [f"{{ double _a = fp_top(); fp_top() = sin(_a);"
-                    f" fp_push(cos(_a)); }} /* fsincos */"]
+            return ["{ double _c; if (recomp_x87_fsincos(&fp_top(), &_c, &g_fp_cc))"
+                    " fp_push(_c); } /* fsincos */"]
         if m == "fptan":
             # st0 = tan(st0), then push 1.0. The constant push is not decoration:
-            # callers use it as the denominator of a subsequent fdiv.
-            return [f"{{ fp_top() = tan(fp_top()); fp_push(1.0); }} /* fptan */"]
+            # callers use it as the denominator of a subsequent fdiv. For an inf
+            # or NaN operand the hardware pushes the NaN instead, so the helper
+            # hands back what to push.
+            return ["{ double _p; if (recomp_x87_fptan(&fp_top(), &_p, &g_fp_cc))"
+                    " fp_push(_p); } /* fptan */"]
         if m == "fpatan":
             # st1 = atan2(st1, st0), pop. Argument order is st1 over st0.
             return [f"{{ fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); }}"
@@ -3803,8 +3841,13 @@ class Lifter:
             # Both leave the remainder in st0 and clear C2 to say "complete".
             # fprem truncates toward zero, fprem1 rounds to nearest (IEEE), which
             # is the difference between fmod and remainder.
+            # C2 has to be written, not just described: the CRT's fmod and its
+            # trig fallback loop `fprem; fnstsw ax; sahf; jp` until C2 clears,
+            # and an out-of-range fsin before it leaves C2 set. The quotient
+            # bits in C0/C3/C1 are not modelled.
             fn = "fmod" if m == "fprem" else "remainder"
-            return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */"]
+            return [f"fp_top() = {fn}(fp_top(), fp_st1());"
+                    f" g_fp_cc &= (uint16_t)~0x0400u; /* {m} */"]
         if m == "fscale":
             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
         if m == "frndint":
@@ -4076,9 +4119,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
+        # setp/setnp read PF, which is how `fnstsw ax; sahf; setp al` turns
+        # C2 into a value; every setter's PF already has a jp/jnp rule.
         if (curr.mnemonic in ("sete", "setne", "setb", "setae", "setbe",
                               "seta", "setl", "setge", "setle", "setg",
-                              "sets", "setns")
+                              "sets", "setns", "setp", "setnp")
                 and last_flag_setter and len(curr.operands) >= 1):
             cond = _make_setcc_value(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
