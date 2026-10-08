@@ -954,20 +954,25 @@ static void metal_on_clear(uint32_t param)
             [s_enc setViewport:vp];
             [s_enc setScissorRect:sr];
             [s_enc setFragmentBytes:fc length:sizeof fc atIndex:0];
-            /* A clear is not a zpass sample: no counting for this draw. */
+            /* A clear is not a zpass sample: no counting for this draw. Metal
+             * sets a visibility offset once per pass, so counting cannot
+             * resume at the same slot: the pass ends, and the next draw's
+             * pass takes a new slot in the query (occ_pass_begin), as a
+             * query spanning passes does. */
             if (s_occ_slot >= 0)
                 [s_enc setVisibilityResultMode:MTLVisibilityResultModeDisabled
                                         offset:(NSUInteger)s_occ_slot * 8u];
             [s_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-            if (s_occ_slot >= 0)
-                [s_enc setVisibilityResultMode:MTLVisibilityResultModeCounting
-                                        offset:(NSUInteger)s_occ_slot * 8u];
-            /* Draws never set a scissor: the whole target again. */
-            sr.x = 0;
-            sr.y = 0;
-            sr.width = rt->hw;
-            sr.height = rt->hh;
-            [s_enc setScissorRect:sr];
+            if (s_occ_slot >= 0) {
+                end_encoder();
+            } else {
+                /* Draws never set a scissor: the whole target again. */
+                sr.x = 0;
+                sr.y = 0;
+                sr.width = rt->hw;
+                sr.height = rt->hh;
+                [s_enc setScissorRect:sr];
+            }
         }
         s_partial_clears++;
     }

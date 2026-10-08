@@ -23,7 +23,10 @@
  * the CPU path and on Metal, the whole frame compared: a clear bounded by its
  * clip, one bounded by SET_CLEAR_RECT, a target grown from 320x240 to
  * 640x480 (contents kept, margin seeded from the guest bytes, at scale 1 and
- * 2), and a flip of a grown target showing only the 320x240 frame.
+ * 2), and a flip of a grown target showing only the 320x240 frame. The CPU
+ * halves of the first two also run before the backend check, for a Mac run
+ * without the Metal backend; Proton's check is d3d11_backend_smoke's
+ * cpu_clip_cases (this test builds on macOS only).
  *
  * Then render-target ownership (rt-stale-alias, Metal): a target the title
  * rewrote from the CPU samples the new texels and is not written back; one
@@ -69,6 +72,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 
 #include "d3d8_swizzle.h"
 #include "nv2a_pb_state.h"
@@ -99,6 +103,7 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define BUF2      0x01258000u   /* the render.scale 2 case: a new target */
 #define BUF3      0x01600000u   /* clip_cases' grow: clear of every other buffer */
 #define BUF4      0x01740000u   /* and its render.scale 2 twin */
+#define REPORT    0x00F00000u   /* occ_case's report: GET_REPORT takes 24 bits */
 #define TEX_GUEST 0x02800000u   /* 64x64 swizzled A8R8G8B8, then YUY2 64x32 */
 #define RTT0      0x01400000u   /* 64x64 render-to-texture targets, pitch 256 */
 #define RTT1      0x01500000u
@@ -614,6 +619,8 @@ static int alias_cases(const struct nv2a_pb_backend *b)
     return f;
 }
 
+#endif
+
 /* ---- clip extents (metal-present-mirror) ------------------------------------ */
 
 #define PATTERN 0xFFFF00FFu
@@ -684,9 +691,11 @@ static void fill(uint32_t buf, uint32_t argb)
 }
 
 /* The pixels each clip case must show, on both paths. */
-static const struct probe s_clip_probe[4][4] = {
+/* The clear rect's (339,339) and (340,339) pin its inclusive max edge. */
+static const struct probe s_clip_probe[4][6] = {
     {{50, 50, 0xFFFF0000u}, {150, 150, 0xFF0000FFu}, {300, 300, 0xFFFF0000u}, {0}},
-    {{320, 320, 0xFF00FF00u}, {350, 350, 0xFFFF0000u}, {299, 320, 0xFFFF0000u}, {0}},
+    {{320, 320, 0xFF00FF00u}, {350, 350, 0xFFFF0000u}, {299, 320, 0xFFFF0000u},
+     {339, 339, 0xFF00FF00u}, {340, 339, 0xFFFF0000u}, {0}},
     {{100, 100, 0xFFFF0000u}, {400, 300, 0xFF00FF00u}, {400, 100, PATTERN}, {100, 300, PATTERN}},
     {{100, 100, 0xFFFF0000u}, {400, 300, 0xFF00FF00u}, {400, 100, PATTERN}, {100, 300, PATTERN}},
 };
@@ -695,7 +704,7 @@ static const char *const s_clip_name[4] = {"clip clear", "clear rect", "grow", "
 static int clip_probes(int cc, const char *path, const uint32_t *px)
 {
     int k, ok = 1;
-    for (k = 0; k < 4 && s_clip_probe[cc][k].argb; k++) {
+    for (k = 0; k < 6 && s_clip_probe[cc][k].argb; k++) {
         const struct probe *p = &s_clip_probe[cc][k];
         uint32_t got = px[p->y * W + p->x] | 0xFF000000u;
         int hit = got == p->argb;
@@ -706,6 +715,29 @@ static int clip_probes(int cc, const char *path, const uint32_t *px)
     return ok;
 }
 
+/* The CPU halves of the clip clear and clear rect cases, before the backend
+ * check: the CPU path's clear box (nv2a_clear_box) needs no GPU, so a Mac run
+ * without the Metal backend still checks it. On a Metal run clip_cases
+ * repeats them. Proton never builds this test; its check is
+ * d3d11_backend_smoke's cpu_clip_cases. Returns the failures. */
+static int clip_cpu_cases(void)
+{
+    static uint32_t px[W * H];
+    int cc, f = 0;
+
+    nv2a_pb_set_backend(nv2a_pb_cpu_backend());
+    for (cc = CC_CLIP; cc <= CC_RECT; cc++) {
+        fill(BUF0, PATTERN);
+        clip_stream(cc);
+        memcpy(px, guest(BUF0), W * H * 4);
+        f += !clip_probes(cc, "cpu", px);
+    }
+    surf_clip(BUF0, 0, 0, W, H);
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+
+#ifdef __APPLE__
 /* Each case's stream on the CPU path (guest memory) and on Metal (its host
  * pixels, box-filtered at scale 2; no flip, so nothing is written back),
  * compared whole. The grow cases' guest bytes are the pattern before each
@@ -799,6 +831,54 @@ static int clip_cases(const struct nv2a_pb_backend *b, uint32_t *cpu, uint32_t *
     }
     surf_clip(BUF0, 0, 0, W, H);
     nv2a_pb_set_backend(NULL);
+    return f;
+}
+
+/* A visibility test spanning a partial clear: two 100x100 quads counted,
+ * a 50x50 clip cleared between them. Metal sets a visibility offset once per
+ * pass, so the clear ends the counting pass and the second quad counts in a
+ * new one (metal_on_clear); the clear itself is not a sample. Metal must
+ * count the 20000 pixels the quads cover. The CPU walker's count is printed,
+ * not checked: it counts 101 rows a quad (20200), a fidelity gap of its own
+ * (TASKS: occlusion count semantics). Returns the failures. */
+static int occ_case(const struct nv2a_pb_backend *b)
+{
+    static const uint32_t white[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    volatile uint32_t *r = (volatile uint32_t *)guest(REPORT);
+    uint32_t count[2] = {0, 0};
+    int k, a, f = 0;
+
+    for (k = 0; k < 2; k++) {
+        const struct nv2a_pb_backend *cur = k ? b : nv2a_pb_cpu_backend();
+        nv2a_pb_set_backend(cur);
+        surf_clip(BUF0, 0, 0, W, H);
+        clear_to(0xFF000000u);
+        for (a = 0; a < 16; a++)
+            M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+        r[3] = 0xFFFFFFFFu;
+        M(0x17C8, 1);                          /* CLEAR_REPORT_VALUE */
+        M(0x17CC, 1);                          /* ZPASS_PIXEL_COUNT_ENABLE */
+        quad_uv(100.0f, 100.0f, 200.0f, 200.0f, white, NULL);
+        surf_clip(BUF0, 300, 300, 50, 50);
+        clear_to(0xFF0000FFu);
+        surf_clip(BUF0, 0, 0, W, H);
+        quad_uv(400.0f, 100.0f, 500.0f, 200.0f, white, NULL);
+        M(0x17CC, 0);
+        M(0x17D0, (1u << 24) | REPORT);        /* GET_REPORT */
+        M(0x0210, BUF1);
+        M(0x0130, 0);                          /* FLIP_STALL: the GPU done */
+        for (a = 0; a < 2000 && r[3]; a++) {   /* at most 2 s */
+            if (cur->on_poll)
+                cur->on_poll();
+            if (r[3])
+                usleep(1000);
+        }
+        count[k] = r[3] ? 0xFFFFFFFFu : r[2];
+    }
+    nv2a_pb_set_backend(NULL);
+    f = count[1] != 20000u;
+    fprintf(stderr, "[backend-smoke] occlusion across a partial clear: gpu %u (want 20000)"
+            " %s; cpu %u\n", count[1], f ? "FAIL" : "PASS", count[0]);
     return f;
 }
 
@@ -947,6 +1027,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "[backend-smoke] FAIL: index limit\n");
         failures++;
     }
+    /* So is the CPU clear box. */
+    if (!guard && !noalias && clip_cpu_cases()) {
+        fprintf(stderr, "[backend-smoke] FAIL: CPU clip clear or clear rect\n");
+        failures++;
+    }
 #ifdef __APPLE__
     if (!strcasecmp(which, "metal"))
         gpu = nv2a_pb_metal_backend();
@@ -1010,6 +1095,7 @@ int main(int argc, char **argv)
         if (f)
             fprintf(stderr, "[backend-smoke] FAIL: %d clip-extent cases\n", f);
         failures += f;
+        failures += occ_case(gpu);
     }
     if (gpu == nv2a_pb_metal_backend() && run(nv2a_pb_cpu_backend(), SC_CLEAR_QUAD, cpu_px, 0)) {
         int f = writeback_cases(gpu, cpu_px, gpu_px);

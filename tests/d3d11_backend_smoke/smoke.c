@@ -12,6 +12,9 @@
  * Then render-target ownership (rt-stale-alias): a target whose guest
  * memory the title rewrote from the CPU is sampled as the new texels, and
  * one left alone still as its rendered image.
+ * Then the CPU path's clip clear and clear rect (nv2a_clear_box) in guest
+ * memory, the CPU halves of clip_cases: no other Proton test clears on the
+ * CPU path.
  * Then index batches (pb-index-batch-cap), as nv2a_backend_smoke's bigidx
  * and elem32: a quad list of 4800 ARRAY_ELEMENT16 indices whose quads from
  * index 4096 on have their own colour, and a triangle list whose odd last
@@ -25,6 +28,7 @@
  */
 #include <windows.h>
 #include "recomp_env.h"
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +43,7 @@ uint32_t nv2a_pb_d3d11_pixel(uint32_t offset, int x, int y);
 uint32_t nv2a_pb_d3d11_back_pixel(int x, int y);
 int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
                         uint32_t *sw, uint32_t *sh);
+ptrdiff_t xbox_GetMemoryOffset(void);
 
 /* The kernel library expects these from the title's generated code. */
 void *recomp_lookup(ULONG address) { (void)address; abort(); }
@@ -489,6 +494,49 @@ static int clip_cases(const uint32_t *buf)
     M(0x0200, 640u << 16);
     M(0x0204, 480u << 16);
     M(0x0210, buf[0]);
+    return f;
+}
+
+/* clip_cases' two clears on the CPU path, read from guest memory: the
+ * clear covers its clip, then only its clear rect, whose max edge is
+ * inclusive ((339,339) green, (340,339) red). Run last: it rewrites the back
+ * buffer's bytes under the D3D11 target. Returns the failures. */
+static int cpu_clip_cases(uint32_t buf)
+{
+    static const struct { uint32_t x, y, argb; } want[6] = {
+        {50, 50, 0xFFFF0000u}, {150, 150, 0xFF0000FFu},   /* clip clear */
+        {320, 320, 0xFF00FF00u}, {350, 350, 0xFFFF0000u}, /* clear rect */
+        {339, 339, 0xFF00FF00u}, {340, 339, 0xFFFF0000u},
+    };
+    const struct nv2a_pb_backend *b = nv2a_pb_get_backend();
+    const uint8_t *g;
+    uint32_t c[6];
+    int f = 0, k;
+
+    nv2a_pb_set_backend(nv2a_pb_cpu_backend());
+    g = (const uint8_t *)xbox_GetMemoryOffset() + nv2a_pb_dma_resolve(buf);
+    surf_clear(buf, 640, 480, 0xFFFF0000u);
+    M(0x0200, (160u << 16) | 100u);
+    M(0x0204, (120u << 16) | 100u);
+    M(0x1D90, 0xFF0000FFu);
+    M(0x1D94, 0xF0);
+    for (k = 0; k < 2; k++)
+        c[k] = *(const uint32_t *)(g + want[k].y * 2560u + want[k].x * 4u);
+    surf_clear(buf, 640, 480, 0xFFFF0000u);
+    M(0x1D98, (339u << 16) | 300u);
+    M(0x1D9C, (339u << 16) | 300u);
+    M(0x1D90, 0xFF00FF00u);
+    M(0x1D94, 0xF0);
+    M(0x1D98, (639u << 16) | 0u);   /* back to the whole surface */
+    M(0x1D9C, (479u << 16) | 0u);
+    for (k = 2; k < 6; k++)
+        c[k] = *(const uint32_t *)(g + want[k].y * 2560u + want[k].x * 4u);
+    for (k = 0; k < 6; k++) {
+        fprintf(stderr, "[backend-smoke] cpu clip clear %d: 0x%08X (want 0x%08X) %s\n", k,
+                c[k], want[k].argb, c[k] == want[k].argb ? "PASS" : "FAIL");
+        f += c[k] != want[k].argb;
+    }
+    nv2a_pb_set_backend(b);
     return f;
 }
 
@@ -1019,6 +1067,10 @@ int main(int argc, char **argv)
     if (index_cases(buf)) {
         fprintf(stderr, "[backend-smoke] FAIL: index batches\n");
         return 4;
+    }
+    if (cpu_clip_cases(buf[0])) {
+        fprintf(stderr, "[backend-smoke] FAIL: CPU clip clear or clear rect\n");
+        return 6;
     }
     fprintf(stderr, "[backend-smoke] done\n");
     return 0;
