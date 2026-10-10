@@ -72,7 +72,14 @@ def test_arms_below_the_base():
                          "negative-index table")
 
 
+def test_negated_index_includes_slot_zero():
+    # neg ecx; jmp [ecx*4 + TABLE+8] -- slots 0, -1, -2; slot 0 is the base
+    _assert_local_switch(_translate(_image(b"\xF7\xD9", TABLE + 8)),
+                         "negated-index table")
+
+
 if __name__ == "__main__":
     test_index_starts_at_one()
     test_arms_below_the_base()
+    test_negated_index_includes_slot_zero()
     print("ok")

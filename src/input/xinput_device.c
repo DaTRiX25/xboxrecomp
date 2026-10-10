@@ -13,6 +13,7 @@
 #include "recomp_env.h"
 #include "input_map.h"
 #include "keyboard.h"
+#include <math.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -144,6 +145,32 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
     return ERROR_SUCCESS;
 }
 
+/* The title's motor speeds were written for the Duke/S pad's motors; a
+ * DualShock or the Deck's haptics barely move at the low values Burnout 3
+ * decays through (18349 at an impact, then 5734, 1791...). A square-root
+ * curve keeps zero at zero and full at full but lifts the middle, the way
+ * the console motors' start-up threshold made small speeds felt.
+ * RECOMP_INPUT_RUMBLE_GAIN scales it; "linear" passes the values through. */
+static Uint16 rumble_level(WORD speed)
+{
+    static int init, linear;
+    static double gain = 1.0;
+    double f;
+
+    if (!init) {
+        const char *g = recomp_env(RENV_INPUT_RUMBLE_GAIN);
+        if (g && !strcmp(g, "linear"))
+            linear = 1;
+        else if (g && atof(g) > 0.0)
+            gain = atof(g);
+        init = 1;
+    }
+    if (!speed || linear)
+        return speed;
+    f = gain * sqrt(speed / 65535.0);
+    return f >= 1.0 ? 65535 : (Uint16)(f * 65535.0);
+}
+
 static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
 {
     SDL_GameController *c = g_pads[port];
@@ -153,7 +180,8 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
     /* SDL rumble needs a duration. The USB pad (usb_gamepad.c) re-issues a
      * held rumble every 150 ms, so 300 ms bridges one refresh and a lost
      * stop report ends within a third of a second. 0 stops it. */
-    SDL_GameControllerRumble(c, v->wLeftMotorSpeed, v->wRightMotorSpeed,
+    SDL_GameControllerRumble(c, rumble_level(v->wLeftMotorSpeed),
+                             rumble_level(v->wRightMotorSpeed),
                              (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 300 : 0);
     return ERROR_SUCCESS;
 }

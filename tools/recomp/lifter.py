@@ -2733,7 +2733,16 @@ class Lifter:
             return skipped
         below = self._leading_arms(self._read_jump_table_backward(table_va - 4))
         if len(below) >= 2:
-            return below
+            # Slot 0 belongs to this table too when it is an arm. memcpy's
+            #
+            #     neg  ecx                 ; 0..-7
+            #     jmp  [ecx*4 + UnwindVec]
+            #
+            # indexes from the base downward, so ecx == 0 lands on the base
+            # entry itself. Dropping it sent every copy with that remainder
+            # to an unresolvable tail jump: memcpy returned early, skipping
+            # its trailing bytes and its pop esi / pop edi epilogue.
+            return below + inside
         return []
 
     def _leading_arms(self, targets):
