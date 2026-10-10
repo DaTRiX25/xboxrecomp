@@ -211,7 +211,7 @@ static void *waiter_main(void *arg)
             }
             __atomic_store_n(&s_vbl_ns, t, __ATOMIC_RELEASE);
             if (s_csv)
-                fprintf(s_csv, "%llu,display,%llu\n", (unsigned long long)next,
+                fprintf(s_csv, "%llu,display,%llu,\n", (unsigned long long)next,
                         (unsigned long long)t);
             prev_t = t;
             next++;
@@ -437,7 +437,7 @@ int fbv_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
     {
         const char *csv = recomp_env(RENV_VK_PRESENT_LOG);
         if (csv && strcmp(csv, "1") && (s_csv = fopen(csv, "w")) != NULL)
-            fprintf(s_csv, "id,event,t_ns\n");
+            fprintf(s_csv, "id,event,t_ns,flip\n");   /* t_ns: CLOCK_MONOTONIC */
     }
     if (C->present_wait)
         s_wait_present = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(C->dev,
@@ -770,8 +770,8 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         pthread_mutex_lock(&s_id_mu);
         s_present_id++;
         if (s_csv)
-            fprintf(s_csv, "%llu,present,%llu\n", (unsigned long long)s_present_id,
-                    (unsigned long long)t);
+            fprintf(s_csv, "%llu,present,%llu,%u\n", (unsigned long long)s_present_id,
+                    (unsigned long long)t, flip);
         pthread_cond_broadcast(&s_sc_cv);
         pthread_mutex_unlock(&s_id_mu);
     }

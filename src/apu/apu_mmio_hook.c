@@ -232,6 +232,7 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 
 #endif /* _WIN32 */
 
+#include "../platform/mmio_decode.h"   /* MMIO_POSIX_TRAP */
 #if defined(MMIO_POSIX_TRAP)
 /* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
  * (src/platform/mmio_decode_a64.h); x86-64 Linux with the x86 one

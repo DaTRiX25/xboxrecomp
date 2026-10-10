@@ -94,7 +94,9 @@ else()
                          ${CMAKE_CURRENT_BINARY_DIR}/d3d8_glsl_split)
         get_target_property(_xr_glslang_type glslang::glslang TYPE)
         if(_xr_glslang_type STREQUAL "STATIC_LIBRARY")
-            target_link_libraries(xbox_d3d8 PUBLIC stdc++ m)
+            # Its config names SPIRV-Tools-opt but not what that needs
+            # (SPIRV-Tools), and GNU ld wants them after it, in order.
+            target_link_libraries(xbox_d3d8 PUBLIC SPIRV-Tools-opt SPIRV-Tools stdc++ m pthread)
         endif()
     endif()
     if(APPLE)

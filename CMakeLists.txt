@@ -108,4 +108,16 @@ target_link_libraries(xboxrecomp INTERFACE
 if(XBOXRECOMP_ENHANCE)
     target_link_libraries(xboxrecomp INTERFACE xbox_enhance)
 endif()
+# GNU ld reads an archive once, in order, and the runtime's libraries call
+# each other both ways: the kernel's bridge calls into the window and the
+# movie player (xbox_video), its fault path into the APU hook (xbox_apu),
+# the executor into the GPU backends (xbox_d3d8). macOS ld64 and lld resolve
+# that by themselves; for GNU ld the edges are declared, and CMake repeats
+# the cycle of static libraries on the link line (the native Linux / Steam
+# Deck build). dladdr is in libdl before glibc 2.34 (the Steam Runtime's).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(xbox_kernel PUBLIC xbox_video xbox_apu xbox_d3d8 ${CMAKE_DL_LIBS})
+    set_property(TARGET xbox_kernel xbox_video xbox_apu xbox_d3d8
+                 PROPERTY LINK_INTERFACE_MULTIPLICITY 3)
+endif()
 
