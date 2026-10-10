@@ -84,6 +84,11 @@ static int s_toggle_n, s_toggle_i;
 static uint32_t s_t0_ms;
 /* RECOMP_OVERLAY=file=<path>: the overlay toggles whenever that file appears
  * (and removes it), for driving it from a script that knows when. */
+/* RECOMP_OVERLAY=aa_cycle=<s>: the anti-aliasing setting steps off, FXAA,
+ * SMAA, off ... every <s> seconds, through the settings (the live switch
+ * under test, with no pad to press). */
+static uint32_t s_cycle_ms, s_cycle_next;
+static int s_cycle_i;
 static char s_trigger[512];
 static uint32_t s_trigger_next;
 
@@ -108,7 +113,7 @@ static const char *const n_filter[]    = { "Nearest", "Linear", "Integer", NULL 
 static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", NULL };
 static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the sides)", NULL };
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
-static const char *const n_aa[]        = { "Off", "FXAA", "SMAA (coming soon)", NULL };
+static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
 
@@ -120,7 +125,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_FIT */        { "Present fit", "Fill the window's height on a 16:10 screen.", 1, FMT_PLAIN, n_fit, 0 },
     /* XS_GRAPHICS_RENDER_SCALE */ { "Render scale", "Internal resolution, a multiple of the Xbox's.", 1, FMT_TIMES, NULL, 0 },
     /* XS_GRAPHICS_ANISO */    { "Anisotropic filtering", "Sharper textures at a slant, the road ahead. Costs GPU time.", 1, FMT_PLAIN, n_aniso, 0 },
-    /* XS_GRAPHICS_AA */       { "Anti-aliasing", "Smooths jagged edges after the frame is drawn. FXAA is one cheap pass.", 1, FMT_PLAIN, n_aa, 1u << 2 },
+    /* XS_GRAPHICS_AA */       { "Anti-aliasing", "Smooths jagged edges after the frame is drawn. FXAA is one cheap pass; SMAA is three, and cleaner.", 1, FMT_PLAIN, n_aa, 0 },
     /* XS_GRAPHICS_SHARPEN */  { "Sharpening", "Contrast-adaptive sharpening (AMD CAS), against the softness of the anti-aliasing and the scale-up.", 0.05, FMT_PERCENT, NULL, 0 },
     /* XS_AUDIO_VOLUME */       { "Master volume", "The game's sound level.", 0.05, FMT_PERCENT, NULL, 0 },
     /* XS_AUDIO_MUTE */         { "Mute", "No sound.", 1, FMT_PLAIN, NULL, 0 },
@@ -556,6 +561,11 @@ void xbox_OverlayPoll(void)
         hot_toggle();
     }
 
+    if (s_cycle_ms && (int32_t)(now_ms() - s_cycle_next) >= 0) {
+        s_cycle_next = now_ms() + s_cycle_ms;
+        s_cycle_i = (s_cycle_i + 1) % 3;
+        xbox_SettingSet(XS_GRAPHICS_AA, s_cycle_i);
+    }
     if (s_trigger[0] && (int32_t)(now_ms() - s_trigger_next) >= 0) {
         s_trigger_next = now_ms() + 200;
         if (unlink(s_trigger) == 0)
@@ -617,6 +627,10 @@ int xbox_OverlaySetWindow(SDL_Window *win)
             s_toggle_ms[s_toggle_n++] = (uint32_t)(sec * 1000.0);
             q = *end == ',' ? end + 1 : end;
         }
+    }
+    if (e && !strncmp(e, "aa_cycle=", 9)) {
+        s_cycle_ms = (uint32_t)(atof(e + 9) * 1000.0);
+        s_cycle_next = now_ms() + s_cycle_ms;
     }
     if (e && !strncmp(e, "file=", 5))
         snprintf(s_trigger, sizeof s_trigger, "%s", e + 5);
@@ -744,14 +758,19 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
         pres_ms = now;
     }
 
-    const float w = fs * 15.0f, h = fs * 6.4f, pad = fs * 0.6f;
+    char l1[128], l2[128];
+    snprintf(l1, sizeof l1, "%.1f fps   %.1f ms", fps, last);
+    snprintf(l2, sizeof l2, "p50 %.1f  p99 %.1f  max %.1f ms   window %.0f/s", p50, p99, mx, pres_rate);
+    /* The panel is as wide as its longer line: a fixed width left the stats
+     * line running past the backdrop at larger values (a 100+ ms max). */
+    const float pad = fs * 0.6f, h = fs * 6.4f;
+    float tw = ImGui::CalcTextSize(l1).x, tw2 = ImGui::CalcTextSize(l2).x;
+    if (tw2 > tw) tw = tw2;
+    const float w = tw + 2 * pad > fs * 15.0f ? tw + 2 * pad : fs * 15.0f;
     ImVec2 a = origin, b(origin.x + w, origin.y + h);
     dl->AddRectFilled(a, b, IM_COL32(8, 8, 10, 200), fs * 0.5f);
-    char buf[128];
-    snprintf(buf, sizeof buf, "%.1f fps   %.1f ms", fps, last);
-    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f), IM_COL32(255, 255, 255, 255), buf);
-    snprintf(buf, sizeof buf, "p50 %.1f  p99 %.1f  max %.1f ms   window %.0f/s", p50, p99, mx, pres_rate);
-    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + fs * 1.15f), IM_COL32(190, 190, 195, 255), buf);
+    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f), IM_COL32(255, 255, 255, 255), l1);
+    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + fs * 1.15f), IM_COL32(190, 190, 195, 255), l2);
 
     /* Bars: the last 120 flip intervals against a 50 ms ceiling; the line
      * is one frame at 60 Hz. */

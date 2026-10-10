@@ -54,6 +54,18 @@ one neutral-dialect source for MSL and GLSL) at the game's internal
 resolution, after the frame is final and before the scale to the window; the
 overlay is drawn after them.
 
+SMAA 1x is the reference implementation (`third_party/smaa`, MIT) at its
+HIGH preset: edge detection by luma, blending weights from the area and
+search tables, neighbourhood blending: three passes in place of FXAA's one.
+`src/video/smaa.c` gives both presenters the same source (GLSL as it is;
+for Metal a few exact text substitutions, checked at run time). A target
+exists only while its setting is on (made at the first frame that needs it,
+freed when none does), so switching live costs nothing while it is off.
+`RECOMP_TRACE=post_gpu` prints each pass's GPU time every 300 presents
+(Metal: the pass's own command buffer; Vulkan: timestamp queries, which a
+tile-based GPU such as MoltenVK's does not give meaningfully). The
+`aa_cycle=<s>` form of `RECOMP_OVERLAY` steps the setting for such a test.
+
 ## Settings
 
 Each is one RECOMP_* knob. Precedence, high to low: the environment, then
@@ -82,7 +94,7 @@ title's defaults when those change. Keys it does not know are kept.
 | `display.fit` (`letterbox`, `fill16x10`) | `RECOMP_PRESENT_FIT` | yes |
 | `graphics.render_scale` | `RECOMP_RENDER_SCALE` | restart |
 | `graphics.aniso` (`off`, `2x` .. `16x`) | `RECOMP_GFX_ANISO` | yes (the sampler caches key on the level) |
-| `graphics.aa` (`off`, `fxaa`, `smaa`) | `RECOMP_GFX_AA` | yes; SMAA is not built yet |
+| `graphics.aa` (`off`, `fxaa`, `smaa`) | `RECOMP_GFX_AA` | yes |
 | `graphics.sharpen` (0..1) | `RECOMP_GFX_SHARPEN` | yes |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |

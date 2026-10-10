@@ -22,6 +22,8 @@
  * the subpixel and edge thresholds of its default (0.75, 0.125, 0.0312).
  * Written here from the algorithm, not from the header.
  *
+ * SMAA is not here: it is the reference's own source (smaa.h, smaa.c).
+ *
  * CAS is AMD FidelityFX Contrast Adaptive Sharpening (MIT): a cross filter
  * whose negative lobe shrinks where the neighbourhood is already contrasty.
  */

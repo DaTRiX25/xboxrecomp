@@ -93,6 +93,23 @@ MIT — Dear ImGui
   in-game settings overlay (src/overlay).
 
 
+MIT - SMAA
+-----------
+
+  https://github.com/iryoku/smaa (reference implementation, commit 71c806a)
+
+  third_party/smaa/: SMAA.hlsl, the area and search lookup textures
+  (AreaTex.h, SearchTex.h) and LICENSE.txt, unmodified. (c) 2013 Jorge
+  Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro, Diego Gutierrez.
+  The licence notice is kept in each copy of the source (src/video/
+  smaa_hlsl.inc carries it); it need not accompany binaries. Used by the
+  window presenters' SMAA 1x pass (src/video/smaa.c).
+
+Also in the presenters: AMD FidelityFX CAS (MIT, the algorithm in
+src/video/post_shaders.h) and FXAA (NVIDIA's FXAA 3.11 algorithm, written
+here from the paper).
+
+
 Reference material (no code taken)
 -----------------------------------
 

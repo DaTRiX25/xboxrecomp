@@ -48,6 +48,7 @@
 #include "fb_present_metal.h"
 #include "latency_trace.h"
 #include "post_shaders.h"
+#include "smaa.h"
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
 #include "overlay.h"
 #include "overlay_metal.h"
@@ -69,6 +70,11 @@ static id<MTLCommandQueue>         s_queue;
 static id<MTLRenderPipelineState>  s_pso;
 static id<MTLRenderPipelineState>  s_pso_fxaa, s_pso_cas;   /* post passes */
 static id<MTLTexture>              s_pp[2];                  /* their targets */
+/* SMAA (smaa.h): made at the first use, its textures only while it is on. */
+static id<MTLRenderPipelineState>  s_pso_sm[3];              /* edges, weights, blend */
+static int                         s_smaa_state;             /* 0 untried, 1 ready, -1 failed */
+static id<MTLTexture>              s_sm_tex[2];              /* edges RG8, weights RGBA8 */
+static id<MTLTexture>              s_sm_lut[2];              /* area RG8, search R8 */
 static id<MTLSamplerState>         s_smp[2];   /* nearest, linear */
 static SDL_MetalView               s_view;
 static CAMetalLayer               *s_layer;
@@ -331,6 +337,15 @@ void fbm_destroy(void)
         [s_pp[0] release];
         [s_pp[1] release];
         s_pp[0] = s_pp[1] = nil;
+        for (k = 0; k < 3; k++) {
+            [s_pso_sm[k] release];
+            s_pso_sm[k] = nil;
+        }
+        for (k = 0; k < 2; k++) {
+            [s_sm_tex[k] release];
+            [s_sm_lut[k] release];
+            s_sm_tex[k] = s_sm_lut[k] = nil;
+        }
         [s_smp[0] release];
         [s_smp[1] release];
         s_smp[0] = s_smp[1] = nil;
@@ -445,37 +460,237 @@ static void save_shot(id<MTLBuffer> buf, uint32_t w, uint32_t h, const char *pat
 }
 
 /* A post pass's target at w x h, made or re-made at that size. */
-static id<MTLTexture> pp_texture(int n, NSUInteger w, NSUInteger h)
+static id<MTLTexture> target_texture(id<MTLTexture> *slot, MTLPixelFormat fmt, NSUInteger w,
+                                     NSUInteger h)
 {
-    if (!s_pp[n] || [s_pp[n] width] != w || [s_pp[n] height] != h) {
+    if (!*slot || [*slot width] != w || [*slot height] != h) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                         width:w height:h mipmapped:NO];
+            texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
         td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModePrivate;
-        [s_pp[n] release];
-        s_pp[n] = [s_dev newTextureWithDescriptor:td];
+        [*slot release];
+        *slot = [s_dev newTextureWithDescriptor:td];
     }
-    return s_pp[n];
+    return *slot;
 }
 
-/* One full-frame pass: src through pso into dst (same size). */
-static void post_pass(id<MTLCommandBuffer> cb, id<MTLRenderPipelineState> pso,
-                      id<MTLTexture> src, id<MTLTexture> dst, const float *sharp)
+/* RECOMP_TRACE=post_gpu: the GPU time of each pass, from its own command
+ * buffer (the passes are committed one by one while it is on). */
+enum { PT_FXAA, PT_CAS, PT_SM_EDGES, PT_SM_WEIGHTS, PT_SM_BLEND, PT_SCALE, PT_N };
+static const char *const s_pt_name[PT_N] = { "fxaa", "cas", "smaa edges", "smaa weights",
+                                             "smaa blend", "scale+overlay" };
+static double s_pt_sum[PT_N];
+static unsigned s_pt_n[PT_N], s_pt_presents;
+static int s_pt_on = -1;
+
+static int pt_on(void)
+{
+    if (s_pt_on < 0)
+        s_pt_on = recomp_env(RENV_POST_GPU) != NULL;
+    return s_pt_on;
+}
+
+/* The command buffer's GPU time under label `what`; every 300 scales a line. */
+static void pt_watch(id<MTLCommandBuffer> cb, int what)
+{
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        @synchronized ([NSNull null]) {
+            int i;
+            s_pt_sum[what] += c.GPUEndTime - c.GPUStartTime;
+            s_pt_n[what]++;
+            if (what == PT_SCALE && ++s_pt_presents % 300 == 0) {
+                fprintf(stderr, "[PRESENT] post GPU ms (avg of the last 300):");
+                for (i = 0; i < PT_N; i++) {
+                    if (s_pt_n[i])
+                        fprintf(stderr, " %s %.3f", s_pt_name[i],
+                                s_pt_sum[i] * 1000.0 / (double)s_pt_n[i]);
+                    s_pt_sum[i] = 0;
+                    s_pt_n[i] = 0;
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }];
+}
+
+/* One full-frame pass: `src` (up to three textures, all sampled bilinear,
+ * binding k with sampler k) through pso into dst, which is first cleared to
+ * zero when `clear` (SMAA's edge pass discards where there is no edge).
+ * `bytes` is the fragment function's constant at buffer 0. With the trace on
+ * the pass is committed on its own and *cbp moves to a new buffer. */
+static void post_pass(id<MTLCommandBuffer> *cbp, int what, id<MTLRenderPipelineState> pso,
+                      id<MTLTexture> dst, int clear, id<MTLTexture> const *src, int nsrc,
+                      const void *bytes, NSUInteger blen)
 {
     MTLRenderPassDescriptor *pr = [MTLRenderPassDescriptor renderPassDescriptor];
     id<MTLRenderCommandEncoder> pe;
+    int i;
+
     pr.colorAttachments[0].texture = dst;
-    pr.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    pr.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionDontCare;
+    pr.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
     pr.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pe = [cb renderCommandEncoderWithDescriptor:pr];
+    pe = [*cbp renderCommandEncoderWithDescriptor:pr];
     [pe setRenderPipelineState:pso];
-    [pe setFragmentTexture:src atIndex:0];
-    [pe setFragmentSamplerState:s_smp[1] atIndex:0];
-    if (sharp)
-        [pe setFragmentBytes:sharp length:sizeof *sharp atIndex:0];
+    for (i = 0; i < nsrc; i++) {
+        [pe setFragmentTexture:src[i] atIndex:(NSUInteger)i];
+        [pe setFragmentSamplerState:s_smp[1] atIndex:(NSUInteger)i];
+    }
+    if (bytes)
+        [pe setFragmentBytes:bytes length:blen atIndex:0];
     [pe drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [pe endEncoding];
+    if (pt_on()) {
+        pt_watch(*cbp, what);
+        [*cbp commit];
+        *cbp = [s_queue commandBuffer];
+    }
+}
+
+/* SMAA's pipelines and lookup textures, at the first use. 1 when it can run. */
+static int smaa_init(void)
+{
+    static const MTLPixelFormat fmt[3] = { MTLPixelFormatRG8Unorm, MTLPixelFormatRGBA8Unorm,
+                                           MTLPixelFormatBGRA8Unorm };
+    static const char *const fn[3] = { "fs_smaa_edges", "fs_smaa_weights", "fs_smaa_blend" };
+    NSError *e = nil;
+    char *src;
+    id<MTLLibrary> lib;
+    int k;
+
+    if (s_smaa_state)
+        return s_smaa_state > 0;
+    s_smaa_state = -1;
+    src = smaa_msl_source();
+    if (!src) {
+        fprintf(stderr, "[PRESENT] SMAA unavailable: its shader source did not adapt\n");
+        return 0;
+    }
+    lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:src] options:nil error:&e];
+    free(src);
+    if (!lib) {
+        fprintf(stderr, "[PRESENT] SMAA unavailable: %s\n",
+                e ? [[e localizedDescription] UTF8String] : "shader compile failed");
+        return 0;
+    }
+    for (k = 0; k < 3; k++) {
+        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = [[lib newFunctionWithName:@"vs_smaa"] autorelease];
+        pd.fragmentFunction = [[lib newFunctionWithName:[NSString stringWithUTF8String:fn[k]]]
+                               autorelease];
+        pd.colorAttachments[0].pixelFormat = fmt[k];
+        s_pso_sm[k] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        [pd release];
+        if (!s_pso_sm[k]) {
+            fprintf(stderr, "[PRESENT] SMAA unavailable: pipeline %s: %s\n", fn[k],
+                    e ? [[e localizedDescription] UTF8String] : "?");
+            [lib release];
+            return 0;
+        }
+    }
+    [lib release];
+    s_smaa_state = 1;
+    fprintf(stderr, "[PRESENT] SMAA ready (preset high)\n");
+    return 1;
+}
+
+/* SMAA's textures at w x h (the lookup tables once), or all released. */
+static int smaa_textures(NSUInteger w, NSUInteger h)
+{
+    if (!target_texture(&s_sm_tex[0], MTLPixelFormatRG8Unorm, w, h)
+            || !target_texture(&s_sm_tex[1], MTLPixelFormatRGBA8Unorm, w, h))
+        return 0;
+    if (!s_sm_lut[0]) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm
+                                         width:SMAA_AREA_W height:SMAA_AREA_H mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        s_sm_lut[0] = [s_dev newTextureWithDescriptor:td];
+        [s_sm_lut[0] replaceRegion:MTLRegionMake2D(0, 0, SMAA_AREA_W, SMAA_AREA_H) mipmapLevel:0
+                         withBytes:smaa_area_bytes bytesPerRow:SMAA_AREA_W * 2];
+        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                                width:SMAA_SEARCH_W
+                                                               height:SMAA_SEARCH_H mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        s_sm_lut[1] = [s_dev newTextureWithDescriptor:td];
+        [s_sm_lut[1] replaceRegion:MTLRegionMake2D(0, 0, SMAA_SEARCH_W, SMAA_SEARCH_H)
+                       mipmapLevel:0 withBytes:smaa_search_bytes bytesPerRow:SMAA_SEARCH_W];
+    }
+    return s_sm_lut[0] && s_sm_lut[1];
+}
+
+static void smaa_release(void)
+{
+    int k;
+    for (k = 0; k < 2; k++) {
+        [s_sm_tex[k] release];
+        [s_sm_lut[k] release];
+        s_sm_tex[k] = s_sm_lut[k] = nil;
+    }
+}
+
+/* The passes asked for (RECOMP_GFX_AA, RECOMP_GFX_SHARPEN) over `src`, the
+ * slot: FXAA, or SMAA's three, then CAS. Returns what the scale to the
+ * window samples. What a setting not asked for needs is released. */
+static id<MTLTexture> post_chain(id<MTLCommandBuffer> *cbp, id<MTLTexture> src)
+{
+    int aa = nv2a_host_post_aa();
+    float sharp = nv2a_host_sharpen();
+    NSUInteger sw = [src width], sh = [src height];
+    int fx = aa == NV2A_AA_FXAA && s_pso_fxaa;
+    int sm = aa == NV2A_AA_SMAA && smaa_init() && smaa_textures(sw, sh);
+    int cas = sharp > 0.001f && s_pso_cas;
+    float metrics[4] = { 1.0f / (float)sw, 1.0f / (float)sh, (float)sw, (float)sh };
+    static int last_aa = -1;
+    static float last_sharp = -1.0f;
+
+    if (aa != last_aa || sharp != last_sharp) {
+        last_aa = aa;
+        last_sharp = sharp;
+        fprintf(stderr, "[PRESENT] post passes: AA %s, sharpen %.2f (%lux%lu)\n",
+                aa == NV2A_AA_FXAA ? "FXAA" : aa == NV2A_AA_SMAA ? (sm ? "SMAA" : "SMAA (unavailable)")
+                : "off", sharp, (unsigned long)sw, (unsigned long)sh);
+    }
+    if (!sm)
+        smaa_release();
+    if (!fx && !sm && s_pp[0]) {
+        [s_pp[0] release];
+        s_pp[0] = nil;
+    }
+    if (!cas && s_pp[1]) {
+        [s_pp[1] release];
+        s_pp[1] = nil;
+    }
+    if (fx) {
+        id<MTLTexture> dst = target_texture(&s_pp[0], MTLPixelFormatBGRA8Unorm, sw, sh);
+        if (dst) {
+            post_pass(cbp, PT_FXAA, s_pso_fxaa, dst, 0, &src, 1, NULL, 0);
+            src = dst;
+        }
+    } else if (sm) {
+        id<MTLTexture> dst = target_texture(&s_pp[0], MTLPixelFormatBGRA8Unorm, sw, sh);
+        if (dst) {
+            id<MTLTexture> in2[3];
+            in2[0] = src;
+            post_pass(cbp, PT_SM_EDGES, s_pso_sm[0], s_sm_tex[0], 1, in2, 1, metrics, sizeof metrics);
+            in2[0] = s_sm_tex[0];
+            in2[1] = s_sm_lut[0];
+            in2[2] = s_sm_lut[1];
+            post_pass(cbp, PT_SM_WEIGHTS, s_pso_sm[1], s_sm_tex[1], 1, in2, 3, metrics, sizeof metrics);
+            in2[0] = src;
+            in2[1] = s_sm_tex[1];
+            post_pass(cbp, PT_SM_BLEND, s_pso_sm[2], dst, 0, in2, 2, metrics, sizeof metrics);
+            src = dst;
+        }
+    }
+    if (cas) {
+        id<MTLTexture> dst = target_texture(&s_pp[1], MTLPixelFormatBGRA8Unorm, sw, sh);
+        if (dst) {
+            post_pass(cbp, PT_CAS, s_pso_cas, dst, 0, &src, 1, &sharp, sizeof sharp);
+            src = dst;
+        }
+    }
+    return src;
 }
 
 /* Slot k (fw x fh) into the window. 0 when no drawable came (timeout, display
@@ -517,36 +732,8 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
          * before the scale to the window; the overlay below is drawn after
          * them, so it is not filtered. */
         src = s_slot[k];
-        if (src && fw && fh) {
-            int aa = nv2a_host_post_aa();
-            float sharp = nv2a_host_sharpen();
-            NSUInteger sw = [src width], sh = [src height];
-            {
-                static int last_aa = -1;
-                static float last_sharp = -1.0f;
-                if (aa != last_aa || sharp != last_sharp) {
-                    last_aa = aa;
-                    last_sharp = sharp;
-                    fprintf(stderr, "[PRESENT] post passes: AA %s, sharpen %.2f (%lux%lu)\n",
-                            aa == NV2A_AA_FXAA ? "FXAA" : aa == NV2A_AA_SMAA ? "SMAA (not built)" : "off",
-                            sharp, (unsigned long)sw, (unsigned long)sh);
-                }
-            }
-            if (aa == NV2A_AA_FXAA && s_pso_fxaa) {
-                id<MTLTexture> dst = pp_texture(0, sw, sh);
-                if (dst) {
-                    post_pass(cb, s_pso_fxaa, src, dst, NULL);
-                    src = dst;
-                }
-            }
-            if (sharp > 0.001f && s_pso_cas) {
-                id<MTLTexture> dst = pp_texture(1, sw, sh);
-                if (dst) {
-                    post_pass(cb, s_pso_cas, src, dst, &sharp);
-                    src = dst;
-                }
-            }
-        }
+        if (src && fw && fh)
+            src = post_chain(&cb, src);
         rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = d.texture;
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -616,6 +803,8 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 xbox_LatRow('D', fl, now, b);
             }];
         }
+        if (pt_on())
+            pt_watch(cb, PT_SCALE);
         [cb commit];
         if (t_acq0)
             xbox_LatRow('P', flip, 0, NULL);

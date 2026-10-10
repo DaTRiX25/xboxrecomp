@@ -78,7 +78,7 @@ extern "C" {
  *   the variable it replaces (an alias for the transition window). */
 #define RECOMP_ENV_KEYS(X) \
     /* ── config ─────────────────────────────────────────────────────── */ \
-    X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "pushbuffer executor (draws frames); default on, 0: off, open: starts open, toggle=<s>,...: opens and closes at those seconds, file=<path>: whenever that file appears (scripted runs)") \
+    X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "pushbuffer executor (draws frames); default on, 0: off, open: starts open, toggle=<s>,...: opens and closes at those seconds, file=<path>: whenever that file appears, aa_cycle=<s>: steps the AA setting every s seconds (scripted runs)") \
     X(PB_BACKEND,        CONFIG, "RECOMP_PB_BACKEND",        NULL, "executor backend: cpu (default), metal, vulkan, d3d11, null") \
     X(EXEC_UCLAMP,       CONFIG, "RECOMP_EXEC_UCLAMP",       NULL, "Linux: the executor thread's minimum utilisation clamp, 0..1024 (CPU clock boost without spinning)") \
     X(PRESENT_OVERSCAN,  CONFIG, "RECOMP_PRESENT_OVERSCAN",  NULL, "crop: show the 640x448 area a TV showed (y 16..464), cropping the sides alike so the aspect holds (Vulkan, Metal windows)") \
@@ -132,6 +132,7 @@ extern "C" {
     X(PCACHE_TRACE,      TRACE, "pcache",          NULL,                       "pipeline cache: each shader/pipeline compile (thread, ms), the pre-warm summary; =<file>: also one CSV line per flip (t_ms, interval_ms, compiles)") \
     X(VK_PROF,           TRACE, "vk_prof",         NULL,                       "Vulkan flip cost every 300 flips: frame waits, write-backs, submits, GPU time") \
     X(VK_PRESENT_LOG,    TRACE, "vk_present",      NULL,                       "=<file>: Vulkan window, one CSV line per present and per frame displayed (present_wait)") \
+    X(POST_GPU,          TRACE, "post_gpu",        NULL,                       "window presenter: each post-process pass's GPU time (FXAA, SMAA's three, CAS) and the scale and overlay's, averaged every 300 presents (Metal; Vulkan: the post passes together)") \
     X(VK_TRACE,          TRACE, "vk",              NULL,                       "Vulkan render-target events, pipeline and shader compiles") \
     X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \
     X(VSH_ZLOG,          TRACE, "zlog",            "RECOMP_VSH_ZLOG",          "depth clears and z-buffer use") \
