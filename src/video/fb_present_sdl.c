@@ -530,8 +530,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * SDL would turn them into SDL_QUIT. Set before the headless return:
      * audio and input start SDL subsystems in headless runs too. */
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
-    if (recomp_env_on(RENV_HEADLESS))
+    if (recomp_env_on(RENV_HEADLESS)) {
+#if defined(__APPLE__)
+        /* No window, but the vblank can still follow the main display. */
+        if (recomp_env(RENV_VBLANK_SYNC))
+            fbm_vblank_link(NULL);
+#endif
         return guest_main();
+    }
     shot_parse();
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");

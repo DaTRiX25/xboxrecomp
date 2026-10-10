@@ -10,6 +10,9 @@
 /* Device, queue, pipeline and the window's layer; 0 with a reason in err. */
 int   fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn);
 void  fbm_destroy(void);
+/* RECOMP_VBLANK_SYNC=display: report win's display refreshes (NULL: the
+ * main display) to the vblank timer. */
+void  fbm_vblank_link(SDL_Window *win);
 void  fbm_get(void **device, void **queue);
 /* Slot k (0..2) at w x h: its id<MTLTexture>, or NULL. */
 void *fbm_slot(int k, uint32_t w, uint32_t h);

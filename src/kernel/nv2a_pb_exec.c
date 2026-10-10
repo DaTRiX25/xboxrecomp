@@ -5790,8 +5790,9 @@ static void pace_report(uint32_t flips)
     }
     if (++n < PACE_WINDOW)
         return;
-    /* The scan is open at a flip: count it up to now. */
-    scan = s_perf.scan_all + (now - s_perf.scan_t0) - scan0;
+    /* The scan is open at a flip: count it up to now (on the scan's own
+     * clock: rt_now is the UTC clock on Windows, not xbox_HostNowNs). */
+    scan = s_perf.scan_all + (rt_now() - s_perf.scan_t0) - scan0;
     draw = s_perf.draw_all - draw0;
     pres = s_perf.flip_all - flip0;
     wall = now - w0;
@@ -5809,7 +5810,7 @@ static void pace_report(uint32_t flips)
             (double)(int64_t)(wall - scan) / 1e6 / n);
     n = 0;
     w0 = now;
-    scan0 = s_perf.scan_all + (now - s_perf.scan_t0);
+    scan0 = s_perf.scan_all + (rt_now() - s_perf.scan_t0);
     draw0 = s_perf.draw_all;
     flip0 = s_perf.flip_all;
     memset(&s_pace, 0, sizeof s_pace);
