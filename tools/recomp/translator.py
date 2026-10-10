@@ -29,6 +29,9 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
 
+_FLOAT_COMPARES = ("comiss", "comisd", "ucomiss", "ucomisd")
+
+
 def _merge_flag_states(states):
     """Merge comparable snapshots without requiring identical source operands.
 
@@ -41,6 +44,17 @@ def _merge_flag_states(states):
         return None
     first = states[0]
     if all(state == first for state in states[1:]):
+        return first
+    # Float compares snapshot both operands into _fca/_fcb as they run, and
+    # every condition _make_condition builds for them reads only that
+    # snapshot -- the operands are named in the comment and nowhere else. So
+    # a join of comiss on one edge and comiss with other operands (or a
+    # ucomiss, or the double forms) on another is answerable from whichever
+    # edge ran. Refusing it compiled the consumer against `_flags`, a branch
+    # that never fires: Burnout 3's stick dead-zone helper (0x1B5700) ends in
+    # exactly such a jbe and returned 0 for every deflection, so the analog
+    # sticks did nothing.
+    if all(s[0] in _FLOAT_COMPARES for s in states):
         return first
     if any(s[0] == "cmp_mixed" for s in states):
         # A mixed join flowing on (a loop head, a second join): still cmp

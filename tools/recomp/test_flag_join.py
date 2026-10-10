@@ -41,3 +41,29 @@ def test_mixed_widths_merge_but_not_for_sign_or_overflow():
     assert merged[0] == 'cmp_mixed'
     assert _make_condition('jne', *merged) is not None
     assert _make_condition('js', *merged) is None
+
+def translate_float_join():
+    # xorps xmm2,xmm2; comiss xmm0,xmm2; jbe alt; comiss xmm2,xmm1; jmp join;
+    # alt: comiss xmm1,xmm2; join: jbe out; movaps xmm0,xmm2; ret;
+    # out: xorps xmm0,xmm0; ret -- the shape of Burnout 3's stick dead zone.
+    image = bytes.fromhex('0f57d2' '0f2fc2' '7605' '0f2fd1' 'eb03'
+                          '0f2fca' '7604' '0f28c2' 'c3' '0f57c0' 'c3')
+    config._install([config.Section('.text', BASE, len(image), 0, len(image), True)],
+                              entry_point=BASE, kernel_thunk_addr=BASE,
+                              origin='flag-join-test')
+    db = {BASE: {'start': hex(BASE), 'end': BASE + len(image),
+                 '_addr': BASE, 'size': len(image)}}
+    return FunctionTranslator(image, db).translate_function(BASE, db[BASE])
+
+def test_float_compares_with_different_operands_join():
+    code = translate_float_join()
+    assert '_flags /* jbe' not in code, code
+    # Both jbe forms read the snapshot, the one after the join included.
+    assert code.count('(_fca <= _fcb ||') == 2, code
+
+def test_float_compare_joins_only_float_compares():
+    x = [Operand(type='reg', reg='xmm0'), Operand(type='reg', reg='xmm1')]
+    y = [Operand(type='reg', reg='xmm2'), Operand(type='reg', reg='xmm3')]
+    a = [Operand(type='reg', reg='eax'), Operand(type='reg', reg='edx')]
+    assert _merge_flag_states([('comiss', x), ('ucomiss', y)]) == ('comiss', x)
+    assert _merge_flag_states([('comiss', x), ('cmp', a)]) is None
