@@ -150,10 +150,11 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
 
     if (!c || !SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         return ERROR_DEVICE_NOT_CONNECTED;
-    /* SDL rumble needs a duration; refresh for ~1s on each call (the game
-     * polls vibration continuously). 0 stops it. */
+    /* SDL rumble needs a duration. The USB pad (usb_gamepad.c) re-issues a
+     * held rumble every 150 ms, so 300 ms bridges one refresh and a lost
+     * stop report ends within a third of a second. 0 stops it. */
     SDL_GameControllerRumble(c, v->wLeftMotorSpeed, v->wRightMotorSpeed,
-                             (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 1000 : 0);
+                             (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 300 : 0);
     return ERROR_SUCCESS;
 }
 
