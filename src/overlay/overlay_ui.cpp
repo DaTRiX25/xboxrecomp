@@ -109,7 +109,7 @@ static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the s
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA (coming soon)", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1 (coming soon)", NULL };
-static const char *const n_power[]     = { "Stock (busy-wait)", "Performance", "Battery saver", NULL };
+static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
 
 static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_FULLSCREEN */ { "Fullscreen", "Borderless fullscreen on the desktop.", 1, FMT_PLAIN, NULL, 0 },
@@ -128,7 +128,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_INPUT_DEADZONE */     { "Stick deadzone", "The part of the stick's travel that reads as centre.", 1638.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_TRIGGER_DEADZONE */ { "Trigger deadzone", "The part of a trigger's pull that reads as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "0 turns the rumble off.", 0.05, FMT_GAIN, NULL, 0 },
-    /* XS_POWER_MODE */         { "Power mode", "Performance spins the last 8 ms before each frame (steady, warmer); Battery saver sleeps (cooler, small dips).", 1, FMT_PLAIN, n_power, 0 },
+    /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits all the time (steadiest, hottest). Balanced sleeps and spins only the last 8 ms before each frame (steady 60). Battery saver only sleeps (coolest, an occasional small dip). Watts measured on a Steam Deck.", 1, FMT_PLAIN, n_power, 0 },
     /* XS_ADVANCED_PERF */      { "Performance overlay", "FPS and frame-time graph in the corner.", 1, FMT_PLAIN, NULL, 0 },
 };
 
