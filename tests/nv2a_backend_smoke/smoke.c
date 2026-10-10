@@ -54,6 +54,10 @@
  * depth cleared to zmax, must cover every pixel (the XMV movie quad; the CPU
  * path's depth interpolation landed an ulp past the clear on a pixel grid).
  *
+ * Then many surfaces (BO-49), CPU path: two back buffers in turn among 18
+ * off-screen targets; the walker's pick stays the 640x480 buffer just
+ * drawn (a 16-entry surface table flipped it between extents).
+ *
  * Then the walker's index limit (overflow): a batch past NV_MAX_INDICES
  * warns, counts one overflowed batch and keeps the first NV_MAX_INDICES; with
  * one slot left an ARRAY_ELEMENT16 word still lands its first half; an
@@ -846,6 +850,52 @@ static int far_quad_case(const struct nv2a_pb_backend *b, const char *path)
     return holes != 0;
 }
 
+/* many surfaces (BO-49): two back buffers flipped in turn, the display at
+ * the first, each frame a 640x480 clear of its buffer, 18 off-screen 64x64
+ * targets, then a draw under a 640x448 clip at y 16 (extent 640x464): 22
+ * surface/extent pairs, Burnout 3's Crash mode has 19. The walker's pick
+ * must stay at the largest extent, 640x480, on the buffer just drawn. With
+ * a 16-entry table the LRU dropped the 640x480 entries and the size went
+ * by whichever buffer's entries survived: in the game 640x480 and 640x464
+ * on alternate flips, a jumping picture. Walker only, so the CPU path.
+ * Returns the failures. */
+static int many_surfaces_case(void)
+{
+    static const uint32_t grey[4] = {0xFF808080u, 0xFF808080u, 0xFF808080u, 0xFF808080u};
+    uint32_t disp_pitch = 0, disp = xbox_GetDisplayFramebuffer(&disp_pitch);
+    int k, a, bad = 0;
+
+    nv2a_pb_set_backend(nv2a_pb_cpu_backend());
+    xbox_SetDisplayFramebuffer(BUF0, W * 4u);
+    for (k = 0; k < 6; k++) {
+        uint32_t buf = (k & 1) ? BUF1 : BUF0, i;
+        const struct nv2a_pb_present *p;
+        surf_clip(buf, 0, 0, W, H);
+        clear_to(0xFF000000u);
+        for (i = 0; i < 18; i++) {
+            surf(RTT2 + 0x4000u * (i + 1), 64, 64, 1, 0xFF000080u + i);
+        }
+        surf_clip(buf, 0, 16, W, 448);
+        for (a = 0; a < 16; a++)
+            M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+        quad_uv(100.0f, 100.0f, 200.0f, 200.0f, grey, NULL);
+        M(0x012C, 0);                          /* FLIP_INCREMENT_WRITE */
+        M(0x0130, 0);                          /* FLIP_STALL */
+        p = nv2a_pb_present_state();
+        if (p->offset != buf || p->w != W || p->h != H) {
+            fprintf(stderr, "[backend-smoke] many surfaces: frame %d presents 0x%08X"
+                    " %ux%u (want 0x%08X %ux%u)\n", k, p->offset, p->w, p->h, buf, W, H);
+            bad++;
+        }
+    }
+    xbox_SetDisplayFramebuffer(disp, disp_pitch);
+    surf_clip(BUF0, 0, 0, W, H);
+    nv2a_pb_set_backend(NULL);
+    fprintf(stderr, "[backend-smoke] many surfaces: %d of 6 flips off the 640x480 back"
+            " buffer just drawn %s\n", bad, bad ? "FAIL" : "PASS");
+    return bad != 0;
+}
+
 #ifdef __APPLE__
 /* Each case's stream on the CPU path (guest memory) and on Metal (its host
  * pixels, box-filtered at scale 2; no flip, so nothing is written back),
@@ -1152,6 +1202,9 @@ int main(int argc, char **argv)
     /* And the depth of a quad at the far plane. */
     if (!guard && !noalias)
         failures += far_quad_case(nv2a_pb_cpu_backend(), "cpu");
+    /* And the walker's present pick under many surfaces. */
+    if (!guard && !noalias)
+        failures += many_surfaces_case();
 #ifdef __APPLE__
     if (!strcasecmp(which, "metal"))
         gpu = nv2a_pb_metal_backend();

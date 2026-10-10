@@ -2838,6 +2838,7 @@ static void kernel_vblank_count(long long now)
     LARGE_INTEGER q;
 
     InterlockedIncrement(&g_vblank_total);
+    xbox_VblankSignal();   /* a flip held for this vblank (nv2a_pb_exec.c) */
     if (!qf.QuadPart)
         QueryPerformanceFrequency(&qf);
     QueryPerformanceCounter(&q);

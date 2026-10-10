@@ -3307,7 +3307,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
     fprintf(stderr, "[METAL] flip %llu batches %llu prog %llu skipped %llu"
             " culled %llu clears %llu tex %llu uploads %llu changed %llu rehash %llu"
             " flushes %llu occ %llu (visible %llu, pending %d, late %llu, superseded %llu,"
-            " sync %llu us, slot overflow %llu) present 0x%08X walker 0x%08X\n",
+            " sync %llu us, slot overflow %llu) present 0x%08X walker 0x%08X shown %ux%u\n",
             (unsigned long long)s_presents,
             (unsigned long long)(s_draws - p_draws),
             (unsigned long long)(s_draws_prog - p_prog),
@@ -3325,7 +3325,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
             (unsigned long long)(s_occ.super - p_super),
             (unsigned long long)(s_occ.sync_us - p_sync),
             (unsigned long long)(s_occ_ovf - p_ovf),
-            rt ? rt->offset : 0, surface_offset);
+            rt ? rt->offset : 0, surface_offset, rt ? s_shown_w : 0, rt ? s_shown_h : 0);
     p_occ = s_occ.reports; p_vis = s_occ.vis; p_late = s_occ.late;
     p_super = s_occ.super; p_sync = s_occ.sync_us; p_ovf = s_occ_ovf;
     p_draws = s_draws; p_prog = s_draws_prog; p_skip = s_draws_skipped;

@@ -16,6 +16,7 @@ set(KERNEL_SOURCES
     kernel_hal.c
     kernel_prof.c
     kernel_pacing.c
+    kernel_frametime.c
     kernel_xbox.c
     kernel_ob.c
     kernel_io.c

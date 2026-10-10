@@ -83,11 +83,19 @@ static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
 static uint32_t s_gen;                       /* under s_lock only */
 static XBOX_THREAD_LOCAL uint32_t t_seen_gen;
 
+/* Vblank waits (xbox_VblankWaitUntil): their own lock and condition
+ * variable, so the vblank's broadcast wakes only the threads waiting for
+ * one. */
+static CRITICAL_SECTION s_vbl_lock;
+static CONDITION_VARIABLE s_vbl_cv;
+
 static BOOL CALLBACK pacing_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
     (void)o; (void)p; (void)c;
     InitializeCriticalSection(&s_lock);
     InitializeConditionVariable(&s_cv);
+    InitializeCriticalSection(&s_vbl_lock);
+    InitializeConditionVariable(&s_vbl_cv);
     return TRUE;
 }
 
@@ -224,6 +232,40 @@ void xbox_SpinWait(uint32_t va)
         site->cpu1_ns = (LONGLONG)c1;
         site->wall1_ns = (LONGLONG)w;
     }
+}
+
+/* ── Waiting for a vblank ────────────────────────────────── */
+
+/* The timer thread, right after it counted a vblank. Taking the lock orders
+ * the broadcast after a waiter's check of the count: a waiter either saw the
+ * new count or is already asleep on the variable (no lost wake-up). */
+void xbox_VblankSignal(void)
+{
+    pacing_once();
+    EnterCriticalSection(&s_vbl_lock);
+    LeaveCriticalSection(&s_vbl_lock);
+    WakeAllConditionVariable(&s_vbl_cv);
+}
+
+int xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms)
+{
+    uint64_t deadline = xbox_HostNowNs() + (uint64_t)timeout_ms * 1000000u;
+    int ok = 1;
+
+    pacing_once();
+    EnterCriticalSection(&s_vbl_lock);
+    while ((int32_t)(xbox_VblankCount() - target) < 0) {
+        uint64_t now = xbox_HostNowNs();
+        DWORD ms;
+        if (now >= deadline) {
+            ok = 0;
+            break;
+        }
+        ms = (DWORD)((deadline - now + 999999u) / 1000000u);
+        SleepConditionVariableCS(&s_vbl_cv, &s_vbl_lock, ms);
+    }
+    LeaveCriticalSection(&s_vbl_lock);
+    return ok;
 }
 
 void xbox_SpinWake(void)

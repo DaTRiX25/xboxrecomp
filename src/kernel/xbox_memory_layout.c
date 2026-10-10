@@ -1474,6 +1474,9 @@ static void kick_nap_us(unsigned us)
 static void kick_cleared(uint64_t now)
 {
     uint64_t seen = __atomic_exchange_n(&g_kick_seen_ns, 0, __ATOMIC_ACQ_REL);
+    /* A lowered KickOff wait (the title polling the busy bit, tools.recomp
+     * --spin-waits) may be sleeping on it: the ack is its wake-up. */
+    xbox_SpinWake();
     __atomic_fetch_add(&g_kick_count, 1, __ATOMIC_RELAXED);
     if (seen && now > seen)
         __atomic_fetch_add(&g_kick_wait_ns, now - seen, __ATOMIC_RELAXED);
@@ -1677,7 +1680,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     /* Release: the title may reuse the buffer once it sees
                      * GET, so every read of it must be done first. */
                     __atomic_thread_fence(__ATOMIC_RELEASE);
-                    *get = put;
+                    if (*get != put) {
+                        *get = put;
+                        /* A lowered wait for GET to reach PUT (D3D's
+                         * wait-for-idle) may be sleeping on it. */
+                        xbox_SpinWake();
+                    }
                 }
                 pgraph_fence_tick(regs);
                 g_scanned_put = put; last_put_ms = now_ms;

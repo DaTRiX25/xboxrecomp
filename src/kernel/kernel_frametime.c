@@ -1,0 +1,388 @@
+/*
+ * kernel_frametime.c - RECOMP_TRACE=frametime=<file>: one CSV line per flip,
+ * saying where that frame's time went.
+ *
+ * Two sources:
+ *
+ *  - The executor (nv2a_pb_exec.c, the nv2a-ack thread) hands in, at every
+ *    FLIP_STALL, its running totals: the time held for the swap's vblank,
+ *    time walking the pushbuffer (and inside that the backend's draws and
+ *    present), so a frame's host NV2A emulation is the difference.
+ *
+ *  - A sampler thread looks at every guest thread (the ones
+ *    xbox_GuestThreadPin registers) every RECOMP_TRACE=frametime_us (500)
+ *    microseconds: suspended for the read, its program counter and whether it
+ *    is running. A running thread whose PC is in a lifted function is
+ *    charged to the XBE section that function came from: .text and the
+ *    other title sections are "game", the XDK's D3D and XGRPH sections
+ *    "d3d", any other XDK section (DSOUND, XMV, WMADEC, XPP, XNET...) "xdk".
+ *    Functions listed in RECOMP_TRACE=frametime_spin=<va>[+<va>...] are
+ *    "spin" instead (a busy-wait for the GPU, say). A running thread
+ *    anywhere else is in host code reached from the title ("host": kernel
+ *    HLE, MMIO traps, spin-wait lowering); a blocked one is "wait".
+ *
+ * The lifted function under a PC is found by a sorted table of every
+ * function recomp_lookup knows, built once from the XBE's own section
+ * table; on macOS the __TEXT,__guest section (templates/runtime/
+ * recomp_guest_section.h) bounds it, elsewhere the first and last lifted
+ * function do. This is the sampling Instruments or `sample` does, only
+ * bucketed per frame and by guest address range, so a run's CSV can be
+ * compared with another's (tools/perf/framestats.py).
+ *
+ * Columns (milliseconds unless named otherwise):
+ *   flip, t_ms         the flip and its time since the first
+ *   frame_ms           since the previous flip
+ *   iv, late           the interval the swap asked for, and whether its
+ *                      vblank had already passed (flip pacing)
+ *   ex_hold            executor held for the vblank (FLIP_STALL)
+ *   ex_busy            executor walking the pushbuffer, minus the hold
+ *   ex_draw, ex_present  the backend's draws and present, inside ex_busy
+ *   ex_idle            executor waiting for the title to submit
+ *   g_game, g_d3d, g_xdk, g_spin, g_host, g_wait
+ *                      guest threads' sampled time, summed over threads
+ *   g_threads          guest threads sampled
+ *   cpu_proc           process CPU time in the frame (all threads)
+ *
+ * Off, the executor's call is one load and a branch.
+ */
+#include "kernel.h"
+#include "kernel_pacing.h"
+#include "recomp_env.h"
+#include "xbox_memory_layout.h"
+#include "platform/host_time.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
+#include <pthread.h>
+#endif
+
+typedef void (*ft_func_t)(void);
+extern ft_func_t recomp_lookup(uint32_t xbox_va);
+
+enum { B_GAME, B_D3D, B_XDK, B_SPIN, B_HOST, B_WAIT, B_COUNT };
+
+#define FT_MAX_THREADS 32
+#define FT_MAX_SECTIONS 32
+#define FT_MAX_SPIN 16
+
+typedef struct {
+    uintptr_t host;      /* the lifted function's address */
+    uint32_t  va;        /* its guest address */
+    uint8_t   bucket;    /* B_GAME / B_D3D / B_XDK / B_SPIN */
+} FtFunc;
+
+static int s_state = -1;            /* -1 unread, 0 off, 1 on */
+static FILE *s_out;
+static FtFunc *s_funcs;
+static size_t s_nfuncs;
+static uintptr_t s_code_lo, s_code_hi;
+static uint32_t s_spin[FT_MAX_SPIN];
+static int s_nspin;
+static unsigned s_period_us = 500;
+
+/* Per-frame sample counts, by bucket: the sampler adds, the flip takes. */
+static volatile LONG s_count[B_COUNT];
+static volatile LONG s_nthreads;
+
+#if defined(__APPLE__)
+static mach_port_t s_threads[FT_MAX_THREADS];
+#elif defined(_WIN32)
+static HANDLE s_threads[FT_MAX_THREADS];
+static ULONG64 s_cycles[FT_MAX_THREADS];
+static uintptr_t s_lastpc[FT_MAX_THREADS];
+#endif
+
+static int cmp_func(const void *a, const void *b)
+{
+    uintptr_t x = ((const FtFunc *)a)->host, y = ((const FtFunc *)b)->host;
+    return x < y ? -1 : x > y;
+}
+
+/* The XBE section a guest address lies in: its name, from the image's own
+ * section headers (XBE base 0x10000: count at +0x11C, headers at +0x120,
+ * 0x38 bytes each, virtual address +4, size +8, name pointer +0x14). */
+static int section_bucket(const char *name)
+{
+    static const char *const xdk[] = {
+        "DSOUND", "XMV", "WMADEC", "XONLINE", "XNET", "XNETS", "XNETN", "XPP",
+        "XACTENG", "XAPI", "DOLBY", "XON_RD", "D3DX", NULL };
+    int i;
+    if (!strcmp(name, "D3D") || !strcmp(name, "XGRPH"))
+        return B_D3D;
+    /* The XDK's other libraries keep sections of their own. */
+    for (i = 0; xdk[i]; i++)
+        if (!strcmp(name, xdk[i]))
+            return B_XDK;
+    return B_GAME;   /* .text and whatever else the title linked */
+}
+
+static void build_table(void)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t n = *(const uint32_t *)(mem + 0x1011C);
+    uint32_t hdr = *(const uint32_t *)(mem + 0x10120);
+    size_t cap = 32768;
+    uint32_t i, va;
+
+    s_funcs = (FtFunc *)malloc(cap * sizeof *s_funcs);
+    if (!s_funcs || n > FT_MAX_SECTIONS || hdr < 0x10000 || hdr > 0x1000000)
+        return;
+    for (i = 0; i < n; i++) {
+        const uint8_t *h = mem + hdr + i * 0x38u;
+        uint32_t flags = *(const uint32_t *)h;
+        uint32_t lo = *(const uint32_t *)(h + 4), sz = *(const uint32_t *)(h + 8);
+        uint32_t name_va = *(const uint32_t *)(h + 0x14);
+        char name[16] = "";
+        int bucket;
+        if (!(flags & 4))            /* XBE section flag 4: executable */
+            continue;
+        if (name_va >= 0x10000 && name_va < 0x1000000)
+            snprintf(name, sizeof name, "%s", (const char *)(mem + name_va));
+        bucket = section_bucket(name);
+        fprintf(stderr, "  [FRAMETIME] section %-8s 0x%08X-0x%08X -> %s\n", name, lo,
+                lo + sz, bucket == B_D3D ? "d3d" : bucket == B_GAME ? "game" : "xdk");
+        for (va = lo; va < lo + sz; va++) {
+            ft_func_t f = recomp_lookup(va);
+            int k;
+            if (!f)
+                continue;
+            if (s_nfuncs == cap) {
+                FtFunc *g = (FtFunc *)realloc(s_funcs, cap * 2 * sizeof *s_funcs);
+                if (!g)
+                    break;
+                s_funcs = g;
+                cap *= 2;
+            }
+            s_funcs[s_nfuncs].host = (uintptr_t)f;
+            s_funcs[s_nfuncs].va = va;
+            s_funcs[s_nfuncs].bucket = (uint8_t)bucket;
+            for (k = 0; k < s_nspin; k++)
+                if (s_spin[k] == va)
+                    s_funcs[s_nfuncs].bucket = B_SPIN;
+            s_nfuncs++;
+        }
+    }
+    qsort(s_funcs, s_nfuncs, sizeof *s_funcs, cmp_func);
+#if defined(__APPLE__)
+    {
+        unsigned long size = 0;
+        const uint8_t *code = (const uint8_t *)getsectiondata(&_mh_execute_header,
+                                                              "__TEXT", "__guest", &size);
+        if (code && size) {
+            s_code_lo = (uintptr_t)code;
+            s_code_hi = (uintptr_t)code + size;
+        }
+    }
+#endif
+    if (!s_code_hi && s_nfuncs) {
+        /* No section to bound the lifted code: from the first lifted
+         * function to the last, plus room for the last one's body. */
+        s_code_lo = s_funcs[0].host;
+        s_code_hi = s_funcs[s_nfuncs - 1].host + 0x10000;
+    }
+    fprintf(stderr, "  [FRAMETIME] %zu lifted functions mapped, code 0x%llx-0x%llx,"
+            " %d spin function(s), sampling every %u us\n", s_nfuncs,
+            (unsigned long long)s_code_lo, (unsigned long long)s_code_hi, s_nspin,
+            s_period_us);
+}
+
+static int bucket_of_pc(uintptr_t pc)
+{
+    size_t lo = 0, hi = s_nfuncs;
+    if (pc < s_code_lo || pc >= s_code_hi || !s_nfuncs || pc < s_funcs[0].host)
+        return B_HOST;
+    while (hi - lo > 1) {
+        size_t mid = (lo + hi) / 2;
+        if (s_funcs[mid].host <= pc)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return s_funcs[lo].bucket;
+}
+
+static void sample_once(void)
+{
+    LONG n = s_nthreads, i;
+    for (i = 0; i < n && i < FT_MAX_THREADS; i++) {
+        int b;
+#if defined(__APPLE__)
+        mach_port_t t = s_threads[i];
+        struct thread_basic_info bi;
+        mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+        uintptr_t pc = 0;
+        if (thread_info(t, THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) != KERN_SUCCESS)
+            continue;
+        if (bi.run_state != TH_STATE_RUNNING) {
+            b = B_WAIT;
+        } else if (thread_suspend(t) == KERN_SUCCESS) {
+#if defined(__arm64__) || defined(__aarch64__)
+            arm_thread_state64_t st;
+            mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state(t, ARM_THREAD_STATE64, (thread_state_t)&st, &sc) == KERN_SUCCESS)
+                pc = (uintptr_t)arm_thread_state64_get_pc(st);
+#else
+            x86_thread_state64_t st;
+            mach_msg_type_number_t sc = x86_THREAD_STATE64_COUNT;
+            if (thread_get_state(t, x86_THREAD_STATE64, (thread_state_t)&st, &sc) == KERN_SUCCESS)
+                pc = (uintptr_t)st.__rip;
+#endif
+            thread_resume(t);
+            b = bucket_of_pc(pc);
+        } else {
+            continue;
+        }
+#elif defined(_WIN32)
+        HANDLE t = s_threads[i];
+        CONTEXT c;
+        ULONG64 cyc = 0;
+        uintptr_t pc;
+        if (SuspendThread(t) == (DWORD)-1)
+            continue;
+        memset(&c, 0, sizeof c);
+        c.ContextFlags = CONTEXT_CONTROL;
+        pc = GetThreadContext(t, &c) ? (uintptr_t)c.Rip : 0;
+        ResumeThread(t);
+        QueryThreadCycleTime(t, &cyc);
+        /* No run state to ask for: a thread whose cycle count barely moved
+         * since the last look, at the same PC, was blocked. */
+        if (pc == s_lastpc[i] && cyc - s_cycles[i] < 20000)
+            b = B_WAIT;
+        else
+            b = bucket_of_pc(pc);
+        s_lastpc[i] = pc;
+        s_cycles[i] = cyc;
+#else
+        (void)i;
+        return;
+#endif
+        InterlockedIncrement(&s_count[b]);
+    }
+}
+
+#if defined(__APPLE__) || defined(_WIN32)
+#if defined(_WIN32)
+static DWORD WINAPI sampler_main(LPVOID p)
+#else
+static void *sampler_main(void *p)
+#endif
+{
+    (void)p;
+    for (;;) {
+        sample_once();
+        xbox_HostSleepNs((uint64_t)s_period_us * 1000u);
+    }
+#if defined(_WIN32)
+    return 0;
+#else
+    return NULL;
+#endif
+}
+#endif
+
+static int frametime_on(void)
+{
+    if (s_state < 0) {
+        const char *path = recomp_env(RENV_FRAMETIME);
+        const char *spin = recomp_env(RENV_FRAMETIME_SPIN);
+        const char *us = recomp_env(RENV_FRAMETIME_US);
+        s_state = 0;
+        if (!path || !*path || !strcmp(path, "1") || !strcmp(path, "0"))
+            return 0;
+        s_out = fopen(path, "w");
+        if (!s_out) {
+            fprintf(stderr, "  [FRAMETIME] cannot write %s\n", path);
+            return 0;
+        }
+        while (spin && *spin && s_nspin < FT_MAX_SPIN) {
+            char *end;
+            unsigned long v = strtoul(spin, &end, 16);
+            if (end == spin)
+                break;
+            s_spin[s_nspin++] = (uint32_t)v;
+            spin = *end ? end + 1 : end;
+        }
+        if (us && atoi(us) >= 100)
+            s_period_us = (unsigned)atoi(us);
+        fprintf(s_out, "flip,t_ms,frame_ms,iv,late,ex_hold,ex_busy,ex_draw,ex_present,"
+                "ex_idle,g_game,g_d3d,g_xdk,g_spin,g_host,g_wait,g_threads,cpu_proc\n");
+        build_table();
+#if defined(__APPLE__)
+        {
+            pthread_t th;
+            pthread_create(&th, NULL, sampler_main, NULL);
+            pthread_detach(th);
+        }
+#elif defined(_WIN32)
+        CloseHandle(CreateThread(NULL, 0, sampler_main, NULL, 0, NULL));
+#else
+        fprintf(stderr, "  [FRAMETIME] no thread sampler on this host: the guest"
+                " columns stay 0\n");
+#endif
+        s_state = 1;
+    }
+    return s_state;
+}
+
+void xbox_FrametimeThread(const char *role)
+{
+    LONG i;
+    if (!frametime_on())
+        return;
+    i = InterlockedIncrement(&s_nthreads) - 1;
+    if (i >= FT_MAX_THREADS)
+        return;
+#if defined(__APPLE__)
+    s_threads[i] = mach_thread_self();
+#elif defined(_WIN32)
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                    &s_threads[i], THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT
+                    | THREAD_QUERY_INFORMATION, FALSE, 0);
+#endif
+    fprintf(stderr, "  [FRAMETIME] sampling guest thread %s\n", role ? role : "?");
+}
+
+/* At FLIP_STALL, from the executor: its running totals in ns. */
+void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
+                        uint64_t scan, uint64_t draw, uint64_t present)
+{
+    static uint64_t t0, last, p_hold, p_scan, p_draw, p_pres, p_cpu;
+    uint64_t now, cpu, frame, d_hold, d_scan;
+    LONG c[B_COUNT];
+    double per;
+    int b;
+
+    if (s_state == 0 || (s_state < 0 && !frametime_on()))
+        return;
+    now = xbox_HostNowNs();
+    cpu = xbox_ProcessCpuNs();
+    for (b = 0; b < B_COUNT; b++)
+        c[b] = InterlockedExchange(&s_count[b], 0);
+    if (!last) {
+        t0 = last = now;
+        p_hold = hold; p_scan = scan; p_draw = draw; p_pres = present; p_cpu = cpu;
+        return;
+    }
+    frame = now - last;
+    d_hold = hold - p_hold;
+    d_scan = scan - p_scan;
+    per = s_period_us / 1000.0;
+    fprintf(s_out, "%u,%.3f,%.3f,%u,%d,%.3f,%.3f,%.3f,%.3f,%.3f,"
+            "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%ld,%.3f\n",
+            flip, (now - t0) / 1e6, frame / 1e6, iv, late,
+            d_hold / 1e6, (double)(int64_t)(d_scan - d_hold) / 1e6,
+            (draw - p_draw) / 1e6, (present - p_pres) / 1e6,
+            (double)(int64_t)(frame - d_scan) / 1e6,
+            c[B_GAME] * per, c[B_D3D] * per, c[B_XDK] * per, c[B_SPIN] * per,
+            c[B_HOST] * per, c[B_WAIT] * per, (long)s_nthreads,
+            (cpu - p_cpu) / 1e6);
+    if ((flip & 63) == 0)
+        fflush(s_out);
+    last = now;
+    p_hold = hold; p_scan = scan; p_draw = draw; p_pres = present; p_cpu = cpu;
+}
