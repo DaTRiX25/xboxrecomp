@@ -718,6 +718,55 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
              s_game_dir, s_save_dir, s_user_dir);
 }
 
+#if !defined(__APPLE__)
+#include <dirent.h>
+#include <strings.h>
+/* Xbox file names are case-insensitive (FATX, and the DVD's XDVDFS lookups),
+ * and titles ask for "D:\Sound\DSP\B3XboxFx.bin" where the dumped disc
+ * has sound/DSP. macOS volumes fold case by default; Linux ones do not, so
+ * from `from` (the part after the existing base directory) each component
+ * that does not exist as written takes the spelling a directory entry has,
+ * compared without case. A component nothing matches stays as written (a
+ * file about to be created). Only misses scan a directory. */
+static void fold_case(char *path, size_t from)
+{
+    char *p, *slash;
+    struct stat st;
+
+    if (stat(path, &st) == 0)
+        return;
+    p = path + from;
+    while (*p == '/')
+        p++;
+    for (; *p; p = slash + 1) {
+        DIR *d;
+        struct dirent *de;
+        char save;
+        slash = strchr(p, '/');
+        if (slash)
+            *slash = '\0';
+        if (stat(path, &st) != 0) {
+            /* p..: this component; its parent is path up to p - 1. */
+            save = p[-1];
+            p[-1] = '\0';
+            d = opendir(p - 1 == path ? "/" : path);
+            p[-1] = save;
+            if (d) {
+                while ((de = readdir(d)) != NULL)
+                    if (!strcasecmp(de->d_name, p) && strlen(de->d_name) == strlen(p)) {
+                        memcpy(p, de->d_name, strlen(p));
+                        break;
+                    }
+                closedir(d);
+            }
+        }
+        if (!slash)
+            break;
+        *slash = '/';
+    }
+}
+#endif
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
     const char* remainder = NULL;
@@ -792,6 +841,9 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+#if !defined(__APPLE__)
+        fold_case(host_path_buf, strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
+#endif
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path

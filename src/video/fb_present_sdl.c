@@ -31,6 +31,12 @@
  * s_in_present handshake) and never through guest memory. Guest-bytes frames are uploaded into a slot. When the
  * layer cannot be set up, the window is re-created with the SDL renderer.
  *
+ * With RECOMP_PB_BACKEND=vulkan the same shape on a Vulkan swapchain
+ * (fb_present_vulkan.c; vk_present=readback keeps the SDL renderer): the
+ * presenter makes the shared Vulkan device with the window's surface
+ * (SDL_Vulkan_CreateSurface) and the backend adopts it, slots are images the
+ * backend copies its frame into, and the main thread presents them FIFO.
+ *
  * RECOMP_HEADLESS=1 (or no display, or SDL video failing to start) skips all
  * of it: the guest runs on the main thread exactly as before.
  *
@@ -81,9 +87,12 @@
 #include "kernel/nv2a_pb_state.h"
 #include "kernel/nv2a_backend_common.h"
 #include "window_title.h"
-#if defined(__APPLE__)
 #include <strings.h>
+#if defined(__APPLE__)
 #include "fb_present_metal.h"
+#endif
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+#include "fb_present_vulkan.h"
 #endif
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 
@@ -119,6 +128,9 @@ static volatile int    s_in_present;         /* ack thread inside Present */
  * SDL_Renderer, and a slot is a GPU texture in fb_present_metal.m (indexed by
  * slot number) rather than bytes. Set once before the guest starts. */
 static int             s_layer;
+/* Vulkan slot mode (RECOMP_PB_BACKEND=vulkan): s_layer is set too, and a
+ * slot is an image in fb_present_vulkan.c. */
+static int             s_vk;
 
 /* Ack-thread side counters, read by the stats line. */
 static uint64_t s_flips, s_copy_ns;          /* relaxed atomics */
@@ -250,6 +262,13 @@ static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
     size_t need;
     uint32_t y;
 
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk) {
+        if (fbv_upload(s_back, src, w, h, pitch, bpp))
+            publish(w, h, 4, t0);
+        return;
+    }
+#endif
 #if defined(__APPLE__)
     if (s_layer) {
         if (fbm_upload(s_back, src, w, h, pitch, bpp))
@@ -280,7 +299,7 @@ static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
 int xbox_FramebufferWindowMetal(void **device, void **queue)
 {
 #if defined(__APPLE__)
-    if (s_layer) {
+    if (s_layer && !s_vk) {
         fbm_get(device, queue);
         return 1;
     }
@@ -290,15 +309,37 @@ int xbox_FramebufferWindowMetal(void **device, void **queue)
     return 0;
 }
 
-/* The back slot's id<MTLTexture> at w x h, for the backend to blit its frame
- * into, or NULL (no layer, window closing). A non-NULL return must be
+/* 1 when the window presents Vulkan slot images on the shared device
+ * (nv2a_vk_core.h); the Vulkan backend then copies its frames into them. */
+int xbox_FramebufferWindowVulkan(void)
+{
+    return s_vk;
+}
+
+/* The display's last vblank as the window saw a frame reach it
+ * (CLOCK_MONOTONIC ns) and its measured refresh period, for pacing that
+ * wants to lock the emulated vblank to the real one; 0 when unknown (no
+ * Vulkan window, or no VK_KHR_present_wait). Any thread. */
+int xbox_FramebufferWindowVblank(uint64_t *t_ns, uint64_t *period_ns)
+{
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk)
+        return fbv_display_vblank(t_ns, period_ns);
+#endif
+    *t_ns = 0;
+    *period_ns = 0;
+    return 0;
+}
+
+/* The back slot's id<MTLTexture> (Vulkan: struct nvk_image *) at w x h, for
+ * the backend to blit its frame into, or NULL (no layer, window closing). A non-NULL return must be
  * followed by xbox_FramebufferWindowPublishTexture: the ack thread counts as
  * inside a present from here to there (the close path's handshake). */
 static uint64_t s_tex_t0;
 void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h)
 {
-#if defined(__APPLE__)
-    void *t;
+#if defined(__APPLE__) || defined(XBOXRECOMP_HAVE_VULKAN)
+    void *t = NULL;
     if (!s_layer || !__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !w || !h)
         return NULL;
     __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
@@ -307,7 +348,14 @@ void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h)
         return NULL;
     }
     s_tex_t0 = now_ns(CLOCK_MONOTONIC);
-    t = fbm_slot(s_back, w, h);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk)
+        t = fbv_slot(s_back, w, h);
+#endif
+#if defined(__APPLE__)
+    if (!s_vk)
+        t = fbm_slot(s_back, w, h);
+#endif
     if (!t) {
         __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
         return NULL;
@@ -498,6 +546,13 @@ static void shot_save(SDL_Renderer *ren, uint32_t flip)
 /* The renderer, or the layer's resources; the window goes after. */
 static void close_present(SDL_Renderer *ren)
 {
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk) {
+        fbv_destroy();
+        s_layer = s_vk = 0;
+        return;
+    }
+#endif
 #if defined(__APPLE__)
     if (s_layer) {
         fbm_destroy();
@@ -568,11 +623,38 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     {
         Uint32 wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
                       | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+        const char *be = recomp_env(RENV_PB_BACKEND);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+        /* The Vulkan backend's frames stay on the GPU too: a Vulkan window
+         * whose swapchain shows the slot images the backend copies into
+         * (fb_present_vulkan.c), unless vk_present=readback. */
+        const char *vp = recomp_env(RENV_VK_PRESENT);
+        if (be && (!strcasecmp(be, "vulkan") || !strcasecmp(be, "vk"))
+                && !(vp && !strcasecmp(vp, "readback"))) {
+            char why[256] = "";
+            win = NULL;
+            if (fbv_load_library(why, sizeof why))
+                win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
+                                       SDL_WINDOWPOS_CENTERED, win_w * scale, 480 * scale,
+                                       wflags | SDL_WINDOW_VULKAN);
+            if (!win && !why[0])
+                snprintf(why, sizeof why, "%s", SDL_GetError());
+            else if (win && fbv_create(win, vsync, s_shot_n > 0, why, sizeof why))
+                s_layer = s_vk = dirty = 1;   /* paint black before the first frame */
+            if (!s_vk) {
+                if (win) {
+                    fbv_destroy();
+                    SDL_DestroyWindow(win);
+                }
+                fprintf(stderr, "[PRESENT] window up: Vulkan swapchain unavailable (%s);"
+                        " SDL renderer, readback present\n", why);
+            }
+        }
+#endif
 #if defined(__APPLE__)
         /* The Metal backend's frames stay on the GPU: a CAMetalLayer window
          * the backend blits into (fb_present_metal.m), unless
          * metal_present=readback asks for the renderer and readback. */
-        const char *be = recomp_env(RENV_PB_BACKEND);
         const char *mp = recomp_env(RENV_METAL_PRESENT);
         if (be && !strcasecmp(be, "metal") && !(mp && !strcasecmp(mp, "readback"))) {
             char why[256] = "";
@@ -606,7 +688,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             }
         }
     }
-    if (s_layer) {
+    if (s_vk) {
+        fprintf(stderr, "[PRESENT] window up: Vulkan swapchain (zero-copy), vsync %s;"
+                " guest runs on a pthread\n", vsync ? "on" : "off");
+    } else if (s_layer) {
         fprintf(stderr, "[PRESENT] window up: CAMetalLayer (zero-copy), vsync %s;"
                 " guest runs on a pthread\n", vsync ? "on" : "off");
     } else {
@@ -739,10 +824,27 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
             dirty = 1;
         }
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+        if (dirty && s_vk
+                && !(SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))) {
+            struct fb_slot *f = &s_slot[s_front];
+            uint64_t t0 = now_ns(CLOCK_MONOTONIC);
+            char path[512];
+            if (shoot)
+                shot_path(path, sizeof path, shown_flip);
+            if (fbv_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
+                            filter, shoot ? path : NULL, shown_flip)) {
+                dirty = 0;
+                shoot = 0;
+                presents++;
+            }
+            upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
+        }
+#endif
 #if defined(__APPLE__)
         /* Not while minimised or hidden: nextDrawable then blocks for up to
          * its 1 s timeout, and the event pump and pad poll with it. */
-        if (dirty && s_layer
+        if (dirty && s_layer && !s_vk
                 && !(SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))) {
             /* Before the first frame this paints the window black. */
             struct fb_slot *f = &s_slot[s_front];
@@ -830,6 +932,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                         (double)(presents - pres_stat) / dt,
                         100.0 * (double)(cpu - cpu_stat) / (double)(t - t_stat),
                         fl ? (double)__atomic_load_n(&s_copy_ns, __ATOMIC_RELAXED) / (double)fl / 1e6 : 0.0);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+                if (s_vk)
+                    fbv_timing_report("presents");
+#endif
                 t_stat = t;
                 cpu_stat = cpu;
                 pres_stat = presents;
@@ -850,7 +956,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 " %llu presents (%.1f/s), %llu dropped, main thread %.1f%% of a"
                 " core, upload %.3f ms/frame, ack copy %.3f ms/flip\n",
                 quit ? "window closed" : "guest returned", dt,
-                s_layer ? "CAMetalLayer" : "SDL renderer",
+                s_vk ? "Vulkan swapchain" : s_layer ? "CAMetalLayer" : "SDL renderer",
                 (unsigned long long)fl, dt > 0 ? (double)fl / dt : 0.0,
                 (unsigned long long)presents, dt > 0 ? (double)presents / dt : 0.0,
                 (unsigned long long)dropped_base,

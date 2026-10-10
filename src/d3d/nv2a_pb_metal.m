@@ -923,18 +923,18 @@ static RenderTarget *surface(void)
 
     if (!g->color_offset || !w || !h || w > 4096 || h > 4096)
         return NULL;
-    swz = ((g->format >> 8) & 0xF) == 2;    /* another layout: another target */
+    swz = ((g->format >> 8) & 0xF) == 2;    /* the layout guest memory holds it in (not the identity: the title draws one surface both ways, and a target per layout retired and wrote back every frame) */
     s_tick++;
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
-        if (rt->tex && rt->offset == g->color_offset && rt->w == w && rt->h == h
-                && rt->swz == swz) {
+        if (rt->tex && rt->offset == g->color_offset && rt->w == w && rt->h == h) {
             /* First use this flip of a target the title may have rewritten:
              * a stale one is made again from the title's bytes, which the
              * GPU would draw over. */
             if (rt_drop_if_stale(rt, "reuse"))
                 break;
             rt->last_use = s_tick;
+            rt->swz = swz;   /* the guest layout for its next seed or write-back */
             return rt;
         }
     }
@@ -952,14 +952,14 @@ static RenderTarget *surface(void)
      * its own and the overlap rule retires this one. */
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
-        if (!rt->tex || rt->offset != g->color_offset || rt->pitch != g->pitch
-                || rt->swz != swz)
+        if (!rt->tex || rt->offset != g->color_offset || rt->pitch != g->pitch)
             continue;
         if (rt_drop_if_stale(rt, "reuse"))
             break;
         if ((rt->w >= w && rt->h >= h)
                 || rt_grow(rt, rt->w > w ? rt->w : w, rt->h > h ? rt->h : h)) {
             rt->last_use = s_tick;
+            rt->swz = swz;   /* the guest layout for its next seed or write-back */
             return rt;
         }
         break;

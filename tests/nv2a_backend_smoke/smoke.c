@@ -78,7 +78,9 @@
  * statistics (MAE per channel, share off by more than 8)
  * are printed alongside. The presented surface must also be the one drawn.
  *
- * Backend under test: RECOMP_SMOKE_BACKEND, default "metal" (the only one
+ * Backend under test: RECOMP_SMOKE_BACKEND, default "metal" ("vulkan" for
+ * the Vulkan backend, the default where there is no Metal; fb_guard is
+ * Metal's alone; the only one
  * that writes back on POSIX). RECOMP_SMOKE_DUMP=<prefix> writes
  * <prefix><scene>_{cpu,gpu}.bmp.
  */
@@ -102,6 +104,28 @@ uint64_t nv2a_pb_metal_writebacks(void);
 const uint8_t *nv2a_pb_metal_host_pixels(uint32_t offset, uint32_t *hw, uint32_t *hh);
 int nv2a_pb_metal_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
                         uint32_t *sw, uint32_t *sh);
+#endif
+#ifdef XBOXRECOMP_HAVE_VULKAN
+const struct nv2a_pb_backend *nv2a_pb_vulkan_backend(void);
+uint64_t nv2a_pb_vulkan_writebacks(void);
+const uint8_t *nv2a_pb_vulkan_host_pixels(uint32_t offset, uint32_t *hw, uint32_t *hh);
+int nv2a_pb_vulkan_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
+                         uint32_t *sw, uint32_t *sh);
+#endif
+#if defined(__APPLE__) || defined(XBOXRECOMP_HAVE_VULKAN)
+#define HAVE_GPU 1
+/* The backend under test's own test hooks (same shapes on Metal and
+ * Vulkan) and its "write back at every flip" switch. */
+static struct {
+    uint64_t (*writebacks)(void);
+    const uint8_t *(*host_pixels)(uint32_t offset, uint32_t *hw, uint32_t *hh);
+    int (*shown)(uint32_t offset, uint32_t *tw, uint32_t *th, uint32_t *sw, uint32_t *sh);
+    int wb_key;
+    int metal;
+} G;
+#define nv2a_pb_metal_writebacks() G.writebacks()
+#define nv2a_pb_metal_host_pixels(o, w, h) G.host_pixels((o), (w), (h))
+#define nv2a_pb_metal_shown(o, a, b, c, d) G.shown((o), (a), (b), (c), (d))
 #endif
 
 /* The kernel library expects these from the title's generated code. */
@@ -446,7 +470,7 @@ static int compare(const char *name, const uint32_t *a, const uint32_t *b)
     return ok;
 }
 
-#ifdef __APPLE__
+#ifdef HAVE_GPU
 static int all_pattern(const uint32_t *g)
 {
     uint32_t i;
@@ -491,12 +515,12 @@ static int writeback_cases(const struct nv2a_pb_backend *b, const uint32_t *ref,
     f += check(nv2a_pb_metal_writebacks() == n0 + 1, "sync_guest again: clean, no write-back");
 
     /* always: written at the flip, before any sync. */
-    recomp_env_set(RENV_METAL_WRITEBACK, "always");
+    recomp_env_set(G.wb_key, "always");
     for (i = 0; i < W * H; i++)
         g[i] = 0xFFFF00FFu;
     scene(SC_CLEAR_QUAD, BUF0, BUF1);
     f += check(!memcmp(g, ref, W * H * 4), "metal_writeback=always: the CPU frame at the flip");
-    recomp_env_set(RENV_METAL_WRITEBACK, NULL);
+    recomp_env_set(G.wb_key, NULL);
 
     /* render.scale 2 on a new target: the box filter of the host pixels. */
     {
@@ -981,7 +1005,7 @@ static int far_quad_case(const struct nv2a_pb_backend *b, const char *path)
     M(0x17FC, 0);
     M(0x1E94, 0);                          /* fixed function again */
     M(0x030C, 0);
-#ifdef __APPLE__
+#ifdef HAVE_GPU
     if (b != nv2a_pb_cpu_backend()) {
         uint32_t hw = 0, hh = 0;
         px = (const uint32_t *)nv2a_pb_metal_host_pixels(BUF0, &hw, &hh);
@@ -1047,7 +1071,7 @@ static int many_surfaces_case(void)
     return bad != 0;
 }
 
-#ifdef __APPLE__
+#ifdef HAVE_GPU
 /* Each case's stream on the CPU path (guest memory) and on Metal (its host
  * pixels, box-filtered at scale 2; no flip, so nothing is written back),
  * compared whole. The grow cases' guest bytes are the pattern before each
@@ -1333,7 +1357,11 @@ int main(int argc, char **argv)
         nv2a_host_opts_set(&o);
     }
     if (!which)
+#ifdef __APPLE__
         which = "metal";
+#else
+        which = "vulkan";
+#endif
     build_xbe(xbe, sizeof xbe);
     if (!xbox_MemoryLayoutInit(xbe, sizeof xbe)) {
         fprintf(stderr, "[backend-smoke] FAIL: guest memory init\n");
@@ -1357,8 +1385,23 @@ int main(int argc, char **argv)
     if (!guard && !noalias)
         failures += many_surfaces_case();
 #ifdef __APPLE__
-    if (!strcasecmp(which, "metal"))
+    if (!strcasecmp(which, "metal")) {
         gpu = nv2a_pb_metal_backend();
+        G.writebacks = nv2a_pb_metal_writebacks;
+        G.host_pixels = nv2a_pb_metal_host_pixels;
+        G.shown = nv2a_pb_metal_shown;
+        G.wb_key = RENV_METAL_WRITEBACK;
+        G.metal = 1;
+    }
+#endif
+#ifdef XBOXRECOMP_HAVE_VULKAN
+    if (!strcasecmp(which, "vulkan")) {
+        gpu = nv2a_pb_vulkan_backend();
+        G.writebacks = nv2a_pb_vulkan_writebacks;
+        G.host_pixels = nv2a_pb_vulkan_host_pixels;
+        G.shown = nv2a_pb_vulkan_shown;
+        G.wb_key = RENV_VK_WRITEBACK;
+    }
 #endif
     if (!gpu) {
         fprintf(stderr, "[backend-smoke] no backend '%s' on this host: GPU scenes"
@@ -1370,7 +1413,11 @@ int main(int argc, char **argv)
     if (!cpu_px || !gpu_px)
         return 1;
     make_textures();
-#ifdef __APPLE__
+#ifdef HAVE_GPU
+    if (guard && !G.metal) {
+        fprintf(stderr, "[backend-smoke] fb_guard is Metal's: skipped\n");
+        return 77;
+    }
     if (guard) {
         recomp_env_set(RENV_METAL_FB_GUARD, "1");
         if (!run(nv2a_pb_cpu_backend(), SC_CLEAR_QUAD, cpu_px, 0))
@@ -1413,15 +1460,15 @@ int main(int argc, char **argv)
         }
     }
     nv2a_pb_set_backend(NULL);
-#ifdef __APPLE__
-    if (gpu == nv2a_pb_metal_backend()) {
+#ifdef HAVE_GPU
+    if (gpu) {
         int f = clip_cases(gpu, cpu_px, gpu_px);
         if (f)
             fprintf(stderr, "[backend-smoke] FAIL: %d clip-extent cases\n", f);
         failures += f;
         failures += occ_case(gpu);
     }
-    if (gpu == nv2a_pb_metal_backend() && run(nv2a_pb_cpu_backend(), SC_CLEAR_QUAD, cpu_px, 0)) {
+    if (gpu && run(nv2a_pb_cpu_backend(), SC_CLEAR_QUAD, cpu_px, 0)) {
         int f = writeback_cases(gpu, cpu_px, gpu_px);
         if (f)
             fprintf(stderr, "[backend-smoke] FAIL: %d write-back checks\n", f);
@@ -1431,13 +1478,13 @@ int main(int argc, char **argv)
             fprintf(stderr, "[backend-smoke] FAIL: %d render-target ownership checks\n", f);
         failures += f;
     }
-    if (gpu == nv2a_pb_metal_backend())
+    if (gpu)
         failures += far_quad_case(gpu, "gpu");
-    if (gpu == nv2a_pb_metal_backend())
+    if (gpu)
         failures += inflight_case(gpu);
-    if (gpu == nv2a_pb_metal_backend())
+    if (gpu)
         failures += poly_offset_case(gpu);
-    if (gpu == nv2a_pb_metal_backend())
+    if (gpu)
         failures += swizzled_case(gpu);
 #endif
     if (failures) {

@@ -162,9 +162,10 @@ static const char s_blit_msl[] =
     "    o.p = float4(o.t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
     "    return o;\n"
     "}\n"
+    /* uv: the shown part of the slot (nv2a_present_layout), offset and size. */
     "fragment float4 fs_blit(VO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
-    "                        sampler s [[sampler(0)]]) {\n"
-    "    return float4(t.sample(s, i.t).rgb, 1);\n"
+    "                        sampler s [[sampler(0)]], constant float4 &uv [[buffer(0)]]) {\n"
+    "    return float4(t.sample(s, uv.xy + i.t * uv.zw).rgb, 1);\n"
     "}\n";
 
 static int fail(char *err, size_t n, const char *what)
@@ -440,8 +441,11 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         enc = [cb renderCommandEncoderWithDescriptor:rp];
         if (s_slot[k] && fw && fh) {
-            whole = nv2a_present_rect(fw, fh, (uint32_t)dw, (uint32_t)dh, filter, &r);
+            struct nv2a_rect sr;
+            whole = nv2a_present_layout(fw, fh, (uint32_t)dw, (uint32_t)dh, filter, &sr, &r);
             if (r.w > 0 && r.h > 0) {
+                float uv[4] = { (float)sr.x / (float)fw, (float)sr.y / (float)fh,
+                                (float)sr.w / (float)fw, (float)sr.h / (float)fh };
                 MTLViewport vp = { r.x, r.y, r.w, r.h, 0.0, 1.0 };
                 int lin = filter == NV2A_PRESENT_LINEAR
                           || (filter == NV2A_PRESENT_INTEGER && !whole);
@@ -449,6 +453,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 [enc setViewport:vp];
                 [enc setFragmentTexture:s_slot[k] atIndex:0];
                 [enc setFragmentSamplerState:s_smp[lin] atIndex:0];
+                [enc setFragmentBytes:uv length:sizeof uv atIndex:0];
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             }
         }

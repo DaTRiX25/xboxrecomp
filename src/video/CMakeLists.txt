@@ -14,6 +14,11 @@ else()
     find_package(SDL2 REQUIRED)
     target_sources(xbox_video PRIVATE fb_present_sdl.c)
     target_link_libraries(xbox_video PUBLIC SDL2::SDL2 xbox_input)
+    if(XBOXRECOMP_HAVE_VULKAN)
+        # The window's Vulkan swapchain for the Vulkan backend.
+        target_sources(xbox_video PRIVATE fb_present_vulkan.c)
+        target_link_libraries(xbox_video PUBLIC Vulkan::Vulkan)
+    endif()
     if(APPLE)
         # The window's CAMetalLayer present for the Metal backend (manual
         # retain/release, like nv2a_pb_metal.m).

@@ -46,6 +46,26 @@ if(XBOXRECOMP_ENHANCE)
     add_subdirectory(src/enhance)
 endif()
 
+# The pushbuffer executor's Vulkan backend (src/d3d/nv2a_pb_vulkan.c,
+# RECOMP_PB_BACKEND=vulkan) and the window's Vulkan swapchain
+# (src/video/fb_present_vulkan.c): POSIX hosts with a Vulkan loader and
+# glslang (shaders are GLSL compiled to SPIR-V at runtime). Native Linux
+# (Steam Deck) draws with it; on macOS it runs on MoltenVK as a test bed.
+if(NOT WIN32)
+    option(XBOXRECOMP_VULKAN "Build the Vulkan backend when Vulkan and glslang are found" ON)
+    if(XBOXRECOMP_VULKAN)
+        find_package(Vulkan QUIET)
+        find_package(glslang CONFIG QUIET)
+        if(Vulkan_FOUND AND glslang_FOUND)
+            set(XBOXRECOMP_HAVE_VULKAN ON)
+            add_compile_definitions(XBOXRECOMP_HAVE_VULKAN=1)
+            message(STATUS "xboxrecomp: Vulkan backend on (${Vulkan_LIBRARY}, glslang ${glslang_VERSION})")
+        else()
+            message(STATUS "xboxrecomp: Vulkan backend off (Vulkan ${Vulkan_FOUND}, glslang ${glslang_FOUND})")
+        endif()
+    endif()
+endif()
+
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 
@@ -87,5 +107,17 @@ target_link_libraries(xboxrecomp INTERFACE
 )
 if(XBOXRECOMP_ENHANCE)
     target_link_libraries(xboxrecomp INTERFACE xbox_enhance)
+endif()
+# GNU ld reads an archive once, in order, and the runtime's libraries call
+# each other both ways: the kernel's bridge calls into the window and the
+# movie player (xbox_video), its fault path into the APU hook (xbox_apu),
+# the executor into the GPU backends (xbox_d3d8). macOS ld64 and lld resolve
+# that by themselves; for GNU ld the edges are declared, and CMake repeats
+# the cycle of static libraries on the link line (the native Linux / Steam
+# Deck build). dladdr is in libdl before glibc 2.34 (the Steam Runtime's).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(xbox_kernel PUBLIC xbox_video xbox_apu xbox_d3d8 ${CMAKE_DL_LIBS})
+    set_property(TARGET xbox_kernel xbox_video xbox_apu xbox_d3d8
+                 PROPERTY LINK_INTERFACE_MULTIPLICITY 3)
 endif()
 

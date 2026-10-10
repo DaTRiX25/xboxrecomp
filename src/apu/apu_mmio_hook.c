@@ -232,9 +232,11 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 
 #endif /* _WIN32 */
 
-#if !defined(_WIN32) && defined(__aarch64__)
+#include "../platform/mmio_decode.h"   /* MMIO_POSIX_TRAP */
+#if defined(MMIO_POSIX_TRAP)
 /* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
- * (src/platform/mmio_decode_a64.h). The fault handler in the game target's
+ * (src/platform/mmio_decode_a64.h); x86-64 Linux with the x86 one
+ * (mmio_decode.h). The fault handler in the game target's
  * main.c calls apu_hook_handle_mmio_posix before it reports a crash. */
 #include <pthread.h>
 #include <time.h>
@@ -342,13 +344,13 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
     trace = s_trace && !g_apu_hook_bench_active;
     if (trace)
         a = s_now_ns();
-    ok = mmio_emulate_a64(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr);
+    ok = mmio_emulate_host(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr);
     if (!ok) {
         g_apu_mmio_decode_fail++;
         if (g_apu_mmio_decode_fail <= 20)
             fprintf(stderr, "[APU] MMIO decode fail at PC=%p insn=%08X offset=0x%X\n",
-                    (void *)(uintptr_t)A64_CTX_PC(uc),
-                    *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc), off);
+                    (void *)(uintptr_t)MMIO_HOST_PC(uc),
+                    *(const uint32_t *)(uintptr_t)MMIO_HOST_PC(uc), off);
         return false;
     }
     if (!trace)
@@ -357,8 +359,12 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
     {
         /* Direction from the opcode: bit 22 clear is a store for the
          * single-register forms; LDP/STP carry L in bit 22 as well. */
-        uint32_t insn = *(const uint32_t *)(uintptr_t)(A64_CTX_PC(uc) - 4);
+#if defined(__aarch64__)
+        uint32_t insn = *(const uint32_t *)(uintptr_t)(MMIO_HOST_PC(uc) - 4);
         int w = !((insn >> 22) & 1);
+#else
+        int w = is_write;   /* the trace's direction: the fault's */
+#endif
         uint32_t slot = off >> 2;
         if (w) { s_tot_w++; s_hist_w[slot]++; s_hist_lastw[slot] = s_last_wval; }
         else   { s_tot_r++; s_hist_r[slot]++; }
