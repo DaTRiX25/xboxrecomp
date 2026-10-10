@@ -195,7 +195,14 @@ static uint64_t s_draws_prog, s_draws_tex;   /* with a vertex program / a textur
 
 /* ---- render targets: one per guest surface ------------------------------ */
 
-#define RT_MAX 8
+/* Burnout 3 draws 14 surfaces a frame in races and Crash mode (the 640x480
+ * pair, a 640x480 and a 320x240 work target, two 160x120, seven 128x128 and
+ * a 64x32). With 8 slots the LRU evicted every one of them every frame: a
+ * new texture seeded from guest memory each time, and, since this backend
+ * writes nothing back, an off-screen one evicted before it was sampled lost
+ * what was drawn into it. xemu keeps its surfaces in an unbounded list; 32
+ * slots hold any frame seen so far (as the Metal backend, 73ed271). */
+#define RT_MAX 32
 /* render.scale keeps targets inside D3D11's 2D limit at feature level 11
  * (nv2a_host_size lowers the factor for a larger surface). */
 #define D3D11_MAX_DIM 16384u
