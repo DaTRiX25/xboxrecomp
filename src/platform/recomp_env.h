@@ -66,6 +66,7 @@ extern "C" {
     X(PRESENT_ASPECT,    CONFIG, "RECOMP_PRESENT_ASPECT",    NULL, "enhancements: present.aspect, the window's frame shape: auto (stock; 16:9 with display.widescreen), frame, 4:3, 16:9") \
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
     X(PRESENT_PACING,    CONFIG, "RECOMP_PRESENT_PACING",    NULL, "enhancements: present.pacing, spin (stock busy-wait) or sleep (lowered spin waits sleep)") \
+    X(PRESENT_SPIN_LEAD, CONFIG, "RECOMP_PRESENT_SPIN_LEAD", NULL, "enhancements: present.spin_lead, ms before the vblank a held flip spins instead of sleeping (pacing sleep; keeps the CPU clock up)") \
     X(RENDER_SHADER_CACHE, CONFIG, "RECOMP_RENDER_SHADER_CACHE", NULL, "enhancements: render.shader_cache, the pipeline-cache directory, or none (default: the per-user cache directory)")
 #else
 #define RECOMP_ENV_ENHANCE_KEYS(X)

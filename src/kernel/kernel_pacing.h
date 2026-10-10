@@ -78,6 +78,12 @@ void xbox_SpinWake(void);
  * plume_graphics_system.cpp, PaceSwapToVblank), rather than a sleep-poll. */
 int  xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms);
 void xbox_VblankSignal(void);
+/* Mode sleep: spin through the last ns before the target vblank instead of
+ * sleeping (present.spin_lead; 0, the default, sleeps to it). The timer
+ * thread tells it when the next vblank is due, before counting the one it
+ * raises. */
+void xbox_PacingSetSpinLead(uint64_t ns);
+void xbox_VblankNextDue(uint64_t ns);
 uint32_t xbox_VblankCount(void);
 
 /* Per-site counters, for the trace and the tests. */

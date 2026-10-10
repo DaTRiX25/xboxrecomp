@@ -15,6 +15,8 @@
  *   present.fullscreen  borderless desktop fullscreen at start
  *   present.pacing      spin | sleep: how lowered guest spin waits wait
  *                       (kernel_pacing.h); spin is stock
+ *   present.spin_lead   ms before the vblank a held flip spins at sleep
+ *                       pacing (kernel_pacing.c); 0 is stock
  *   render.shader_cache the pipeline cache's directory, or "none"
  *                       (nv2a_pcache.h; default the per-user cache dir)
  *   display.aspect      only 4:3 so far; anything else is reported

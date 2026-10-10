@@ -38,6 +38,7 @@ int xbox_enhance_init(const char *root, const char *title)
     const char *aspect;
     long long scale;
     int rc, pacing, wide, hdtv, pa;
+    double lead;
     ULONG xc_video;
 
     rc = enhance_cfg_init(root, title) < 0 ? -1 : 0;
@@ -58,6 +59,14 @@ int xbox_enhance_init(const char *root, const char *title)
      * generated with --spin-waits have any. Set before the guest starts. */
     pacing = enhance_cfg_choice("present.pacing", s_pacing, XBOX_PACING_SPIN);
     xbox_PacingSetMode(pacing);
+    /* Milliseconds of the flip's vblank hold spun, not slept, at sleep
+     * pacing: what keeps an APU's CPU clock up (kernel_pacing.c). */
+    lead = enhance_cfg_float("present.spin_lead", 0.0);
+    if (lead < 0 || lead > 20) {
+        fprintf(stderr, LOGP "present.spin_lead=%g out of range 0..20 ms; using 0\n", lead);
+        lead = 0;
+    }
+    xbox_PacingSetSpinLead((uint64_t)(lead * 1e6));
 
     /* The dashboard's video settings, as the kernel reports them to the
      * title (XC_VIDEO, HalBootSMCVideoMode; kernel.h). What the title does
@@ -100,6 +109,9 @@ int xbox_enhance_init(const char *root, const char *title)
     fprintf(stderr, LOGP "display.widescreen=%d display.hdtv=%s (XC_VIDEO=0x%08lX)"
             " present.aspect=%s (%s)\n", wide, s_hdtv[hdtv], (unsigned long)xc_video,
             s_aspects[pa], s_aspects[o.present_aspect + 1]);
+    if (lead > 0)
+        fprintf(stderr, LOGP "present.spin_lead=%g ms%s\n", lead,
+                pacing == XBOX_PACING_SLEEP ? "" : " (no effect: pacing is spin)");
     if (o.shader_cache)
         fprintf(stderr, LOGP "render.shader_cache=%s\n", o.shader_cache);
     /* No enhance_cfg_report_unused() here: the title reads its own keys

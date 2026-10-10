@@ -28,6 +28,9 @@
 #include <sys/resource.h>
 #include <time.h>
 #endif
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 
 /* ── The vblank schedule ─────────────────────────────────── */
 
@@ -342,6 +345,43 @@ void xbox_SpinWait(uint32_t va)
 
 /* ── Waiting for a vblank ────────────────────────────────── */
 
+/* present.spin_lead: the last stretch before the vblank that a held flip
+ * spins through instead of sleeping (mode sleep only).
+ *
+ * The Steam Deck's APU picks its CPU clock itself (amd-pstate-epp: CPPC
+ * autonomous, no governor; a utilization clamp asks nothing of it), from
+ * how busy its cores are. With every wait asleep the process keeps all
+ * eight threads near 2.3 GHz; one core kept busy lifts them all to
+ * 3.2-3.4. The executor's frame is the same cycles and instructions either
+ * way (perf stat, BO-78), so at sleep pacing it takes a third longer and
+ * the heavy frames miss their vblank. Mode spin kept the clock up by
+ * accident: the title's fence wait spun beside the executor. The spin here
+ * is on the executor's own thread, right before the frame it scans next,
+ * and its length is the trade between clock and watts. */
+#define SPIN_LATE_NS 2000000ull   /* past a vblank due, give up the spin */
+static uint64_t s_spin_lead_ns;
+/* When the vblank after the last one raised is due (the timer thread). */
+static volatile LONGLONG s_vbl_next_ns;
+
+void xbox_PacingSetSpinLead(uint64_t ns)
+{
+    s_spin_lead_ns = ns;
+}
+
+void xbox_VblankNextDue(uint64_t ns)
+{
+    s_vbl_next_ns = (LONGLONG)ns;
+}
+
+static void cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
 /* The timer thread, right after it counted a vblank. Taking the lock orders
  * the broadcast after a waiter's check of the count: a waiter either saw the
  * new count or is already asleep on the variable (no lost wake-up). */
@@ -366,6 +406,26 @@ int xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms)
         if (now >= deadline) {
             ok = 0;
             break;
+        }
+        /* One vblank to go, and its edge is known: sleep to the lead, then
+         * spin to the edge. An edge already well past (the timer thread is
+         * behind, or has not published one) falls back to the condition
+         * variable. */
+        if (s_spin_lead_ns && xbox_VblankCount() + 1 == target) {
+            uint64_t due = (uint64_t)s_vbl_next_ns;
+            if (due + SPIN_LATE_NS > now) {
+                LeaveCriticalSection(&s_vbl_lock);
+                if (due > now + s_spin_lead_ns) {
+                    uint64_t d = due - s_spin_lead_ns - now;
+                    xbox_HostSleepNs(d < deadline - now ? d : deadline - now);
+                } else {
+                    while ((int32_t)(xbox_VblankCount() - target) < 0
+                           && xbox_HostNowNs() < due + SPIN_LATE_NS)
+                        cpu_relax();
+                }
+                EnterCriticalSection(&s_vbl_lock);
+                continue;
+            }
         }
         ms = (DWORD)((deadline - now + 999999u) / 1000000u);
         SleepConditionVariableCS(&s_vbl_cv, &s_vbl_lock, ms);

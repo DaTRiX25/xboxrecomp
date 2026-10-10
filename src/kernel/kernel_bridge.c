@@ -3022,6 +3022,7 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
         return 0;
     if (late && xbox_ProfOn())
         xbox_ProfCount(XBOX_PROF_SCHED_RESTART, (long long)(late / 1000000u));
+    xbox_VblankNextDue(*next_due_ns);   /* before the count a held flip reads */
     kernel_vblank_count(kernel_clock_ms());
     xbox_PacingVblank(now_ns);
     if (xbox_LatOn())   /* RECOMP_TRACE=latency: B, the emulated vblank */

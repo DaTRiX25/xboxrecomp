@@ -116,6 +116,7 @@ the stock settings.
 | `present.aspect` | string | the window's frame shape: `"auto"`, `"frame"`, `"4:3"`, `"16:9"` | `"auto"` | `RECOMP_PRESENT_ASPECT` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
+| `present.spin_lead` | float | milliseconds before the vblank that a held flip spins instead of sleeping, at `sleep` pacing | `0` | `RECOMP_PRESENT_SPIN_LEAD` |
 | `render.shader_cache` | string | the pipeline cache's directory (`"~/..."` is under `$HOME`), or `"none"` for no disk cache | the per-user cache directory: macOS `~/Library/Caches/<executable>`, Linux `$XDG_CACHE_HOME/<executable>`, Windows `%LOCALAPPDATA%\<executable>\cache` | `RECOMP_RENDER_SHADER_CACHE` |
 | `fps.mode` | string | `"lock30"` (stock), `"lock60"`, `"free"` | `"lock30"` | the game's `RECOMP_FPS_MODE` |
 | `fx.glow` | string | `"on"` (stock), `"off"` (BLiNX 2: its post-mode-3 glow pass) | `"on"` | the game's `RECOMP_GLOW` |
@@ -216,6 +217,15 @@ is stock. One line shows the values in force:
   1 ms timeout. A site whose loops keep leaving on the timeout (more than
   5% of exits) has a writer the kernel never signals; timeouts in the
   middle of a loop are normal.
+- **`present.spin_lead`.** At `sleep` pacing the executor holds each flip
+  for its vblank asleep. On an APU that sets its own CPU clock from how busy
+  the cores are (the Steam Deck: amd-pstate-epp), a process that only
+  sleeps runs near 2.3 GHz instead of 3.3, and the executor's frame takes a
+  third longer. A lead makes the hold sleep to that many milliseconds
+  before the vblank and spin the rest: the busier core keeps the clock up,
+  at the cost of the spin's watts. The flip is released when the vblank
+  count moves, as before, so the latency does not grow. `0` sleeps the
+  whole hold; a lead of a frame or more spins all of it.
 
 ### Naming rule
 
@@ -242,6 +252,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_PRESENT_ASPECT` | overrides `present.aspect` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 | `RECOMP_PRESENT_PACING` | overrides `present.pacing` |
+| `RECOMP_PRESENT_SPIN_LEAD` | overrides `present.spin_lead` |
 | `RECOMP_RENDER_SHADER_CACHE` | overrides `render.shader_cache` |
 
 The layer converts an environment value to the type of the key:
