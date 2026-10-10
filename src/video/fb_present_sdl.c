@@ -107,6 +107,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
+extern void xbox_InputInit(void);            /* src/input/input_core.c */
 extern int  xbox_InputAnyOpen(void);
 
 /* ── Handoff: three slots, one each for writer, reader and the ready frame ── */
@@ -730,6 +731,18 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     s_guest_main = guest_main;
     xbox_InputSetMainPump(1);
     xbox_InputSdlInit();
+    /* The controllers come up here, on the thread that pumps events, before
+     * any other thread runs: left to the first pad read, the OHCI thread
+     * did SDL_InitSubSystem(GAMECONTROLLER) and SDL_NumJoysticks while this
+     * thread pumped the joystick-added events that init posts. Under
+     * sdl2-compat (Fedora/Bazzite: SDL2 is SDL3 underneath) both paths end
+     * in its SDL_NumJoysticks, which frees and replaces one unlocked global
+     * list (sdl2_compat.c, joystick_list; EventFilter3to2 calls it for
+     * every joystick event), so the two threads freed it twice: "malloc():
+     * unaligned tcache chunk detected" at startup, now and then (BO-76, six
+     * crash reports on the Bazzite). A two-thread test of that shape there
+     * aborted 9 times in 40; with the init first, 0 in 40. */
+    xbox_InputInit();
     xbox_log_thread_role("sdl-main", 0);
     s_running = 1;
     if (!start_guest()) {
