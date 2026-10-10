@@ -583,6 +583,23 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
 
+/** Device registers at a constant address, by call instead of by fault.
+ *
+ * The lifter emits these for an 8/16/32-bit load or store whose address is a
+ * literal inside a trapped device window (tools/recomp/mmio_lower.py): the
+ * APU's registers and the OHCI controllers. As MEMn they would fault and be
+ * decoded by the trap handler; here they call the same device model directly
+ * (xbox_MmioLoad/Store, kernel/xbox_memory_layout.c), which falls back to the
+ * plain access -- and so to the trap -- for anything no model owns. */
+uint32_t xbox_MmioLoad(uint32_t va, int size);
+void     xbox_MmioStore(uint32_t va, uint32_t v, int size);
+#define MMIO_RD8(addr)      ((uint8_t)xbox_MmioLoad((uint32_t)(addr), 1))
+#define MMIO_RD16(addr)     ((uint16_t)xbox_MmioLoad((uint32_t)(addr), 2))
+#define MMIO_RD32(addr)     xbox_MmioLoad((uint32_t)(addr), 4)
+#define MMIO_WR8(addr, v)   xbox_MmioStore((uint32_t)(addr), (uint8_t)(v), 1)
+#define MMIO_WR16(addr, v)  xbox_MmioStore((uint32_t)(addr), (uint16_t)(v), 2)
+#define MMIO_WR32(addr, v)  xbox_MmioStore((uint32_t)(addr), (uint32_t)(v), 4)
+
 /* ================================================================
  * SSE / XMM register state
  *

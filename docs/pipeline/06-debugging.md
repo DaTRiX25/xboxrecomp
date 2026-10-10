@@ -312,6 +312,12 @@ Wreckless did exactly this and reached its main loop with no renderer set up.
   Windows/Proton, and macOS/Linux arm64 through the A64 decoder) reports the codec ready and routes the APU aperture to the
   emulated APU. If behaviour changes with `RECOMP_AC97_READY=0`, the audio
   probe was the gate.
+- The recompiler lowers loads/stores of a constant APU/OHCI register address
+  to direct calls into the device model (`tools/recomp/mmio_lower.py`,
+  `xbox_MmioLoad`/`xbox_MmioStore`); everything else still traps.
+  `RECOMP_MMIO_DIRECT=0` sends those through the trap again (A/B, bisecting);
+  `RECOMP_TRACE=mmio` prints trapped vs direct accesses per device, the hot
+  APU registers and the host PCs that still trap, every 10 s.
 - NV2A register space has no semantics by default and nothing raises a GPU
   interrupt, so a D3D callback driven by one (swap, fence, notifier) never
   fires. `RECOMP_NV2A_TRACE=1` shows whether `DMA_PUT` moves at all;

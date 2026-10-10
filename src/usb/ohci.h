@@ -49,6 +49,13 @@ int  xbox_OhciOwnsAddress(uint32_t xbox_va);
  * treats the fault as a crash. */
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 
+/* The same access without the fault: a lifted load or store whose address the
+ * recompiler proved constant (xbox_MmioLoad/xbox_MmioStore, BO-72). Runs the
+ * register model exactly as xbox_OhciHandleMmio's decoder would for a
+ * `size`-byte access. Returns 0 when the model is off or does not own the
+ * address; the caller then makes the plain access, which traps as before. */
+int  xbox_OhciDirect(uint32_t xbox_va, int size, int is_write, uint32_t *val);
+
 /* Report counts at exit, so a run says whether the driver ever looked. */
 void xbox_OhciReport(void);
 
