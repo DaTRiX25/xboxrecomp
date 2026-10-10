@@ -12,7 +12,11 @@ if(WIN32)
     target_link_libraries(xbox_video PUBLIC xbox_input)
 else()
     find_package(SDL2 REQUIRED)
-    target_sources(xbox_video PRIVATE fb_present_sdl.c)
+    # SMAA's shaders and lookup textures (third_party/smaa), for the layer
+    # presenters' post passes.
+    target_sources(xbox_video PRIVATE fb_present_sdl.c smaa.c)
+    target_include_directories(xbox_video PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/smaa)
     target_link_libraries(xbox_video PUBLIC SDL2::SDL2 xbox_input)
     if(XBOXRECOMP_HAVE_VULKAN)
         # The window's Vulkan swapchain for the Vulkan backend.

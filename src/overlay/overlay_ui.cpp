@@ -83,6 +83,11 @@ static int s_toggle_n, s_toggle_i;
 static uint32_t s_t0_ms;
 /* RECOMP_OVERLAY=file=<path>: the overlay toggles whenever that file appears
  * (and removes it), for driving it from a script that knows when. */
+/* RECOMP_OVERLAY=aa_cycle=<s>: the anti-aliasing setting steps off, FXAA,
+ * SMAA, off ... every <s> seconds, through the settings (the live switch
+ * under test, with no pad to press). */
+static uint32_t s_cycle_ms, s_cycle_next;
+static int s_cycle_i;
 static char s_trigger[512];
 static uint32_t s_trigger_next;
 
@@ -107,7 +112,7 @@ static const char *const n_filter[]    = { "Nearest", "Linear", "Integer", NULL 
 static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", NULL };
 static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the sides)", NULL };
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
-static const char *const n_aa[]        = { "Off", "FXAA", "SMAA (coming soon)", NULL };
+static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1 (coming soon)", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
 
@@ -119,7 +124,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_FIT */        { "Present fit", "Fill the window's height on a 16:10 screen.", 1, FMT_PLAIN, n_fit, 0 },
     /* XS_GRAPHICS_RENDER_SCALE */ { "Render scale", "Internal resolution, a multiple of the Xbox's.", 1, FMT_TIMES, NULL, 0 },
     /* XS_GRAPHICS_ANISO */    { "Anisotropic filtering", "Sharper textures at a slant, the road ahead. Costs GPU time.", 1, FMT_PLAIN, n_aniso, 0 },
-    /* XS_GRAPHICS_AA */       { "Anti-aliasing", "Smooths jagged edges after the frame is drawn. FXAA is one cheap pass.", 1, FMT_PLAIN, n_aa, 1u << 2 },
+    /* XS_GRAPHICS_AA */       { "Anti-aliasing", "Smooths jagged edges after the frame is drawn. FXAA is one cheap pass; SMAA is three, and cleaner.", 1, FMT_PLAIN, n_aa, 0 },
     /* XS_GRAPHICS_SHARPEN */  { "Sharpening", "Contrast-adaptive sharpening (AMD CAS), against the softness of the anti-aliasing and the scale-up.", 0.05, FMT_PERCENT, NULL, 0 },
     /* XS_AUDIO_VOLUME */       { "Master volume", "The game's sound level.", 0.05, FMT_PERCENT, NULL, 0 },
     /* XS_AUDIO_MUTE */         { "Mute", "No sound.", 1, FMT_PLAIN, NULL, 0 },
@@ -501,6 +506,11 @@ void xbox_OverlayPoll(void)
         hot_toggle();
     }
 
+    if (s_cycle_ms && (int32_t)(now_ms() - s_cycle_next) >= 0) {
+        s_cycle_next = now_ms() + s_cycle_ms;
+        s_cycle_i = (s_cycle_i + 1) % 3;
+        xbox_SettingSet(XS_GRAPHICS_AA, s_cycle_i);
+    }
     if (s_trigger[0] && (int32_t)(now_ms() - s_trigger_next) >= 0) {
         s_trigger_next = now_ms() + 200;
         if (unlink(s_trigger) == 0)
@@ -562,6 +572,10 @@ int xbox_OverlaySetWindow(SDL_Window *win)
             s_toggle_ms[s_toggle_n++] = (uint32_t)(sec * 1000.0);
             q = *end == ',' ? end + 1 : end;
         }
+    }
+    if (e && !strncmp(e, "aa_cycle=", 9)) {
+        s_cycle_ms = (uint32_t)(atof(e + 9) * 1000.0);
+        s_cycle_next = now_ms() + s_cycle_ms;
     }
     if (e && !strncmp(e, "file=", 5))
         snprintf(s_trigger, sizeof s_trigger, "%s", e + 5);

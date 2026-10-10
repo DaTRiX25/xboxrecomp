@@ -57,6 +57,7 @@
 #include "latency_trace.h"
 #include "d3d/nv2a_vk_glsl.h"
 #include "post_shaders.h"
+#include "smaa.h"
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
 #include "overlay.h"
 #include "overlay_vulkan.h"
@@ -643,14 +644,20 @@ static void save_shot(const uint8_t *px, uint32_t w, uint32_t h, const char *pat
 
 /* ---- the post passes ------------------------------------------------------
  *
- * FXAA and CAS (post_shaders.h) as fullscreen-triangle passes with dynamic
- * rendering, at the frame's own size: the slot (or the pass before) is the
- * input, a BGRA8 image of the slot's size the target, and the scale to the
- * window then blits the last target instead of the slot. GLSL compiled at
- * the first use (the SPIR-V cache serves it after), a pipeline each. A
- * failure leaves the passes off, logged once; the present is unaffected.
- * One descriptor set per pass and frame in flight, rewritten each frame:
- * the fence wait at the top of fbv_present has retired its last use. */
+ * FXAA or SMAA's three passes, then CAS (post_shaders.h, smaa.h), as
+ * fullscreen-triangle passes with dynamic rendering at the frame's own size:
+ * the slot (or the pass before) is the input, an image of the slot's size the
+ * target, and the scale to the window then blits the last target instead of
+ * the slot. GLSL compiled at the first use (the SPIR-V cache serves it
+ * after), a pipeline each. A failure leaves that pass off, logged once; the
+ * present is unaffected. A target exists only while its setting is on: it is
+ * made at the first frame that needs it and freed (after the queue is idle)
+ * when no setting does. One descriptor set per pass and frame in flight,
+ * rewritten each frame: the fence wait at the top of fbv_present has retired
+ * its last use.
+ *
+ * RECOMP_TRACE=post_gpu: each pass's GPU time, from timestamp queries around
+ * it, read a frame later and averaged every 300 presents. */
 
 static const char s_post_vs[] =
     "#version 450\n"
@@ -676,17 +683,60 @@ static const char s_post_vs[] =
 static const char s_post_fxaa[] = POST_GLSL_HEAD POST_FXAA_BODY "}\n";
 static const char s_post_cas[] = POST_GLSL_HEAD POST_CAS_BODY "}\n";
 
-enum { PP_FXAA, PP_CAS, PP_COUNT };
+/* SMAA's three: the reference library after a header with the push constant
+ * (1/w 1/h w h) and the passes' own bindings. */
+static const char s_smaa_head[] =
+    "#version 450\n"
+    "#define SMAA_GLSL_4\n"
+    "#define SMAA_PRESET_HIGH\n"
+    "layout(push_constant) uniform PC { vec4 rtm; } pc;\n"
+    "#define SMAA_RT_METRICS pc.rtm\n"
+    "layout(location = 0) in vec2 vUv;\n"
+    "layout(location = 0) out vec4 outColor;\n";
+static const char *const s_smaa_bind[3] = {
+    "layout(set = 0, binding = 0) uniform sampler2D colorTex;\n",
+    "layout(set = 0, binding = 0) uniform sampler2D edgesTex;\n"
+    "layout(set = 0, binding = 1) uniform sampler2D areaTex;\n"
+    "layout(set = 0, binding = 2) uniform sampler2D searchTex;\n",
+    "layout(set = 0, binding = 0) uniform sampler2D colorTex;\n"
+    "layout(set = 0, binding = 1) uniform sampler2D blendTex;\n",
+};
+static const char *const s_smaa_main[3] = {
+    "void main() { vec4 offset[3]; SMAAEdgeDetectionVS(vUv, offset);\n"
+    "    outColor = vec4(SMAALumaEdgeDetectionPS(vUv, offset, colorTex), 0.0, 0.0); }\n",
+    "void main() { vec4 offset[3]; vec2 pixcoord; SMAABlendingWeightCalculationVS(vUv, pixcoord, offset);\n"
+    "    outColor = SMAABlendingWeightCalculationPS(vUv, pixcoord, offset, edgesTex, areaTex,\n"
+    "                                               searchTex, vec4(0.0)); }\n",
+    "void main() { vec4 offset; SMAANeighborhoodBlendingVS(vUv, offset);\n"
+    "    outColor = vec4(SMAANeighborhoodBlendingPS(vUv, offset, colorTex, blendTex).rgb, 1.0); }\n",
+};
+
+enum { PP_FXAA, PP_CAS, PP_SM_EDGES, PP_SM_WEIGHTS, PP_SM_BLEND, PP_COUNT };
+/* Targets: 0 FXAA's and SMAA's result, 1 CAS's, 2 edges, 3 weights. */
+enum { TG_AA, TG_CAS, TG_EDGES, TG_WEIGHTS, TG_COUNT };
+static const VkFormat s_tg_fmt[TG_COUNT] = { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
+                                             VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8B8A8_UNORM };
+static const char *const s_pp_name[PP_COUNT] = { "fxaa", "cas", "smaa edges", "smaa weights",
+                                                 "smaa blend" };
+#define PP_TS 16                           /* timestamp slots a frame */
 
 static struct {
-    int tried, ok;
+    int tried, ok, smaa_tried, smaa_ok;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkSampler smp;
     VkDescriptorPool pool;
     VkDescriptorSet ds[2][PP_COUNT];       /* [frame in flight][pass] */
     VkPipeline pso[PP_COUNT];
-    struct nvk_image img[PP_COUNT];         /* each pass's target */
+    struct nvk_image img[TG_COUNT];
+    struct nvk_image lut[2];               /* SMAA's area and search tables */
+    struct nvk_buffer stage[2];            /* their upload, until freed with them */
+    int lut_done;
+    /* post_gpu */
+    VkQueryPool qp;
+    int ts_n[2], ts_pass[2][PP_COUNT];     /* stamps written / which passes, per frame */
+    double ts_sum[PP_COUNT];
+    unsigned ts_cnt[PP_COUNT], ts_presents;
 } P;
 
 static VkShaderModule post_module(enum nvk_stage st, const char *src, const char *what)
@@ -711,7 +761,7 @@ static VkShaderModule post_module(enum nvk_stage st, const char *src, const char
     return m;
 }
 
-static VkPipeline post_pipeline(VkShaderModule vs, VkShaderModule fs)
+static VkPipeline post_pipeline(VkShaderModule vs, VkShaderModule fs, VkFormat cf)
 {
     VkPipelineShaderStageCreateInfo ss[2];
     VkPipelineVertexInputStateCreateInfo vi;
@@ -724,7 +774,6 @@ static VkPipeline post_pipeline(VkShaderModule vs, VkShaderModule fs)
     VkPipelineDynamicStateCreateInfo dy;
     VkPipelineRenderingCreateInfo pr;
     VkGraphicsPipelineCreateInfo gp;
-    VkFormat cf = VK_FORMAT_B8G8R8A8_UNORM;
     static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
     VkPipeline p = VK_NULL_HANDLE;
 
@@ -784,10 +833,58 @@ static VkPipeline post_pipeline(VkShaderModule vs, VkShaderModule fs)
     return p;
 }
 
+/* The three SMAA fragment sources, made when it is first asked for. */
+static void smaa_pipelines(VkShaderModule vs)
+{
+    static const VkFormat fmt[3] = { VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
+                                     VK_FORMAT_B8G8R8A8_UNORM };
+    int k;
+
+    P.smaa_ok = 1;
+    for (k = 0; k < 3; k++) {
+        const char *lib = smaa_glsl_library();
+        size_t n = strlen(s_smaa_head) + strlen(s_smaa_bind[k]) + strlen(lib)
+                 + strlen(s_smaa_main[k]) + 1;
+        char *src = (char *)malloc(n);
+        VkShaderModule fs;
+        if (!src) {
+            P.smaa_ok = 0;
+            return;
+        }
+        snprintf(src, n, "%s%s%s%s", s_smaa_head, s_smaa_bind[k], lib, s_smaa_main[k]);
+        fs = post_module(NVK_STAGE_FRAGMENT, src, s_pp_name[PP_SM_EDGES + k]);
+        free(src);
+        if (fs) {
+            P.pso[PP_SM_EDGES + k] = post_pipeline(vs, fs, fmt[k]);
+            vkDestroyShaderModule(C->dev, fs, NULL);
+        }
+        if (!P.pso[PP_SM_EDGES + k])
+            P.smaa_ok = 0;
+    }
+    fprintf(stderr, LOGP "SMAA %s (preset high)\n", P.smaa_ok ? "ready" : "unavailable");
+}
+
+/* SMAA's pipelines, when it is first asked for (the larger compile, once;
+ * the SPIR-V cache serves it after). */
+static int smaa_prepare(void)
+{
+    VkShaderModule vs;
+
+    if (P.smaa_tried)
+        return P.smaa_ok;
+    P.smaa_tried = 1;
+    vs = post_module(NVK_STAGE_VERTEX, s_post_vs, "vertex");
+    if (vs) {
+        smaa_pipelines(vs);
+        vkDestroyShaderModule(C->dev, vs, NULL);
+    }
+    return P.smaa_ok;
+}
+
 /* Made at the first use; 1 when the passes can run. */
 static int post_init(void)
 {
-    VkDescriptorSetLayoutBinding lb;
+    VkDescriptorSetLayoutBinding lb[3];
     VkDescriptorSetLayoutCreateInfo li;
     VkPushConstantRange pcr;
     VkPipelineLayoutCreateInfo pli;
@@ -796,20 +893,23 @@ static int post_init(void)
     VkDescriptorPoolCreateInfo pci;
     VkDescriptorSetAllocateInfo dai;
     VkDescriptorSetLayout lay[2 * PP_COUNT];
-    VkShaderModule vs, fs[PP_COUNT];
+    VkShaderModule vs, fs[2];
     int i;
 
     if (P.tried)
         return P.ok;
     P.tried = 1;
-    memset(&lb, 0, sizeof lb);
-    lb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    lb.descriptorCount = 1;
-    lb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    memset(lb, 0, sizeof lb);
+    for (i = 0; i < 3; i++) {
+        lb[i].binding = (uint32_t)i;
+        lb[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        lb[i].descriptorCount = 1;
+        lb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
     memset(&li, 0, sizeof li);
     li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    li.bindingCount = 1;
-    li.pBindings = &lb;
+    li.bindingCount = 3;
+    li.pBindings = lb;
     memset(&pcr, 0, sizeof pcr);
     pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr.size = 16;
@@ -820,7 +920,7 @@ static int post_init(void)
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     memset(&psz, 0, sizeof psz);
     psz.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    psz.descriptorCount = 2 * PP_COUNT;
+    psz.descriptorCount = 3 * 2 * PP_COUNT;
     memset(&pci, 0, sizeof pci);
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pci.maxSets = 2 * PP_COUNT;
@@ -856,12 +956,12 @@ static int post_init(void)
     fs[PP_FXAA] = post_module(NVK_STAGE_FRAGMENT, s_post_fxaa, "FXAA");
     fs[PP_CAS] = post_module(NVK_STAGE_FRAGMENT, s_post_cas, "CAS");
     if (vs) {
-        for (i = 0; i < PP_COUNT; i++)
+        for (i = 0; i < 2; i++)
             if (fs[i])
-                P.pso[i] = post_pipeline(vs, fs[i]);
+                P.pso[i] = post_pipeline(vs, fs[i], VK_FORMAT_B8G8R8A8_UNORM);
     }
     /* The modules are no longer needed once the pipelines exist. */
-    for (i = 0; i < PP_COUNT; i++)
+    for (i = 0; i < 2; i++)
         if (fs[i])
             vkDestroyShaderModule(C->dev, fs[i], NULL);
     if (vs)
@@ -869,10 +969,34 @@ static int post_init(void)
     P.ok = P.pso[PP_FXAA] || P.pso[PP_CAS];
     fprintf(stderr, LOGP "post passes: FXAA %s, CAS %s\n", P.pso[PP_FXAA] ? "ready" : "unavailable",
             P.pso[PP_CAS] ? "ready" : "unavailable");
+    if (recomp_env(RENV_POST_GPU) && C->props.limits.timestampPeriod > 0.0f) {
+        VkQueryPoolCreateInfo qi;
+        memset(&qi, 0, sizeof qi);
+        qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2 * PP_TS;
+        if (vkCreateQueryPool(C->dev, &qi, NULL, &P.qp) != VK_SUCCESS)
+            P.qp = VK_NULL_HANDLE;
+    }
     return P.ok;
 fail:
     fprintf(stderr, LOGP "post passes unavailable (Vulkan objects failed)\n");
     return 0;
+}
+
+static void post_free_targets(int luts_too)
+{
+    int i;
+    queue_idle();
+    for (i = 0; i < TG_COUNT; i++)
+        nvk_image_free(&P.img[i]);
+    if (luts_too) {
+        for (i = 0; i < 2; i++) {
+            nvk_image_free(&P.lut[i]);
+            nvk_buffer_free(&P.stage[i]);
+        }
+        P.lut_done = 0;
+    }
 }
 
 static void post_destroy(void)
@@ -880,11 +1004,12 @@ static void post_destroy(void)
     int i;
     if (!P.tried)
         return;
-    for (i = 0; i < PP_COUNT; i++) {
+    post_free_targets(1);
+    for (i = 0; i < PP_COUNT; i++)
         if (P.pso[i])
             vkDestroyPipeline(C->dev, P.pso[i], NULL);
-        nvk_image_free(&P.img[i]);
-    }
+    if (P.qp)
+        vkDestroyQueryPool(C->dev, P.qp, NULL);
     if (P.pool)
         vkDestroyDescriptorPool(C->dev, P.pool, NULL);
     if (P.smp)
@@ -896,100 +1021,274 @@ static void post_destroy(void)
     memset(&P, 0, sizeof P);
 }
 
+/* The target t at w x h, made if it is not (0 when it cannot be). */
+static struct nvk_image *post_target(int t, uint32_t w, uint32_t h)
+{
+    struct nvk_image *im = &P.img[t];
+    if (im->img && (im->w != w || im->h != h)) {
+        queue_idle();                   /* a present may still read it: rare */
+        nvk_image_free(im);
+    }
+    if (!im->img && !nvk_image_new(im, s_tg_fmt[t], w, h, 1,
+                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                                   | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
+        return NULL;
+    return im;
+}
+
+/* SMAA's lookup tables, uploaded in cb the first time. */
+static int post_luts(VkCommandBuffer cb)
+{
+    static const struct { VkFormat f; uint32_t w, h, bpp; } d[2] = {
+        { VK_FORMAT_R8G8_UNORM, SMAA_AREA_W, SMAA_AREA_H, 2 },
+        { VK_FORMAT_R8_UNORM, SMAA_SEARCH_W, SMAA_SEARCH_H, 1 },
+    };
+    const unsigned char *src[2];
+    int i;
+
+    if (P.lut_done)
+        return 1;
+    src[0] = smaa_area_bytes;
+    src[1] = smaa_search_bytes;
+    for (i = 0; i < 2; i++) {
+        VkBufferImageCopy bc;
+        VkDeviceSize n = (VkDeviceSize)d[i].w * d[i].h * d[i].bpp;
+        if (!nvk_image_new(&P.lut[i], d[i].f, d[i].w, d[i].h, 1,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT)
+                || !nvk_buffer_new(&P.stage[i], n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                   | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)) {
+            post_free_targets(1);
+            return 0;
+        }
+        memcpy(P.stage[i].map, src[i], (size_t)n);
+        nvk_image_to(cb, &P.lut[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        memset(&bc, 0, sizeof bc);
+        bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        bc.imageSubresource.layerCount = 1;
+        bc.imageExtent.width = d[i].w;
+        bc.imageExtent.height = d[i].h;
+        bc.imageExtent.depth = 1;
+        vkCmdCopyBufferToImage(cb, P.stage[i].buf, P.lut[i].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &bc);
+        nvk_image_to(cb, &P.lut[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    P.lut_done = 1;
+    return 1;
+}
+
+/* One pass in cb: `in` (up to three images, as laid out now) through pass p
+ * into target t (cleared first when `clear`). pc is the 16 bytes of push
+ * constants. */
+static void post_pass(VkCommandBuffer cb, int p, struct nvk_image *dst, int clear,
+                      struct nvk_image *const *in, const VkImageLayout *in_layout, int nin,
+                      const float *pc)
+{
+    VkDescriptorImageInfo di[3];
+    VkWriteDescriptorSet wr[3];
+    VkRenderingAttachmentInfo att;
+    VkRenderingInfo ri;
+    VkViewport vp;
+    VkRect2D sc;
+    int i, slot = -1;
+
+    for (i = 0; i < nin; i++) {
+        memset(&di[i], 0, sizeof di[i]);
+        di[i].sampler = P.smp;
+        di[i].imageView = in[i]->view;
+        di[i].imageLayout = in_layout[i];
+        memset(&wr[i], 0, sizeof wr[i]);
+        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstSet = P.ds[s_fi][p];
+        wr[i].dstBinding = (uint32_t)i;
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[i].pImageInfo = &di[i];
+    }
+    vkUpdateDescriptorSets(C->dev, (uint32_t)nin, wr, 0, NULL);
+
+    nvk_image_to(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    if (P.qp && P.ts_n[s_fi] + 2 <= PP_TS) {
+        slot = P.ts_n[s_fi];
+        P.ts_pass[s_fi][slot / 2] = p;
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, P.qp, (uint32_t)(s_fi * PP_TS + slot));
+    }
+    memset(&att, 0, sizeof att);
+    att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    att.imageView = dst->view;
+    att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    att.loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    memset(&ri, 0, sizeof ri);
+    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    ri.renderArea.extent.width = dst->w;
+    ri.renderArea.extent.height = dst->h;
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &att;
+    vkCmdBeginRendering(cb, &ri);
+    memset(&vp, 0, sizeof vp);
+    vp.width = (float)dst->w;
+    vp.height = (float)dst->h;
+    vp.maxDepth = 1.0f;
+    sc.offset.x = sc.offset.y = 0;
+    sc.extent.width = dst->w;
+    sc.extent.height = dst->h;
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pso[p]);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl, 0, 1, &P.ds[s_fi][p], 0, NULL);
+    vkCmdPushConstants(cb, P.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    /* Readable by the next pass or the blit. */
+    nvk_image_to(cb, dst, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (slot >= 0) {
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, P.qp,
+                            (uint32_t)(s_fi * PP_TS + slot + 1));
+        P.ts_n[s_fi] += 2;
+    }
+}
+
+/* The last frame in this slot's passes' timestamps, read now that its fence
+ * has signalled; a line every 300 presents. */
+static void post_gpu_read(void)
+{
+    uint64_t t[PP_TS];
+    int n = P.ts_n[s_fi], i;
+    double period = (double)C->props.limits.timestampPeriod * 1e-6;     /* ms a tick */
+
+    if (!P.qp || !n)
+        return;
+    P.ts_n[s_fi] = 0;
+    if (vkGetQueryPoolResults(C->dev, P.qp, (uint32_t)(s_fi * PP_TS), (uint32_t)n,
+                              sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return;
+    for (i = 0; i + 1 < n; i += 2) {
+        int p = P.ts_pass[s_fi][i / 2];
+        P.ts_sum[p] += (double)(t[i + 1] - t[i]) * period;
+        P.ts_cnt[p]++;
+    }
+    if (++P.ts_presents % 300 == 0) {
+        fprintf(stderr, LOGP "post GPU ms (avg of the last 300):");
+        for (i = 0; i < PP_COUNT; i++) {
+            if (P.ts_cnt[i])
+                fprintf(stderr, " %s %.3f", s_pp_name[i], P.ts_sum[i] / (double)P.ts_cnt[i]);
+            P.ts_sum[i] = 0;
+            P.ts_cnt[i] = 0;
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
 /* The passes asked for (RECOMP_GFX_AA, RECOMP_GFX_SHARPEN), recorded into cb
  * over slot k. Returns the image and layout the scale to the window reads:
  * the last target, or the slot itself when no pass ran. */
 static void post_run(VkCommandBuffer cb, int k, VkImage *src, VkImageLayout *layout)
 {
-    int want[PP_COUNT];
-    struct nvk_image *cur = &s_slot[k];
-    VkImageLayout cur_layout = VK_IMAGE_LAYOUT_GENERAL;
-    int p, ran = 0;
+    int aa = nv2a_host_post_aa(), cas = nv2a_host_sharpen() > 0.001f;
+    float sharp = nv2a_host_sharpen();
+    struct nvk_image *slot = &s_slot[k], *cur = slot, *in[3], *t;
+    VkImageLayout cur_layout = VK_IMAGE_LAYOUT_GENERAL, inl[3];
+    float pc[4];
+    int fx = aa == NV2A_AA_FXAA, sm = aa == NV2A_AA_SMAA, ran = 0;
 
-    want[PP_FXAA] = nv2a_host_post_aa() == NV2A_AA_FXAA;
-    want[PP_CAS] = nv2a_host_sharpen() > 0.001f;
-    *src = s_slot[k].img;
+    *src = slot->img;
     *layout = VK_IMAGE_LAYOUT_GENERAL;
-    if ((!want[PP_FXAA] && !want[PP_CAS]) || !post_init())
+    if (!(fx || sm || cas) && !P.tried)
         return;
-    for (p = 0; p < PP_COUNT; p++)
-        if (want[p] && P.pso[p] && (P.img[p].w != s_slot[k].w || P.img[p].h != s_slot[k].h
-                                    || !P.img[p].img)) {
-            if (P.img[p].img) {
-                queue_idle();           /* a present may still read it: rare */
-                nvk_image_free(&P.img[p]);
-            }
-            if (!nvk_image_new(&P.img[p], VK_FORMAT_B8G8R8A8_UNORM, s_slot[k].w, s_slot[k].h, 1,
-                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-                               | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) {
-                want[p] = 0;
-                continue;
-            }
+    if (!post_init())
+        return;
+    fx = fx && P.pso[PP_FXAA];
+    sm = sm && smaa_prepare();
+    cas = cas && P.pso[PP_CAS];
+    {
+        static int last_aa = -1;
+        static float last_sharp = -1.0f;
+        if (aa != last_aa || sharp != last_sharp) {
+            last_aa = aa;
+            last_sharp = sharp;
+            fprintf(stderr, LOGP "post passes: AA %s, sharpen %.2f (%ux%u)\n",
+                    aa == NV2A_AA_FXAA ? "FXAA" : aa == NV2A_AA_SMAA ? (sm ? "SMAA" : "SMAA (unavailable)")
+                    : "off", sharp, slot->w, slot->h);
         }
+    }
+    post_gpu_read();
+    /* Targets only while a setting needs them. */
+    if (!fx && !sm && !cas && !P.img[TG_AA].img && !P.img[TG_CAS].img && !P.img[TG_EDGES].img
+            && !P.lut[0].img)
+        return;
+    if (!sm && (P.img[TG_EDGES].img || P.img[TG_WEIGHTS].img || P.lut[0].img)) {
+        /* SMAA went off: its targets and tables go (the queue is idle first). */
+        queue_idle();
+        nvk_image_free(&P.img[TG_EDGES]);
+        nvk_image_free(&P.img[TG_WEIGHTS]);
+        for (int i = 0; i < 2; i++) {
+            nvk_image_free(&P.lut[i]);
+            nvk_buffer_free(&P.stage[i]);
+        }
+        P.lut_done = 0;
+    }
+    if (!fx && !sm && P.img[TG_AA].img) {
+        queue_idle();
+        nvk_image_free(&P.img[TG_AA]);
+    }
+    if (!cas && P.img[TG_CAS].img) {
+        queue_idle();
+        nvk_image_free(&P.img[TG_CAS]);
+    }
+    if (!fx && !sm && !cas)
+        return;
     /* After the backend's copy into the slot (earlier on the queue). */
-    nvk_image_barrier(cb, s_slot[k].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL,
+    nvk_image_barrier(cb, slot->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL,
                       VK_IMAGE_LAYOUT_GENERAL);
-    for (p = 0; p < PP_COUNT; p++) {
-        VkDescriptorImageInfo di;
-        VkWriteDescriptorSet wr;
-        VkRenderingAttachmentInfo att;
-        VkRenderingInfo ri;
-        VkViewport vp;
-        VkRect2D sc;
-        float pc[4];
-        struct nvk_image *dst = &P.img[p];
-
-        if (!want[p] || !P.pso[p] || !dst->img)
-            continue;
-        memset(&di, 0, sizeof di);
-        di.sampler = P.smp;
-        di.imageView = cur->view;
-        di.imageLayout = cur_layout;
-        memset(&wr, 0, sizeof wr);
-        wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr.dstSet = P.ds[s_fi][p];
-        wr.descriptorCount = 1;
-        wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        wr.pImageInfo = &di;
-        vkUpdateDescriptorSets(C->dev, 1, &wr, 0, NULL);
-
-        nvk_image_to(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        memset(&att, 0, sizeof att);
-        att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        att.imageView = dst->view;
-        att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        memset(&ri, 0, sizeof ri);
-        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea.extent.width = dst->w;
-        ri.renderArea.extent.height = dst->h;
-        ri.layerCount = 1;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachments = &att;
-        vkCmdBeginRendering(cb, &ri);
-        memset(&vp, 0, sizeof vp);
-        vp.width = (float)dst->w;
-        vp.height = (float)dst->h;
-        vp.maxDepth = 1.0f;
-        sc.offset.x = sc.offset.y = 0;
-        sc.extent.width = dst->w;
-        sc.extent.height = dst->h;
-        vkCmdSetViewport(cb, 0, 1, &vp);
-        vkCmdSetScissor(cb, 0, 1, &sc);
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pso[p]);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl, 0, 1, &P.ds[s_fi][p],
-                                0, NULL);
-        pc[0] = 1.0f / (float)dst->w;
-        pc[1] = 1.0f / (float)dst->h;
-        pc[2] = nv2a_host_sharpen();
-        pc[3] = 0.0f;
-        vkCmdPushConstants(cb, P.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
-        vkCmdDraw(cb, 3, 1, 0, 0);
-        vkCmdEndRendering(cb);
-        /* Readable by the next pass or the blit. */
-        nvk_image_to(cb, dst, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        cur = dst;
+    if (P.qp) {
+        vkCmdResetQueryPool(cb, P.qp, (uint32_t)(s_fi * PP_TS), PP_TS);
+        P.ts_n[s_fi] = 0;
+    }
+    memset(pc, 0, sizeof pc);
+    pc[0] = 1.0f / (float)slot->w;
+    pc[1] = 1.0f / (float)slot->h;
+    pc[2] = sharp;
+    if (fx && (t = post_target(TG_AA, slot->w, slot->h)) != NULL) {
+        in[0] = cur;
+        inl[0] = cur_layout;
+        post_pass(cb, PP_FXAA, t, 0, in, inl, 1, pc);
+        cur = t;
+        cur_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ran = 1;
+    } else if (sm && post_luts(cb)) {
+        struct nvk_image *ed = post_target(TG_EDGES, slot->w, slot->h),
+                         *wt = post_target(TG_WEIGHTS, slot->w, slot->h),
+                         *out = post_target(TG_AA, slot->w, slot->h);
+        if (ed && wt && out) {
+            float m[4] = { pc[0], pc[1], (float)slot->w, (float)slot->h };
+            in[0] = cur;
+            inl[0] = cur_layout;
+            post_pass(cb, PP_SM_EDGES, ed, 1, in, inl, 1, m);
+            in[0] = ed;
+            inl[0] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            in[1] = &P.lut[0];
+            inl[1] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            in[2] = &P.lut[1];
+            inl[2] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            post_pass(cb, PP_SM_WEIGHTS, wt, 1, in, inl, 3, m);
+            in[0] = cur;
+            inl[0] = cur_layout;
+            in[1] = wt;
+            inl[1] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            post_pass(cb, PP_SM_BLEND, out, 0, in, inl, 2, m);
+            cur = out;
+            cur_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            ran = 1;
+        }
+    }
+    if (cas && (t = post_target(TG_CAS, slot->w, slot->h)) != NULL) {
+        in[0] = cur;
+        inl[0] = cur_layout;
+        post_pass(cb, PP_CAS, t, 0, in, inl, 1, pc);
+        cur = t;
         cur_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         ran = 1;
     }
