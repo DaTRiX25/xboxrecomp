@@ -886,6 +886,51 @@ static void z_vertex(float x, float y, float z, uint32_t argb)
     M(0x1818, argb);
 }
 
+/* swizzled target (BO-24, Metal): a 64x64 surface of format type 2 cleared
+ * blue with a red quad over its top left, then written back: the guest
+ * bytes are the CPU path's, Z order and all. Returns the failures. */
+static void swz_stream(void)
+{
+    static const uint32_t red[4] = {0xFFFF0000u, 0xFFFF0000u, 0xFFFF0000u, 0xFFFF0000u};
+    int a;
+    M(0x0200, 64u << 16);
+    M(0x0204, 64u << 16);
+    M(0x0208, 0x06060228u);                /* A8R8G8B8, swizzled, 64x64 */
+    M(0x020C, 256u);
+    M(0x0210, RTT2);
+    M(0x0214, 0x02400000u);
+    M(0x0304, 0);
+    M(0x1B0C, 0);
+    M(0x1D90, 0xFF0000FFu);
+    M(0x1D94, 0xF0);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+    quad_uv(0.0f, 0.0f, 24.0f, 40.0f, red, NULL);
+}
+
+static int swizzled_case(const struct nv2a_pb_backend *b)
+{
+    static uint8_t cpu[64 * 64 * 4];
+    int diff = 0, i;
+
+    memset(guest(RTT2), 0x55, sizeof cpu);
+    nv2a_pb_set_backend(nv2a_pb_cpu_backend());
+    swz_stream();
+    memcpy(cpu, guest(RTT2), sizeof cpu);
+    memset(guest(RTT2), 0x55, sizeof cpu);
+    nv2a_pb_set_backend(b);
+    swz_stream();
+    b->sync_guest(RTT2, 256, 64, 64);
+    for (i = 0; i < 64 * 64; i++)
+        diff += (((const uint32_t *)guest(RTT2))[i] | 0xFF000000u)
+                != (((const uint32_t *)cpu)[i] | 0xFF000000u);
+    nv2a_pb_set_backend(NULL);
+    surf_clip(BUF0, 0, 0, W, H);
+    fprintf(stderr, "[backend-smoke] swizzled target: %d of 4096 texels differ from the"
+            " CPU path's %s\n", diff, diff ? "FAIL" : "PASS");
+    return diff != 0;
+}
+
 static int poly_offset_case(const struct nv2a_pb_backend *b)
 {
     static const uint32_t col[2] = {0xFFFF0000u, 0xFF0000FFu};
@@ -1439,6 +1484,8 @@ int main(int argc, char **argv)
         failures += inflight_case(gpu);
     if (gpu)
         failures += poly_offset_case(gpu);
+    if (gpu == nv2a_pb_metal_backend())
+        failures += swizzled_case(gpu);
 #endif
     if (failures) {
         fprintf(stderr, "[backend-smoke] FAIL: %d of %d scenes\n", failures, SC_COUNT);

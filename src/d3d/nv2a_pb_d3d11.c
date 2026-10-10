@@ -79,15 +79,15 @@ static struct xbox_title_clock s_title_clock;
  * is the SDL window's knob (default on there); here only a value that turns
  * it on changes anything, so an unset key keeps the stock behaviour. */
 static UINT                    s_sync_interval;
-/* RECOMP_PRESENT_VSYNC=fifo: three flip-model buffers, Present(1) and the
+/* RECOMP_PRESENT_VSYNC=fifo: two flip-model buffers, Present(1) and the
  * frame-latency waitable (SetMaximumFrameLatency, RECOMP_PRESENT_LATENCY,
- * 2 by default), waited on before each present: the swap chain queues at
- * most that many frames ahead of the display and, when full, holds the
- * executor -- the display's refresh back-pressures the title, the
- * documented low-latency flip-model pacing (IDXGISwapChain2::
- * SetMaximumFrameLatency) that DXVK honours. Xerenge's plume presents the
- * same way (FIFO, three buffers). s_swap_flags is what ResizeBuffers must
- * keep. */
+ * 1 by default -- the BO-74 latency measurement's recommendation), waited on
+ * before each present: the swap chain queues at most that many frames ahead
+ * of the display and, when full, holds the executor -- the display's
+ * refresh back-pressures the title, the documented low-latency flip-model
+ * pacing (IDXGISwapChain2::SetMaximumFrameLatency) that DXVK honours (under
+ * Proton also DXVK_CONFIG="dxgi.maxFrameLatency = 1"). s_swap_flags is what
+ * ResizeBuffers must keep. */
 static UINT                    s_swap_flags;
 static HANDLE                  s_latency_wait;
 static ID3D11Device           *s_dev;
@@ -550,7 +550,7 @@ static int init(void)
     sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = s_swap_flags ? 3 : 2;
+    sd.BufferCount = 2;
     sd.OutputWindow = s_hwnd;
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -566,16 +566,16 @@ static int init(void)
     if (s_swap_flags) {
         IDXGISwapChain2 *sc2 = NULL;
         const char *e = recomp_env(RENV_PRESENT_LATENCY);
-        UINT lat = e ? (UINT)atoi(e) : 2;
+        UINT lat = e ? (UINT)atoi(e) : 1;
         if (lat < 1 || lat > 3)
-            lat = 2;
+            lat = 1;
         if (SUCCEEDED(IDXGISwapChain_QueryInterface(s_swap, &IID_IDXGISwapChain2,
                                                     (void **)&sc2))) {
             IDXGISwapChain2_SetMaximumFrameLatency(sc2, lat);
             s_latency_wait = IDXGISwapChain2_GetFrameLatencyWaitableObject(sc2);
             IDXGISwapChain2_Release(sc2);
         }
-        fprintf(stderr, LOGP "present: FIFO, 3 buffers, max frame latency %u%s\n",
+        fprintf(stderr, LOGP "present: FIFO, 2 buffers, max frame latency %u%s\n",
                 lat, s_latency_wait ? "" : " (no waitable: Present blocks instead)");
     }
     vblank_link_start();

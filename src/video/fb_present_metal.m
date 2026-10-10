@@ -235,11 +235,12 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         }
         s_layer.framebufferOnly = shots ? NO : YES;
         s_layer.displaySyncEnabled = vsync ? YES : NO;
-        /* RECOMP_PRESENT_DRAWABLES=2: one frame less queued ahead of the
-         * display (less latency, less slack); 3 is the default. */
+        /* Two drawables: at most one frame queued ahead of the display
+         * (the BO-74 latency measurement's recommendation, with display
+         * sync on). RECOMP_PRESENT_DRAWABLES=3 gives one more of slack. */
         {
             const char *e = recomp_env(RENV_PRESENT_DRAWABLES);
-            s_layer.maximumDrawableCount = (e && atoi(e) == 2) ? 2 : 3;
+            s_layer.maximumDrawableCount = (e && atoi(e) == 3) ? 3 : 2;
             if (e)
                 fprintf(stderr, "[PRESENT] CAMetalLayer: %d drawables, display sync %s\n",
                         (int)s_layer.maximumDrawableCount, vsync ? "on" : "off");

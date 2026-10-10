@@ -83,6 +83,7 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
 #include "d3d8_msl.h"
+#include "d3d8_swizzle.h"
 #include "nv2a_pcache.h"
 #include "latency_trace.h"
 #include "host_time.h"
@@ -354,6 +355,7 @@ static id<MTLCommandBuffer> s_prof_cmd[PROF_CMDS];
 static int s_prof_ncmd;
 static struct {
     uint64_t n, flip, wait, gpu, hostrb, wb, winrb, winpush, blit, ncmd, hash;
+    uint64_t texh, texh_bytes, texh_n, texup, texup_n;   /* tex_bind */
 } s_pa;
 
 /* The last committed command buffer: a sync between flips waits for it when
@@ -779,17 +781,50 @@ static id<MTLTexture> rt_texture_new(uint32_t hw, uint32_t hh)
     return [s_dev newTextureWithDescriptor:td];
 }
 
+/* Swizzled render targets (BO-24). A surface of format type 2 lies in guest
+ * memory in the NV2A's Z order (d3d8_swizzle.h), as the CPU path draws it
+ * (surface_swizzle_index): the seed reads it so, and a write-back stores it
+ * so, through a linear staging copy. Only a power-of-two w x h is a swizzled
+ * layout; anything else is left linear, as before. */
+static int rt_swz_ok(int swz, uint32_t w, uint32_t h)
+{
+    return swz && w && h && !(w & (w - 1)) && !(h & (h - 1));
+}
+
+static uint8_t *s_swz_lin;    /* staging: one w x h target, linear */
+static size_t   s_swz_cap;
+
+static uint8_t *swz_staging(size_t bytes)
+{
+    if (s_swz_cap < bytes) {
+        uint8_t *n = (uint8_t *)realloc(s_swz_lin, bytes);
+        if (!n)
+            return NULL;
+        s_swz_lin = n;
+        s_swz_cap = bytes;
+    }
+    return s_swz_lin;
+}
+
 /* tex (w x h guest, hw x hh host) from the guest's bytes at addr when the
  * surface is 32-bit, as the CPU path draws over whatever memory holds; 0 when
  * it is not (the texture is left as made). */
 static int rt_seed(id<MTLTexture> tex, uint32_t addr, uint32_t pitch, uint32_t w,
-                    uint32_t h, uint32_t hw, uint32_t hh)
+                    uint32_t h, uint32_t hw, uint32_t hh, int swz)
 {
     const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset() + addr;
 
     if (pitch < w * 4u)
         return 0;
     guard_open();   /* our own read of the seed is not a title read */
+    if (rt_swz_ok(swz, w, h)) {
+        uint8_t *lin = swz_staging((size_t)w * h * 4u);
+        if (!lin)
+            return 0;
+        xbox_unswizzle_rect(lin, src, w, h, 4);
+        src = lin;
+        pitch = w * 4u;
+    }
     if (hw == w) {
         [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
                  withBytes:src bytesPerRow:pitch];
@@ -831,7 +866,7 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     tex = rt_texture_new(hw, hh);
     if (!tex)
         return 0;
-    if (!rt_seed(tex, rt->addr, rt->pitch, w, h, hw, hh)) {
+    if (!rt_seed(tex, rt->addr, rt->pitch, w, h, hw, hh, rt->swz)) {
         /* A new texture's contents are undefined: a 16-bit surface's margin
          * starts black, as D3D11's does. */
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -884,14 +919,16 @@ static RenderTarget *surface(void)
     uint32_t w = g->clip_x + g->clip_w, h = g->clip_y + g->clip_h;
     RenderTarget *free_rt = NULL, *lru = &s_rt[0];
     uint32_t hw, hh;
-    int i;
+    int i, swz;
 
     if (!g->color_offset || !w || !h || w > 4096 || h > 4096)
         return NULL;
+    swz = ((g->format >> 8) & 0xF) == 2;    /* another layout: another target */
     s_tick++;
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
-        if (rt->tex && rt->offset == g->color_offset && rt->w == w && rt->h == h) {
+        if (rt->tex && rt->offset == g->color_offset && rt->w == w && rt->h == h
+                && rt->swz == swz) {
             /* First use this flip of a target the title may have rewritten:
              * a stale one is made again from the title's bytes, which the
              * GPU would draw over. */
@@ -915,7 +952,8 @@ static RenderTarget *surface(void)
      * its own and the overlap rule retires this one. */
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
-        if (!rt->tex || rt->offset != g->color_offset || rt->pitch != g->pitch)
+        if (!rt->tex || rt->offset != g->color_offset || rt->pitch != g->pitch
+                || rt->swz != swz)
             continue;
         if (rt_drop_if_stale(rt, "reuse"))
             break;
@@ -977,10 +1015,10 @@ static RenderTarget *surface(void)
     free_rt->hw = hw;
     free_rt->hh = hh;
     free_rt->pitch = g->pitch;
-    free_rt->swz = ((g->format >> 8) & 0xF) == 2;
+    free_rt->swz = swz;
     free_rt->last_use = s_tick;
     rt_own_reset(free_rt);   /* the bytes the seed reads, or would */
-    rt_seed(free_rt->tex, free_rt->addr, g->pitch, w, h, hw, hh);
+    rt_seed(free_rt->tex, free_rt->addr, g->pitch, w, h, hw, hh, free_rt->swz);
     if (hw != w)
         fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
                 g->color_offset, w, h, hw, hh);
@@ -1633,11 +1671,18 @@ static id<MTLTexture> tex_bind(const Stage *t)
     }
     if (e) {
         if (e->gen != g->flips) {
-            uint64_t h = tex_hash_pal(mem, t, bytes);
+            uint64_t tp = prof_t(), h = tex_hash_pal(mem, t, bytes);
+            prof_add(&s_pa.texh, tp);
+            s_pa.texh_bytes += bytes;
+            s_pa.texh_n++;
             s_tex_rehash++;
             e->gen = g->flips;
             if (h != e->hash) {
-                id<MTLTexture> nt = tex_upload(t);
+                id<MTLTexture> nt;
+                tp = prof_t();
+                nt = tex_upload(t);
+                prof_add(&s_pa.texup, tp);
+                s_pa.texup_n++;
                 e->hash = h;
                 s_tex_changed++;
                 if (!nt)
@@ -1652,7 +1697,12 @@ static id<MTLTexture> tex_bind(const Stage *t)
         [e->tex release];
         e->tex = nil;
         e->live = 0;
-        nt = tex_upload(t);
+        {
+            uint64_t tp = prof_t();
+            nt = tex_upload(t);
+            prof_add(&s_pa.texup, tp);
+            s_pa.texup_n++;
+        }
         if (!nt)
             return s_black;
         e->offset = t->offset;
@@ -1907,7 +1957,7 @@ typedef struct {
     id<MTLFunction>   fn;
 } FsEntry;
 static FsEntry *s_fs;         /* s_pc_max, allocated in init */
-static struct { int valid; uint32_t r[37]; FsEntry *e; } s_fs_memo;
+static struct { int valid; uint32_t r[39]; FsEntry *e; } s_fs_memo;
 
 /* The fragment function for combiner state `st`, a new reference or nil.
  * Any thread. */
@@ -1970,7 +2020,7 @@ static FsEntry *fs_slot(int evict)
 static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
 {
     NV2ACombinerState st;
-    uint32_t key[37], modes = 0, signs = 0;
+    uint32_t key[39], modes = 0, signs = 0;
     id<MTLFunction> fn;
     uint64_t kid;
     FsEntry *e;
@@ -2001,6 +2051,8 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     key[34] = v->rc_fcw1;
     key[35] = modes;
     key[36] = signs;
+    key[37] = v->shader_ctl & 0x00FF0000u;  /* stage 2 and 3 input stages */
+    key[38] = v->clip_plane_mode;
     if (s_fs_memo.valid && !memcmp(s_fs_memo.r, key, sizeof key)) {
         if (!s_fs_memo.e)
             return s_fs_basic;
@@ -2013,8 +2065,12 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw,
                              v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
     st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
-    for (n = 0; n < 4; n++)
+    for (n = 0; n < 4; n++) {
         st.tex_signed[n] = (uint8_t)((signs >> (4 * n)) & 0xFu);
+        st.clip_mode[n] = (uint8_t)((v->clip_plane_mode >> (4 * n)) & 0xFu);
+    }
+    st.input_tex[2] = (uint8_t)((v->shader_ctl >> 16) & 0xFu);
+    st.input_tex[3] = (uint8_t)((v->shader_ctl >> 20) & 0xFu);
     kid = nv2a_fnv64(&st, sizeof st, NV2A_FNV64_INIT);
     if (!kid)
         kid = 1;
@@ -3012,10 +3068,36 @@ static uint32_t s_shown_w, s_shown_h;   /* the last flip's present extent */
 /* rt's pixels into the guest surface at `addr`, `pitch` bytes a row: 32-bit
  * as they are (BGRA8 is X8R8G8B8's byte order), 16-bit as R5G6B5. Runs after
  * the wait, on the executor's thread. */
+/* lin (w x h, 32-bit linear) into guest memory at dst as rt's swizzled
+ * layout, at bpp 4 or (R5G6B5) 2. */
+static void swz_store(const RenderTarget *rt, uint8_t *dst, uint32_t *lin, uint32_t bpp)
+{
+    uint32_t w = rt->w, h = rt->h, i;
+    if (bpp == 2) {
+        uint16_t *o = (uint16_t *)lin;      /* in place: each texel shrinks */
+        for (i = 0; i < w * h; i++) {
+            uint32_t c = lin[i];
+            o[i] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F));
+        }
+    }
+    xbox_swizzle_rect(dst, lin, w, h, bpp);
+}
+
 static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
 {
     uint8_t *dst = (uint8_t *)xbox_GetMemoryOffset() + addr;
     uint32_t bpp = pitch / rt->w, w = rt->w, y, x;
+
+    if (rt_swz_ok(rt->swz, rt->w, rt->h) && (bpp == 4 || bpp == 2)) {
+        uint32_t *lin = (uint32_t *)swz_staging((size_t)w * rt->h * 4u);
+        if (!lin)
+            return;
+        [rt->tex getBytes:lin bytesPerRow:w * 4u fromRegion:MTLRegionMake2D(0, 0, w, rt->h)
+              mipmapLevel:0];
+        swz_store(rt, dst, lin, bpp);
+        s_writebacks++;
+        return;
+    }
 
     if (bpp >= 4) {
         [rt->tex getBytes:dst bytesPerRow:pitch fromRegion:MTLRegionMake2D(0, 0, w, rt->h)
@@ -3074,6 +3156,16 @@ static void write_back_scaled(RenderTarget *rt, const uint8_t *px, uint32_t addr
 {
     uint8_t *dst = (uint8_t *)xbox_GetMemoryOffset() + addr;
     uint32_t bpp = pitch / rt->w, w = rt->w, n = rt->hw / rt->w, y, x;
+
+    if (rt_swz_ok(rt->swz, rt->w, rt->h) && (bpp == 4 || bpp == 2)) {
+        uint32_t *lin = (uint32_t *)swz_staging((size_t)w * rt->h * 4u);
+        if (!lin)
+            return;
+        nv2a_downscale_box32(px, rt->hw * 4u, w, rt->h, n, (uint8_t *)lin, w * 4u);
+        swz_store(rt, dst, lin, bpp);
+        s_writebacks++;
+        return;
+    }
 
     if (bpp >= 4) {
         nv2a_downscale_box32(px, rt->hw * 4u, w, rt->h, n, dst, pitch);
@@ -3724,13 +3816,16 @@ static void prof_flip_end(uint64_t t_flip0)
         fprintf(stderr, LOGP "prof %llu flips: on_flip %.3f ms = wait %.3f + hostrb %.3f"
                 " + wb %.3f + winrb %.3f + winpush %.3f + blit %.3f (+rest); gpu %.3f ms"
                 " over %.1f cmd buffers/flip; %llu write-backs, %llu decode syncs;"
-                " rt ownership hashes %.3f ms/flip\n",
+                " rt ownership hashes %.3f ms/flip; textures: %.1f rehashes %.3f ms"
+                " (%.0f KB), %.1f uploads %.3f ms per flip\n",
                 (unsigned long long)s_presents,
                 s_pa.flip / n / 1e6, s_pa.wait / n / 1e6, s_pa.hostrb / n / 1e6,
                 s_pa.wb / n / 1e6, s_pa.winrb / n / 1e6, s_pa.winpush / n / 1e6,
                 s_pa.blit / n / 1e6, s_pa.gpu / n / 1e6, s_pa.ncmd / n,
                 (unsigned long long)(s_writebacks - p_wb),
-                (unsigned long long)(s_decode_syncs - p_ds), s_pa.hash / n / 1e6);
+                (unsigned long long)(s_decode_syncs - p_ds), s_pa.hash / n / 1e6,
+                s_pa.texh_n / n, s_pa.texh / n / 1e6, s_pa.texh_bytes / n / 1024.0,
+                s_pa.texup_n / n, s_pa.texup / n / 1e6);
         p_wb = s_writebacks;
         p_ds = s_decode_syncs;
         memset(&s_pa, 0, sizeof s_pa);

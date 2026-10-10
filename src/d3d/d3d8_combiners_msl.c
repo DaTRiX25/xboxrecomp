@@ -119,8 +119,15 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
             EMIT("    x%d = float4(0.0, 0.0, 0.0, 1.0);\n", 8 + i);
             continue;
         }
-        if (m == NV2A_TEXMODE_CLIPPLANE)
+        if (m == NV2A_TEXMODE_CLIPPLANE) {
+            /* xemu psh.c PS_TEXTUREMODES_CLIPPLANE: each coordinate
+             * component against 0, by the stage's compare mode; the
+             * register reads 0 (left at its initial value). */
+            for (k = 0; k < 4; k++)
+                EMIT("    if (i.t%d.%c %s 0.0) discard_fragment();\n", i, "xyzw"[k],
+                     (state->clip_mode[i] >> k) & 1u ? ">=" : "<");
             continue;
+        }
         if (m == NV2A_TEXMODE_PASSTHRU) {
             EMIT("    x%d = saturate(i.t%d);\n", 8 + i, i);
             continue;
@@ -138,7 +145,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
              * xemu uploads it) and added to this stage's coordinate. _LUM
              * then scales the texel by scale * l + offset, l the previous
              * stage's r. */
-            int p = i - 1, sg = state->tex_signed[p];
+            int p = i == 1 ? 0 : state->input_tex[i] < i ? state->input_tex[i] : i - 1;
+            int sg = state->tex_signed[p];
             EMIT("    {\n");
             if ((sg & 3u) == 3u)
                 EMIT("        float2 dsdt = float2(x%d.b, x%d.g);\n", 8 + p, 8 + p);

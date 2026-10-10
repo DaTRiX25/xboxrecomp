@@ -163,6 +163,33 @@ static int bump_check(void)
     return bad;
 }
 
+/* BO-71: a CLIPPLANE stage kills by its compare mode (xemu psh.c), and a
+ * stage-2 bump-env reads the stage SET_SHADER_OTHER_STAGE_INPUT names. */
+static int clip_input_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    NV2ACombinerState st;
+    int bad = 0;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u,
+                             5u | 1u << 5 | 6u << 10, &st);
+    st.clip_mode[0] = 0x5u;                 /* x, z at >= 0; y, w at < 0 */
+    st.input_tex[2] = 0;                    /* stage 2 reads stage 0, not 1 */
+    if (d3d8_combiners_generate_msl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (!strstr(text, "if (i.t0.x >= 0.0) discard_fragment();")
+            || !strstr(text, "if (i.t0.y < 0.0) discard_fragment();")
+            || !strstr(text, "if (i.t0.w < 0.0) discard_fragment();")
+            || !strstr(text, "float2(rc_sign8(x8.b), rc_sign8(x8.g))")) {
+        printf("FAIL: clip-plane kill or the stage-2 bump input\n");
+        bad = 1;
+    }
+    compile_case("clip", 0, text, (int)strlen(text), "fs_main");
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -234,7 +261,7 @@ int main(void)
         return 1;
     if (texmode_check())
         return 1;
-    if (bump_check() || s_compile_bad)
+    if (bump_check() || clip_input_check() || s_compile_bad)
         return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (MSL_DUMP=<file> writes the text)\n",
