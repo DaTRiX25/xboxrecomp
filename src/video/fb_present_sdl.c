@@ -108,6 +108,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
 extern void xbox_InputInit(void);            /* src/input/input_core.c */
+extern void xbox_InputPadEvent(const SDL_Event *ev); /* src/input/xinput_device.c */
 extern int  xbox_InputAnyOpen(void);
 
 /* ── Handoff: three slots, one each for writer, reader and the ready frame ── */
@@ -780,6 +781,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                  * has the pad and keys neutral at the source,
                  * xbox_InputSetBlocked, so the key table keeps its state.) */
                 xbox_InputSdlEvent(&ev);
+                /* Controllers come and go, and take a port, here. */
+                xbox_InputPadEvent(&ev);
                 if (ev.type == SDL_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)
