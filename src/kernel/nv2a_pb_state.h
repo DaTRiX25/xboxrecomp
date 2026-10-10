@@ -187,6 +187,12 @@ struct nv2a_pb_vsh {
     uint32_t shader_prog, fog_color;
     uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE: per stage
                                          * and component, kill at >= 0 (1) or < 0 */
+    uint32_t shader_ctl;                /* NV_PGRAPH_SHADERCTL as xemu keeps it:
+                                         * [11:0] SET_DOT_RGBMAPPING (4 bits per
+                                         * stage 1..3), [27:12]
+                                         * SET_SHADER_OTHER_STAGE_INPUT (stage 2's
+                                         * input stage at [19:16], stage 3's at
+                                         * [23:20]) */
     int      rc_set, shader_set, fog_enable, atest_enable;
     uint32_t atest_func, atest_ref;
     int      poly_offset;
