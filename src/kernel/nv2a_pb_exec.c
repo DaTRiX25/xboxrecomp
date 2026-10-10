@@ -2497,6 +2497,8 @@ static struct {
 static struct {
     uint64_t scan, draw, flip, scan_t0, flip_t0;
     uint32_t methods, batches;
+    /* Never reset by the flip line: RECOMP_TRACE=pacing's executor split. */
+    uint64_t scan_all, draw_all, flip_all;
 } s_perf;
 
 uint64_t nv2a_pb_now_ns(void) { return rt_now(); }
@@ -2505,6 +2507,7 @@ void nv2a_pb_perf_scan_end(void)
 {
     uint64_t now = rt_now();
     s_perf.scan += now - s_perf.scan_t0;
+    s_perf.scan_all += now - s_perf.scan_t0;
     s_perf.scan_t0 = now;
 }
 
@@ -5319,7 +5322,11 @@ static void draw_primitive(void)
             cpu_px_report(before, zb);
         } else
             s_backend->on_draw(&d);
-        s_perf.draw += rt_now() - t0;
+        {
+            uint64_t d_ns = rt_now() - t0;
+            s_perf.draw += d_ns;
+            s_perf.draw_all += d_ns;
+        }
         if (s_backend->writes_back)
             s_gpu_backend_batches++;
     }
@@ -5622,6 +5629,15 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
  * from the kernel's vblank clock, so this needs RECOMP_VBLANK; without a
  * vblank arriving the wait gives up and the pacing turns itself off. */
 static int      s_flip_pacing = -1;   /* -1 unread, 0 off, 1 on */
+/* RECOMP_TRACE=pacing: what the swaps asked for and what the executor did,
+ * per window of flips (pace_report). Counted whether pacing is on or not. */
+static struct {
+    uint32_t iv[8];        /* swaps by interval, (param >> 5) & 7 */
+    uint32_t imm;          /* with the "immediate when late" flag */
+    uint32_t late;         /* whose target vblank had already passed */
+    uint32_t swaps;
+    uint64_t stall_ns;     /* the executor held in flip_pacing_stall */
+} s_pace;
 static int      s_swap_pending;
 static uint32_t s_swap_target;        /* vblank the pending flip waits for */
 static uint32_t s_swap_last;          /* the handler's last target */
@@ -5643,13 +5659,20 @@ static void flip_pacing_swap(uint32_t param)
 {
     uint32_t now, target, arg;
 
-    if ((param & 0x1F) != 1 || !flip_pacing_on())
+    if ((param & 0x1F) != 1)
         return;
     arg = param >> 5;
+    s_pace.iv[arg & 7]++;
+    s_pace.imm += (arg & 8) != 0;
+    s_pace.swaps++;
+    if (!flip_pacing_on())
+        return;
     now = xbox_VblankCount();
     target = s_swap_last + (arg & 7);
-    if ((int32_t)(target - now) <= 0)
+    if ((int32_t)(target - now) <= 0) {
+        s_pace.late++;
         target = (arg & 8) ? now : now + 1;
+    }
     s_swap_last = target;
     s_swap_target = target;
     s_swap_pending = 1;
@@ -5660,11 +5683,12 @@ static void flip_pacing_swap(uint32_t param)
 static void flip_pacing_stall(void)
 {
     static int timeouts;
-    uint64_t waited = 0;
+    uint64_t waited = 0, t0;
 
     if (!s_swap_pending)
         return;
     s_swap_pending = 0;
+    t0 = xbox_HostNowNs();
     while ((int32_t)(xbox_VblankCount() - s_swap_target) < 0) {
         if (waited >= 100000000ull) {        /* 100 ms: six vblanks */
             if (++timeouts >= 3) {
@@ -5672,12 +5696,71 @@ static void flip_pacing_stall(void)
                 fprintf(stderr, "  [GPU] flip pacing off: no vblank arrived"
                         " in 100 ms three times (is RECOMP_VBLANK set?)\n");
             }
-            return;
+            break;
         }
         xbox_HostSleepNs(250000);
         waited += 250000;
     }
-    timeouts = 0;
+    if (waited < 100000000ull)
+        timeouts = 0;
+    s_pace.stall_ns += xbox_HostNowNs() - t0;
+}
+
+/* RECOMP_TRACE=pacing, every PACE_WINDOW flips: the intervals the swaps
+ * asked for, how many were already late, and where the executor's (the
+ * nv2a-ack thread's) wall time went: held for the vblank, busy walking the
+ * pushbuffer (decode, draws, present), or idle waiting for the title to
+ * submit. A frame is guest-bound when idle is large, executor-bound when
+ * busy is near the interval. */
+#define PACE_WINDOW 600
+static void pace_report(uint32_t flips)
+{
+    static int on = -1;
+    static uint64_t w0, scan0, draw0, flip0;
+    static uint32_t n;
+    uint64_t now, wall, scan, draw, pres, stall;
+    const char *e;
+
+    if (on < 0) {
+        e = recomp_env(RENV_PACING_TRACE);
+        on = e && *e && *e != '0';
+    }
+    if (!on)
+        return;
+    now = xbox_HostNowNs();
+    if (!w0) {
+        w0 = now;
+        scan0 = s_perf.scan_all;
+        draw0 = s_perf.draw_all;
+        flip0 = s_perf.flip_all;
+        memset(&s_pace, 0, sizeof s_pace);
+        return;
+    }
+    if (++n < PACE_WINDOW)
+        return;
+    /* The scan is open at a flip: count it up to now. */
+    scan = s_perf.scan_all + (now - s_perf.scan_t0) - scan0;
+    draw = s_perf.draw_all - draw0;
+    pres = s_perf.flip_all - flip0;
+    wall = now - w0;
+    stall = s_pace.stall_ns;
+    fprintf(stderr, "[PACING] swaps %u: interval 0:%u 1:%u 2:%u 3:%u 4+:%u"
+            " immediate-flag %u late %u (flip %u)\n", s_pace.swaps,
+            s_pace.iv[0], s_pace.iv[1], s_pace.iv[2], s_pace.iv[3],
+            s_pace.iv[4] + s_pace.iv[5] + s_pace.iv[6] + s_pace.iv[7],
+            s_pace.imm, s_pace.late, flips);
+    fprintf(stderr, "[PACING] executor per flip: wall %.2f ms = vblank hold %.2f"
+            " + busy %.2f (draw %.2f, present %.2f, decode %.2f) + idle %.2f\n",
+            wall / 1e6 / n, stall / 1e6 / n, (double)(scan - stall) / 1e6 / n,
+            draw / 1e6 / n, pres / 1e6 / n,
+            (double)(int64_t)(scan - stall - draw - pres) / 1e6 / n,
+            (double)(int64_t)(wall - scan) / 1e6 / n);
+    n = 0;
+    w0 = now;
+    scan0 = s_perf.scan_all + (now - s_perf.scan_t0);
+    draw0 = s_perf.draw_all;
+    flip0 = s_perf.flip_all;
+    memset(&s_pace, 0, sizeof s_pace);
 }
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
@@ -6040,6 +6123,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             uint32_t b = s_gpu.batches_textured + s_gpu.batches_no_uv
                        + s_gpu.batches_no_tex + s_gpu_backend_batches;
             xbox_PacingFlip(s_gpu.flips, b - prev);
+            pace_report(s_gpu.flips);
             prev = b;
         }
         /* Present the frame just finished: present_pick says which surface
@@ -6055,7 +6139,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 s_backend->on_flip(s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                       : s_gpu.color_offset,
                                    s_gpu.pitch);
-            s_perf.flip += rt_now() - t0;   /* Present, for the [PB-PERF] line */
+            uint64_t f_ns = rt_now() - t0;
+            s_perf.flip += f_ns;            /* Present, for the [PB-PERF] line */
+            s_perf.flip_all += f_ns;
         }
         /* The window title's FPS and draws: one call per flip, with the
          * draws of the frame just finished. */
