@@ -6,8 +6,15 @@
  * call, no restart), a 150 ms stall (the grid restarts at now instead of
  * firing a burst), 10^6 vblanks fired at jittered times with no drift, and an
  * epoch near 2^62 ns, a host that has been up for a very long time.
+ *
+ * Then RECOMP_VBLANK_SYNC=display against a simulated FIFO display at 60,
+ * 59.94, 90, 100, 119.88, 120 and 144 Hz, reported as Vulkan's present_wait
+ * does: only the refreshes a frame was shown at, a little late, with no
+ * period. A frame now and then misses its refresh, so the steps between
+ * reports are uneven whole numbers of refreshes (BO-77).
  */
 #include "kernel_pacing.h"
+#include "platform/recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,14 +148,96 @@ static void large_epoch(void)
           "epoch near 2^62 ns: no wrap, 100 s on the grid");
 }
 
+/* A title flipping at every emulated vblank onto a FIFO display of the
+ * given refresh: each frame is ready `work` after its vblank (one in 29
+ * takes longer than a frame and misses), shown at the first free refresh,
+ * and reported up to 300 us after it. Returns the vblank rate over the last
+ * 20 of 40 simulated seconds, edge to edge. */
+static double display_run(double hz, int fps30)
+{
+    XboxVblankSchedule s = {0};
+    const uint64_t t0 = 3 * NS_PER_S, end = t0 + 40 * NS_PER_S;
+    const double rp = 1e9 / hz;
+    uint64_t now = t0, next = t0, late, shown = 0, report = 0, n_mid = 0, n = 0;
+    uint64_t t_mid = 0, t_last = 0;
+    uint64_t pend[8];
+    int npend = 0;
+    unsigned rng = 12345;
+
+    while (now < end) {
+        /* The next event: a vblank edge, or the oldest pending report. */
+        if (npend && pend[0] <= next) {
+            int i;
+            now = pend[0];
+            xbox_VblankDisplayRefresh(now, 0);
+            for (i = 1; i < npend; i++)
+                pend[i - 1] = pend[i];
+            npend--;
+            continue;
+        }
+        now = next;
+        if (!xbox_VblankSchedule(&s, now, &next, &late))
+            continue;
+        n++;
+        t_last = now;
+        if (now >= t0 + 20 * NS_PER_S && !n_mid) {
+            n_mid = n;
+            t_mid = now;
+        }
+        if (fps30 && (n & 1))
+            continue;
+        {
+            uint64_t ready = now + (n % 29 == 0 ? 20 : 4) * MS;
+            uint64_t k = (uint64_t)((double)(ready - t0) / rp) + 1, at;
+            at = t0 + (uint64_t)((double)k * rp);
+            if (at <= shown)
+                at = shown + (uint64_t)rp;
+            shown = at;
+            rng = rng * 1103515245u + 12345u;
+            report = at + (rng >> 8) % 300000u;
+            if (npend < 8)
+                pend[npend++] = report;
+        }
+    }
+    return (double)(n - n_mid) * 1e9 / (double)(t_last - t_mid);
+}
+
+static void display_lock(void)
+{
+    static const double hz[] = { 60.0, 59.94, 90.0, 100.0, 119.88, 120.0, 144.0 };
+    unsigned i;
+    char what[96];
+
+    for (i = 0; i < sizeof hz / sizeof hz[0]; i++) {
+        /* A multiple of 60 within 1%: the display's own rate over two or
+         * one refreshes; otherwise the free-running 60.000. */
+        double m = hz[i] / 60.0, want = 60.0;
+        double r60, r30;
+        if (m > 0.99 && m < 1.01)
+            want = hz[i];
+        else if (m > 1.98 && m < 2.02)
+            want = hz[i] / 2;
+        r60 = display_run(hz[i], 0);
+        r30 = display_run(hz[i], 1);
+        snprintf(what, sizeof what, "display %.2f Hz: vblank %.3f Hz (30 fps title %.3f)",
+                 hz[i], r60, r30);
+        check(r60 > want - 0.005 && r60 < want + 0.005
+              && r30 > want - 0.005 && r30 < want + 0.005, what);
+    }
+}
+
 int main(void)
 {
     printf("vblank_schedule:\n");
+    /* Read once, at the first schedule: on from the start. With no display
+     * report the schedule is the free-running one. */
+    recomp_env_set(RENV_VBLANK_SYNC, "display");
     steady_grid();
     late_tick();
     stall_restart();
     no_drift();
     large_epoch();
+    display_lock();
     printf(failures ? "FAILED (%d)\n" : "all passed\n", failures);
     return failures ? 1 : 0;
 }

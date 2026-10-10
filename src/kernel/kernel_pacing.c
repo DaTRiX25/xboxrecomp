@@ -60,14 +60,28 @@ static uint64_t vblank_due(const XboxVblankSchedule *s, uint64_t n)
  * present_wait timestamps), and each vblank's next edge is the display
  * refresh nearest one guest period on. Its period is the display's, or a
  * whole multiple of it (120 Hz: every second refresh), when that is within
- * 5% of 60 Hz; otherwise, or with no report for 250 ms, the timer runs on
+ * 1% of 60 Hz; otherwise, or with no report for 250 ms, the timer runs on
  * its own 60.000 Hz grid as before. In phase with the display, a guest
  * flip's present always lands the same distance before the next latch:
- * each frame is shown exactly once. */
+ * each frame is shown exactly once.
+ *
+ * A path that reports only the refreshes a frame was shown at (Vulkan's
+ * present_wait) gives no period, and the step between two reports is a
+ * whole number of refreshes, not one: at 120 Hz a 60 Hz title's frames
+ * are 16.7 ms apart, and 25 ms when one misses its refresh. Averaged, the
+ * steps were the title's own frame rate -- 17.5 ms at 57 fps -- which the
+ * lock then took for the display's and held the title to (BO-77). So the
+ * period is the longest one every step is a whole multiple of: a step off
+ * the current period's grid (25 ms on a 16.7 ms period) shows a shorter
+ * one (8.3 ms), taken once three steps agree on it. */
 #define DISPLAY_STALE_NS 250000000ull
+#define DISPLAY_LOCK_TOL 100                /* 1 / 100 of 60 Hz */
 static volatile LONGLONG s_disp_ns;        /* last display refresh, host ns */
 static volatile LONGLONG s_disp_period;    /* filtered refresh period, ns */
 static int s_disp_lock = -1;               /* RECOMP_VBLANK_SYNC=display */
+static uint64_t s_disp_cand;               /* a shorter period the steps show */
+static int s_disp_cand_n;                  /* steps that showed it */
+static int s_disp_off;                     /* steps in a row on no period */
 
 static int display_lock_on(void)
 {
@@ -83,21 +97,73 @@ int xbox_VblankDisplayLockOn(void)
     return display_lock_on();
 }
 
+/* The longest period both steps are whole multiples of, within an eighth
+ * of it (Euclid's algorithm with a tolerance); 0 when it would be under
+ * 2 ms, so the steps disagree by more than a reporting thread's jitter. */
+static uint64_t steps_gcd(uint64_t a, uint64_t b)
+{
+    if (a < b) {
+        uint64_t t = a;
+        a = b;
+        b = t;
+    }
+    while (b >= 2000000u) {
+        uint64_t r = a % b;
+        if (r <= b / 8 || b - r <= b / 8)
+            return b;
+        a = b;
+        b = r;
+    }
+    return 0;
+}
+
 void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns)
 {
-    uint64_t prev = (uint64_t)s_disp_ns, p = period_ns;
+    uint64_t prev = (uint64_t)s_disp_ns, cur = (uint64_t)s_disp_period;
 
     if (!display_lock_on() || !when_ns)
         return;
-    if (!p && prev && when_ns > prev)
-        p = when_ns - prev;
     /* A report may be of a refresh still to come (CVDisplayLink's output
      * time): any point on the display's grid will do. */
-    if (p >= 2000000u && p <= 50000000u) {
-        uint64_t cur = (uint64_t)s_disp_period;
-        /* A reported period is exact; one measured between two reports
-         * jitters with the reporting thread's wake-up, so it is smoothed. */
-        s_disp_period = (LONGLONG)(period_ns || !cur ? p : (cur * 15u + p) / 16u);
+    if (period_ns) {
+        /* A reported period is exact. */
+        if (period_ns >= 2000000u && period_ns <= 50000000u)
+            s_disp_period = (LONGLONG)period_ns;
+    } else if (prev && when_ns > prev && when_ns - prev <= 100000000u) {
+        /* Measured: a step of one or more refreshes, jittered by the
+         * reporting thread's wake-up. */
+        uint64_t d = when_ns - prev, g;
+        if (!cur) {
+            if (d >= 2000000u && d <= 50000000u)
+                s_disp_period = (LONGLONG)d;
+        } else if ((g = steps_gcd(cur, d)) == 0) {
+            /* No period fits both: one stray step, or a period that was
+             * wrong from the start. Eight in a row start it over. */
+            if (++s_disp_off >= 8 && d >= 2000000u && d <= 50000000u) {
+                s_disp_period = (LONGLONG)d;
+                s_disp_off = 0;
+            }
+        } else {
+            s_disp_off = 0;
+            if (g + cur / 8 >= cur) {
+                /* On the period's grid: n periods, smoothed in. */
+                uint64_t n = (d + cur / 2) / cur;
+                s_disp_period = (LONGLONG)((cur * 15u + d / n) / 16u);
+            } else {
+                if (s_disp_cand && g + s_disp_cand / 8 >= s_disp_cand
+                        && g <= s_disp_cand + s_disp_cand / 8)
+                    s_disp_cand_n++;
+                else {
+                    s_disp_cand = g;
+                    s_disp_cand_n = 1;
+                }
+                if (s_disp_cand_n >= 3) {
+                    s_disp_period = (LONGLONG)s_disp_cand;
+                    s_disp_cand = 0;
+                    s_disp_cand_n = 0;
+                }
+            }
+        }
     }
     s_disp_ns = (LONGLONG)when_ns;
 }
@@ -119,8 +185,9 @@ static int display_grid(uint64_t now_ns, uint64_t *ref_ns, uint64_t *period_ns)
     if (!m)
         return 0;
     p = m * pd;
-    if (p < nominal - nominal / 20 || p > nominal + nominal / 20)
-        return 0;                          /* not within 5% of 60 Hz */
+    if (p < nominal - nominal / DISPLAY_LOCK_TOL
+            || p > nominal + nominal / DISPLAY_LOCK_TOL)
+        return 0;                          /* not within 1% of 60 Hz */
     *ref_ns = ref;
     *period_ns = p;
     return 1;
