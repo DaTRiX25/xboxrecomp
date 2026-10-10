@@ -21,6 +21,19 @@
  *                  and never the walker, as Metal's displaySyncEnabled.
  *   shot           RECOMP_WINDOW_SHOT: the swapchain image read back after
  *                  the blit.
+ *   latency        the swapchain has the fewest images the driver allows
+ *                  (minImageCount, at least 2): with FIFO, one image on
+ *                  screen and at most one queued, so presenting adds at most
+ *                  one frame (BO-74). The slot hand-off drops a stale frame
+ *                  rather than queueing it, as on Metal.
+ *   timing         every present's host time, and with VK_KHR_present_id +
+ *                  VK_KHR_present_wait (RADV, MoltenVK) the time each frame
+ *                  reached the display, from a waiter thread: present-to-
+ *                  present intervals (p50/p95/p99, frames past 1.5 refresh
+ *                  periods), every 5 s under RECOMP_TRACE=present_stats and
+ *                  at exit; RECOMP_TRACE=vk_present=<file> writes one CSV line
+ *                  per frame. The last displayed vblank is
+ *                  fbv_display_vblank().
  *
  * Thread use: fbv_create/fbv_destroy/fbv_present on the main thread,
  * fbv_slot/fbv_upload on the NV2A ack thread (each with its own command
@@ -31,12 +44,16 @@
 #include <SDL.h>
 #include <SDL_vulkan.h>
 #include <dlfcn.h>
+#include <sched.h>
+#include <pthread.h>
 #include <stdint.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "d3d/nv2a_vk_core.h"
+#include "recomp_env.h"
 #include "kernel/nv2a_backend_common.h"
 #include "fb_present_vulkan.h"
 
@@ -69,6 +86,143 @@ static VkFence           s_up_fence;
 static int               s_up_pending;
 static struct nvk_buffer s_up_buf;
 static struct nvk_buffer s_shot_buf;
+
+/* ---- present timing ----------------------------------------------------- */
+
+#define IV_N 8192
+typedef struct {
+    float    iv[IV_N];      /* ms between consecutive frames */
+    uint32_t n;             /* filled */
+    uint32_t pos;
+    uint64_t last_ns, count;
+} Intervals;
+static Intervals       s_host_iv, s_disp_iv;
+static pthread_mutex_t s_tm_mu = PTHREAD_MUTEX_INITIALIZER;   /* the stats */
+static pthread_mutex_t s_sc_mu = PTHREAD_MUTEX_INITIALIZER;   /* s_sc vs the waiter */
+static pthread_mutex_t s_id_mu = PTHREAD_MUTEX_INITIALIZER;   /* s_present_id */
+static pthread_cond_t  s_sc_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t        s_present_id;        /* last id presented */
+static uint64_t        s_sc_first_id;       /* the first id of this swapchain */
+static int             s_waiter_run;
+static pthread_t       s_waiter;
+static FILE           *s_csv;
+static uint64_t        s_vbl_ns, s_vbl_period_ns;
+static PFN_vkWaitForPresentKHR s_wait_present;   /* a device function */
+
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void iv_add(Intervals *v, uint64_t t)
+{
+    if (v->last_ns && t > v->last_ns) {
+        v->iv[v->pos] = (float)((double)(t - v->last_ns) / 1e6);
+        v->pos = (v->pos + 1) % IV_N;
+        if (v->n < IV_N)
+            v->n++;
+    }
+    v->last_ns = t;
+    v->count++;
+}
+
+static int fcmp(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* p50/p95/p99/max and the share past 1.5 periods, of the last IV_N. */
+static void iv_line(const char *what, Intervals *v, char *out, size_t n)
+{
+    static float tmp[IV_N];
+    uint32_t i, miss = 0;
+    double period = 1000.0 / 60.0;
+    if (!v->n) {
+        snprintf(out, n, "%s: none", what);
+        return;
+    }
+    memcpy(tmp, v->iv, v->n * sizeof *tmp);
+    qsort(tmp, v->n, sizeof *tmp, fcmp);
+    for (i = 0; i < v->n; i++)
+        miss += tmp[i] > 1.5 * period;
+    snprintf(out, n, "%s: %u intervals p50 %.2f p95 %.2f p99 %.2f max %.2f ms, %.2f%% past"
+             " 25 ms", what, v->n, tmp[v->n / 2], tmp[(uint32_t)(v->n * 0.95)],
+             tmp[(uint32_t)(v->n * 0.99)], tmp[v->n - 1], 100.0 * miss / v->n);
+}
+
+void fbv_timing_report(const char *when)
+{
+    char a[256], b[256];
+    pthread_mutex_lock(&s_tm_mu);
+    iv_line("host presents", &s_host_iv, a, sizeof a);
+    iv_line("displayed", &s_disp_iv, b, sizeof b);
+    pthread_mutex_unlock(&s_tm_mu);
+    fprintf(stderr, LOGP "Vulkan %s: %s; %s%s\n", when, a, b,
+            C && C->present_wait ? "" : " (no VK_KHR_present_wait)");
+}
+
+/* The last vblank a frame was shown at (CLOCK_MONOTONIC ns) and the
+ * measured refresh period; 0 when not known (no present_wait). */
+int fbv_display_vblank(uint64_t *t_ns, uint64_t *period_ns)
+{
+    uint64_t t = __atomic_load_n(&s_vbl_ns, __ATOMIC_ACQUIRE);
+    *t_ns = t;
+    *period_ns = __atomic_load_n(&s_vbl_period_ns, __ATOMIC_RELAXED);
+    return t != 0;
+}
+
+/* Waits for each present id in turn to reach the display. s_id_mu guards
+ * the id counter (held for instants); s_sc_mu is held across one wait (20 ms
+ * at most), so the swapchain is not destroyed under it. */
+static void *waiter_main(void *arg)
+{
+    uint64_t next = 1, prev_t = 0;
+    (void)arg;
+    for (;;) {
+        VkResult r;
+        pthread_mutex_lock(&s_id_mu);
+        while (s_waiter_run && next > s_present_id)
+            pthread_cond_wait(&s_sc_cv, &s_id_mu);
+        pthread_mutex_unlock(&s_id_mu);
+        if (!s_waiter_run)
+            break;
+        pthread_mutex_lock(&s_sc_mu);
+        if (next < s_sc_first_id)
+            next = s_sc_first_id;
+        r = s_sc && next <= s_present_id
+            ? s_wait_present(C->dev, s_sc, next, 20000000ull) : VK_NOT_READY;
+        pthread_mutex_unlock(&s_sc_mu);
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+            uint64_t t = mono_ns();
+            pthread_mutex_lock(&s_tm_mu);
+            iv_add(&s_disp_iv, t);
+            pthread_mutex_unlock(&s_tm_mu);
+            if (prev_t && t - prev_t < 60000000ull) {
+                /* A smoothed refresh period from single-period steps. */
+                uint64_t d = t - prev_t, p = s_vbl_period_ns;
+                if (!p)
+                    p = d;
+                else if (d < p * 3 / 2)
+                    p = (p * 15 + d) / 16;
+                __atomic_store_n(&s_vbl_period_ns, p, __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(&s_vbl_ns, t, __ATOMIC_RELEASE);
+            if (s_csv)
+                fprintf(s_csv, "%llu,display,%llu\n", (unsigned long long)next,
+                        (unsigned long long)t);
+            prev_t = t;
+            next++;
+        } else if (r != VK_TIMEOUT && r != VK_NOT_READY) {
+            next = s_present_id + 1;    /* out of date: the next swapchain */
+        } else {
+            sched_yield();
+        }
+    }
+    return NULL;
+}
 
 int fbv_load_library(char *err, size_t errn)
 {
@@ -133,6 +287,7 @@ static int make_swapchain(SDL_Window *win)
     queue_idle();
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(C->phys, C->surface, &caps) != VK_SUCCESS)
         return 0;
+    pthread_mutex_lock(&s_sc_mu);
     vkGetPhysicalDeviceSurfaceFormatsKHR(C->phys, C->surface, &nf, fmts);
     vkGetPhysicalDeviceSurfacePresentModesKHR(C->phys, C->surface, &nm, modes);
     /* UNORM: the frame's bytes go to the display as they are, as the SDL
@@ -166,10 +321,13 @@ static int make_swapchain(SDL_Window *win)
     if (s_sc_ext.height < caps.minImageExtent.height) s_sc_ext.height = caps.minImageExtent.height;
     if (s_sc_ext.width > caps.maxImageExtent.width) s_sc_ext.width = caps.maxImageExtent.width;
     if (s_sc_ext.height > caps.maxImageExtent.height) s_sc_ext.height = caps.maxImageExtent.height;
-    if (!s_sc_ext.width || !s_sc_ext.height)
+    if (!s_sc_ext.width || !s_sc_ext.height) {
+        pthread_mutex_unlock(&s_sc_mu);
         return 0;     /* minimised */
-    n = caps.minImageCount + 1;
-    if (n < 3) n = 3;
+    }
+    /* The fewest images: one shown, at most one queued (BO-74 latency). */
+    n = caps.minImageCount;
+    if (n < 2) n = 2;
     if (caps.maxImageCount && n > caps.maxImageCount) n = caps.maxImageCount;
     if (n > SC_MAX) n = SC_MAX;
     s_sc_shots = s_shots && (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -201,9 +359,12 @@ static int make_swapchain(SDL_Window *win)
     }
     if (r != VK_SUCCESS) {
         s_sc = VK_NULL_HANDLE;
+        pthread_mutex_unlock(&s_sc_mu);
         fprintf(stderr, LOGP "vkCreateSwapchainKHR: %s\n", nvk_result_str(r));
         return 0;
     }
+    s_sc_first_id = s_present_id + 1;
+    pthread_mutex_unlock(&s_sc_mu);
     s_sc_n = SC_MAX;
     vkGetSwapchainImagesKHR(C->dev, s_sc, &s_sc_n, s_sc_img);
     memset(&si, 0, sizeof si);
@@ -273,10 +434,24 @@ int fbv_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         snprintf(err, errn, "no swapchain for the window");
         return 0;
     }
-    fprintf(stderr, LOGP "Vulkan swapchain: %ux%u, %u images, %s, %s\n", s_sc_ext.width,
+    {
+        const char *csv = recomp_env(RENV_VK_PRESENT_LOG);
+        if (csv && strcmp(csv, "1") && (s_csv = fopen(csv, "w")) != NULL)
+            fprintf(s_csv, "id,event,t_ns\n");
+    }
+    if (C->present_wait)
+        s_wait_present = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(C->dev,
+                                                                      "vkWaitForPresentKHR");
+    if (C->present_wait && s_wait_present) {
+        s_waiter_run = 1;
+        if (pthread_create(&s_waiter, NULL, waiter_main, NULL) != 0)
+            s_waiter_run = 0;
+    }
+    fprintf(stderr, LOGP "Vulkan swapchain: %ux%u, %u images, %s, %s%s\n", s_sc_ext.width,
             s_sc_ext.height, s_sc_n, s_sc_fmt == VK_FORMAT_B8G8R8A8_UNORM ? "BGRA8" : "RGBA8",
             s_sc_mode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO (vsync)"
-            : s_sc_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "IMMEDIATE");
+            : s_sc_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "IMMEDIATE",
+            s_waiter_run ? ", present_wait timing" : "");
     return 1;
 }
 
@@ -285,6 +460,17 @@ void fbv_destroy(void)
     int k;
     if (!C)
         return;
+    if (s_waiter_run) {
+        pthread_mutex_lock(&s_id_mu);
+        s_waiter_run = 0;
+        pthread_cond_broadcast(&s_sc_cv);
+        pthread_mutex_unlock(&s_id_mu);
+        pthread_join(s_waiter, NULL);
+    }
+    fbv_timing_report("presents at exit");
+    if (s_csv)
+        fclose(s_csv);
+    s_csv = NULL;
     queue_idle();
     for (k = 0; k < 3; k++)
         nvk_image_free(&s_slot[k]);
@@ -560,10 +746,35 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     pi.swapchainCount = 1;
     pi.pSwapchains = &s_sc;
     pi.pImageIndices = &idx;
+    {
+        static VkPresentIdKHR pid;
+        static uint64_t idv;
+        if (C->present_wait) {
+            idv = s_present_id + 1;
+            memset(&pid, 0, sizeof pid);
+            pid.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
+            pid.swapchainCount = 1;
+            pid.pPresentIds = &idv;
+            pi.pNext = &pid;
+        }
+    }
     nvk_queue_lock();
     r = vkQueueSubmit(C->queue, 1, &si, s_fence[s_fi]);
     pr = r == VK_SUCCESS ? vkQueuePresentKHR(C->queue, &pi) : r;
     nvk_queue_unlock();
+    if (r == VK_SUCCESS) {
+        uint64_t t = mono_ns();
+        pthread_mutex_lock(&s_tm_mu);
+        iv_add(&s_host_iv, t);
+        pthread_mutex_unlock(&s_tm_mu);
+        pthread_mutex_lock(&s_id_mu);
+        s_present_id++;
+        if (s_csv)
+            fprintf(s_csv, "%llu,present,%llu\n", (unsigned long long)s_present_id,
+                    (unsigned long long)t);
+        pthread_cond_broadcast(&s_sc_cv);
+        pthread_mutex_unlock(&s_id_mu);
+    }
     if (r != VK_SUCCESS) {
         static int said;
         if (said++ < 4)

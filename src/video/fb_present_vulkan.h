@@ -24,4 +24,9 @@ int   fbv_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pit
 int   fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                   const char *shot_path, uint32_t flip);
 
+/* The present timing (see fb_present_vulkan.c): a summary line now, and
+ * the last displayed vblank (0 when unknown). */
+void  fbv_timing_report(const char *when);
+int   fbv_display_vblank(uint64_t *t_ns, uint64_t *period_ns);
+
 #endif

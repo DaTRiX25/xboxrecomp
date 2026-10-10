@@ -79,12 +79,20 @@ else()
         # The pushbuffer executor's Vulkan backend (RECOMP_PB_BACKEND=vulkan),
         # its device (shared with the window's swapchain) and glslang.
         target_sources(xbox_d3d8 PRIVATE nv2a_vk_core.c nv2a_vk_glsl.c nv2a_pb_vulkan.c)
+        # For a title's own sources too (its default backend).
+        target_compile_definitions(xbox_d3d8 PUBLIC XBOXRECOMP_HAVE_VULKAN=1)
         set_source_files_properties(nv2a_pb_vulkan.c PROPERTIES
             COMPILE_DEFINITIONS "XBOXRECOMP_GIT_REV=\"${XR_GIT_REV}\"")
         target_include_directories(xbox_d3d8 PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_link_libraries(xbox_d3d8 PUBLIC Vulkan::Vulkan glslang::glslang
                               glslang::glslang-default-resource-limits)
+        # A static glslang (the Steam Runtime SDK's) is C++: its runtime
+        # comes with it, as this C program's link would not add it.
+        get_target_property(_xr_glslang_type glslang::glslang TYPE)
+        if(_xr_glslang_type STREQUAL "STATIC_LIBRARY")
+            target_link_libraries(xbox_d3d8 PUBLIC stdc++ m)
+        endif()
     endif()
     if(APPLE)
         # The pushbuffer executor's Metal backend (RECOMP_PB_BACKEND=metal).

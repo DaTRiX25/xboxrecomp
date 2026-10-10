@@ -162,7 +162,10 @@ static int make_device(void)
     uint32_t npd = 8, i, best_q = 0, navail = 0, ne = 0;
     int best = -1;
     VkExtensionProperties *avail;
-    const char *exts[4];
+    const char *exts[6];
+    VkPhysicalDevicePresentIdFeaturesKHR pid, have_pid;
+    VkPhysicalDevicePresentWaitFeaturesKHR pw, have_pw;
+    int want_pw = 0;
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci;
     VkPhysicalDeviceFeatures2 f2;
@@ -207,6 +210,10 @@ static int make_device(void)
         exts[ne++] = "VK_KHR_portability_subset";
         s_core.portability = 1;
     }
+    /* When each frame reached the display (vkWaitForPresentKHR): the
+     * presenter's present-to-present statistics. */
+    want_pw = s_core.surface && has_ext(avail, navail, VK_KHR_PRESENT_ID_EXTENSION_NAME)
+              && has_ext(avail, navail, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
     free(avail);
 
     memset(&have13, 0, sizeof have13);
@@ -214,6 +221,12 @@ static int make_device(void)
     memset(&have12, 0, sizeof have12);
     have12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     have12.pNext = &have13;
+    memset(&have_pw, 0, sizeof have_pw);
+    have_pw.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
+    memset(&have_pid, 0, sizeof have_pid);
+    have_pid.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
+    have_pid.pNext = &have_pw;
+    have13.pNext = want_pw ? &have_pid : NULL;
     memset(&have2, 0, sizeof have2);
     have2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     have2.pNext = &have12;
@@ -224,6 +237,19 @@ static int make_device(void)
 
     memset(&f13, 0, sizeof f13);
     f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    if (want_pw && have_pid.presentId && have_pw.presentWait) {
+        memset(&pw, 0, sizeof pw);
+        pw.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
+        pw.presentWait = VK_TRUE;
+        memset(&pid, 0, sizeof pid);
+        pid.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
+        pid.presentId = VK_TRUE;
+        pid.pNext = &pw;
+        f13.pNext = &pid;
+        exts[ne++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+        exts[ne++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
+        s_core.present_wait = 1;
+    }
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;
     memset(&f12, 0, sizeof f12);

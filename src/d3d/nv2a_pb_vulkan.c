@@ -64,9 +64,15 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
 #include "d3d8_glsl.h"
+#include "nv2a_pcache.h"
 #include "recomp_env.h"
+#include <pthread.h>
 
 ptrdiff_t xbox_GetMemoryOffset(void);
+
+#ifndef XBOXRECOMP_GIT_REV
+#define XBOXRECOMP_GIT_REV "unknown"
+#endif
 
 #define LOGP "[vulkan] "
 
@@ -1072,9 +1078,19 @@ typedef struct {
     uint32_t       hash;
     uint16_t       inputs;
     int            used, bad;
+    uint64_t       kid;       /* nv2a_fnv64 of the slots: the disk key's id */
     VkShaderModule mod;
 } VsEntry;
 static VsEntry s_vs[VS_MAX];
+
+/* The key list on disk (nv2a_pcache.h, the Metal pipeline cache's format):
+ * what was built, as keys, so a start whose driver cache is cold builds it
+ * before the title draws with it (pc_prewarm). Types: */
+enum { PC_VS = 0, PC_FS = 1, PC_PSO = 2 };
+#define PC_VS_PASS  1ull      /* ids of the two built-in shaders */
+#define PC_FS_BASIC 2ull
+static nv2a_pcache *s_pcf;
+static void pc_put(uint32_t type, const void *data, uint32_t len);
 
 /* As Metal's vs_cache: the program from its start slot, parsed, emitted as
  * GLSL with the screen-space epilogue, keyed by nv2a_vsh_program_hash. */
@@ -1109,6 +1125,16 @@ static VsEntry *vs_cache(void)
         e->used = 1;
         e->hash = hash;
         e->bad = 1;
+        {
+            uint32_t len = 0;
+            (void)nv2a_vsh_program_hash(v, &len);
+            if (!len || len > NV2A_VSH_SLOTS - v->start)
+                len = NV2A_VSH_SLOTS - v->start;
+            e->kid = nv2a_fnv64(&v->prog[v->start][0], (size_t)len * 16u, NV2A_FNV64_INIT);
+            if (e->kid <= PC_FS_BASIC)
+                e->kid += 3;
+            pc_put(PC_VS, &v->prog[v->start][0], len * 16u);
+        }
         d3d8_vsh_parse(&v->prog[v->start][0], NV2A_VSH_SLOTS - (int)v->start, &parsed);
         snprintf(what, sizeof what, "program %08X", hash);
         if (d3d8_vsh_generate_glsl(&parsed, D3D8_GLSL_SCREEN_SPACE, glsl, (int)sizeof glsl) <= 0) {
@@ -1131,6 +1157,7 @@ static VsEntry *vs_cache(void)
 typedef struct {
     uint32_t          hash;
     int               bad;
+    uint64_t          kid;
     NV2ACombinerState st;
     VkShaderModule    mod;
 } FsEntry;
@@ -1202,6 +1229,10 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
         e->hash = hash;
         e->st = st;
         e->bad = 1;
+        e->kid = nv2a_fnv64(&st, sizeof st, NV2A_FNV64_INIT);
+        if (e->kid <= PC_FS_BASIC)
+            e->kid += 3;
+        pc_put(PC_FS, &st, sizeof st);
         snprintf(what, sizeof what, "combiners %08X", hash);
         if (d3d8_combiners_generate_glsl(&st, glsl, (int)sizeof glsl) <= 0) {
             s_compile_errors++;
@@ -1389,6 +1420,41 @@ static VkPipeline pipeline_new(const PsoKey *k)
     return p;
 }
 
+/* A pipeline key on disk: the shaders by id, not by module. */
+typedef struct {
+    uint64_t vs, fs;
+    uint32_t nf4, topo, depth, wmask;
+    uint32_t blend[4];
+} PsoDisk;
+
+static uint64_t module_kid(VkShaderModule m)
+{
+    int i;
+    if (m == s_vs_pass)
+        return PC_VS_PASS;
+    if (m == s_fs_basic)
+        return PC_FS_BASIC;
+    for (i = 0; i < VS_MAX; i++)
+        if (s_vs[i].used && s_vs[i].mod == m)
+            return s_vs[i].kid;
+    for (i = 0; i < s_fs_n; i++)
+        if (s_fs[i].mod == m)
+            return s_fs[i].kid;
+    return 0;
+}
+
+static void pso_disk(const PsoKey *k, PsoDisk *d)
+{
+    memset(d, 0, sizeof *d);
+    d->vs = module_kid((VkShaderModule)(uintptr_t)k->vs);
+    d->fs = module_kid((VkShaderModule)(uintptr_t)k->fs);
+    d->nf4 = k->nf4;
+    d->topo = k->topo;
+    d->depth = k->depth;
+    d->wmask = k->wmask;
+    memcpy(d->blend, k->blend, sizeof d->blend);
+}
+
 static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
                            enum nv2a_topology topo)
 {
@@ -1420,6 +1486,11 @@ static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
         return VK_NULL_HANDLE;   /* a title with this many wants eviction */
     s_pso[i].k = k;
     s_pso[i].p = pipeline_new(&k);
+    if (s_pso[i].p) {
+        PsoDisk dk;
+        pso_disk(&k, &dk);
+        pc_put(PC_PSO, &dk, sizeof dk);
+    }
     s_pso[i].used = 1;
     s_pso_n++;
     last = i;
@@ -2688,6 +2759,8 @@ static void at_exit_save(void)
         pcache_save();
 }
 
+static int s_pcache_warm;
+
 static VkPipelineCache pcache_load(void)
 {
     char path[1100];
@@ -2723,8 +2796,127 @@ static VkPipelineCache pcache_load(void)
         n = 0;
     }
     free(data);
-    fprintf(stderr, LOGP "pipeline cache: %s (%zu bytes)\n", n ? path : "empty", n);
+    {
+        /* Warm: the driver kept most of what the file held. */
+        size_t kept = 0;
+        vkGetPipelineCacheData(s_dev, pc, &kept, NULL);
+        s_pcache_warm = n > 4096 && kept * 2 >= n;
+        fprintf(stderr, LOGP "pipeline cache: %s (%zu bytes, %zu kept by the driver)\n",
+                n ? path : "empty", n, kept);
+    }
     return pc;
+}
+
+/* ---- the key list and the pre-warm thread ---------------------------------------- */
+
+static void pc_put(uint32_t type, const void *data, uint32_t len)
+{
+    if (s_pcf && nv2a_pcache_put(s_pcf, type, data, len) < 0) {
+        fprintf(stderr, LOGP "pcache: cannot append; the key list is off for this run\n");
+        nv2a_pcache_close(s_pcf);
+        s_pcf = NULL;
+    }
+}
+
+/* Builds every key of the file once, into the SPIR-V cache and the
+ * VkPipelineCache only: the ack thread's own tables are untouched, and its
+ * first use of each then hits both caches. Runs when the driver's cache came
+ * up empty (a first start, a driver update); a warm start skips it. */
+static void *pc_prewarm(void *arg)
+{
+    static char glsl[65536];
+    size_t n = nv2a_pcache_count(s_pcf), i;
+    uint64_t *ids = (uint64_t *)calloc(n ? n : 1, sizeof *ids);
+    VkShaderModule *mods = (VkShaderModule *)calloc(n ? n : 1, sizeof *mods);
+    NV2AVshProgram *parsed = (NV2AVshProgram *)malloc(sizeof *parsed);
+    uint64_t t0 = now_ns(), nv = 0, nf = 0, np = 0;
+    int pass;
+    (void)arg;
+    if (!ids || !mods || !parsed)
+        goto out;
+    for (pass = 0; pass < 2; pass++)
+        for (i = 0; i < n; i++) {
+            const void *d;
+            uint32_t type, len;
+            if (!nv2a_pcache_get(s_pcf, i, &type, &d, &len))
+                continue;
+            if (pass == 0 && type == PC_VS && len >= 16 && len % 16 == 0
+                    && len <= NV2A_VSH_SLOTS * 16u) {
+                d3d8_vsh_parse((const uint32_t *)d, (int)(len / 16u), parsed);
+                if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE, glsl, sizeof glsl) > 0
+                        && (mods[i] = module_from_glsl(NVK_STAGE_VERTEX, glsl, "pre-warm vs"))) {
+                    ids[i] = nv2a_fnv64(d, len, NV2A_FNV64_INIT);
+                    if (ids[i] <= PC_FS_BASIC)
+                        ids[i] += 3;
+                    nv++;
+                }
+            } else if (pass == 0 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
+                if (d3d8_combiners_generate_glsl((const NV2ACombinerState *)d, glsl, sizeof glsl) > 0
+                        && (mods[i] = module_from_glsl(NVK_STAGE_FRAGMENT, glsl, "pre-warm fs"))) {
+                    ids[i] = nv2a_fnv64(d, len, NV2A_FNV64_INIT);
+                    if (ids[i] <= PC_FS_BASIC)
+                        ids[i] += 3;
+                    nf++;
+                }
+            } else if (pass == 1 && type == PC_PSO && len == sizeof(PsoDisk)) {
+                PsoDisk dk;
+                PsoKey k;
+                size_t j;
+                VkPipeline p;
+                memcpy(&dk, d, sizeof dk);
+                memset(&k, 0, sizeof k);
+                k.vs = dk.vs == PC_VS_PASS ? (uint64_t)(uintptr_t)s_vs_pass : 0;
+                k.fs = dk.fs == PC_FS_BASIC ? (uint64_t)(uintptr_t)s_fs_basic : 0;
+                for (j = 0; j < n && (!k.vs || !k.fs); j++) {
+                    if (!k.vs && ids[j] == dk.vs)
+                        k.vs = (uint64_t)(uintptr_t)mods[j];
+                    if (!k.fs && ids[j] == dk.fs)
+                        k.fs = (uint64_t)(uintptr_t)mods[j];
+                }
+                if (!k.vs || !k.fs)
+                    continue;
+                k.nf4 = dk.nf4;
+                k.topo = dk.topo;
+                k.depth = dk.depth;
+                k.wmask = dk.wmask;
+                memcpy(k.blend, dk.blend, sizeof k.blend);
+                if ((p = pipeline_new(&k)) != VK_NULL_HANDLE) {
+                    vkDestroyPipeline(s_dev, p, NULL);
+                    np++;
+                }
+            }
+        }
+    for (i = 0; i < n; i++)
+        if (mods[i])
+            vkDestroyShaderModule(s_dev, mods[i], NULL);
+    fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines in %.0f ms\n",
+            (unsigned long long)nv, (unsigned long long)nf, (unsigned long long)np,
+            (double)(now_ns() - t0) / 1e6);
+out:
+    free(ids);
+    free(mods);
+    free(parsed);
+    return NULL;
+}
+
+static void pc_start(int driver_cache_warm)
+{
+    char dir[1024], path[1100], ver[256], msg[256];
+    pthread_t th;
+
+    if (!nvk_cache_dir(dir, sizeof dir))
+        return;
+    snprintf(path, sizeof path, "%s/vk_pipelines.bin", dir);
+    snprintf(ver, sizeof ver, "vk pipelines 1; PsoDisk %zu; NV2ACombinerState %zu;"
+             " vsh slots %d; toolkit %s", sizeof(PsoDisk), sizeof(NV2ACombinerState),
+             (int)NV2A_VSH_SLOTS, XBOXRECOMP_GIT_REV);
+    s_pcf = nv2a_pcache_open(path, ver, msg, sizeof msg);
+    fprintf(stderr, LOGP "pcache: %s: %s%s\n", path, msg,
+            s_pcf && nv2a_pcache_count(s_pcf) && driver_cache_warm
+            ? "; the driver's cache is warm: no pre-warm" : "");
+    if (s_pcf && nv2a_pcache_count(s_pcf) && !driver_cache_warm
+            && pthread_create(&th, NULL, pc_prewarm, NULL) == 0)
+        pthread_detach(th);
 }
 
 /* ---- init ---------------------------------------------------------------------- */
@@ -2917,6 +3109,7 @@ static int init(void)
         fprintf(stderr, LOGP "base shaders failed\n");
         return 0;
     }
+    pc_start(s_pcache_warm);
     if (!solid_texture(&s_black, 0xFF000000u) || !solid_texture(&s_magenta, NV2A_TEX_MAGENTA)) {
         fprintf(stderr, LOGP "base textures failed\n");
         return 0;

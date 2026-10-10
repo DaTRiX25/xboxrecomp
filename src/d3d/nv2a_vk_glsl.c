@@ -28,7 +28,13 @@
 
 #include <glslang/Include/glslang_c_interface.h>
 #include <glslang/Public/resource_limits_c.h>
+#if __has_include(<glslang/build_info.h>)
 #include <glslang/build_info.h>
+#else
+#define GLSLANG_VERSION_MAJOR 0   /* glslang before 14 ships no build_info.h */
+#define GLSLANG_VERSION_MINOR 0
+#define GLSLANG_VERSION_PATCH 0
+#endif
 
 #include "recomp_env.h"
 #include "nv2a_pcache.h"

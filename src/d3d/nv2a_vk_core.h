@@ -42,6 +42,7 @@ struct nvk_core {
     VkFormat                         depth_format;   /* D32S8, else D24S8 */
     int                              portability;    /* MoltenVK */
     int                              validation;     /* layers on */
+    int                              present_wait;   /* VK_KHR_present_id + _wait on */
     char                             name[256];
 };
 

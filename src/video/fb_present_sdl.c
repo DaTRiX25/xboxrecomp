@@ -880,6 +880,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                         (double)(presents - pres_stat) / dt,
                         100.0 * (double)(cpu - cpu_stat) / (double)(t - t_stat),
                         fl ? (double)__atomic_load_n(&s_copy_ns, __ATOMIC_RELAXED) / (double)fl / 1e6 : 0.0);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+                if (s_vk)
+                    fbv_timing_report("presents");
+#endif
                 t_stat = t;
                 cpu_stat = cpu;
                 pres_stat = presents;
