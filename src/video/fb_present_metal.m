@@ -47,6 +47,7 @@
 #include "recomp_env.h"
 #include "fb_present_metal.h"
 #include "latency_trace.h"
+#include "post_shaders.h"
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
 #include "overlay.h"
 #include "overlay_metal.h"
@@ -66,6 +67,8 @@ int  xbox_VblankDisplayLockOn(void);
 static id<MTLDevice>               s_dev;
 static id<MTLCommandQueue>         s_queue;
 static id<MTLRenderPipelineState>  s_pso;
+static id<MTLRenderPipelineState>  s_pso_fxaa, s_pso_cas;   /* post passes */
+static id<MTLTexture>              s_pp[2];                  /* their targets */
 static id<MTLSamplerState>         s_smp[2];   /* nearest, linear */
 static SDL_MetalView               s_view;
 static CAMetalLayer               *s_layer;
@@ -170,6 +173,23 @@ static const char s_blit_msl[] =
     "fragment float4 fs_blit(VO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
     "                        sampler s [[sampler(0)]], constant float4 &uv [[buffer(0)]]) {\n"
     "    return float4(t.sample(s, uv.xy + i.t * uv.zw).rgb, 1);\n"
+    "}\n"
+    /* The post passes (post_shaders.h): the frame at its own size, one pixel
+     * to one texel, so a bilinear fetch at an offset of whole texels is that
+     * texel. */
+    "#define FETCH(p) t.sample(s, (p)).rgb\n"
+    "#define RETURN(c) return float4((c), 1.0)\n"
+    "fragment float4 fs_fxaa(VO vo [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+    "                        sampler s [[sampler(0)]]) {\n"
+    "    float2 uv = vo.t;\n"
+    "    float2 rcp = 1.0 / float2(t.get_width(), t.get_height());\n"
+    POST_FXAA_BODY
+    "}\n"
+    "fragment float4 fs_cas(VO vo [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+    "                       sampler s [[sampler(0)]], constant float &sharp [[buffer(0)]]) {\n"
+    "    float2 uv = vo.t;\n"
+    "    float2 rcp = 1.0 / float2(t.get_width(), t.get_height());\n"
+    POST_CAS_BODY
     "}\n";
 
 static int fail(char *err, size_t n, const char *what)
@@ -210,6 +230,20 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         pd.fragmentFunction = [[lib newFunctionWithName:@"fs_blit"] autorelease];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         s_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (s_pso) {
+            /* The post passes; a failure leaves them off (logged), the
+             * present itself unaffected. */
+            pd.fragmentFunction = [[lib newFunctionWithName:@"fs_fxaa"] autorelease];
+            s_pso_fxaa = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+            if (!s_pso_fxaa)
+                fprintf(stderr, "[PRESENT] FXAA pass unavailable: %s\n",
+                        e ? [[e localizedDescription] UTF8String] : "?");
+            pd.fragmentFunction = [[lib newFunctionWithName:@"fs_cas"] autorelease];
+            s_pso_cas = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+            if (!s_pso_cas)
+                fprintf(stderr, "[PRESENT] CAS pass unavailable: %s\n",
+                        e ? [[e localizedDescription] UTF8String] : "?");
+        }
         [pd release];
         [lib release];
         if (!s_pso)
@@ -291,6 +325,12 @@ void fbm_destroy(void)
         s_view = NULL;
         [s_pso release];
         s_pso = nil;
+        [s_pso_fxaa release];
+        [s_pso_cas release];
+        s_pso_fxaa = s_pso_cas = nil;
+        [s_pp[0] release];
+        [s_pp[1] release];
+        s_pp[0] = s_pp[1] = nil;
         [s_smp[0] release];
         [s_smp[1] release];
         s_smp[0] = s_smp[1] = nil;
@@ -404,6 +444,40 @@ static void save_shot(id<MTLBuffer> buf, uint32_t w, uint32_t h, const char *pat
     SDL_FreeSurface(surf);
 }
 
+/* A post pass's target at w x h, made or re-made at that size. */
+static id<MTLTexture> pp_texture(int n, NSUInteger w, NSUInteger h)
+{
+    if (!s_pp[n] || [s_pp[n] width] != w || [s_pp[n] height] != h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                         width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        [s_pp[n] release];
+        s_pp[n] = [s_dev newTextureWithDescriptor:td];
+    }
+    return s_pp[n];
+}
+
+/* One full-frame pass: src through pso into dst (same size). */
+static void post_pass(id<MTLCommandBuffer> cb, id<MTLRenderPipelineState> pso,
+                      id<MTLTexture> src, id<MTLTexture> dst, const float *sharp)
+{
+    MTLRenderPassDescriptor *pr = [MTLRenderPassDescriptor renderPassDescriptor];
+    id<MTLRenderCommandEncoder> pe;
+    pr.colorAttachments[0].texture = dst;
+    pr.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    pr.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pe = [cb renderCommandEncoderWithDescriptor:pr];
+    [pe setRenderPipelineState:pso];
+    [pe setFragmentTexture:src atIndex:0];
+    [pe setFragmentSamplerState:s_smp[1] atIndex:0];
+    if (sharp)
+        [pe setFragmentBytes:sharp length:sizeof *sharp atIndex:0];
+    [pe drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [pe endEncoding];
+}
+
 /* Slot k (fw x fh) into the window. 0 when no drawable came (timeout, display
  * asleep, window hidden): the caller keeps the frame and tries again. */
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
@@ -413,6 +487,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
 
     @autoreleasepool {
         id<CAMetalDrawable> d;
+        id<MTLTexture> src;
         id<MTLCommandBuffer> cb;
         id<MTLRenderCommandEncoder> enc;
         MTLRenderPassDescriptor *rp;
@@ -438,6 +513,29 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         dw = (int)[d.texture width];
         dh = (int)[d.texture height];
         cb = [s_queue commandBuffer];
+        /* The post passes (post_shaders.h), at the frame's own size and
+         * before the scale to the window; the overlay below is drawn after
+         * them, so it is not filtered. */
+        src = s_slot[k];
+        if (src && fw && fh) {
+            int aa = nv2a_host_post_aa();
+            float sharp = nv2a_host_sharpen();
+            NSUInteger sw = [src width], sh = [src height];
+            if (aa == NV2A_AA_FXAA && s_pso_fxaa) {
+                id<MTLTexture> dst = pp_texture(0, sw, sh);
+                if (dst) {
+                    post_pass(cb, s_pso_fxaa, src, dst, NULL);
+                    src = dst;
+                }
+            }
+            if (sharp > 0.001f && s_pso_cas) {
+                id<MTLTexture> dst = pp_texture(1, sw, sh);
+                if (dst) {
+                    post_pass(cb, s_pso_cas, src, dst, &sharp);
+                    src = dst;
+                }
+            }
+        }
         rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = d.texture;
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -455,7 +553,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                           || (filter == NV2A_PRESENT_INTEGER && !whole);
                 [enc setRenderPipelineState:s_pso];
                 [enc setViewport:vp];
-                [enc setFragmentTexture:s_slot[k] atIndex:0];
+                [enc setFragmentTexture:src atIndex:0];
                 [enc setFragmentSamplerState:s_smp[lin] atIndex:0];
                 [enc setFragmentBytes:uv length:sizeof uv atIndex:0];
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];

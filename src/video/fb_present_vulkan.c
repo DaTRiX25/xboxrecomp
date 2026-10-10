@@ -55,6 +55,8 @@
 #include "d3d/nv2a_vk_core.h"
 #include "recomp_env.h"
 #include "latency_trace.h"
+#include "d3d/nv2a_vk_glsl.h"
+#include "post_shaders.h"
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
 #include "overlay.h"
 #include "overlay_vulkan.h"
@@ -90,6 +92,7 @@ static VkSemaphore      s_done[SC_MAX];
 static int              s_fi;
 
 static struct nvk_image s_slot[3];       /* GENERAL once written */
+static void post_destroy(void);          /* the post passes, below */
 
 static VkCommandPool     s_up_pool;      /* ack thread */
 static VkCommandBuffer   s_up_cb;
@@ -514,6 +517,7 @@ void fbv_destroy(void)
         fclose(s_csv);
     s_csv = NULL;
     queue_idle();
+    post_destroy();
     for (k = 0; k < 3; k++)
         nvk_image_free(&s_slot[k]);
     nvk_buffer_free(&s_up_buf);
@@ -637,6 +641,365 @@ static void save_shot(const uint8_t *px, uint32_t w, uint32_t h, const char *pat
     SDL_FreeSurface(surf);
 }
 
+/* ---- the post passes ------------------------------------------------------
+ *
+ * FXAA and CAS (post_shaders.h) as fullscreen-triangle passes with dynamic
+ * rendering, at the frame's own size: the slot (or the pass before) is the
+ * input, a BGRA8 image of the slot's size the target, and the scale to the
+ * window then blits the last target instead of the slot. GLSL compiled at
+ * the first use (the SPIR-V cache serves it after), a pipeline each. A
+ * failure leaves the passes off, logged once; the present is unaffected.
+ * One descriptor set per pass and frame in flight, rewritten each frame:
+ * the fence wait at the top of fbv_present has retired its last use. */
+
+static const char s_post_vs[] =
+    "#version 450\n"
+    "layout(location = 0) out vec2 vUv;\n"
+    "void main() {\n"
+    "    vUv = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));\n"
+    "    gl_Position = vec4(vUv * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+
+#define POST_GLSL_HEAD \
+    "#version 450\n" \
+    "#define float2 vec2\n#define float3 vec3\n#define float4 vec4\n" \
+    "#define saturate(x) clamp((x), 0.0, 1.0)\n" \
+    "layout(set = 0, binding = 0) uniform sampler2D tex0;\n" \
+    "layout(push_constant) uniform PC { vec2 rcpv; float sharpv; } pc;\n" \
+    "layout(location = 0) in vec2 vUv;\n" \
+    "layout(location = 0) out vec4 outColor;\n" \
+    "#define FETCH(p) texture(tex0, (p)).rgb\n" \
+    "#define RETURN(c) { outColor = vec4((c), 1.0); return; }\n" \
+    "void main() {\n" \
+    "    vec2 uv = vUv; vec2 rcp = pc.rcpv; float sharp = pc.sharpv;\n"
+
+static const char s_post_fxaa[] = POST_GLSL_HEAD POST_FXAA_BODY "}\n";
+static const char s_post_cas[] = POST_GLSL_HEAD POST_CAS_BODY "}\n";
+
+enum { PP_FXAA, PP_CAS, PP_COUNT };
+
+static struct {
+    int tried, ok;
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout pl;
+    VkSampler smp;
+    VkDescriptorPool pool;
+    VkDescriptorSet ds[2][PP_COUNT];       /* [frame in flight][pass] */
+    VkPipeline pso[PP_COUNT];
+    struct nvk_image img[PP_COUNT];         /* each pass's target */
+} P;
+
+static VkShaderModule post_module(enum nvk_stage st, const char *src, const char *what)
+{
+    char err[2048];
+    const uint32_t *w;
+    size_t n;
+    int compiled;
+    VkShaderModuleCreateInfo ci;
+    VkShaderModule m = VK_NULL_HANDLE;
+
+    if (!nvk_glsl_spirv(st, src, &w, &n, &compiled, err, sizeof err)) {
+        fprintf(stderr, LOGP "post pass %s: GLSL compile failed: %s\n", what, err);
+        return VK_NULL_HANDLE;
+    }
+    memset(&ci, 0, sizeof ci);
+    ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ci.codeSize = n * 4;
+    ci.pCode = w;
+    if (vkCreateShaderModule(C->dev, &ci, NULL, &m) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    return m;
+}
+
+static VkPipeline post_pipeline(VkShaderModule vs, VkShaderModule fs)
+{
+    VkPipelineShaderStageCreateInfo ss[2];
+    VkPipelineVertexInputStateCreateInfo vi;
+    VkPipelineInputAssemblyStateCreateInfo ia;
+    VkPipelineViewportStateCreateInfo vp;
+    VkPipelineRasterizationStateCreateInfo rs;
+    VkPipelineMultisampleStateCreateInfo ms;
+    VkPipelineColorBlendAttachmentState cba;
+    VkPipelineColorBlendStateCreateInfo cb;
+    VkPipelineDynamicStateCreateInfo dy;
+    VkPipelineRenderingCreateInfo pr;
+    VkGraphicsPipelineCreateInfo gp;
+    VkFormat cf = VK_FORMAT_B8G8R8A8_UNORM;
+    static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipeline p = VK_NULL_HANDLE;
+
+    memset(ss, 0, sizeof ss);
+    ss[0].sType = ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    ss[0].module = vs;
+    ss[0].pName = ss[1].pName = "main";
+    ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    ss[1].module = fs;
+    memset(&vi, 0, sizeof vi);
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    memset(&ia, 0, sizeof ia);
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    memset(&vp, 0, sizeof vp);
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = vp.scissorCount = 1;
+    memset(&rs, 0, sizeof rs);
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    memset(&ms, 0, sizeof ms);
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    memset(&cba, 0, sizeof cba);
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    memset(&cb, 0, sizeof cb);
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    memset(&dy, 0, sizeof dy);
+    dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    memset(&pr, 0, sizeof pr);
+    pr.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    pr.colorAttachmentCount = 1;
+    pr.pColorAttachmentFormats = &cf;
+    memset(&gp, 0, sizeof gp);
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.pNext = &pr;
+    gp.stageCount = 2;
+    gp.pStages = ss;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = &dy;
+    gp.layout = P.pl;
+    if (vkCreateGraphicsPipelines(C->dev, VK_NULL_HANDLE, 1, &gp, NULL, &p) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    return p;
+}
+
+/* Made at the first use; 1 when the passes can run. */
+static int post_init(void)
+{
+    VkDescriptorSetLayoutBinding lb;
+    VkDescriptorSetLayoutCreateInfo li;
+    VkPushConstantRange pcr;
+    VkPipelineLayoutCreateInfo pli;
+    VkSamplerCreateInfo sci;
+    VkDescriptorPoolSize psz;
+    VkDescriptorPoolCreateInfo pci;
+    VkDescriptorSetAllocateInfo dai;
+    VkDescriptorSetLayout lay[2 * PP_COUNT];
+    VkShaderModule vs, fs[PP_COUNT];
+    int i;
+
+    if (P.tried)
+        return P.ok;
+    P.tried = 1;
+    memset(&lb, 0, sizeof lb);
+    lb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    lb.descriptorCount = 1;
+    lb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    memset(&li, 0, sizeof li);
+    li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    li.bindingCount = 1;
+    li.pBindings = &lb;
+    memset(&pcr, 0, sizeof pcr);
+    pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.size = 16;
+    memset(&sci, 0, sizeof sci);
+    sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    memset(&psz, 0, sizeof psz);
+    psz.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    psz.descriptorCount = 2 * PP_COUNT;
+    memset(&pci, 0, sizeof pci);
+    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.maxSets = 2 * PP_COUNT;
+    pci.poolSizeCount = 1;
+    pci.pPoolSizes = &psz;
+    if (vkCreateDescriptorSetLayout(C->dev, &li, NULL, &P.dsl) != VK_SUCCESS)
+        goto fail;
+    memset(&pli, 0, sizeof pli);
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &P.dsl;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pcr;
+    if (vkCreatePipelineLayout(C->dev, &pli, NULL, &P.pl) != VK_SUCCESS
+            || vkCreateSampler(C->dev, &sci, NULL, &P.smp) != VK_SUCCESS
+            || vkCreateDescriptorPool(C->dev, &pci, NULL, &P.pool) != VK_SUCCESS)
+        goto fail;
+    for (i = 0; i < 2 * PP_COUNT; i++)
+        lay[i] = P.dsl;
+    memset(&dai, 0, sizeof dai);
+    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dai.descriptorPool = P.pool;
+    dai.descriptorSetCount = 2 * PP_COUNT;
+    dai.pSetLayouts = lay;
+    {
+        VkDescriptorSet sets[2 * PP_COUNT];
+        if (vkAllocateDescriptorSets(C->dev, &dai, sets) != VK_SUCCESS)
+            goto fail;
+        for (i = 0; i < 2 * PP_COUNT; i++)
+            P.ds[i / PP_COUNT][i % PP_COUNT] = sets[i];
+    }
+    vs = post_module(NVK_STAGE_VERTEX, s_post_vs, "vertex");
+    fs[PP_FXAA] = post_module(NVK_STAGE_FRAGMENT, s_post_fxaa, "FXAA");
+    fs[PP_CAS] = post_module(NVK_STAGE_FRAGMENT, s_post_cas, "CAS");
+    if (vs) {
+        for (i = 0; i < PP_COUNT; i++)
+            if (fs[i])
+                P.pso[i] = post_pipeline(vs, fs[i]);
+    }
+    /* The modules are no longer needed once the pipelines exist. */
+    for (i = 0; i < PP_COUNT; i++)
+        if (fs[i])
+            vkDestroyShaderModule(C->dev, fs[i], NULL);
+    if (vs)
+        vkDestroyShaderModule(C->dev, vs, NULL);
+    P.ok = P.pso[PP_FXAA] || P.pso[PP_CAS];
+    fprintf(stderr, LOGP "post passes: FXAA %s, CAS %s\n", P.pso[PP_FXAA] ? "ready" : "unavailable",
+            P.pso[PP_CAS] ? "ready" : "unavailable");
+    return P.ok;
+fail:
+    fprintf(stderr, LOGP "post passes unavailable (Vulkan objects failed)\n");
+    return 0;
+}
+
+static void post_destroy(void)
+{
+    int i;
+    if (!P.tried)
+        return;
+    for (i = 0; i < PP_COUNT; i++) {
+        if (P.pso[i])
+            vkDestroyPipeline(C->dev, P.pso[i], NULL);
+        nvk_image_free(&P.img[i]);
+    }
+    if (P.pool)
+        vkDestroyDescriptorPool(C->dev, P.pool, NULL);
+    if (P.smp)
+        vkDestroySampler(C->dev, P.smp, NULL);
+    if (P.pl)
+        vkDestroyPipelineLayout(C->dev, P.pl, NULL);
+    if (P.dsl)
+        vkDestroyDescriptorSetLayout(C->dev, P.dsl, NULL);
+    memset(&P, 0, sizeof P);
+}
+
+/* The passes asked for (RECOMP_GFX_AA, RECOMP_GFX_SHARPEN), recorded into cb
+ * over slot k. Returns the image and layout the scale to the window reads:
+ * the last target, or the slot itself when no pass ran. */
+static void post_run(VkCommandBuffer cb, int k, VkImage *src, VkImageLayout *layout)
+{
+    int want[PP_COUNT];
+    struct nvk_image *cur = &s_slot[k];
+    VkImageLayout cur_layout = VK_IMAGE_LAYOUT_GENERAL;
+    int p, ran = 0;
+
+    want[PP_FXAA] = nv2a_host_post_aa() == NV2A_AA_FXAA;
+    want[PP_CAS] = nv2a_host_sharpen() > 0.001f;
+    *src = s_slot[k].img;
+    *layout = VK_IMAGE_LAYOUT_GENERAL;
+    if ((!want[PP_FXAA] && !want[PP_CAS]) || !post_init())
+        return;
+    for (p = 0; p < PP_COUNT; p++)
+        if (want[p] && P.pso[p] && (P.img[p].w != s_slot[k].w || P.img[p].h != s_slot[k].h
+                                    || !P.img[p].img)) {
+            if (P.img[p].img) {
+                queue_idle();           /* a present may still read it: rare */
+                nvk_image_free(&P.img[p]);
+            }
+            if (!nvk_image_new(&P.img[p], VK_FORMAT_B8G8R8A8_UNORM, s_slot[k].w, s_slot[k].h, 1,
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                               | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) {
+                want[p] = 0;
+                continue;
+            }
+        }
+    /* After the backend's copy into the slot (earlier on the queue). */
+    nvk_image_barrier(cb, s_slot[k].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_IMAGE_LAYOUT_GENERAL);
+    for (p = 0; p < PP_COUNT; p++) {
+        VkDescriptorImageInfo di;
+        VkWriteDescriptorSet wr;
+        VkRenderingAttachmentInfo att;
+        VkRenderingInfo ri;
+        VkViewport vp;
+        VkRect2D sc;
+        float pc[4];
+        struct nvk_image *dst = &P.img[p];
+
+        if (!want[p] || !P.pso[p] || !dst->img)
+            continue;
+        memset(&di, 0, sizeof di);
+        di.sampler = P.smp;
+        di.imageView = cur->view;
+        di.imageLayout = cur_layout;
+        memset(&wr, 0, sizeof wr);
+        wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr.dstSet = P.ds[s_fi][p];
+        wr.descriptorCount = 1;
+        wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr.pImageInfo = &di;
+        vkUpdateDescriptorSets(C->dev, 1, &wr, 0, NULL);
+
+        nvk_image_to(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        memset(&att, 0, sizeof att);
+        att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        att.imageView = dst->view;
+        att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        memset(&ri, 0, sizeof ri);
+        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea.extent.width = dst->w;
+        ri.renderArea.extent.height = dst->h;
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &att;
+        vkCmdBeginRendering(cb, &ri);
+        memset(&vp, 0, sizeof vp);
+        vp.width = (float)dst->w;
+        vp.height = (float)dst->h;
+        vp.maxDepth = 1.0f;
+        sc.offset.x = sc.offset.y = 0;
+        sc.extent.width = dst->w;
+        sc.extent.height = dst->h;
+        vkCmdSetViewport(cb, 0, 1, &vp);
+        vkCmdSetScissor(cb, 0, 1, &sc);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pso[p]);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pl, 0, 1, &P.ds[s_fi][p],
+                                0, NULL);
+        pc[0] = 1.0f / (float)dst->w;
+        pc[1] = 1.0f / (float)dst->h;
+        pc[2] = nv2a_host_sharpen();
+        pc[3] = 0.0f;
+        vkCmdPushConstants(cb, P.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+        vkCmdDraw(cb, 3, 1, 0, 0);
+        vkCmdEndRendering(cb);
+        /* Readable by the next pass or the blit. */
+        nvk_image_to(cb, dst, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        cur = dst;
+        cur_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ran = 1;
+    }
+    if (ran) {
+        nvk_image_to(cb, cur, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        *src = cur->img;
+        *layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    }
+}
+
 int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 const char *shot_path, uint32_t flip)
 {
@@ -736,10 +1099,15 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             int lin = filter == NV2A_PRESENT_LINEAR
                       || (filter == NV2A_PRESENT_INTEGER && !whole);
             VkImageBlit b;
-            /* After the backend's copy into the slot (earlier on the queue),
-             * and the clear above. */
-            nvk_image_barrier(cb, s_slot[k].img, VK_IMAGE_ASPECT_COLOR_BIT,
-                              VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+            VkImage bsrc;
+            VkImageLayout bsrc_layout;
+            /* The post passes, if asked for, then the blit reads their last
+             * target; else after the backend's copy into the slot (earlier on
+             * the queue), and the clear above. */
+            post_run(cb, k, &bsrc, &bsrc_layout);
+            if (bsrc == s_slot[k].img)
+                nvk_image_barrier(cb, s_slot[k].img, VK_IMAGE_ASPECT_COLOR_BIT,
+                                  VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
             nvk_image_barrier(cb, s_sc_img[idx], VK_IMAGE_ASPECT_COLOR_BIT,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -757,7 +1125,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             b.dstOffsets[1].x = r2.x + r2.w;
             b.dstOffsets[1].y = r2.y + r2.h;
             b.dstOffsets[1].z = 1;
-            vkCmdBlitImage(cb, s_slot[k].img, VK_IMAGE_LAYOUT_GENERAL, s_sc_img[idx],
+            vkCmdBlitImage(cb, bsrc, bsrc_layout, s_sc_img[idx],
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
                            lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
         }

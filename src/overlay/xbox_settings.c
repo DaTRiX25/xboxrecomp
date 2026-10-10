@@ -42,6 +42,7 @@ static const char *const k_fits[]     = { "letterbox", "fill16x10", NULL };
 static const char *const k_speakers[] = { "auto", "stereo", "5.1", NULL };
 static const char *const k_aniso[]    = { "off", "2x", "4x", "8x", "16x", NULL };
 static const char *const k_aniso_env[] = { "1", "2", "4", "8", "16", NULL };
+static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
@@ -56,6 +57,8 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_DISPLAY_FIT]        = SETTING("display.fit", XS_CHOICE, 0, RENV_PRESENT_FIT, k_fits, NULL, 0, 0, 0),
     [XS_GRAPHICS_RENDER_SCALE] = SETTING("graphics.render_scale", XS_INT, XS_RESTART, RENV_RENDER_SCALE, NULL, NULL, 1, 4, 1),
     [XS_GRAPHICS_ANISO]     = SETTING("graphics.aniso", XS_CHOICE, 0, RENV_GFX_ANISO, k_aniso, k_aniso_env, 0, 0, 0),
+    [XS_GRAPHICS_AA]        = SETTING("graphics.aa", XS_CHOICE, 0, RENV_GFX_AA, k_aa, NULL, 0, 0, 0),
+    [XS_GRAPHICS_SHARPEN]   = SETTING("graphics.sharpen", XS_FLOAT, 0, RENV_GFX_SHARPEN, NULL, NULL, 0, 1, 0),
     [XS_AUDIO_VOLUME]       = SETTING("audio.volume", XS_FLOAT, 0, RENV_AUDIO_VOLUME, NULL, NULL, 0, 1, 1),
     [XS_AUDIO_MUTE]         = SETTING("audio.mute", XS_BOOL, 0, RENV_AUDIO_MUTE, NULL, NULL, 0, 0, 0),
     [XS_AUDIO_MUTE_BG]      = SETTING("audio.mute_background", XS_BOOL, 0, RENV_AUDIO_MUTE_BG, NULL, NULL, 0, 0, 0),
@@ -226,6 +229,12 @@ static void apply(xs_id id)
         nv2a_host_set_aniso(levels[(int)v]);
         break;
     }
+    case XS_GRAPHICS_AA:
+        nv2a_host_set_post_aa((int)v);
+        break;
+    case XS_GRAPHICS_SHARPEN:
+        nv2a_host_set_sharpen((float)v);
+        break;
     case XS_AUDIO_VOLUME:
     case XS_AUDIO_MUTE:
     case XS_AUDIO_MUTE_BG:

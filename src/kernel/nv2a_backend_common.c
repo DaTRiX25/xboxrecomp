@@ -619,6 +619,39 @@ void nv2a_host_set_aniso(int level)
     s_aniso = aniso_level(level);
 }
 
+static volatile int s_post_aa = -1;          /* -1: not read yet */
+static volatile float s_sharpen = -1.0f;
+
+int nv2a_host_post_aa(void)
+{
+    if (s_post_aa < 0) {
+        const char *e = recomp_env(RENV_GFX_AA);
+        s_post_aa = e && !strcmp(e, "fxaa") ? NV2A_AA_FXAA
+                  : e && !strcmp(e, "smaa") ? NV2A_AA_SMAA : NV2A_AA_OFF;
+    }
+    return s_post_aa;
+}
+
+void nv2a_host_set_post_aa(int aa)
+{
+    s_post_aa = aa == NV2A_AA_FXAA || aa == NV2A_AA_SMAA ? aa : NV2A_AA_OFF;
+}
+
+float nv2a_host_sharpen(void)
+{
+    if (s_sharpen < 0.0f) {
+        const char *e = recomp_env(RENV_GFX_SHARPEN);
+        float v = e && *e ? (float)atof(e) : 0.0f;
+        s_sharpen = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+    }
+    return s_sharpen;
+}
+
+void nv2a_host_set_sharpen(float strength)
+{
+    s_sharpen = strength < 0.0f ? 0.0f : strength > 1.0f ? 1.0f : strength;
+}
+
 unsigned nv2a_host_render_scale(void)
 {
     return s_host_opts.render_scale > 1 ? s_host_opts.render_scale : 1;

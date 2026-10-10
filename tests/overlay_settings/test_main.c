@@ -36,7 +36,10 @@ void nv2a_present_set_fit(int f) { st_fit = f; }
 void nv2a_host_opts_set(const struct nv2a_host_opts *o) { st_opts = *o; }
 const struct nv2a_host_opts *nv2a_host_opts(void) { return &st_opts; }
 void xa2_set_gain(float g) { st_gain = g; }
-static int st_aniso = -2;
+static int st_aniso = -2, st_aa = -2;
+static float st_sharpen = -2;
+void nv2a_host_set_post_aa(int a) { st_aa = a; }
+void nv2a_host_set_sharpen(float v) { st_sharpen = v; }
 void nv2a_host_set_aniso(int n) { st_aniso = n; }
 
 static void set_env(const char *k, const char *v)
@@ -158,6 +161,10 @@ int main(void)
     xbox_SettingSet(XS_GRAPHICS_ANISO, 3);
     CHECK(st_aniso == 8);
     CHECK(recomp_env(RENV_GFX_ANISO) && !strcmp(recomp_env(RENV_GFX_ANISO), "8"));
+    xbox_SettingSet(XS_GRAPHICS_AA, 1);
+    xbox_SettingSet(XS_GRAPHICS_SHARPEN, 0.4);
+    CHECK(st_aa == 1 && st_sharpen > 0.39f && st_sharpen < 0.41f);
+    CHECK(recomp_env(RENV_GFX_AA) && !strcmp(recomp_env(RENV_GFX_AA), "fxaa"));
     /* A restart-flagged setting. */
     xbox_SettingSet(XS_GRAPHICS_RENDER_SCALE, 2);
     CHECK(xbox_SettingsNeedRestart());

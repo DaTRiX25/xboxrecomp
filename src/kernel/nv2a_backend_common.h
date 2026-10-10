@@ -999,6 +999,16 @@ struct nv2a_host_opts {
 int  nv2a_host_aniso(void);
 void nv2a_host_set_aniso(int level);
 
+/* RECOMP_GFX_AA and RECOMP_GFX_SHARPEN: the window presenters' post passes
+ * (src/video/fb_present_metal.m, fb_present_vulkan.c), read on every present
+ * so a change while running shows at once. AA: 0 off, 1 FXAA, 2 SMAA.
+ * Sharpen: CAS strength 0..1, 0 off. */
+enum { NV2A_AA_OFF = 0, NV2A_AA_FXAA = 1, NV2A_AA_SMAA = 2 };
+int   nv2a_host_post_aa(void);
+void  nv2a_host_set_post_aa(int aa);
+float nv2a_host_sharpen(void);
+void  nv2a_host_set_sharpen(float strength);
+
 void nv2a_host_opts_set(const struct nv2a_host_opts *o);
 const struct nv2a_host_opts *nv2a_host_opts(void);
 /* render_scale as a factor: 1 when unset. */
