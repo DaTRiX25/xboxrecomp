@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "enhance_cfg.h"
+#include "kernel.h"
 #include "kernel_pacing.h"
 #include "nv2a_backend_common.h"
 
@@ -17,13 +18,26 @@
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
 /* Indexes match XBOX_PACING_SPIN / XBOX_PACING_SLEEP. */
 static const char *const s_pacing[] = { "spin", "sleep", NULL };
+/* present.aspect; "auto" is resolved below, the rest index
+ * enum nv2a_present_aspect + 1. */
+static const char *const s_aspects[] = { "auto", "frame", "4:3", "16:9", NULL };
+/* The dashboard's HDTV modes, each with those below it (the dashboard has a
+ * box per mode; a set that skips one is not offered here). */
+static const char *const s_hdtv[] = { "off", "480p", "720p", "1080i", NULL };
+static const ULONG s_hdtv_bits[] = {
+    0,
+    XC_VIDEO_AV_HDTV_480p,
+    XC_VIDEO_AV_HDTV_480p | XC_VIDEO_AV_HDTV_720p,
+    XC_VIDEO_AV_HDTV_480p | XC_VIDEO_AV_HDTV_720p | XC_VIDEO_AV_HDTV_1080i,
+};
 
 int xbox_enhance_init(const char *root, const char *title)
 {
     struct nv2a_host_opts o;
     const char *aspect;
     long long scale;
-    int rc, pacing;
+    int rc, pacing, wide, hdtv, pa;
+    ULONG xc_video;
 
     rc = enhance_cfg_init(root, title) < 0 ? -1 : 0;
     memset(&o, 0, sizeof o);
@@ -44,6 +58,24 @@ int xbox_enhance_init(const char *root, const char *title)
     pacing = enhance_cfg_choice("present.pacing", s_pacing, XBOX_PACING_SPIN);
     xbox_PacingSetMode(pacing);
 
+    /* The dashboard's video settings, as the kernel reports them to the
+     * title (XC_VIDEO, HalBootSMCVideoMode; kernel.h). What the title does
+     * with them is its own: Burnout 3 renders 16:9 anamorphic into its
+     * 640x480 buffer and asks D3D for 480p. Stock is neither. Before the
+     * kernel bridge starts, which copies the SMC mode into guest memory. */
+    wide = enhance_cfg_bool("display.widescreen", 0);
+    hdtv = enhance_cfg_choice("display.hdtv", s_hdtv, 0);
+    xc_video = (wide ? XC_VIDEO_AV_WIDESCREEN : 0) | s_hdtv_bits[hdtv];
+    xbox_SetVideoSettings(xc_video, hdtv ? SMC_VIDEO_MODE_HDTV : SMC_VIDEO_MODE_SCART);
+
+    /* The window's frame shape. A title in its widescreen mode draws 16:9
+     * into the same 4:3-sized buffer (anamorphic; the TV stretched it), so
+     * auto shows 16:9 when display.widescreen tells it to, and the frame's
+     * own shape otherwise (stock). A title that ignores the setting stays
+     * 4:3 with present.aspect = "frame". */
+    pa = enhance_cfg_choice("present.aspect", s_aspects, 0);
+    o.present_aspect = pa == 0 ? (wide ? NV2A_ASPECT_16_9 : NV2A_ASPECT_FRAME) : pa - 1;
+
     /* Hor+ is a later slice; a file or env that asks for it must not be
      * ignored silently. */
     aspect = enhance_cfg_string("display.aspect", "4:3");
@@ -57,6 +89,9 @@ int xbox_enhance_init(const char *root, const char *title)
     fprintf(stderr, LOGP "render.scale=%u present.filter=%s present.fullscreen=%d"
             " present.pacing=%s (display.aspect=%s)\n", o.render_scale,
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], aspect);
+    fprintf(stderr, LOGP "display.widescreen=%d display.hdtv=%s (XC_VIDEO=0x%08lX)"
+            " present.aspect=%s (%s)\n", wide, s_hdtv[hdtv], (unsigned long)xc_video,
+            s_aspects[pa], s_aspects[o.present_aspect + 1]);
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (fps.mode) after this, and calls it then. */
     return rc;

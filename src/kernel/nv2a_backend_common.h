@@ -952,10 +952,21 @@ enum nv2a_present_filter {
     NV2A_PRESENT_INTEGER        /* largest whole multiple that fits, centred */
 };
 
+/* The shape the window gives a frame. FRAME (stock) keeps the frame's own
+ * pixel aspect (640x480 shows 4:3). 16_9 shows any frame 16:9: a title in
+ * its widescreen mode draws 16:9 anamorphic into a 4:3-sized buffer (the
+ * console's TV stretched it), so its pixels are wider than tall. */
+enum nv2a_present_aspect {
+    NV2A_ASPECT_FRAME = 0,      /* stock: the frame's width:height */
+    NV2A_ASPECT_4_3,
+    NV2A_ASPECT_16_9
+};
+
 struct nv2a_host_opts {
     unsigned render_scale;      /* 0 or 1 = guest size; 2..4 */
     int      present_filter;    /* enum nv2a_present_filter */
     int      fullscreen;        /* borderless desktop fullscreen at start */
+    int      present_aspect;    /* enum nv2a_present_aspect */
 };
 
 void nv2a_host_opts_set(const struct nv2a_host_opts *o);
@@ -977,6 +988,17 @@ unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim
 struct nv2a_rect { int32_t x, y, w, h; };
 int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
                       int filter, struct nv2a_rect *r);
+/* The same at a display aspect (enum nv2a_present_aspect); nv2a_present_rect
+ * is this at nv2a_host_opts()->present_aspect. At any aspect but the frame's
+ * own, INTEGER scales the height by a whole number and stretches the width
+ * to the aspect, and the result is a fit (0: filter it linearly). */
+int nv2a_present_rect_aspect(uint32_t src_w, uint32_t src_h, int aspect,
+                             uint32_t dst_w, uint32_t dst_h, int filter,
+                             struct nv2a_rect *r);
+/* The width a src_w x src_h frame is shown at, its height kept, at the host
+ * option's aspect: src_w at FRAME, else src_h * aspect, rounded. For window
+ * sizes and renderer logical sizes. */
+uint32_t nv2a_present_width(uint32_t src_w, uint32_t src_h);
 
 /* 32-bit pixels: nearest N x upscale of a w x h image (src_pitch bytes a
  * row) into dst (w*n x h*n, dst_pitch bytes a row), and the box filter back:

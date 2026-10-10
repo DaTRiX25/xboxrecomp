@@ -119,7 +119,8 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  * settings. On real hardware these are stored in the 256-byte EEPROM on the
  * SMBus. For recompilation, we return sensible defaults:
  *   - Region: North America
- *   - Video: NTSC, widescreen+HDTV enabled
+ *   - Video: none of widescreen/480p/720p/1080i unless set (kernel.h,
+ *     xbox_SetVideoSettings)
  *   - Language: English
  *   - Audio: Stereo, Dolby Digital
  *   - DVD Region: Region 1 (North America)
@@ -145,9 +146,10 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC with widescreen and HDTV support enabled */
+        /* The dashboard's video settings, XC_VIDEO_AV_* bits (kernel.h):
+         * stock none, else display.widescreen / display.hdtv. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            *(PULONG)Value = xbox_GetVideoSettings();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

@@ -1293,6 +1293,19 @@ NTSTATUS __stdcall xbox_NtSetSystemTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGE
 
 static ULONG g_av_saved_data_address = 0;
 static ULONG g_av_display_mode = 0;
+/* XC_VIDEO: XC_VIDEO_AV_* bits (kernel.h). */
+static ULONG g_xc_video = 0;
+
+void xbox_SetVideoSettings(ULONG xc_video, ULONG smc_video_mode)
+{
+    g_xc_video = xc_video & XC_VIDEO_AV_USER_MASK;
+    xbox_HalBootSMCVideoMode = smc_video_mode;
+}
+
+ULONG xbox_GetVideoSettings(void)
+{
+    return g_xc_video;
+}
 
 ULONG __stdcall xbox_AvGetSavedDataAddress(void)
 {
@@ -1324,10 +1337,16 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          *
          * HDTV pack keeps 480p/720p available to titles that offer them;
          * NTSC-M and 60Hz are the North American retail default, and match
-         * the region reported by ExQueryNonVolatileSetting. */
+         * the region reported by ExQueryNonVolatileSetting.
+         *
+         * The dashboard's settings (XC_VIDEO) go in as well, as the real
+         * kernel does: D3D lists a widescreen row only with 0x00010000 here
+         * and an HDTV row only with its 0x000E0000 bit (Burnout 3's
+         * sub_0035BB10), so a title asking for 480p would find no mode. */
         *Result = AV_PACK_HDTV
                 | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
-                | AV_REFRESH_60Hz;
+                | AV_REFRESH_60Hz
+                | g_xc_video;
         break;
 
     case AV_OPTION_QUERY_MODE:
@@ -1529,8 +1548,8 @@ XBOX_ANSI_STRING xbox_HalDiskSerialNumber = {
 };
 
 /*
- * Video mode the SMC reported at boot. 0 lets title code fall back to querying
- * the AV pack, which we answer properly in AvGetSavedDataAddress/SMBus.
+ * The AV pack the SMC reported at boot (SMC_VIDEO_MODE_*, kernel.h). Stock 0;
+ * xbox_SetVideoSettings makes it 1 (HDTV pack) for 480p/720p/1080i.
  */
 ULONG xbox_HalBootSMCVideoMode = 0;
 

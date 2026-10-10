@@ -516,6 +516,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     int vsync = !recomp_env(RENV_PRESENT_VSYNC) || recomp_env_on(RENV_PRESENT_VSYNC);
     int stats = recomp_env_on(RENV_PRESENT_STATS);
     int scale = recomp_env(RENV_WINDOW_SCALE) ? atoi(recomp_env(RENV_WINDOW_SCALE)) : 2;
+    int win_w;
     int quit = 0, guest_done = 0, dirty = 0, shoot = 0;
     double quit_after = recomp_env(RENV_WINDOW_QUIT_AFTER)
                       ? atof(recomp_env(RENV_WINDOW_QUIT_AFTER)) : 0.0;
@@ -541,6 +542,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     }
     if (scale < 1 || scale > 8)
         scale = 2;
+    /* 640 wide, or 853 at present.aspect 16:9: the window starts the shape
+     * the frame is shown at. */
+    win_w = (int)nv2a_present_width(640, 480);
     {
         Uint32 wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
                       | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -553,7 +557,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         if (be && !strcasecmp(be, "metal") && !(mp && !strcasecmp(mp, "readback"))) {
             char why[256] = "";
             win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
-                                   SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale,
+                                   SDL_WINDOWPOS_CENTERED, win_w * scale, 480 * scale,
                                    wflags | SDL_WINDOW_METAL);
             if (!win)
                 snprintf(why, sizeof why, "%s", SDL_GetError());
@@ -570,7 +574,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
 #endif
         if (!s_layer) {
             win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
-                                   SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale, wflags);
+                                   SDL_WINDOWPOS_CENTERED, win_w * scale, 480 * scale, wflags);
             ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
                                            | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0))
                       : NULL;
@@ -687,7 +691,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 if (filter == NV2A_PRESENT_INTEGER) {
                     dst_ok = 0;          /* new frame size: place it again */
                 } else {
-                    SDL_RenderSetLogicalSize(ren, (int)f->w, (int)f->h);
+                    /* At the present.aspect shape: the copy fills it. */
+                    SDL_RenderSetLogicalSize(ren, (int)nv2a_present_width(f->w, f->h),
+                                             (int)f->h);
                     if (tex && filter == NV2A_PRESENT_LINEAR)
                         SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
                 }

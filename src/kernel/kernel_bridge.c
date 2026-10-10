@@ -294,9 +294,10 @@ static void kernel_data_init(void)
      * this to convert ticks to time gets a division by zero if it is left 0. */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TIME_INCREMENT) = 0x2710;
 
-    /* HalBootSMCVideoMode (ordinal 356) - SMC video mode word from boot. 0 is
-     * "no video mode reported", which titles treat as auto-detect. */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO) = 0;
+    /* HalBootSMCVideoMode (ordinal 356) - the AV pack the SMC reported at
+     * boot. Stock 0; 1 (HDTV pack) when xbox_SetVideoSettings asked for
+     * 480p/720p/1080i, since XGetVideoFlags keeps those only on 1. */
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO) = xbox_HalBootSMCVideoMode;
 
     /* IdexChannelObject is a structure, not an opaque pointer. Guest file-close
      * code walks DeviceQueue.DeviceListHead at +0x28. Host-backed synchronous

@@ -60,7 +60,10 @@ extern "C" {
     X(ENHANCE_CONFIG,    CONFIG, "RECOMP_ENHANCE_CONFIG",    NULL, "enhancements file: a path, or none (default: <root>/<title>/enhance.toml, <root>/enhance.toml)") \
     X(RENDER_SCALE,      CONFIG, "RECOMP_RENDER_SCALE",      NULL, "enhancements: render.scale, internal resolution factor (1 = stock)") \
     X(DISPLAY_ASPECT,    CONFIG, "RECOMP_DISPLAY_ASPECT",    NULL, "enhancements: display.aspect, 4:3 (stock), 16:9, 16:10, 21:9") \
+    X(DISPLAY_WIDESCREEN, CONFIG, "RECOMP_DISPLAY_WIDESCREEN", NULL, "enhancements: display.widescreen, the dashboard's 16:9 setting the title reads (1/0)") \
+    X(DISPLAY_HDTV,      CONFIG, "RECOMP_DISPLAY_HDTV",      NULL, "enhancements: display.hdtv, the dashboard's HDTV modes: off (stock), 480p, 720p, 1080i (each with those below)") \
     X(PRESENT_FILTER,    CONFIG, "RECOMP_PRESENT_FILTER",    NULL, "enhancements: present.filter, nearest (stock), linear, integer") \
+    X(PRESENT_ASPECT,    CONFIG, "RECOMP_PRESENT_ASPECT",    NULL, "enhancements: present.aspect, the window's frame shape: auto (stock; 16:9 with display.widescreen), frame, 4:3, 16:9") \
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
     X(PRESENT_PACING,    CONFIG, "RECOMP_PRESENT_PACING",    NULL, "enhancements: present.pacing, spin (stock busy-wait) or sleep (lowered spin waits sleep)")
 #else

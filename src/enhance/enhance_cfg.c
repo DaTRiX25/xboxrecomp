@@ -35,7 +35,10 @@ static void bind_builtins(void)
 #ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS
     enhance_cfg_bind_env("render.scale", RENV_RENDER_SCALE);
     enhance_cfg_bind_env("display.aspect", RENV_DISPLAY_ASPECT);
+    enhance_cfg_bind_env("display.widescreen", RENV_DISPLAY_WIDESCREEN);
+    enhance_cfg_bind_env("display.hdtv", RENV_DISPLAY_HDTV);
     enhance_cfg_bind_env("present.filter", RENV_PRESENT_FILTER);
+    enhance_cfg_bind_env("present.aspect", RENV_PRESENT_ASPECT);
     enhance_cfg_bind_env("present.fullscreen", RENV_PRESENT_FULLSCREEN);
     enhance_cfg_bind_env("present.pacing", RENV_PRESENT_PACING);
 #endif
