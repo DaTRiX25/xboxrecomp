@@ -643,6 +643,9 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics);
 PVOID   __stdcall xbox_MmMapIoSpace(ULONG_PTR PhysicalAddress, ULONG NumberOfBytes, ULONG Protect);
 VOID    __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes);
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress);
+/* The guest address a physical one was last translated from by
+ * MmGetPhysicalAddress, or 0 if it never was (kernel_memory.c). */
+uint32_t xbox_PhysicalToGuest(uint32_t pa);
 
 VOID    __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist);
 ULONG   __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress);

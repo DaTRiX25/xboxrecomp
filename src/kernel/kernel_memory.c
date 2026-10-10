@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -163,6 +164,38 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
         VirtualFree(BaseAddress, 0, MEM_RELEASE);
 }
 
+/* Physical to guest, from the translations handed out below.
+ *
+ * MmGetPhysicalAddress subtracts the contiguous base inside the window and is
+ * the identity outside it. On the console those are the same bytes; here the
+ * window is separate storage, so a physical number names two places: P in
+ * RAM (the identity form of an ordinary address) and 0x80000000 + P (the
+ * physical form of a contiguous one). The heap and the contiguous allocator
+ * both hand out low physical numbers, so in a large title they collide all
+ * the time. A bus master given P (the APU, reading a sound buffer's pages from
+ * the scatter-gather list DirectSound built) cannot tell them apart by
+ * arithmetic, and a guess reads the other allocation's bytes: Burnout 3 loads
+ * its frontend sound bank (sound\fe.awd) into heap pages around 0x018B0000,
+ * those page numbers are also live contiguous pages, and the voice processor
+ * played the window's bytes -- ASCII text, in the capture -- as the menu's
+ * sound effects, and silence as the menu music.
+ *
+ * What was handed out is not ambiguous, though: DirectSound translates each
+ * page of a buffer with this call when it builds the voice's SGE entries. So
+ * each translation is recorded per physical page, the last one winning, and a
+ * device model asks xbox_PhysicalToGuest before falling back to its own rule.
+ * The approach is vyanhursky/xboxrecomp's xbox_PhysicalToVirtual (Def Jam);
+ * the record here is a flat table rather than a list, one 32-bit word per
+ * physical page, so a lookup costs one load and needs no lock. */
+#define PHYS_OWNER_PAGES (0x10000000u >> 12)        /* 256 MB of physical */
+static volatile LONG g_phys_owner[PHYS_OWNER_PAGES]; /* guest page + 1, 0: never */
+
+uint32_t xbox_PhysicalToGuest(uint32_t pa)
+{
+    uint32_t owner = (uint32_t)g_phys_owner[(pa & 0x0FFFFFFFu) >> 12];
+    return owner ? ((owner - 1) << 12) | (pa & 0xFFFu) : 0;
+}
+
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
 {
     /*
@@ -179,9 +212,27 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * nothing naming this function.
      */
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    uint32_t pa = (va >= XBOX_CONTIG_BASE &&
+                   (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+                ? va - XBOX_CONTIG_BASE : va;
+    if (pa < 0x10000000u) {
+        LONG owner = (LONG)((va >> 12) + 1);
+        LONG was = g_phys_owner[pa >> 12];
+        if (was != owner) {
+            InterlockedExchange(&g_phys_owner[pa >> 12], owner);
+            /* RAM and window forms of one physical page both handed out:
+             * the record answers for the later one. Said a few times, since
+             * a model reading the earlier one gets the other bytes. */
+            if (was) {
+                static volatile LONG said;
+                if (InterlockedIncrement(&said) <= 8)
+                    fprintf(stderr, "[MM] physical page 0x%08X translated from "
+                                    "0x%08X, earlier from 0x%08X\n", pa & ~0xFFFu,
+                            va & ~0xFFFu, (uint32_t)(was - 1) << 12);
+            }
+        }
+    }
+    return (ULONG_PTR)pa;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)
