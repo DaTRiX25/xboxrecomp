@@ -1748,7 +1748,7 @@ static id<MTLSamplerState> sampler(const Stage *t)
     MTLSamplerDescriptor *sd;
     id<MTLSamplerState> st;
     uint32_t u = t->addr_u & 0xF, v = t->addr_v & 0xF;
-    int mn, mg, mip, i;
+    int mn, mg, mip, i, aniso;
     uint64_t key;
 
     if (point < 0)
@@ -1756,13 +1756,18 @@ static id<MTLSamplerState> sampler(const Stage *t)
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
+    /* Anisotropy only on a mipmapped sampler with a linear minification
+     * filter, as asked (RECOMP_GFX_ANISO). */
+    aniso = (mip && mn) ? nv2a_host_aniso() : 1;
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9 | (uint64_t)mip << 10;
     if (mip)
         key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
+    key |= (uint64_t)aniso << 33;       /* the level is part of the sampler */
     for (i = 0; i < s_smp_n; i++)
         if (s_smp[i].key == key)
             return s_smp[i].s;
     sd = [[MTLSamplerDescriptor alloc] init];
+    sd.maxAnisotropy = (NSUInteger)aniso;
     sd.minFilter = mn ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
     sd.magFilter = mg ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
     sd.mipFilter = mip == 2 ? MTLSamplerMipFilterLinear

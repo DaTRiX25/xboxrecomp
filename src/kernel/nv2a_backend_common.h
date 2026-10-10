@@ -991,6 +991,14 @@ struct nv2a_host_opts {
     const char *shader_cache;
 };
 
+/* RECOMP_GFX_ANISO: the anisotropic filtering level the Metal and Vulkan
+ * samplers ask for, 1 (off), 2, 4, 8 or 16. Only a mipmapped sampler with a
+ * linear minification filter gets it, never a point-filtered one or a
+ * render-target read (the backends' sampler()), and the sampler caches key on
+ * the level, so a change while running reaches the next draw. */
+int  nv2a_host_aniso(void);
+void nv2a_host_set_aniso(int level);
+
 void nv2a_host_opts_set(const struct nv2a_host_opts *o);
 const struct nv2a_host_opts *nv2a_host_opts(void);
 /* render_scale as a factor: 1 when unset. */

@@ -93,6 +93,7 @@ static const char *const n_aspect[]    = { "4:3", "16:9", NULL };
 static const char *const n_filter[]    = { "Nearest", "Linear", "Integer", NULL };
 static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", NULL };
 static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the sides)", NULL };
+static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1 (coming soon)", NULL };
 static const char *const n_power[]     = { "Stock (busy-wait)", "Performance", "Battery saver", NULL };
 
@@ -103,6 +104,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_OVERSCAN */   { "Overscan", "Crop the border a TV would have hidden.", 1, FMT_PLAIN, n_overscan, 0 },
     /* XS_DISPLAY_FIT */        { "Present fit", "Fill the window's height on a 16:10 screen.", 1, FMT_PLAIN, n_fit, 0 },
     /* XS_GRAPHICS_RENDER_SCALE */ { "Render scale", "Internal resolution, a multiple of the Xbox's.", 1, FMT_TIMES, NULL, 0 },
+    /* XS_GRAPHICS_ANISO */    { "Anisotropic filtering", "Sharper textures at a slant, the road ahead. Costs GPU time.", 1, FMT_PLAIN, n_aniso, 0 },
     /* XS_AUDIO_VOLUME */       { "Master volume", "The game's sound level.", 0.05, FMT_PERCENT, NULL, 0 },
     /* XS_AUDIO_MUTE */         { "Mute", "No sound.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_MUTE_BG */      { "Mute in the background", "No sound while the window is not in front.", 1, FMT_PLAIN, NULL, 0 },
@@ -137,7 +139,7 @@ static int page_rows(int page, Row *r)
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_GRAPHICS:
-        SET(XS_GRAPHICS_RENDER_SCALE);
+        SET(XS_GRAPHICS_RENDER_SCALE); SET(XS_GRAPHICS_ANISO);
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_AUDIO:

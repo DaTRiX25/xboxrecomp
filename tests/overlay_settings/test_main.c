@@ -36,6 +36,8 @@ void nv2a_present_set_fit(int f) { st_fit = f; }
 void nv2a_host_opts_set(const struct nv2a_host_opts *o) { st_opts = *o; }
 const struct nv2a_host_opts *nv2a_host_opts(void) { return &st_opts; }
 void xa2_set_gain(float g) { st_gain = g; }
+static int st_aniso = -2;
+void nv2a_host_set_aniso(int n) { st_aniso = n; }
 
 static void set_env(const char *k, const char *v)
 {
@@ -152,6 +154,10 @@ int main(void)
     CHECK(st_gain == 0.0f);
     xbox_SettingsSetBackground(0);
     CHECK(st_gain == 0.25f);
+    /* Anisotropic filtering: the choice's level, the environment's spelling. */
+    xbox_SettingSet(XS_GRAPHICS_ANISO, 3);
+    CHECK(st_aniso == 8);
+    CHECK(recomp_env(RENV_GFX_ANISO) && !strcmp(recomp_env(RENV_GFX_ANISO), "8"));
     /* A restart-flagged setting. */
     xbox_SettingSet(XS_GRAPHICS_RENDER_SCALE, 2);
     CHECK(xbox_SettingsNeedRestart());
@@ -172,6 +178,7 @@ int main(void)
         CHECK(strstr(text, "fit = \"fill16x10\""));
         CHECK(strstr(text, "filter = \"linear\""));
         CHECK(strstr(text, "mute_background = true"));
+        CHECK(strstr(text, "aniso = \"8x\""));
         CHECK(strstr(text, "volume = 0.5"));                     /* locked: the file's own */
         CHECK(!strstr(text, "fullscreen"));                      /* never touched */
     }

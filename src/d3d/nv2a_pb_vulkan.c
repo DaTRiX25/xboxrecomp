@@ -1803,7 +1803,7 @@ static VkSampler sampler(const Stage *t)
     VkSamplerCreateInfo sc;
     VkSampler st;
     uint32_t u = t->addr_u & 0xF, v = t->addr_v & 0xF;
-    int mn, mg, mip, i;
+    int mn, mg, mip, i, aniso;
     uint64_t key;
 
     if (point < 0)
@@ -1811,14 +1811,25 @@ static VkSampler sampler(const Stage *t)
     mn = !point && nv2a_tex_filter_linear(t->filter, 0);
     mg = !point && nv2a_tex_filter_linear(t->filter, 1);
     mip = t->levels > 1 ? nv2a_tex_filter_mip(t->filter) : 0;
+    /* Anisotropy only on a mipmapped sampler with a linear minification
+     * filter, as asked (RECOMP_GFX_ANISO), within the device's limit. */
+    {
+        const struct nvk_core *core = nvk_core_get();
+        aniso = (mip && mn && core && core->max_aniso > 1.0f) ? nv2a_host_aniso() : 1;
+        if (aniso > 1 && (float)aniso > core->max_aniso)
+            aniso = (int)core->max_aniso;
+    }
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9 | (uint64_t)mip << 10;
     if (mip)
         key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
+    key |= (uint64_t)aniso << 33;       /* the level is part of the sampler */
     for (i = 0; i < s_smp_n; i++)
         if (s_smp[i].key == key)
             return s_smp[i].s;
     memset(&sc, 0, sizeof sc);
     sc.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sc.anisotropyEnable = aniso > 1 ? VK_TRUE : VK_FALSE;
+    sc.maxAnisotropy = aniso > 1 ? (float)aniso : 1.0f;
     sc.minFilter = mn ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     sc.magFilter = mg ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     sc.mipmapMode = mip == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;

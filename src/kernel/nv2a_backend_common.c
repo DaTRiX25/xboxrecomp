@@ -598,6 +598,27 @@ const struct nv2a_host_opts *nv2a_host_opts(void)
     return &s_host_opts;
 }
 
+static volatile int s_aniso = -1;     /* -1: not read yet */
+
+static int aniso_level(int n)
+{
+    return n >= 16 ? 16 : n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 1;
+}
+
+int nv2a_host_aniso(void)
+{
+    if (s_aniso < 0) {
+        const char *e = recomp_env(RENV_GFX_ANISO);
+        s_aniso = e && *e ? aniso_level(atoi(e)) : 1;   /* "off" reads 0 */
+    }
+    return s_aniso;
+}
+
+void nv2a_host_set_aniso(int level)
+{
+    s_aniso = aniso_level(level);
+}
+
 unsigned nv2a_host_render_scale(void)
 {
     return s_host_opts.render_scale > 1 ? s_host_opts.render_scale : 1;

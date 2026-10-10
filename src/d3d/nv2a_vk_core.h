@@ -43,6 +43,7 @@ struct nvk_core {
     int                              portability;    /* MoltenVK */
     int                              validation;     /* layers on */
     int                              present_wait;   /* VK_KHR_present_id + _wait on */
+    float                            max_aniso;      /* samplerAnisotropy on: the limit; else 0 */
     char                             name[256];
 };
 

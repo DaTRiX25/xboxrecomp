@@ -262,7 +262,11 @@ static int make_device(void)
     f2.pNext = &f12;
     /* Exact zpass counts, as Metal's counting visibility results. */
     f2.features.occlusionQueryPrecise = have2.features.occlusionQueryPrecise;
-    f2.features.samplerAnisotropy = VK_FALSE;
+    /* Anisotropic filtering (RECOMP_GFX_ANISO): on where the device has it,
+     * for the backend's samplers to ask for. */
+    f2.features.samplerAnisotropy = have2.features.samplerAnisotropy;
+    s_core.max_aniso = have2.features.samplerAnisotropy
+                     ? s_core.props.limits.maxSamplerAnisotropy : 0.0f;
     if (!have12.hostQueryReset)
         fprintf(stderr, "[vulkan] %s: no hostQueryReset; occlusion reports are"
                 " fixed (visible)\n", s_core.name);
