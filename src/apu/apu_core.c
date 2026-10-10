@@ -92,9 +92,35 @@ static inline uint32_t apu_mapped_ram(void)
     return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
 }
 
+extern uint32_t xbox_PhysicalToGuest(uint32_t pa);
+
+/* The guest address the title itself translated this physical page from
+ * (MmGetPhysicalAddress records each one; kernel_memory.c), or 0 when it never
+ * did or the answer is not memory the APU can reach. Asked first: it is
+ * exact where the rules below guess. DirectSound translates every page of a
+ * sound buffer when it builds the voice's SGE entries, and Burnout 3's
+ * frontend bank sits in heap pages whose physical numbers the contiguous
+ * allocator has also handed out: the page-map rule below sent those to the
+ * window, so the menu's sound effects played its bytes as noise and the menu
+ * music played its zeroes. */
+static uint32_t apu_translated(uint32_t a)
+{
+    uint32_t va = xbox_PhysicalToGuest(a);
+    if (!va)
+        return 0;
+    if (va >= 0x80000000u && va - 0x80000000u < (64u << 20))
+        return va;                                  /* the contiguous window */
+    if (va < 0x80000000u && va < apu_mapped_ram())
+        return va;                                  /* RAM */
+    return 0;
+}
+
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    uint32_t va = apu_translated(a);
+    if (va)
+        return g_apu_ram_ptr + va;
     /* RAM above the window's 64 MB. The target maps 128 MB (a devkit) and
      * its heap runs from 0x038C0000 to 0x08000000, so most of what the title
      * malloc()s -- BLiNX 2's sound buffers among them, handed to DirectSound
@@ -126,13 +152,17 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 }
 
 /* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
- * per-voice line: "win" (a page the contiguous allocator handed out), "img"
- * (inside the XBE image), "hiwin" (below the arena's high-water mark but not
+ * per-voice line: "xlat-win" or "xlat-ram" (the title translated this page
+ * from the window or from RAM), "win" (a page the contiguous allocator
+ * handed out), "img" (inside the XBE image), "hiwin" (below the arena's high-water mark but not
  * a live page), "ram" (plain RAM below 64 MB) or "wrap" (at or above 64 MB,
  * which the fallback folds into the low 64 MB). */
 const char *mcpx_apu_phys_class(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    uint32_t va = apu_translated(a);
+    if (va)
+        return va >= 0x80000000u ? "xlat-win" : "xlat-ram";
     if (a >= (64u << 20))
         return a < apu_mapped_ram() ? "ram" : "wrap";
     if (xbox_ContiguousPageMap()[a >> 12])
