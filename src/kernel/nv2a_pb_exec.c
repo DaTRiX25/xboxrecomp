@@ -5722,6 +5722,20 @@ static void flip_pacing_stall(void)
         return;
     s_swap_pending = 0;
     t0 = xbox_HostNowNs();
+    /* present.pacing=sleep: block on the vblank's condition variable (the
+     * timer thread signals it) instead of polling every 250 us. */
+    if (xbox_PacingMode() == XBOX_PACING_SLEEP) {
+        if (!xbox_VblankWaitUntil(s_swap_target, 100))
+            waited = 100000000ull;
+        else
+            timeouts = 0;
+        if (waited && ++timeouts >= 3) {
+            s_flip_pacing = 0;
+            fprintf(stderr, "  [GPU] flip pacing off: no vblank arrived"
+                    " in 100 ms three times (is RECOMP_VBLANK set?)\n");
+        }
+        goto done;
+    }
     while ((int32_t)(xbox_VblankCount() - s_swap_target) < 0) {
         if (waited >= 100000000ull) {        /* 100 ms: six vblanks */
             if (++timeouts >= 3) {
@@ -5736,6 +5750,7 @@ static void flip_pacing_stall(void)
     }
     if (waited < 100000000ull)
         timeouts = 0;
+done:
     {
         uint64_t d = xbox_HostNowNs() - t0;
         s_pace.stall_ns += d;
