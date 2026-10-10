@@ -330,7 +330,9 @@ int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
          * rasteriser's divide gives perspective-correct interpolation. */
         sb_append(&sb,
             "    float pw = (oPos.w == 0.0) ? 1.0 : oPos.w;\n"
-            "    float pz = oPos.z * vp.vp_scale.z * pw;\n"
+            /* vp_scale.w: polygon offset's constant part, normalised
+             * (nv2a_vp_consts_fill), as the MSL. */
+            "    float pz = (oPos.z * vp.vp_scale.z + vp.vp_scale.w) * pw;\n"
             /* z = zmax times 1/zmax can round an ulp past 1: the far plane
              * would clip Burnout 3's movie quad, which sits at zmax (BO-43).
              * Only that rounding is snapped back; farther geometry clips as

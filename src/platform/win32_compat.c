@@ -1619,6 +1619,73 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
 }
 #endif
 
+/* ---- the guest window (Linux) ---------------------------------------------
+ *
+ * The memory layout maps the guest's views at fixed addresses spread over
+ * 4 GB from its base: RAM and its mirrors, the contiguous window at +2 GB,
+ * the tiled aperture, the device apertures near the top. With only the RAM
+ * span reserved, anything mapped meanwhile can sit where a later view goes:
+ * a native Linux build with a window makes its Vulkan device (RADV) and SDL
+ * before the guest's memory, and their mappings landed at base + 2 GB, so the
+ * contiguous window failed and the first contiguous allocation faulted.
+ * xbox_compat_guest_window() records a whole-window PROT_NONE reservation;
+ * a fixed-address VirtualAlloc or MapViewOfFileEx whose pages are all still
+ * that placeholder replaces them (MAP_FIXED), and anything else keeps
+ * MAP_FIXED_NOREPLACE's refusal; VirtualFree in the window puts the
+ * placeholder back. One bit per 4 KB page. */
+#if defined(__linux__)
+static uintptr_t s_gw_lo;
+static size_t    s_gw_pages;
+static uint8_t  *s_gw_bits;      /* 1: page is our placeholder */
+
+void xbox_compat_guest_window(void *lo, size_t size)
+{
+    size_t n = size / 4096u;
+    uint8_t *b = (uint8_t *)malloc((n + 7) / 8);
+    if (!b)
+        return;
+    memset(b, 0xFF, (n + 7) / 8);
+    s_gw_bits = b;
+    s_gw_lo = (uintptr_t)lo;
+    s_gw_pages = n;
+}
+
+/* 1 if [a, a+n) lies in the window; *all set when every page is placeholder. */
+static int gw_range(const void *a, size_t n, size_t *p0, size_t *p1)
+{
+    uintptr_t x = (uintptr_t)a;
+    if (!s_gw_bits || x < s_gw_lo || n == 0)
+        return 0;
+    *p0 = (x - s_gw_lo) / 4096u;
+    *p1 = (x - s_gw_lo + n + 4095u) / 4096u;
+    return *p1 <= s_gw_pages;
+}
+
+static int gw_placeholder(const void *a, size_t n)
+{
+    size_t p0, p1, i;
+    if (!gw_range(a, n, &p0, &p1))
+        return 0;
+    for (i = p0; i < p1; i++)
+        if (!(s_gw_bits[i >> 3] & (1u << (i & 7))))
+            return 0;
+    return 1;
+}
+
+static void gw_mark(const void *a, size_t n, int placeholder)
+{
+    size_t p0, p1, i;
+    if (!gw_range(a, n, &p0, &p1))
+        return;
+    for (i = p0; i < p1; i++) {
+        if (placeholder) s_gw_bits[i >> 3] |= (uint8_t)(1u << (i & 7));
+        else             s_gw_bits[i >> 3] &= (uint8_t)~(1u << (i & 7));
+    }
+}
+#else
+void xbox_compat_guest_window(void *lo, size_t size) { (void)lo; (void)size; }
+#endif
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
@@ -1634,6 +1701,23 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 
 #if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
+#endif
+#if defined(__linux__)
+    if (address && gw_placeholder(address, size)) {
+        flags = (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED;
+        gw_mark(address, size, 0);
+    }
+    /* A pure no-access reservation holds address space, not memory: the
+     * 4 GB guest window must not count against overcommit. */
+    if (allocationType == MEM_RESERVE && protect == PAGE_NOACCESS && !address) {
+        void *r = mmap(NULL, size, PROT_NONE, flags | MAP_NORESERVE, -1, 0);
+        if (r == MAP_FAILED) {
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
+        view_register(r, size);
+        return r;
+    }
 #endif
 
     void *p;
@@ -1675,6 +1759,20 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
         size_t len = view_take(address);
         if (size == 0) size = len;
         if (size == 0) return FALSE;
+#if defined(__linux__)
+        {
+            size_t p0, p1;
+            if (gw_range(address, size, &p0, &p1)) {
+                /* Back to the guest window's placeholder, not a hole. */
+                void *r = mmap(address, size, PROT_NONE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+                if (r == MAP_FAILED)
+                    return FALSE;
+                gw_mark(address, size, 1);
+                return TRUE;
+            }
+        }
+#endif
         return munmap(address, size) == 0;
     }
     if (freeType & MEM_DECOMMIT)
@@ -2152,6 +2250,12 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
      * difference is the process quietly destroying its own libraries and heap
      * and dying somewhere unrelated a moment later. */
     if (baseAddr) {
+#if defined(__linux__)
+        if (gw_placeholder(baseAddr, len)) {
+            flags |= MAP_FIXED;          /* replaces our placeholder only */
+            gw_mark(baseAddr, len, 0);
+        } else
+#endif
 #if defined(MAP_FIXED_NOREPLACE)
         flags |= MAP_FIXED_NOREPLACE;
 #elif defined(__APPLE__)

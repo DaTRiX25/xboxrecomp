@@ -54,12 +54,15 @@ extern "C" {
 /** The fragment constants: struct nv2a_ps_consts (nv2a_backend_common.h) in
  * vec4/uvec4 only, then tex_bias (stage k's mip LOD bias, the bias argument
  * of texture()), as D3D8_MSL_PSCONSTS. atest is (alpha_ref as float bits,
- * alpha_func, alpha_test_enable, fog_enable). */
+ * alpha_func, alpha_test_enable, fog_enable); bump_mat[k] is stage k's
+ * SET_TEXTURE_SET_BUMP_ENV_MAT (00 01 10 11), bump_lum[k] its luminance
+ * scale and offset, as D3D8_MSL_PSCONSTS. */
 #define D3D8_GLSL_PSCONSTS \
     "layout(set = 0, binding = 2, std140) uniform PsConsts {\n" \
     "    vec4 c0[8]; vec4 c1[8]; vec4 fc0; vec4 fc1; vec4 fog_color;\n" \
     "    uvec4 atest; uvec4 alpha_only; vec4 tex_scale[4]; uvec4 tex_mode;\n" \
     "    vec4 tex_bias;\n" \
+    "    vec4 bump_mat[4]; vec4 bump_lum[4];\n" \
     "} pc;\n"
 
 /** The vertex constants of a screen-space program (nv2a_vp_consts): vp_scale,

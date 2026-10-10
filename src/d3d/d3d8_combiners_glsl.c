@@ -50,6 +50,11 @@ static const char s_rc_helpers[] =
     "    else if (op == 6) x *= 0.5;\n"
     "    return clamp(x, -1.0, 1.0);\n"
     "}\n"
+    /* A UNORM byte read as two's complement, / 127: xemu psh.c sign3. */
+    "float rc_sign8(float x) {\n"
+    "    x *= 255.0;\n"
+    "    return x >= 128.0 ? (x - 256.0) / 127.0 : x / 127.0;\n"
+    "}\n"
     "vec3 rc_op3(vec3 x, int op) {\n"
     "    return vec3(rc_op(x.r, op), rc_op(x.g, op), rc_op(x.b, op));\n"
     "}\n";
@@ -105,6 +110,33 @@ int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
         }
         if (m == NV2A_TEXMODE_3D || m == NV2A_TEXMODE_CUBEMAP) {
             EMIT("    x%d = texture(tex%d, i_t%d.xyz, pc.tex_bias[%d]);\n", 8 + i, i, i, i);
+        } else if ((m == NV2A_TEXMODE_BUMPENVMAP || m == NV2A_TEXMODE_BUMPENVMAP_LUM)
+                   && i > 0) {
+            /* As d3d8_combiners_msl.c (xemu psh.c PS_TEXTUREMODES_BUMPENVMAP):
+             * the previous stage's (b, g) as signed, turned by this stage's
+             * bump matrix and added to its coordinate; _LUM scales the texel
+             * by scale * l + offset. */
+            int p = i - 1, sg = state->tex_signed[p];
+            EMIT("    {\n");
+            if ((sg & 3u) == 3u)
+                EMIT("        vec2 dsdt = vec2(x%d.b, x%d.g);\n", 8 + p, 8 + p);
+            else
+                EMIT("        vec2 dsdt = vec2(rc_sign8(x%d.b), rc_sign8(x%d.g));\n",
+                     8 + p, 8 + p);
+            EMIT("        vec4 bm = pc.bump_mat[%d];\n", i);
+            EMIT("        dsdt = vec2(bm.x * dsdt.x + bm.z * dsdt.y,"
+                 " bm.y * dsdt.x + bm.w * dsdt.y);\n");
+            EMIT("        x%d = texture(tex%d, (i_t%d.xy + dsdt) * pc.tex_scale[%d].xy,"
+                 " pc.tex_bias[%d]);\n", 8 + i, i, i, i, i);
+            if (m == NV2A_TEXMODE_BUMPENVMAP_LUM) {
+                if (sg & 4u)
+                    EMIT("        float l = x%d.r >= 0.0 ? x%d.r * 0.5 : 1.0 + x%d.r * 0.5;\n",
+                         8 + p, 8 + p, 8 + p);
+                else
+                    EMIT("        float l = x%d.r;\n", 8 + p);
+                EMIT("        x%d *= pc.bump_lum[%d].x * l + pc.bump_lum[%d].y;\n", 8 + i, i, i);
+            }
+            EMIT("    }\n");
         } else {
             EMIT("    {\n");
             EMIT("        vec2 uv = i_t%d.xy;\n", i);
@@ -115,6 +147,15 @@ int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
             EMIT("        x%d = texture(tex%d, uv * pc.tex_scale[%d].xy, pc.tex_bias[%d]);\n",
                  8 + i, i, i, i);
             EMIT("    }\n");
+        }
+        if (state->tex_signed[i]) {
+            /* Signed channels (stored + 128, d3d8_combiners_parse.h): the
+             * filtered byte back to two's complement, / 127, as the MSL. */
+            static const char ch[4] = { 'b', 'g', 'r', 'a' };
+            for (k = 0; k < 4; k++)
+                if (state->tex_signed[i] & (1u << k))
+                    EMIT("    x%d.%c = max((x%d.%c * 255.0 - 128.0) / 127.0, -1.0);\n",
+                         8 + i, ch[k], 8 + i, ch[k]);
         }
         EMIT("    if (pc.alpha_only[%d] != 0u) x%d.rgb = vec3(1.0);\n", i, 8 + i);
     }

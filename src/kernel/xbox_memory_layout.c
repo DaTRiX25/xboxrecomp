@@ -2891,7 +2891,21 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * otherwise run to 0xE8000000 and hold 0x80000000 against it. */
         if (g_span_size > XBOX_CONTIG_BASE)
             g_span_size = XBOX_CONTIG_BASE;
+#if defined(__linux__)
+        {
+            /* The whole 4 GB guest window, held as a placeholder that the
+             * fixed views replace (win32_compat.c, xbox_compat_guest_window):
+             * a Vulkan device made before this (a windowed native build) had
+             * mapped at base + 2 GB, where the contiguous window goes. */
+            extern void xbox_compat_guest_window(void *lo, size_t size);
+            const size_t win = (size_t)1 << 32;
+            g_span_base = VirtualAlloc(NULL, win, MEM_RESERVE, PAGE_NOACCESS);
+            if (g_span_base)
+                xbox_compat_guest_window(g_span_base, win);
+        }
+#else
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+#endif
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,

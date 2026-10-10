@@ -99,9 +99,12 @@ _Static_assert(sizeof(struct nv2a_ps_consts) == 416, "nv2a_ps_consts size change
 typedef struct {
     struct nv2a_ps_consts b;
     float tex_bias[4];
+    float bump_mat[4][4];   /* per stage: SET_TEXTURE_SET_BUMP_ENV_MAT 00 01 10 11 */
+    float bump_lum[4][4];   /* per stage: x bump-env luminance scale, y offset */
 } VkPsConsts;
-_Static_assert(offsetof(VkPsConsts, tex_bias) == 416 && sizeof(VkPsConsts) == 432,
-               "VkPsConsts.tex_bias moved");
+_Static_assert(offsetof(VkPsConsts, tex_bias) == 416 && offsetof(VkPsConsts, bump_mat) == 432
+               && offsetof(VkPsConsts, bump_lum) == 496 && sizeof(VkPsConsts) == 560,
+               "VkPsConsts tail moved (D3D8_GLSL_PSCONSTS)");
 
 #define VS_C_BYTES  (NV2A_VS_MAX_CONSTANTS * 16)
 #define VP_C_BYTES  ((uint32_t)sizeof(struct nv2a_vp_consts))
@@ -127,7 +130,7 @@ static const char s_vs_pass_glsl[] =
      * (2/w, -2/h, 1/zmax, 0) and c[1] (-1, 1, 0, 0), as Metal's vs_pass. */
     "void main() {\n"
     "    gl_Position = vec4(a_pos.xy * vp.c[0].xy + vp.c[1].xy,\n"
-    "                       clamp(a_pos.z * vp.c[0].z, 0.0, 1.0), 1.0);\n"
+    "                       clamp(a_pos.z * vp.c[0].z + vp.c[0].w, 0.0, 1.0), 1.0);\n"
     "    o_d0 = a_d0; o_d1 = a_d1;\n"
     "    o_t0 = a_t0; o_t1 = a_t1; o_t2 = a_t2; o_t3 = a_t3;\n"
     "    o_fog = 1.0;\n"
@@ -517,11 +520,13 @@ struct RenderTarget {
     uint32_t         pitch;      /* the guest pitch it was made with */
     int              swz;        /* made as a swizzled surface (format type 2) */
     int              dirty;      /* drawn since its last write-back */
+    uint64_t         gen;        /* s_rt_seq at its last clear or draw */
     int              presented;  /* ever picked by present_target */
     struct nv2a_rt_own own;      /* is the guest memory under it still its own */
 };
 
 static RenderTarget  s_rt[RT_MAX];
+static uint64_t      s_rt_seq;   /* bumped by every pass begun and draw recorded */
 static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
@@ -650,6 +655,7 @@ static void begin_pass(RenderTarget *rt, int clear, const float c[4],
     end_encoder();
     ensure_cmd();
     rt->dirty = 1;
+    rt->gen = ++s_rt_seq;
     nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
     nvk_image_to(s_cmd, &rt->im, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     memset(&ca, 0, sizeof ca);
@@ -699,8 +705,8 @@ static void begin_encoder(RenderTarget *rt, int clear, const float c[4])
 /* Bytes into image `im` (level `level`, w x h, tightly packed BGRA8) through
  * the staging ring, on the upload command buffer: im must be new this
  * batch (nothing in s_cmd uses it yet). Leaves it in `final`. */
-static int upload_level(struct nvk_image *im, uint32_t level, uint32_t w, uint32_t h,
-                        const void *px, VkImageLayout final, int last)
+static int upload_layer(struct nvk_image *im, uint32_t layer, uint32_t level, uint32_t w,
+                        uint32_t h, const void *px, VkImageLayout final, int last)
 {
     VkDeviceSize off;
     VkBufferImageCopy bc;
@@ -710,12 +716,13 @@ static int upload_level(struct nvk_image *im, uint32_t level, uint32_t w, uint32
         return 0;
     memcpy(dst, px, (size_t)w * h * 4u);
     ensure_up();
-    if (level == 0)
+    if (im->layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
         nvk_image_to(s_up, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     memset(&bc, 0, sizeof bc);
     bc.bufferOffset = off;
     bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     bc.imageSubresource.mipLevel = level;
+    bc.imageSubresource.baseArrayLayer = layer;
     bc.imageSubresource.layerCount = 1;
     bc.imageExtent.width = w;
     bc.imageExtent.height = h;
@@ -725,6 +732,12 @@ static int upload_level(struct nvk_image *im, uint32_t level, uint32_t w, uint32
     if (last)
         nvk_image_to(s_up, im, final);
     return 1;
+}
+
+static int upload_level(struct nvk_image *im, uint32_t level, uint32_t w, uint32_t h,
+                        const void *px, VkImageLayout final, int last)
+{
+    return upload_layer(im, 0, level, w, h, px, final, last);
 }
 
 static int rt_image_new(struct nvk_image *im, uint32_t hw, uint32_t hh)
@@ -1185,9 +1198,9 @@ static Stage s_stage[4];
 static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
 {
     static char glsl[65536];
-    static struct { int valid; uint32_t r[36]; VkShaderModule m; } memo;
+    static struct { int valid; uint32_t r[37]; VkShaderModule m; } memo;
     NV2ACombinerState st;
-    uint32_t key[36], modes = 0, hash;
+    uint32_t key[37], modes = 0, signs = 0, hash;
     FsEntry *e = NULL;
     char what[32];
     int n;
@@ -1198,8 +1211,14 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
         uint32_t m = (uint32_t)s_stage[n].mode;
         if (s_stage[n].raw_mode == 5)
             m = 5;
+        else if (m == 3 && s_stage[n].cube)
+            m = 3;          /* CUBEMAP: a samplerCube (cube_bind) */
+        else if ((m == 6 || m == 7) && n > 0)
+            ;               /* BUMPENVMAP(_LUM): offset by the previous stage */
         else if (m && m != 4) m = 1;
         modes |= m << (5 * n);
+        if (m == 1 || m == 6 || m == 7)
+            signs |= (uint32_t)nv2a_tex_signed_mask(s_stage[n].filter) << (4 * n);
     }
     memcpy(key, v->rc_cicw, 32);
     memcpy(key + 8, v->rc_aicw, 32);
@@ -1209,6 +1228,7 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     key[33] = v->rc_fcw0;
     key[34] = v->rc_fcw1;
     key[35] = modes;
+    key[36] = signs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.m;
 
@@ -1216,6 +1236,8 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw,
                              v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
     st.fog_input = 1;
+    for (n = 0; n < 4; n++)
+        st.tex_signed[n] = (uint8_t)((signs >> (4 * n)) & 0xFu);
     hash = fnv(&st, sizeof st);
     if (!s_fs && !(s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs)))
         return s_fs_basic;
@@ -1321,7 +1343,8 @@ static VkPipeline pipeline_new(const PsoKey *k)
         VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
         VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
-        VK_DYNAMIC_STATE_STENCIL_OP,
+        VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_DEPTH_BIAS,
+        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
     };
     uint32_t i;
     VkResult r;
@@ -1509,6 +1532,7 @@ static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
 #define TEX_CACHE 256
 typedef struct {
     uint32_t         offset, color, width, height, pitch, palette, levels;
+    uint32_t         sign;          /* nv2a_tex_signed_mask the bytes carry */
     uint32_t         gen, used;
     uint64_t         hash;
     int              live;
@@ -1516,6 +1540,16 @@ typedef struct {
 } TexEntry;
 
 static TexEntry         s_tc[TEX_CACHE];
+
+/* BO-45, as Metal: the channels stage t's filter reads as signed, honoured
+ * for textures decoded from guest memory when the pixel stage is a combiner
+ * shader; uploaded offset by 128 (nv2a_tex_signed_xor) for the shader to
+ * take back (d3d8_combiners_glsl.c). xemu #587. */
+static int s_signed_on;
+static uint8_t stage_signed(const struct nv2a_stage *t)
+{
+    return s_signed_on ? nv2a_tex_signed_mask(t->filter) : 0;
+}
 static uint32_t         s_tc_clock;
 static uint32_t        *s_texels;
 static size_t           s_texels_cap;
@@ -1585,6 +1619,12 @@ static int tex_upload(const Stage *t, struct nvk_image *out)
         pal = (const uint32_t *)(mem + t->palette);
     nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
                     t->levels, pal, pal ? t->pal_len : 0, s_texels);
+    if (stage_signed(t)) {
+        uint32_t x = nv2a_tex_signed_xor(stage_signed(t));
+        size_t i;
+        for (i = 0; i < n; i++)
+            s_texels[i] ^= x;
+    }
     if (!nvk_image_new(out, RT_FORMAT, t->width, t->height, t->levels,
                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                        VK_IMAGE_ASPECT_COLOR_BIT))
@@ -1653,7 +1693,7 @@ static VkImageView tex_bind(const Stage *t)
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
                 && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels) {
+                && c->levels == t->levels && c->sign == stage_signed(t)) {
             e = c;
             break;
         }
@@ -1691,6 +1731,7 @@ static VkImageView tex_bind(const Stage *t)
         e->pitch = t->pitch;
         e->palette = t->palette;
         e->levels = t->levels;
+        e->sign = stage_signed(t);
         e->gen = g->flips;
         e->hash = tex_hash_pal(mem, t, bytes);
         e->im = ni;
@@ -1891,6 +1932,220 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur, VkImageView *
     return self;
 }
 
+/* ---- cube maps (BO-8): Metal's cube_bind ---------------------------------------
+ *
+ * A CUBEMAP stage samples a samplerCube (d3d8_combiners_glsl.c). The six
+ * faces sit face_stride apart (nv2a_tex_face_stride, xemu texture.c); a face
+ * this backend drew -- Burnout 3 renders its car reflections into six 128x128
+ * targets every frame -- is copied from that target on the GPU whenever it
+ * was drawn since the last copy (xemu renders a surface into the texture
+ * that reads it, pgraph/gl/surface.c pgraph_gl_render_surface_to_texture);
+ * the other faces decode from guest memory, re-checked once per flip; a
+ * change makes a new cube, so a frame in flight keeps the one it used. */
+#define CUBE_MAX 8
+typedef struct {
+    uint32_t         offset, color, width, levels, side;   /* side: host face size */
+    uint32_t         gen, used;
+    uint64_t         hash;
+    uint64_t         face_gen[6];
+    struct nvk_image im;
+} CubeEntry;
+static CubeEntry        s_cube[CUBE_MAX];
+static uint32_t         s_cube_clock;
+static struct nvk_image s_black_cube;
+static uint64_t         s_cube_copies, s_cube_uploads;
+
+static VkImageView black_cube(void)
+{
+    if (!s_black_cube.img) {
+        static const uint32_t px = 0xFF000000u;
+        int f;
+        if (!nvk_image_new_cube(&s_black_cube, RT_FORMAT, 1, 1,
+                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+            return s_black.view;   /* a 2D view: invalid there, but never NULL */
+        for (f = 0; f < 6; f++)
+            upload_layer(&s_black_cube, (uint32_t)f, 0, 1, 1, &px,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, f == 5);
+    }
+    return s_black_cube.view;
+}
+
+static RenderTarget *cube_face_rt(uint32_t addr, uint32_t w)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->im.img || ((rt->addr ^ addr) & 0x07FFFFFFu) || rt->w < w || rt->h < w)
+            continue;
+        if (rt_drop_if_stale(rt, "bind"))
+            continue;
+        return rt;
+    }
+    return NULL;
+}
+
+static VkImageView cube_bind(const Stage *t)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint32_t *pal = t->color == NV2A_TEX_P8 ? (const uint32_t *)(mem + t->palette) : NULL;
+    RenderTarget *frt[6];
+    uint32_t w = t->width, side = t->width, levels, stride, bytes, f, l;
+    CubeEntry *e = NULL, *victim = &s_cube[0];
+    int any = 0, all = 1, fresh = 0, ncopy = 0, i;
+
+    if (!t->cube || !w || t->width != t->height || (uint64_t)w * w * 6u > TEX_MAX_TEXELS)
+        return black_cube();
+    stride = nv2a_tex_face_stride(t->color, w, w, t->pitch, t->fmt_levels);
+    bytes = nv2a_tex_extent(t->color, w, w, t->pitch, t->levels);
+    if (!bytes)
+        return black_cube();
+    for (f = 0; f < 6; f++) {
+        frt[f] = cube_face_rt(t->offset + f * stride, w);
+        if (frt[f]) {
+            any = 1;
+            side = w * frt[f]->hw / frt[f]->w;
+        } else {
+            all = 0;
+        }
+    }
+    levels = any ? 1u : t->levels;
+    for (i = 0; i < CUBE_MAX; i++) {
+        CubeEntry *c = &s_cube[i];
+        if (c->im.img && c->offset == t->offset && c->color == t->color
+                && c->width == w && c->levels == levels) {
+            e = c;
+            break;
+        }
+        if (!c->im.img || (victim->im.img && c->used < victim->used))
+            victim = c;
+    }
+    if (!e) {
+        e = victim;
+        if (e->im.img)
+            garbage_push(&e->im, VK_NULL_HANDLE, NULL);
+        memset(e, 0, sizeof *e);
+        e->offset = t->offset;
+        e->color = t->color;
+        e->width = w;
+        e->levels = levels;
+        fresh = 1;
+    }
+    if (e->side != side)
+        fresh = 1;
+    if (!all && (fresh || e->gen != g->flips)) {
+        uint64_t h = NV2A_TEX_HASH_SEED;
+        for (f = 0; f < 6; f++)
+            if (!frt[f])
+                h = h * 31u + nv2a_tex_hash(mem + t->offset + f * stride, bytes,
+                                            NV2A_TEX_HASH_SEED);
+        if (pal)
+            h ^= nv2a_tex_hash(mem + t->palette, t->pal_len * 4u, NV2A_TEX_HASH_SEED) * 31u;
+        e->gen = g->flips;
+        if (h != e->hash)
+            fresh = 1;
+        e->hash = h;
+    }
+    if (fresh) {
+        size_t n = nv2a_tex_texels(w, w, levels);
+        int uploaded = 0;
+        if (e->im.img)
+            garbage_push(&e->im, VK_NULL_HANDLE, NULL);
+        memset(&e->im, 0, sizeof e->im);
+        e->side = side;
+        memset(e->face_gen, 0, sizeof e->face_gen);
+        if (!nvk_image_new_cube(&e->im, RT_FORMAT, side, levels,
+                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+            return black_cube();
+        if (n > s_texels_cap) {
+            uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
+            if (!p)
+                return black_cube();
+            s_texels = p;
+            s_texels_cap = n;
+        }
+        for (f = 0; f < 6; f++) {
+            const uint32_t *src = s_texels;
+            if (frt[f])
+                continue;
+            nv2a_tex_decode(mem + t->offset + f * stride, t->color, w, w, t->pitch,
+                            levels, pal, pal ? t->pal_len : 0, s_texels);
+            if (side != w) {    /* beside drawn faces at render.scale: upscaled */
+                uint8_t *up = (uint8_t *)malloc((size_t)side * side * 4u);
+                if (up) {
+                    nv2a_upscale_nearest32((const uint8_t *)s_texels, w * 4u, w, w,
+                                           side / w, up, side * 4u);
+                    upload_layer(&e->im, f, 0, side, side, up,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0);
+                    free(up);
+                    uploaded = 1;
+                }
+                continue;
+            }
+            for (l = 0; l < levels; l++) {
+                uint32_t lw = nv2a_tex_level_dim(w, l);
+                upload_layer(&e->im, f, l, lw, lw, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0);
+                src += (size_t)lw * lw;
+            }
+            uploaded = 1;
+        }
+        if (uploaded && !any)
+            nvk_image_to(s_up, &e->im, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        else if (!uploaded) {
+            /* All faces drawn: the copies below start from an undefined
+             * image; a face never copied reads black (cleared). */
+            VkClearColorValue z;
+            VkImageSubresourceRange r;
+            memset(&z, 0, sizeof z);
+            z.float32[3] = 1.0f;
+            memset(&r, 0, sizeof r);
+            r.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            r.levelCount = VK_REMAINING_MIP_LEVELS;
+            r.layerCount = VK_REMAINING_ARRAY_LAYERS;
+            ensure_up();
+            nvk_image_to(s_up, &e->im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            vkCmdClearColorImage(s_up, e->im.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &r);
+            if (!any)
+                nvk_image_to(s_up, &e->im, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+        s_cube_uploads++;
+    }
+    for (f = 0; f < 6; f++)
+        if (frt[f] && frt[f]->gen != e->face_gen[f])
+            ncopy++;
+    if (ncopy) {
+        end_encoder();
+        ensure_cmd();
+        nvk_image_to(s_cmd, &e->im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        for (f = 0; f < 6; f++) {
+            VkImageCopy ic;
+            if (!frt[f] || frt[f]->gen == e->face_gen[f])
+                continue;
+            nvk_image_to(s_cmd, &frt[f]->im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            memset(&ic, 0, sizeof ic);
+            ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            ic.srcSubresource.layerCount = 1;
+            ic.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            ic.dstSubresource.baseArrayLayer = f;
+            ic.dstSubresource.layerCount = 1;
+            ic.extent.width = side;
+            ic.extent.height = side;
+            ic.extent.depth = 1;
+            vkCmdCopyImage(s_cmd, frt[f]->im.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           e->im.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+            e->face_gen[f] = frt[f]->gen;
+            s_cube_copies++;
+        }
+    }
+    if (e->im.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        end_encoder();
+        ensure_cmd();
+        nvk_image_to(s_cmd, &e->im, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    e->used = ++s_cube_clock;
+    return e->im.view;
+}
+
 /* ---- descriptor sets --------------------------------------------------------- */
 
 static VkDescriptorSet texture_set(const VkImageView v[4], const VkSampler s[4])
@@ -2058,7 +2313,18 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                 ? nv2a_tex_lod_bias(t->filter) : 0.0f;
         pc.tex_bias[k] = b > 15.99f ? 15.99f : b < -16.0f ? -16.0f : b;
     }
+    {   /* Bump-env registers: methods 0x1B28..0x1B3C of each stage block. */
+        const uint32_t *tr = nv2a_pb_tex_regs();
+        for (k = 0; k < 4; k++) {
+            const uint32_t *r = &tr[(0x40u * k + 0x28u) / 4];
+            memcpy(pc.bump_mat[k], r, 16);
+            memcpy(&pc.bump_lum[k][0], &r[4], 4);
+            memcpy(&pc.bump_lum[k][1], &r[5], 4);
+            pc.bump_lum[k][2] = pc.bump_lum[k][3] = 0.0f;
+        }
+    }
     fmod = fs_select(v);
+    s_signed_on = fmod != s_fs_basic;   /* fs_basic has no signed channels */
     for (i = 0; i < d->idx_count; i++) {
         if (d->idx[i] < lo) lo = d->idx[i];
         if (d->idx[i] > hi) hi = d->idx[i];
@@ -2111,7 +2377,10 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
             if (!t->mode || t->mode == 4)
                 continue;
             textured = 1;
-            if (rt_texture(t, rt, &sview[k], &sw, &sh) != NULL) {
+            if (t->mode == 3 && t->cube && fmod != s_fs_basic) {   /* samplerCube */
+                sview[k] = cube_bind(t);
+            } else if ((t->mode == 3 || !stage_signed(t))
+                       && rt_texture(t, rt, &sview[k], &sw, &sh) != NULL) {
                 if (!nv2a_tex_size_from_format(t->color)) {
                     pc.b.tex_scale[k][0] = 1.0f / (float)sw;
                     pc.b.tex_scale[k][1] = 1.0f / (float)sh;
@@ -2199,6 +2468,15 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         vkCmdSetStencilWriteMask(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, v->stencil_wmask & 0xFFu);
         vkCmdSetStencilReference(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
                                  s ? (v->stencil_ref & 0xFFu) : 0u);
+        /* BO-10 polygon offset, as Metal: the constant part in the vertex
+         * stage (vp_scale.w); the slope part per host pixel, so times
+         * render.scale (xemu PR #2240). */
+        {
+            float slope = (s_enc_dt && use_z && v->poly_offset)
+                        ? v->poly_factor * (float)nv2a_host_render_scale() : 0.0f;
+            vkCmdSetDepthBiasEnable(s_cmd, slope != 0.0f ? VK_TRUE : VK_FALSE);
+            vkCmdSetDepthBias(s_cmd, 0.0f, 0.0f, slope);
+        }
         if (s_enc_dt && use_z)
             s_draws_z++;
     }
@@ -2234,6 +2512,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     vkCmdBindIndexBuffer(s_cmd, s_ring[RING_IB].buf, ib_off, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(s_cmd, nidx, 1, 0, 0, 0);
     s_draws++;
+    rt->gen = ++s_rt_seq;
 }
 
 /* ---- flip ---------------------------------------------------------------------- */

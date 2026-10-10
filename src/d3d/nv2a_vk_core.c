@@ -404,8 +404,9 @@ void nvk_buffer_free(struct nvk_buffer *b)
     memset(b, 0, sizeof *b);
 }
 
-int nvk_image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
-                  uint32_t levels, VkImageUsageFlags usage, VkImageAspectFlags aspect)
+static int image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
+                     uint32_t levels, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                     int cube)
 {
     VkImageCreateInfo ii;
     VkImageViewCreateInfo vi;
@@ -422,7 +423,8 @@ int nvk_image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
     ii.extent.height = h;
     ii.extent.depth = 1;
     ii.mipLevels = levels ? levels : 1;
-    ii.arrayLayers = 1;
+    ii.arrayLayers = cube ? 6 : 1;
+    ii.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = usage;
@@ -447,11 +449,11 @@ int nvk_image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
     memset(&vi, 0, sizeof vi);
     vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vi.image = im->img;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
     vi.format = fmt;
     vi.subresourceRange.aspectMask = aspect;
     vi.subresourceRange.levelCount = ii.mipLevels;
-    vi.subresourceRange.layerCount = 1;
+    vi.subresourceRange.layerCount = ii.arrayLayers;
     if (vkCreateImageView(s_core.dev, &vi, NULL, &im->view) != VK_SUCCESS) {
         nvk_image_free(im);
         return 0;
@@ -463,6 +465,18 @@ int nvk_image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
     im->levels = ii.mipLevels;
     im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     return 1;
+}
+
+int nvk_image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
+                  uint32_t levels, VkImageUsageFlags usage, VkImageAspectFlags aspect)
+{
+    return image_new(im, fmt, w, h, levels, usage, aspect, 0);
+}
+
+int nvk_image_new_cube(struct nvk_image *im, VkFormat fmt, uint32_t side, uint32_t levels,
+                       VkImageUsageFlags usage)
+{
+    return image_new(im, fmt, side, side, levels, usage, VK_IMAGE_ASPECT_COLOR_BIT, 1);
 }
 
 void nvk_image_free(struct nvk_image *im)
