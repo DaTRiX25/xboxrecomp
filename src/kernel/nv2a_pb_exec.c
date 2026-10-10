@@ -33,6 +33,7 @@
 #include <time.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "kernel_pacing.h"
+#include "host_time.h"            /* xbox_HostSleepNs, for flip pacing */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
@@ -194,6 +195,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_FLIP_READ               0x0120
 #define NV097_SET_FLIP_WRITE              0x0124
 #define NV097_SET_FLIP_MODULO             0x0128
+#define NV097_NO_OPERATION                0x0100
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
@@ -5560,6 +5562,90 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     }
     return 0;
 }
+/* RECOMP_FLIP_PACING=vblank: hold the flip until the vblank the swap asked
+ * for, as the hardware does.
+ *
+ * XDK D3D's swap does not wait on the CPU. It puts a software method in the
+ * pushbuffer, NO_OPERATION with a parameter of (address | interval) << 5 | 1,
+ * and then FLIP_STALL. On the console the NOP raises the GPU interrupt, whose
+ * handler schedules the flip for a vblank, and FLIP_STALL keeps the GPU
+ * from going on until the flip has happened. The title's CPU is held back
+ * only through the GPU: the fence and pushbuffer-space waits catch up with
+ * a stalled GPU. Here neither the interrupt nor the scanout exists, so the
+ * flip went through at once and a title that steps its simulation per frame
+ * ran as fast as the host could draw.
+ *
+ * The scheduling below is the interrupt handler's own, read from Burnout 3
+ * (XDK 5849 D3D8LTCG): sub_00357000 calls sub_00357250 for method 0x100,
+ * which takes the low five bits as the software method (1: swap) and, at
+ * 0x00357274-0x003572D2: target = last target + (param >> 5 & 7); when that
+ * vblank has already passed, now if bit 3 of (param >> 5) is set (the
+ * "immediate when late" interval flag), else the next vblank. The swap that
+ * writes it is sub_00350DB0 (0x00350E15-0x00350E5A).
+ *
+ * This runs on the executor's thread, the nv2a-ack thread, which stands in
+ * for the GPU, so waiting here is the GPU stalling. The vblank count comes
+ * from the kernel's vblank clock, so this needs RECOMP_VBLANK; without a
+ * vblank arriving the wait gives up and the pacing turns itself off. */
+static int      s_flip_pacing = -1;   /* -1 unread, 0 off, 1 on */
+static int      s_swap_pending;
+static uint32_t s_swap_target;        /* vblank the pending flip waits for */
+static uint32_t s_swap_last;          /* the handler's last target */
+
+static int flip_pacing_on(void)
+{
+    if (s_flip_pacing < 0) {
+        const char *e = recomp_env(RENV_FLIP_PACING);
+        s_flip_pacing = e && !strcmp(e, "vblank");
+        if (s_flip_pacing)
+            fprintf(stderr, "  [GPU] flip pacing: FLIP_STALL holds until the"
+                    " swap's vblank (RECOMP_FLIP_PACING=vblank)\n");
+    }
+    return s_flip_pacing;
+}
+
+/* NO_OPERATION: a swap's software method schedules its vblank. */
+static void flip_pacing_swap(uint32_t param)
+{
+    uint32_t now, target, arg;
+
+    if ((param & 0x1F) != 1 || !flip_pacing_on())
+        return;
+    arg = param >> 5;
+    now = xbox_VblankCount();
+    target = s_swap_last + (arg & 7);
+    if ((int32_t)(target - now) <= 0)
+        target = (arg & 8) ? now : now + 1;
+    s_swap_last = target;
+    s_swap_target = target;
+    s_swap_pending = 1;
+}
+
+/* FLIP_STALL: wait for the scheduled vblank. Bounded, so a runtime with no
+ * vblank arriving degrades to the old behaviour instead of hanging. */
+static void flip_pacing_stall(void)
+{
+    static int timeouts;
+    uint64_t waited = 0;
+
+    if (!s_swap_pending)
+        return;
+    s_swap_pending = 0;
+    while ((int32_t)(xbox_VblankCount() - s_swap_target) < 0) {
+        if (waited >= 100000000ull) {        /* 100 ms: six vblanks */
+            if (++timeouts >= 3) {
+                s_flip_pacing = 0;
+                fprintf(stderr, "  [GPU] flip pacing off: no vblank arrived"
+                        " in 100 ms three times (is RECOMP_VBLANK set?)\n");
+            }
+            return;
+        }
+        xbox_HostSleepNs(250000);
+        waited += 250000;
+    }
+    timeouts = 0;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -5899,9 +5985,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.flips++;
         return;
 
+    case NV097_NO_OPERATION:
+        flip_pacing_swap(param);
+        note_unhandled(method, param);   /* still listed in the survey */
+        return;
+
     case NV097_FLIP_STALL:
         /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is now. */
+         * There is no scanout here to wait for, so that is now -- or, with
+         * RECOMP_FLIP_PACING=vblank, the vblank the swap asked for. */
+        flip_pacing_stall();
         s_gpu.flip_read = s_gpu.flip_write;
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */

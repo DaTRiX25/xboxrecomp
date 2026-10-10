@@ -75,6 +75,7 @@ extern "C" {
     /* ── config ─────────────────────────────────────────────────────── */ \
     X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "pushbuffer executor (draws frames); default on, 0: off") \
     X(PB_BACKEND,        CONFIG, "RECOMP_PB_BACKEND",        NULL, "executor backend: cpu (default), metal, d3d11, null") \
+    X(FLIP_PACING,       CONFIG, "RECOMP_FLIP_PACING",       NULL, "vblank: FLIP_STALL holds until the vblank the title's swap asked for (needs RECOMP_VBLANK); default off") \
     X(HEADLESS,          CONFIG, "RECOMP_HEADLESS",          NULL, "1: no window (SDL host)") \
     X(WINDOW_SCALE,      CONFIG, "RECOMP_WINDOW_SCALE",      NULL, "window scale factor (SDL host, default 2)") \
     X(PRESENT_VSYNC,     CONFIG, "RECOMP_PRESENT_VSYNC",     NULL, "vsync: SDL host 0 = off (default on); D3D11 1 = on (default off)") \
