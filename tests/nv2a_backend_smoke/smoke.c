@@ -114,6 +114,7 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define TEX_GUEST 0x02800000u   /* 64x64 swizzled A8R8G8B8, then YUY2 64x32 */
 #define RTT0      0x01400000u   /* 64x64 render-to-texture targets, pitch 256 */
 #define RTT1      0x01500000u
+#define RTT2      0x01900000u   /* alias_cases' eviction: it and 40 more 64x64 */
 #define TEX_LOG2  6
 #define VB_GUEST  0x02000000u   /* bigidx and elem32 vertex arrays */
 
@@ -622,6 +623,20 @@ static int alias_cases(const struct nv2a_pb_backend *b)
                && px_at(RTT1 + 32u * 256u, 256, 2, 2) == 0xFF0000FFu
                && nv2a_pb_metal_writebacks() == n0 + 2,
                "overlapping target: the old one written back, then seeded");
+
+    /* Drawn red over green memory, then 40 other off-screen targets drawn
+     * (more than the backend keeps): the texture is still the red. Burnout
+     * 3 draws 14 targets a frame; with 8 slots its blur passes sampled
+     * evicted targets and got the bytes from before (BO-47). */
+    for (i = 0; i < 64 * 64; i++)
+        ((uint32_t *)guest(RTT2))[i] = 0xFF00FF00u;
+    surf(RTT2, 64, 64, 1, 0xFFFF0000u);
+    for (i = 0; i < 40; i++)
+        surf(RTT2 + 0x4000u * (i + 1), 64, 64, 1, 0xFF000080u + i);
+    c = sample_rtt(b, RTT2);
+    if (c != 0xFFFF0000u)
+        fprintf(stderr, "[backend-smoke] target past 40 others: got 0x%08X\n", c);
+    f += check(c == 0xFFFF0000u, "target past 40 others: its rendered image");
     nv2a_pb_set_backend(NULL);
     return f;
 }
