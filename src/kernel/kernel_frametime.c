@@ -42,6 +42,21 @@
  *                      guest threads' sampled time, summed over threads
  *   g_threads          guest threads sampled
  *   cpu_proc           process CPU time in the frame (all threads)
+ *   g_io               guest threads blocked in uninterruptible sleep (disk
+ *                      I/O: Linux D state, Mach TH_STATE_UNINTERRUPTIBLE);
+ *                      sampled like g_wait, and not counted in it
+ *   g_runq             time guest threads were runnable but not running
+ *                      (preempted, or queued behind another thread on the
+ *                      guest core), exact from /proc/<tid>/schedstat; Linux
+ *                      only, 0 elsewhere
+ *   m_game ... m_runq  the same buckets for the guest-main thread alone
+ *                      (the one the executor waits for)
+ *
+ * Linux has no thread_suspend/GetThreadContext, so the sampler reads each
+ * thread's run state from /proc/self/task/<tid>/stat (R, S, D) and sends a
+ * running one SIGPROF; the handler, on that thread, buckets its own
+ * interrupted PC. This is how perf-less profilers (gperftools' SIGPROF
+ * timer, Go's runtime/pprof) sample a thread's PC on Linux.
  *
  * Off, the executor's call is one load and a branch.
  */
@@ -59,12 +74,20 @@
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include <pthread.h>
+#elif defined(__linux__)
+#include <pthread.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/syscall.h>
 #endif
 
 typedef void (*ft_func_t)(void);
 extern ft_func_t recomp_lookup(uint32_t xbox_va);
 
-enum { B_GAME, B_D3D, B_XDK, B_SPIN, B_HOST, B_WAIT, B_COUNT };
+enum { B_GAME, B_D3D, B_XDK, B_SPIN, B_HOST, B_WAIT, B_IO, B_COUNT };
 
 #define FT_MAX_THREADS 32
 #define FT_MAX_SECTIONS 32
@@ -85,9 +108,23 @@ static uint32_t s_spin[FT_MAX_SPIN];
 static int s_nspin;
 static unsigned s_period_us = 500;
 
-/* Per-frame sample counts, by bucket: the sampler adds, the flip takes. */
+/* Per-frame sample counts, by bucket: the sampler adds, the flip takes.
+ * s_mcount: the guest-main thread's alone. s_runq_ns / s_mrunq_ns: time
+ * runnable but not running (Linux schedstat), summed / main only. */
 static volatile LONG s_count[B_COUNT];
+static volatile LONG s_mcount[B_COUNT];
 static volatile LONG s_nthreads;
+static volatile LONG s_main_slot = -1;
+#if defined(__linux__)
+static volatile int64_t s_runq_ns, s_mrunq_ns;
+#endif
+
+static void count_sample(LONG slot, int b)
+{
+    InterlockedIncrement(&s_count[b]);
+    if (slot >= 0 && slot == s_main_slot)
+        InterlockedIncrement(&s_mcount[b]);
+}
 
 #if defined(__APPLE__)
 static mach_port_t s_threads[FT_MAX_THREADS];
@@ -95,6 +132,12 @@ static mach_port_t s_threads[FT_MAX_THREADS];
 static HANDLE s_threads[FT_MAX_THREADS];
 static ULONG64 s_cycles[FT_MAX_THREADS];
 static uintptr_t s_lastpc[FT_MAX_THREADS];
+#elif defined(__linux__)
+static pthread_t s_threads[FT_MAX_THREADS];
+static int s_statfd[FT_MAX_THREADS], s_schedfd[FT_MAX_THREADS];
+static uint64_t s_runq_last[FT_MAX_THREADS];
+static volatile int s_ready[FT_MAX_THREADS];
+static __thread LONG t_slot = -1;   /* the sampled thread's own slot */
 #endif
 
 static int cmp_func(const void *a, const void *b)
@@ -218,7 +261,9 @@ static void sample_once(void)
         uintptr_t pc = 0;
         if (thread_info(t, THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) != KERN_SUCCESS)
             continue;
-        if (bi.run_state != TH_STATE_RUNNING) {
+        if (bi.run_state == TH_STATE_UNINTERRUPTIBLE) {
+            b = B_IO;
+        } else if (bi.run_state != TH_STATE_RUNNING) {
             b = B_WAIT;
         } else if (thread_suspend(t) == KERN_SUCCESS) {
 #if defined(__arm64__) || defined(__aarch64__)
@@ -257,15 +302,69 @@ static void sample_once(void)
             b = bucket_of_pc(pc);
         s_lastpc[i] = pc;
         s_cycles[i] = cyc;
+#elif defined(__linux__)
+        char buf[512];
+        ssize_t n;
+        const char *p;
+        if (!s_ready[i])
+            continue;
+        /* schedstat: "<ns on cpu> <ns runnable on a runqueue> <slices>" */
+        n = s_schedfd[i] >= 0 ? pread(s_schedfd[i], buf, sizeof buf - 1, 0) : -1;
+        if (n > 0) {
+            unsigned long long run = 0, rq = 0;
+            buf[n] = 0;
+            if (sscanf(buf, "%llu %llu", &run, &rq) == 2) {
+                if (s_runq_last[i] && rq > s_runq_last[i]) {
+                    int64_t d = (int64_t)(rq - s_runq_last[i]);
+                    __atomic_add_fetch(&s_runq_ns, d, __ATOMIC_RELAXED);
+                    if (i == s_main_slot)
+                        __atomic_add_fetch(&s_mrunq_ns, d, __ATOMIC_RELAXED);
+                }
+                s_runq_last[i] = rq;
+            }
+        }
+        /* stat: "<tid> (<comm>) <state> ...": comm may hold spaces. */
+        n = s_statfd[i] >= 0 ? pread(s_statfd[i], buf, sizeof buf - 1, 0) : -1;
+        if (n <= 0)
+            continue;
+        buf[n] = 0;
+        p = strrchr(buf, ')');
+        if (!p || !p[1] || !p[2])
+            continue;
+        if (p[2] == 'R') {
+            pthread_kill(s_threads[i], SIGPROF);   /* it buckets its own PC */
+            continue;
+        }
+        b = p[2] == 'D' ? B_IO : B_WAIT;
 #else
         (void)i;
         return;
 #endif
-        InterlockedIncrement(&s_count[b]);
+        count_sample(i, b);
     }
 }
 
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__linux__)
+static void prof_handler(int sig, siginfo_t *si, void *ucv)
+{
+    const ucontext_t *uc = (const ucontext_t *)ucv;
+    uintptr_t pc;
+    int e = errno;
+    (void)sig; (void)si;
+#if defined(__x86_64__)
+    pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#elif defined(__aarch64__)
+    pc = (uintptr_t)uc->uc_mcontext.pc;
+#else
+    pc = 0;
+#endif
+    if (t_slot >= 0)
+        count_sample(t_slot, bucket_of_pc(pc));
+    errno = e;
+}
+#endif
+
+#if defined(__APPLE__) || defined(_WIN32) || defined(__linux__)
 #if defined(_WIN32)
 static DWORD WINAPI sampler_main(LPVOID p)
 #else
@@ -310,7 +409,8 @@ static int frametime_on(void)
         if (us && atoi(us) >= 100)
             s_period_us = (unsigned)atoi(us);
         fprintf(s_out, "flip,t_ms,frame_ms,iv,late,ex_hold,ex_busy,ex_draw,ex_present,"
-                "ex_idle,g_game,g_d3d,g_xdk,g_spin,g_host,g_wait,g_threads,cpu_proc\n");
+                "ex_idle,g_game,g_d3d,g_xdk,g_spin,g_host,g_wait,g_threads,cpu_proc,"
+                "g_io,g_runq,m_game,m_d3d,m_xdk,m_spin,m_host,m_wait,m_io,m_runq\n");
         build_table();
 #if defined(__APPLE__)
         {
@@ -320,6 +420,18 @@ static int frametime_on(void)
         }
 #elif defined(_WIN32)
         CloseHandle(CreateThread(NULL, 0, sampler_main, NULL, 0, NULL));
+#elif defined(__linux__)
+        {
+            struct sigaction sa;
+            pthread_t th;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = prof_handler;
+            sa.sa_flags = SA_SIGINFO | SA_RESTART;
+            sigemptyset(&sa.sa_mask);
+            sigaction(SIGPROF, &sa, NULL);
+            pthread_create(&th, NULL, sampler_main, NULL);
+            pthread_detach(th);
+        }
 #else
         fprintf(stderr, "  [FRAMETIME] no thread sampler on this host: the guest"
                 " columns stay 0\n");
@@ -343,7 +455,21 @@ void xbox_FrametimeThread(const char *role)
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
                     &s_threads[i], THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT
                     | THREAD_QUERY_INFORMATION, FALSE, 0);
+#elif defined(__linux__)
+    {
+        char path[64];
+        long tid = (long)syscall(SYS_gettid);
+        s_threads[i] = pthread_self();
+        snprintf(path, sizeof path, "/proc/self/task/%ld/stat", tid);
+        s_statfd[i] = open(path, O_RDONLY | O_CLOEXEC);
+        snprintf(path, sizeof path, "/proc/self/task/%ld/schedstat", tid);
+        s_schedfd[i] = open(path, O_RDONLY | O_CLOEXEC);
+        t_slot = i;
+        __atomic_store_n(&s_ready[i], 1, __ATOMIC_RELEASE);
+    }
 #endif
+    if (role && !strcmp(role, "guest-main") && s_main_slot < 0)
+        s_main_slot = i;
     fprintf(stderr, "  [FRAMETIME] sampling guest thread %s\n", role ? role : "?");
 }
 
@@ -353,7 +479,8 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
 {
     static uint64_t t0, last, p_hold, p_scan, p_draw, p_pres, p_cpu;
     uint64_t now, cpu, frame, d_hold, d_scan;
-    LONG c[B_COUNT];
+    LONG c[B_COUNT], m[B_COUNT];
+    int64_t rq, mrq;
     double per;
     int b;
 
@@ -361,8 +488,16 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
         return;
     now = xbox_HostNowNs();
     cpu = xbox_ProcessCpuNs();
-    for (b = 0; b < B_COUNT; b++)
+    for (b = 0; b < B_COUNT; b++) {
         c[b] = InterlockedExchange(&s_count[b], 0);
+        m[b] = InterlockedExchange(&s_mcount[b], 0);
+    }
+#if defined(__linux__)
+    rq = __atomic_exchange_n(&s_runq_ns, 0, __ATOMIC_RELAXED);
+    mrq = __atomic_exchange_n(&s_mrunq_ns, 0, __ATOMIC_RELAXED);
+#else
+    rq = mrq = 0;
+#endif
     if (!last) {
         t0 = last = now;
         p_hold = hold; p_scan = scan; p_draw = draw; p_pres = present; p_cpu = cpu;
@@ -373,14 +508,18 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
     d_scan = scan - p_scan;
     per = s_period_us / 1000.0;
     fprintf(s_out, "%u,%.3f,%.3f,%u,%d,%.3f,%.3f,%.3f,%.3f,%.3f,"
-            "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%ld,%.3f\n",
+            "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%ld,%.3f,"
+            "%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
             flip, (now - t0) / 1e6, frame / 1e6, iv, late,
             d_hold / 1e6, (double)(int64_t)(d_scan - d_hold) / 1e6,
             (draw - p_draw) / 1e6, (present - p_pres) / 1e6,
             (double)(int64_t)(frame - d_scan) / 1e6,
             c[B_GAME] * per, c[B_D3D] * per, c[B_XDK] * per, c[B_SPIN] * per,
             c[B_HOST] * per, c[B_WAIT] * per, (long)s_nthreads,
-            (cpu - p_cpu) / 1e6);
+            (cpu - p_cpu) / 1e6,
+            c[B_IO] * per, rq / 1e6,
+            m[B_GAME] * per, m[B_D3D] * per, m[B_XDK] * per, m[B_SPIN] * per,
+            m[B_HOST] * per, m[B_WAIT] * per, m[B_IO] * per, mrq / 1e6);
     if ((flip & 63) == 0)
         fflush(s_out);
     last = now;
