@@ -27,19 +27,33 @@
  */
 #if defined(__APPLE__)
 
+#import <AppKit/AppKit.h>
+#import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <SDL.h>
 #include <SDL_metal.h>
+#include <SDL_syswm.h>
+#include <mach/mach_time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "kernel/nv2a_backend_common.h"
+#include "platform/host_time.h"
+#include "recomp_env.h"
 #include "fb_present_metal.h"
+#include "latency_trace.h"
+#include "host_time.h"
+#include <mach/mach_time.h>
+
+/* src/kernel/kernel_pacing.c */
+void xbox_PacingPresent(uint64_t when_ns);
+void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
+int  xbox_VblankDisplayLockOn(void);
 
 #if __has_feature(objc_arc)
 #error "fb_present_metal.m is manual retain/release: build it without -fobjc-arc"
@@ -60,6 +74,83 @@ static id<MTLTexture>              s_slot[3];
 static id<MTLCommandBuffer>        s_slot_cb[3];
 static uint32_t                   *s_conv;     /* R5G6B5 -> BGRA8 rows */
 static size_t                      s_conv_cap;
+
+/* ---- the display's clock ------------------------------------------------
+ *
+ * RECOMP_VBLANK_SYNC=display: a CVDisplayLink on the window's display
+ * reports every refresh to the vblank timer (kernel_pacing.c), which then
+ * keeps the emulated vblank in phase with the display. RECOMP_TRACE=
+ * pacing=all: each drawable's presentedTime, the time it reached the screen,
+ * is logged as a host present. Both are mach_absolute_time stamps, moved
+ * onto xbox_HostNowNs's clock by the offset between the two read now. */
+static CVDisplayLinkRef s_link;
+static int s_trace_presented;
+
+static uint64_t mach_to_host_ns(uint64_t mach_ns)
+{
+    static mach_timebase_info_data_t tb;
+    uint64_t host = xbox_HostNowNs(), mnow;
+    if (!tb.denom)
+        mach_timebase_info(&tb);
+    mnow = mach_absolute_time() * tb.numer / tb.denom;
+    return mnow >= mach_ns ? host - (mnow - mach_ns) : host + (mach_ns - mnow);
+}
+
+static uint64_t mach_ticks_ns(uint64_t ticks)
+{
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom)
+        mach_timebase_info(&tb);
+    return ticks * tb.numer / tb.denom;
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static CVReturn link_cb(CVDisplayLinkRef link, const CVTimeStamp *now,
+                        const CVTimeStamp *out, CVOptionFlags in_flags,
+                        CVOptionFlags *out_flags, void *ctx)
+{
+    uint64_t period = 0;
+    (void)link; (void)in_flags; (void)out_flags; (void)ctx;
+    /* The output stamp: the refresh the next frame will be shown at, on
+     * the display's grid (inNow is only when the callback ran). Its period
+     * from the stamp's video time scale. */
+    (void)now;
+    if ((out->flags & kCVTimeStampVideoRefreshPeriodValid) && out->videoTimeScale)
+        period = (uint64_t)out->videoRefreshPeriod * 1000000000ull
+                 / (uint64_t)out->videoTimeScale;
+    if (out->flags & kCVTimeStampHostTimeValid)
+        xbox_VblankDisplayRefresh(mach_to_host_ns(mach_ticks_ns(out->hostTime)), period);
+    return kCVReturnSuccess;
+}
+
+/* The display the window is on (its NSScreen's number), else the main one
+ * (win NULL: a headless run, for measuring the lock without a window). */
+void fbm_vblank_link(SDL_Window *win)
+{
+    CGDirectDisplayID id = CGMainDisplayID();
+    SDL_SysWMinfo wm;
+    if (s_link)
+        return;
+    SDL_VERSION(&wm.version);
+    if (win && SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_COCOA) {
+        NSScreen *scr = [wm.info.cocoa.window screen];
+        NSNumber *n = scr ? [[scr deviceDescription] objectForKey:@"NSScreenNumber"] : nil;
+        if (n)
+            id = (CGDirectDisplayID)[n unsignedIntValue];
+    }
+    if (CVDisplayLinkCreateWithCGDisplay(id, &s_link) != kCVReturnSuccess) {
+        s_link = NULL;
+        fprintf(stderr, "[PRESENT] vblank sync: no CVDisplayLink; the vblank keeps"
+                " its own 60 Hz timer\n");
+        return;
+    }
+    CVDisplayLinkSetOutputCallback(s_link, link_cb, NULL);
+    CVDisplayLinkStart(s_link);
+    fprintf(stderr, "[PRESENT] vblank sync: the emulated vblank follows display %u"
+            " (CVDisplayLink, RECOMP_VBLANK_SYNC=display)\n", (unsigned)id);
+}
+#pragma clang diagnostic pop
 
 static const char s_blit_msl[] =
     "#include <metal_stdlib>\n"
@@ -144,11 +235,25 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         }
         s_layer.framebufferOnly = shots ? NO : YES;
         s_layer.displaySyncEnabled = vsync ? YES : NO;
-        s_layer.maximumDrawableCount = 3;
+        /* RECOMP_PRESENT_DRAWABLES=2: one frame less queued ahead of the
+         * display (less latency, less slack); 3 is the default. */
+        {
+            const char *e = recomp_env(RENV_PRESENT_DRAWABLES);
+            s_layer.maximumDrawableCount = (e && atoi(e) == 2) ? 2 : 3;
+            if (e)
+                fprintf(stderr, "[PRESENT] CAMetalLayer: %d drawables, display sync %s\n",
+                        (int)s_layer.maximumDrawableCount, vsync ? "on" : "off");
+        }
         s_layer.allowsNextDrawableTimeout = YES;
         SDL_Metal_GetDrawableSize(win, &w, &h);
         if (w > 0 && h > 0)
             s_layer.drawableSize = CGSizeMake(w, h);
+        if (xbox_VblankDisplayLockOn())
+            fbm_vblank_link(win);
+        {
+            const char *t = recomp_env(RENV_PACING_TRACE);
+            s_trace_presented = t && !strcmp(t, "all");
+        }
     }
     return 1;
 }
@@ -156,6 +261,14 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
 void fbm_destroy(void)
 {
     int k;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (s_link) {
+        CVDisplayLinkStop(s_link);
+        CVDisplayLinkRelease(s_link);
+        s_link = NULL;
+    }
+#pragma clang diagnostic pop
     @autoreleasepool {
         for (k = 0; k < 3; k++) {
             if (s_slot_cb[k])
@@ -307,9 +420,15 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         SDL_Metal_GetDrawableSize(win, &dw, &dh);
         if (dw > 0 && dh > 0 && ((int)cur.width != dw || (int)cur.height != dh))
             s_layer.drawableSize = CGSizeMake(dw, dh);
+        uint64_t t_acq0 = xbox_LatOn() ? xbox_HostNowNs() : 0;
         d = [s_layer nextDrawable];
         if (!d)
             return 0;
+        if (t_acq0) {
+            char b[32];
+            snprintf(b, sizeof b, "%llu", (unsigned long long)xbox_HostNowNs());
+            xbox_LatRow('W', flip, t_acq0, b);
+        }
         dw = (int)[d.texture width];
         dh = (int)[d.texture height];
         cb = [s_queue commandBuffer];
@@ -347,8 +466,34 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 [b endEncoding];
             }
         }
+        if (s_trace_presented)
+            [d addPresentedHandler:^(id<MTLDrawable> dr) {
+                CFTimeInterval t = dr.presentedTime;   /* 0: never shown */
+                if (t > 0)
+                    xbox_PacingPresent(mach_to_host_ns((uint64_t)(t * 1e9)));
+            }];
         [cb presentDrawable:d];
+        if (t_acq0) {
+            /* presentedTime: host seconds (mach_absolute_time) when the
+             * drawable reached the glass, 0 when it never did. */
+            uint32_t fl = flip;
+            [d addPresentedHandler:^(id<MTLDrawable> dr) {
+                static mach_timebase_info_data_t tb;
+                double ps = dr.presentedTime;
+                uint64_t now = xbox_HostNowNs(), mach_ns, on = 0;
+                char b[32];
+                if (!tb.denom)
+                    mach_timebase_info(&tb);
+                mach_ns = mach_absolute_time() * tb.numer / tb.denom;
+                if (ps > 0)
+                    on = now - mach_ns + (uint64_t)(ps * 1e9);
+                snprintf(b, sizeof b, "%llu", (unsigned long long)on);
+                xbox_LatRow('D', fl, now, b);
+            }];
+        }
         [cb commit];
+        if (t_acq0)
+            xbox_LatRow('P', flip, 0, NULL);
         [s_slot_cb[k] release];
         s_slot_cb[k] = [cb retain];
         if (shot) {

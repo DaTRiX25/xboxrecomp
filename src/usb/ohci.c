@@ -8,6 +8,7 @@
  */
 #include "ohci.h"
 #include "recomp_env.h"
+#include "latency_trace.h"
 #include "../platform/mmio_decode.h"
 #include "../platform/mmio_decode_a64.h"
 #include "../kernel/xbox_memory_layout.h"
@@ -925,6 +926,7 @@ static int ohci_call_isr(OhciController *hc)
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
     claimed = ohci_isr_call(hc->index);
     xbox_worker_stack_free(slot);
+    xbox_LatGuestIsr();
     return claimed;
 }
 
@@ -936,6 +938,7 @@ static volatile int s_posting_hc;       /* the controller that posted, for logs 
 static void ohci_isr_on_holder(void)
 {
     ohci_isr_call(s_posting_hc);
+    xbox_LatGuestIsr();
 }
 
 /* Set the status bits and, if the driver has unmasked them, call the ISR.

@@ -34,6 +34,8 @@
 #include <d3d11.h>
 #include <d3d11_1.h>   /* ID3D11DeviceContext1::ClearView, for a partial clear */
 #include <dxgi.h>
+#include <dxgi1_3.h>   /* IDXGISwapChain2: the frame-latency waitable */
+#include "latency_trace.h"
 #include <d3dcompiler.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,6 +51,11 @@
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 #include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
 #include "video/window_title.h"
+
+void xbox_PacingPresent(uint64_t when_ns);   /* src/kernel/kernel_pacing.c */
+void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
+int  xbox_VblankDisplayLockOn(void);
+uint64_t xbox_HostNowNs(void);
 
 #define LOGP "[d3d11] "
 #define D3D11_WND_CLASS "RecompNv2aD3D11"   /* RegisterClassA, then CreateWindowW as L"" D3D11_WND_CLASS */
@@ -72,6 +79,17 @@ static struct xbox_title_clock s_title_clock;
  * is the SDL window's knob (default on there); here only a value that turns
  * it on changes anything, so an unset key keeps the stock behaviour. */
 static UINT                    s_sync_interval;
+/* RECOMP_PRESENT_VSYNC=fifo: three flip-model buffers, Present(1) and the
+ * frame-latency waitable (SetMaximumFrameLatency, RECOMP_PRESENT_LATENCY,
+ * 2 by default), waited on before each present: the swap chain queues at
+ * most that many frames ahead of the display and, when full, holds the
+ * executor -- the display's refresh back-pressures the title, the
+ * documented low-latency flip-model pacing (IDXGISwapChain2::
+ * SetMaximumFrameLatency) that DXVK honours. Xerenge's plume presents the
+ * same way (FIFO, three buffers). s_swap_flags is what ResizeBuffers must
+ * keep. */
+static UINT                    s_swap_flags;
+static HANDLE                  s_latency_wait;
 static ID3D11Device           *s_dev;
 static ID3D11DeviceContext    *s_ctx;
 static ID3D11DeviceContext1   *s_ctx1;   /* NULL below D3D 11.1: partial clears clear it all */
@@ -415,6 +433,44 @@ static const char s_vs_passthrough_src[] =
 
 static void create_black_texture(void);
 
+
+/* RECOMP_VBLANK_SYNC=display: a thread that waits for each vertical blank of
+ * the swap chain's output (IDXGIOutput::WaitForVBlank) and reports it to the
+ * vblank timer (kernel_pacing.c), which then keeps the emulated vblank in
+ * phase with the display. */
+static DWORD WINAPI vblank_link_thread(LPVOID param)
+{
+    IDXGIOutput *out = (IDXGIOutput *)param;
+    for (;;) {
+        if (FAILED(IDXGIOutput_WaitForVBlank(out))) {
+            Sleep(16);
+            continue;
+        }
+        xbox_VblankDisplayRefresh(xbox_HostNowNs(), 0);
+    }
+    return 0;
+}
+
+static void vblank_link_start(void)
+{
+    IDXGIOutput *out = NULL;
+    HANDLE t;
+    if (!xbox_VblankDisplayLockOn() || !s_swap)
+        return;
+    if (FAILED(IDXGISwapChain_GetContainingOutput(s_swap, &out)) || !out) {
+        fprintf(stderr, LOGP "vblank sync: no output to wait on; the vblank keeps"
+                " its own 60 Hz timer\n");
+        return;
+    }
+    t = CreateThread(NULL, 0, vblank_link_thread, out, 0, NULL);
+    if (t) {
+        SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL);
+        CloseHandle(t);
+        fprintf(stderr, LOGP "vblank sync: the emulated vblank follows the output's"
+                " vertical blank (RECOMP_VBLANK_SYNC=display)\n");
+    }
+}
+
 static int init(void)
 {
     static int tried;
@@ -477,6 +533,13 @@ static int init(void)
         return 0;
     }
     s_sync_interval = recomp_env_on(RENV_PRESENT_VSYNC) ? 1 : 0;
+    {
+        const char *v = recomp_env(RENV_PRESENT_VSYNC);
+        if (v && !strcmp(v, "fifo")) {
+            s_sync_interval = 1;
+            s_swap_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        }
+    }
     if (recomp_env(RENV_PRESENT_VSYNC))
         fprintf(stderr, LOGP "present vsync %s (RECOMP_PRESENT_VSYNC=%s)\n",
                 s_sync_interval ? "on" : "off", recomp_env(RENV_PRESENT_VSYNC));
@@ -487,10 +550,11 @@ static int init(void)
     sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = 2;
+    sd.BufferCount = s_swap_flags ? 3 : 2;
     sd.OutputWindow = s_hwnd;
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.Flags = s_swap_flags;
     hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
                                        NULL, 0, D3D11_SDK_VERSION, &sd,
                                        &s_swap, &s_dev, &fl, &s_ctx);
@@ -499,6 +563,22 @@ static int init(void)
                 (unsigned long)hr);
         return 0;
     }
+    if (s_swap_flags) {
+        IDXGISwapChain2 *sc2 = NULL;
+        const char *e = recomp_env(RENV_PRESENT_LATENCY);
+        UINT lat = e ? (UINT)atoi(e) : 2;
+        if (lat < 1 || lat > 3)
+            lat = 2;
+        if (SUCCEEDED(IDXGISwapChain_QueryInterface(s_swap, &IID_IDXGISwapChain2,
+                                                    (void **)&sc2))) {
+            IDXGISwapChain2_SetMaximumFrameLatency(sc2, lat);
+            s_latency_wait = IDXGISwapChain2_GetFrameLatencyWaitableObject(sc2);
+            IDXGISwapChain2_Release(sc2);
+        }
+        fprintf(stderr, LOGP "present: FIFO, 3 buffers, max frame latency %u%s\n",
+                lat, s_latency_wait ? "" : " (no waitable: Present blocks instead)");
+    }
+    vblank_link_start();
     IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&s_back);
     if (FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1,
                                                   (void **)&s_ctx1)))
@@ -3255,7 +3335,7 @@ static void present_resize(void)
         ID3D11Texture2D_Release(s_back);
         s_back = NULL;
     }
-    hr = IDXGISwapChain_ResizeBuffers(s_swap, 0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+    hr = IDXGISwapChain_ResizeBuffers(s_swap, 0, cw, ch, DXGI_FORMAT_UNKNOWN, s_swap_flags);
     if (FAILED(hr))
         fprintf(stderr, LOGP "ResizeBuffers %ux%u hr=0x%08lX\n", cw, ch, (unsigned long)hr);
     IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&s_back);
@@ -3350,6 +3430,14 @@ static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
 static int s_probe_x = -1, s_probe_y;
 static uint32_t s_probe_px = 0xDEADBEEFu;
 
+/* FLIP_STALL reached: hand the frame's work to the GPU now, so it is drawn
+ * during the vblank hold, not after it (BO-74). */
+static void d3d11_on_flip_ready(void)
+{
+    if (s_ctx)
+        ID3D11DeviceContext_Flush(s_ctx);
+}
+
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     HRESULT hr;
@@ -3428,7 +3516,12 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                    : 0xDEADBEEFu;
     s_presents++;
     dump_frame();
+    if (s_latency_wait)   /* a queue slot free: the display's back-pressure */
+        WaitForSingleObjectEx(s_latency_wait, 100, TRUE);
     hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
+    xbox_PacingPresent(0);   /* RECOMP_TRACE=pacing=all: host present times */
+    if (xbox_LatOn())
+        xbox_LatRow('P', nv2a_pb_gpu_state()->flips, 0, NULL);
     if (FAILED(hr) && s_presents < 4)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own
@@ -3613,6 +3706,9 @@ static const struct nv2a_pb_backend s_d3d11_backend = {
     d3d11_on_zpass_clear,
     d3d11_on_report,
     d3d11_on_poll,
+    0,                  /* writes_back */
+    NULL,               /* sync_guest */
+    d3d11_on_flip_ready,
 };
 
 /* For tests/d3d11_backend_smoke: the size of the target at a colour offset
