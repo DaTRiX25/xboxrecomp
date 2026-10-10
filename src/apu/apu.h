@@ -49,6 +49,20 @@ uint32_t mcpx_apu_xc_audio(void);
  * before mcpx_apu_init_standalone. */
 void mcpx_apu_set_speaker_map(const int8_t map[32]);
 
+/* The settings overlay's speaker test: about a second of noise on one
+ * speaker, 0..5 = FL FR FC LFE SL SR (a 60 Hz tone on the LFE), through the
+ * device and layout the title plays on. via_map: put into the mixbins the
+ * speaker map sends to that speaker (stereo: DirectSound's bin for it) and
+ * mixed as the title's sounds are; else straight into that output channel.
+ * Meant for while the title is paused; a new call replaces a test playing,
+ * a speaker of -1 stops it.
+ * _playing: the speaker playing now, -1 when none. */
+void mcpx_apu_speaker_test(int speaker, int via_map);
+int mcpx_apu_speaker_test_playing(int *via_map);
+
+/* The speaker map in use (mcpx_apu_set_speaker_map, or the default). */
+void mcpx_apu_speaker_map_get(int8_t map[32]);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);

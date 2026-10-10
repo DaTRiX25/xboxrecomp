@@ -202,6 +202,15 @@ void mcpx_apu_set_speaker_map(const int8_t map[32])
     s_spk_map_set = 1;
 }
 
+void mcpx_apu_speaker_map_get(int8_t map[32])
+{
+    if (!s_spk_map_set) {
+        apu_spk_default_map(s_spk_map);
+        s_spk_map_set = 1;
+    }
+    memcpy(map, s_spk_map, sizeof(s_spk_map));
+}
+
 /* RECOMP_TRACE=audio_channels: what reaches each mixbin and each output
  * channel, once a second (1500 frames of 32 samples):
  *

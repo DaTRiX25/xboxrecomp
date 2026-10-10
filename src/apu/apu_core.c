@@ -502,6 +502,127 @@ static struct {
     int16_t amplitude;
 } g_test_tone = { false, 0.0, 0.0, 0 };
 
+/* The settings overlay's speaker test (mcpx_apu_speaker_test): about a
+ * second of white noise on one speaker (a 60 Hz tone on the LFE), put in at
+ * one of two places:
+ *
+ *   via the map  into the mixbins, every bin the speaker map sends to that
+ *                speaker (in stereo: DirectSound's bin for it, 0..5), then
+ *                the DSP stage's own mix (apu_spk_mix51 or the stereo
+ *                fold), the monitor, the device -- the path the title's
+ *                sounds take
+ *   direct       into that output channel after the mix (in stereo, folded
+ *                to L/R with the ITU coefficients)
+ *
+ * so a disagreement between the two says whether the map or the output
+ * order is wrong. The title is paused (the overlay is open): the frame
+ * thread runs for the test alone, and the VP and the title's interrupts
+ * stay still. */
+#define SPK_TEST_FRAMES 1504            /* 188 EP periods, ~1 s */
+#define SPK_TEST_FADE   480             /* 10 ms in and out */
+static struct {
+    volatile int active;
+    volatile int speaker, via_map;
+    int frame;                          /* 32-sample frames done */
+    uint32_t rng;
+    double phase;
+} g_spk = { 0, -1, 0, 0, 1u, 0.0 };
+
+/* One 32-sample frame of the test, in place of se_frame. */
+static void spk_test_frame(MCPXAPUState *d)
+{
+    float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    float x[NUM_SAMPLES_PER_FRAME];
+    const int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+    const int sp = g_spk.speaker;
+    const int six = d->monitor.channels == APU_SPK_CHANNELS;
+
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        int n = g_spk.frame * NUM_SAMPLES_PER_FRAME + i;
+        const int len = SPK_TEST_FRAMES * NUM_SAMPLES_PER_FRAME;
+        float env = n < SPK_TEST_FADE ? (float)n / SPK_TEST_FADE
+                  : n > len - SPK_TEST_FADE ? (float)(len - n) / SPK_TEST_FADE : 1.0f;
+        if (sp == APU_SPK_LFE) {
+            x[i] = 0.3f * (float)sin(g_spk.phase);
+            g_spk.phase += 2.0 * M_PI * 60.0 / 48000.0;
+        } else {
+            g_spk.rng = g_spk.rng * 1664525u + 1013904223u;
+            x[i] = 0.2f * (float)(int32_t)g_spk.rng / 2147483648.0f;
+        }
+        x[i] *= env;
+    }
+
+    memset(mixbins, 0, sizeof(mixbins));
+    if (g_spk.via_map) {
+        int bins[NUM_MIXBINS], nb = 0;
+        if (six) {
+            int8_t map[NUM_MIXBINS];
+            mcpx_apu_speaker_map_get(map);
+            for (int b = 0; b < NUM_MIXBINS; b++)
+                if (map[b] == sp)
+                    bins[nb++] = b;
+        } else {
+            bins[nb++] = sp;
+        }
+        for (int k = 0; k < nb; k++)
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                mixbins[bins[k]][i] = x[i] / (float)nb;
+    }
+    mcpx_apu_dsp_frame(d, mixbins);
+    if (!g_spk.via_map) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            if (six) {
+                d->monitor.frame_buf6[off + i][sp] = (int16_t)(x[i] * 32767.0f);
+            } else {
+                /* The ITU fold of one channel (apu_speakers.h). */
+                float l = sp == APU_SPK_FL || sp == APU_SPK_FC || sp == APU_SPK_SL;
+                float r = sp == APU_SPK_FR || sp == APU_SPK_FC || sp == APU_SPK_SR;
+                float g = sp == APU_SPK_FL || sp == APU_SPK_FR ? 1.0f : 0.70711f;
+                d->monitor.frame_buf[off + i][0] = (int16_t)(x[i] * l * g * 32767.0f);
+                d->monitor.frame_buf[off + i][1] = (int16_t)(x[i] * r * g * 32767.0f);
+            }
+        }
+    }
+    mcpx_apu_monitor_frame(d);
+    d->ep_frame_div++;
+    if (++g_spk.frame >= SPK_TEST_FRAMES) {
+        g_spk.active = 0;
+        g_spk.speaker = -1;
+    }
+}
+
+void mcpx_apu_speaker_test(int speaker, int via_map)
+{
+    MCPXAPUState *d = g_state;
+
+    if (!d || speaker >= APU_SPK_CHANNELS)
+        return;
+    qemu_mutex_lock(&d->lock);
+    if (speaker < 0) {                  /* stop */
+        g_spk.active = 0;
+        g_spk.speaker = -1;
+        qemu_mutex_unlock(&d->lock);
+        return;
+    }
+    g_spk.speaker = speaker;
+    g_spk.via_map = via_map != 0;
+    g_spk.frame = 0;
+    g_spk.phase = 0.0;
+    g_spk.active = 1;
+    fprintf(stderr, "[APU] speaker test: speaker %d %s\n", speaker,
+            via_map ? "via the mixbins and the speaker map" : "direct to the output");
+    qemu_cond_broadcast(&d->cond);
+    qemu_mutex_unlock(&d->lock);
+}
+
+int mcpx_apu_speaker_test_playing(int *via_map)
+{
+    int sp = g_spk.active ? g_spk.speaker : -1;
+    if (via_map)
+        *via_map = g_spk.via_map;
+    return sp;
+}
+
 /* ============================================================
  * Monitor - Audio output (XAudio2 primary, waveOut fallback)
  * ============================================================ */
@@ -858,16 +979,44 @@ static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
  * to frame_buf6, the tone and software mixer (stereo) added to the front
  * pair, then to the device as they are, or folded to stereo (ITU) when the
  * device has two channels. */
+/* One 5.1 period to the device: as it is, or folded to stereo (ITU) when
+ * the device has two channels. */
+static void submit_51(MCPXAPUState *d, int16_t period[][APU_SPK_CHANNELS])
+{
+    int16_t folded[MIXER_FRAME_SAMPLES][2];
+
+    if (xa2_is_active()) {
+        int ch = xa2_channels();
+        hs_submit(MIXER_FRAME_SAMPLES);
+        if (ch == APU_SPK_CHANNELS) {
+            xa2_submit_samples(&period[0][0], MIXER_FRAME_SAMPLES);
+            return;
+        }
+        apu_spk_downmix((const int16_t (*)[APU_SPK_CHANNELS])period, folded,
+                        MIXER_FRAME_SAMPLES);
+        xa2_submit_samples(&folded[0][0], MIXER_FRAME_SAMPLES);
+        return;
+    }
+    if (g_waveout.initialized) {
+        apu_spk_downmix((const int16_t (*)[APU_SPK_CHANNELS])period, folded,
+                        MIXER_FRAME_SAMPLES);
+        waveout_submit(d, (const int16_t (*)[2])folded);
+    }
+}
+
 static void monitor_frame_51(MCPXAPUState *d)
 {
     int16_t period[MIXER_FRAME_SAMPLES][APU_SPK_CHANNELS];
     int16_t extra[MIXER_FRAME_SAMPLES][2];
-    int16_t folded[MIXER_FRAME_SAMPLES][2];
 
+    memcpy(period, d->monitor.frame_buf6, sizeof(period));
+    /* The DSP stage writes every slice of a period it runs for; a period
+     * it does not run for (the lightweight branch) must be silence, not
+     * this one again. */
+    memset(d->monitor.frame_buf6, 0, sizeof(d->monitor.frame_buf6));
     if (g_audio_muted) {
         memset(period, 0, sizeof(period));
     } else {
-        memcpy(period, d->monitor.frame_buf6, sizeof(period));
         memset(extra, 0, sizeof(extra));
         if (g_test_tone.active) {
             for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
@@ -889,24 +1038,7 @@ static void monitor_frame_51(MCPXAPUState *d)
     }
 
     apu_wav_write(&period[0][0], MIXER_FRAME_SAMPLES);
-
-    if (xa2_is_active()) {
-        int ch = xa2_channels();
-        hs_submit(MIXER_FRAME_SAMPLES);
-        if (ch == APU_SPK_CHANNELS) {
-            xa2_submit_samples(&period[0][0], MIXER_FRAME_SAMPLES);
-            return;
-        }
-        apu_spk_downmix((const int16_t (*)[APU_SPK_CHANNELS])period, folded,
-                        MIXER_FRAME_SAMPLES);
-        xa2_submit_samples(&folded[0][0], MIXER_FRAME_SAMPLES);
-        return;
-    }
-    if (g_waveout.initialized) {
-        apu_spk_downmix((const int16_t (*)[APU_SPK_CHANNELS])period, folded,
-                        MIXER_FRAME_SAMPLES);
-        waveout_submit(d, (const int16_t (*)[2])folded);
-    }
+    submit_51(d, period);
 }
 
 /* Called once per 32-sample frame; acts on the last frame of each EP period
@@ -1036,7 +1168,7 @@ static void throttle(MCPXAPUState *d)
 {
     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
-    while (!d->pause_requested && !d->host_paused) {
+    while ((!d->pause_requested && !d->host_paused) || g_spk.active) {
         int64_t wait_us = mcpx_apu_pace_step(
             d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
         if (wait_us <= 0)
@@ -1058,7 +1190,7 @@ static void throttle(MCPXAPUState *d)
             if (GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                          NV_PAPU_SECTL_XCNTMODE) != NV_PAPU_SECTL_XCNTMODE_OFF
                 && !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED)
-                && !g_test_tone.active)
+                && !g_test_tone.active && !g_spk.active)
                 mcpx_apu_vp_idle_scan(d);
         }
         if (d->set_irq) {
@@ -1120,8 +1252,8 @@ static void *mcpx_apu_frame_thread(void *arg)
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
-        if (d->host_paused
-            || (d->pause_requested && !g_test_tone.active && !g_mixer_active_count)) {
+        if (!g_spk.active && (d->host_paused
+            || (d->pause_requested && !g_test_tone.active && !g_mixer_active_count))) {
             d->is_idle = true;
             if (xa2_is_active())
                 xa2_expect_drain();     /* a pause, not an underrun */
@@ -1153,11 +1285,13 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         bool fe_trapped = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                           (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !g_test_tone.active;
+                          !g_test_tone.active && !g_spk.active;
 
         hs_trap(fe_trapped);
 
-        if (apu_active && !g_test_tone.active) {
+        if (g_spk.active) {
+            spk_test_frame(d);
+        } else if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             if (xbox_ProfOn()) {
                 long long t0 = xbox_ProfNowUs();
