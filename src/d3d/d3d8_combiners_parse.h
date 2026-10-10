@@ -115,6 +115,9 @@ typedef enum NV2ATextureMode {
     NV2A_TEXMODE_PASSTHRU = 4,  /* The coordinate itself, clamped */
     NV2A_TEXMODE_CLIPPLANE = 5, /* No texture, reads zero; the coordinate is
                                  * clip distances (the CPU path kills there) */
+    NV2A_TEXMODE_BUMPENVMAP = 6,     /* 2D at the coordinate + the bump matrix
+                                      * times the previous stage's (b, g) */
+    NV2A_TEXMODE_BUMPENVMAP_LUM = 7, /* the same, times scale * r + offset */
 } NV2ATextureMode;
 
 /* ================================================================
@@ -236,6 +239,14 @@ typedef struct NV2ACombinerState {
      * alpha is that factor (xemu psh.c: vec4(fogColor.rgb, clamp(vtxFog))).
      * 0: FOG is the constant fog colour, as before. */
     int fog_input;
+
+    /* Per stage, the channels the texture filter reads as signed
+     * (SET_TEXTURE_FILTER bits 28-31: A, R, G, B; nv2a_tex_signed_mask):
+     * bit 3 A, 2 R, 1 G, 0 B. The texture's bytes are uploaded with those
+     * channels offset by 128 (nv2a_tex_signed_xor), so the filter runs on
+     * unsigned values in the signed order, and the shader maps each such
+     * channel back to [-1, 1] after sampling. 0: none (the default). */
+    uint8_t tex_signed[NV2A_MAX_TEXTURES];
 } NV2ACombinerState;
 
 /**

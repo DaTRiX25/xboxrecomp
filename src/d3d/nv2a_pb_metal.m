@@ -158,9 +158,12 @@ _Static_assert(sizeof(struct nv2a_ps_consts) == 416, "nv2a_ps_consts size change
 typedef struct {
     struct nv2a_ps_consts b;
     float tex_bias[4];
+    float bump_mat[4][4];   /* per stage: SET_TEXTURE_SET_BUMP_ENV_MAT 00 01 10 11 */
+    float bump_lum[4][4];   /* per stage: x bump-env luminance scale, y offset */
 } MsPsConsts;
-_Static_assert(offsetof(MsPsConsts, tex_bias) == 416 && sizeof(MsPsConsts) == 432,
-               "MsPsConsts.tex_bias moved");
+_Static_assert(offsetof(MsPsConsts, tex_bias) == 416 && offsetof(MsPsConsts, bump_mat) == 432
+               && offsetof(MsPsConsts, bump_lum) == 496 && sizeof(MsPsConsts) == 560,
+               "MsPsConsts tail moved (D3D8_MSL_PSCONSTS)");
 _Static_assert(sizeof(float) == 4 && sizeof(uint32_t) == 4, "alpha_ref is read as uint bits");
 
 /* One expanded vertex of a pass-through batch: attributes 0, 3, 4, 9..12 as
@@ -185,7 +188,7 @@ static const char s_msl[] =
     "    const device float4 *v = vb + vid * 7u;\n"
     "    VOut o;\n"
     "    o.pos = float4(v[0].xy * vp.c[0].xy + vp.c[1].xy,\n"
-    "                   saturate(v[0].z * vp.c[0].z), 1.0);\n"
+    "                   saturate(v[0].z * vp.c[0].z + vp.c[0].w), 1.0);\n"
     "    o.d0 = v[1]; o.d1 = v[2];\n"
     "    o.t0 = v[3]; o.t1 = v[4]; o.t2 = v[5]; o.t3 = v[6];\n"
     "    o.fog = 1.0; o.psize = 1.0;\n"
@@ -313,11 +316,13 @@ typedef struct {
     uint32_t       pitch;      /* the guest pitch it was made with */
     int            swz;        /* made as a swizzled surface (format type 2) */
     int            dirty;      /* drawn since its last write-back */
+    uint64_t       gen;        /* s_rt_seq at its last clear or draw */
     int            presented;  /* ever picked by present_target */
     struct nv2a_rt_own own;    /* is the guest memory under it still its own */
 } RenderTarget;
 
 static RenderTarget  s_rt[RT_MAX];
+static uint64_t      s_rt_seq;   /* bumped by every pass begun and draw encoded */
 static RenderTarget *s_enc_rt;   /* the target s_enc draws into */
 static DepthTarget  *s_enc_dt;   /* and its depth attachment, or NULL */
 static DepthTarget   s_dt[DT_MAX];
@@ -492,6 +497,7 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     end_encoder();
     ensure_cmd();
     rt->dirty = 1;
+    rt->gen = ++s_rt_seq;
     nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = rt->tex;
@@ -1450,6 +1456,7 @@ static Stage s_stage[4];
 #define TEX_CACHE 256
 typedef struct {
     uint32_t       offset, color, width, height, pitch, palette, levels;
+    uint32_t       sign;          /* nv2a_tex_signed_mask the bytes carry */
     uint32_t       gen, used;
     uint64_t       hash;
     int            live;
@@ -1457,6 +1464,17 @@ typedef struct {
 } TexEntry;
 
 static TexEntry       s_tc[TEX_CACHE];
+
+/* BO-45: the channels stage t's filter reads as signed (nv2a_tex_signed_mask),
+ * honoured for 32-bit-decoded textures from guest memory, which tex_bind
+ * uploads offset by 128 (nv2a_tex_signed_xor) for the combiner shader to
+ * take back (d3d8_combiners_msl.c). Burnout 3's water bump maps (SZ_G8B8,
+ * R G B signed) read wrong without it: xemu #587. */
+static int s_signed_on;   /* the draw's pixel stage is a combiner shader */
+static uint8_t stage_signed(const Stage *t)
+{
+    return s_signed_on ? nv2a_tex_signed_mask(t->filter) : 0;
+}
 static uint32_t       s_tc_clock;
 static uint32_t      *s_texels;
 static size_t         s_texels_cap;
@@ -1527,6 +1545,12 @@ static id<MTLTexture> tex_upload(const Stage *t)
         pal = (const uint32_t *)(mem + t->palette);
     nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
                     t->levels, pal, pal ? t->pal_len : 0, s_texels);
+    if (stage_signed(t)) {
+        uint32_t x = nv2a_tex_signed_xor(stage_signed(t));
+        size_t i;
+        for (i = 0; i < n; i++)
+            s_texels[i] ^= x;
+    }
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                             width:t->width
                                                            height:t->height
@@ -1597,7 +1621,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
                 && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels) {
+                && c->levels == t->levels && c->sign == stage_signed(t)) {
             e = c;
             break;
         }
@@ -1635,6 +1659,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->pitch = t->pitch;
         e->palette = t->palette;
         e->levels = t->levels;
+        e->sign = stage_signed(t);
         e->gen = g->flips;
         e->hash = tex_hash_pal(mem, t, bytes);
         e->tex = nt;
@@ -1879,7 +1904,7 @@ typedef struct {
     id<MTLFunction>   fn;
 } FsEntry;
 static FsEntry *s_fs;         /* s_pc_max, allocated in init */
-static struct { int valid; uint32_t r[36]; FsEntry *e; } s_fs_memo;
+static struct { int valid; uint32_t r[37]; FsEntry *e; } s_fs_memo;
 
 /* The fragment function for combiner state `st`, a new reference or nil.
  * Any thread. */
@@ -1942,7 +1967,7 @@ static FsEntry *fs_slot(int evict)
 static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
 {
     NV2ACombinerState st;
-    uint32_t key[36], modes = 0;
+    uint32_t key[37], modes = 0, signs = 0;
     id<MTLFunction> fn;
     uint64_t kid;
     FsEntry *e;
@@ -1955,8 +1980,14 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
         uint32_t m = (uint32_t)s_stage[n].mode;
         if (s_stage[n].raw_mode == 5)
             m = 5;          /* CLIPPLANE reads 0, not NONE's (0, 0, 0, 1) */
+        else if (m == 3 && s_stage[n].cube)
+            m = 3;          /* CUBEMAP: a texturecube (cube_bind) */
+        else if ((m == 6 || m == 7) && n > 0)
+            ;               /* BUMPENVMAP(_LUM): offset by the previous stage */
         else if (m && m != 4) m = 1;
         modes |= m << (5 * n);
+        if (m == 1 || m == 6 || m == 7)   /* 2D sampling; a cube's faces may be targets */
+            signs |= (uint32_t)nv2a_tex_signed_mask(s_stage[n].filter) << (4 * n);
     }
     memcpy(key, v->rc_cicw, 32);
     memcpy(key + 8, v->rc_aicw, 32);
@@ -1966,6 +1997,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     key[33] = v->rc_fcw0;
     key[34] = v->rc_fcw1;
     key[35] = modes;
+    key[36] = signs;
     if (s_fs_memo.valid && !memcmp(s_fs_memo.r, key, sizeof key)) {
         if (!s_fs_memo.e)
             return s_fs_basic;
@@ -1978,6 +2010,8 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw,
                              v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
     st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
+    for (n = 0; n < 4; n++)
+        st.tex_signed[n] = (uint8_t)((signs >> (4 * n)) & 0xFu);
     kid = nv2a_fnv64(&st, sizeof st, NV2A_FNV64_INIT);
     if (!kid)
         kid = 1;
@@ -2384,6 +2418,199 @@ static RenderTarget *rt_opaque(RenderTarget *rt)
     return &s_opaque;
 }
 
+/* ---- cube maps (BO-8) ---------------------------------------------------------
+ *
+ * A CUBEMAP stage samples a texturecube (d3d8_combiners_msl.c declares one
+ * for it); binding a 2D texture there, as every stage was, left the car
+ * reflections wrong. The six faces sit face_stride apart in guest memory
+ * (nv2a_tex_face_stride: a face with all its levels, 128-byte aligned, as
+ * xemu's texture.c). A face this backend drew -- Burnout 3 renders its car
+ * reflections into six 128x128 targets at 0x00AFE000 + n * 0x10000 every
+ * frame -- is copied from that target on the GPU whenever it was drawn since
+ * the last copy: nothing writes those targets back, so the guest bytes under
+ * them are not the image. xemu likewise renders a surface into the texture
+ * that reads it (hw/xbox/nv2a/pgraph/gl/surface.c,
+ * pgraph_gl_render_surface_to_texture). The other faces decode from guest
+ * memory, re-checked once per flip as 2D textures are; a change makes a new
+ * cube, so a frame still in flight keeps the one it was encoded with. */
+#define CUBE_MAX 8
+typedef struct {
+    uint32_t       offset, color, width, levels, side;   /* side: host face size */
+    uint32_t       gen, used;     /* flip of the last memory check; LRU */
+    uint64_t       hash;          /* the memory faces' bytes */
+    uint64_t       face_gen[6];   /* the target's gen at its last copy */
+    id<MTLTexture> tex;
+} CubeEntry;
+static CubeEntry      s_cube[CUBE_MAX];
+static uint32_t       s_cube_clock;
+static id<MTLTexture> s_black_cube;
+static uint64_t       s_cube_copies, s_cube_uploads;
+
+static id<MTLTexture> black_cube(void)
+{
+    if (!s_black_cube) {
+        static const uint32_t px = 0xFF000000u;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm size:1 mipmapped:NO];
+        int f;
+        td.usage = MTLTextureUsageShaderRead;
+        s_black_cube = [s_dev newTextureWithDescriptor:td];
+        for (f = 0; s_black_cube && f < 6; f++)
+            [s_black_cube replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:f
+                              withBytes:&px bytesPerRow:4 bytesPerImage:4];
+    }
+    return s_black_cube;
+}
+
+/* The target drawn at a face's address, w x w guest pixels of it, or NULL. */
+static RenderTarget *cube_face_rt(uint32_t addr, uint32_t w)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->tex || ((rt->addr ^ addr) & 0x07FFFFFFu) || rt->w < w || rt->h < w)
+            continue;
+        if (rt_drop_if_stale(rt, "bind"))
+            continue;   /* the title rewrote it: the face decodes from memory */
+        return rt;
+    }
+    return NULL;
+}
+
+static id<MTLTexture> cube_bind(const Stage *t)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint32_t *pal = t->color == NV2A_TEX_P8 ? (const uint32_t *)(mem + t->palette) : NULL;
+    RenderTarget *frt[6];
+    uint32_t w = t->width, side = t->width, levels, stride, bytes, f, l;
+    CubeEntry *e = NULL, *victim = &s_cube[0];
+    int any = 0, all = 1, fresh = 0, ncopy = 0, i;
+
+    if (!t->cube || !w || t->width != t->height || (uint64_t)w * w * 6u > TEX_MAX_TEXELS)
+        return black_cube();
+    stride = nv2a_tex_face_stride(t->color, w, w, t->pitch, t->fmt_levels);
+    bytes = nv2a_tex_extent(t->color, w, w, t->pitch, t->levels);
+    if (!bytes)
+        return black_cube();
+    for (f = 0; f < 6; f++) {
+        frt[f] = cube_face_rt(t->offset + f * stride, w);
+        if (frt[f]) {
+            any = 1;
+            side = w * frt[f]->hw / frt[f]->w;
+        } else {
+            all = 0;
+        }
+    }
+    levels = any ? 1u : t->levels;     /* a drawn face has one level */
+    for (i = 0; i < CUBE_MAX; i++) {
+        CubeEntry *c = &s_cube[i];
+        if (c->tex && c->offset == t->offset && c->color == t->color
+                && c->width == w && c->levels == levels) {
+            e = c;
+            break;
+        }
+        if (!c->tex || (victim->tex && c->used < victim->used))
+            victim = c;
+    }
+    if (!e) {
+        e = victim;
+        [e->tex release];
+        memset(e, 0, sizeof *e);
+        e->offset = t->offset;
+        e->color = t->color;
+        e->width = w;
+        e->levels = levels;
+        fresh = 1;
+    }
+    if (e->side != side)
+        fresh = 1;
+    if (!all && (fresh || e->gen != g->flips)) {
+        uint64_t h = NV2A_TEX_HASH_SEED;
+        for (f = 0; f < 6; f++)
+            if (!frt[f])
+                h = h * 31u + nv2a_tex_hash(mem + t->offset + f * stride, bytes,
+                                            NV2A_TEX_HASH_SEED);
+        if (pal)
+            h ^= nv2a_tex_hash(mem + t->palette, t->pal_len * 4u, NV2A_TEX_HASH_SEED) * 31u;
+        e->gen = g->flips;
+        if (h != e->hash)
+            fresh = 1;
+        e->hash = h;
+    }
+    if (fresh) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm size:side
+                                       mipmapped:levels > 1];
+        size_t n = nv2a_tex_texels(w, w, levels);
+        if (levels > 1)
+            td.mipmapLevelCount = levels;
+        td.usage = MTLTextureUsageShaderRead;
+        [e->tex release];
+        e->tex = [s_dev newTextureWithDescriptor:td];
+        e->side = side;
+        memset(e->face_gen, 0, sizeof e->face_gen);
+        if (!e->tex)
+            return black_cube();
+        if (n > s_texels_cap) {
+            uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
+            if (!p)
+                return black_cube();
+            s_texels = p;
+            s_texels_cap = n;
+        }
+        for (f = 0; f < 6; f++) {
+            const uint32_t *src = s_texels;
+            if (frt[f])
+                continue;
+            nv2a_tex_decode(mem + t->offset + f * stride, t->color, w, w, t->pitch,
+                            levels, pal, pal ? t->pal_len : 0, s_texels);
+
+            if (side != w) {    /* beside drawn faces at render.scale: level 0, upscaled */
+                uint8_t *up = (uint8_t *)malloc((size_t)side * side * 4u);
+                if (up) {
+                    nv2a_upscale_nearest32((const uint8_t *)s_texels, w * 4u, w, w,
+                                           side / w, up, side * 4u);
+                    [e->tex replaceRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0
+                                    slice:f withBytes:up bytesPerRow:side * 4u
+                            bytesPerImage:side * side * 4u];
+                    free(up);
+                }
+                continue;
+            }
+            for (l = 0; l < levels; l++) {
+                uint32_t lw = nv2a_tex_level_dim(w, l);
+                [e->tex replaceRegion:MTLRegionMake2D(0, 0, lw, lw) mipmapLevel:l slice:f
+                            withBytes:src bytesPerRow:lw * 4u bytesPerImage:lw * lw * 4u];
+                src += (size_t)lw * lw;
+            }
+        }
+        s_cube_uploads++;
+    }
+    for (f = 0; f < 6; f++)
+        if (frt[f] && frt[f]->gen != e->face_gen[f])
+            ncopy++;
+    if (ncopy) {
+        id<MTLBlitCommandEncoder> b;
+        end_encoder();
+        ensure_cmd();
+        b = [s_cmd blitCommandEncoder];
+        for (f = 0; f < 6; f++) {
+            if (!frt[f] || frt[f]->gen == e->face_gen[f])
+                continue;
+            [b copyFromTexture:frt[f]->tex sourceSlice:0 sourceLevel:0
+                  sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(side, side, 1)
+                     toTexture:e->tex destinationSlice:f destinationLevel:0
+             destinationOrigin:MTLOriginMake(0, 0, 0)];
+            e->face_gen[f] = frt[f]->gen;
+            s_cube_copies++;
+        }
+        [b endEncoding];
+    }
+    e->used = ++s_cube_clock;
+    return e->tex;
+}
+
 static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
 {
     static int off = -1;
@@ -2557,7 +2784,18 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             float b = t->levels > 1 && filter_mip(t->filter) ? lod_bias(t->filter) : 0.0f;
             mpc.tex_bias[k] = b > 15.99f ? 15.99f : b < -16.0f ? -16.0f : b;
         }
+        {   /* Bump-env registers: methods 0x1B28..0x1B3C of each stage block. */
+            const uint32_t *tr = nv2a_pb_tex_regs();
+            for (k = 0; k < 4; k++) {
+                const uint32_t *r = &tr[(0x40u * k + 0x28u) / 4];
+                memcpy(mpc.bump_mat[k], r, 16);
+                memcpy(&mpc.bump_lum[k][0], &r[4], 4);
+                memcpy(&mpc.bump_lum[k][1], &r[5], 4);
+                mpc.bump_lum[k][2] = mpc.bump_lum[k][3] = 0.0f;
+            }
+        }
         ffn = fs_select(v, &fid);
+        s_signed_on = fid != PC_FS_BASIC;   /* fs_basic has no signed channels */
         for (i = 0; i < d->idx_count; i++) {
             if (d->idx[i] < lo) lo = d->idx[i];
             if (d->idx[i] > hi) hi = d->idx[i];
@@ -2644,7 +2882,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 if (!t->mode || t->mode == 4)
                     continue;
                 textured = 1;
-                if ((src = rt_texture(t, rt)) != NULL) {
+                if (t->mode == 3 && t->cube && fid != PC_FS_BASIC) {   /* texturecube */
+                    stex[k] = cube_bind(t);
+                } else if ((t->mode == 3 || !stage_signed(t))
+                           && (src = rt_texture(t, rt)) != NULL) {
                     stex[k] = src->tex;
                     /* Linear coordinates are texels of the surface as drawn. */
                     if (!nv2a_tex_size_from_format(t->color)) {
@@ -2672,6 +2913,16 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             id<MTLDepthStencilState> dss = use_z ? depth_state(v->depth_enable, use_s)
                                                  : depth_state(0, 0);
             [s_enc setDepthStencilState:dss];
+            /* BO-10 polygon offset: the constant part is in the vertex
+             * stage (vp_scale.w, nv2a_vp_consts_fill), exact in depth
+             * units; the slope part is Metal's, per host pixel, so the
+             * guest-pixel factor scales with render.scale. xemu applies
+             * both to its own interpolated z (pgraph/glsl/psh.c:
+             * zvalue += depthOffset + depthFactor * triMZ; PR #2240). */
+            [s_enc setDepthBias:0.0f
+                     slopeScale:(use_z && v->poly_offset)
+                                ? v->poly_factor * (float)nv2a_host_render_scale() : 0.0f
+                          clamp:0.0f];
             [s_enc setStencilReferenceValue:use_s ? (v->stencil_ref & 0xFFu) : 0u];
             if (use_z)
                 s_draws_z++;
@@ -2712,6 +2963,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         s_draws++;
+        rt->gen = ++s_rt_seq;
     }
 }
 
