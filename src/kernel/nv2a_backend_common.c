@@ -362,7 +362,11 @@ void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
     o->c[0] = 2.0f / (float)w;
     o->c[1] = -2.0f / (float)h;
     o->c[2] = 1.0f / nv2a_zmax(surface_format);
-    o->c[3] = 0.0f;
+    /* Polygon offset's constant part (SET_POLYGON_OFFSET_BIAS, depth units)
+     * as normalised depth, added to every vertex's z by the GPU backends
+     * that read it (Metal); xemu adds it to z in the same units
+     * (pgraph/glsl/psh.c depthOffset). The slope part is the backend's. */
+    o->c[3] = v->poly_offset ? v->poly_bias / nv2a_zmax(surface_format) : 0.0f;
     o->c[4] = -1.0f;
     o->c[5] = 1.0f;
     o->c[6] = 0.0f;

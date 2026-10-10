@@ -132,6 +132,37 @@ static int texmode_check(void)
     return bad;
 }
 
+/* BO-45/BO-70: a signed stage feeding a bump-env stage (Burnout 3's water:
+ * stage 0 SZ_G8B8 read R G B signed, stage 1 BUMPENVMAP). Stage 0's signed
+ * channels come back to [-1, 1] after sampling, stage 1 offsets its
+ * coordinate by the bump matrix times them; the _LUM form scales by the
+ * luminance. Both must compile. */
+static int bump_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    NV2ACombinerState st;
+    int bad = 0, lum;
+
+    for (lum = 0; lum < 2; lum++) {
+        memset(&st, 0, sizeof st);
+        d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u,
+                                 1u | (lum ? 7u : 6u) << 5, &st);
+        st.tex_signed[0] = 7u;              /* R G B */
+        if (d3d8_combiners_generate_msl(&st, text, (int)sizeof text) <= 0)
+            return 1;
+        if (!strstr(text, "x8.b = max((x8.b * 255.0 - 128.0) / 127.0, -1.0);")
+                || !strstr(text, "float2 dsdt = float2(x8.b, x8.g);")
+                || !strstr(text, "pc.bump_mat[1]")
+                || (lum && !strstr(text, "pc.bump_lum[1].x"))) {
+            printf("FAIL: signed stage 0 into bump-env stage 1 (lum %d)\n", lum);
+            bad = 1;
+        }
+        compile_case("bump", lum, text, (int)strlen(text), "fs_main");
+    }
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -202,6 +233,8 @@ int main(void)
     if (s_compile_bad)
         return 1;
     if (texmode_check())
+        return 1;
+    if (bump_check() || s_compile_bad)
         return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (MSL_DUMP=<file> writes the text)\n",

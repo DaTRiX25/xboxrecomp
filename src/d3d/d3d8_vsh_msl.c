@@ -344,7 +344,7 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
         sb_append(&sb,
             "    float  pw = (oPos.w == 0.0) ? 1.0 : oPos.w;\n"
             "    o.pos = float4((oPos.xy * vp.vp_scale.xy + vp.vp_off.xy) * pw,\n"
-            "                   oPos.z * vp.vp_scale.z * pw, pw);\n"
+            "                   (oPos.z * vp.vp_scale.z + vp.vp_scale.w) * pw, pw);\n"
             "    {\n"
             "        float fd = oFog.x, ff = 1.0;\n"
             "        if (vp.fog_ctl.x != 0u) {\n"
