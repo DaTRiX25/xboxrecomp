@@ -108,7 +108,7 @@ static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", NU
 static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the sides)", NULL };
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA (coming soon)", NULL };
-static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1 (coming soon)", NULL };
+static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
 
 static const Meta k_meta[XS_COUNT] = {
@@ -124,7 +124,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_AUDIO_VOLUME */       { "Master volume", "The game's sound level.", 0.05, FMT_PERCENT, NULL, 0 },
     /* XS_AUDIO_MUTE */         { "Mute", "No sound.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_MUTE_BG */      { "Mute in the background", "No sound while the window is not in front.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_AUDIO_SPEAKERS */     { "Speakers", "5.1 output is not built yet.", 1, FMT_PLAIN, n_speakers, 1u << 2 },
+    /* XS_AUDIO_SPEAKERS */     { "Speakers", "Auto plays 5.1 when the system's sound output is set to 5.1 (or more), else stereo. The game picks its mix at start.", 1, FMT_PLAIN, n_speakers, 0 },
     /* XS_INPUT_DEADZONE */     { "Stick deadzone", "The part of the stick's travel that reads as centre.", 1638.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_TRIGGER_DEADZONE */ { "Trigger deadzone", "The part of a trigger's pull that reads as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "0 turns the rumble off.", 0.05, FMT_GAIN, NULL, 0 },
