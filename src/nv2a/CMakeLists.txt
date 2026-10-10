@@ -33,3 +33,12 @@ target_link_libraries(xbox_nv2a PRIVATE platform)
 if(WIN32)
     target_link_libraries(xbox_nv2a PRIVATE kernel32)
 endif()
+
+# Extracted from xemu, which QEMU builds with -fwrapv -fno-strict-aliasing
+# (qemu meson.build, "qemu_common_flags"): -fwrapv makes a left shift into
+# a signed int's sign bit well defined, which the register masks here rely on
+# (e.g. 0xF << 28; UBSan flagged apu_vp.c:249, 1083, 1421 and 1430). Same
+# dialect here, so the optimiser cannot take those shifts as unreachable.
+if(NOT MSVC)
+    target_compile_options(xbox_nv2a PRIVATE -fwrapv -fno-strict-aliasing)
+endif()

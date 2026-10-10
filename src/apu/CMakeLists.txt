@@ -49,3 +49,12 @@ else()
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
 endif()
+
+# Extracted from xemu, which QEMU builds with -fwrapv -fno-strict-aliasing
+# (qemu meson.build, "qemu_common_flags"): -fwrapv makes a left shift into
+# a signed int's sign bit well defined, which the register masks here rely on
+# (e.g. 0xF << 28; UBSan flagged apu_vp.c:249, 1083, 1421 and 1430). Same
+# dialect here, so the optimiser cannot take those shifts as unreachable.
+if(NOT MSVC)
+    target_compile_options(xbox_apu PRIVATE -fwrapv -fno-strict-aliasing)
+endif()
