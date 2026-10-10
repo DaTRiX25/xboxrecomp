@@ -102,8 +102,15 @@ int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
             EMIT("    x%d = vec4(0.0, 0.0, 0.0, 1.0);\n", 8 + i);
             continue;
         }
-        if (m == NV2A_TEXMODE_CLIPPLANE)
+        if (m == NV2A_TEXMODE_CLIPPLANE) {
+            /* As the MSL (xemu psh.c PS_TEXTUREMODES_CLIPPLANE): each
+             * coordinate component against 0 by the stage's compare mode;
+             * the register reads 0. */
+            for (k = 0; k < 4; k++)
+                EMIT("    if (i_t%d.%c %s 0.0) discard;\n", i, "xyzw"[k],
+                     (state->clip_mode[i] >> k) & 1u ? ">=" : "<");
             continue;
+        }
         if (m == NV2A_TEXMODE_PASSTHRU) {
             EMIT("    x%d = saturate(i_t%d);\n", 8 + i, i);
             continue;
@@ -116,7 +123,8 @@ int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
              * the previous stage's (b, g) as signed, turned by this stage's
              * bump matrix and added to its coordinate; _LUM scales the texel
              * by scale * l + offset. */
-            int p = i - 1, sg = state->tex_signed[p];
+            int p = i == 1 ? 0 : state->input_tex[i] < i ? state->input_tex[i] : i - 1;
+            int sg = state->tex_signed[p];
             EMIT("    {\n");
             if ((sg & 3u) == 3u)
                 EMIT("        vec2 dsdt = vec2(x%d.b, x%d.g);\n", 8 + p, 8 + p);

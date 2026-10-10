@@ -64,6 +64,7 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
 #include "d3d8_glsl.h"
+#include "d3d8_swizzle.h"
 #include "nv2a_pcache.h"
 #include "recomp_env.h"
 #include <pthread.h>
@@ -752,12 +753,45 @@ static int rt_image_new(struct nvk_image *im, uint32_t hw, uint32_t hh)
  * the surface is 32-bit, as Metal's rt_seed; else cleared to transparent
  * black, as a new Metal target's margin is. On the upload command buffer;
  * im ends as a colour attachment. */
+/* Swizzled render targets (BO-24, as Metal): a surface of format type 2 lies
+ * in guest memory in the NV2A's Z order (d3d8_swizzle.h); the seed reads it
+ * so and a write-back stores it so, through a linear staging copy. Only a
+ * power-of-two size is a swizzled layout. */
+static int rt_swz_ok(int swz, uint32_t w, uint32_t h)
+{
+    return swz && w && h && !(w & (w - 1)) && !(h & (h - 1));
+}
+
+static uint8_t *s_swz_lin;
+static size_t   s_swz_cap;
+
+static uint8_t *swz_staging(size_t bytes)
+{
+    if (s_swz_cap < bytes) {
+        uint8_t *n = (uint8_t *)realloc(s_swz_lin, bytes);
+        if (!n)
+            return NULL;
+        s_swz_lin = n;
+        s_swz_cap = bytes;
+    }
+    return s_swz_lin;
+}
+
 static void rt_seed(struct nvk_image *im, uint32_t addr, uint32_t pitch, uint32_t w,
-                    uint32_t h, uint32_t hw, uint32_t hh)
+                    uint32_t h, uint32_t hw, uint32_t hh, int swz)
 {
     const uint8_t *src = (const uint8_t *)xbox_GetMemoryOffset() + addr;
     VkDeviceSize off;
     uint8_t *dst;
+
+    if (pitch >= w * 4u && rt_swz_ok(swz, w, h)) {
+        uint8_t *lin = swz_staging((size_t)w * h * 4u);
+        if (lin) {
+            xbox_unswizzle_rect(lin, src, w, h, 4);
+            src = lin;
+            pitch = w * 4u;
+        }
+    }
 
     if (pitch >= w * 4u
             && (dst = (uint8_t *)ring_alloc(RING_UP, (VkDeviceSize)hw * hh * 4u, 16, &off))) {
@@ -813,7 +847,7 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     end_encoder();
     if (!rt_image_new(&im, hw, hh))
         return 0;
-    rt_seed(&im, rt->addr, rt->pitch, w, h, hw, hh);
+    rt_seed(&im, rt->addr, rt->pitch, w, h, hw, hh, rt->swz);
     if (keep) {
         VkImageCopy ic;
         ensure_cmd();
@@ -853,14 +887,15 @@ static RenderTarget *surface(void)
     uint32_t w = g->clip_x + g->clip_w, h = g->clip_y + g->clip_h;
     RenderTarget *free_rt = NULL, *lru = &s_rt[0];
     uint32_t hw, hh;
-    int i;
+    int i, swz = ((g->format >> 8) & 0xF) == 2;   /* another layout: another target */
 
     if (!g->color_offset || !w || !h || w > 4096 || h > 4096)
         return NULL;
     s_tick++;
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
-        if (rt->im.img && rt->offset == g->color_offset && rt->w == w && rt->h == h) {
+        if (rt->im.img && rt->offset == g->color_offset && rt->w == w && rt->h == h
+                && rt->swz == swz) {
             if (rt_drop_if_stale(rt, "reuse"))
                 break;
             rt->last_use = s_tick;
@@ -869,7 +904,8 @@ static RenderTarget *surface(void)
     }
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
-        if (!rt->im.img || rt->offset != g->color_offset || rt->pitch != g->pitch)
+        if (!rt->im.img || rt->offset != g->color_offset || rt->pitch != g->pitch
+                || rt->swz != swz)
             continue;
         if (rt_drop_if_stale(rt, "reuse"))
             break;
@@ -922,10 +958,10 @@ static RenderTarget *surface(void)
     free_rt->hw = hw;
     free_rt->hh = hh;
     free_rt->pitch = g->pitch;
-    free_rt->swz = ((g->format >> 8) & 0xF) == 2;
+    free_rt->swz = swz;
     free_rt->last_use = s_tick;
     rt_own_reset(free_rt);
-    rt_seed(&free_rt->im, free_rt->addr, g->pitch, w, h, hw, hh);
+    rt_seed(&free_rt->im, free_rt->addr, g->pitch, w, h, hw, hh, free_rt->swz);
     if (hw != w)
         fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
                 g->color_offset, w, h, hw, hh);
@@ -1198,9 +1234,9 @@ static Stage s_stage[4];
 static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
 {
     static char glsl[65536];
-    static struct { int valid; uint32_t r[37]; VkShaderModule m; } memo;
+    static struct { int valid; uint32_t r[39]; VkShaderModule m; } memo;
     NV2ACombinerState st;
-    uint32_t key[37], modes = 0, signs = 0, hash;
+    uint32_t key[39], modes = 0, signs = 0, hash;
     FsEntry *e = NULL;
     char what[32];
     int n;
@@ -1229,6 +1265,8 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     key[34] = v->rc_fcw1;
     key[35] = modes;
     key[36] = signs;
+    key[37] = v->shader_ctl & 0x00FF0000u;  /* stage 2 and 3 input stages */
+    key[38] = v->clip_plane_mode;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.m;
 
@@ -1236,8 +1274,12 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw,
                              v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
     st.fog_input = 1;
-    for (n = 0; n < 4; n++)
+    for (n = 0; n < 4; n++) {
         st.tex_signed[n] = (uint8_t)((signs >> (4 * n)) & 0xFu);
+        st.clip_mode[n] = (uint8_t)((v->clip_plane_mode >> (4 * n)) & 0xFu);
+    }
+    st.input_tex[2] = (uint8_t)((v->shader_ctl >> 16) & 0xFu);
+    st.input_tex[3] = (uint8_t)((v->shader_ctl >> 20) & 0xFu);
     hash = fnv(&st, sizeof st);
     if (!s_fs && !(s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs)))
         return s_fs_basic;
@@ -2611,6 +2653,27 @@ static void write_back_px(RenderTarget *rt, const uint8_t *px, uint32_t addr, ui
     static uint32_t *row;
     static uint32_t row_cap;
 
+    if (rt_swz_ok(rt->swz, rt->w, rt->h) && (bpp == 4 || bpp == 2)) {
+        /* Swizzled: linear first (box-filtered when scaled), then Z order. */
+        uint32_t *lin = (uint32_t *)swz_staging((size_t)w * rt->h * 4u);
+        uint32_t i;
+        if (!lin)
+            return;
+        if (n == 1)
+            memcpy(lin, px, (size_t)w * rt->h * 4u);
+        else
+            nv2a_downscale_box32(px, rt->hw * 4u, w, rt->h, n, (uint8_t *)lin, w * 4u);
+        if (bpp == 2) {
+            uint16_t *o = (uint16_t *)lin;   /* in place: each texel shrinks */
+            for (i = 0; i < w * rt->h; i++) {
+                uint32_t c = lin[i];
+                o[i] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F));
+            }
+        }
+        xbox_swizzle_rect(dst, lin, w, rt->h, bpp);
+        s_writebacks++;
+        return;
+    }
     if (bpp >= 4) {
         if (n == 1)
             for (y = 0; y < rt->h; y++)
