@@ -1010,6 +1010,14 @@ unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim
 struct nv2a_rect { int32_t x, y, w, h; };
 int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
                       int filter, struct nv2a_rect *r);
+/* The part of an fw x fh frame a window shows and where it goes:
+ * nv2a_present_rect, after RECOMP_PRESENT_OVERSCAN=crop (16 rows of 480 off
+ * the top and bottom, as a TV's overscan hid them, and the same share of
+ * the width, so the aspect holds) and with RECOMP_PRESENT_FIT=fill16x10 (the
+ * window's full height, the frame's sides cropped where wider: the Deck's
+ * 16:10 panel). src is in frame pixels; returns `whole` as nv2a_present_rect. */
+int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
+                        struct nv2a_rect *src, struct nv2a_rect *dst);
 /* The same at a display aspect (enum nv2a_present_aspect); nv2a_present_rect
  * is this at nv2a_host_opts()->present_aspect. At any aspect but the frame's
  * own, INTEGER scales the height by a whole number and stretches the width

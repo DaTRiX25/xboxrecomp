@@ -79,6 +79,9 @@ extern "C" {
     /* ── config ─────────────────────────────────────────────────────── */ \
     X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "pushbuffer executor (draws frames); default on, 0: off") \
     X(PB_BACKEND,        CONFIG, "RECOMP_PB_BACKEND",        NULL, "executor backend: cpu (default), metal, vulkan, d3d11, null") \
+    X(EXEC_UCLAMP,       CONFIG, "RECOMP_EXEC_UCLAMP",       NULL, "Linux: the executor thread's minimum utilisation clamp, 0..1024 (CPU clock boost without spinning)") \
+    X(PRESENT_OVERSCAN,  CONFIG, "RECOMP_PRESENT_OVERSCAN",  NULL, "crop: show the 640x448 area a TV showed (y 16..464), cropping the sides alike so the aspect holds (Vulkan, Metal windows)") \
+    X(PRESENT_FIT,       CONFIG, "RECOMP_PRESENT_FIT",       NULL, "fill16x10: fill the window's height, cropping the frame's sides (the Deck's 16:10 panel) (Vulkan, Metal windows)") \
     X(PRESENT_EARLY,     CONFIG, "RECOMP_PRESENT_EARLY",     NULL, "1: frames go to the host at FLIP_STALL, before the vblank hold (lower latency, same pacing)") \
     X(FLIP_PACING,       CONFIG, "RECOMP_FLIP_PACING",       NULL, "vblank: FLIP_STALL holds until the vblank the title's swap asked for (needs RECOMP_VBLANK); default off") \
     X(HEADLESS,          CONFIG, "RECOMP_HEADLESS",          NULL, "1: no window (SDL host)") \

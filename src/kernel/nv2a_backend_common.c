@@ -3,8 +3,10 @@
  * of nv2a_backend_common.h. No OS or graphics headers.
  */
 #include "nv2a_backend_common.h"
+#include "recomp_env.h"
 
 #include <stdatomic.h>
+#include <string.h>
 
 uint32_t nv2a_tex_extent(uint32_t fmt, uint32_t w, uint32_t h,
                          uint32_t pitch, uint32_t levels)
@@ -630,6 +632,52 @@ uint32_t nv2a_present_width(uint32_t src_w, uint32_t src_h)
     if (!src_h || !ah)
         return src_w;
     return (uint32_t)(((uint64_t)src_h * aw + ah / 2) / ah);
+}
+
+/* RECOMP_PRESENT_OVERSCAN=crop / RECOMP_PRESENT_FIT=fill16x10 (see
+ * nv2a_backend_common.h, nv2a_present_layout). */
+int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
+                        struct nv2a_rect *src, struct nv2a_rect *dst)
+{
+    static int crop = -1, fill = -1;
+    int whole;
+    if (crop < 0) {
+        const char *e = recomp_env(RENV_PRESENT_OVERSCAN);
+        crop = e && !strcmp(e, "crop");
+        e = recomp_env(RENV_PRESENT_FIT);
+        fill = e && !strcmp(e, "fill16x10");
+    }
+    src->x = src->y = 0;
+    src->w = (int32_t)fw;
+    src->h = (int32_t)fh;
+    if (crop && fw && fh) {
+        /* 16 of 480 rows top and bottom (a TV's overscan: the 640x448 the
+         * title keeps its picture in), the same share of the width. */
+        int32_t cy = (int32_t)((fh * 16u + 240u) / 480u);
+        int32_t cx = (int32_t)(((uint64_t)fw * 16u + 240u) / 480u);
+        src->x = cx;
+        src->y = cy;
+        src->w = (int32_t)fw - 2 * cx;
+        src->h = (int32_t)fh - 2 * cy;
+    }
+    whole = nv2a_present_rect((uint32_t)src->w, (uint32_t)src->h, dw, dh, filter, dst);
+    if (fill && dst->h > 0 && (uint32_t)dst->h < dh) {
+        /* Fill the height; what is wider than the window is cropped from
+         * the frame's sides. */
+        int64_t nw = (int64_t)dst->w * dh / dst->h;
+        if (nw > (int64_t)dw) {
+            int32_t keep = (int32_t)((int64_t)src->w * dw / nw);
+            src->x += (src->w - keep) / 2;
+            src->w = keep;
+            nw = dw;
+        }
+        dst->x = (int32_t)(((int64_t)dw - nw) / 2);
+        dst->y = 0;
+        dst->w = (int32_t)nw;
+        dst->h = (int32_t)dh;
+        whole = 0;
+    }
+    return whole;
 }
 
 int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,

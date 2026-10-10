@@ -703,9 +703,10 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     rr.layerCount = 1;
     vkCmdClearColorImage(cb, s_sc_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rr);
     if (s_slot[k].img && s_slot[k].layout == VK_IMAGE_LAYOUT_GENERAL && fw && fh) {
-        struct nv2a_rect r2;
-        int whole = nv2a_present_rect(fw, fh, (uint32_t)s_sc_ext.width,
-                                      (uint32_t)s_sc_ext.height, filter, &r2);
+        struct nv2a_rect r2, sr;
+        uint32_t sw = fw < s_slot[k].w ? fw : s_slot[k].w, sh = fh < s_slot[k].h ? fh : s_slot[k].h;
+        int whole = nv2a_present_layout(sw, sh, (uint32_t)s_sc_ext.width,
+                                        (uint32_t)s_sc_ext.height, filter, &sr, &r2);
         if (r2.w > 0 && r2.h > 0) {
             int lin = filter == NV2A_PRESENT_LINEAR
                       || (filter == NV2A_PRESENT_INTEGER && !whole);
@@ -721,8 +722,10 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             b.srcSubresource.layerCount = 1;
             b.dstSubresource = b.srcSubresource;
-            b.srcOffsets[1].x = (int32_t)(fw < s_slot[k].w ? fw : s_slot[k].w);
-            b.srcOffsets[1].y = (int32_t)(fh < s_slot[k].h ? fh : s_slot[k].h);
+            b.srcOffsets[0].x = sr.x;
+            b.srcOffsets[0].y = sr.y;
+            b.srcOffsets[1].x = sr.x + sr.w;
+            b.srcOffsets[1].y = sr.y + sr.h;
             b.srcOffsets[1].z = 1;
             b.dstOffsets[0].x = r2.x;
             b.dstOffsets[0].y = r2.y;

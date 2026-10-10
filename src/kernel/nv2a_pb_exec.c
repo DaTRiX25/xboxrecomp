@@ -42,6 +42,11 @@
 #include "nv2a_vsh_cpu.h"
 #include "nv2a_combiner.h"
 #include "nv2a_pb_state.h"
+#if defined(__linux__)
+#include <errno.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 #include "nv2a_backend_common.h"
 #include "nv2a_zbuf_cache.h"
 #include "../video/video_player.h"   /* xbox_FramebufferWindowFrameStats */
@@ -5977,6 +5982,29 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         {   /* RECOMP_PB_BACKEND=metal: src/d3d/nv2a_pb_metal.m */
             extern void nv2a_pb_metal_register_from_env(void);
             nv2a_pb_metal_register_from_env();
+        }
+#endif
+#if defined(__linux__)
+        {   /* RECOMP_EXEC_UCLAMP=<0..1024>: this (the executor's) thread asks
+             * the scheduler for at least that share of a core's capacity, so
+             * schedutil keeps the clock up for it between frames without a
+             * spin (sched_setattr SCHED_FLAG_UTIL_CLAMP_MIN; CONFIG_UCLAMP_TASK,
+             * unprivileged on SteamOS's kernel). */
+            const char *u = recomp_env(RENV_EXEC_UCLAMP);
+            if (u && *u) {
+                struct { uint32_t size, policy; uint64_t flags; int32_t nice;
+                         uint32_t prio; uint64_t runtime, deadline, period;
+                         uint32_t util_min, util_max; } a;
+                long r;
+                memset(&a, 0, sizeof a);
+                a.size = sizeof a;
+                a.flags = 0x20 | 0x08 | 0x10;   /* UTIL_CLAMP_MIN, KEEP_POLICY, KEEP_PARAMS */
+                a.util_min = (uint32_t)atoi(u) > 1024u ? 1024u : (uint32_t)atoi(u);
+                a.util_max = 1024;
+                r = syscall(314 /* SYS_sched_setattr, x86-64 */, 0, &a, 0);
+                fprintf(stderr, "  [GPU] executor thread uclamp min %u: %s\n", a.util_min,
+                        r == 0 ? "set" : strerror(errno));
+            }
         }
 #endif
 #ifdef XBOXRECOMP_HAVE_VULKAN
