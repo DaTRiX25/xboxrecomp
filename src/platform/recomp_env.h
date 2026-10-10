@@ -90,8 +90,8 @@ extern "C" {
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt") \
     X(VBLANK_SYNC,       CONFIG, "RECOMP_VBLANK_SYNC",       NULL, "=display: the emulated vblank follows the display's refresh (reported by the present path) when within 5% of 60 Hz; default: its own 60.000 Hz timer") \
-    X(PRESENT_DRAWABLES, CONFIG, "RECOMP_PRESENT_DRAWABLES", NULL, "Metal: CAMetalLayer maximumDrawableCount, 2 or 3 (default 3)") \
-    X(PRESENT_LATENCY,   CONFIG, "RECOMP_PRESENT_LATENCY",   NULL, "D3D11 RECOMP_PRESENT_VSYNC=fifo: SetMaximumFrameLatency, 1-3 (default 2)") \
+    X(PRESENT_DRAWABLES, CONFIG, "RECOMP_PRESENT_DRAWABLES", NULL, "Metal: CAMetalLayer maximumDrawableCount, 2 or 3 (default 2)") \
+    X(PRESENT_LATENCY,   CONFIG, "RECOMP_PRESENT_LATENCY",   NULL, "D3D11 RECOMP_PRESENT_VSYNC=fifo: SetMaximumFrameLatency, 1-3 (default 1)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
     X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \

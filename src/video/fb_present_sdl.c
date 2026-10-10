@@ -104,6 +104,12 @@ struct fb_slot {
 static struct fb_slot  s_slot[3];
 static int             s_back = 0, s_ready = 1, s_front = 2;
 static uint64_t        s_ready_seq;          /* frames published */
+/* RECOMP_TRACE=pacing=all: when each frame was published (host ns, by
+ * sequence, a small ring), so a dropped one can be told apart: two
+ * publishes inside one main-loop turn, and how long that turn took. */
+static int             s_trace_drops = -1;
+static uint64_t        s_pub_ns[8];
+static uint64_t        s_last_pickup_ns, s_last_present_ns;
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int    s_running;            /* window up: flips copy */
 static Uint32          s_frame_event;        /* wakes the main loop */
@@ -217,6 +223,7 @@ static void publish(uint32_t w, uint32_t h, uint32_t bpp, uint64_t t0)
         s_ready = s_back;
         s_back = t;
         s_ready_seq++;
+        s_pub_ns[s_ready_seq & 7] = now_ns(CLOCK_MONOTONIC);
     }
     pthread_mutex_unlock(&s_lock);
 
@@ -672,6 +679,24 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
         pthread_mutex_unlock(&s_lock);
 
+        if (s_trace_drops < 0) {
+            const char *tr = recomp_env(RENV_PACING_TRACE);
+            s_trace_drops = tr && !strcmp(tr, "all");
+        }
+        if (s_trace_drops && seq > shown_seq + 1 && shown_seq) {
+            /* The frames between were overwritten unseen: when they and
+             * this one were published, and how long the last present took. */
+            uint64_t now = now_ns(CLOCK_MONOTONIC);
+            fprintf(stderr, "[PACING] window dropped %llu at t_us %llu: published"
+                    " %.2f and %.2f ms ago, last pickup %.2f ms ago, last present"
+                    " %.2f ms\n", (unsigned long long)(seq - shown_seq - 1),
+                    (unsigned long long)(now / 1000u),
+                    (now - s_pub_ns[(shown_seq + 1) & 7]) / 1e6,
+                    (now - s_pub_ns[seq & 7]) / 1e6,
+                    (now - s_last_pickup_ns) / 1e6, s_last_present_ns / 1e6);
+        }
+        if (seq != shown_seq)
+            s_last_pickup_ns = now_ns(CLOCK_MONOTONIC);
         if (seq != shown_seq && s_layer) {
             /* Layer mode: the slot is already a GPU texture. */
             dropped_base += seq - shown_seq - 1;
@@ -726,7 +751,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             if (shoot)
                 shot_path(path, sizeof path, shown_flip);
             if (fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
-                            filter, shoot ? path : NULL, shown_flip)) {
+                            filter, shoot ? path : NULL, shown_flip)
+                    && ((s_last_present_ns = now_ns(CLOCK_MONOTONIC) - t0), 1)) {
                 dirty = 0;
                 shoot = 0;
                 presents++;
