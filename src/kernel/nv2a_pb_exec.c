@@ -863,18 +863,35 @@ static void dump_present_bmp(void)
  * dump k as flip 60k+1, or for a window around an event. The CPU path and
  * backends that write back (Metal) are dumped here, from guest memory, with
  * the RECOMP_FB_DUMP prefix; a backend that presents from its own surfaces
- * (D3D11) dumps the listed flips itself (nv2a_pb_dump_at_listed). */
+ * (D3D11) dumps the listed flips itself (nv2a_pb_dump_at_listed).
+ *
+ * RECOMP_FB_DUMP_AT=@<file>: the list is in that file and is read again
+ * whenever the file changes, so a script driving the title can ask for
+ * flips ahead of the one the flip log shows, e.g. 40 flips after the log
+ * names an event's file: a golden frame anchored on an event, not on a flip
+ * number that moves with menu timing. Numbers and ranges may be separated
+ * by commas, spaces or newlines; append to the file rather than rewrite it
+ * (a change is seen by its size or time). The file may not exist yet. */
+#include <sys/stat.h>
 static int s_dump_at_n = -1;
 static uint32_t s_dump_at_lo[64], s_dump_at_hi[64];
+static const char *s_dump_at_file;
+static long long s_dump_at_size = -1, s_dump_at_mtime = -1;
 
-static void dump_at_parse(void)
+static void dump_at_parse_text(const char *e, int lenient)
 {
-    const char *e = recomp_env(RENV_FB_DUMP_AT);
     int n = 0;
 
     while (e && *e && n < 64) {
         char *end;
-        unsigned long a = strtoul(e, &end, 10), b = a;
+        unsigned long a, b;
+        if (lenient)
+            while (*e && (*e < '0' || *e > '9'))
+                e++;
+        if (!*e)
+            break;
+        a = strtoul(e, &end, 10);
+        b = a;
         if (end == e)
             break;
         if (*end == '-') {
@@ -889,18 +906,64 @@ static void dump_at_parse(void)
             n++;
         }
         e = *end == ',' ? end + 1 : end;
-        if (*end != ',')
+        if (!lenient && *end != ',')
             break;
     }
     s_dump_at_n = n;
 }
 
+/* The @file form: read the file again if its size or time moved. */
+static void dump_at_reload(void)
+{
+    struct stat st;
+    static char buf[4096];
+    FILE *f;
+    size_t len;
+
+    if (stat(s_dump_at_file, &st) != 0) {
+        s_dump_at_n = 0;
+        s_dump_at_size = s_dump_at_mtime = -1;
+        return;
+    }
+    if ((long long)st.st_size == s_dump_at_size
+            && (long long)st.st_mtime == s_dump_at_mtime)
+        return;
+    f = fopen(s_dump_at_file, "rb");
+    if (!f)
+        return;
+    len = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[len] = 0;
+    s_dump_at_size = (long long)st.st_size;
+    s_dump_at_mtime = (long long)st.st_mtime;
+    dump_at_parse_text(buf, 1);
+    fprintf(stderr, "  [GPU] fb_dump_at: %d flip ranges from %s\n",
+            s_dump_at_n, s_dump_at_file);
+}
+
+static void dump_at_parse(void)
+{
+    const char *e = recomp_env(RENV_FB_DUMP_AT);
+
+    if (e && e[0] == '@' && e[1]) {
+        s_dump_at_file = e + 1;
+        s_dump_at_n = 0;
+        dump_at_reload();
+        return;
+    }
+    dump_at_parse_text(e, 0);
+}
+
 int nv2a_pb_dump_at_listed(uint32_t flip)
 {
+    static uint32_t last_flip = 0xFFFFFFFFu;
     int i;
 
     if (s_dump_at_n < 0)
         dump_at_parse();
+    else if (s_dump_at_file && flip != last_flip)
+        dump_at_reload();       /* once a flip, however many ask */
+    last_flip = flip;
     for (i = 0; i < s_dump_at_n; i++)
         if (flip >= s_dump_at_lo[i] && flip <= s_dump_at_hi[i])
             return 1;
@@ -920,7 +983,7 @@ static void dump_at_flip(uint32_t flip)
         if (s_dump_at_n < 0)
             dump_at_parse();
         here = be == nv2a_pb_cpu_backend() || be->writes_back;
-        if (s_dump_at_n) {
+        if (s_dump_at_n || s_dump_at_file) {
             fprintf(stderr, "  [GPU] fb_dump_at: %d flip ranges%s\n", s_dump_at_n,
                     here ? "" : ", dumped by the backend");
             if (here && !prefix)
@@ -933,6 +996,8 @@ static void dump_at_flip(uint32_t flip)
     snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix, flip);
     if (!write_present_bmp(path))
         fprintf(stderr, "  [GPU] flip %u: fb_dump_at dump failed\n", flip);
+    else if (s_dump_at_file)    /* a driver waits for this line */
+        fprintf(stderr, "  [GPU] fb_dump_at: dumped %s\n", path);
 }
 
 /* Write the current surface out as a 24-bit BMP.
@@ -6291,6 +6356,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
             if (every > 0 && s_gpu.flips % (uint32_t)every == 0)
                 prev_tris = drew;
+        }
+        /* RECOMP_TRACE=flipmark: the flip number and time only, the head of
+         * the flip log's line. The scene drivers (Burnout 3's
+         * tools/headless) count frames by it to wait and to anchor golden
+         * frames; RECOMP_FLIP_LOG says much more and starts the kick watcher
+         * thread, which a frame-time or power measurement must not carry. */
+        {
+            static int mark = -1;
+            if (mark < 0)
+                mark = recomp_env(RENV_FLIP_MARK) != NULL
+                       && recomp_env(RENV_FLIP_LOG) == NULL;
+            if (mark)
+                fprintf(stderr, "[GPU] flip %u %lu ms\n", s_gpu.flips,
+                        xbox_log_ms());
         }
         /* RECOMP_FLIP_LOG=1: every flip, with the batches drawn since the last. */
         {
