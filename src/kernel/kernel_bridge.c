@@ -33,6 +33,7 @@
 #include "platform/latency_trace.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "xbox_crash.h"
 #include <stdio.h>
 #ifndef _WIN32
 #include <pthread.h>
@@ -543,6 +544,8 @@ void xbox_log_thread_role(const char *role, uint32_t routine)
      * process comm, so renaming it to guest-main breaks pgrep and ps. */
     if (GetCurrentThreadId() != main_tid)
         thread_set_os_name(os);
+    /* Known to the hang report, by this name. */
+    xbox_crash_thread_register(os);
     if (routine)
         fprintf(stderr, "[THREAD] tid=%lu role=%s routine=0x%08X\n",
                 (unsigned long)GetCurrentThreadId(), role, routine);
@@ -10368,6 +10371,9 @@ static void kernel_thunk_dispatch(void)
      * arguments or takes any lock (xbox_IrqPost). After the slot is read,
      * since a kernel call in the routine sets it again. */
     xbox_IrqSafePoint();
+    /* RECOMP_DEBUG=crash_test, once armed: fault or hang here. */
+    if (g_xbox_crash_test)
+        xbox_crash_test_fire();
 
     if (slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
         fprintf(stderr, "  [KERNEL] bad slot %d\n", slot);

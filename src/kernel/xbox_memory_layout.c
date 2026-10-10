@@ -18,6 +18,7 @@
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
 #include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
+#include "xbox_crash.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2735,6 +2736,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                     (unsigned)hi, (unsigned)lo);
         fflush(stderr);
     }
+    xbox_crash_log_flush(500);      /* _exit: the tee's pipe would be lost */
     _exit(3);
     return 0;
 }

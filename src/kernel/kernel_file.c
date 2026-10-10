@@ -18,6 +18,7 @@
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #endif
 #include "kernel.h"
+#include <stddef.h>     /* offsetof */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,50 @@ uint32_t g_xbox_last_file_error;
 uint32_t xbox_LastFileError(void)
 {
     return g_xbox_last_file_error;
+}
+
+/* NtQueryDirectoryFile, shared by both backends.
+ *
+ * The fixed part of FILE_DIRECTORY_INFORMATION, before the name. It was
+ * computed as &((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName, a member
+ * access through a null pointer: undefined behaviour, and what UBSan's
+ * "member access within null pointer of type XBOX_FILE_DIRECTORY_INFORMATION"
+ * at this line was about. The buffer itself was never null (both callers
+ * check it); offsetof is the defined way to say the same thing. */
+#define XBOX_DIRINFO_HEADER \
+    ((ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName))
+
+/* "*.*" lists every entry, directories without a dot included: Cxbx-Reloaded
+ * rewrites it to "*" for the same reason ("Xbox expects directories to be
+ * listed when *.* is passed", src/core/kernel/exports/EmuKrnlNt.cpp,
+ * NtQueryDirectoryFile). FindFirstFileW already reads it that way; fnmatch
+ * does not, so on POSIX that mask skipped every name without a dot (a save
+ * folder's, for one). Burnout 3 passes "*", NULL and a name; this is for a
+ * title that passes "*.*". */
+static int dirinfo_mask_is_all(const XBOX_ANSI_STRING *mask)
+{
+    return mask->Length == 3 && !memcmp(mask->Buffer, "*.*", 3);
+}
+
+/* The name after the fixed fields, and the status. A name longer than the
+ * buffer is cut to fit and the call says STATUS_BUFFER_OVERFLOW, as NT does
+ * for one entry, with FileNameLength still the full length. It used to
+ * leave the name out entirely and report success, with Information past the
+ * end of the caller's buffer. */
+static NTSTATUS dirinfo_finish(PXBOX_FILE_DIRECTORY_INFORMATION entry, ULONG Length,
+                               const char *name, int name_len,
+                               PXBOX_IO_STATUS_BLOCK IoStatusBlock)
+{
+    ULONG room = Length - XBOX_DIRINFO_HEADER;   /* Length >= header: checked */
+    ULONG copy = (ULONG)name_len <= room ? (ULONG)name_len : room;
+    NTSTATUS st = copy < (ULONG)name_len ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+
+    entry->FileNameLength = (ULONG)name_len;
+    if (copy)
+        memcpy(entry->FileName, name, copy);
+    IoStatusBlock->Status = st;
+    IoStatusBlock->Information = XBOX_DIRINFO_HEADER + copy;
+    return st;
 }
 
 #if defined(_WIN32)
@@ -428,11 +473,14 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     return STATUS_UNSUCCESSFUL;
 }
 
+static void dir_context_release(HANDLE FileHandle);
+
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         overwrite_settle(Handle);
+        dir_context_release(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -724,6 +772,28 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
 
+/* The handle is being closed: its enumeration ends with it. An enumeration
+ * the title stopped before STATUS_NO_MORE_FILES used to stay in the table,
+ * keyed by a handle value the host hands out again, so the next directory
+ * opened under that value continued the old listing with the old mask; see
+ * the POSIX version. */
+static void dir_context_release(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init)
+        return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].file_handle == FileHandle && s_dir_contexts[i].find_handle) {
+            if (s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+                FindClose(s_dir_contexts[i].find_handle);
+            s_dir_contexts[i].find_handle = NULL;
+            s_dir_contexts[i].file_handle = NULL;
+            s_dir_contexts[i].first_done = FALSE;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
 static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 {
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
@@ -764,6 +834,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
         return STATUS_INVALID_INFO_CLASS;
     }
+    /* Too small for the fixed part: refused before an entry is consumed. */
+    if (Length < XBOX_DIRINFO_HEADER) {
+        IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
 
     ctx = find_or_create_dir_context(FileHandle, TRUE);
     if (!ctx)
@@ -785,7 +860,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
+        if (FileName && FileName->Buffer && !dirinfo_mask_is_all(FileName)) {
             WCHAR pattern_wide[MAX_PATH];
             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                 pattern_wide, MAX_PATH);
@@ -842,15 +917,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->EndOfFile.QuadPart = ((LONGLONG)ctx->find_data.nFileSizeHigh << 32) | ctx->find_data.nFileSizeLow;
     entry->AllocationSize.QuadPart = (entry->EndOfFile.QuadPart + 4095) & ~4095LL;
     entry->FileAttributes = ctx->find_data.dwFileAttributes;
-    entry->FileNameLength = name_len;
-    {
-        ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
-        if (name_len > 0 && (header_size + name_len) <= Length)
-            memcpy(entry->FileName, filename_ansi, name_len);
-        IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = header_size + name_len;
-    }
-    return STATUS_SUCCESS;
+    return dirinfo_finish(entry, Length, filename_ansi, name_len > 0 ? name_len : 0,
+                          IoStatusBlock);
 }
 
 
@@ -1201,11 +1269,14 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     return STATUS_SUCCESS;
 }
 
+static void dir_context_release(HANDLE FileHandle);
+
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         overwrite_settle(w32_handle_fd(Handle));
+        dir_context_release(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1537,6 +1608,36 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
 
+/* The handle is being closed: its enumeration ends with it.
+ *
+ * An enumeration the title stops early (XAPI's save-game search reads the
+ * U: root until it has what it wants, then closes the handle) used to stay
+ * here, keyed by the handle value, with its DIR still open. The host hands
+ * that value out again, so a later NtQueryDirectoryFile on another directory
+ * opened under it continued the old root listing, and its own mask was never
+ * read: Burnout 3's autosave asked its save folder for "Profile 1", got
+ * STATUS_NO_MORE_FILES and showed "Autosave Failed", so the records and
+ * totals of that session were never written, or were, depending on which
+ * handle values earlier listings happened to leave behind. Sixty-four
+ * abandoned listings also filled the table for good. NT ties the scan to the
+ * file object, which the close destroys (Cxbx-Reloaded passes it through to
+ * the host's NtQueryDirectoryFile on the handle for the same reason). */
+static void dir_context_release(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init)
+        return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].handle == FileHandle) {
+            if (s_dir_contexts[i].dir)
+                closedir(s_dir_contexts[i].dir);
+            s_dir_contexts[i].dir = NULL;
+            s_dir_contexts[i].handle = NULL;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
@@ -1550,6 +1651,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     if (FileInformationClass != XboxFileDirectoryInformation) {
         IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
         return STATUS_INVALID_INFO_CLASS;
+    }
+    /* Too small for the fixed part: refused before an entry is consumed. */
+    if (Length < XBOX_DIRINFO_HEADER) {
+        IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+        return STATUS_INFO_LENGTH_MISMATCH;
     }
 
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
@@ -1577,7 +1683,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
-        if (FileName && FileName->Buffer && FileName->Length > 0) {
+        if (FileName && FileName->Buffer && FileName->Length > 0
+            && !dirinfo_mask_is_all(FileName)) {
             USHORT n = FileName->Length;
             if (n >= sizeof(ctx->pattern)) n = sizeof(ctx->pattern) - 1;
             memcpy(ctx->pattern, FileName->Buffer, n);
@@ -1607,8 +1714,12 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             break;
     }
 
+    /* The name is copied while the lock is held: the dirent lives in the
+     * DIR's buffer, which the next caller's readdir or closedir reuses. */
+    char name[256];
     char full[MAX_PATH];
-    snprintf(full, sizeof(full), "%s/%s", dpath ? dpath : ".", de->d_name);
+    snprintf(name, sizeof(name), "%s", de->d_name);
+    snprintf(full, sizeof(full), "%s/%s", dpath ? dpath : ".", name);
     if (stat(full, &st) != 0)
         memset(&st, 0, sizeof(st));
     LeaveCriticalSection(&s_dir_cs);
@@ -1616,7 +1727,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     PXBOX_FILE_DIRECTORY_INFORMATION entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
     memset(entry, 0, Length);
 
-    int name_len = (int)strlen(de->d_name);
+    int name_len = (int)strlen(name);
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;
     unix_to_filetime(st.st_ctime, 0, &entry->CreationTime);
@@ -1626,14 +1737,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->EndOfFile.QuadPart = st.st_size;
     entry->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
     entry->FileAttributes = mode_to_xbox_attrs(st.st_mode);
-    entry->FileNameLength = name_len;
-
-    ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
-    if (name_len > 0 && (header_size + (ULONG)name_len) <= Length)
-        memcpy(entry->FileName, de->d_name, name_len);
-    IoStatusBlock->Status = STATUS_SUCCESS;
-    IoStatusBlock->Information = header_size + name_len;
-    return STATUS_SUCCESS;
+    return dirinfo_finish(entry, Length, name, name_len, IoStatusBlock);
 }
 
 #endif /* _WIN32 */
