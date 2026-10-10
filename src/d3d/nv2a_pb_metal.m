@@ -240,7 +240,27 @@ static id<MTLRenderCommandEncoder> s_enc;      /* open pass, or nil */
 static int                         s_failed;
 static int                         s_unified;  /* shared textures readable */
 
-/* Vertex and index rings, reset after every wait (flip or overflow). */
+/* Frames in flight (BO-57). The flip commits the frame and goes on without
+ * waiting for it; the GPU draws frame N while the executor builds N+1. What
+ * the CPU writes for a frame and the GPU reads later -- the vertex and index
+ * rings -- is one set per frame slot, and a slot is reused only once the
+ * frame that last used it has completed: the wait moves from the end of
+ * this frame to the start of the one after next, and is usually free by
+ * then. UnleashedRecomp does the same with NUM_FRAMES = 2
+ * (UnleashedRecomp/gpu/video.cpp: per-frame command lists, upload buffers
+ * and a fence waited on before the slot is reused). Everything else the
+ * CPU touches is made new (textures, targets), read only after an explicit
+ * wait (write-back, readback), or tracked per command buffer (visibility
+ * slots). RECOMP_DEBUG=metal_frames=1 waits at every flip as before. */
+#define NUM_FRAMES 2
+static id<MTLBuffer>        s_vbf[NUM_FRAMES], s_ibf[NUM_FRAMES];
+static id<MTLCommandBuffer> s_frame_cmd[NUM_FRAMES];  /* each slot's last commit */
+static int                  s_frame;                   /* the slot being built */
+static int                  s_frames = -1;             /* in flight: 1 or 2 */
+static uint64_t             s_frame_waits;             /* advances that blocked */
+
+/* The current slot's vertex and index rings, reset after every wait (a slot
+ * reuse or an overflow). */
 static id<MTLBuffer> s_vb, s_ib;
 static NSUInteger    s_vb_size, s_vb_pos, s_ib_size, s_ib_pos;
 
@@ -370,16 +390,23 @@ static void flush(int wait)
 {
     end_encoder();
     if (!s_cmd) {
-        if (wait) {            /* nothing in flight: the rings are free */
+        if (wait) {
+            /* Nothing open, but the last commit (a GET_REPORT's, the
+             * flip's) may still read the rings: wait for it first. */
+            if (s_last_cmd && [s_last_cmd status] < MTLCommandBufferStatusCompleted)
+                [s_last_cmd waitUntilCompleted];
             s_vb_pos = 0;
             s_ib_pos = 0;
             s_flushes++;
+            occ_after_wait();
         }
         return;
     }
     [s_cmd commit];
     [s_last_cmd release];
     s_last_cmd = [s_cmd retain];
+    [s_frame_cmd[s_frame] release];
+    s_frame_cmd[s_frame] = [s_cmd retain];
     if (wait) {
         [s_cmd waitUntilCompleted];
         if ([s_cmd status] == MTLCommandBufferStatusError) {
@@ -398,6 +425,46 @@ static void flush(int wait)
     s_flushes++;
     if (wait)
         occ_after_wait();
+}
+
+static int frames_in_flight(void)
+{
+    if (s_frames < 0) {
+        const char *e = recomp_env(RENV_METAL_FRAMES);
+        int n = e ? atoi(e) : NUM_FRAMES;
+        s_frames = n < 1 ? 1 : n > NUM_FRAMES ? NUM_FRAMES : n;
+    }
+    return s_frames;
+}
+
+static void occ_retire_poll(void);
+
+/* At the flip, after its commit: the next frame takes the other slot, once
+ * the frame that last used it is done (the only wait left in a flip). */
+static void frame_advance(void)
+{
+    id<MTLCommandBuffer> c;
+
+    if (frames_in_flight() < 2) {
+        flush(1);
+        return;
+    }
+    flush(0);
+    s_frame = (s_frame + 1) % NUM_FRAMES;
+    c = s_frame_cmd[s_frame];
+    if (c) {
+        if ([c status] < MTLCommandBufferStatusCompleted) {
+            [c waitUntilCompleted];
+            s_frame_waits++;
+        }
+        [c release];
+        s_frame_cmd[s_frame] = nil;
+    }
+    s_vb = s_vbf[s_frame];
+    s_ib = s_ibf[s_frame];
+    s_vb_pos = 0;
+    s_ib_pos = 0;
+    occ_retire_poll();
 }
 
 static void ensure_cmd(void)
@@ -519,11 +586,18 @@ static int init(void)
          * per index at most. */
         s_vb_size = 16u << 20;
         s_ib_size = NV_MAX_INDICES * 3u * 4u;
-        s_vb = [s_dev newBufferWithLength:s_vb_size options:MTLResourceStorageModeShared];
-        s_ib = [s_dev newBufferWithLength:s_ib_size options:MTLResourceStorageModeShared];
+        for (int k = 0; k < NUM_FRAMES; k++) {
+            s_vbf[k] = [s_dev newBufferWithLength:s_vb_size
+                                          options:MTLResourceStorageModeShared];
+            s_ibf[k] = [s_dev newBufferWithLength:s_ib_size
+                                          options:MTLResourceStorageModeShared];
+        }
+        s_vb = s_vbf[0];
+        s_ib = s_ibf[0];
         s_vis = [s_dev newBufferWithLength:VIS_SLOTS * 8u
                                    options:MTLResourceStorageModeShared];
-        if (!s_vb || !s_ib || !s_vis) {
+        if (!s_vbf[0] || !s_ibf[0] || !s_vbf[NUM_FRAMES - 1] || !s_ibf[NUM_FRAMES - 1]
+                || !s_vis) {
             fprintf(stderr, LOGP "buffer creation failed\n");
             return 0;
         }
@@ -2499,7 +2573,11 @@ static OccQuery         *s_qfree;
 static int               s_qmade;
 static unsigned char     s_vis_used[VIS_SLOTS];
 static int               s_vis_next;
-static int               s_retire[VIS_SLOTS], s_nretire;
+/* Slots of queries freed while their command buffer was in flight: free
+ * once it completes (occ_retire_poll, at each frame advance) or at a full
+ * wait (occ_after_wait). */
+static struct { int slot; id<MTLCommandBuffer> cmd; } s_retire[VIS_SLOTS];
+static int               s_nretire;
 static struct nv2a_occ   s_occ;
 static int               s_occ_mode = -1;  /* 0 defer, 1 sync, 2 fixed */
 static uint64_t          s_occ_ovf;
@@ -2599,8 +2677,11 @@ static void occ_put(void *ctx, void *qv)
     for (i = 0; i < q->n; i++) {
         if (cmd_done(q->cmd[i]))
             s_vis_used[q->slot[i]] = 0;
-        else
-            s_retire[s_nretire++] = q->slot[i];
+        else {
+            s_retire[s_nretire].slot = q->slot[i];
+            s_retire[s_nretire].cmd = [q->cmd[i] retain];
+            s_nretire++;
+        }
         [q->cmd[i] release];
     }
     q->n = 0;
@@ -2725,11 +2806,32 @@ static void metal_on_poll(void)
     }
 }
 
-/* After the flip's wait every command buffer is done: retired slots free. */
+/* After a full wait every command buffer is done: retired slots free. */
 static void occ_after_wait(void)
 {
-    while (s_nretire)
-        s_vis_used[s_retire[--s_nretire]] = 0;
+    while (s_nretire) {
+        s_nretire--;
+        s_vis_used[s_retire[s_nretire].slot] = 0;
+        [s_retire[s_nretire].cmd release];
+    }
+    if (s_occ.ops)
+        nv2a_occ_poll(&s_occ, 0);
+}
+
+/* At a frame advance: the retired slots whose command buffer is done, and
+ * the reports that completed meanwhile. */
+static void occ_retire_poll(void)
+{
+    int i, n = 0;
+    for (i = 0; i < s_nretire; i++) {
+        if (cmd_done(s_retire[i].cmd)) {
+            s_vis_used[s_retire[i].slot] = 0;
+            [s_retire[i].cmd release];
+        } else {
+            s_retire[n++] = s_retire[i];
+        }
+    }
+    s_nretire = n;
     if (s_occ.ops)
         nv2a_occ_poll(&s_occ, 0);
 }
@@ -2779,17 +2881,27 @@ static void prof_flip_end(uint64_t t_flip0)
     int i;
     if (!prof_on())
         return;
-    for (i = 0; i < s_prof_ncmd; i++) {
-        id<MTLCommandBuffer> c = s_prof_cmd[i];
-        if ([c status] == MTLCommandBufferStatusCompleted) {
-            CFTimeInterval a = [c GPUStartTime], b = [c GPUEndTime];
-            if (b > a)
-                s_pa.gpu += (uint64_t)((b - a) * 1e9);
+    {
+        /* With frames in flight a command buffer may still run: it is
+         * counted at a later flip, once complete. */
+        int n = 0;
+        for (i = 0; i < s_prof_ncmd; i++) {
+            id<MTLCommandBuffer> c = s_prof_cmd[i];
+            MTLCommandBufferStatus st = [c status];
+            if (st < MTLCommandBufferStatusCompleted && s_prof_ncmd < PROF_CMDS) {
+                s_prof_cmd[n++] = c;
+                continue;
+            }
+            if (st == MTLCommandBufferStatusCompleted) {
+                CFTimeInterval a = [c GPUStartTime], b = [c GPUEndTime];
+                if (b > a)
+                    s_pa.gpu += (uint64_t)((b - a) * 1e9);
+            }
+            s_pa.ncmd++;
+            [c release];
         }
-        [c release];
+        s_prof_ncmd = n;
     }
-    s_pa.ncmd += (uint64_t)s_prof_ncmd;
-    s_prof_ncmd = 0;
     s_pa.flip += prof_now() - t_flip0;
     if (++s_pa.n == 300) {
         double n = (double)s_pa.n;
@@ -2838,14 +2950,20 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
             wb = rt && addr && pitch && pitch >= rt->w * 2u && always;
             if (rt && (wb || (win && !layer)))
                 rt_managed_sync(rt);
+            /* The CPU reads this frame only for a write-back or the
+             * readback window: then it waits, else the frame stays in
+             * flight (frame_advance below). */
             t = prof_t();
-            flush(1);
+            if (wb || (win && !layer))
+                flush(1);
+            else
+                flush(0);
             prof_add(&s_pa.wait, t);
             if (layer) {
-                /* After the wait, in a command buffer of its own that nobody
-                 * waits for: the flip's wait never includes the copy, nor a
-                 * present pass still reading the slot (tracked hazards order
-                 * the two on the GPU). Published once committed, so the main
+                /* After the frame's commit, in a command buffer of its own
+                 * that nobody waits for: the queue runs it after the frame,
+                 * and tracked hazards order it against a present pass still
+                 * reading the slot. Published once committed, so the main
                  * thread's pass that shows it is committed after it. */
                 t = prof_t();
                 slot = (id<MTLTexture>)xbox_FramebufferWindowBackTexture(hcw, hch);
@@ -2882,6 +3000,9 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 if (addr == rt->addr && pitch == rt->pitch)
                     rt_own_reset(rt);
             }
+            t = prof_t();
+            frame_advance();
+            prof_add(&s_pa.wait, t);
         }
     }
     s_presents++;
@@ -2894,7 +3015,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 " shaders %llu vs + %llu fs, %llu compile errors;"
                 " %llu z-clears, %llu depth draws, %llu rt binds (%llu self copies);"
                 " %llu window presents (%s); %llu flushes,"
-                " %llu at GET_REPORT\n",
+                " %llu at GET_REPORT; %d frames in flight, %llu slot waits\n",
                 (unsigned long long)s_presents, surface_offset,
                 rt ? "drawn here" : "guest bytes",
                 (unsigned long long)s_clears, (unsigned long long)s_draws,
@@ -2910,7 +3031,8 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_rtt_binds, (unsigned long long)s_self_copies,
                 (unsigned long long)s_window_presents,
                 s_layer ? "CAMetalLayer slots" : "texture readback",
-                (unsigned long long)s_flushes, (unsigned long long)s_report_commits);
+                (unsigned long long)s_flushes, (unsigned long long)s_report_commits,
+                frames_in_flight(), (unsigned long long)s_frame_waits);
     if (!always && rt && addr && pitch)
         guard_flip(addr, pitch * rt->h);
     if (!pitch || !addr || layer) {
