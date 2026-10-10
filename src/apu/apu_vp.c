@@ -496,6 +496,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         d->vp.hrtf_submix[1] = (uint8_t)((argument >> 8) & 0x1f);
         d->vp.hrtf_submix[2] = (uint8_t)((argument >> 16) & 0x1f);
         d->vp.hrtf_submix[3] = (uint8_t)((argument >> 24) & 0x1f);
+        if (recomp_env_on(RENV_AUDIO_CHANNELS))
+            fprintf(stderr, "[AUDIO-CH] HRTF submixes %u,%u,%u,%u (3D voices'"
+                            " first four bins)\n",
+                    d->vp.hrtf_submix[0], d->vp.hrtf_submix[1],
+                    d->vp.hrtf_submix[2], d->vp.hrtf_submix[3]);
         break;
 
     case NV1BA0_PIO_SET_HRTF_HEADROOM:
@@ -775,6 +780,8 @@ struct VpVoiceStat {
     uint32_t addr, fmt;
     uint16_t vol0, vol1;
     uint8_t  bin0, bin1;
+    uint8_t  bins[8];                   /* all eight, 3D's first four HRTF */
+    uint16_t vols[8];                   /* and their volumes (attenuation) */
     const char *cls;
 };
 static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
@@ -787,7 +794,9 @@ static char s_vdump_prefix[512];
 static void vp_stat_init(void)
 {
     const char *e;
-    s_vstat_on = recomp_env_on(RENV_APU_TRACE);
+    /* RECOMP_TRACE=audio_channels too: which bins each voice feeds is half
+     * of what that trace is for. */
+    s_vstat_on = recomp_env_on(RENV_APU_TRACE) || recomp_env_on(RENV_AUDIO_CHANNELS);
     e = recomp_env(RENV_APU_VOICE_DUMP);
     if (e && *e) {
         const char *path = recomp_env(RENV_APU_VOICE_DUMP_FILE);
@@ -862,7 +871,8 @@ static void vp_stat_report(void)
         if (!s->frames) continue;
         fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
                 " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
-                " frames=%u rms=%.0f zcr=%.2f\n",
+                " frames=%u rms=%.0f zcr=%.2f bins=%u,%u,%u,%u,%u,%u,%u,%u"
+                " vols=%03X,%03X,%03X,%03X,%03X,%03X,%03X,%03X%s\n",
                 secs, v, s->fmt,
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) != 0),
@@ -871,7 +881,12 @@ static void vp_stat_report(void)
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK)),
                 s->rate, s->ea, s->vol0, s->vol1, s->bin0, s->bin1, s->addr,
                 s->cls ? s->cls : "?", s->frames,
-                sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
+                sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames,
+                s->bins[0], s->bins[1], s->bins[2], s->bins[3],
+                s->bins[4], s->bins[5], s->bins[6], s->bins[7],
+                s->vols[0], s->vols[1], s->vols[2], s->vols[3],
+                s->vols[4], s->vols[5], s->vols[6], s->vols[7],
+                v < MCPX_HW_MAX_3D_VOICES ? " 3d" : "");
         s->frames = 0; s->zc = 0; s->sq = 0;
     }
     if (s_vdump) fflush(s_vdump);
@@ -1528,6 +1543,10 @@ static void voice_process(MCPXAPUState *d,
     s_vstat[v].rate = rate;
     s_vstat[v].vol0 = vol[0]; s_vstat[v].vol1 = vol[1];
     s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
+    for (int i = 0; i < 8; i++) {
+        s_vstat[v].bins[i] = (uint8_t)bin[i];
+        s_vstat[v].vols[i] = vol[i];
+    }
 
     if (voice_should_mute(v)) return;
 

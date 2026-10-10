@@ -3,7 +3,9 @@
  *
  * Writes exactly the samples handed to the host device -- 48 kHz, 16-bit
  * stereo, after the mixdown, tone and software mixer -- so what a check reads
- * is what was played.
+ * is what was played. In 5.1 (apu_wav_set_channels(6)) it is six channels,
+ * FL FR FC LFE SL SR, what the title mixed, before any fold to a stereo
+ * device.
  *
  * The header is valid at every point a run can end: it is rewritten with the
  * current sizes once per second of audio (so a hard kill loses at most the
@@ -24,7 +26,12 @@
  * open while one is active is refused (returns 0). */
 int  apu_wav_open(const char *path, double max_secs);
 
-/* Append `count` stereo sample frames (interleaved L/R). No-op when closed. */
+/* 2 (the default) or 6 channels a sample frame; before apu_wav_open, ignored
+ * while a dump is open. */
+void apu_wav_set_channels(int channels);
+
+/* Append `count` sample frames (interleaved, the channel count above).
+ * No-op when closed. */
 void apu_wav_write(const int16_t *samples, int count);
 
 /* Finalise the header and close. Safe to call more than once and from any

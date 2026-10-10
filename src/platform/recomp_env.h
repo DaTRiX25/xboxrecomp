@@ -107,7 +107,7 @@ extern "C" {
     X(AUDIO_VOLUME,      CONFIG, "RECOMP_AUDIO_VOLUME",      NULL, "master volume of the title's audio, 0..1 (default 1)") \
     X(AUDIO_MUTE,        CONFIG, "RECOMP_AUDIO_MUTE",        NULL, "1: no sound") \
     X(AUDIO_MUTE_BG,     CONFIG, "RECOMP_AUDIO_MUTE_BG",     NULL, "1: no sound while the window is in the background") \
-    X(AUDIO_SPEAKERS,    CONFIG, "RECOMP_AUDIO_SPEAKERS",    NULL, "speaker mode: auto (default), stereo, 5.1 (5.1 is not implemented yet: BO-76)") \
+    X(AUDIO_SPEAKERS,    CONFIG, "RECOMP_AUDIO_SPEAKERS",    NULL, "speaker mode: auto (default: 5.1 when the default output has 6+ channels), stereo, 5.1") \
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
     X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \
     X(SETTINGS_FILE,     CONFIG, "RECOMP_SETTINGS",          NULL, "the overlay's settings file: a path, or none (default: <save dir>/settings.toml)") \
@@ -154,6 +154,7 @@ extern "C" {
     X(IRQL_TRACE,        TRACE, "irql",            "RECOMP_IRQL_TRACE",        "first IRQL transitions") \
     X(APU_TRACE,         TRACE, "apu",             "RECOMP_APU_TRACE",         "APU register and frame trace; [APU-IRQ] line every 5 s") \
     X(AUDIO_HOST,        TRACE, "audio_host",      NULL,                       "host audio playback vs wall clock; [AUDIO-HOST] starve lines (on with apu)") \
+    X(AUDIO_CHANNELS,    TRACE, "audio_channels",  NULL,                       "level of every APU mixbin and output channel, once a second: [AUDIO-CH]") \
     X(APU_RING,          TRACE, "apu_ring",        NULL,                       "looping APU buffers refilled by the title: [APU-RING] lead and stale-lap replays") \
     X(MMIO_TRACE,        TRACE, "mmio",            NULL,                       "trapped vs direct device-register accesses by device, register and host PC; [MMIO] block every 10 s") \
     X(USB_TRACE,         TRACE, "usb",             "RECOMP_USB_TRACE",         "OHCI trace") \

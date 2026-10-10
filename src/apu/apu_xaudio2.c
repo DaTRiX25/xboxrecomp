@@ -69,6 +69,23 @@ static ULONGLONG g_xa2_underrun_logged;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 
+/* XAudio2 here stays stereo: a title mixing 5.1 is folded down before it
+ * is submitted (apu_core.c). */
+int xa2_probe_channels(void)
+{
+    return 0;
+}
+
+void xa2_request_channels(int title_channels)
+{
+    (void)title_channels;
+}
+
+int xa2_channels(void)
+{
+    return XA2_CHANNELS;
+}
+
 int xa2_init(void)
 {
     HRESULT hr;

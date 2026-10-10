@@ -23,9 +23,11 @@
  */
 
 #include "apu_state.h"
+#include "apu_speakers.h"
 #include "recomp_env.h"
 #include "fpconv.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -188,6 +190,75 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
     (void)d;
 }
 
+/* The bin -> speaker map of the 5.1 path (apu_speakers.c): DirectSound's
+ * layout unless the title's wiring set its own. Read once a frame; set
+ * before the APU starts. */
+static apu_spk_map s_spk_map;
+static int s_spk_map_set;
+
+void mcpx_apu_set_speaker_map(const int8_t map[32])
+{
+    memcpy(s_spk_map, map, sizeof(s_spk_map));
+    s_spk_map_set = 1;
+}
+
+/* RECOMP_TRACE=audio_channels: what reaches each mixbin and each output
+ * channel, once a second (1500 frames of 32 samples):
+ *
+ *   [AUDIO-CH] t=12s layout=5.1 bins 0=-31.2 1=-30.8 4=-40.1 ... (dBFS RMS)
+ *   [AUDIO-CH] t=12s out FL=-29.0 FR=-28.7 FC=-90 LFE=-90 SL=-38.2 SR=-37.9
+ *
+ * Bins that stayed silent are left out. Off: one branch a frame. */
+static int s_ch_trace = -1;
+static double s_ch_bin_sq[NUM_MIXBINS];
+static double s_ch_out_sq[APU_SPK_CHANNELS];
+static unsigned s_ch_frames, s_ch_secs;
+
+static double ch_db(double sq, double n)
+{
+    return sq > 0 ? 10.0 * log10(sq / n) : -90.0;
+}
+
+static void ch_trace(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
+                     const int16_t *out, int nch)
+{
+    char line[1024];
+    int len = 0;
+    double n;
+
+    for (int b = 0; b < NUM_MIXBINS; b++)
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            s_ch_bin_sq[b] += (double)mixbins[b][i] * mixbins[b][i];
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        for (int c = 0; c < nch; c++) {
+            double x = out[i * nch + c] / 32768.0;
+            s_ch_out_sq[c] += x * x;
+        }
+    if (++s_ch_frames < 1500)
+        return;
+
+    n = (double)s_ch_frames * NUM_SAMPLES_PER_FRAME;
+    s_ch_secs++;
+    for (int b = 0; b < NUM_MIXBINS; b++)
+        if (s_ch_bin_sq[b] > 0 && len < (int)sizeof(line) - 16)
+            len += snprintf(line + len, sizeof(line) - len, " %d=%.1f", b,
+                            ch_db(s_ch_bin_sq[b], n));
+    fprintf(stderr, "[AUDIO-CH] t=%us layout=%s bins%s\n", s_ch_secs,
+            nch == APU_SPK_CHANNELS ? "5.1" : "stereo", len ? line : " (silent)");
+    if (nch == APU_SPK_CHANNELS)
+        fprintf(stderr, "[AUDIO-CH] t=%us out FL=%.1f FR=%.1f FC=%.1f LFE=%.1f"
+                        " SL=%.1f SR=%.1f\n", s_ch_secs,
+                ch_db(s_ch_out_sq[0], n), ch_db(s_ch_out_sq[1], n),
+                ch_db(s_ch_out_sq[2], n), ch_db(s_ch_out_sq[3], n),
+                ch_db(s_ch_out_sq[4], n), ch_db(s_ch_out_sq[5], n));
+    else
+        fprintf(stderr, "[AUDIO-CH] t=%us out L=%.1f R=%.1f\n", s_ch_secs,
+                ch_db(s_ch_out_sq[0], n), ch_db(s_ch_out_sq[1], n));
+    memset(s_ch_bin_sq, 0, sizeof(s_ch_bin_sq));
+    memset(s_ch_out_sq, 0, sizeof(s_ch_out_sq));
+    s_ch_frames = 0;
+}
+
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -206,6 +277,28 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      */
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+
+    if (s_ch_trace < 0)
+        s_ch_trace = recomp_env_on(RENV_AUDIO_CHANNELS);
+
+    /* 5.1: the six speaker feeds (apu_speakers.c), and the stereo fold
+     * below is not run at all, so the stereo path is the same code it
+     * always was. */
+    if (d->monitor.channels == APU_SPK_CHANNELS &&
+        d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        if (!s_spk_map_set) {
+            apu_spk_default_map(s_spk_map);
+            s_spk_map_set = 1;
+        }
+        apu_spk_mix51(&mixbins[0][0], NUM_SAMPLES_PER_FRAME, s_spk_map,
+                      &d->monitor.frame_buf6[off], NUM_SAMPLES_PER_FRAME);
+        if (s_ch_trace)
+            ch_trace((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins,
+                     &d->monitor.frame_buf6[off][0], APU_SPK_CHANNELS);
+        g_dbg.gp.cycles = 0;
+        g_dbg.ep.cycles = 0;
+        return;
+    }
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -259,6 +352,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
         }
+        if (s_ch_trace)
+            ch_trace((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins,
+                     &d->monitor.frame_buf[off][0], 2);
     }
 
     g_dbg.gp.cycles = 0;

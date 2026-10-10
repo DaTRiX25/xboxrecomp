@@ -36,6 +36,19 @@ double apu_hook_fault_bench(unsigned n);
  * variable is unset, or off Windows). */
 void apu_hook_trace_start(void);
 
+/* The speaker layout the title mixes for, 2 or 6 (RECOMP_AUDIO_SPEAKERS,
+ * decided when the APU comes up), and the dashboard audio word (XC_AUDIO)
+ * that tells the title so: 0 for stereo, SURROUND | ENABLE_AC3 for 5.1. */
+int mcpx_apu_title_channels(void);
+uint32_t mcpx_apu_xc_audio(void);
+
+/* Which speaker each of the 32 mixbins feeds in 5.1, 0..5 = FL FR FC LFE
+ * SL SR, -1 = left out (apu_speakers.h). Without it: DirectSound's layout,
+ * the FX sends folded to the front pair. A title that mixes its 5.1 sounds
+ * into FX sends routes them with this, as its GP effects image does. Call
+ * before mcpx_apu_init_standalone. */
+void mcpx_apu_set_speaker_map(const int8_t map[32]);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);

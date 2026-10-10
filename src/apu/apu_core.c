@@ -23,6 +23,7 @@
 #include "recomp_env.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
+#include "apu_speakers.h"
 #include "apu_wav.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
@@ -533,6 +534,27 @@ typedef struct {
 
 static WaveOutState g_waveout = { 0 };
 
+/* The layout the title mixes for, 2 or 6; 0 until mcpx_apu_monitor_init
+ * has decided it. The kernel reports it as the dashboard's audio setting
+ * (XC_AUDIO, mcpx_apu_xc_audio), which the title reads during engine start,
+ * after the APU is up. */
+static int g_title_channels;
+
+int mcpx_apu_title_channels(void)
+{
+    /* Asked before the APU came up (or without one): only a forced 5.1 is
+     * 5.1, auto has no device to ask. */
+    if (!g_title_channels)
+        return apu_spk_title_channels(
+            apu_spk_parse(recomp_env(RENV_AUDIO_SPEAKERS)), 0);
+    return g_title_channels;
+}
+
+uint32_t mcpx_apu_xc_audio(void)
+{
+    return apu_spk_xc_audio(mcpx_apu_title_channels());
+}
+
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 {
     (void)errp;
@@ -540,7 +562,31 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
-    /* RECOMP_AUDIO_WAV=<path>: dump exactly what the device is given. */
+    /* The speaker layout (RECOMP_AUDIO_SPEAKERS): stereo and 5.1 are what
+     * they say; auto asks the default output for its channel count and
+     * takes 5.1 at six or more. Fixed for the run: the title reads it
+     * once. A forced stereo never asks the device anything. */
+    {
+        const char *e = recomp_env(RENV_AUDIO_SPEAKERS);
+        int mode = apu_spk_parse(e);
+        int probed = mode == APU_SPK_AUTO ? xa2_probe_channels() : 0;
+        g_title_channels = apu_spk_title_channels(mode, probed);
+        d->monitor.channels = g_title_channels;
+        xa2_request_channels(g_title_channels);
+        apu_wav_set_channels(g_title_channels);
+        fprintf(stderr, "[APU] speakers: %s%s -> the title mixes %s"
+                        " (dashboard audio 0x%08X)\n",
+                mode == APU_SPK_AUTO ? "auto" : mode == APU_SPK_51 ? "5.1" : "stereo",
+                mode != APU_SPK_AUTO ? "" : probed > 0
+                    ? (probed >= APU_SPK_CHANNELS ? ", default output has 6+ channels"
+                                                  : ", default output is stereo")
+                    : ", default output did not say",
+                g_title_channels == APU_SPK_CHANNELS ? "5.1" : "stereo",
+                (unsigned)apu_spk_xc_audio(g_title_channels));
+    }
+
+    /* RECOMP_AUDIO_WAV=<path>: dump exactly what the title mixed (in 5.1,
+     * six channels, before any fold to a stereo device). */
     {
         const char *wav = recomp_env(RENV_AUDIO_WAV);
         const char *secs = recomp_env(RENV_AUDIO_WAV_SECS);
@@ -808,6 +854,61 @@ static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
     fill = 0;
 }
 
+/* The 5.1 arm of mcpx_apu_monitor_frame: the six feeds the DSP stage wrote
+ * to frame_buf6, the tone and software mixer (stereo) added to the front
+ * pair, then to the device as they are, or folded to stereo (ITU) when the
+ * device has two channels. */
+static void monitor_frame_51(MCPXAPUState *d)
+{
+    int16_t period[MIXER_FRAME_SAMPLES][APU_SPK_CHANNELS];
+    int16_t extra[MIXER_FRAME_SAMPLES][2];
+    int16_t folded[MIXER_FRAME_SAMPLES][2];
+
+    if (g_audio_muted) {
+        memset(period, 0, sizeof(period));
+    } else {
+        memcpy(period, d->monitor.frame_buf6, sizeof(period));
+        memset(extra, 0, sizeof(extra));
+        if (g_test_tone.active) {
+            for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                extra[i][0] = s;
+                extra[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
+            }
+        }
+        mixer_render(extra, MIXER_FRAME_SAMPLES);
+        for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+            for (int c = 0; c < 2; c++) {
+                int32_t v = (int32_t)period[i][c] + extra[i][c];
+                period[i][c] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+            }
+        }
+    }
+
+    apu_wav_write(&period[0][0], MIXER_FRAME_SAMPLES);
+
+    if (xa2_is_active()) {
+        int ch = xa2_channels();
+        hs_submit(MIXER_FRAME_SAMPLES);
+        if (ch == APU_SPK_CHANNELS) {
+            xa2_submit_samples(&period[0][0], MIXER_FRAME_SAMPLES);
+            return;
+        }
+        apu_spk_downmix((const int16_t (*)[APU_SPK_CHANNELS])period, folded,
+                        MIXER_FRAME_SAMPLES);
+        xa2_submit_samples(&folded[0][0], MIXER_FRAME_SAMPLES);
+        return;
+    }
+    if (g_waveout.initialized) {
+        apu_spk_downmix((const int16_t (*)[APU_SPK_CHANNELS])period, folded,
+                        MIXER_FRAME_SAMPLES);
+        waveout_submit(d, (const int16_t (*)[2])folded);
+    }
+}
+
 /* Called once per 32-sample frame; acts on the last frame of each EP period
  * (8 frames, 256 samples, 5.33 ms).
  *
@@ -825,6 +926,12 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     int16_t extra[MIXER_FRAME_SAMPLES][2];
 
     if ((d->ep_frame_div + 1) % 8) {
+        return;
+    }
+
+    if (d->monitor.channels == APU_SPK_CHANNELS &&
+        d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        monitor_frame_51(d);
         return;
     }
 

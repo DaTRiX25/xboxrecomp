@@ -14,8 +14,23 @@
 #define XA2_BACKEND_NAME "SDL2"
 #endif
 
+/* The speaker layout (apu_speakers.h). Before xa2_init: xa2_probe_channels
+ * brings the backend's audio subsystem up if it has to and returns the
+ * default output's channel count, <= 0 when it cannot be asked;
+ * xa2_request_channels sets the layout the title mixes for (2 or 6), which
+ * xa2_init opens the device for (apu_spk_device_channels). */
+int xa2_probe_channels(void);
+void xa2_request_channels(int title_channels);
+
 /* Initialize the device backend. Returns 1 on success, 0 on failure. */
 int xa2_init(void);
+
+/* The channel count of the open device, 2 or 6: what xa2_submit_samples
+ * takes interleaved. Called by the frame thread once per period, before it
+ * lays out that period; that is also where a default device that came or
+ * went (an SDL audio hotplug event) is acted on, by reopening the device
+ * for the layout the new default takes. Never changes inside a period. */
+int xa2_channels(void);
 
 /* Shut down XAudio2 and release all resources. */
 void xa2_shutdown(void);
@@ -23,7 +38,8 @@ void xa2_shutdown(void);
 /* Returns 1 if XAudio2 is active. */
 int xa2_is_active(void);
 
-/* Submit interleaved stereo 16-bit samples. Returns 1 if accepted. */
+/* Submit interleaved 16-bit samples, xa2_channels() to a sample frame.
+ * Returns 1 if accepted. */
 int xa2_submit_samples(const int16_t *samples, int num_samples);
 
 /* Output gain, 0..1 (master volume, mute): applied to what is submitted from
