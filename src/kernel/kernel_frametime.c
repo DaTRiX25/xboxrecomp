@@ -52,6 +52,15 @@
  *   m_game ... m_runq  the same buckets for the guest-main thread alone
  *                      (the one the executor waits for)
  *
+ * RECOMP_TRACE=frametime_host=<file> says where guest-main's host time
+ * goes: each of its samples in host code also records the host stack (the
+ * frame-record walk on Mach, glibc backtrace() in the Linux handler, as
+ * xbox_crash.c unwinds), and every frame whose m_host reaches
+ * frametime_host_ms (4) is written out with its stacks, identical ones
+ * counted together, each address as symbol+offset where dladdr knows one,
+ * else module+offset (addr2line -e <binary> takes that offset), and a
+ * frame in lifted code as the guest function it came from.
+ *
  * Linux has no thread_suspend/GetThreadContext, so the sampler reads each
  * thread's run state from /proc/self/task/<tid>/stat (R, S, D) and sends a
  * running one SIGPROF; the handler, on that thread, buckets its own
@@ -76,6 +85,7 @@
 #include <pthread.h>
 #elif defined(__linux__)
 #include <pthread.h>
+#include <execinfo.h>
 #include <signal.h>
 #include <ucontext.h>
 #include <fcntl.h>
@@ -118,6 +128,15 @@ static volatile LONG s_main_slot = -1;
 #if defined(__linux__)
 static volatile int64_t s_runq_ns, s_mrunq_ns;
 #endif
+
+/* frametime_host: guest-main's host-code samples this frame, with stacks. */
+#define HS_MAX    512
+#define HS_FRAMES 12
+typedef struct { int n; uintptr_t pc[HS_FRAMES]; } HostStack;
+static FILE *s_hout;
+static unsigned s_host_min = 8;    /* samples: frametime_host_ms / period */
+static HostStack s_hs[HS_MAX];
+static volatile LONG s_hs_n;
 
 static void count_sample(LONG slot, int b)
 {
@@ -277,8 +296,35 @@ static void sample_once(void)
             if (thread_get_state(t, x86_THREAD_STATE64, (thread_state_t)&st, &sc) == KERN_SUCCESS)
                 pc = (uintptr_t)st.__rip;
 #endif
-            thread_resume(t);
             b = bucket_of_pc(pc);
+            if (b == B_HOST && s_hout && i == s_main_slot) {
+                LONG k = InterlockedIncrement(&s_hs_n) - 1;
+                if (k < HS_MAX) {
+                    HostStack *h = &s_hs[k];
+                    uintptr_t fp, lo;
+                    h->n = 0;
+                    h->pc[h->n++] = pc;
+#if defined(__arm64__) || defined(__aarch64__)
+                    h->pc[h->n++] = (uintptr_t)arm_thread_state64_get_lr(st);
+                    fp = (uintptr_t)arm_thread_state64_get_fp(st);
+#else
+                    fp = (uintptr_t)st.__rbp;
+#endif
+                    /* The frame records, as xbox_crash.c's host_frames
+                     * walks them: the thread is stopped, so they hold. */
+                    lo = fp;
+                    while (h->n < HS_FRAMES && fp >= lo && fp - lo < (8u << 20)
+                           && !(fp & 7) && fp) {
+                        uintptr_t next = ((const uintptr_t *)fp)[0];
+                        uintptr_t ret = ((const uintptr_t *)fp)[1];
+                        if (!ret || next <= fp)
+                            break;
+                        h->pc[h->n++] = ret;
+                        fp = next;
+                    }
+                }
+            }
+            thread_resume(t);
         } else {
             continue;
         }
@@ -358,8 +404,27 @@ static void prof_handler(int sig, siginfo_t *si, void *ucv)
 #else
     pc = 0;
 #endif
-    if (t_slot >= 0)
-        count_sample(t_slot, bucket_of_pc(pc));
+    if (t_slot >= 0) {
+        int b = bucket_of_pc(pc);
+        count_sample(t_slot, b);
+        if (b == B_HOST && s_hout && t_slot == s_main_slot) {
+            LONG k = InterlockedIncrement(&s_hs_n) - 1;
+            if (k < HS_MAX) {
+                void *f[HS_FRAMES + 4];
+                HostStack *h = &s_hs[k];
+                int got = backtrace(f, HS_FRAMES + 4), i, skip = 0;
+                /* From the interrupted pc: the frames before it are this
+                 * handler's and the signal trampoline's. */
+                for (i = 0; i < got; i++)
+                    if ((uintptr_t)f[i] == pc) { skip = i; break; }
+                h->n = 0;
+                if (skip == 0)
+                    h->pc[h->n++] = pc;
+                for (i = skip; i < got && h->n < HS_FRAMES; i++)
+                    h->pc[h->n++] = (uintptr_t)f[i];
+            }
+        }
+    }
     errno = e;
 }
 #endif
@@ -412,6 +477,20 @@ static int frametime_on(void)
                 "ex_idle,g_game,g_d3d,g_xdk,g_spin,g_host,g_wait,g_threads,cpu_proc,"
                 "g_io,g_runq,m_game,m_d3d,m_xdk,m_spin,m_host,m_wait,m_io,m_runq\n");
         build_table();
+        {
+            const char *hp = recomp_env(RENV_FRAMETIME_HOST);
+            const char *hm = recomp_env(RENV_FRAMETIME_HOST_MS);
+            double ms = hm ? atof(hm) : 4.0;
+            if (hp && *hp && strcmp(hp, "0") && strcmp(hp, "1")) {
+                s_hout = fopen(hp, "w");
+                if (!s_hout)
+                    fprintf(stderr, "  [FRAMETIME] cannot write %s\n", hp);
+            }
+            if (ms > 0)
+                s_host_min = (unsigned)(ms * 1000.0 / s_period_us + 0.5);
+            if (!s_host_min)
+                s_host_min = 1;
+        }
 #if defined(__APPLE__)
         {
             pthread_t th;
@@ -473,6 +552,77 @@ void xbox_FrametimeThread(const char *role)
     fprintf(stderr, "  [FRAMETIME] sampling guest thread %s\n", role ? role : "?");
 }
 
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
+
+static void host_addr(FILE *f, uintptr_t pc)
+{
+    int b = bucket_of_pc(pc);
+#if !defined(_WIN32)
+    Dl_info info;
+#endif
+    if (b != B_HOST) {
+        /* Lifted code: the guest function it was lifted from. */
+        size_t lo = 0, hi = s_nfuncs;
+        while (hi - lo > 1) {
+            size_t mid = (lo + hi) / 2;
+            if (s_funcs[mid].host <= pc) lo = mid; else hi = mid;
+        }
+        fprintf(f, " guest:0x%08X", s_funcs[lo].va);
+        return;
+    }
+#if !defined(_WIN32)
+    memset(&info, 0, sizeof info);
+    if (dladdr((void *)pc, &info) && info.dli_sname && info.dli_saddr) {
+        fprintf(f, " %s+0x%lx", info.dli_sname, (unsigned long)(pc - (uintptr_t)info.dli_saddr));
+        return;
+    }
+    if (info.dli_fname && info.dli_fbase) {
+        const char *base = strrchr(info.dli_fname, '/');
+        fprintf(f, " %s+0x%lx", base ? base + 1 : info.dli_fname,
+                (unsigned long)(pc - (uintptr_t)info.dli_fbase));
+        return;
+    }
+#endif
+    fprintf(f, " 0x%llx", (unsigned long long)pc);
+}
+
+/* frametime_host: this frame's stacks, identical ones counted together. */
+static void host_dump(uint32_t flip, double frame_ms, LONG mhost)
+{
+    LONG n = InterlockedExchange(&s_hs_n, 0), i, j;
+    static int seen[HS_MAX];
+    if (!s_hout)
+        return;
+    if (n > HS_MAX)
+        n = HS_MAX;
+    if (mhost < (LONG)s_host_min || n <= 0)
+        return;
+    fprintf(s_hout, "flip %u frame_ms %.2f m_host %.2f stacks %ld\n", flip, frame_ms,
+            mhost * (s_period_us / 1000.0), (long)n);
+    memset(seen, 0, sizeof seen);
+    for (i = 0; i < n; i++) {
+        int count = 1, k;
+        if (seen[i])
+            continue;
+        for (j = i + 1; j < n; j++)
+            if (!seen[j] && s_hs[j].n == s_hs[i].n
+                && !memcmp(s_hs[j].pc, s_hs[i].pc, sizeof(uintptr_t) * (size_t)s_hs[i].n)) {
+                seen[j] = 1;
+                count++;
+            }
+        fprintf(s_hout, "  %3d", count);
+        for (k = 0; k < s_hs[i].n; k++) {
+            if (k)
+                fprintf(s_hout, " <-");
+            host_addr(s_hout, s_hs[i].pc[k]);
+        }
+        fprintf(s_hout, "\n");
+    }
+    fflush(s_hout);
+}
+
 /* At FLIP_STALL, from the executor: its running totals in ns. */
 void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
                         uint64_t scan, uint64_t draw, uint64_t present)
@@ -498,6 +648,8 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
 #else
     rq = mrq = 0;
 #endif
+    if (s_hout)
+        host_dump(flip, last ? (now - last) / 1e6 : 0, m[B_HOST]);
     if (!last) {
         t0 = last = now;
         p_hold = hold; p_scan = scan; p_draw = draw; p_pres = present; p_cpu = cpu;
