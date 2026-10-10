@@ -223,6 +223,9 @@ extern "C" {
     X(PAD_LIVE,          DEBUG, "pad_live",        "RECOMP_PAD_LIVE",          "=file: press each line appended to it (btn[+btn][:hold])") \
     X(PB_REPORT_MS,      TRACE, "pb_report_ms",    "RECOMP_PB_REPORT_MS",      "=ms: [PB] report / fb_dump interval (10000, min 100)") \
     X(DPC_PROF,          TRACE, "dpc",             NULL,                       "[DPCPROF] time per host-run DPC/ISR routine and its waits, under the 600-vblank line") \
+    X(FRAMETIME,         TRACE, "frametime",       NULL,                       "=file: one CSV line per flip: executor hold/busy/draw/present/idle and sampled guest time by section (game, d3d, xdk), spin, host, wait (tools/perf/framestats.py)") \
+    X(FRAMETIME_SPIN,    TRACE, "frametime_spin",  NULL,                       "=va[+va...]: lifted functions whose sampled time counts as spin (a guest busy-wait), not as their section") \
+    X(FRAMETIME_US,      TRACE, "frametime_us",    NULL,                       "=us: guest thread sampling period for frametime (500, min 100)") \
     X(PACING_TRACE,      TRACE, "pacing",          NULL,                       "[PACING] flip intervals, vblank gaps, CPU and spin-wait sites every 600 flips; =all also every flip") \
     X(VBLANK_CLOCK,      DEBUG, "vblank_clock",    NULL,                       "=ms: the old millisecond vblank schedule and timer loop (A/B)") \
     X(MISSING,           TRACE, "missing",         NULL,                       "missing game files, one line each and an exit summary; default on, =0 off, =all also absent directories, other trees, probes, every FAILED repeat and NtOpenFile/IoCreateFile successes") \

@@ -563,6 +563,8 @@ void xbox_GuestThreadPin(const char *role)
     DWORD_PTR mask;
     int core = 0;
 
+    xbox_FrametimeThread(role);   /* RECOMP_TRACE=frametime samples it */
+
 #if !defined(_WIN32)
     if (guest_cpus_token()) {
         static INIT_ONCE once = INIT_ONCE_STATIC_INIT;

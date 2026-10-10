@@ -767,6 +767,11 @@ NTSTATUS __stdcall xbox_NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHan
  * the calling thread on it. */
 DWORD_PTR xbox_GuestCpuMask(void);
 void      xbox_GuestThreadPin(const char *role);
+/* RECOMP_TRACE=frametime (kernel_frametime.c): a guest thread to sample,
+ * and the executor's running totals at each flip (ns). */
+void      xbox_FrametimeThread(const char *role);
+void      xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
+                             uint64_t scan, uint64_t draw, uint64_t present);
 
 /* ============================================================================
  * Synchronization (kernel_sync.c)
