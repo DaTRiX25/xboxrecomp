@@ -596,11 +596,16 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
                 DWORD rc = xbox_InputGetState(0, &probe);
                 last = now;
                 fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
-                        "InputGetState=%lu buttons=0x%04X\n",
+                        "InputGetState=%lu buttons=0x%04X"
+                        " lx=%d ly=%d rx=%d ry=%d\n",
                         recomp_env(RENV_KEYBOARD) ? 1 : 0,
                         xbox_FramebufferKeyDown(0x0D),
                         (unsigned long)rc,
-                        rc == 0 ? probe.Gamepad.wButtons : 0);
+                        rc == 0 ? probe.Gamepad.wButtons : 0,
+                        rc == 0 ? probe.Gamepad.sThumbLX : 0,
+                        rc == 0 ? probe.Gamepad.sThumbLY : 0,
+                        rc == 0 ? probe.Gamepad.sThumbRX : 0,
+                        rc == 0 ? probe.Gamepad.sThumbRY : 0);
                 fflush(stderr);
             }
         }
