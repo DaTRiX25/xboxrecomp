@@ -5662,6 +5662,20 @@ static void flip_pacing_swap(uint32_t param)
     if ((param & 0x1F) != 1)
         return;
     arg = param >> 5;
+    /* RECOMP_TRACE=pacing: say when the title changes its interval. */
+    {
+        static uint32_t last_iv = 1;
+        static int on = -1;
+        if (on < 0) {
+            const char *e = recomp_env(RENV_PACING_TRACE);
+            on = e && *e && *e != '0';
+        }
+        if (on && (arg & 7) != last_iv) {
+            fprintf(stderr, "[PACING] swap interval %u -> %u at flip %u, %lu ms\n",
+                    last_iv, arg & 7, s_gpu.flips, xbox_log_ms());
+            last_iv = arg & 7;
+        }
+    }
     s_pace.iv[arg & 7]++;
     s_pace.imm += (arg & 8) != 0;
     s_pace.swaps++;
