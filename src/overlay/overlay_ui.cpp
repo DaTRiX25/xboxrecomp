@@ -703,14 +703,19 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
         pres_ms = now;
     }
 
-    const float w = fs * 15.0f, h = fs * 6.4f, pad = fs * 0.6f;
+    char l1[128], l2[128];
+    snprintf(l1, sizeof l1, "%.1f fps   %.1f ms", fps, last);
+    snprintf(l2, sizeof l2, "p50 %.1f  p99 %.1f  max %.1f ms   window %.0f/s", p50, p99, mx, pres_rate);
+    /* The panel is as wide as its longer line: a fixed width left the stats
+     * line running past the backdrop at larger values (a 100+ ms max). */
+    const float pad = fs * 0.6f, h = fs * 6.4f;
+    float tw = ImGui::CalcTextSize(l1).x, tw2 = ImGui::CalcTextSize(l2).x;
+    if (tw2 > tw) tw = tw2;
+    const float w = tw + 2 * pad > fs * 15.0f ? tw + 2 * pad : fs * 15.0f;
     ImVec2 a = origin, b(origin.x + w, origin.y + h);
     dl->AddRectFilled(a, b, IM_COL32(8, 8, 10, 200), fs * 0.5f);
-    char buf[128];
-    snprintf(buf, sizeof buf, "%.1f fps   %.1f ms", fps, last);
-    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f), IM_COL32(255, 255, 255, 255), buf);
-    snprintf(buf, sizeof buf, "p50 %.1f  p99 %.1f  max %.1f ms   window %.0f/s", p50, p99, mx, pres_rate);
-    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + fs * 1.15f), IM_COL32(190, 190, 195, 255), buf);
+    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f), IM_COL32(255, 255, 255, 255), l1);
+    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + fs * 1.15f), IM_COL32(190, 190, 195, 255), l2);
 
     /* Bars: the last 120 flip intervals against a 50 ms ceiling; the line
      * is one frame at 60 Hz. */
