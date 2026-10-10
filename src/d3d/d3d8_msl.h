@@ -46,6 +46,7 @@ extern "C" {
     "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n" \
     "    uint4 atest; uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n" \
     "    float4 tex_bias;\n" \
+    "    float4 bump_mat[4]; float4 bump_lum[4];\n" \
     "};\n"
 
 /**

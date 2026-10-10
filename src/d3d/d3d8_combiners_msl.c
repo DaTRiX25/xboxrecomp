@@ -65,6 +65,11 @@ static const char s_rc_helpers[] =
     "    else if (op == 6) x *= 0.5;\n"
     "    return clamp(x, -1.0, 1.0);\n"
     "}\n"
+    /* A UNORM byte read as two's complement, / 127: xemu psh.c sign3. */
+    "float rc_sign8(float x) {\n"
+    "    x *= 255.0;\n"
+    "    return x >= 128.0 ? (x - 256.0) / 127.0 : x / 127.0;\n"
+    "}\n"
     "float3 rc_op3(float3 x, int op) {\n"
     "    return float3(rc_op(x.r, op), rc_op(x.g, op), rc_op(x.b, op));\n"
     "}\n";
@@ -123,6 +128,37 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
         if (m == NV2A_TEXMODE_3D || m == NV2A_TEXMODE_CUBEMAP) {
             EMIT("    x%d = tex%d.sample(samp%d, i.t%d.xyz, bias(pc.tex_bias[%d]));\n",
                  8 + i, i, i, i, i);
+        } else if ((m == NV2A_TEXMODE_BUMPENVMAP || m == NV2A_TEXMODE_BUMPENVMAP_LUM)
+                   && i > 0) {
+            /* xemu psh.c PS_TEXTUREMODES_BUMPENVMAP(_LUM): (du, dv) is the
+             * previous stage's (b, g) as signed bytes -- already in [-1, 1]
+             * when its filter reads them signed (tex_signed), else taken as
+             * two's complement here, as xemu's sign3 -- turned by the stage's
+             * bump matrix (SET_TEXTURE_SET_BUMP_ENV_MAT, column-major as
+             * xemu uploads it) and added to this stage's coordinate. _LUM
+             * then scales the texel by scale * l + offset, l the previous
+             * stage's r. */
+            int p = i - 1, sg = state->tex_signed[p];
+            EMIT("    {\n");
+            if ((sg & 3u) == 3u)
+                EMIT("        float2 dsdt = float2(x%d.b, x%d.g);\n", 8 + p, 8 + p);
+            else
+                EMIT("        float2 dsdt = float2(rc_sign8(x%d.b), rc_sign8(x%d.g));\n",
+                     8 + p, 8 + p);
+            EMIT("        float4 bm = pc.bump_mat[%d];\n", i);
+            EMIT("        dsdt = float2(bm.x * dsdt.x + bm.z * dsdt.y,"
+                 " bm.y * dsdt.x + bm.w * dsdt.y);\n");
+            EMIT("        x%d = tex%d.sample(samp%d, (i.t%d.xy + dsdt) * pc.tex_scale[%d].xy,"
+                 " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i, i);
+            if (m == NV2A_TEXMODE_BUMPENVMAP_LUM) {
+                if (sg & 4u)
+                    EMIT("        float l = x%d.r >= 0.0 ? x%d.r * 0.5 : 1.0 + x%d.r * 0.5;\n",
+                         8 + p, 8 + p, 8 + p);
+                else
+                    EMIT("        float l = x%d.r;\n", 8 + p);
+                EMIT("        x%d *= pc.bump_lum[%d].x * l + pc.bump_lum[%d].y;\n", 8 + i, i, i);
+            }
+            EMIT("    }\n");
         } else {
             EMIT("    {\n");
             EMIT("        float2 uv = i.t%d.xy;\n", i);
@@ -133,6 +169,17 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
             EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy,"
                  " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i);
             EMIT("    }\n");
+        }
+        if (state->tex_signed[i]) {
+            /* BO-45: signed channels (stored + 128, d3d8_combiners_parse.h):
+             * the filtered byte back to two's complement, then / 127 with
+             * -128 at -1, as a signed 8-bit texel reads on the NV2A (xemu
+             * #587 has no support yet; D3D's signed formats map the same). */
+            static const char ch[4] = { 'b', 'g', 'r', 'a' };
+            for (k = 0; k < 4; k++)
+                if (state->tex_signed[i] & (1u << k))
+                    EMIT("    x%d.%c = max((x%d.%c * 255.0 - 128.0) / 127.0, -1.0);\n",
+                         8 + i, ch[k], 8 + i, ch[k]);
         }
         EMIT("    if (pc.alpha_only[%d] != 0u) x%d.rgb = float3(1.0);\n", i, 8 + i);
     }

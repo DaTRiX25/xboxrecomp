@@ -848,6 +848,60 @@ static int inflight_case(const struct nv2a_pb_backend *b)
     return bad != 0;
 }
 
+/* polygon offset (BO-10, Metal): a red quad at z 8e6 written LEQUAL, then
+ * a blue one at the same z tested LESS with POLY_OFFSET_FILL and bias -64
+ * (depth units): the offset pulls it in front, so it draws; without the
+ * offset it is equal and fails. Pre-transformed quads (vs_pass). The CPU
+ * path does not apply polygon offset yet. Returns the failures. */
+static void z_vertex(float x, float y, float z, uint32_t argb)
+{
+    M(0x1818, f2u(x));
+    M(0x1818, f2u(y));
+    M(0x1818, f2u(z));
+    M(0x1818, f2u(1.0f));
+    M(0x1818, argb);
+}
+
+static int poly_offset_case(const struct nv2a_pb_backend *b)
+{
+    static const uint32_t col[2] = {0xFFFF0000u, 0xFF0000FFu};
+    uint32_t got;
+    int a, k;
+
+    nv2a_pb_set_backend(b);
+    surf_clip(BUF0, 0, 0, W, H);
+    M(0x1D8C, 0xFFFFFF00u);
+    M(0x1D90, 0xFF000000u);
+    M(0x1D94, 0xF3);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+    M(0x030C, 1);                          /* DEPTH_TEST_ENABLE */
+    M(0x035C, 1);                          /* DEPTH_MASK */
+    for (k = 0; k < 2; k++) {
+        M(0x0354, k ? 0x201 : 0x203);      /* LESS, then LEQUAL first */
+        M(0x0338, k ? 1u : 0u);            /* POLY_OFFSET_FILL_ENABLE */
+        M(0x0384, f2u(0.0f));              /* factor */
+        M(0x0388, f2u(k ? -64.0f : 0.0f)); /* bias, depth units */
+        M(0x17FC, 8);
+        z_vertex(100.0f, 100.0f, 8.0e6f, col[k]);
+        z_vertex(300.0f, 100.0f, 8.0e6f, col[k]);
+        z_vertex(300.0f, 300.0f, 8.0e6f, col[k]);
+        z_vertex(100.0f, 300.0f, 8.0e6f, col[k]);
+        M(0x17FC, 0);
+    }
+    M(0x0338, 0);
+    M(0x0388, 0);
+    M(0x030C, 0);
+    M(0x0210, BUF1);
+    M(0x0130, 0);
+    b->sync_guest(BUF0, W * 4u, W, H);
+    got = px_at(BUF0, W * 4u, 200, 200);
+    nv2a_pb_set_backend(NULL);
+    fprintf(stderr, "[backend-smoke] polygon offset: 0x%08X (want 0x%08X) %s\n",
+            got, col[1], got == col[1] ? "PASS" : "FAIL");
+    return got != col[1];
+}
+
 static int far_quad_case(const struct nv2a_pb_backend *b, const char *path)
 {
     const uint32_t *px = (const uint32_t *)guest(BUF0);
@@ -1336,6 +1390,8 @@ int main(int argc, char **argv)
         failures += far_quad_case(gpu, "gpu");
     if (gpu == nv2a_pb_metal_backend())
         failures += inflight_case(gpu);
+    if (gpu == nv2a_pb_metal_backend())
+        failures += poly_offset_case(gpu);
 #endif
     if (failures) {
         fprintf(stderr, "[backend-smoke] FAIL: %d of %d scenes\n", failures, SC_COUNT);

@@ -126,6 +126,25 @@ static inline float nv2a_tex_lod_bias(uint32_t f)
     return (float)b / 256.0f;
 }
 
+/* SET_TEXTURE_FILTER's signed channels (NV_PGRAPH_TEXFILTER0_ASIGNED bit
+ * 28, RSIGNED 29, GSIGNED 30, BSIGNED 31, xemu nv2a_regs.h) as the combiner
+ * state's mask: bit 3 A, 2 R, 1 G, 0 B. */
+static inline uint8_t nv2a_tex_signed_mask(uint32_t filter)
+{
+    return (uint8_t)(((filter >> 28) & 1u) << 3 | ((filter >> 29) & 1u) << 2
+                   | ((filter >> 30) & 1u) << 1 | ((filter >> 31) & 1u));
+}
+
+/* The XOR that offsets those channels of a decoded A8R8G8B8 texel by 128:
+ * a signed byte s becomes s + 128, unsigned and in the same order, so a
+ * linear filter over the stored bytes is the filter over the signed values
+ * (the shader takes 128 off again). */
+static inline uint32_t nv2a_tex_signed_xor(uint8_t mask)
+{
+    return ((mask & 8u) ? 0x80000000u : 0u) | ((mask & 4u) ? 0x00800000u : 0u)
+         | ((mask & 2u) ? 0x00008000u : 0u) | ((mask & 1u) ? 0x00000080u : 0u);
+}
+
 /* Cube-map face and its 2D coordinates for direction `c` (xemu, and the
  * D3D face order +X -X +Y -Y +Z -Z); s, t in [0,1] on the face. */
 static inline uint32_t nv2a_cube_face(const float c[3], float *s, float *t)
