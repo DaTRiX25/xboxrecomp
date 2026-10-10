@@ -611,7 +611,13 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  *    before it say nothing about the new mode), a surface at twice it
  *    qualifies instead, with a warning the first time. The runtime does not interleave fields anywhere, so such a
  *    pick shows one field; it beats presenting the buffer about to be drawn. */
-#define PRESENT_MAX 16
+/* Every (surface, extent) pair a frame draws has an entry. Burnout 3's
+ * Crash mode uses 19 a frame: five extents of each back buffer (640x480,
+ * 640x464, 640x463, 639x403, 159x344) and 14 off-screen targets. With 16
+ * the LRU evicted the back buffer not on screen, so the two buffers saw
+ * different largest sizes and the presented extent alternated between
+ * 640x480 and 640x464 every flip: the picture jumped (BO-49). */
+#define PRESENT_MAX 64
 #define PRESENT_STALE_FLIPS 120u
 static struct {
     uint32_t offset, w, h, pitch, format;
@@ -619,6 +625,7 @@ static struct {
     uint64_t last_use, last_draw, last_clear;
 } s_psurf[PRESENT_MAX];
 static uint64_t s_psurf_seq, s_psurf_flip_seq;
+static int s_psurf_last = PRESENT_MAX;   /* present_note's last entry */
 static struct nv2a_pb_present s_present;
 
 /* RECOMP_PRESENT_TRACE=1: the order this frame used its surfaces in (runs of
@@ -637,7 +644,11 @@ static void present_note(int clear)
 
     if (!s_gpu.color_offset || !w || !h)
         return;
-    for (i = 0; i < PRESENT_MAX; i++) {
+    /* Most notes repeat the previous one's surface and extent. */
+    if (s_psurf_last < PRESENT_MAX && s_psurf[s_psurf_last].offset == s_gpu.color_offset
+            && s_psurf[s_psurf_last].w == w && s_psurf[s_psurf_last].h == h)
+        e = s_psurf_last;
+    for (i = 0; e < 0 && i < PRESENT_MAX; i++) {
         if (s_psurf[i].offset == s_gpu.color_offset
                 && s_psurf[i].w == w && s_psurf[i].h == h) {
             e = i;
@@ -653,6 +664,7 @@ static void present_note(int clear)
         s_psurf[e].w = w;
         s_psurf[e].h = h;
     }
+    s_psurf_last = e;
     s_psurf[e].pitch = s_gpu.pitch;
     s_psurf[e].format = s_gpu.format;
     s_psurf[e].last_flip = s_gpu.flips;
