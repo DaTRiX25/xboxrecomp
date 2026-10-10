@@ -116,6 +116,7 @@ the stock settings.
 | `present.aspect` | string | the window's frame shape: `"auto"`, `"frame"`, `"4:3"`, `"16:9"` | `"auto"` | `RECOMP_PRESENT_ASPECT` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
+| `render.shader_cache` | string | the pipeline cache's directory (`"~/..."` is under `$HOME`), or `"none"` for no disk cache | the per-user cache directory: macOS `~/Library/Caches/<executable>`, Linux `$XDG_CACHE_HOME/<executable>`, Windows `%LOCALAPPDATA%\<executable>\cache` | `RECOMP_RENDER_SHADER_CACHE` |
 | `fps.mode` | string | `"lock30"` (stock), `"lock60"`, `"free"` | `"lock30"` | the game's `RECOMP_FPS_MODE` |
 | `fx.glow` | string | `"on"` (stock), `"off"` (BLiNX 2: its post-mode-3 glow pass) | `"on"` | the game's `RECOMP_GLOW` |
 | `fx.glow_intensity` | float | `0.0` to `2.0`, a scale of that glow layer (BLiNX 2) | `1.0` | the game's `RECOMP_GLOW_INTENSITY` |
@@ -241,6 +242,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_PRESENT_ASPECT` | overrides `present.aspect` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 | `RECOMP_PRESENT_PACING` | overrides `present.pacing` |
+| `RECOMP_RENDER_SHADER_CACHE` | overrides `render.shader_cache` |
 
 The layer converts an environment value to the type of the key:
 

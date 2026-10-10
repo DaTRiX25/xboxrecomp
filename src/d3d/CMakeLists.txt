@@ -21,6 +21,7 @@ if(WIN32)
         d3d8_combiners_hlsl.c
         d3d8_vsh_msl.c
         d3d8_combiners_msl.c
+        nv2a_pcache.c
         nv2a_pb_d3d11.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
@@ -49,6 +50,7 @@ else()
         d3d8_combiners_hlsl.c
         d3d8_vsh_msl.c
         d3d8_combiners_msl.c
+        nv2a_pcache.c
     )
     find_package(SDL2 REQUIRED)
     find_package(PkgConfig REQUIRED)
@@ -65,6 +67,17 @@ else()
         # Manual retain/release (no -fobjc-arc); shaders are MSL compiled at
         # runtime, so no metallib build step.
         target_sources(xbox_d3d8 PRIVATE nv2a_pb_metal.m)
+        # The pipeline cache's version key (nv2a_pcache.h): the toolkit
+        # revision at configure time, so a file from another build is dropped.
+        execute_process(COMMAND git describe --always --dirty --abbrev=12
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                        OUTPUT_VARIABLE XR_GIT_REV OUTPUT_STRIP_TRAILING_WHITESPACE
+                        ERROR_QUIET)
+        if(NOT XR_GIT_REV)
+            set(XR_GIT_REV "unknown")
+        endif()
+        set_source_files_properties(nv2a_pb_metal.m PROPERTIES
+            COMPILE_DEFINITIONS "XBOXRECOMP_GIT_REV=\"${XR_GIT_REV}\"")
         target_include_directories(xbox_d3d8 PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_link_libraries(xbox_d3d8 PUBLIC

@@ -5,6 +5,7 @@
 #include "enhance.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "enhance_cfg.h"
@@ -85,6 +86,13 @@ int xbox_enhance_init(const char *root, const char *title)
         aspect = "4:3";
     }
 
+    /* Where the GPU backends keep their pipeline-key list (nv2a_pcache.h):
+     * unset is the per-user cache directory, "none" no disk cache. */
+    {
+        const char *sc = enhance_cfg_string("render.shader_cache", NULL);
+        o.shader_cache = sc ? strdup(sc) : NULL;
+    }
+
     nv2a_host_opts_set(&o);
     fprintf(stderr, LOGP "render.scale=%u present.filter=%s present.fullscreen=%d"
             " present.pacing=%s (display.aspect=%s)\n", o.render_scale,
@@ -92,6 +100,8 @@ int xbox_enhance_init(const char *root, const char *title)
     fprintf(stderr, LOGP "display.widescreen=%d display.hdtv=%s (XC_VIDEO=0x%08lX)"
             " present.aspect=%s (%s)\n", wide, s_hdtv[hdtv], (unsigned long)xc_video,
             s_aspects[pa], s_aspects[o.present_aspect + 1]);
+    if (o.shader_cache)
+        fprintf(stderr, LOGP "render.shader_cache=%s\n", o.shader_cache);
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (fps.mode) after this, and calls it then. */
     return rc;

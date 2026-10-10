@@ -65,7 +65,8 @@ extern "C" {
     X(PRESENT_FILTER,    CONFIG, "RECOMP_PRESENT_FILTER",    NULL, "enhancements: present.filter, nearest (stock), linear, integer") \
     X(PRESENT_ASPECT,    CONFIG, "RECOMP_PRESENT_ASPECT",    NULL, "enhancements: present.aspect, the window's frame shape: auto (stock; 16:9 with display.widescreen), frame, 4:3, 16:9") \
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
-    X(PRESENT_PACING,    CONFIG, "RECOMP_PRESENT_PACING",    NULL, "enhancements: present.pacing, spin (stock busy-wait) or sleep (lowered spin waits sleep)")
+    X(PRESENT_PACING,    CONFIG, "RECOMP_PRESENT_PACING",    NULL, "enhancements: present.pacing, spin (stock busy-wait) or sleep (lowered spin waits sleep)") \
+    X(RENDER_SHADER_CACHE, CONFIG, "RECOMP_RENDER_SHADER_CACHE", NULL, "enhancements: render.shader_cache, the pipeline-cache directory, or none (default: the per-user cache directory)")
 #else
 #define RECOMP_ENV_ENHANCE_KEYS(X)
 #endif
@@ -102,6 +103,7 @@ extern "C" {
     X(PRESENT_STATS,     TRACE, "present_stats",   "RECOMP_PRESENT_STATS",     "SDL host present statistics") \
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
     X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip") \
+    X(PCACHE_TRACE,      TRACE, "pcache",          NULL,                       "pipeline cache: each shader/pipeline compile (thread, ms), the pre-warm summary; =<file>: also one CSV line per flip (t_ms, interval_ms, compiles)") \
     X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \
     X(VSH_ZLOG,          TRACE, "zlog",            "RECOMP_VSH_ZLOG",          "depth clears and z-buffer use") \
     X(TEX_LOG,           TRACE, "tex",             "RECOMP_TEX_LOG",           "texture format survey; =2 also every texture") \
@@ -192,6 +194,7 @@ extern "C" {
     X(METAL_WRITEBACK,   DEBUG, "metal_writeback", NULL,                       "=lazy|always: Metal writes guest memory when a dump reads it (default) or at every flip") \
     X(METAL_FB_GUARD,    DEBUG, "metal_fb_guard",  NULL,                       "trap title reads of the last Metal present surface; a read switches to metal_writeback=always") \
     X(METAL_OCC,         DEBUG, "metal_occ",       "RECOMP_METAL_OCC",         "=sync|fixed: Metal occlusion mode") \
+    X(METAL_PCACHE_MAX,  DEBUG, "metal_pcache_max", NULL,                      "=n: Metal keeps at most n vertex functions, n fragment functions and n pipelines (LRU; default 512 each)") \
     X(RT_ALIAS_CHECK,    DEBUG, "rt_alias_check",  NULL,                       "=0: Metal and D3D11 keep render targets whose guest memory the title rewrote (before rt-stale-alias)") \
     X(FB_VA,             DEBUG, "fb_va",           "RECOMP_FB_VA",             "=va: framebuffer window shows that address") \
     X(USB,               DEBUG, "ohci",            "RECOMP_USB",               "emulated OHCI/XID USB (unused path)") \
