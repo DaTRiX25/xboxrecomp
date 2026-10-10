@@ -13,6 +13,7 @@
  */
 #include "usb_gamepad.h"
 #include "recomp_env.h"
+#include "latency_trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -617,6 +618,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out);
+        xbox_LatPadReport(pad, out, 20);
         return 20;
     }
 
@@ -634,5 +636,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
+    xbox_LatPadReport(pad, out, 20);
     return 20;
 }

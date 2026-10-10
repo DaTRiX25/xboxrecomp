@@ -516,7 +516,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     int vsync = !recomp_env(RENV_PRESENT_VSYNC) || recomp_env_on(RENV_PRESENT_VSYNC);
     int stats = recomp_env_on(RENV_PRESENT_STATS);
     int scale = recomp_env(RENV_WINDOW_SCALE) ? atoi(recomp_env(RENV_WINDOW_SCALE)) : 2;
-    int win_w;
+    int win_w, win_pos;
     int quit = 0, guest_done = 0, dirty = 0, shoot = 0;
     double quit_after = recomp_env(RENV_WINDOW_QUIT_AFTER)
                       ? atof(recomp_env(RENV_WINDOW_QUIT_AFTER)) : 0.0;
@@ -551,6 +551,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     /* 640 wide, or 853 at present.aspect 16:9: the window starts the shape
      * the frame is shown at. */
     win_w = (int)nv2a_present_width(640, 480);
+    /* RECOMP_DEBUG=window_display=<n>: open on display n (0 = main), e.g. a
+     * 60 Hz screen next to a 120 Hz one for latency runs (BO-74). */
+    {
+        const char *e = recomp_env(RENV_WINDOW_DISPLAY);
+        win_pos = e ? (int)SDL_WINDOWPOS_CENTERED_DISPLAY(atoi(e))
+                    : (int)SDL_WINDOWPOS_CENTERED;
+    }
     {
         Uint32 wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
                       | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -562,8 +569,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         const char *mp = recomp_env(RENV_METAL_PRESENT);
         if (be && !strcasecmp(be, "metal") && !(mp && !strcasecmp(mp, "readback"))) {
             char why[256] = "";
-            win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
-                                   SDL_WINDOWPOS_CENTERED, win_w * scale, 480 * scale,
+            win = SDL_CreateWindow(window_name(), win_pos, win_pos, win_w * scale, 480 * scale,
                                    wflags | SDL_WINDOW_METAL);
             if (!win)
                 snprintf(why, sizeof why, "%s", SDL_GetError());
@@ -579,8 +585,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
 #endif
         if (!s_layer) {
-            win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
-                                   SDL_WINDOWPOS_CENTERED, win_w * scale, 480 * scale, wflags);
+            win = SDL_CreateWindow(window_name(), win_pos, win_pos, win_w * scale, 480 * scale, wflags);
             ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
                                            | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0))
                       : NULL;

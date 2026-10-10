@@ -46,6 +46,9 @@
 #include "platform/host_time.h"
 #include "recomp_env.h"
 #include "fb_present_metal.h"
+#include "latency_trace.h"
+#include "host_time.h"
+#include <mach/mach_time.h>
 
 /* src/kernel/kernel_pacing.c */
 void xbox_PacingPresent(uint64_t when_ns);
@@ -417,9 +420,15 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         SDL_Metal_GetDrawableSize(win, &dw, &dh);
         if (dw > 0 && dh > 0 && ((int)cur.width != dw || (int)cur.height != dh))
             s_layer.drawableSize = CGSizeMake(dw, dh);
+        uint64_t t_acq0 = xbox_LatOn() ? xbox_HostNowNs() : 0;
         d = [s_layer nextDrawable];
         if (!d)
             return 0;
+        if (t_acq0) {
+            char b[32];
+            snprintf(b, sizeof b, "%llu", (unsigned long long)xbox_HostNowNs());
+            xbox_LatRow('W', flip, t_acq0, b);
+        }
         dw = (int)[d.texture width];
         dh = (int)[d.texture height];
         cb = [s_queue commandBuffer];
@@ -464,7 +473,27 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                     xbox_PacingPresent(mach_to_host_ns((uint64_t)(t * 1e9)));
             }];
         [cb presentDrawable:d];
+        if (t_acq0) {
+            /* presentedTime: host seconds (mach_absolute_time) when the
+             * drawable reached the glass, 0 when it never did. */
+            uint32_t fl = flip;
+            [d addPresentedHandler:^(id<MTLDrawable> dr) {
+                static mach_timebase_info_data_t tb;
+                double ps = dr.presentedTime;
+                uint64_t now = xbox_HostNowNs(), mach_ns, on = 0;
+                char b[32];
+                if (!tb.denom)
+                    mach_timebase_info(&tb);
+                mach_ns = mach_absolute_time() * tb.numer / tb.denom;
+                if (ps > 0)
+                    on = now - mach_ns + (uint64_t)(ps * 1e9);
+                snprintf(b, sizeof b, "%llu", (unsigned long long)on);
+                xbox_LatRow('D', fl, now, b);
+            }];
+        }
         [cb commit];
+        if (t_acq0)
+            xbox_LatRow('P', flip, 0, NULL);
         [s_slot_cb[k] release];
         s_slot_cb[k] = [cb retain];
         if (shot) {

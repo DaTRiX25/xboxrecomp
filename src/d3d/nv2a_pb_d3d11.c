@@ -35,6 +35,7 @@
 #include <d3d11_1.h>   /* ID3D11DeviceContext1::ClearView, for a partial clear */
 #include <dxgi.h>
 #include <dxgi1_3.h>   /* IDXGISwapChain2: the frame-latency waitable */
+#include "latency_trace.h"
 #include <d3dcompiler.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -3429,6 +3430,14 @@ static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
 static int s_probe_x = -1, s_probe_y;
 static uint32_t s_probe_px = 0xDEADBEEFu;
 
+/* FLIP_STALL reached: hand the frame's work to the GPU now, so it is drawn
+ * during the vblank hold, not after it (BO-74). */
+static void d3d11_on_flip_ready(void)
+{
+    if (s_ctx)
+        ID3D11DeviceContext_Flush(s_ctx);
+}
+
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     HRESULT hr;
@@ -3511,6 +3520,8 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
         WaitForSingleObjectEx(s_latency_wait, 100, TRUE);
     hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
     xbox_PacingPresent(0);   /* RECOMP_TRACE=pacing=all: host present times */
+    if (xbox_LatOn())
+        xbox_LatRow('P', nv2a_pb_gpu_state()->flips, 0, NULL);
     if (FAILED(hr) && s_presents < 4)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own
@@ -3695,6 +3706,9 @@ static const struct nv2a_pb_backend s_d3d11_backend = {
     d3d11_on_zpass_clear,
     d3d11_on_report,
     d3d11_on_poll,
+    0,                  /* writes_back */
+    NULL,               /* sync_guest */
+    d3d11_on_flip_ready,
 };
 
 /* For tests/d3d11_backend_smoke: the size of the target at a colour offset
