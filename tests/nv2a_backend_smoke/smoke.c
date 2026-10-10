@@ -49,6 +49,11 @@
  *   elem32       a triangle list whose last (odd) index is an
  *                ARRAY_ELEMENT32
  *
+ * Then a far quad (BO-43), on the CPU path before the backend check and on
+ * the backend after: a vertex-program quad at z = zmax, LEQUAL against a
+ * depth cleared to zmax, must cover every pixel (the XMV movie quad; the CPU
+ * path's depth interpolation landed an ulp past the clear on a pixel grid).
+ *
  * Then the walker's index limit (overflow): a batch past NV_MAX_INDICES
  * warns, counts one overflowed batch and keeps the first NV_MAX_INDICES; with
  * one slot left an ARRAY_ELEMENT16 word still lands its first half; an
@@ -755,6 +760,77 @@ static int clip_cpu_cases(void)
     return f;
 }
 
+/* far quad (BO-43): a vertex-program quad at z = zmax, tilted so its edges
+ * cross pixels at every fraction, depth-tested LEQUAL against a depth
+ * cleared to 0xFFFFFF with depth writes off -- Burnout 3's XMV movie quad.
+ * The NV2A compares integer depth, so every pixel the quad covers passes.
+ * The CPU rasteriser used to weight the three vertex depths separately and
+ * land an ulp above 1.0 on a regular grid of pixels, which failed the test
+ * and left the clear colour there: black dots over every movie. Counted in
+ * an inner box well inside all four edges. Returns the failures. */
+static void far_vertex(float x, float y, uint32_t argb)
+{
+    M(0x1818, f2u(x));
+    M(0x1818, f2u(y));
+    M(0x1818, f2u(16777215.0f));
+    M(0x1818, f2u(0.1f));
+    M(0x1818, argb);
+}
+
+static int far_quad_case(const struct nv2a_pb_backend *b, const char *path)
+{
+    const uint32_t *px = (const uint32_t *)guest(BUF0);
+    uint32_t x, y, holes = 0;
+    int a, k;
+
+    nv2a_pb_set_backend(b);
+    surf_clip(BUF0, 0, 0, W, H);
+    M(0x1D8C, 0xFFFFFF00u);                /* ZSTENCIL_CLEAR_VALUE: zmax, 0 */
+    M(0x1D90, 0xFF000000u);
+    M(0x1D94, 0xF3);                       /* CLEAR_SURFACE: colour, Z, S */
+    M(0x030C, 1);                          /* DEPTH_TEST_ENABLE */
+    M(0x0354, 0x203);                      /* DEPTH_FUNC: LEQUAL */
+    M(0x035C, 0);                          /* DEPTH_MASK: no writes */
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+    M(0x1E9C, 0);                          /* PROGRAM_LOAD: slot 0 */
+    for (k = 0; k < 2; k++) {              /* mov oPos, v0; mov oD0, v3 */
+        uint32_t o = k ? 3u : 0u;
+        M(0x0B00 + 16 * k + 0, 0);
+        M(0x0B00 + 16 * k + 4, (1u << 21) | (o << 9) | 0x1Bu);
+        M(0x0B00 + 16 * k + 8, 2u << 26);
+        M(0x0B00 + 16 * k + 12, (0xFu << 12) | (1u << 11) | (o << 3) | (k == 1 ? 1u : 0u));
+    }
+    M(0x1EA0, 0);                          /* PROGRAM_START */
+    M(0x1E94, 2);                          /* EXECUTION_MODE: program */
+    M(0x17FC, 8);                          /* BEGIN_END: QUADS */
+    far_vertex(37.3f, 21.7f, 0xFF4080C0u);
+    far_vertex(610.9f, 30.2f, 0xFF4080C0u);
+    far_vertex(590.1f, 455.6f, 0xFF4080C0u);
+    far_vertex(20.4f, 440.8f, 0xFF4080C0u);
+    M(0x17FC, 0);
+    M(0x1E94, 0);                          /* fixed function again */
+    M(0x030C, 0);
+#ifdef __APPLE__
+    if (b != nv2a_pb_cpu_backend()) {
+        uint32_t hw = 0, hh = 0;
+        px = (const uint32_t *)nv2a_pb_metal_host_pixels(BUF0, &hw, &hh);
+        if (!px || hw != W || hh != H) {
+            fprintf(stderr, "[backend-smoke] far quad: no %ux%u %s target FAIL\n", W, H, path);
+            nv2a_pb_set_backend(NULL);
+            return 1;
+        }
+    }
+#endif
+    for (y = 60; y < 420; y++)
+        for (x = 60; x < 580; x++)
+            holes += (px[y * W + x] & 0x00FFFFFFu) == 0;
+    nv2a_pb_set_backend(NULL);
+    fprintf(stderr, "[backend-smoke] far quad: %s %u of %u pixels left at the clear colour %s\n",
+            path, holes, 360u * 520u, holes ? "FAIL" : "PASS");
+    return holes != 0;
+}
+
 #ifdef __APPLE__
 /* Each case's stream on the CPU path (guest memory) and on Metal (its host
  * pixels, box-filtered at scale 2; no flip, so nothing is written back),
@@ -1050,6 +1126,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "[backend-smoke] FAIL: CPU clip clear or clear rect\n");
         failures++;
     }
+    /* And the depth of a quad at the far plane. */
+    if (!guard && !noalias)
+        failures += far_quad_case(nv2a_pb_cpu_backend(), "cpu");
 #ifdef __APPLE__
     if (!strcasecmp(which, "metal"))
         gpu = nv2a_pb_metal_backend();
@@ -1125,6 +1204,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "[backend-smoke] FAIL: %d render-target ownership checks\n", f);
         failures += f;
     }
+    if (gpu == nv2a_pb_metal_backend())
+        failures += far_quad_case(gpu, "gpu");
 #endif
     if (failures) {
         fprintf(stderr, "[backend-smoke] FAIL: %d of %d scenes\n", failures, SC_COUNT);
