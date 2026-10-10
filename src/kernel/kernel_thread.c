@@ -17,6 +17,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
+#endif
 
 /* ============================================================================
  * Thread Start Wrapper
@@ -478,7 +482,29 @@ void xbox_worker_stack_free(int slot)
  * work removed. The GPU and the audio keep their cores for the same
  * reason. RECOMP_GUEST_CPUS=all is the A/B, =<n> picks the core (cpu 0
  * takes most of the IRQ work on Linux).
+ *
+ * =token keeps the same rule where there is no affinity to set: Darwin on
+ * Apple Silicon, where SetThreadAffinityMask does nothing and the pin above
+ * left every guest thread on every core. The threads that would be pinned
+ * join a token instead (win32_compat.c, ported from vyanhursky/xboxrecomp
+ * dc00f70): one of them runs at a time, every blocking primitive gives the
+ * token up, and a thread that has waited a millisecond preempts the holder
+ * -- at once while the holder is in the title's lifted code, at its next
+ * kernel call's return (kernel_bridge.c) while it is in host code. The
+ * lifted code is the __TEXT,__guest section, where a title puts it by
+ * force-including templates/runtime/recomp_guest_section.h; without one a
+ * guest thread spinning with no kernel call keeps the token, the deadlock
+ * upstream's cooperative RECOMP_GUEST_LOCK (#160) documents. The threads
+ * left off the core are left off the token too, so an interrupt still runs
+ * beside the holder, ordered by the one-CPU gate as it is with affinity.
+ * Off by default: no thread joins, and nothing changes for any title.
  */
+static int guest_cpus_token(void)
+{
+    const char *mode = recomp_env(RENV_GUEST_CPUS);
+    return mode && !strcmp(mode, "token");
+}
+
 DWORD_PTR xbox_GuestCpuMask(void)
 {
     const char *mode = recomp_env(RENV_GUEST_CPUS);
@@ -486,6 +512,10 @@ DWORD_PTR xbox_GuestCpuMask(void)
 
     if (mode && !strcmp(mode, "all"))
         return 0;
+#if !defined(_WIN32)
+    if (guest_cpus_token())
+        return 0;   /* the token, not a core, holds them to one CPU */
+#endif
     if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc)
         return 0;
     /* =<n>: that core, when the process may use it. */
@@ -502,12 +532,48 @@ DWORD_PTR xbox_GuestCpuMask(void)
     return proc & (DWORD_PTR)(-(intptr_t)proc);
 }
 
+#if !defined(_WIN32)
+static BOOL CALLBACK guest_turn_setup(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+#if defined(__APPLE__)
+    if (!guest_turn_has_code()) {
+        unsigned long size = 0;
+        const void *code = getsectiondata(&_mh_execute_header, "__TEXT",
+                                          "__guest", &size);
+        if (code && size)
+            guest_turn_set_code(code, (size_t)size);
+    }
+#endif
+    if (guest_turn_has_code())
+        fprintf(stderr, "  [KERNEL] guest threads take turns on one guest CPU"
+                        " (guest_cpus=token); preempted in the lifted code\n");
+    else
+        fprintf(stderr, "  [KERNEL] guest threads take turns on one guest CPU"
+                        " (guest_cpus=token); no __TEXT,__guest section, so"
+                        " they change over only at kernel calls and waits\n");
+    fflush(stderr);
+    return TRUE;
+}
+#endif
+
 void xbox_GuestThreadPin(const char *role)
 {
     static int announced, failed;
-    DWORD_PTR mask = xbox_GuestCpuMask();
+    DWORD_PTR mask;
     int core = 0;
 
+#if !defined(_WIN32)
+    if (guest_cpus_token()) {
+        static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+        InitOnceExecuteOnce(&once, guest_turn_setup, NULL, NULL);
+        guest_turn_join();
+        xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "guest thread %s joins the"
+                 " guest CPU token", role ? role : "?");
+        return;
+    }
+#endif
+    mask = xbox_GuestCpuMask();
     if (!mask)
         return;
     while (!((mask >> core) & 1))

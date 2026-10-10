@@ -26,6 +26,11 @@
 #include <stdio.h>
 #include <time.h>
 #include <signal.h>
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#else
+#include <ucontext.h>
+#endif
 #include <errno.h>
 #include <unistd.h>
 #include <sched.h>
@@ -48,6 +53,313 @@ static __thread DWORD t_last_error = 0;
 
 DWORD GetLastError(void)            { return t_last_error; }
 VOID  SetLastError(DWORD code)      { t_last_error = code; }
+
+/* ===================================================================== */
+/* One guest CPU without thread affinity                                 */
+/* ===================================================================== */
+
+/*
+ * Ported from vyanhursky/xboxrecomp dc00f70 ("one guest CPU on hosts that
+ * cannot pin threads", the Def Jam: Fight for NY macOS port), with the
+ * guest_turn_* names of its e5e59f6. Opt-in here: the kernel layer joins a
+ * thread only under RECOMP_DEBUG=guest_cpus=token (kernel_thread.c,
+ * xbox_GuestThreadPin).
+ *
+ * A console title was written for one core, and some rely on it without
+ * saying so: two of its threads never run at the same instant. Where the
+ * host can pin threads, the kernel layer puts every thread that runs guest
+ * code on one CPU. Darwin on Apple Silicon cannot (SetThreadAffinityMask
+ * below returns 0 there), so the same rule is kept here with a token: a
+ * thread that has joined runs only while it holds it.
+ *
+ *   - Every blocking primitive in this file gives the token up for as long
+ *     as it blocks, and takes it back before returning.
+ *   - A thread that has waited a millisecond for it interrupts the holder
+ *     with a signal. A holder that was in guest code hands it over from the
+ *     handler: that is the preemption a single core gives the title, and a
+ *     thread spinning on a flag another thread sets still lets that thread
+ *     run. A holder that was in host code may hold a lock the next thread
+ *     needs (the C library's, a device model's), so it only notes the
+ *     request and hands over at guest_turn_checkpoint(), which the kernel
+ *     layer calls on the way back to the title. What counts as guest code is
+ *     the range given to guest_turn_set_code(); with none, every hand-over
+ *     waits for a checkpoint or a blocking call, and a thread that spins in
+ *     guest code without a kernel call keeps the CPU (upstream #160's
+ *     RECOMP_GUEST_LOCK deadlock). A thread coming out of a wait, and one at
+ *     time-critical priority, does not wait the millisecond.
+ *   - Waiters are served in arrival order, so a thread that hands over is
+ *     behind every thread that was already waiting.
+ *
+ * A thread that has not joined is never held up and never signalled.
+ * Preempting anywhere, host code included, was tried in dc00f70 first and
+ * deadlocked: a thread stopped inside getenv() held the environment lock the
+ * next holder then blocked on, inside a fault handler with the signal masked.
+ */
+#define GC_SIGNAL    SIGUSR2
+#define GC_SLICE_NS  1000000L
+
+typedef struct {
+    int holding;                    /* has the token */
+    int urgent;                     /* interrupts the holder at once */
+    volatile sig_atomic_t pending;  /* asked to hand over while in host code */
+    volatile uintptr_t asked_pc;    /* where it was when first asked ... */
+    struct timespec asked_at;       /* ... and when */
+    volatile sig_atomic_t busy;     /* inside the token's own code */
+} gc_thread;
+
+static pthread_mutex_t gc_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  gc_cond = PTHREAD_COND_INITIALIZER;
+static uint64_t  gc_next, gc_serving;   /* tickets: issued, allowed to run */
+static pthread_t gc_holder;
+static int       gc_held;
+static volatile uint64_t gc_handoffs, gc_kicks;
+static uintptr_t gc_code_lo, gc_code_hi;
+static volatile long gc_longest_wait_ms;    /* by a thread due to run at once */
+static pthread_key_t  gc_key;
+static pthread_once_t gc_once = PTHREAD_ONCE_INIT;
+static __thread gc_thread *t_gc;
+
+/* The interrupted program counter (dc00f70 used mmio_trap_pc, which this
+ * runtime does not have). */
+static uintptr_t gc_context_pc(void *uctx)
+{
+    ucontext_t *uc = (ucontext_t *)uctx;
+#if defined(__APPLE__) && defined(__aarch64__)
+    return (uintptr_t)uc->uc_mcontext->__ss.__pc;
+#elif defined(__APPLE__) && defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext->__ss.__rip;
+#elif defined(__linux__) && defined(__aarch64__)
+    return (uintptr_t)uc->uc_mcontext.pc;
+#elif defined(__linux__) && defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#else
+    (void)uc;
+    return 0;   /* never guest code: hand-overs wait for a checkpoint */
+#endif
+}
+
+static void gc_release(gc_thread *t)
+{
+    t->busy = 1;
+    pthread_mutex_lock(&gc_lock);
+    t->holding = 0;
+    gc_held = 0;
+    gc_serving++;
+    pthread_cond_broadcast(&gc_cond);
+    pthread_mutex_unlock(&gc_lock);
+    t->busy = 0;
+}
+
+static void gc_acquire(gc_thread *t, int waited)
+{
+    uint64_t me;
+    struct timespec t0, t1;
+    int timed = waited;     /* a thread that should have run at once */
+
+    t->busy = 1;
+    if (timed)
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+    pthread_mutex_lock(&gc_lock);
+    me = gc_next++;
+    while (gc_serving != me) {
+        struct timespec ts;
+        /* The holder cannot exit without this lock, so it is there to be
+         * signalled. A signal that finds it between two holds is lost, which
+         * the next pass makes good. */
+        if (waited && gc_held) {
+            pthread_kill(gc_holder, GC_SIGNAL);
+            gc_kicks++;
+        }
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += GC_SLICE_NS;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        if (pthread_cond_timedwait(&gc_cond, &gc_lock, &ts) == ETIMEDOUT)
+            waited = 1;
+    }
+    gc_holder = pthread_self();
+    gc_held = 1;
+    t->holding = 1;
+    pthread_mutex_unlock(&gc_lock);
+    if (timed) {
+        long ms;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ms = (long)(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        if (ms > gc_longest_wait_ms)
+            gc_longest_wait_ms = ms;
+    }
+    t->busy = 0;
+}
+
+/* The holder was interrupted because another thread has waited its slice. */
+static void gc_preempt(int sig, siginfo_t *si, void *uctx)
+{
+    gc_thread *t = t_gc;
+    int e = errno;
+
+    (void)sig; (void)si;
+    if (t && t->holding && !t->busy) {
+        uintptr_t pc = gc_context_pc(uctx);
+        if (pc >= gc_code_lo && pc < gc_code_hi) {
+            gc_handoffs++;
+            t->pending = 0;
+            gc_release(t);
+            gc_acquire(t, t->urgent);
+        } else if (!t->pending) {
+            t->asked_pc = pc;
+            clock_gettime(CLOCK_MONOTONIC, &t->asked_at);
+            t->pending = 1;
+        }
+    }
+    errno = e;
+}
+
+static void gc_thread_gone(void *p)
+{
+    gc_thread *t = p;
+
+    if (t->holding)
+        gc_release(t);
+    free(t);
+}
+
+static void gc_setup(void)
+{
+    struct sigaction sa;
+
+    pthread_key_create(&gc_key, gc_thread_gone);
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = gc_preempt;
+    sa.sa_flags = SA_RESTART | SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(GC_SIGNAL, &sa, NULL);
+}
+
+void guest_turn_join(void)
+{
+    gc_thread *t = t_gc;
+
+    if (t)
+        return;
+    pthread_once(&gc_once, gc_setup);
+    t = calloc(1, sizeof *t);
+    if (!t)
+        return;
+    pthread_setspecific(gc_key, t);
+    t_gc = t;
+    gc_acquire(t, 0);
+}
+
+int guest_turn_joined(void)
+{
+    return t_gc != NULL;
+}
+
+void guest_turn_set_code(const void *start, size_t size)
+{
+    gc_code_lo = (uintptr_t)start;
+    gc_code_hi = (uintptr_t)start + size;
+}
+
+int guest_turn_has_code(void)
+{
+    return gc_code_hi > gc_code_lo;
+}
+
+static void gc_note_late(gc_thread *t);
+
+void guest_turn_checkpoint(void)
+{
+    gc_thread *t = t_gc;
+
+    if (t && t->pending) {
+        t->pending = 0;
+        gc_note_late(t);
+        if (t->holding) {
+            gc_handoffs++;
+            gc_release(t);
+            gc_acquire(t, t->urgent);
+        }
+    }
+}
+
+long guest_turn_longest_wait_ms(void)
+{
+    long ms = gc_longest_wait_ms;
+
+    gc_longest_wait_ms = 0;
+    return ms;
+}
+
+void guest_turn_counts(uint64_t *handoffs, uint64_t *kicks)
+{
+    if (handoffs) *handoffs = gc_handoffs;
+    if (kicks)    *kicks = gc_kicks;
+}
+
+/* A thread kept the guest CPU in host code long after it was asked for it.
+ * Nothing is wrong with a few milliseconds; tens are a hitch the title was
+ * never given on its console, and the address says which host function to
+ * teach to give the CPU up. */
+static void gc_note_late(gc_thread *t)
+{
+    struct timespec now;
+    long ms;
+    static volatile LONG lines;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ms = (long)(now.tv_sec - t->asked_at.tv_sec) * 1000 +
+         (now.tv_nsec - t->asked_at.tv_nsec) / 1000000;
+    if (ms >= 10 && __atomic_add_fetch(&lines, 1, __ATOMIC_SEQ_CST) <= 40)
+        fprintf(stderr, "  [KERNEL] guest CPU kept %ld ms in host code after it was"
+                        " asked for (at host pc %p)\n", ms, (void *)t->asked_pc);
+}
+
+/* Around anything that blocks: gc_block() before, gc_unblock(its result)
+ * after. Nothing happens on a thread that has not joined. */
+static int gc_block(void)
+{
+    gc_thread *t = t_gc;
+
+    if (!t || !t->holding)
+        return 0;
+    if (t->pending) {
+        t->pending = 0;
+        gc_note_late(t);
+    }
+    gc_release(t);
+    return 1;
+}
+
+static void gc_unblock(int blocked)
+{
+    /* A thread that wakes runs at once, as the priority boost a wait ends
+     * with gives it on the console's kernel; only threads that were
+     * themselves preempted, or yielded, wait out a slice. */
+    if (blocked)
+        gc_acquire(t_gc, 1);
+}
+
+/* Let a waiting thread run, as a yield on one core does. */
+void guest_turn_yield(void)
+{
+    gc_thread *t = t_gc;
+    int waiting;
+
+    if (!t || !t->holding)
+        return;
+    t->busy = 1;
+    pthread_mutex_lock(&gc_lock);
+    waiting = gc_next != gc_serving + 1;
+    pthread_mutex_unlock(&gc_lock);
+    t->busy = 0;
+    if (waiting) {
+        t->pending = 0;
+        gc_release(t);
+        gc_acquire(t, t->urgent);
+    } else {
+        t->pending = 0;     /* whoever asked has been and gone */
+    }
+}
 
 /* ===================================================================== */
 /* Interlocked atomics                                                   */
@@ -103,7 +415,12 @@ VOID InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION cs, DWORD spin)
 VOID EnterCriticalSection(LPCRITICAL_SECTION cs)
 {
     if (!cs->LockSemaphore) InitializeCriticalSection(cs);
-    pthread_mutex_lock((pthread_mutex_t *)cs->LockSemaphore);
+    if (pthread_mutex_trylock((pthread_mutex_t *)cs->LockSemaphore) != 0) {
+        /* Its owner may need the guest CPU to get as far as leaving. */
+        int blocked = gc_block();
+        pthread_mutex_lock((pthread_mutex_t *)cs->LockSemaphore);
+        gc_unblock(blocked);
+    }
     cs->RecursionCount++;
 }
 
@@ -167,9 +484,29 @@ VOID InitializeSRWLock(PSRWLOCK lock)
     srw_lazy_init(lock);
 }
 
-VOID AcquireSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_rdlock(srw_lazy_init(lock)); }
+/* A contended acquire gives the guest CPU up, as EnterCriticalSection does:
+ * the holder may be a guest thread waiting for it (the heap lock, taken from
+ * kernel calls on every guest thread). Not in dc00f70, whose runtime took
+ * no SRW lock from a guest thread. */
+VOID AcquireSRWLockShared(PSRWLOCK lock)
+{
+    pthread_rwlock_t *rw = srw_lazy_init(lock);
+    if (pthread_rwlock_tryrdlock(rw) != 0) {
+        int blocked = gc_block();
+        pthread_rwlock_rdlock(rw);
+        gc_unblock(blocked);
+    }
+}
 VOID ReleaseSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_unlock(srw_lazy_init(lock)); }
-VOID AcquireSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_wrlock(srw_lazy_init(lock)); }
+VOID AcquireSRWLockExclusive(PSRWLOCK lock)
+{
+    pthread_rwlock_t *rw = srw_lazy_init(lock);
+    if (pthread_rwlock_trywrlock(rw) != 0) {
+        int blocked = gc_block();
+        pthread_rwlock_wrlock(rw);
+        gc_unblock(blocked);
+    }
+}
 VOID ReleaseSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_unlock(srw_lazy_init(lock)); }
 
 /* ===================================================================== */
@@ -187,7 +524,12 @@ BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *
     if (__atomic_load_n(&once->Ptr, __ATOMIC_ACQUIRE))
         return TRUE;
 
-    pthread_mutex_lock(&once_lock);
+    if (pthread_mutex_trylock(&once_lock) != 0) {
+        /* The callback running may need the guest CPU to finish. */
+        int blocked = gc_block();
+        pthread_mutex_lock(&once_lock);
+        gc_unblock(blocked);
+    }
     BOOL ok = TRUE;
     if (!once->Ptr) {
         ok = fn(once, param, context);
@@ -227,13 +569,16 @@ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWOR
     if (!cs->LockSemaphore) InitializeCriticalSection(cs);
     pthread_cond_t  *c = (pthread_cond_t  *)cv->Ptr;
     pthread_mutex_t *m = (pthread_mutex_t *)cs->LockSemaphore;
+    int blocked = gc_block();
     if (ms == INFINITE) {
         pthread_cond_wait(c, m);
+        gc_unblock(blocked);
         return TRUE;
     }
     struct timespec ts;
     deadline_from_ms(ms, &ts);
     int rc = pthread_cond_timedwait(c, m, &ts);
+    gc_unblock(blocked);
     if (rc == ETIMEDOUT) { SetLastError(WAIT_TIMEOUT); return FALSE; }
     return TRUE;
 }
@@ -479,6 +824,7 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
+    int blocked = 0;
 
     for (;;) {
         int ready = 0;
@@ -493,6 +839,8 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         default:       ready = 1; break;
         }
         if (ready) break;
+        if (timed && ms == 0) { result = WAIT_TIMEOUT; break; }
+        if (!blocked) blocked = gc_block();
 
         /* An armed timer has its own deadline. Waiting on the caller's alone
          * would sleep straight past the due time, so take whichever comes
@@ -523,6 +871,9 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         }
     }
     pthread_mutex_unlock(&o->lock);
+    /* Taken back with the object's lock dropped: the thread that holds the
+     * guest CPU may be about to signal this very object. */
+    gc_unblock(blocked);
     return result;
 }
 
@@ -578,7 +929,11 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                 (now.tv_sec == ts.tv_sec && now.tv_nsec >= ts.tv_nsec))
                 return WAIT_TIMEOUT;
         }
-        usleep(1000);
+        {
+            int blocked = gc_block();
+            usleep(1000);
+            gc_unblock(blocked);
+        }
     }
 }
 
@@ -765,6 +1120,7 @@ static void *thread_trampoline(void *arg)
     pthread_mutex_unlock(&o->lock);
 
     DWORD rc = o->start ? o->start(o->start_param) : 0;
+    gc_block();   /* a thread that ran guest code is leaving the guest CPU */
 
     pthread_mutex_lock(&o->lock);
     o->exit_code = rc;
@@ -811,6 +1167,7 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 VOID ExitThread(DWORD exitCode)
 {
     w32_object *o = t_self_obj;
+    gc_block();
     if (o) {
         pthread_mutex_lock(&o->lock);
         o->exit_code = exitCode;
@@ -860,9 +1217,14 @@ DWORD SuspendThread(HANDLE h)
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
-    if (o == t_self_obj)
+    if (o == t_self_obj) {
+        int blocked = gc_block();
         while (o->suspend_count > 0)
             pthread_cond_wait(&o->gate, &o->lock);
+        pthread_mutex_unlock(&o->lock);
+        gc_unblock(blocked);
+        return prev;
+    }
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
@@ -885,6 +1247,8 @@ BOOL SetThreadPriority(HANDLE h, int priority)
 {
     w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
     if (o && o->kind == K_THREAD) o->priority = priority;
+    if (t_gc && (h == PSEUDO_CURRENT_THREAD || (o && o == t_self_obj)))
+        t_gc->urgent = priority >= THREAD_PRIORITY_TIME_CRITICAL;
     return TRUE;   /* real RT priorities need privileges; tracked only */
 }
 
@@ -936,7 +1300,7 @@ BOOL GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
     return TRUE;
 }
 
-VOID SwitchToThread(void) { sched_yield(); }
+VOID SwitchToThread(void) { guest_turn_yield(); sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
@@ -960,9 +1324,11 @@ DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 
 VOID Sleep(DWORD ms)
 {
-    if (ms == 0) { sched_yield(); return; }
+    if (ms == 0) { guest_turn_yield(); sched_yield(); return; }
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    int blocked = gc_block();
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
+    gc_unblock(blocked);
 }
 
 DWORD SleepEx(DWORD ms, BOOL alertable)

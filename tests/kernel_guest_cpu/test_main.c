@@ -14,7 +14,10 @@
  *    main pin or after it by the pinned thread (the kernel timer thread
  *    is made that way);
  *  - on Win32 the pin took: a second SetThreadAffinityMask reports the
- *    core as the previous mask.
+ *    core as the previous mask;
+ *  - off Windows, RECOMP_GUEST_CPUS=token is no mask, and a thread that
+ *    pins itself joins the guest-CPU token instead while one that does not
+ *    stays off it (the token itself: tests/guest_turn_posix).
  */
 #include "kernel.h"
 #include "recomp_env.h"
@@ -103,6 +106,18 @@ static DWORD WINAPI host(LPVOID unused)
     return 0;
 }
 
+#if !defined(_WIN32)
+static volatile int s_token_joined = -1;
+
+static DWORD WINAPI token_worker(LPVOID arg)
+{
+    (void)arg;
+    xbox_GuestThreadPin("test-token-worker");
+    s_token_joined = guest_turn_joined();
+    return 0;
+}
+#endif
+
 static void join(HANDLE th)
 {
     if (th) {
@@ -178,6 +193,18 @@ int main(void)
     CHECK(s_worker_mask == 0 && s_early_mask == 0 && s_host_mask == 0, "the threads ran");
 #endif
     (void)s_worker_prev;
+
+#if !defined(_WIN32)
+    recomp_env_set(RENV_GUEST_CPUS, "token");
+    CHECK(xbox_GuestCpuMask() == 0, "guest_cpus=token sets no core: %#lx",
+          (unsigned long)xbox_GuestCpuMask());
+    th = CreateThread(NULL, 0, token_worker, NULL, 0, NULL);
+    CHECK(th != NULL, "token worker thread");
+    join(th);
+    CHECK(s_token_joined == 1, "a pinned thread joins the token under guest_cpus=token");
+    CHECK(!guest_turn_joined(), "a thread that does not pin itself stays off the token");
+    recomp_env_set(RENV_GUEST_CPUS, NULL);
+#endif
 
     if (s_fail) {
         fprintf(stderr, "%d failure(s)\n", s_fail);
