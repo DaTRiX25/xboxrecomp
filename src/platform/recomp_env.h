@@ -116,6 +116,7 @@ extern "C" {
     X(GFX_SHARPEN,       CONFIG, "RECOMP_GFX_SHARPEN",       NULL, "post-process sharpening (AMD FidelityFX CAS) strength, 0..1 (default 0, off) (Metal, Vulkan windows)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
+    X(AUDIO_FX_LEVEL,    CONFIG, "RECOMP_AUDIO_FX_LEVEL",    NULL, "5.1: level of the title's effect-send bins, 0..1 (default 0.25)") \
     X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \
     X(AUDIO_BUF_COUNT,   CONFIG, "RECOMP_AUDIO_BUF_COUNT",   NULL, "audio output buffer count") \
     X(CMDLINE,           CONFIG, "RECOMP_CMDLINE",           NULL, "launch-data command line handed to the title") \

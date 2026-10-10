@@ -202,6 +202,34 @@ void mcpx_apu_set_speaker_map(const int8_t map[32])
     s_spk_map_set = 1;
 }
 
+/* RECOMP_AUDIO_FX_LEVEL (audio.fx_level): in 5.1, the level of the bins
+ * the title's wiring names as effect sends (mcpx_apu_set_fx_bins), which
+ * reach the speakers dry here since no effect runs. Live. */
+static uint32_t s_fx_bins;
+static float s_bin_gain[NUM_MIXBINS];
+static volatile float s_fx_level = -1.0f;      /* < 0: not read yet */
+
+static void fx_gains(void)
+{
+    if (s_fx_level < 0.0f) {
+        const char *e = recomp_env(RENV_AUDIO_FX_LEVEL);
+        float v = e && *e ? (float)atof(e) : 0.25f;
+        s_fx_level = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+    }
+    for (int b = 0; b < NUM_MIXBINS; b++)
+        s_bin_gain[b] = (s_fx_bins >> b) & 1u ? s_fx_level : 1.0f;
+}
+
+void mcpx_apu_set_fx_bins(uint32_t mask)
+{
+    s_fx_bins = mask;
+}
+
+void mcpx_apu_set_fx_level(float level)
+{
+    s_fx_level = level < 0.0f ? 0.0f : level > 1.0f ? 1.0f : level;
+}
+
 void mcpx_apu_speaker_map_get(int8_t map[32])
 {
     if (!s_spk_map_set) {
@@ -299,7 +327,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             apu_spk_default_map(s_spk_map);
             s_spk_map_set = 1;
         }
+        fx_gains();
         apu_spk_mix51(&mixbins[0][0], NUM_SAMPLES_PER_FRAME, s_spk_map,
+                      s_fx_bins ? s_bin_gain : NULL,
                       &d->monitor.frame_buf6[off], NUM_SAMPLES_PER_FRAME);
         if (s_ch_trace)
             ch_trace((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins,

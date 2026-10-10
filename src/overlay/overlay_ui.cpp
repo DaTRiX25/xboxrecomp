@@ -126,6 +126,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_AUDIO_MUTE */         { "Mute", "No sound.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_MUTE_BG */      { "Mute in the background", "No sound while the window is not in front.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_SPEAKERS */     { "Speakers", "Auto plays 5.1 when the system's sound output is set to 5.1 (or more), else stereo. The game picks its mix at start.", 1, FMT_PLAIN, n_speakers, 0 },
+    /* XS_AUDIO_FX_LEVEL */     { "Surround effects (reverb) level", "5.1 only: the level of the game's effect sends, which play dry here (no effect DSP runs). Tune by ear.", 0.05, FMT_PERCENT, NULL, 0 },
     /* XS_INPUT_DEADZONE */     { "Stick deadzone", "The part of the stick's travel that reads as centre.", 1638.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_TRIGGER_DEADZONE */ { "Trigger deadzone", "The part of a trigger's pull that reads as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "0 turns the rumble off.", 0.05, FMT_GAIN, NULL, 0 },
@@ -165,6 +166,7 @@ static int page_rows(int page, Row *r)
         break;
     case P_AUDIO:
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
+        SET(XS_AUDIO_FX_LEVEL);
         SPK(0, "Speaker test, game mix");
         SPK(1, "Speaker test, direct");
         if (mcpx_apu_title_channels() != 6)

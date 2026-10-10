@@ -60,6 +60,13 @@ void mcpx_apu_set_speaker_map(const int8_t map[32]);
 void mcpx_apu_speaker_test(int speaker, int via_map);
 int mcpx_apu_speaker_test_playing(int *via_map);
 
+/* 5.1: the bins (a mask, bit = bin) the title's wiring names as effect
+ * sends, and their level, 0..1 (RECOMP_AUDIO_FX_LEVEL, audio.fx_level,
+ * default 0.25; live). No effect runs here, so a send reaches its speaker
+ * dry; this keeps it down. Stereo does not use it. */
+void mcpx_apu_set_fx_bins(uint32_t mask);
+void mcpx_apu_set_fx_level(float level);
+
 /* The speaker map in use (mcpx_apu_set_speaker_map, or the default). */
 void mcpx_apu_speaker_map_get(int8_t map[32]);
 

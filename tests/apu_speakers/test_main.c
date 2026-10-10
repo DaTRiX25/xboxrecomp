@@ -89,7 +89,7 @@ static void test_map(const apu_spk_map map, const char *what)
         memset(bins, 0, sizeof(bins));
         for (int i = 0; i < N; i++)
             bins[b][i] = (i + 1) / 64.0f;
-        apu_spk_mix51(&bins[0][0], N, map, out, N);
+        apu_spk_mix51(&bins[0][0], N, map, NULL, out, N);
         for (int c = 0; c < APU_SPK_CHANNELS; c++) {
             int want = map[b] == c, got = 1;
             for (int i = 0; i < N; i++) {
@@ -148,7 +148,7 @@ static void test_same_conversion(void)
         for (int i = 0; i < N; i++)
             bins[b][i] = (float)(rand() % 2001 - 1000) / 4000.0f;   /* sums clip */
     }
-    apu_spk_mix51(&bins[0][0], N, m, six, N);
+    apu_spk_mix51(&bins[0][0], N, m, NULL, six, N);
     stereo_fold(two);
     for (int i = 0; i < N; i++)
         if (six[i][APU_SPK_FL] != two[i][0] || six[i][APU_SPK_FR] != two[i][1])

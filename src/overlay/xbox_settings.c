@@ -10,6 +10,7 @@
 #include "kernel_pacing.h"
 #include "nv2a_backend_common.h"
 #include "apu_xaudio2.h"
+#include "apu.h"                /* mcpx_apu_set_fx_level */
 
 #include <ctype.h>
 #include <math.h>
@@ -63,6 +64,7 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_AUDIO_MUTE]         = SETTING("audio.mute", XS_BOOL, 0, RENV_AUDIO_MUTE, NULL, NULL, 0, 0, 0),
     [XS_AUDIO_MUTE_BG]      = SETTING("audio.mute_background", XS_BOOL, 0, RENV_AUDIO_MUTE_BG, NULL, NULL, 0, 0, 0),
     [XS_AUDIO_SPEAKERS]     = SETTING("audio.speakers", XS_CHOICE, XS_RESTART, RENV_AUDIO_SPEAKERS, k_speakers, NULL, 0, 0, 0),
+    [XS_AUDIO_FX_LEVEL]     = SETTING("audio.fx_level", XS_FLOAT, 0, RENV_AUDIO_FX_LEVEL, NULL, NULL, 0, 1, 0.25),
     [XS_INPUT_DEADZONE]     = SETTING("input.deadzone", XS_INT, 0, RENV_PAD_DEADZONE, NULL, NULL, 0, 32767, 0),
     [XS_INPUT_TRIGGER_DEADZONE] = SETTING("input.trigger_deadzone", XS_INT, 0, RENV_PAD_TRIGGER_DEADZONE, NULL, NULL, 0, 254, 0),
     [XS_INPUT_RUMBLE]       = SETTING("input.rumble", XS_FLOAT, 0, RENV_INPUT_RUMBLE_GAIN, NULL, NULL, 0, 2, 1),
@@ -239,6 +241,9 @@ static void apply(xs_id id)
     case XS_AUDIO_MUTE:
     case XS_AUDIO_MUTE_BG:
         apply_audio();
+        break;
+    case XS_AUDIO_FX_LEVEL:
+        mcpx_apu_set_fx_level((float)v);
         break;
     case XS_INPUT_DEADZONE:
         xbox_InputSetDeadzone((int)v);

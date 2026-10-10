@@ -99,7 +99,7 @@ static inline int16_t to_s16(float x)
 }
 
 void apu_spk_mix51(const float *mixbins, int stride, const apu_spk_map map,
-                   int16_t (*out)[APU_SPK_CHANNELS], int n)
+                   const float *gain, int16_t (*out)[APU_SPK_CHANNELS], int n)
 {
     /* A bin at a time into six accumulators: 32 adds a sample, as the
      * stereo fold. */
@@ -114,8 +114,14 @@ void apu_spk_mix51(const float *mixbins, int stride, const apu_spk_map map,
         if (map[b] < 0 || map[b] >= APU_SPK_CHANNELS)
             continue;
         dst = acc[map[b]];
-        for (int i = 0; i < n; i++)
-            dst[i] += src[i];
+        if (gain && gain[b] != 1.0f) {
+            const float g = gain[b];
+            for (int i = 0; i < n; i++)
+                dst[i] += g * src[i];
+        } else {
+            for (int i = 0; i < n; i++)
+                dst[i] += src[i];
+        }
     }
     for (int i = 0; i < n; i++)
         for (int c = 0; c < APU_SPK_CHANNELS; c++)

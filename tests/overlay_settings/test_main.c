@@ -36,6 +36,8 @@ void nv2a_present_set_fit(int f) { st_fit = f; }
 void nv2a_host_opts_set(const struct nv2a_host_opts *o) { st_opts = *o; }
 const struct nv2a_host_opts *nv2a_host_opts(void) { return &st_opts; }
 void xa2_set_gain(float g) { st_gain = g; }
+static float st_fx = -2;
+void mcpx_apu_set_fx_level(float v) { st_fx = v; }
 static int st_aniso = -2, st_aa = -2;
 static float st_sharpen = -2;
 void nv2a_host_set_post_aa(int a) { st_aa = a; }

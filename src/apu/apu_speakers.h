@@ -69,9 +69,10 @@ typedef int8_t apu_spk_map[APU_SPK_BINS];
 void apu_spk_default_map(apu_spk_map map);
 
 /* The six speaker feeds of n samples from the 32 mixbins, s16 interleaved
- * FL FR FC LFE SL SR. mixbins is float[32][stride], n at most 32. */
+ * FL FR FC LFE SL SR. mixbins is float[32][stride], n at most 32. gain:
+ * a level per bin, or NULL for unity. */
 void apu_spk_mix51(const float *mixbins, int stride, const apu_spk_map map,
-                   int16_t (*out)[APU_SPK_CHANNELS], int n);
+                   const float *gain, int16_t (*out)[APU_SPK_CHANNELS], int n);
 
 /* ITU-R BS.775 5.1 -> 2.0: L = FL + 0.7071 C + 0.7071 SL,
  * R = FR + 0.7071 C + 0.7071 SR, LFE dropped; saturating, unnormalised

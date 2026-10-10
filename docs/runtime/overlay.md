@@ -86,6 +86,7 @@ title's defaults when those change. Keys it does not know are kept.
 | `graphics.sharpen` (0..1) | `RECOMP_GFX_SHARPEN` | yes |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |
+| `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins |
 | `input.deadzone`, `input.trigger_deadzone` | `RECOMP_PAD_DEADZONE`, `RECOMP_PAD_TRIGGER_DEADZONE` | yes |
 | `input.rumble` (strength, 0 off) | `RECOMP_INPUT_RUMBLE_GAIN` | yes |
 | `power.mode` (`stock`, `performance`, `battery`) | `RECOMP_PRESENT_PACING` + `RECOMP_PRESENT_SPIN_LEAD` | yes |
