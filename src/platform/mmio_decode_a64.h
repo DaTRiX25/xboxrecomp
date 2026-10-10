@@ -244,5 +244,9 @@ static inline int mmio_emulate_a64(ucontext_t *uc, uint32_t off, void *dev,
     return 0;
 }
 
+#define MMIO_HOST_PC(uc) A64_CTX_PC((ucontext_t *)(uc))
+#define mmio_emulate_host(uc, off, dev, rd, wr) \
+    mmio_emulate_a64((ucontext_t *)(uc), (off), (dev), (rd), (wr))
+
 #endif /* __aarch64__ && !_WIN32 */
 #endif /* MMIO_DECODE_A64_H */

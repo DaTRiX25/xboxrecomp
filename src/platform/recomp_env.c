@@ -266,12 +266,13 @@ static void load(void)
 
     /* Switches that default on: unset means on, =0 (or empty) off, so a
      * reader keeps asking only "is it set". Audio needs the host to service
-     * the APU's MMIO faults (x86-64 Windows/Proton, or POSIX arm64 with the
-     * A64 decoder); elsewhere it is off,
+     * the APU's MMIO faults (x86-64 Windows/Proton, POSIX arm64 with the
+     * A64 decoder, x86-64 Linux with the x86 one); elsewhere it is off,
      * with a note when asked for explicitly. */
     default_on(values, RENV_PB_EXEC, 1);
 #if (defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))) || \
-    (!defined(_WIN32) && defined(__aarch64__))
+    (!defined(_WIN32) && defined(__aarch64__)) || \
+    (defined(__linux__) && defined(__x86_64__))
     default_on(values, RENV_AC97_READY, 1);
 #else
     default_on(values, RENV_AC97_READY, 0);

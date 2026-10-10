@@ -25,8 +25,8 @@
  * handler. A host with neither leaves the model off (see xbox_OhciInit). */
 #if defined(_WIN32)
 #  define OHCI_TRAP_WIN32 1
-#elif defined(__aarch64__)
-#  define OHCI_TRAP_POSIX_A64 1
+#elif defined(MMIO_POSIX_TRAP)
+#  define OHCI_TRAP_POSIX_A64 1   /* arm64, or x86-64 Linux (mmio_emulate_host) */
 #endif
 
 /* The runtime maps guest memory at a fixed host offset. */
@@ -1444,12 +1444,12 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 
     if (!hc)
         return 0;
-    ok = mmio_emulate_a64(uc, xbox_va - hc->base, hc,
+    ok = mmio_emulate_host(uc, xbox_va - hc->base, hc,
                           ohci_read_a64, ohci_write_a64);
     if (!ok && hc->decode_fail++ < 20) {
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: insn %08X\n",
                 hc->index, xbox_va - hc->base,
-                *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc));
+                *(const uint32_t *)(uintptr_t)MMIO_HOST_PC(uc));
         fflush(stderr);
     }
     return ok;

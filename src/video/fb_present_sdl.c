@@ -309,6 +309,21 @@ int xbox_FramebufferWindowVulkan(void)
     return s_vk;
 }
 
+/* The display's last vblank as the window saw a frame reach it
+ * (CLOCK_MONOTONIC ns) and its measured refresh period, for pacing that
+ * wants to lock the emulated vblank to the real one; 0 when unknown (no
+ * Vulkan window, or no VK_KHR_present_wait). Any thread. */
+int xbox_FramebufferWindowVblank(uint64_t *t_ns, uint64_t *period_ns)
+{
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (s_vk)
+        return fbv_display_vblank(t_ns, period_ns);
+#endif
+    *t_ns = 0;
+    *period_ns = 0;
+    return 0;
+}
+
 /* The back slot's id<MTLTexture> (Vulkan: struct nvk_image *) at w x h, for
  * the backend to blit its frame into, or NULL (no layer, window closing). A non-NULL return must be
  * followed by xbox_FramebufferWindowPublishTexture: the ack thread counts as

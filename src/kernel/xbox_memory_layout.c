@@ -620,7 +620,8 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
  * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
  * channel has nothing to gain from it, and the page fault costs something. */
-#if !defined(_WIN32) && defined(__aarch64__)
+#include "../platform/mmio_decode.h"
+#if defined(MMIO_POSIX_TRAP)
 #include "../platform/mmio_decode_a64.h"
 #include <unistd.h>
 #include <sys/mman.h>
@@ -664,7 +665,7 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
     while (__atomic_exchange_n(&g_ac97_posix_lock, 1, __ATOMIC_ACQUIRE))
         ;
     mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE);
-    ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
+    ok = mmio_emulate_host(ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
                           g_ac97_page, ac97_posix_rd, ac97_posix_wr);
     if (ok)
         ac97_clear_reset_bits();
@@ -681,7 +682,7 @@ static void ac97_arm_write_trap(void)
     if (!g_mcpx_memory || g_ac97_page)
         return;
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
-#if !defined(_WIN32) && defined(__aarch64__)
+#if defined(MMIO_POSIX_TRAP)
     (void)old;
     g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
     if (g_ac97_hsize < AC97_TRAP_BYTES)
@@ -779,7 +780,7 @@ int xbox_VehMmioFault(void *exception_pointers)
     return 0;
 }
 #else
-#if defined(__aarch64__)
+#if defined(MMIO_POSIX_TRAP)
 extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
                                        uint32_t fault_xbox_va, int is_write);
 #endif
@@ -791,7 +792,7 @@ extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
  * 0. */
 int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 {
-#if defined(__aarch64__)
+#if defined(MMIO_POSIX_TRAP)
     uint32_t va;
 
     if (!mmio_fault_va(fault, &va))

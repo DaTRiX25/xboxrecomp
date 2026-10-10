@@ -89,6 +89,9 @@ else()
                               glslang::glslang-default-resource-limits)
         # A static glslang (the Steam Runtime SDK's) is C++: its runtime
         # comes with it, as this C program's link would not add it.
+        # The GLSL emitters' output through glslang (no device needed).
+        add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_glsl_split
+                         ${CMAKE_CURRENT_BINARY_DIR}/d3d8_glsl_split)
         get_target_property(_xr_glslang_type glslang::glslang TYPE)
         if(_xr_glslang_type STREQUAL "STATIC_LIBRARY")
             target_link_libraries(xbox_d3d8 PUBLIC stdc++ m)

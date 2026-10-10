@@ -982,6 +982,8 @@ static void vk_on_clear(uint32_t param)
     cr.rect.extent.width = (uint32_t)((uint64_t)b[2] * rt->hw / rt->w) - (uint32_t)cr.rect.offset.x;
     cr.rect.extent.height = (uint32_t)((uint64_t)b[3] * rt->hh / rt->h) - (uint32_t)cr.rect.offset.y;
     cr.layerCount = 1;
+    if (!cr.rect.extent.width || !cr.rect.extent.height)
+        return;
     if (s_occ_slot >= 0) {
         occ_pass_end();
         vkCmdClearAttachments(s_cmd, 1, &ca, 1, &cr);
