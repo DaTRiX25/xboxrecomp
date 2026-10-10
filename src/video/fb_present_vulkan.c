@@ -229,8 +229,11 @@ static void *waiter_main(void *arg)
             __atomic_store_n(&s_vbl_ns, t, __ATOMIC_RELEASE);
             /* The real display refresh, for RECOMP_VBLANK_SYNC=display (the
              * emulated vblank's edges snap to it) and the pacing trace. A
-             * frame shown is a refresh; FIFO shows every frame. */
-            xbox_VblankDisplayRefresh(t, __atomic_load_n(&s_vbl_period_ns, __ATOMIC_RELAXED));
+             * frame shown is a refresh; FIFO shows every frame. No period:
+             * the step to the last one is a whole number of refreshes,
+             * which the kernel resolves (s_vbl_period_ns is the frame
+             * rate, not the display's, above 60 Hz). */
+            xbox_VblankDisplayRefresh(t, 0);
             xbox_PacingPresent(t);
             if (xbox_LatOn()) {
                 char b[32];
