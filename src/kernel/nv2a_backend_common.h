@@ -967,6 +967,9 @@ struct nv2a_host_opts {
     int      present_filter;    /* enum nv2a_present_filter */
     int      fullscreen;        /* borderless desktop fullscreen at start */
     int      present_aspect;    /* enum nv2a_present_aspect */
+    /* render.shader_cache: the pipeline cache's directory (nv2a_pcache_dir),
+     * "none" for no disk cache; NULL is the per-user default. */
+    const char *shader_cache;
 };
 
 void nv2a_host_opts_set(const struct nv2a_host_opts *o);

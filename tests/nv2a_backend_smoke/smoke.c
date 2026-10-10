@@ -1123,6 +1123,14 @@ int main(int argc, char **argv)
     int noalias = argc > 1 && !strcmp(argv[1], "noalias");
 
     setvbuf(stderr, NULL, _IONBF, 0);
+    {
+        /* No pipeline cache on disk: the Metal backend reads it once, at
+         * its first frame. */
+        struct nv2a_host_opts o;
+        memset(&o, 0, sizeof o);
+        o.shader_cache = "none";
+        nv2a_host_opts_set(&o);
+    }
     if (!which)
         which = "metal";
     build_xbe(xbe, sizeof xbe);

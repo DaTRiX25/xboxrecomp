@@ -41,6 +41,7 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("present.aspect", RENV_PRESENT_ASPECT);
     enhance_cfg_bind_env("present.fullscreen", RENV_PRESENT_FULLSCREEN);
     enhance_cfg_bind_env("present.pacing", RENV_PRESENT_PACING);
+    enhance_cfg_bind_env("render.shader_cache", RENV_RENDER_SHADER_CACHE);
 #endif
 }
 

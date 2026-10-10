@@ -83,6 +83,8 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
 #include "d3d8_msl.h"
+#include "nv2a_pcache.h"
+#include <dispatch/dispatch.h>
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
  * which collides with Objective-C and CoreServices: declare what is used. */
 ptrdiff_t xbox_GetMemoryOffset(void);
@@ -108,6 +110,11 @@ extern int   xbox_FramebufferWindowMetal(void **device, void **queue);
 extern void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h);
 extern void  xbox_FramebufferWindowPublishTexture(void);
 static int s_layer;                  /* the window takes GPU slot textures */
+static int pc_start(void);           /* the pipeline cache: tables, disk, pre-warm */
+static void pc_log(uint64_t presents);
+#ifndef XBOXRECOMP_GIT_REV
+#define XBOXRECOMP_GIT_REV "unknown"
+#endif
 static void guard_open(void);        /* metal_fb_guard: open the pages before we touch them */
 static int wb_always(void);
 static uint64_t s_window_presents;   /* frames sent to the window (slot or readback) */
@@ -525,6 +532,10 @@ static int init(void)
                                    options:MTLResourceStorageModeShared];
         if (!s_vb || !s_ib || !s_vis) {
             fprintf(stderr, LOGP "buffer creation failed\n");
+            return 0;
+        }
+        if (!pc_start()) {
+            fprintf(stderr, LOGP "pipeline cache allocation failed\n");
             return 0;
         }
         fprintf(stderr, LOGP "device up: %s (unified memory %d), fast math off; present %s,"
@@ -1105,44 +1116,166 @@ static MTLBlendFactor blend_factor(uint32_t gl, int alpha)
     return map[alpha ? nv2a_blend_for_alpha(bf) : bf];
 }
 
-/* A pipeline is its two functions plus the blend state. The functions are
- * cached for the life of the process (vs_cache, fs_cache), so their
- * pointers identify them. */
+/* ---- pipeline cache ---------------------------------------------------------
+ *
+ * Three caches, each of at most s_pc_max entries (512; metal_pcache_max for
+ * tests), least recently used out when full, so a title with more programs
+ * than that still draws every batch (before: a full vertex-function cache
+ * dropped the draw, a full fragment one fell back to fs_basic):
+ *   s_vs   vertex functions, by the program's slots (vs_cache)
+ *   s_fs   fragment functions, by the combiner state (fs_select)
+ *   s_pso  pipelines, by the two functions' ids and the fixed state (pipeline)
+ * An eviction only releases: an encoded draw holds its own reference, and a
+ * pipeline keeps the code of its functions, so a pipeline outlives an evicted
+ * function of its key. Ids, not pointers, key the pipelines, so a function
+ * built again (or by the pre-warm thread) finds its pipelines.
+ *
+ * What is built is also appended to a key list on disk (nv2a_pcache.h:
+ * the program's slots, the combiner state, the pipeline key), and a thread
+ * started with the device builds that list at the next start, before the
+ * title draws with it (pc_prewarm), so a warm start compiles nothing on the
+ * ack thread. The file holds keys, not code: MSL is generated afresh from
+ * each key, and Metal's own shader cache (com.apple.metal in the user cache
+ * directory) turns a repeated source into a lookup.
+ *
+ * Locking: s_pc_mu guards the three tables' slots. The ack thread looks up
+ * without it only through its memos (an entry it already holds) and is the
+ * only thread that evicts; the pre-warm thread only fills free slots, so an
+ * entry the ack thread holds never moves under it. */
+
+static pthread_mutex_t s_pc_mu = PTHREAD_MUTEX_INITIALIZER;
+#define PC_MAX_DEFAULT 512
+#define PC_MAX_LIMIT   16384
+static int      s_pc_max = PC_MAX_DEFAULT;
+static uint64_t s_tick = 1;             /* LRU clock: one per flip */
+static uint64_t s_t0_ns;                /* process start, for the trace */
+static int      s_pc_trace;             /* RECOMP_TRACE=pcache */
+static FILE    *s_pc_csv;               /* RECOMP_TRACE=pcache=<file> */
+/* Ids of the built-in functions in a pipeline key. */
+#define PC_VS_PASS  0x7061737376730001ull
+#define PC_FS_BASIC 0x6261736963660001ull
+
+enum { PC_VS = 0, PC_FS = 1, PC_PSO = 2 };
+static const char *const s_pc_kind[3] = { "vs", "fs", "pso" };
+/* Compile counts and time, [ack thread, pre-warm][kind]; s_pc_mu. */
+static struct {
+    uint64_t n[2][3], ns[2][3];
+    uint64_t rt_flip_n, rt_flip_ns;      /* ack thread, since the last flip */
+    uint64_t rt_10s;                     /* ack thread, first 10 s of the process */
+    uint64_t evicted[3];
+    double   rt_max_ms;
+} s_cs;
+
+__attribute__((constructor)) static void pc_t0(void)
+{
+    s_t0_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static uint64_t pc_now(void)
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+/* One compile done: counted, and logged under RECOMP_TRACE=pcache. */
+static void pc_note(int prewarm, int kind, uint64_t t_start, const char *what)
+{
+    uint64_t t = pc_now(), ns = t - t_start;
+    double ms = (double)ns / 1e6, at = (double)(t - s_t0_ns) / 1e9;
+    pthread_mutex_lock(&s_pc_mu);
+    s_cs.n[prewarm][kind]++;
+    s_cs.ns[prewarm][kind] += ns;
+    if (!prewarm) {
+        s_cs.rt_flip_n++;
+        s_cs.rt_flip_ns += ns;
+        if (at < 10.0)
+            s_cs.rt_10s++;
+        if (ms > s_cs.rt_max_ms)
+            s_cs.rt_max_ms = ms;
+    }
+    pthread_mutex_unlock(&s_pc_mu);
+    if (s_pc_trace)
+        fprintf(stderr, LOGP "pcache: compiled %s %s on the %s thread: %.2f ms at %.3f s\n",
+                s_pc_kind[kind], what, prewarm ? "pre-warm" : "ack", ms, at);
+}
+
+/* A pipeline: its two functions (by id) and the blend, colour-mask and
+ * depth-format state, which Metal bakes into the pipeline. */
 typedef struct {
     uint64_t vs, fs;
     uint32_t key[6];
 } PsoKey;
-#define PSO_MAX 512
-static struct { PsoKey k; id<MTLRenderPipelineState> pso; } s_pso[PSO_MAX];
-static int s_pso_n, s_pso_last;
+_Static_assert(sizeof(PsoKey) == 40, "PsoKey is written to disk as is");
+typedef struct {
+    PsoKey   k;
+    uint64_t tick;                       /* last use, for LRU */
+    int      used, next;                 /* bucket chain */
+    id<MTLRenderPipelineState> pso;
+} PsoEntry;
+#define PSO_BUCKETS 2048
+static PsoEntry *s_pso;                  /* s_pc_max, allocated in init */
+static int       s_pso_head[PSO_BUCKETS];
+static int       s_pso_last = -1;
 
-static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> fs)
+static unsigned pso_bucket(const PsoKey *k)
 {
-    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    return (unsigned)(nv2a_fnv64(k, sizeof *k, NV2A_FNV64_INIT) & (PSO_BUCKETS - 1));
+}
+
+/* s_pc_mu held. */
+static int pso_find(const PsoKey *k)
+{
+    int i;
+    for (i = s_pso_head[pso_bucket(k)]; i >= 0; i = s_pso[i].next)
+        if (!memcmp(&s_pso[i].k, k, sizeof *k))
+            return i;
+    return -1;
+}
+
+/* s_pc_mu held. Puts `pso` (its reference) in a free slot, or with `evict`
+ * (the ack thread) in the least recently used one. -1 when full. */
+static int pso_insert(const PsoKey *k, id<MTLRenderPipelineState> pso, int evict)
+{
+    int i, lru = -1, *pp;
+    unsigned b;
+    for (i = 0; i < s_pc_max; i++) {
+        if (!s_pso[i].used)
+            break;
+        if (lru < 0 || s_pso[i].tick < s_pso[lru].tick)
+            lru = i;
+    }
+    if (i == s_pc_max) {
+        if (!evict)
+            return -1;
+        i = lru;
+        for (pp = &s_pso_head[pso_bucket(&s_pso[i].k)]; *pp != i; pp = &s_pso[*pp].next)
+            ;
+        *pp = s_pso[i].next;
+        [s_pso[i].pso release];          /* an encoded draw keeps its own reference */
+        s_cs.evicted[PC_PSO]++;
+        if (s_pso_last == i)
+            s_pso_last = -1;
+    }
+    b = pso_bucket(k);
+    s_pso[i].k = *k;
+    s_pso[i].pso = pso;
+    s_pso[i].tick = 0;
+    s_pso[i].used = 1;
+    s_pso[i].next = s_pso_head[b];
+    s_pso_head[b] = i;
+    return i;
+}
+
+/* Builds the pipeline for `pk` (a new reference), or nil. Any thread. */
+static id<MTLRenderPipelineState> pso_build(const PsoKey *pk, id<MTLFunction> vs,
+                                            id<MTLFunction> fs, int prewarm)
+{
+    const uint32_t *key = pk->key;
     MTLRenderPipelineDescriptor *pd;
     MTLRenderPipelineColorAttachmentDescriptor *ca;
     id<MTLRenderPipelineState> pso;
     NSError *err = nil;
-    PsoKey pk;
-    uint32_t *key = pk.key;
-    int i;
-
-    memset(&pk, 0, sizeof pk);
-    pk.vs = (uint64_t)(uintptr_t)vs;
-    pk.fs = (uint64_t)(uintptr_t)fs;
-    key[0] = g->blend_enable ? 1 : 0;
-    key[1] = key[0] ? g->blend_sfactor : 0;
-    key[2] = key[0] ? g->blend_dfactor : 0;
-    key[3] = g->color_keep;             /* SET_COLOR_MASK, inverted */
-    key[4] = key[0] ? (uint32_t)blend_op(g->blend_equation) : 0;
-    key[5] = s_enc_dt ? 1 : 0;          /* the open pass has a depth buffer */
-    if (s_pso_last < s_pso_n && !memcmp(&s_pso[s_pso_last].k, &pk, sizeof pk))
-        return s_pso[s_pso_last].pso;
-    for (i = 0; i < s_pso_n; i++)
-        if (!memcmp(&s_pso[i].k, &pk, sizeof pk)) {
-            s_pso_last = i;
-            return s_pso[i].pso;
-        }
+    uint64_t t = pc_now();
+    char what[48];
 
     pd = [[MTLRenderPipelineDescriptor alloc] init];
     pd.vertexFunction = vs;
@@ -1175,17 +1308,55 @@ static id<MTLRenderPipelineState> pipeline(id<MTLFunction> vs, id<MTLFunction> f
                     err ? [[err localizedDescription] UTF8String] : "?");
         return nil;
     }
-    if (s_pso_n < PSO_MAX) {
-        i = s_pso_n++;
-    } else {
-        static unsigned next;
-        i = (int)(next++ % PSO_MAX);
-        [s_pso[i].pso release];   /* an encoded draw keeps its own reference */
-    }
-    s_pso[i].k = pk;
-    s_pso[i].pso = pso;
-    s_pso_last = i;
+    snprintf(what, sizeof what, "%016llX/%016llX", (unsigned long long)pk->vs,
+             (unsigned long long)pk->fs);
+    pc_note(prewarm, PC_PSO, t, what);
     return pso;
+}
+
+static void pc_put(uint32_t type, const void *data, uint32_t len);
+
+/* The pipeline for the batch: functions vs and fs (ids vs_id, fs_id) and
+ * the blend state now. */
+static id<MTLRenderPipelineState> pipeline(uint64_t vs_id, id<MTLFunction> vs,
+                                           uint64_t fs_id, id<MTLFunction> fs)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    id<MTLRenderPipelineState> pso;
+    PsoKey pk;
+    uint32_t *key = pk.key;
+    int i;
+
+    memset(&pk, 0, sizeof pk);
+    pk.vs = vs_id;
+    pk.fs = fs_id;
+    key[0] = g->blend_enable ? 1 : 0;
+    key[1] = key[0] ? g->blend_sfactor : 0;
+    key[2] = key[0] ? g->blend_dfactor : 0;
+    key[3] = g->color_keep;             /* SET_COLOR_MASK, inverted */
+    key[4] = key[0] ? (uint32_t)blend_op(g->blend_equation) : 0;
+    key[5] = s_enc_dt ? 1 : 0;          /* the open pass has a depth buffer */
+    if (s_pso_last >= 0 && !memcmp(&s_pso[s_pso_last].k, &pk, sizeof pk)) {
+        s_pso[s_pso_last].tick = s_tick;
+        return s_pso[s_pso_last].pso;
+    }
+    pthread_mutex_lock(&s_pc_mu);
+    i = pso_find(&pk);
+    pthread_mutex_unlock(&s_pc_mu);
+    if (i < 0) {
+        if (!(pso = pso_build(&pk, vs, fs, 0)))
+            return nil;
+        pthread_mutex_lock(&s_pc_mu);
+        if ((i = pso_find(&pk)) >= 0)
+            [pso release];               /* the pre-warm thread was first */
+        else
+            i = pso_insert(&pk, pso, 1);
+        pthread_mutex_unlock(&s_pc_mu);
+        pc_put(PC_PSO, &pk, sizeof pk);
+    }
+    s_pso[i].tick = s_tick;
+    s_pso_last = i;
+    return s_pso[i].pso;
 }
 
 /* ---- textures ------------------------------------------------
@@ -1469,133 +1640,241 @@ static id<MTLSamplerState> sampler(const Stage *t)
  *
  * As the D3D11 backend's vertex_shader and combiner_ps: the program is
  * parsed from the slots it starts at (d3d8_vsh_parse) and emitted as MSL
- * (d3d8_vsh_generate_msl, screen-space epilogue), keyed by
- * nv2a_vsh_program_hash; the combiner registers become NV2ACombinerState
- * (d3d8_combiners_from_regs) and MSL (d3d8_combiners_generate_msl), keyed by
- * the state's bytes. Each compiles once, with s_opts (fast math off). A
- * source that fails to compile is logged with its text, counted
- * (s_compile_errors, in the present log) and remembered as bad. */
+ * (d3d8_vsh_generate_msl, screen-space epilogue), keyed by its slots; the
+ * combiner registers become NV2ACombinerState (d3d8_combiners_from_regs) and
+ * MSL (d3d8_combiners_generate_msl), keyed by the state's bytes. Each
+ * compiles once, with s_opts (fast math off), and stays until evicted (the
+ * pipeline cache above). A source that fails to compile is logged with its
+ * text, counted (s_compile_errors, in the present log) and remembered as bad. */
 
 static uint64_t s_compile_errors, s_vs_compiled, s_fs_compiled;
 
+/* MSL for one function, compiled (a new reference), or nil. Any thread. */
 static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *what)
 {
     NSError *err = nil;
     id<MTLLibrary> lib;
     id<MTLFunction> fn;
 
-    lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:src]
-                              options:s_opts error:&err];
-    if (!lib) {
-        s_compile_errors++;
-        if (s_compile_errors <= 4)
-            fprintf(stderr, LOGP "\x1b[1;31m%s: MSL compile failed: %s\x1b[0m\n%s\n",
-                    what, err ? [[err localizedDescription] UTF8String] : "?", src);
-        return nil;
-    }
-    fn = [lib newFunctionWithName:name];
-    [lib release];
-    if (!fn) {
-        s_compile_errors++;
-        fprintf(stderr, LOGP "%s: no function %s\n", what, [name UTF8String]);
+    @autoreleasepool {
+        lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:src]
+                                  options:s_opts error:&err];
+        if (!lib) {
+            uint64_t n = __atomic_add_fetch(&s_compile_errors, 1, __ATOMIC_RELAXED);
+            if (n <= 4)
+                fprintf(stderr, LOGP "\x1b[1;31m%s: MSL compile failed: %s\x1b[0m\n%s\n",
+                        what, err ? [[err localizedDescription] UTF8String] : "?", src);
+            return nil;
+        }
+        fn = [lib newFunctionWithName:name];
+        [lib release];
+        if (!fn) {
+            __atomic_add_fetch(&s_compile_errors, 1, __ATOMIC_RELAXED);
+            fprintf(stderr, LOGP "%s: no function %s\n", what, [name UTF8String]);
+        }
     }
     return fn;
 }
 
-#define VS_MAX 512
 typedef struct {
-    uint32_t        hash;
+    uint64_t        id;       /* nv2a_fnv64 of the program's slots; 0: free */
+    uint64_t        tick;     /* last use, for LRU */
+    uint32_t        hash;     /* nv2a_vsh_program_hash, as logged */
     uint16_t        inputs;
-    int             used, bad;
+    uint8_t         bad;
     id<MTLFunction> fn;
 } VsEntry;
-static VsEntry s_vs[VS_MAX];
+static VsEntry *s_vs;         /* s_pc_max, allocated in init */
+static struct { int valid; uint32_t dwords, start; VsEntry *e; } s_vs_memo;
+
+/* The vertex function for `n` slots of program (up to its FINAL), a new
+ * reference or nil; its inputs in *inputs. Any thread. */
+static id<MTLFunction> vs_build(const uint32_t *slots, int n, uint32_t hash,
+                                uint16_t *inputs, int prewarm)
+{
+    NV2AVshProgram *parsed = (NV2AVshProgram *)malloc(sizeof *parsed);
+    char *msl = (char *)malloc(65536);
+    id<MTLFunction> fn = nil;
+    uint64_t t = pc_now();
+    char what[32];
+
+    snprintf(what, sizeof what, "program %08X", hash);
+    if (parsed && msl) {
+        d3d8_vsh_parse(slots, n, parsed);
+        if (d3d8_vsh_generate_msl(parsed, D3D8_MSL_SCREEN_SPACE, msl, 65536) <= 0) {
+            __atomic_add_fetch(&s_compile_errors, 1, __ATOMIC_RELAXED);
+            fprintf(stderr, LOGP "%s: no MSL\n", what);
+        } else if ((fn = compile_fn(msl, @"vs_main", what)) != nil) {
+            *inputs = parsed->inputs_read;
+            __atomic_add_fetch(&s_vs_compiled, 1, __ATOMIC_RELAXED);
+            pc_note(prewarm, PC_VS, t, what);
+        }
+    }
+    free(parsed);
+    free(msl);
+    return fn;
+}
+
+/* s_pc_mu held. */
+static VsEntry *vs_find(uint64_t kid)
+{
+    int i;
+    for (i = 0; i < s_pc_max; i++)
+        if (s_vs[i].id == kid)
+            return &s_vs[i];
+    return NULL;
+}
+
+/* s_pc_mu held. A free entry, or with `evict` (the ack thread) the least
+ * recently used one, emptied; NULL when full. */
+static VsEntry *vs_slot(int evict)
+{
+    VsEntry *lru = NULL;
+    int i;
+    for (i = 0; i < s_pc_max; i++) {
+        if (!s_vs[i].id)
+            return &s_vs[i];
+        if (!lru || s_vs[i].tick < lru->tick)
+            lru = &s_vs[i];
+    }
+    if (!evict)
+        return NULL;
+    [lru->fn release];
+    if (s_vs_memo.e == lru)
+        s_vs_memo.valid = 0;
+    memset(lru, 0, sizeof *lru);
+    s_cs.evicted[PC_VS]++;
+    return lru;
+}
 
 static VsEntry *vs_cache(void)
 {
-    static NV2AVshProgram parsed;
-    static char msl[65536];
-    static struct { int valid; uint32_t dwords, start; VsEntry *e; } memo;
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
-    uint32_t hash;
-    VsEntry *e = NULL;
-    char what[32];
-    int i;
+    const uint32_t *slots;
+    id<MTLFunction> fn;
+    uint32_t hash, len;
+    uint16_t inputs = 0;
+    uint64_t kid;
+    VsEntry *e;
 
     /* Programs only change by upload (prog_dwords) or a new start slot. */
-    if (memo.valid && memo.dwords == v->prog_dwords && memo.start == v->start)
-        return memo.e;
-    hash = nv2a_vsh_program_hash(v, NULL);
-    if (!hash)
-        hash = 1;
-    for (i = 0; i < VS_MAX; i++) {
-        if (s_vs[i].used && s_vs[i].hash == hash) {
-            e = &s_vs[i];
-            break;
-        }
+    if (s_vs_memo.valid && s_vs_memo.dwords == v->prog_dwords && s_vs_memo.start == v->start) {
+        if (s_vs_memo.e)
+            s_vs_memo.e->tick = s_tick;
+        return s_vs_memo.e;
     }
+    hash = nv2a_vsh_program_hash(v, &len);
+    slots = &v->prog[v->start][0];
+    kid = nv2a_fnv64(slots, (size_t)len * 16u, NV2A_FNV64_INIT);
+    if (!kid)
+        kid = 1;
+    pthread_mutex_lock(&s_pc_mu);
+    e = vs_find(kid);
+    pthread_mutex_unlock(&s_pc_mu);
     if (!e) {
-        for (i = 0; i < VS_MAX && s_vs[i].used; i++)
-            ;
-        if (i == VS_MAX)
-            return NULL;   /* full: a title with this many programs wants LRU */
-        e = &s_vs[i];
-        e->used = 1;
-        e->hash = hash;
-        e->bad = 1;
-        d3d8_vsh_parse(&v->prog[v->start][0], NV2A_VSH_SLOTS - (int)v->start, &parsed);
-        snprintf(what, sizeof what, "program %08X", hash);
-        if (d3d8_vsh_generate_msl(&parsed, D3D8_MSL_SCREEN_SPACE, msl, (int)sizeof msl) <= 0) {
-            s_compile_errors++;
-            fprintf(stderr, LOGP "%s: no MSL\n", what);
-        } else if ((e->fn = compile_fn(msl, @"vs_main", what)) != nil) {
-            e->inputs = parsed.inputs_read;
-            e->bad = 0;
-            s_vs_compiled++;
+        fn = vs_build(slots, (int)len, hash, &inputs, 0);
+        pthread_mutex_lock(&s_pc_mu);
+        if ((e = vs_find(kid)) != NULL) {
+            [fn release];               /* the pre-warm thread was first */
+            fn = nil;
+        } else {
+            e = vs_slot(1);
+            e->id = kid;
+            e->hash = hash;
+            e->inputs = inputs;
+            e->bad = fn ? 0 : 1;
+            e->fn = fn;
         }
+        pthread_mutex_unlock(&s_pc_mu);
+        if (fn)
+            pc_put(PC_VS, slots, len * 16u);
     }
-    memo.valid = 1;
-    memo.dwords = v->prog_dwords;
-    memo.start = v->start;
-    memo.e = e->bad ? NULL : e;
-    return memo.e;
+    e->tick = s_tick;
+    s_vs_memo.valid = 1;
+    s_vs_memo.dwords = v->prog_dwords;
+    s_vs_memo.start = v->start;
+    s_vs_memo.e = e->bad ? NULL : e;
+    return s_vs_memo.e;
 }
 
-#define FS_MAX 512
 typedef struct {
-    uint32_t          hash;
-    int               bad;
+    uint64_t          id;     /* nv2a_fnv64 of st; 0: free */
+    uint64_t          tick;   /* last use, for LRU */
+    uint8_t           bad;
     NV2ACombinerState st;
     id<MTLFunction>   fn;
 } FsEntry;
-static FsEntry *s_fs;   /* FS_MAX, allocated on first use */
-static int      s_fs_n;
+static FsEntry *s_fs;         /* s_pc_max, allocated in init */
+static struct { int valid; uint32_t r[36]; FsEntry *e; } s_fs_memo;
 
-static uint32_t fnv(const void *p, size_t n)
+/* The fragment function for combiner state `st`, a new reference or nil.
+ * Any thread. */
+static id<MTLFunction> fs_build(const NV2ACombinerState *st, uint64_t kid, int prewarm)
 {
-    const uint8_t *b = (const uint8_t *)p;
-    uint32_t h = 0x811c9dc5u;
-    while (n--) {
-        h ^= *b++;
-        h *= 0x01000193u;
+    char *msl = (char *)malloc(65536);
+    id<MTLFunction> fn = nil;
+    uint64_t t = pc_now();
+    char what[40];
+
+    snprintf(what, sizeof what, "combiners %08X", (uint32_t)kid);
+    if (!msl)
+        return nil;
+    if (d3d8_combiners_generate_msl(st, msl, 65536) <= 0) {
+        __atomic_add_fetch(&s_compile_errors, 1, __ATOMIC_RELAXED);
+        fprintf(stderr, LOGP "%s: no MSL\n", what);
+    } else if ((fn = compile_fn(msl, @"fs_main", what)) != nil) {
+        __atomic_add_fetch(&s_fs_compiled, 1, __ATOMIC_RELAXED);
+        pc_note(prewarm, PC_FS, t, what);
     }
-    return h;
+    free(msl);
+    return fn;
 }
 
-/* The fragment function for the batch: its register combiners when they
- * are programmed (v->rc_set and a stage count), else fs_basic. As the D3D11
- * setup_pixel, only 2D textures are bound, so every sampling mode is passed
- * to the combiners as 2D. */
-static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
+/* s_pc_mu held. */
+static FsEntry *fs_find(uint64_t kid, const NV2ACombinerState *st)
 {
-    static char msl[65536];
-    static struct { int valid; uint32_t r[36]; id<MTLFunction> fn; } memo;
+    int i;
+    for (i = 0; i < s_pc_max; i++)
+        if (s_fs[i].id == kid && !memcmp(&s_fs[i].st, st, sizeof *st))
+            return &s_fs[i];
+    return NULL;
+}
+
+/* s_pc_mu held. As vs_slot. */
+static FsEntry *fs_slot(int evict)
+{
+    FsEntry *lru = NULL;
+    int i;
+    for (i = 0; i < s_pc_max; i++) {
+        if (!s_fs[i].id)
+            return &s_fs[i];
+        if (!lru || s_fs[i].tick < lru->tick)
+            lru = &s_fs[i];
+    }
+    if (!evict)
+        return NULL;
+    [lru->fn release];
+    if (s_fs_memo.e == lru)
+        s_fs_memo.valid = 0;
+    memset(lru, 0, sizeof *lru);
+    s_cs.evicted[PC_FS]++;
+    return lru;
+}
+
+/* The fragment function for the batch, its id in *id: its register
+ * combiners when they are programmed (v->rc_set and a stage count), else
+ * fs_basic. As the D3D11 setup_pixel, only 2D textures are bound, so every
+ * sampling mode is passed to the combiners as 2D. */
+static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
+{
     NV2ACombinerState st;
-    uint32_t key[36], modes = 0, hash;
-    FsEntry *e = NULL;
-    char what[32];
+    uint32_t key[36], modes = 0;
+    id<MTLFunction> fn;
+    uint64_t kid;
+    FsEntry *e;
     int n;
 
+    *fid = PC_FS_BASIC;
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
         return s_fs_basic;
     for (n = 0; n < 4; n++) {
@@ -1613,41 +1892,311 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     key[33] = v->rc_fcw0;
     key[34] = v->rc_fcw1;
     key[35] = modes;
-    if (memo.valid && !memcmp(memo.r, key, sizeof key))
-        return memo.fn;
+    if (s_fs_memo.valid && !memcmp(s_fs_memo.r, key, sizeof key)) {
+        if (!s_fs_memo.e)
+            return s_fs_basic;
+        s_fs_memo.e->tick = s_tick;
+        *fid = s_fs_memo.e->id;
+        return s_fs_memo.e->fn;
+    }
 
     memset(&st, 0, sizeof st);
     d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw,
                              v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
     st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
-    hash = fnv(&st, sizeof st);
-    if (!s_fs && !(s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs)))
-        return s_fs_basic;
-    for (n = 0; n < s_fs_n; n++)
-        if (s_fs[n].hash == hash && !memcmp(&s_fs[n].st, &st, sizeof st)) {
-            e = &s_fs[n];
-            break;
-        }
+    kid = nv2a_fnv64(&st, sizeof st, NV2A_FNV64_INIT);
+    if (!kid)
+        kid = 1;
+    pthread_mutex_lock(&s_pc_mu);
+    e = fs_find(kid, &st);
+    pthread_mutex_unlock(&s_pc_mu);
     if (!e) {
-        if (s_fs_n == FS_MAX)
-            return s_fs_basic;
-        e = &s_fs[s_fs_n++];
-        e->hash = hash;
-        e->st = st;
-        e->bad = 1;
-        snprintf(what, sizeof what, "combiners %08X", hash);
-        if (d3d8_combiners_generate_msl(&st, msl, (int)sizeof msl) <= 0) {
-            s_compile_errors++;
-            fprintf(stderr, LOGP "%s: no MSL\n", what);
-        } else if ((e->fn = compile_fn(msl, @"fs_main", what)) != nil) {
-            e->bad = 0;
-            s_fs_compiled++;
+        fn = fs_build(&st, kid, 0);
+        pthread_mutex_lock(&s_pc_mu);
+        if ((e = fs_find(kid, &st)) != NULL) {
+            [fn release];               /* the pre-warm thread was first */
+            fn = nil;
+        } else {
+            e = fs_slot(1);
+            e->id = kid;
+            e->st = st;
+            e->bad = fn ? 0 : 1;
+            e->fn = fn;
+        }
+        pthread_mutex_unlock(&s_pc_mu);
+        if (fn)
+            pc_put(PC_FS, &st, sizeof st);
+    }
+    e->tick = s_tick;
+    memcpy(s_fs_memo.r, key, sizeof key);
+    s_fs_memo.valid = 1;
+    s_fs_memo.e = e->bad ? NULL : e;   /* as D3D11: the basic PS */
+    if (!s_fs_memo.e)
+        return s_fs_basic;
+    *fid = e->id;
+    return e->fn;
+}
+
+/* ---- pipeline cache on disk, and the pre-warm thread ------------------------ */
+
+static nv2a_pcache *s_pcf;              /* the key list, or NULL (off) */
+static uint64_t     s_pc_loaded[3], s_pc_warm[3], s_pc_warm_ns;
+static int          s_pc_warm_done;
+
+/* Appends a key the ack thread just built (it is new to this process; the
+ * file drops one it already has). */
+static void pc_put(uint32_t type, const void *data, uint32_t len)
+{
+    if (s_pcf && nv2a_pcache_put(s_pcf, type, data, len) < 0) {
+        fprintf(stderr, LOGP "pcache: cannot append; the disk cache is off for this run\n");
+        nv2a_pcache_close(s_pcf);
+        s_pcf = NULL;
+    }
+}
+
+/* One record of the file built and cached, as the ack thread would have:
+ * pass 0 builds the functions, pass 1 the pipelines (which need them).
+ * Never evicts: a full table leaves the rest to the ack thread. */
+static void pc_warm_one(size_t i, int pass)
+{
+    const void *data;
+    uint32_t type, len;
+    uint64_t kid;
+
+    if (!nv2a_pcache_get(s_pcf, i, &type, &data, &len))
+        return;
+    if (pass == 0 && type == PC_VS && len >= 16 && len % 16 == 0
+            && len <= NV2A_VSH_SLOTS * 16u) {
+        uint32_t hash = 2166136261u, k;
+        uint16_t inputs = 0;
+        id<MTLFunction> fn;
+        VsEntry *e;
+        for (k = 0; k < len / 4u; k++)  /* nv2a_vsh_program_hash, for the log */
+            hash = (hash ^ ((const uint32_t *)data)[k]) * 16777619u;
+        if (!(kid = nv2a_fnv64(data, len, NV2A_FNV64_INIT)))
+            kid = 1;
+        pthread_mutex_lock(&s_pc_mu);
+        e = vs_find(kid);
+        pthread_mutex_unlock(&s_pc_mu);
+        if (e || !(fn = vs_build((const uint32_t *)data, (int)(len / 16u), hash, &inputs, 1)))
+            return;
+        pthread_mutex_lock(&s_pc_mu);
+        if (!vs_find(kid) && (e = vs_slot(0)) != NULL) {
+            e->id = kid;
+            e->hash = hash;
+            e->inputs = inputs;
+            e->fn = fn;
+            fn = nil;
+            s_pc_warm[PC_VS]++;
+        }
+        pthread_mutex_unlock(&s_pc_mu);
+        [fn release];
+    } else if (pass == 0 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
+        NV2ACombinerState st;
+        id<MTLFunction> fn;
+        FsEntry *e;
+        memcpy(&st, data, sizeof st);
+        if (!(kid = nv2a_fnv64(&st, sizeof st, NV2A_FNV64_INIT)))
+            kid = 1;
+        pthread_mutex_lock(&s_pc_mu);
+        e = fs_find(kid, &st);
+        pthread_mutex_unlock(&s_pc_mu);
+        if (e || !(fn = fs_build(&st, kid, 1)))
+            return;
+        pthread_mutex_lock(&s_pc_mu);
+        if (!fs_find(kid, &st) && (e = fs_slot(0)) != NULL) {
+            e->id = kid;
+            e->st = st;
+            e->fn = fn;
+            fn = nil;
+            s_pc_warm[PC_FS]++;
+        }
+        pthread_mutex_unlock(&s_pc_mu);
+        [fn release];
+    } else if (pass == 1 && type == PC_PSO && len == sizeof(PsoKey)) {
+        id<MTLFunction> vs = nil, fs = nil;
+        id<MTLRenderPipelineState> pso;
+        PsoKey pk;
+        int found;
+        memcpy(&pk, data, sizeof pk);
+        pthread_mutex_lock(&s_pc_mu);
+        found = pso_find(&pk) >= 0;
+        if (!found) {
+            /* The functions by id; each retained, as the ack thread may
+             * evict its entry while the pipeline builds. */
+            VsEntry *ve = pk.vs == PC_VS_PASS ? NULL : vs_find(pk.vs);
+            int i;
+            vs = pk.vs == PC_VS_PASS ? s_vs_pass : (ve && !ve->bad ? ve->fn : nil);
+            if (pk.fs == PC_FS_BASIC)
+                fs = s_fs_basic;
+            else
+                for (i = 0; i < s_pc_max; i++)
+                    if (s_fs[i].id == pk.fs && !s_fs[i].bad) {
+                        fs = s_fs[i].fn;
+                        break;
+                    }
+            [vs retain];
+            [fs retain];
+        }
+        pthread_mutex_unlock(&s_pc_mu);
+        if (!found && vs && fs && (pso = pso_build(&pk, vs, fs, 1)) != nil) {
+            pthread_mutex_lock(&s_pc_mu);
+            if (pso_find(&pk) < 0 && pso_insert(&pk, pso, 0) >= 0) {
+                pso = nil;
+                s_pc_warm[PC_PSO]++;
+            }
+            pthread_mutex_unlock(&s_pc_mu);
+            [pso release];
+        }
+        [vs release];
+        [fs release];
+    }
+}
+
+/* Builds every key of the file, functions first, on the utility queues:
+ * done before the title reaches the draws that need them, the ack thread
+ * finds them built. */
+static void *pc_prewarm(void *arg)
+{
+    size_t n = nv2a_pcache_count(s_pcf);
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    uint64_t t = pc_now();
+    int pass;
+    (void)arg;
+    for (pass = 0; pass < 2; pass++)
+        dispatch_apply(n, q, ^(size_t i) {
+            @autoreleasepool {
+                pc_warm_one(i, pass);
+            }
+        });
+    s_pc_warm_ns = pc_now() - t;
+    if (@available(macOS 13.3, *))
+        s_dev.shouldMaximizeConcurrentCompilation = NO;
+    __atomic_store_n(&s_pc_warm_done, 1, __ATOMIC_RELEASE);
+    fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines of %llu/%llu/%llu"
+            " on disk in %.0f ms (done at %.2f s)\n",
+            (unsigned long long)s_pc_warm[PC_VS], (unsigned long long)s_pc_warm[PC_FS],
+            (unsigned long long)s_pc_warm[PC_PSO], (unsigned long long)s_pc_loaded[PC_VS],
+            (unsigned long long)s_pc_loaded[PC_FS], (unsigned long long)s_pc_loaded[PC_PSO],
+            (double)s_pc_warm_ns / 1e6, (double)(pc_now() - s_t0_ns) / 1e9);
+    return NULL;
+}
+
+/* With the device up: the tables, the trace, the key list and its
+ * pre-warm thread. 0 if the tables cannot be allocated. */
+static int pc_start(void)
+{
+    const char *tr = recomp_env(RENV_PCACHE_TRACE);
+    long max = recomp_env_int(RENV_METAL_PCACHE_MAX, PC_MAX_DEFAULT);
+    char dir[1024], path[1100], ver[256], msg[256];
+    size_t i, n;
+    pthread_t th;
+
+    s_pc_max = max < 1 ? 1 : max > PC_MAX_LIMIT ? PC_MAX_LIMIT : (int)max;
+    s_vs = (VsEntry *)calloc((size_t)s_pc_max, sizeof *s_vs);
+    s_fs = (FsEntry *)calloc((size_t)s_pc_max, sizeof *s_fs);
+    s_pso = (PsoEntry *)calloc((size_t)s_pc_max, sizeof *s_pso);
+    if (!s_vs || !s_fs || !s_pso)
+        return 0;
+    for (i = 0; i < PSO_BUCKETS; i++)
+        s_pso_head[i] = -1;
+    if (tr) {
+        s_pc_trace = 1;
+        if (strcmp(tr, "1") != 0) {
+            if ((s_pc_csv = fopen(tr, "w")) != NULL)
+                fprintf(s_pc_csv, "flip,t_ms,interval_ms,ack_compiles,ack_compile_ms\n");
+            else
+                fprintf(stderr, LOGP "pcache: cannot write %s\n", tr);
         }
     }
-    memcpy(memo.r, key, sizeof key);
-    memo.valid = 1;
-    memo.fn = e->bad ? s_fs_basic : e->fn;   /* as D3D11: the basic PS */
-    return memo.fn;
+
+    if (!nv2a_pcache_dir(nv2a_host_opts()->shader_cache, getprogname(), dir, sizeof dir)) {
+        fprintf(stderr, LOGP "pcache: no disk cache (render.shader_cache=%s); %d entries"
+                " per table\n", nv2a_host_opts()->shader_cache ? nv2a_host_opts()->shader_cache
+                                                               : "(default, unavailable)",
+                s_pc_max);
+        s_pc_warm_done = 1;
+        return 1;
+    }
+    snprintf(path, sizeof path, "%s/metal_pipelines.bin", dir);
+    /* The keys' layout and the build: a file from another build is dropped
+     * (nv2a_pcache_open), as a changed key layout would not read back. */
+    snprintf(ver, sizeof ver, "metal pipelines 1; PsoKey %zu; NV2ACombinerState %zu;"
+             " vsh slots %d; toolkit %s", sizeof(PsoKey), sizeof(NV2ACombinerState),
+             (int)NV2A_VSH_SLOTS, XBOXRECOMP_GIT_REV);
+    s_pcf = nv2a_pcache_open(path, ver, msg, sizeof msg);
+    fprintf(stderr, LOGP "pcache: %s: %s; %d entries per table\n", path, msg, s_pc_max);
+    if (!s_pcf) {
+        s_pc_warm_done = 1;
+        return 1;
+    }
+    n = nv2a_pcache_count(s_pcf);
+    for (i = 0; i < n; i++) {
+        const void *d;
+        uint32_t type, len;
+        if (nv2a_pcache_get(s_pcf, i, &type, &d, &len) && type <= PC_PSO)
+            s_pc_loaded[type]++;
+    }
+    /* The compiler service's full width while the pre-warm runs (WWDC23
+     * 10127, "Optimize GPU renderers with Metal"); back to balanced after. */
+    if (@available(macOS 13.3, *)) {
+        if (n && s_dev.maximumConcurrentCompilationTaskCount)
+            s_dev.shouldMaximizeConcurrentCompilation = YES;
+    }
+    if (n && pthread_create(&th, NULL, pc_prewarm, NULL) == 0)
+        pthread_detach(th);
+    else
+        s_pc_warm_done = 1;
+    return 1;
+}
+
+/* At every flip: the LRU clock, and the CSV line. */
+static void pc_flip(uint64_t flip)
+{
+    static uint64_t last;
+    uint64_t t = pc_now(), n, ns;
+    pthread_mutex_lock(&s_pc_mu);
+    n = s_cs.rt_flip_n;
+    ns = s_cs.rt_flip_ns;
+    s_cs.rt_flip_n = s_cs.rt_flip_ns = 0;
+    pthread_mutex_unlock(&s_pc_mu);
+    s_tick++;
+    if (s_pc_csv) {
+        fprintf(s_pc_csv, "%llu,%.3f,%.3f,%llu,%.3f\n", (unsigned long long)flip,
+                (double)(t - s_t0_ns) / 1e6, last ? (double)(t - last) / 1e6 : 0.0,
+                (unsigned long long)n, (double)ns / 1e6);
+        if ((flip % 60) == 0)
+            fflush(s_pc_csv);
+    }
+    last = t;
+}
+
+/* The present log's pipeline-cache line. */
+static void pc_log(uint64_t presents)
+{
+    int i, nv = 0, nf = 0, np = 0;
+    pthread_mutex_lock(&s_pc_mu);
+    for (i = 0; i < s_pc_max; i++) {
+        nv += s_vs[i].id != 0;
+        nf += s_fs[i].id != 0;
+        np += s_pso[i].used;
+    }
+    fprintf(stderr, LOGP "pcache at present #%llu: cached %d vs, %d fs, %d pipelines (max %d);"
+            " ack-thread compiles %llu vs + %llu fs + %llu pipelines in %.1f ms (max %.1f,"
+            " %llu in the first 10 s); pre-warm %llu + %llu + %llu in %.1f ms (%s);"
+            " evicted %llu + %llu + %llu\n",
+            (unsigned long long)presents, nv, nf, np, s_pc_max,
+            (unsigned long long)s_cs.n[0][PC_VS], (unsigned long long)s_cs.n[0][PC_FS],
+            (unsigned long long)s_cs.n[0][PC_PSO],
+            (double)(s_cs.ns[0][0] + s_cs.ns[0][1] + s_cs.ns[0][2]) / 1e6, s_cs.rt_max_ms,
+            (unsigned long long)s_cs.rt_10s,
+            (unsigned long long)s_cs.n[1][PC_VS], (unsigned long long)s_cs.n[1][PC_FS],
+            (unsigned long long)s_cs.n[1][PC_PSO],
+            (double)(s_cs.ns[1][0] + s_cs.ns[1][1] + s_cs.ns[1][2]) / 1e6,
+            __atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE) ? "done" : "running",
+            (unsigned long long)s_cs.evicted[PC_VS], (unsigned long long)s_cs.evicted[PC_FS],
+            (unsigned long long)s_cs.evicted[PC_PSO]);
+    pthread_mutex_unlock(&s_pc_mu);
 }
 
 /* ---- depth / stencil state ---------------------------------------------------
@@ -1700,8 +2249,17 @@ static id<MTLDepthStencilState> depth_state(int depth, int stencil)
     [dd release];
     if (!st)
         return nil;
-    if (s_dss_n >= DSS_MAX)
-        return st;   /* uncached: a title with this many wants LRU (leaks) */
+    if (s_dss_n >= DSS_MAX) {
+        /* Full: replace one in turn, as the sampler cache does (a state is
+         * a descriptor, not a compile; an encoded draw keeps its own
+         * reference). Before, a state past 64 was made per draw and leaked. */
+        static unsigned next;
+        i = (int)(next++ % DSS_MAX);
+        [s_dss[i].dss release];
+        s_dss[i].key = key;
+        s_dss[i].dss = st;
+        return st;
+    }
     s_dss[s_dss_n].key = key;
     s_dss[s_dss_n].dss = st;
     s_dss_n++;
@@ -1867,6 +2425,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     RenderTarget *rt;
     id<MTLRenderPipelineState> pso;
     id<MTLFunction> vfn, ffn;
+    uint64_t vid, fid;
     struct nv2a_vp_consts vc;
     MsPsConsts mpc;
     NSUInteger vb_off, ib_off, vbytes;
@@ -1901,11 +2460,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 return;
             }
             vfn = e->fn;
+            vid = e->id;
             for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
                 if (e->inputs & (1u << i))
                     slot[nf4++] = (int)i;
         } else {
             vfn = s_vs_pass;
+            vid = PC_VS_PASS;
             for (k = 0; k < VTX_F4; k++)
                 slot[nf4++] = s_vtx_attr[k];
         }
@@ -1922,7 +2483,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             float b = t->levels > 1 && filter_mip(t->filter) ? lod_bias(t->filter) : 0.0f;
             mpc.tex_bias[k] = b > 15.99f ? 15.99f : b < -16.0f ? -16.0f : b;
         }
-        ffn = fs_select(v);
+        ffn = fs_select(v, &fid);
         for (i = 0; i < d->idx_count; i++) {
             if (d->idx[i] < lo) lo = d->idx[i];
             if (d->idx[i] > hi) hi = d->idx[i];
@@ -2027,7 +2588,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
 
         if (!s_enc || s_enc_rt != rt)
             begin_encoder(rt, 0, NULL);
-        pso = pipeline(vfn, ffn);
+        pso = pipeline(vid, vfn, fid, ffn);
         if (!pso) {
             s_draws_skipped++;
             return;
@@ -2886,6 +3447,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
     }
     s_presents++;
     flip_log(surface_offset, rt);
+    pc_flip(s_presents);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (%s), %llu clears,"
                 " %llu draws (%llu vertex-program), %llu skipped, %llu culled,"
@@ -2911,6 +3473,8 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_window_presents,
                 s_layer ? "CAMetalLayer slots" : "texture readback",
                 (unsigned long long)s_flushes, (unsigned long long)s_report_commits);
+    if (s_presents == 1 || (s_presents % 300) == 0)
+        pc_log(s_presents);
     if (!always && rt && addr && pitch)
         guard_flip(addr, pitch * rt->h);
     if (!pitch || !addr || layer) {
