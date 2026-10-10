@@ -966,7 +966,8 @@ static void metal_on_clear(uint32_t param)
             if (s_occ_slot >= 0) {
                 end_encoder();
             } else {
-                /* Draws never set a scissor: the whole target again. */
+                /* The whole target again; each draw sets its own
+                 * (draw_scissor). */
                 sr.x = 0;
                 sr.y = 0;
                 sr.width = rt->hw;
@@ -1757,6 +1758,35 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
 
 /* ---- draws ------------------------------------------------------------------- */
 
+/* The scissor a draw takes: the surface clip (SET_SURFACE_CLIP_HORIZONTAL/
+ * VERTICAL), clamped to rt, in host pixels. The NV2A writes no pixel outside
+ * the clip; xemu scissors every draw to it (pgraph/gl/draw.c,
+ * glScissor(clip_x, clip_y, clip_width, clip_height)) and the CPU path's
+ * rasteriser bounds each triangle by it. A target serves every clip of its
+ * surface (rt_grow), so without the scissor a draw spills over pixels its
+ * clip leaves alone: Burnout 3 draws its frame under a 640x448 clip at y 16
+ * of the 640x480 back buffer, and the full-screen passes that reach past it
+ * (the speed blur's scaled copies of the frame, HUD included) painted the
+ * 16-row bands above and below it with displaced HUD and scenery, a
+ * different picture in each back buffer. 0 when the clip leaves nothing of
+ * rt. */
+static int draw_scissor(const struct nv2a_pb_gpu *g, const RenderTarget *rt,
+                        MTLScissorRect *sr)
+{
+    uint32_t x0 = g->clip_x, y0 = g->clip_y;
+    uint32_t x1 = g->clip_x + g->clip_w, y1 = g->clip_y + g->clip_h;
+
+    if (x1 > rt->w) x1 = rt->w;
+    if (y1 > rt->h) y1 = rt->h;
+    if (x0 >= x1 || y0 >= y1)
+        return 0;
+    sr->x = (NSUInteger)((uint64_t)x0 * rt->hw / rt->w);
+    sr->y = (NSUInteger)((uint64_t)y0 * rt->hh / rt->h);
+    sr->width = (NSUInteger)((uint64_t)x1 * rt->hw / rt->w) - sr->x;
+    sr->height = (NSUInteger)((uint64_t)y1 * rt->hh / rt->h) - sr->y;
+    return 1;
+}
+
 static void metal_on_draw(const struct nv2a_pb_draw *d)
 {
     /* The expanded list: at most three entries per index (a fan or a quad
@@ -1947,7 +1977,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         {
             MTLViewport vp = {0.0, 0.0, (double)rt->hw, (double)rt->hh, 0.0, 1.0};
+            MTLScissorRect sr;
+            if (!draw_scissor(g, rt, &sr)) {
+                s_draws_skipped++;
+                return;
+            }
             [s_enc setViewport:vp];
+            [s_enc setScissorRect:sr];
         }
         [s_enc setFrontFacingWinding:v->front_face != 0x900
                                      ? MTLWindingCounterClockwise : MTLWindingClockwise];
