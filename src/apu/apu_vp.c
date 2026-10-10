@@ -556,6 +556,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             slot = (method - NV1BA0_PIO_SET_SUBMIX_HEADROOM) / 4;
             d->vp.submix_headroom[slot] =
                 (uint8_t)(argument & NV1BA0_PIO_SET_SUBMIX_HEADROOM_AMOUNT);
+            if (recomp_env_on(RENV_AUDIO_CHANNELS))
+                fprintf(stderr, "[AUDIO-CH] submix headroom: bin %u = %u (mixed at 1/%u)\n",
+                        (unsigned)slot, (unsigned)d->vp.submix_headroom[slot],
+                        1u << d->vp.submix_headroom[slot]);
         } else if ((method >= NV1BA0_PIO_SET_OUTBUF_BA &&
                     method < NV1BA0_PIO_SET_OUTBUF_BA + 32) ||
                    (method >= NV1BA0_PIO_SET_OUTBUF_LEN &&

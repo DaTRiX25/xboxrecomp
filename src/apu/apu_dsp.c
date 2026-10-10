@@ -230,6 +230,97 @@ void mcpx_apu_set_fx_level(float level)
     s_fx_level = level < 0.0f ? 0.0f : level > 1.0f ? 1.0f : level;
 }
 
+/* The title's GP EQs, 5.1 only. A bin set with mcpx_apu_set_bin_eq passes
+ * through the biquad its effects image applies to it, with the
+ * coefficients the title keeps in GP scratch memory: five s24 words, b0 b1
+ * b2 a1 a2, stored halved,
+ *
+ *     y[n] = 2 (b0 x[n] + b1 x[n-1] + b2 x[n-2] + a1 y[n-1] + a2 y[n-2])
+ *
+ * -- the form in which Burnout 3's image defaults (0x400000 0xAD7746
+ * 0x23434C 0x5288B9 0xDCBCB3) are exactly unity. The title rewrites them
+ * while it runs (DirectSound's SetEffectData lands in the scratch copy the
+ * GP's DMA loads from), so they are read again every EP period; the GP's
+ * memory itself is not emulated. On the APU frame thread, 32 samples a bin
+ * a frame. */
+#define EQ_NONE 0xFFFFFFFFu
+static uint32_t s_eq_off[NUM_MIXBINS];
+static int s_eq_any;
+static struct { float c[5]; float x1, x2, y1, y2; int bypass; } s_eq[NUM_MIXBINS];
+
+void mcpx_apu_set_bin_eq(int bin, uint32_t scratch_offset)
+{
+    if (!s_eq_any)
+        for (int b = 0; b < NUM_MIXBINS; b++)
+            s_eq_off[b] = EQ_NONE;
+    if (bin < 0 || bin >= NUM_MIXBINS)
+        return;
+    s_eq_off[bin] = scratch_offset;
+    s_eq_any = 1;
+}
+
+/* A dword of GP scratch, through the GPSADDR scatter-gather table (8 bytes
+ * an entry, the page's physical address first, as xemu's scratch_rw walks
+ * it). 0 with the table not set up yet. */
+static uint32_t gp_scratch_word(MCPXAPUState *d, uint32_t off)
+{
+    uint32_t sge = qatomic_read(&d->regs[NV_PAPU_GPSADDR]), page;
+    if (!sge || !d->ram_ptr || (off >> 12) > d->regs[NV_PAPU_GPSMAXSGE])
+        return 0;
+    page = *(const uint32_t *)mcpx_apu_phys(sge + (off >> 12) * 8);
+    if (!page || (page & 0xFFF))
+        return 0;
+    return *(const uint32_t *)(mcpx_apu_phys(page) + (off & 0xFFF));
+}
+
+static float s24f(uint32_t v)
+{
+    v &= 0xFFFFFF;
+    return (float)((int32_t)(v << 8) >> 8) / 8388608.0f;
+}
+
+static void eq_read(MCPXAPUState *d)
+{
+    static int logged;
+    for (int b = 0; b < NUM_MIXBINS; b++) {
+        float c[5], c1, c2;
+        if (s_eq_off[b] == EQ_NONE)
+            continue;
+        for (int k = 0; k < 5; k++)
+            c[k] = 2.0f * s24f(gp_scratch_word(d, s_eq_off[b] + 4 * k));
+        /* 1 - c1 z^-1 - c2 z^-2 must have its poles inside the circle. */
+        c1 = c[3];
+        c2 = c[4];
+        s_eq[b].bypass = !(c2 > -1.0f && c2 < 1.0f && fabsf(c1) < 1.0f - c2);
+        if (s_eq[b].bypass && logged++ < 4)
+            fprintf(stderr, "[APU] bin %d EQ %.4f %.4f %.4f / %.4f %.4f is not"
+                            " stable: passed through\n", b, c[0], c[1], c[2], c1, c2);
+        memcpy(s_eq[b].c, c, sizeof(c));
+    }
+}
+
+static void eq_run(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    for (int b = 0; b < NUM_MIXBINS; b++) {
+        float *x = mixbins[b];
+        if (s_eq_off[b] == EQ_NONE || s_eq[b].bypass)
+            continue;
+        const float b0 = s_eq[b].c[0], b1 = s_eq[b].c[1], b2 = s_eq[b].c[2];
+        const float a1 = s_eq[b].c[3], a2 = s_eq[b].c[4];
+        float x1 = s_eq[b].x1, x2 = s_eq[b].x2, y1 = s_eq[b].y1, y2 = s_eq[b].y2;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float y = b0 * x[i] + b1 * x1 + b2 * x2 + a1 * y1 + a2 * y2;
+            x2 = x1; x1 = x[i];
+            y2 = y1; y1 = y;
+            x[i] = y;
+        }
+        /* Denormals in a silent tail cost more than they are worth. */
+        if (fabsf(y1) < 1e-20f) y1 = 0.0f;
+        if (fabsf(y2) < 1e-20f) y2 = 0.0f;
+        s_eq[b].x1 = x1; s_eq[b].x2 = x2; s_eq[b].y1 = y1; s_eq[b].y2 = y2;
+    }
+}
+
 void mcpx_apu_speaker_map_get(int8_t map[32])
 {
     if (!s_spk_map_set) {
@@ -328,6 +419,11 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             s_spk_map_set = 1;
         }
         fx_gains();
+        if (s_eq_any) {
+            if (off == 0)
+                eq_read(d);
+            eq_run(mixbins);
+        }
         apu_spk_mix51(&mixbins[0][0], NUM_SAMPLES_PER_FRAME, s_spk_map,
                       s_fx_bins ? s_bin_gain : NULL,
                       &d->monitor.frame_buf6[off], NUM_SAMPLES_PER_FRAME);

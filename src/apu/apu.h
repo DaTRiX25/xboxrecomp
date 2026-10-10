@@ -67,6 +67,12 @@ int mcpx_apu_speaker_test_playing(int *via_map);
 void mcpx_apu_set_fx_bins(uint32_t mask);
 void mcpx_apu_set_fx_level(float level);
 
+/* 5.1: bin passes through the biquad EQ the title's GP effects image runs
+ * on it, its coefficients read live from GP scratch memory at
+ * scratch_offset (b0 b1 b2 a1 a2, s24, halved; apu_dsp.c). Stereo does not
+ * use it. Call before mcpx_apu_init_standalone. */
+void mcpx_apu_set_bin_eq(int bin, uint32_t scratch_offset);
+
 /* The speaker map in use (mcpx_apu_set_speaker_map, or the default). */
 void mcpx_apu_speaker_map_get(int8_t map[32]);
 
