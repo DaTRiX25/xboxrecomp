@@ -85,7 +85,9 @@ extern "C" {
     X(PRESENT_VSYNC,     CONFIG, "RECOMP_PRESENT_VSYNC",     NULL, "vsync: SDL host 0 = off (default on); D3D11 1 = on (default off)") \
     X(WINDOW_QUIT_AFTER, CONFIG, "RECOMP_WINDOW_QUIT_AFTER", NULL, "close the window after this many seconds") \
     X(FB_WINDOW,         CONFIG, "RECOMP_FB_WINDOW",         NULL, "Windows: show the framebuffer window") \
-    X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA") \
+    X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA (a host using recomp_save_dir: the whole save root, instead of the per-user directory)") \
+    X(SAVE_BACKUPS,      CONFIG, "RECOMP_SAVE_BACKUPS",      NULL, "save backups kept in <save dir>/backup, one per start that found the saves changed (recomp_save_backup; default 5, 0 none)") \
+    X(HANG_WATCHDOG,     CONFIG, "RECOMP_HANG_WATCHDOG",     NULL, "seconds without a flip before a hang report in <save dir>/crash (default 15, 0 off; 60 before the first flip)") \
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
@@ -221,6 +223,7 @@ extern "C" {
     X(WATCH_DEPTH,       DEBUG, "watch_depth",     "RECOMP_WATCH_DEPTH",       "=n: watch stack depth (14)") \
     X(WATCH_LEN,         DEBUG, "watch_len",       "RECOMP_WATCH_LEN",         "=bytes: watch range") \
     X(WATCHDOG_SECS,     DEBUG, "watchdog",        "RECOMP_WATCHDOG_SECS",     "=s: dump and exit after s seconds") \
+    X(CRASH_TEST,        DEBUG, "crash_test",      NULL,                       "=segv[:s] or =hang[:s]: fault, or hang, the first guest kernel call after s seconds (default 5), to test the crash and hang reports") \
     /* from upstream (merge of origin/main 1409a7d), appended */ \
     X(USB_PADS,          CONFIG, "RECOMP_USB_PADS",          NULL, "emulated USB pads plugged in, 1..4 (default 1)") \
     X(PAD_SCRIPT,        DEBUG, "pad_script",      "RECOMP_PAD_SCRIPT",        "=ms:btn[+btn][:hold],... or =@file: timed pad presses") \
@@ -292,6 +295,9 @@ double recomp_env_double(recomp_env_id id, double def);
 
 /* The variable or list key, for messages. */
 const char *recomp_env_name(recomp_env_id id);
+/* The list variable a key belongs to ("RECOMP_TRACE", "RECOMP_DEBUG"), or
+ * NULL for a config-tier variable, whose name is the variable. */
+const char *recomp_env_list_var(recomp_env_id id);
 
 #ifdef __cplusplus
 }

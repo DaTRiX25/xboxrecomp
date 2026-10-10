@@ -16,6 +16,7 @@
 #include "kernel_pacing.h"
 #include "recomp_env.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
+#include "xbox_crash.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1053,9 +1054,18 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     DebugBreak();
 #endif
 
+    {
+        char head[96];
+        snprintf(head, sizeof head, "[CRASH] KeBugCheck 0x%08X", (unsigned)BugCheckCode);
+        if (xbox_crash_begin("bugcheck", head)) {
+            xbox_crash_guest_state();
+            xbox_crash_end();
+        }
+    }
     /* ExitProcess skips atexit. Guest code calls this, never from inside
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
+    xbox_crash_log_flush(500);
     ExitProcess(BugCheckCode);
 }
 
@@ -1074,9 +1084,22 @@ VOID __stdcall xbox_KeBugCheckEx(
     DebugBreak();
 #endif
 
+    {
+        char head[160];
+        snprintf(head, sizeof head,
+                 "[CRASH] KeBugCheckEx 0x%08X (0x%llX, 0x%llX, 0x%llX, 0x%llX)",
+                 (unsigned)BugCheckCode, (unsigned long long)Param1,
+                 (unsigned long long)Param2, (unsigned long long)Param3,
+                 (unsigned long long)Param4);
+        if (xbox_crash_begin("bugcheck", head)) {
+            xbox_crash_guest_state();
+            xbox_crash_end();
+        }
+    }
     /* ExitProcess skips atexit. Guest code calls this, never from inside
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
+    xbox_crash_log_flush(500);
     ExitProcess(BugCheckCode);
 }
 
@@ -1122,12 +1145,14 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "HalReturnToFirmware: routine=%u (exiting)", Routine);
+    xbox_crash_log_flush(500);
     ExitProcess(0);
 }
 
 VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
+    xbox_crash_log_flush(500);
     ExitProcess(0);
 }
 

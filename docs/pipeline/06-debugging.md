@@ -318,6 +318,14 @@ Wreckless did exactly this and reached its main loop with no renderer set up.
   `RECOMP_PB_EXEC` (on by default, `=0` off) consumes the pushbuffer.
 - `RECOMP_WATCHDOG_SECS=N` dumps registers, PUT/GET and the guest stack when
   the title stops making progress -- it names the wait.
+- A host that calls `xbox_crash_init` and `xbox_crash_watchdog_start`
+  (`src/kernel/xbox_crash.h`) writes a folder per crash, bugcheck or hang
+  (no flip for `RECOMP_HANG_WATCHDOG` seconds, default 15) under
+  `<save dir>/crash/`: host backtrace, every registered thread's guest
+  registers and guest call stack in `tools/stackwalk.py`'s format (its raw
+  `GS` lines included, so `stackwalk.py functions.json < report.txt` redoes
+  it with real bounds), the last 500 log lines and the settings.
+  `RECOMP_DEBUG=crash_test=segv:10` or `=hang:10` makes one on purpose.
 - `RECOMP_WATCH=<va>` names the guest code that writes a value (a callback
   table slot, a "ready" flag); `RECOMP_UNIMPL_TRAP=1` stops at the first
   untranslated instruction that is actually reached.

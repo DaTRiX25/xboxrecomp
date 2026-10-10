@@ -361,3 +361,10 @@ const char *recomp_env_name(recomp_env_id id)
 {
     return (unsigned)id < RENV_COUNT ? s_keys[id].name : "?";
 }
+
+const char *recomp_env_list_var(recomp_env_id id)
+{
+    if ((unsigned)id >= RENV_COUNT || s_keys[id].tier == TIER_CONFIG)
+        return NULL;
+    return s_list_var[s_keys[id].tier];
+}

@@ -24,6 +24,7 @@ set(KERNEL_SOURCES
     kernel_thunks.c
     kernel_bridge.c
     xbox_memory_layout.c
+    xbox_crash.c
     icall_feedback.c
     recomp_trace.c
     nv2a_pb_scan.c

@@ -35,6 +35,7 @@
 #include "kernel_pacing.h"
 #include "host_time.h"            /* xbox_HostSleepNs, for flip pacing */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
+#include "xbox_crash.h"           /* g_xbox_flip_count */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -6168,6 +6169,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        g_xbox_flip_count++;            /* the hang watchdog's sign of life */
         /* RECOMP_TRACE=pacing: the flip's time, here where every backend
          * passes, with the draws since the last (CPU and GPU paths). */
         {
