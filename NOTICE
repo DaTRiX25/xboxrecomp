@@ -82,6 +82,17 @@ Derived algorithms — credited, independently implemented
   label.
 
 
+MIT — Dear ImGui
+-----------------
+
+  https://github.com/ocornut/imgui
+
+  third_party/imgui/ (release v1.92.9b, see third_party/imgui/VENDORED.txt): the
+  core and the SDL2, Metal and Vulkan backends, unmodified. (c) 2014-2026 Omar
+  Cornut. The licence text is third_party/imgui/LICENSE.txt. Used by the
+  in-game settings overlay (src/overlay).
+
+
 Reference material (no code taken)
 -----------------------------------
 
