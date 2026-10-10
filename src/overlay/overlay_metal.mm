@@ -22,7 +22,7 @@ extern "C" void xbox_OverlayMetalDraw(void *device, void *cmdbuf, void *rpdesc, 
     if (!s_init) {
         if (!overlay_core_init(false)) {
             s_failed = true;
-            fprintf(stderr, "[OVERLAY] ImGui could not start; no overlay\n");
+            overlay_fail();
             return;
         }
         ImGui_ImplMetal_Init((__bridge id<MTLDevice>)device);

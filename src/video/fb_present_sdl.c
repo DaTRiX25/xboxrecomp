@@ -785,6 +785,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
          * title behind it is paused, so no frame would wake the loop). */
         s_overlay_open = s_layer && xbox_OverlayOpen();
         dirty |= s_overlay_open;
+        /* The title is paused behind an open overlay, so no new frame comes
+         * to take a pending RECOMP_WINDOW_SHOT: any pending one is taken now,
+         * of what is shown (the overlay over the last frame). */
+        if (s_overlay_open && shown_seq)
+            shoot |= s_shot_n && shot_due(0xFFFFFFFFu);
 #endif
         pthread_mutex_lock(&s_lock);
         seq = s_ready_seq;

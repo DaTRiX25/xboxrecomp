@@ -36,7 +36,7 @@ extern "C" void xbox_OverlayVulkanDraw(const struct nvk_core *core, VkCommandBuf
         ImGui_ImplVulkan_InitInfo ii{};
         if (!overlay_core_init(true)) {
             s_failed = true;
-            fprintf(stderr, "[OVERLAY] ImGui could not start; no overlay\n");
+            overlay_fail();
             return;
         }
         s_fmt = fmt;
@@ -59,7 +59,7 @@ extern "C" void xbox_OverlayVulkanDraw(const struct nvk_core *core, VkCommandBuf
         ii.CheckVkResultFn = check;
         if (!ImGui_ImplVulkan_Init(&ii)) {
             s_failed = true;
-            fprintf(stderr, "[OVERLAY] the Vulkan renderer could not start; no overlay\n");
+            overlay_fail();
             return;
         }
         s_init = true;

@@ -521,6 +521,17 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             int aa = nv2a_host_post_aa();
             float sharp = nv2a_host_sharpen();
             NSUInteger sw = [src width], sh = [src height];
+            {
+                static int last_aa = -1;
+                static float last_sharp = -1.0f;
+                if (aa != last_aa || sharp != last_sharp) {
+                    last_aa = aa;
+                    last_sharp = sharp;
+                    fprintf(stderr, "[PRESENT] post passes: AA %s, sharpen %.2f (%lux%lu)\n",
+                            aa == NV2A_AA_FXAA ? "FXAA" : aa == NV2A_AA_SMAA ? "SMAA (not built)" : "off",
+                            sharp, (unsigned long)sw, (unsigned long)sh);
+                }
+            }
             if (aa == NV2A_AA_FXAA && s_pso_fxaa) {
                 id<MTLTexture> dst = pp_texture(0, sw, sh);
                 if (dst) {

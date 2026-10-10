@@ -13,8 +13,11 @@ path).
 | Keyboard | F1 |
 | macOS | Cmd + , |
 
-Close with B or Esc. `RECOMP_OVERLAY=0` turns it off; `RECOMP_OVERLAY=open`
-starts it open (screenshots).
+Close with B or Esc. `RECOMP_OVERLAY=0` turns it off. For scripted runs:
+`open` starts it open, `toggle=<s>,<s>` opens and closes it at those seconds,
+`file=<path>` toggles it whenever that file appears (and removes it); a
+`RECOMP_WINDOW_SHOT` pending while it is open is taken of the overlay over
+the last frame.
 
 ## What it does to the title
 
@@ -37,6 +40,19 @@ starts it open (screenshots).
   catches up by at most that.
   The pause takes hold at the next flip, so a load or movie that does not
   flip finishes first; the overlay opens at once.
+
+A pad's Back is held back from Start: with the overlay on, the title never
+sees Start while Back is held (`xbox_InputSetComboGuard`), so pressing View
+first and Menu second does not also pause the game. Menu first still does.
+
+## Post passes and anisotropy
+
+Anisotropic filtering applies to a mipmapped sampler with a linear
+minification filter only (never a point-filtered one, never a render-target
+read). FXAA and CAS run in the window presenters (`src/video/post_shaders.h`,
+one neutral-dialect source for MSL and GLSL) at the game's internal
+resolution, after the frame is final and before the scale to the window; the
+overlay is drawn after them.
 
 ## Settings
 
@@ -65,6 +81,9 @@ title's defaults when those change. Keys it does not know are kept.
 | `display.overscan` (`off`, `crop`) | `RECOMP_PRESENT_OVERSCAN` | yes |
 | `display.fit` (`letterbox`, `fill16x10`) | `RECOMP_PRESENT_FIT` | yes |
 | `graphics.render_scale` | `RECOMP_RENDER_SCALE` | restart |
+| `graphics.aniso` (`off`, `2x` .. `16x`) | `RECOMP_GFX_ANISO` | yes (the sampler caches key on the level) |
+| `graphics.aa` (`off`, `fxaa`, `smaa`) | `RECOMP_GFX_AA` | yes; SMAA is not built yet |
+| `graphics.sharpen` (0..1) | `RECOMP_GFX_SHARPEN` | yes |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | stored; 5.1 is not built (BO-76) |
 | `input.deadzone`, `input.trigger_deadzone` | `RECOMP_PAD_DEADZONE`, `RECOMP_PAD_TRIGGER_DEADZONE` | yes |

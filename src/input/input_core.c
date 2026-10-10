@@ -45,6 +45,10 @@ static void neutral(XBOX_GAMEPAD *g)
     memset(g, 0, sizeof *g);
 }
 
+static volatile int g_combo_guard;
+
+void xbox_InputSetComboGuard(int on) { g_combo_guard = on != 0; }
+
 int xbox_InputBlocked(void) { return g_blocked; }
 
 void xbox_InputSetBlocked(int on)
@@ -142,6 +146,9 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
          * number reads as the same state and a key press never happens. */
         pState->dwPacketNumber = kb.dwPacketNumber;
     }
+    if (rc == ERROR_SUCCESS && g_combo_guard
+            && (pState->Gamepad.wButtons & XBOX_GAMEPAD_BACK))
+        pState->Gamepad.wButtons &= (WORD)~XBOX_GAMEPAD_START;
     if (rc == ERROR_SUCCESS && (g_blocked || (g_latched & (1u << dwPort)))) {
         if (!g_blocked && !any_held(&pState->Gamepad))
             g_latched &= ~(1u << dwPort);

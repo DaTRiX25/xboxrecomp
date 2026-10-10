@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define LOGP "[OVERLAY] "
 
@@ -72,6 +73,18 @@ static uint32_t s_save_at;
 
 /* Fullscreen follows the setting when the setting changes. */
 static int s_fs_applied = -1;
+
+/* RECOMP_OVERLAY=toggle=<s>[,<s>...]: the overlay opens and closes at those
+ * seconds after the window came up, for scripted runs (the pause, the
+ * screenshots) with no pad to press. */
+#define TOGGLE_MAX 8
+static uint32_t s_toggle_ms[TOGGLE_MAX];
+static int s_toggle_n, s_toggle_i;
+static uint32_t s_t0_ms;
+/* RECOMP_OVERLAY=file=<path>: the overlay toggles whenever that file appears
+ * (and removes it), for driving it from a script that knows when. */
+static char s_trigger[512];
+static uint32_t s_trigger_next;
 
 /* The window's present rate for the graph. */
 static volatile uint32_t s_presents;
@@ -483,6 +496,17 @@ void xbox_OverlayPoll(void)
     if (!s_enabled)
         return;
 
+    while (s_toggle_i < s_toggle_n && (int32_t)(now_ms() - s_t0_ms - s_toggle_ms[s_toggle_i]) >= 0) {
+        s_toggle_i++;
+        hot_toggle();
+    }
+
+    if (s_trigger[0] && (int32_t)(now_ms() - s_trigger_next) >= 0) {
+        s_trigger_next = now_ms() + 200;
+        if (unlink(s_trigger) == 0)
+            hot_toggle();
+    }
+
     /* B or Esc: here and not in the frame, so a window that cannot present
      * (minimised) still closes. */
     if (s_back > 0) {
@@ -507,6 +531,15 @@ void xbox_OverlayPoll(void)
     }
 }
 
+void overlay_fail()
+{
+    if (s_open)
+        set_open(false);
+    s_enabled = false;
+    xbox_InputSetComboGuard(0);
+    fprintf(stderr, LOGP "no overlay (its renderer did not start)\n");
+}
+
 int xbox_OverlaySetWindow(SDL_Window *win)
 {
     const char *e = getenv("RECOMP_OVERLAY");
@@ -517,6 +550,21 @@ int xbox_OverlaySetWindow(SDL_Window *win)
         fprintf(stderr, LOGP "off (RECOMP_OVERLAY=0)\n");
         return 0;
     }
+    xbox_InputSetComboGuard(1);
+    s_t0_ms = now_ms();
+    if (e && !strncmp(e, "toggle=", 7)) {
+        const char *q = e + 7;
+        while (*q && s_toggle_n < TOGGLE_MAX) {
+            char *end;
+            double sec = strtod(q, &end);
+            if (end == q)
+                break;
+            s_toggle_ms[s_toggle_n++] = (uint32_t)(sec * 1000.0);
+            q = *end == ',' ? end + 1 : end;
+        }
+    }
+    if (e && !strncmp(e, "file=", 5))
+        snprintf(s_trigger, sizeof s_trigger, "%s", e + 5);
     if (e && !strcmp(e, "open"))
         set_open(true);
     return 1;

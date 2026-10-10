@@ -20,6 +20,9 @@
 /* The ImGui context and the SDL platform backend, made at the first draw.
  * `vulkan` selects ImGui_ImplSDL2_InitForVulkan. */
 bool overlay_core_init(bool vulkan);
+/* A backend could not start: the overlay turns itself off (an open one is
+ * closed), so the title is not left paused behind nothing. */
+void overlay_fail();
 bool overlay_begin_frame();
 ImDrawData *overlay_end_frame();
 

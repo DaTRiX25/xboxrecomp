@@ -291,13 +291,13 @@ static int f_plugged[4], f_get_calls[4], f_set_calls[4], f_init_calls, f_kb_on;
 static XBOX_VIBRATION f_last_vib[4];
 
 static void f_init(void) { f_init_calls++; }
-static int f_hold_start = 1;
+static int f_hold_start = 1, f_hold_back;
 static DWORD f_get(DWORD p, XBOX_INPUT_STATE *s)
 {
     f_get_calls[p]++;
     if (!f_plugged[p]) return ERROR_DEVICE_NOT_CONNECTED;
     memset(s, 0, sizeof *s);
-    s->Gamepad.wButtons = f_hold_start ? XBOX_GAMEPAD_START : 0;
+    s->Gamepad.wButtons = (f_hold_start ? XBOX_GAMEPAD_START : 0) | (f_hold_back ? XBOX_GAMEPAD_BACK : 0);
     return ERROR_SUCCESS;
 }
 static DWORD f_set(DWORD p, const XBOX_VIBRATION *v)
@@ -438,6 +438,31 @@ static void test_block(void)
     xbox_InputSetBackend(NULL);
 }
 
+/* The overlay's combo guard: Start is hidden while Back is held. */
+static void test_combo_guard(void)
+{
+    XBOX_INPUT_STATE st;
+
+    f_now = 95000;
+    f_plugged[0] = 1;
+    f_kb_on = 0;
+    f_hold_start = 1;
+    xbox_InputSetBackend(&k_fake);
+    xbox_InputInit();
+    xbox_InputSetComboGuard(1);
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && st.Gamepad.wButtons == XBOX_GAMEPAD_START,
+          "guard: Start alone was hidden");
+    f_hold_back = 1;
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && st.Gamepad.wButtons == XBOX_GAMEPAD_BACK,
+          "guard: Start reached the title with Back held (%04X)", st.Gamepad.wButtons);
+    xbox_InputSetComboGuard(0);
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS
+          && st.Gamepad.wButtons == (XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START),
+          "guard off: the buttons were changed");
+    f_hold_back = 0;
+    xbox_InputSetBackend(NULL);
+}
+
 static void test_trigger_deadzone(void)
 {
     XBOX_HOST_XINPUT_GAMEPAD in;
@@ -468,6 +493,7 @@ int main(int argc, char **argv)
     test_readme(argc > 1 ? argv[1] : "input_README.md");
     test_cache();
     test_block();
+    test_combo_guard();
     test_trigger_deadzone();
     printf("input_map: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

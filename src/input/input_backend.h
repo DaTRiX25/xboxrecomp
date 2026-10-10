@@ -41,6 +41,11 @@ void xbox_InputSetRumbleGain(double gain);
  * port stays neutral until its buttons have been let go once, so the press
  * that closed the overlay is not also the title's. Any thread. */
 void xbox_InputSetBlocked(int on);
+
+/* The overlay's hotkey is Back+Start: with the guard on, a title never sees
+ * Start while Back is held, so pressing Back first (View, then Menu on a
+ * Steam Deck) does not also pause the game. Start first still reaches it. */
+void xbox_InputSetComboGuard(int on);
 int  xbox_InputBlocked(void);
 
 /* The host backend this build uses (xinput_device.c). */
