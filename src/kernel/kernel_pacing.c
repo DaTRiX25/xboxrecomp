@@ -38,6 +38,91 @@ static uint64_t vblank_due(const XboxVblankSchedule *s, uint64_t n)
     return s->t0_ns + n * 1000000000ull / XBOX_VBLANK_HZ;
 }
 
+/* ── Locking the vblank to the display ─────────────────────
+ *
+ * RECOMP_VBLANK_SYNC=display. The emulated vblank is a host timer at
+ * exactly 60 Hz; the display refreshes at its own 59.9x-60.0x Hz, from its
+ * own clock. Free-running, the two drift through each other: a guest flip
+ * that lands just before a display latch one second lands just after it the
+ * next, and the screen repeats one frame and skips another -- the periodic
+ * double/skip a FIFO swap chain only postpones. Emulators that care pace to
+ * the host refresh instead (DuckStation's and PCSX2's "sync to host refresh
+ * rate": when the guest rate is within a few percent of the display's, the
+ * display is the clock).
+ *
+ * Here the vblank timer stays the clock -- a stalled or missing display
+ * report never stops the title -- but its grid is moved onto the display's:
+ * a present path reports each display refresh (xbox_VblankDisplayRefresh:
+ * Metal's CVDisplayLink, D3D11's IDXGIOutput::WaitForVBlank, Vulkan's
+ * present_wait timestamps), and each vblank's next edge is the display
+ * refresh nearest one guest period on. Its period is the display's, or a
+ * whole multiple of it (120 Hz: every second refresh), when that is within
+ * 5% of 60 Hz; otherwise, or with no report for 250 ms, the timer runs on
+ * its own 60.000 Hz grid as before. In phase with the display, a guest
+ * flip's present always lands the same distance before the next latch:
+ * each frame is shown exactly once. */
+#define DISPLAY_STALE_NS 250000000ull
+static volatile LONGLONG s_disp_ns;        /* last display refresh, host ns */
+static volatile LONGLONG s_disp_period;    /* filtered refresh period, ns */
+static int s_disp_lock = -1;               /* RECOMP_VBLANK_SYNC=display */
+
+static int display_lock_on(void)
+{
+    if (s_disp_lock < 0) {
+        const char *e = recomp_env(RENV_VBLANK_SYNC);
+        s_disp_lock = e && !strcmp(e, "display");
+    }
+    return s_disp_lock;
+}
+
+int xbox_VblankDisplayLockOn(void)
+{
+    return display_lock_on();
+}
+
+void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns)
+{
+    uint64_t prev = (uint64_t)s_disp_ns, p = period_ns;
+
+    if (!display_lock_on() || !when_ns)
+        return;
+    if (!p && prev && when_ns > prev)
+        p = when_ns - prev;
+    /* A report may be of a refresh still to come (CVDisplayLink's output
+     * time): any point on the display's grid will do. */
+    if (p >= 2000000u && p <= 50000000u) {
+        uint64_t cur = (uint64_t)s_disp_period;
+        /* A reported period is exact; one measured between two reports
+         * jitters with the reporting thread's wake-up, so it is smoothed. */
+        s_disp_period = (LONGLONG)(period_ns || !cur ? p : (cur * 15u + p) / 16u);
+    }
+    s_disp_ns = (LONGLONG)when_ns;
+}
+
+/* The display grid the vblank follows now: a refresh time and the guest
+ * period on it. 0 when not locked. */
+static int display_grid(uint64_t now_ns, uint64_t *ref_ns, uint64_t *period_ns)
+{
+    const uint64_t nominal = 1000000000ull / XBOX_VBLANK_HZ;
+    uint64_t ref, pd, m, p;
+
+    if (!display_lock_on())
+        return 0;
+    ref = (uint64_t)s_disp_ns;
+    pd = (uint64_t)s_disp_period;
+    if (!ref || !pd || (now_ns > ref && now_ns - ref > DISPLAY_STALE_NS))
+        return 0;
+    m = (nominal + pd / 2) / pd;           /* refreshes per guest vblank */
+    if (!m)
+        return 0;
+    p = m * pd;
+    if (p < nominal - nominal / 20 || p > nominal + nominal / 20)
+        return 0;                          /* not within 5% of 60 Hz */
+    *ref_ns = ref;
+    *period_ns = p;
+    return 1;
+}
+
 int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,
                         uint64_t *next_due_ns, uint64_t *restarted_late_ns)
 {
@@ -61,6 +146,27 @@ int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,
     }
     s->count++;
     *next_due_ns = vblank_due(s, s->count);
+    {
+        /* Locked: the next edge is one guest period (on the display's
+         * clock) after the edge just raised, moved to the display refresh
+         * nearest it -- from the edge, not from now, so at 120 Hz the same
+         * refresh of each pair stays the guest's. The grid is re-anchored
+         * there, so the free-running schedule takes over if the reports
+         * stop. */
+        uint64_t ref, p, pd, target, next;
+        if (display_grid(now_ns, &ref, &p)) {
+            pd = (uint64_t)s_disp_period;
+            target = due + p;
+            if (target >= ref)
+                next = ref + (target - ref + pd / 2) / pd * pd;
+            else
+                next = ref - (ref - target + pd / 2) / pd * pd;
+            while (next <= now_ns)
+                next += p;
+            s->t0_ns = next - s->count * 1000000000ull / XBOX_VBLANK_HZ;
+            *next_due_ns = next;
+        }
+    }
     return 1;
 }
 
@@ -370,6 +476,9 @@ static int s_trace = -1;          /* 0 off, 1 summaries, 2 also every flip */
  * writes, the walker reads and resets). */
 static volatile LONG s_gap_min_us = 0x7FFFFFFF, s_gap_max_us;
 static uint64_t s_last_vblank_ns;   /* timer thread only */
+/* RECOMP_VBLANK_SYNC=display: each vblank's distance after the display
+ * refresh before it, in us, over the window. */
+static volatile LONG s_ph_min_us = 0x7FFFFFFF, s_ph_max_us = -1;
 
 static int trace_mode(void)
 {
@@ -394,6 +503,16 @@ void xbox_PacingVblank(uint64_t now_ns)
             ;
     }
     s_last_vblank_ns = now_ns;
+    {
+        uint64_t ref, p;
+        if (display_grid(now_ns, &ref, &p)) {
+            uint64_t pd = (uint64_t)s_disp_period;
+            LONG ph = (LONG)((now_ns >= ref ? (now_ns - ref) % pd
+                                           : pd - (ref - now_ns) % pd) / 1000u);
+            if (ph < s_ph_min_us) s_ph_min_us = ph;
+            if (ph > s_ph_max_us) s_ph_max_us = ph;
+        }
+    }
 }
 
 static int cmp_u32(const void *a, const void *b)
@@ -485,6 +604,14 @@ void xbox_PacingFlip(uint32_t flip, uint32_t batches)
                     gmax / 1000.0);
         else
             fprintf(stderr, "vblank gap -; ");
+        {
+            LONG pmin = InterlockedExchange(&s_ph_min_us, 0x7FFFFFFF);
+            LONG pmax = InterlockedExchange(&s_ph_max_us, -1);
+            if (pmax >= 0)
+                fprintf(stderr, "display %.3f ms, vblank %.2f-%.2f ms after its"
+                        " refresh; ", (double)s_disp_period / 1e6, pmin / 1000.0,
+                        pmax / 1000.0);
+        }
         fprintf(stderr, "cpu process %.0f%%; mode %s\n",
                 window_s > 0 ? (double)(cpu - win_cpu) / 1e9 / window_s * 100.0 : 0,
                 g_xbox_spin_sleep ? "sleep" : "spin");

@@ -96,6 +96,12 @@ void xbox_SpinStatsReset(void);
 
 /* The executor's flip, on every backend (nv2a_pb_exec.c). */
 void xbox_PacingFlip(uint32_t flip, uint32_t batches);
+
+/* RECOMP_VBLANK_SYNC=display: a present path reports each display refresh
+ * (host time, and its period when the platform knows it, else 0) and the
+ * vblank timer's grid follows the display's (xbox_VblankSchedule). */
+void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
+int  xbox_VblankDisplayLockOn(void);
 /* A host present reached the swap chain (when_ns 0: now) or the display. */
 void xbox_PacingPresent(uint64_t when_ns);
 /* A vblank raised at now_ns (the timer thread), for the gap range. */
