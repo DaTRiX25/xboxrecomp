@@ -859,8 +859,18 @@ static RenderTarget *surface(void)
             lru = rt;
     }
     if (!free_rt) {
+        /* Out of slots: the least recently used target goes, and what it
+         * holds goes to guest memory first, presented or not. A texture
+         * that samples it later decodes those bytes, and a target made
+         * there again seeds from them; without the write-back an
+         * off-screen pass (a blur level, a scene copy) read back whatever
+         * the memory held before -- black, under Burnout 3's motion blur,
+         * a dark vignette over the race (BO-47). */
         free_rt = lru;
-        rt_free(free_rt);
+        if (free_rt->dirty && !rt_drop_if_stale(free_rt, "evict"))
+            rt_sync(free_rt, free_rt->pitch);
+        if (free_rt->tex)
+            rt_free(free_rt);
     }
     nv2a_host_size(w, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
     free_rt->tex = rt_texture_new(hw, hh);
