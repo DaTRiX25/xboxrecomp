@@ -19,6 +19,10 @@
 #include "kernel_pacing.h"
 #include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
 #include "xbox_crash.h"
+#include "platform/host_time.h"
+#if !defined(_WIN32)
+#include <dlfcn.h>    /* dladdr, RECOMP_TRACE=mmio */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -736,6 +740,142 @@ static void ac97_arm_write_trap(void)
 
 #define MMIO_APU_BASE 0xFE800000u   /* what MemoryLayoutInit unmaps for the APU */
 #define MMIO_APU_END  0xFE880000u
+#define MMIO_APU_TRAPPED 0x00030000u /* the part of it that faults (see below) */
+
+static int g_apu_mmio_trapped;      /* defined with its comment further down */
+
+/*
+ * RECOMP_TRACE=mmio: where the register traffic goes (BO-72).
+ *
+ * Every trapped access (fault + decoder + model) and every direct one (a
+ * lifted load/store of a constant device address, xbox_MmioLoad/Store) is
+ * counted by device; APU accesses also per dword register, split trap/direct;
+ * traps also by host PC, so a hot site the recompiler did not lower can be
+ * found (sub_XXXXXXXX via dladdr, or the module offset for nm). On POSIX the
+ * time inside the trap handler is summed as well -- the kernel's signal
+ * delivery around it is not visible from here; compare the guest thread's CPU
+ * time with RECOMP_MMIO_DIRECT=0 for the whole cost. One [MMIO] block every
+ * 10 s, printed by whichever access crosses the boundary (from the trap
+ * handler too: diagnostic only, as RECOMP_APU_TRACE's table).
+ */
+enum { MS_APU, MS_AC97, MS_OHCI, MS_N };
+static int s_mmio_stats = -1;
+static volatile uint64_t s_ms_trap[MS_N], s_ms_direct[MS_N], s_ms_trap_ns;
+static volatile uint32_t s_ms_reg_trap[MMIO_APU_TRAPPED / 4];
+static volatile uint32_t s_ms_reg_direct[MMIO_APU_TRAPPED / 4];
+#define MS_PCS 128
+static volatile uintptr_t s_ms_pc[MS_PCS];
+static volatile uint32_t s_ms_pc_n[MS_PCS], s_ms_pc_va[MS_PCS];
+static volatile uint64_t s_ms_next_ns, s_ms_t0_ns;
+static volatile int s_ms_busy;
+
+static int mmio_stats_on(void)
+{
+    if (s_mmio_stats < 0)
+        s_mmio_stats = recomp_env_on(RENV_MMIO_TRACE);
+    return s_mmio_stats;
+}
+
+static void mmio_stats_report(uint64_t now)
+{
+    static uint64_t p_trap[MS_N], p_direct[MS_N], p_ns, p_t;
+    static const char *const names[MS_N] = { "apu", "ac97", "ohci" };
+    double dt = p_t ? (now - p_t) / 1e9 : (now - s_ms_t0_ns) / 1e9;
+    uint64_t traps = 0, ns = s_ms_trap_ns;
+    int d, k;
+
+    if (dt <= 0)
+        dt = 1;
+    fprintf(stderr, "[MMIO] t=%.1fs", (now - s_ms_t0_ns) / 1e9);
+    for (d = 0; d < MS_N; d++) {
+        uint64_t t = s_ms_trap[d], x = s_ms_direct[d];
+        fprintf(stderr, " %s trap %.0f/s direct %.0f/s;", names[d],
+                (t - p_trap[d]) / dt, (x - p_direct[d]) / dt);
+        traps += t - p_trap[d];
+        p_trap[d] = t; p_direct[d] = x;
+    }
+    fprintf(stderr, " handler %.2f us/trap (POSIX, excl. signal delivery)\n",
+            traps ? (ns - p_ns) / 1e3 / (double)traps : 0.0);
+    p_ns = ns; p_t = now;
+    /* Top host PCs that trapped (cumulative) and top APU registers. */
+    for (k = 0; k < 8; k++) {
+        int best = -1;
+        uint32_t bn = 0;
+        for (d = 0; d < MS_PCS; d++)
+            if (s_ms_pc_n[d] > bn) {
+                bn = s_ms_pc_n[d];
+                best = d;
+            }
+        if (best < 0)
+            break;
+        {
+            const char *sym = NULL;
+            uintptr_t pc = s_ms_pc[best], base = 0, sa = 0;
+#if !defined(_WIN32)
+            Dl_info info;
+            if (dladdr((void *)pc, &info)) {
+                sym = info.dli_sname;
+                base = (uintptr_t)info.dli_fbase;
+                sa = (uintptr_t)info.dli_saddr;
+            }
+#endif
+            fprintf(stderr, "[MMIO-PC] %u traps at guest 0x%08X, host pc"
+                    " 0x%llX (module +0x%llX) %s+0x%llX\n", bn, s_ms_pc_va[best],
+                    (unsigned long long)pc, (unsigned long long)(pc - base),
+                    sym ? sym : "?", (unsigned long long)(sym ? pc - sa : 0));
+        }
+        s_ms_pc_n[best] = 0;   /* reported: the table counts afresh */
+    }
+    for (k = 0; k < 12; k++) {
+        uint32_t i, best = 0, bn = 0;
+        for (i = 0; i < MMIO_APU_TRAPPED / 4; i++) {
+            uint32_t n = s_ms_reg_trap[i] + s_ms_reg_direct[i];
+            if (n > bn) { bn = n; best = i; }
+        }
+        if (!bn)
+            break;
+        fprintf(stderr, "[MMIO-REG] apu +0x%05X trap %u direct %u\n", best * 4,
+                s_ms_reg_trap[best], s_ms_reg_direct[best]);
+        s_ms_reg_trap[best] = s_ms_reg_direct[best] = 0;
+    }
+    fflush(stderr);
+}
+
+static void mmio_stats_tick(void)
+{
+    uint64_t now = xbox_HostNowNs();
+
+    if (!s_ms_t0_ns) {
+        s_ms_t0_ns = now;
+        s_ms_next_ns = now + 10000000000ull;
+        return;
+    }
+    if (now < s_ms_next_ns || __atomic_exchange_n(&s_ms_busy, 1, __ATOMIC_ACQUIRE))
+        return;
+    s_ms_next_ns = now + 10000000000ull;
+    mmio_stats_report(now);
+    __atomic_store_n(&s_ms_busy, 0, __ATOMIC_RELEASE);
+}
+
+static void mmio_stats_trap(int dev, uint32_t va, uintptr_t pc, uint64_t ns)
+{
+    uint32_t h = (uint32_t)((pc >> 2) * 2654435761u) % MS_PCS, i;
+
+    s_ms_trap[dev]++;
+    s_ms_trap_ns += ns;
+    if (dev == MS_APU && va - MMIO_APU_BASE < MMIO_APU_TRAPPED)
+        s_ms_reg_trap[(va - MMIO_APU_BASE) >> 2]++;
+    for (i = 0; i < 8; i++, h = (h + 1) % MS_PCS) {
+        if (s_ms_pc[h] == pc || !s_ms_pc[h]) {
+            s_ms_pc[h] = pc;
+            s_ms_pc_va[h] = va;
+            s_ms_pc_n[h]++;
+            break;
+        }
+    }
+    if ((s_ms_trap[dev] & 255) == 0)
+        mmio_stats_tick();
+}
 
 extern MCPXAPUState *g_apu_state;   /* apu_mmio_hook.c; NULL until audio is up */
 
@@ -772,12 +912,18 @@ int xbox_VehMmioFault(void *exception_pointers)
     fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
     if (!mmio_fault_va(fault, &va))
         return 0;
-    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
+    if (va >= MMIO_APU_BASE && va < MMIO_APU_END) {
+        if (mmio_stats_on())
+            mmio_stats_trap(MS_APU, va, (uintptr_t)ep->ContextRecord->Rip, 0);
         return g_apu_state
             && apu_hook_handle_mmio(ep->ContextRecord, fault, va,
                    ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0);
-    if (xbox_OhciOwnsAddress(va))
+    }
+    if (xbox_OhciOwnsAddress(va)) {
+        if (mmio_stats_on())
+            mmio_stats_trap(MS_OHCI, va, (uintptr_t)ep->ContextRecord->Rip, 0);
         return xbox_OhciHandleMmio(ep->ContextRecord, va);
+    }
     return 0;
 }
 #else
@@ -795,23 +941,154 @@ int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 {
 #if defined(MMIO_POSIX_TRAP)
     uint32_t va;
+    uintptr_t pc;
+    uint64_t t0;
+    int dev, ok;
 
     if (!mmio_fault_va(fault, &va))
         return 0;
-    /* The APU decodes the direction from the opcode; is_write is advisory. */
-    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
-        return g_apu_state
-            && apu_hook_handle_mmio_posix(ucv, fault, va, 0);
-    if (xbox_Ac97PosixFault(ucv, fault))
-        return 1;
-    if (xbox_OhciOwnsAddress(va))
-        return xbox_OhciHandleMmio(ucv, va);
+    if (!mmio_stats_on()) {
+        /* The APU decodes the direction from the opcode; is_write is
+         * advisory. */
+        if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
+            return g_apu_state
+                && apu_hook_handle_mmio_posix(ucv, fault, va, 0);
+        if (xbox_Ac97PosixFault(ucv, fault))
+            return 1;
+        if (xbox_OhciOwnsAddress(va))
+            return xbox_OhciHandleMmio(ucv, va);
+        return 0;
+    }
+    /* RECOMP_TRACE=mmio: the same calls, counted and timed. */
+    pc = (uintptr_t)MMIO_HOST_PC((ucontext_t *)ucv);
+    t0 = xbox_HostNowNs();
+    if (va >= MMIO_APU_BASE && va < MMIO_APU_END) {
+        dev = MS_APU;
+        ok = g_apu_state && apu_hook_handle_mmio_posix(ucv, fault, va, 0);
+    } else if (xbox_Ac97PosixFault(ucv, fault)) {
+        dev = MS_AC97;
+        ok = 1;
+    } else if (xbox_OhciOwnsAddress(va)) {
+        dev = MS_OHCI;
+        ok = xbox_OhciHandleMmio(ucv, va);
+    } else {
+        return 0;
+    }
+    if (ok)
+        mmio_stats_trap(dev, va, pc, xbox_HostNowNs() - t0);
+    return ok;
 #else
     (void)ucv; (void)fault;
 #endif
     return 0;
 }
 #endif
+
+/*
+ * Direct register access for lifted code (BO-72).
+ *
+ * The recompiler lowers a load or store whose address is a constant inside a
+ * trapped device window (MMIO_RD32(0xFE820010u), MMIO_WR32(0xFE8202F8u, eax),
+ * templates/runtime/recomp_types.h) to these calls, so the hot DirectSound
+ * PIO traffic -- PIO_FREE polls and voice-method writes, ~57,000 a second in
+ * a Burnout 3 race on the Steam Deck, each a SIGSEGV -- reaches the device
+ * model without a fault. The same approach as xemu's memory API, where a
+ * device region's accesses are calls into its MemoryRegionOps rather than
+ * page faults; here the lifter knows the address at translation time.
+ *
+ * Each call goes to exactly the handler the trap path would reach, with the
+ * same offset and size (mcpx_apu_mmio_read/write for the APU's trapped
+ * registers, the OHCI register model), on the same thread, at the same point
+ * in program order. Anything else -- a device not up yet, the APU's DSP
+ * memories above MMIO_APU_TRAPPED (plain RAM), a host without a trap, an
+ * address no model owns -- is the plain guest-memory access the lifted code
+ * made before, which faults into the trap path exactly as it did.
+ *
+ * RECOMP_MMIO_DIRECT=0 makes every call the plain access (all traps again),
+ * for A/B measurement and bisecting.
+ */
+static int s_mmio_direct = -1;
+
+static int mmio_direct_on(void)
+{
+    if (s_mmio_direct < 0) {
+        const char *v = recomp_env(RENV_MMIO_DIRECT);
+        s_mmio_direct = !(v && *v == '0');
+    }
+    return s_mmio_direct;
+}
+
+static uint32_t mmio_plain_load(uint32_t va, int size)
+{
+    volatile void *p = (volatile void *)((uintptr_t)va
+                                         + (uintptr_t)xbox_GetMemoryOffset());
+    switch (size) {
+    case 1:  return *(volatile uint8_t *)p;
+    case 2:  return *(volatile uint16_t *)p;
+    default: return *(volatile uint32_t *)p;
+    }
+}
+
+static void mmio_plain_store(uint32_t va, uint32_t v, int size)
+{
+    volatile void *p = (volatile void *)((uintptr_t)va
+                                         + (uintptr_t)xbox_GetMemoryOffset());
+    switch (size) {
+    case 1:  *(volatile uint8_t *)p = (uint8_t)v; break;
+    case 2:  *(volatile uint16_t *)p = (uint16_t)v; break;
+    default: *(volatile uint32_t *)p = v; break;
+    }
+}
+
+uint32_t xbox_MmioLoad(uint32_t va, int size)
+{
+    uint32_t off = va - MMIO_APU_BASE, v;
+
+    if (mmio_direct_on()) {
+        if (off < MMIO_APU_TRAPPED && g_apu_mmio_trapped && g_apu_state) {
+            if (mmio_stats_on()) {
+                s_ms_direct[MS_APU]++;
+                s_ms_reg_direct[off >> 2]++;
+                mmio_stats_tick();
+            }
+            return (uint32_t)mcpx_apu_mmio_read(g_apu_state, off,
+                                                (unsigned)size);
+        }
+        if (xbox_OhciDirect(va, size, 0, &v)) {
+            if (mmio_stats_on()) {
+                s_ms_direct[MS_OHCI]++;
+                mmio_stats_tick();
+            }
+            return v;
+        }
+    }
+    return mmio_plain_load(va, size);
+}
+
+void xbox_MmioStore(uint32_t va, uint32_t v, int size)
+{
+    uint32_t off = va - MMIO_APU_BASE;
+
+    if (mmio_direct_on()) {
+        if (off < MMIO_APU_TRAPPED && g_apu_mmio_trapped && g_apu_state) {
+            if (mmio_stats_on()) {
+                s_ms_direct[MS_APU]++;
+                s_ms_reg_direct[off >> 2]++;
+                mmio_stats_tick();
+            }
+            mcpx_apu_mmio_write(g_apu_state, off, v, (unsigned)size);
+            return;
+        }
+        if (xbox_OhciDirect(va, size, 1, &v)) {
+            if (mmio_stats_on()) {
+                s_ms_direct[MS_OHCI]++;
+                mmio_stats_tick();
+            }
+            return;
+        }
+    }
+    mmio_plain_store(va, v, size);
+}
 
 /*
  * Command words the DSP stub completes instantly. A bring-up probe, not a

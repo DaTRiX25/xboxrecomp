@@ -548,6 +548,8 @@ def main():
 
     if translator.translator.spin_waits is not None:
         _finish_spin_waits(translator.translator.spin_waits, output_dir)
+    print(f"MMIO: {translator.translator.mmio_lowered} constant device-register"
+          f" accesses lowered to direct calls", file=sys.stderr)
 
 
 def _load_observed_seeds(paths):

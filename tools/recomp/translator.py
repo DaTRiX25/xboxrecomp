@@ -24,6 +24,7 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .flag_fallbacks import FlagFallbacks
+from .mmio_lower import lower_stmts as lower_mmio_stmts
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width)
@@ -424,6 +425,7 @@ class FunctionTranslator:
         self.spin_waits = None
         # Every `_flags` fallback emitted, with why (flag_fallbacks.py).
         self.flag_fallbacks = FlagFallbacks()
+        self.mmio_lowered = 0   # constant device-register accesses lowered (mmio_lower.py)
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover function entries from bounded static callback tables."""
@@ -2393,6 +2395,11 @@ class FunctionTranslator:
                 bb.start == start, incoming)
             if self.spin_waits is not None:
                 stmts = self.spin_waits.consider(start, bb, stmts)
+            # Constant-address device registers by call, not fault (BO-72;
+            # mmio_lower.py). After spin-wait lowering, which matches the
+            # statements as lifted.
+            stmts, n_mmio = lower_mmio_stmts(stmts)
+            self.mmio_lowered += n_mmio
             for stmt in stmts:
                 lines.append(f"    {stmt}")
             bypass = debug_slide_bypasses.get(bb.last_insn.address)

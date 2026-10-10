@@ -1479,6 +1479,24 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 #endif
 }
 
+int xbox_OhciDirect(uint32_t xbox_va, int size, int is_write, uint32_t *val)
+{
+#if defined(OHCI_TRAP_WIN32) || defined(OHCI_TRAP_POSIX_A64)
+    OhciController *hc = hc_for(xbox_va);
+
+    if (!hc)
+        return 0;
+    if (is_write)
+        ohci_write(hc, xbox_va - hc->base, *val, size);
+    else
+        *val = (uint32_t)ohci_read(hc, xbox_va - hc->base, size);
+    return 1;
+#else
+    (void)xbox_va; (void)size; (void)is_write; (void)val;
+    return 0;
+#endif
+}
+
 void xbox_OhciReport(void)
 {
     int i;

@@ -253,6 +253,15 @@ int xbox_VehMmioFault(void *exception_pointers);
 int xbox_PosixMmioFault(void *ucv, uintptr_t fault);
 #endif
 
+/* The same registers reached by a call instead of a fault: what the
+ * recompiler emits for a load/store whose address is a constant in a trapped
+ * device window (MMIO_RD8/16/32, MMIO_WR8/16/32 in recomp_types.h). Same
+ * device handler, offset and size as the trap; a plain guest-memory access
+ * (which traps as before) for anything no model owns at the moment.
+ * RECOMP_MMIO_DIRECT=0: always the plain access. */
+uint32_t xbox_MmioLoad(uint32_t va, int size);
+void     xbox_MmioStore(uint32_t va, uint32_t v, int size);
+
 /* Dump the guest call stack and abort if the title has not exited within
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
  * does nothing unless that variable is set. */
