@@ -355,6 +355,7 @@ static id<MTLCommandBuffer> s_prof_cmd[PROF_CMDS];
 static int s_prof_ncmd;
 static struct {
     uint64_t n, flip, wait, gpu, hostrb, wb, winrb, winpush, blit, ncmd, hash;
+    uint64_t texh, texh_bytes, texh_n, texup, texup_n;   /* tex_bind */
 } s_pa;
 
 /* The last committed command buffer: a sync between flips waits for it when
@@ -1670,11 +1671,18 @@ static id<MTLTexture> tex_bind(const Stage *t)
     }
     if (e) {
         if (e->gen != g->flips) {
-            uint64_t h = tex_hash_pal(mem, t, bytes);
+            uint64_t tp = prof_t(), h = tex_hash_pal(mem, t, bytes);
+            prof_add(&s_pa.texh, tp);
+            s_pa.texh_bytes += bytes;
+            s_pa.texh_n++;
             s_tex_rehash++;
             e->gen = g->flips;
             if (h != e->hash) {
-                id<MTLTexture> nt = tex_upload(t);
+                id<MTLTexture> nt;
+                tp = prof_t();
+                nt = tex_upload(t);
+                prof_add(&s_pa.texup, tp);
+                s_pa.texup_n++;
                 e->hash = h;
                 s_tex_changed++;
                 if (!nt)
@@ -1689,7 +1697,12 @@ static id<MTLTexture> tex_bind(const Stage *t)
         [e->tex release];
         e->tex = nil;
         e->live = 0;
-        nt = tex_upload(t);
+        {
+            uint64_t tp = prof_t();
+            nt = tex_upload(t);
+            prof_add(&s_pa.texup, tp);
+            s_pa.texup_n++;
+        }
         if (!nt)
             return s_black;
         e->offset = t->offset;
@@ -3803,13 +3816,16 @@ static void prof_flip_end(uint64_t t_flip0)
         fprintf(stderr, LOGP "prof %llu flips: on_flip %.3f ms = wait %.3f + hostrb %.3f"
                 " + wb %.3f + winrb %.3f + winpush %.3f + blit %.3f (+rest); gpu %.3f ms"
                 " over %.1f cmd buffers/flip; %llu write-backs, %llu decode syncs;"
-                " rt ownership hashes %.3f ms/flip\n",
+                " rt ownership hashes %.3f ms/flip; textures: %.1f rehashes %.3f ms"
+                " (%.0f KB), %.1f uploads %.3f ms per flip\n",
                 (unsigned long long)s_presents,
                 s_pa.flip / n / 1e6, s_pa.wait / n / 1e6, s_pa.hostrb / n / 1e6,
                 s_pa.wb / n / 1e6, s_pa.winrb / n / 1e6, s_pa.winpush / n / 1e6,
                 s_pa.blit / n / 1e6, s_pa.gpu / n / 1e6, s_pa.ncmd / n,
                 (unsigned long long)(s_writebacks - p_wb),
-                (unsigned long long)(s_decode_syncs - p_ds), s_pa.hash / n / 1e6);
+                (unsigned long long)(s_decode_syncs - p_ds), s_pa.hash / n / 1e6,
+                s_pa.texh_n / n, s_pa.texh / n / 1e6, s_pa.texh_bytes / n / 1024.0,
+                s_pa.texup_n / n, s_pa.texup / n / 1e6);
         p_wb = s_writebacks;
         p_ds = s_decode_syncs;
         memset(&s_pa, 0, sizeof s_pa);
