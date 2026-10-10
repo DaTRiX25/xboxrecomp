@@ -128,8 +128,12 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
+/* A voice went off since the last idle scan (mcpx_apu_vp_idle_scan). */
+static volatile int s_idle_pending;
+
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    s_idle_pending = 1;
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -585,6 +589,16 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
 
     /* Dispatch known methods through fe_method */
     fe_method(d, (uint32_t)addr, (uint32_t)val);
+    /* A notification raised or a voice turned off: wake the frame thread
+     * out of its pacing wait to report it (throttle, apu_core.c). Under
+     * d->lock: this write does not hold it, and a signal sent between the
+     * frame thread's last look and its wait would be lost, leaving the
+     * voice to the next EP period after all. */
+    if (d->set_irq || s_idle_pending) {
+        qemu_mutex_lock(&d->lock);
+        qemu_cond_signal(&d->cond);
+        qemu_mutex_unlock(&d->lock);
+    }
 }
 
 /* ============================================================
@@ -1623,6 +1637,51 @@ static void vp_trace_positions(MCPXAPUState *d)
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
         }
     }
+}
+
+/* The idle-voice trap of a VP frame, without the frame.
+ *
+ * The hardware VP walks its voice lists every 32-sample frame (0.67 ms) and
+ * traps the front end on the first voice it finds off (SE2FE_IDLE_VOICE),
+ * which is how DirectSound learns that a VOICE_OFF took effect. The frame
+ * thread here renders a whole 256-sample EP period at once and then waits
+ * for real time to catch up, so a voice turned off during that wait was only
+ * reported at the next period, up to 5.33 ms later -- per voice, since one
+ * trap is taken at a time. DirectSound's StopEx-and-wait spins on Sleep(0)
+ * until then: Burnout 3 stopping two crash sounds held guest-main ~10 ms, a
+ * late frame on the Deck (BO-78). The frame thread's pacing wait calls this
+ * when a voice went off, so the trap comes as soon as on hardware; the voice
+ * is already silent, so the audio is the same. Returns 1 when it trapped, 0
+ * when nothing went off or no listed voice is idle, -1 when the front end
+ * is already trapped (tried again on the next call). */
+int mcpx_apu_vp_idle_scan(MCPXAPUState *d)
+{
+    if (!s_idle_pending)
+        return 0;
+    if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+            == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+        return -1;
+    /* Once per VOICE_OFF: a voice the service routine leaves in the list
+     * until its DPC must not trap again and again here (se_frame keeps
+     * finding it at the frame rate, as the hardware would). */
+    s_idle_pending = 0;
+    for (int list = 0; list < 3; list++) {
+        uint32_t h = d->regs[voice_list_regs[list].top];
+        for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+            uint16_t v = (uint16_t)h;
+            if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+                fe_method(d, SE2FE_IDLE_VOICE, v);
+                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                        == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                    return 1;
+                return 0;   /* the title does not trap idle voices */
+            }
+            h = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        }
+    }
+    return 0;
 }
 
 void mcpx_apu_vp_frame(MCPXAPUState *d,

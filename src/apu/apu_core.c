@@ -933,6 +933,32 @@ static void throttle(MCPXAPUState *d)
             d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
         if (wait_us <= 0)
             break;
+        /* The pace renders a whole 256-sample EP period at once and then
+         * sleeps up to 5.33 ms. What the title starts during that sleep is
+         * reported now, not at the next period: a voice it turned off gets
+         * its idle-voice trap as the hardware VP's next 32-sample frame
+         * would give it (mcpx_apu_vp_idle_scan), and a notification raised
+         * (a VOICE_OFF's SSLA_DONE, the trap) becomes the interrupt at once,
+         * as xemu's frame thread raises it after every frame
+         * (hw/xbox/mcpx/apu/apu.c, "if (d->set_irq)"). DirectSound's
+         * StopEx-and-wait spins on Sleep(0) until its service routine has
+         * seen the voice go idle: Burnout 3 stopping two crash sounds spent
+         * ~10 ms of guest-main there, a late frame on the Deck (BO-78).
+         * Only while the pipeline runs, as se_frame does. */
+        {
+            uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+            if (GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                         NV_PAPU_SECTL_XCNTMODE) != NV_PAPU_SECTL_XCNTMODE_OFF
+                && !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED)
+                && !g_test_tone.active)
+                mcpx_apu_vp_idle_scan(d);
+        }
+        if (d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+            apu_deliver_irq(d);
+            continue;
+        }
         qemu_cond_timedwait(&d->cond, &d->lock,
                             (int)((wait_us + 999) / 1000));
     }

@@ -523,6 +523,7 @@ struct MCPXAPUState {
 void mcpx_apu_vp_init(MCPXAPUState *d);
 void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+int  mcpx_apu_vp_idle_scan(MCPXAPUState *d);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
 
 /* DSP functions (stubbed) */
