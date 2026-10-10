@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "apu.h"                /* mcpx_apu_xc_audio: XC_AUDIO */
 #include <string.h>
 
 /* ============================================================================
@@ -122,7 +123,7 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  *   - Video: none of widescreen/480p/720p/1080i unless set (kernel.h,
  *     xbox_SetVideoSettings)
  *   - Language: English
- *   - Audio: Stereo, Dolby Digital
+ *   - Audio: the APU's speaker layout, stereo or 5.1 (Dolby Digital)
  *   - DVD Region: Region 1 (North America)
  * ============================================================================ */
 
@@ -156,10 +157,17 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_AUDIO:
-        /* Stereo PCM matches the two-channel host output. 1 means mono;
-         * advertising AC3 requires an encoded-output path. */
+        /* The dashboard's audio setting, the layout the APU mixes for
+         * (RECOMP_AUDIO_SPEAKERS): stereo 0, or for 5.1 SURROUND |
+         * ENABLE_AC3 (0x00010002), "Dolby Digital" ticked. XAPI's
+         * XGetAudioFlags passes it on unchanged on our AV pack (it forces
+         * mono on the RF pack, clears the AC-3/DTS bits on the composite
+         * one: Burnout 3's sub_001D00F2), and RenderWare's DirectSound
+         * driver takes 5.1 only with both bits (sub_0020A120: surround
+         * alone is its matrixed mode 4, with AC-3 mode 5). No AC-3 is
+         * encoded: the six feeds leave as LPCM (apu_speakers.c). */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 0x00000000;
+            *(PULONG)Value = mcpx_apu_xc_audio();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
