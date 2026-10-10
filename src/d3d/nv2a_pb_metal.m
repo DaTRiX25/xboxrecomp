@@ -265,16 +265,26 @@ typedef struct {
     int            fresh;      /* contents undefined: the next pass clears */
 } DepthTarget;
 
-#define RT_MAX 8
+/* Burnout 3's Crash mode draws 14 surfaces a frame (the 640x480 pair, a
+ * 640x480 and a 320x240 work target, two 160x120, seven 128x128 and a
+ * 64x32). With 8 slots the LRU evicted every one of them every frame: a new
+ * texture seeded from guest memory each time, a GPU wait and read-back for
+ * each presented one evicted, and an off-screen one evicted before it was
+ * sampled lost what was drawn into it. xemu keeps its surfaces in an
+ * unbounded list (hw/xbox/nv2a/pgraph surface cache); 32 slots hold any frame
+ * seen so far, and a slot costs only its texture. */
+#define RT_MAX 32
 typedef struct {
     uint32_t       offset;     /* color_offset, as the title set it */
     uint32_t       addr;       /* its guest address (nv2a_pb_dma_resolve) */
     uint32_t       w, h;       /* guest size: the cache key, the mapping */
     uint32_t       hw, hh;     /* host size: the texture (render.scale) */
     id<MTLTexture> tex;
+    id<MTLTexture> opaque;     /* tex with alpha read as 1 (rt_texture, 16-bit) */
     uint64_t       last_use;
     DepthTarget   *dt;         /* the depth buffer its passes attach, or NULL */
     uint32_t       pitch;      /* the guest pitch it was made with */
+    int            swz;        /* made as a swizzled surface (format type 2) */
     int            dirty;      /* drawn since its last write-back */
     int            presented;  /* ever picked by present_target */
     struct nv2a_rt_own own;    /* is the guest memory under it still its own */
@@ -603,6 +613,7 @@ static void rt_free(RenderTarget *rt)
         rt_sync(rt, rt->pitch);
     if (s_enc_rt == rt)
         end_encoder();
+    [rt->opaque release];
     [rt->tex release];
     memset(rt, 0, sizeof *rt);
 }
@@ -754,6 +765,8 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
         fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target grown to %ux%u\n",
                 rt->offset, rt->w, rt->h, w, h);
     [rt->tex release];   /* an encoded command keeps its own reference */
+    [rt->opaque release];
+    rt->opaque = nil;
     rt->tex = tex;
     rt->w = w;
     rt->h = h;
@@ -860,6 +873,7 @@ static RenderTarget *surface(void)
     free_rt->hw = hw;
     free_rt->hh = hh;
     free_rt->pitch = g->pitch;
+    free_rt->swz = ((g->format >> 8) & 0xF) == 2;
     free_rt->last_use = s_tick;
     rt_own_reset(free_rt);   /* the bytes the seed reads, or would */
     rt_seed(free_rt->tex, free_rt->addr, g->pitch, w, h, hw, hh);
@@ -1692,31 +1706,73 @@ static id<MTLDepthStencilState> depth_state(int depth, int stencil)
  * present surface). 32-bit, non-compressed formats only; the low 27 bits of
  * the address compare, so either memory window matches. The target being
  * drawn into is sampled through a copy (s_self), made by a blit between
- * passes. RECOMP_METAL_NO_RTT=1 decodes guest memory instead (A/B). */
+ * passes. RECOMP_METAL_NO_RTT=1 decodes guest memory instead (A/B).
+ *
+ * A 16-bit (R5G6B5) surface sampled as (LIN_)R5G6B5 binds too, as xemu binds
+ * a surface whose host texel size matches the texture's (hw/xbox/nv2a/
+ * pgraph/vk/texture.c, check_surface_to_texture_compatiblity). Burnout 3's
+ * Crash mode samples its 320x240 and 160x120 R5G6B5 work targets and a
+ * swizzled 128x128 one every frame; decoding them meant a GPU wait and a
+ * read-back each time, five a frame (the swizzled one was also written back
+ * in rows and decoded in Morton order). The target is BGRA8, so it is
+ * sampled through a view whose alpha reads 1, as an R5G6B5 texel's does; its
+ * colour keeps 8 bits a channel where the console's would have 5-6-5. */
 static RenderTarget s_self;   /* tex, w, h: the copy; offset: whose */
+static RenderTarget s_opaque; /* tex: an rt's opaque view, for one bind */
+
+/* rt (a 16-bit surface) as a texture whose alpha reads 1: a swizzled view,
+ * made on first use and kept until rt's texture goes. NULL if Metal cannot
+ * make one; the texture then decodes from guest memory as before. */
+static RenderTarget *rt_opaque(RenderTarget *rt)
+{
+    if (!rt->opaque) {
+        MTLTextureSwizzleChannels sw = MTLTextureSwizzleChannelsMake(
+            MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+            MTLTextureSwizzleBlue, MTLTextureSwizzleOne);
+        rt->opaque = [rt->tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                textureType:MTLTextureType2D
+                                                     levels:NSMakeRange(0, 1)
+                                                     slices:NSMakeRange(0, 1)
+                                                    swizzle:sw];
+        if (!rt->opaque)
+            return NULL;
+    }
+    s_opaque = *rt;
+    s_opaque.tex = rt->opaque;
+    return &s_opaque;
+}
 
 static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
 {
     static int off = -1;
     RenderTarget *self = NULL;
-    int i;
+    int i, r565;
 
     if (off < 0)
         off = recomp_env(RENV_METAL_NO_RTT) != NULL;
-    if (off || !t->offset || d3d8_format_dxt_block_bytes(t->color)
-            || nv2a_tex_texel_bytes(nv2a_tex_linear_twin(t->color)) != 4)
+    if (off || !t->offset || d3d8_format_dxt_block_bytes(t->color))
+        return NULL;
+    r565 = nv2a_tex_linear_twin(t->color) == 0x11;   /* (LIN_)R5G6B5 */
+    if (!r565 && nv2a_tex_texel_bytes(nv2a_tex_linear_twin(t->color)) != 4)
         return NULL;
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (!rt->tex || ((rt->addr ^ t->offset) & 0x07FFFFFFu))
             continue;
+        /* 16-bit textures only on 16-bit surfaces of the same size, a linear
+         * one at the same pitch, a swizzled one only on a swizzled surface
+         * (xemu's rule); 32-bit as before. */
+        if (r565 && (rt->pitch / rt->w != 2u || rt->w != t->width || rt->h != t->height
+                     || (t->color == 0x11 ? rt->swz || t->pitch != rt->pitch : !rt->swz)))
+            continue;
         if (rt_drop_if_stale(rt, "bind"))
             continue;   /* the texture decodes from the title's bytes */
         if (rt == cur) {
-            self = rt;
+            if (!r565)
+                self = rt;
             continue;
         }
-        return rt;
+        return r565 ? rt_opaque(rt) : rt;
     }
     if (!self)
         return NULL;
