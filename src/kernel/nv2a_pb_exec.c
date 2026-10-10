@@ -5840,6 +5840,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             nv2a_pb_metal_register_from_env();
         }
 #endif
+#ifdef XBOXRECOMP_HAVE_VULKAN
+        {   /* RECOMP_PB_BACKEND=vulkan: src/d3d/nv2a_pb_vulkan.c */
+            extern void nv2a_pb_vulkan_register_from_env(void);
+            nv2a_pb_vulkan_register_from_env();
+        }
+#endif
         {
             const char *b = recomp_env(RENV_PB_BACKEND);
             if (b && !strcmp(b, "null")) {

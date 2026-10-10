@@ -21,6 +21,8 @@ if(WIN32)
         d3d8_combiners_hlsl.c
         d3d8_vsh_msl.c
         d3d8_combiners_msl.c
+        d3d8_vsh_glsl.c
+        d3d8_combiners_glsl.c
         nv2a_pcache.c
         nv2a_pb_d3d11.c
     )
@@ -50,6 +52,8 @@ else()
         d3d8_combiners_hlsl.c
         d3d8_vsh_msl.c
         d3d8_combiners_msl.c
+        d3d8_vsh_glsl.c
+        d3d8_combiners_glsl.c
         nv2a_pcache.c
     )
     find_package(SDL2 REQUIRED)
@@ -62,6 +66,26 @@ else()
     # in via add_subdirectory from tests/, where the link fails with
     # "library 'epoxy' not found". The _LINK_LIBRARIES form is absolute paths.
     target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
+    # The toolkit revision at configure time: the pipeline caches' version
+    # key (nv2a_pcache.h), so a file from another build is dropped.
+    execute_process(COMMAND git describe --always --dirty --abbrev=12
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                    OUTPUT_VARIABLE XR_GIT_REV OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    if(NOT XR_GIT_REV)
+        set(XR_GIT_REV "unknown")
+    endif()
+    if(XBOXRECOMP_HAVE_VULKAN)
+        # The pushbuffer executor's Vulkan backend (RECOMP_PB_BACKEND=vulkan),
+        # its device (shared with the window's swapchain) and glslang.
+        target_sources(xbox_d3d8 PRIVATE nv2a_vk_core.c nv2a_vk_glsl.c nv2a_pb_vulkan.c)
+        set_source_files_properties(nv2a_pb_vulkan.c PROPERTIES
+            COMPILE_DEFINITIONS "XBOXRECOMP_GIT_REV=\"${XR_GIT_REV}\"")
+        target_include_directories(xbox_d3d8 PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        target_link_libraries(xbox_d3d8 PUBLIC Vulkan::Vulkan glslang::glslang
+                              glslang::glslang-default-resource-limits)
+    endif()
     if(APPLE)
         # The pushbuffer executor's Metal backend (RECOMP_PB_BACKEND=metal).
         # Manual retain/release (no -fobjc-arc); shaders are MSL compiled at
@@ -69,21 +93,16 @@ else()
         target_sources(xbox_d3d8 PRIVATE nv2a_pb_metal.m)
         # The pipeline cache's version key (nv2a_pcache.h): the toolkit
         # revision at configure time, so a file from another build is dropped.
-        execute_process(COMMAND git describe --always --dirty --abbrev=12
-                        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                        OUTPUT_VARIABLE XR_GIT_REV OUTPUT_STRIP_TRAILING_WHITESPACE
-                        ERROR_QUIET)
-        if(NOT XR_GIT_REV)
-            set(XR_GIT_REV "unknown")
-        endif()
         set_source_files_properties(nv2a_pb_metal.m PROPERTIES
             COMPILE_DEFINITIONS "XBOXRECOMP_GIT_REV=\"${XR_GIT_REV}\"")
         target_include_directories(xbox_d3d8 PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_link_libraries(xbox_d3d8 PUBLIC
             "-framework Metal" "-framework QuartzCore" "-framework Foundation")
-        # The executor's backend, driven by a synthetic stream: Metal against
-        # the CPU rasteriser, frame by frame.
+    endif()
+    # The executor's backend, driven by a synthetic stream: Metal or Vulkan
+    # against the CPU rasteriser, frame by frame.
+    if(APPLE OR XBOXRECOMP_HAVE_VULKAN)
         add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_backend_smoke
                          ${CMAKE_CURRENT_BINARY_DIR}/nv2a_backend_smoke)
     endif()

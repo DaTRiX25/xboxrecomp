@@ -17,3 +17,10 @@ add_test(NAME nv2a_backend_smoke_guard COMMAND nv2a_backend_smoke guard)
 add_test(NAME nv2a_backend_smoke_noalias COMMAND nv2a_backend_smoke noalias)
 set_tests_properties(nv2a_backend_smoke nv2a_backend_smoke_guard nv2a_backend_smoke_noalias
     PROPERTIES SKIP_RETURN_CODE 77)
+# The Vulkan column (MoltenVK on macOS, RADV on the Steam Deck).
+if(XBOXRECOMP_HAVE_VULKAN AND APPLE)
+    add_test(NAME nv2a_backend_smoke_vulkan COMMAND nv2a_backend_smoke)
+    add_test(NAME nv2a_backend_smoke_vulkan_noalias COMMAND nv2a_backend_smoke noalias)
+    set_tests_properties(nv2a_backend_smoke_vulkan nv2a_backend_smoke_vulkan_noalias
+        PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "RECOMP_SMOKE_BACKEND=vulkan")
+endif()
