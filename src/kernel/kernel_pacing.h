@@ -96,6 +96,8 @@ void xbox_SpinStatsReset(void);
 
 /* The executor's flip, on every backend (nv2a_pb_exec.c). */
 void xbox_PacingFlip(uint32_t flip, uint32_t batches);
+/* A host present reached the swap chain (when_ns 0: now) or the display. */
+void xbox_PacingPresent(uint64_t when_ns);
 /* A vblank raised at now_ns (the timer thread), for the gap range. */
 void xbox_PacingVblank(uint64_t now_ns);
 

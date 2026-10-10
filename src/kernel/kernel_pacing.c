@@ -427,6 +427,20 @@ static void site_line(const SpinSite *s, double window_s, int other)
             (long)s->exit_timeout, inwait, thread);
 }
 
+/* A host present (the backend's swap chain Present returned, or Metal's
+ * presented handler with the time the drawable reached the display): under
+ * RECOMP_TRACE=pacing=all one line each, so the present-to-present intervals
+ * -- what the display was handed -- can be read beside the guest's flips
+ * (tools/deck/stats.py). when_ns 0: now. */
+void xbox_PacingPresent(uint64_t when_ns)
+{
+    static volatile LONG n;
+    if (trace_mode() != 2)
+        return;
+    fprintf(stderr, "[PACING] present %ld t_us %llu\n", (long)InterlockedIncrement(&n),
+            (unsigned long long)((when_ns ? when_ns : xbox_HostNowNs()) / 1000u));
+}
+
 void xbox_PacingFlip(uint32_t flip, uint32_t batches)
 {
     /* Walker thread only. */

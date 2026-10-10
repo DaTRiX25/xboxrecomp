@@ -50,6 +50,8 @@
 #include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
 #include "video/window_title.h"
 
+void xbox_PacingPresent(uint64_t when_ns);   /* src/kernel/kernel_pacing.c */
+
 #define LOGP "[d3d11] "
 #define D3D11_WND_CLASS "RecompNv2aD3D11"   /* RegisterClassA, then CreateWindowW as L"" D3D11_WND_CLASS */
 
@@ -3429,6 +3431,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     s_presents++;
     dump_frame();
     hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
+    xbox_PacingPresent(0);   /* RECOMP_TRACE=pacing=all: host present times */
     if (FAILED(hr) && s_presents < 4)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own
