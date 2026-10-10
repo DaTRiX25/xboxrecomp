@@ -54,6 +54,10 @@
  * depth cleared to zmax, must cover every pixel (the XMV movie quad; the CPU
  * path's depth interpolation landed an ulp past the clear on a pixel grid).
  *
+ * Then frames in flight (BO-57, Metal): eight frames of 1200 quads into the
+ * two buffers in turn, flips that do not wait, each buffer then read back
+ * with its last frame's colour.
+ *
  * Then many surfaces (BO-49), CPU path: two back buffers in turn among 18
  * off-screen targets; the walker's pick stays the 640x480 buffer just
  * drawn (a 16-entry surface table flipped it between extents).
@@ -820,6 +824,54 @@ static void far_vertex(float x, float y, uint32_t argb)
     M(0x1818, argb);
 }
 
+/* frames in flight (BO-57, Metal): eight frames into BUF0/BUF1 in turn,
+ * each 1200 quads of its own colour from vertex arrays (a ring's worth of
+ * vertices a frame) and a flip that does not wait. Then each buffer, read
+ * back, holds its last frame's colour in every quad: a slot reused before
+ * its frame finished would have fed the GPU the next frame's vertices.
+ * Returns the failures. */
+static int inflight_case(const struct nv2a_pb_backend *b)
+{
+    static const uint32_t col[8] = {0xFFE02020u, 0xFF20E020u, 0xFF2020E0u, 0xFFE0E020u,
+                                    0xFF20E0E0u, 0xFFE020E0u, 0xFF808080u, 0xFFFFFFFFu};
+    int k, bad = 0;
+    uint32_t q, i;
+
+    nv2a_pb_set_backend(b);
+    for (k = 0; k < 8; k++) {
+        uint32_t buf = (k & 1) ? BUF1 : BUF0;
+        surf(buf, W, H, 1, 0xFF000000u);
+        for (q = 0; q < GRID_QUADS; q++) {
+            float x = (float)((q % GRID_COLS) * 16u + 2u), y = (float)((q / GRID_COLS) * 16u + 2u);
+            vb_vertex(q * 4u + 0u, x, y, col[k]);
+            vb_vertex(q * 4u + 1u, x + 12.0f, y, col[k]);
+            vb_vertex(q * 4u + 2u, x + 12.0f, y + 12.0f, col[k]);
+            vb_vertex(q * 4u + 3u, x, y + 12.0f, col[k]);
+        }
+        vb_arrays();
+        M(0x17FC, 8);                          /* BEGIN_END: QUADS */
+        for (i = 0; i < GRID_QUADS * 4u; i += 2)
+            M(0x1800, i | ((i + 1u) << 16));
+        M(0x17FC, 0);
+        M(0x0210, (k & 1) ? BUF0 : BUF1);
+        M(0x012C, 0);                          /* FLIP_INCREMENT_WRITE */
+        M(0x0130, 0);                          /* FLIP_STALL */
+    }
+    for (k = 6; k < 8; k++) {
+        uint32_t buf = (k & 1) ? BUF1 : BUF0;
+        b->sync_guest(buf, W * 4u, W, H);
+        for (q = 0; q < GRID_QUADS; q += 37)
+            bad += px_at(buf, W * 4u, (q % GRID_COLS) * 16u + 8u, (q / GRID_COLS) * 16u + 8u)
+                   != col[k];
+    }
+    for (i = 0; i < 16; i++)
+        M(0x1760 + 4 * i, i == 0 ? 0x42u : i == 3 ? 0x40u : 0x02u);
+    nv2a_pb_set_backend(NULL);
+    fprintf(stderr, "[backend-smoke] frames in flight: %d quads off their frame's colour %s\n",
+            bad, bad ? "FAIL" : "PASS");
+    return bad != 0;
+}
+
 static int far_quad_case(const struct nv2a_pb_backend *b, const char *path)
 {
     const uint32_t *px = (const uint32_t *)guest(BUF0);
@@ -1329,6 +1381,8 @@ int main(int argc, char **argv)
     }
     if (gpu)
         failures += far_quad_case(gpu, "gpu");
+    if (gpu == nv2a_pb_metal_backend())
+        failures += inflight_case(gpu);
 #endif
     if (failures) {
         fprintf(stderr, "[backend-smoke] FAIL: %d of %d scenes\n", failures, SC_COUNT);
