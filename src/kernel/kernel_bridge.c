@@ -10401,6 +10401,121 @@ static void kernel_watch_arm_once(void)
         g_kernel_watch_va = (uint32_t)strtoul(env, NULL, 0);
 }
 
+/* RECOMP_TRACE=kwait=<file>: where the title's threads sit in the kernel.
+ *
+ * The frametime sampler says a thread is blocked, not on what. This times
+ * every bridge call on the wall clock and sums it by thread, ordinal and
+ * guest call site; once a second the sites that took a millisecond or more
+ * are written out as a block ("K <t_ms>" then one row each), so a load or
+ * any other stretch of the run can be cut out by time and ranked. A call of
+ * KW_LONG_MS or more also gets a line of its own with its first five stack
+ * arguments: a wait's object and timeout pointer, a delay's interval. */
+#define KW_SITES   512
+#define KW_THREADS 16
+#define KW_LONG_MS 20
+typedef struct {
+    uint32_t caller;
+    uint16_t ordinal;
+    uint8_t  thread;
+    uint8_t  used;
+    uint32_t n;
+    uint64_t tot_ns, max_ns;
+} KwSite;
+static int s_kw_on = -1;
+static FILE *s_kw_out;
+static CRITICAL_SECTION s_kw_lock;
+static KwSite s_kw[KW_SITES];
+static DWORD s_kw_tid[KW_THREADS];
+static uint64_t s_kw_t0, s_kw_last, s_kw_all_from, s_kw_all_to;
+static RECOMP_TLS int t_kw_thread = -1;
+
+static int kw_on(void)
+{
+    if (s_kw_on < 0) {
+        const char *f = recomp_env(RENV_KWAIT_TRACE);
+        if (f && *f && strcmp(f, "0")) {
+            InitializeCriticalSection(&s_kw_lock);
+            s_kw_out = fopen(strcmp(f, "1") ? f : "kwait.txt", "w");
+            s_kw_t0 = s_kw_last = xbox_HostNowNs();
+            f = recomp_env(RENV_KWAIT_ALL);
+            if (f) {
+                char *e;
+                s_kw_all_from = strtoull(f, &e, 10) * 1000000ull;
+                s_kw_all_to = (*e == '-' ? strtoull(e + 1, NULL, 10) : 0) * 1000000ull;
+            }
+        }
+        s_kw_on = s_kw_out != NULL;
+    }
+    return s_kw_on;
+}
+
+static void kw_flush(uint64_t now)
+{
+    int i;
+    fprintf(s_kw_out, "K %.0f\n", (now - s_kw_t0) / 1e6);
+    for (i = 0; i < KW_SITES; i++) {
+        KwSite *k = &s_kw[i];
+        if (k->used && k->tot_ns >= 1000000ull)
+            fprintf(s_kw_out, "  t%u ord %3u site 0x%08X n %u tot %.1f max %.1f\n",
+                    k->thread, k->ordinal, k->caller, k->n,
+                    k->tot_ns / 1e6, k->max_ns / 1e6);
+        k->n = 0;
+        k->tot_ns = k->max_ns = 0;
+    }
+    fflush(s_kw_out);
+    s_kw_last = now;
+}
+
+static void kw_record(unsigned ordinal, uint32_t caller, const uint32_t *args,
+                      uint64_t t0, uint64_t t1)
+{
+    uint64_t d = t1 - t0;
+    unsigned h;
+    int i, th = t_kw_thread;
+
+    EnterCriticalSection(&s_kw_lock);
+    if (th < 0) {
+        DWORD me = GetCurrentThreadId();
+        for (i = 0; i < KW_THREADS && s_kw_tid[i] && s_kw_tid[i] != me; i++)
+            ;
+        th = i < KW_THREADS ? i : KW_THREADS - 1;
+        if (!s_kw_tid[th]) {
+            s_kw_tid[th] = me;
+            fprintf(s_kw_out, "T t%d tid %lu first ordinal %u site 0x%08X\n",
+                    th, (unsigned long)me, ordinal, caller);
+        }
+        t_kw_thread = th;
+    }
+    if (t0 - s_kw_t0 >= s_kw_all_from && t0 - s_kw_t0 < s_kw_all_to)
+        fprintf(s_kw_out, "C %.3f t%d ord %u site 0x%08X %.3f ms args"
+                " %08X %08X %08X %08X %08X ret %08X\n", (t0 - s_kw_t0) / 1e6, th,
+                ordinal, caller, d / 1e6, args[0], args[1], args[2], args[3],
+                args[4], g_eax);
+    else if (d >= KW_LONG_MS * 1000000ull)
+        fprintf(s_kw_out, "L %.1f t%d ord %u site 0x%08X %.1f ms args"
+                " %08X %08X %08X %08X %08X\n", (t0 - s_kw_t0) / 1e6, th,
+                ordinal, caller, d / 1e6, args[0], args[1], args[2], args[3],
+                args[4]);
+    h = (caller * 2654435761u ^ ordinal * 40503u ^ (unsigned)th * 97u) % KW_SITES;
+    for (i = 0; i < KW_SITES; i++, h = (h + 1) % KW_SITES) {
+        KwSite *k = &s_kw[h];
+        if (!k->used) {
+            k->used = 1; k->caller = caller;
+            k->ordinal = (uint16_t)ordinal; k->thread = (uint8_t)th;
+        }
+        if (k->caller == caller && k->ordinal == ordinal && k->thread == th) {
+            k->n++;
+            k->tot_ns += d;
+            if (d > k->max_ns)
+                k->max_ns = d;
+            break;
+        }
+    }
+    if (t1 - s_kw_last >= 1000000000ull)
+        kw_flush(t1);
+    LeaveCriticalSection(&s_kw_lock);
+}
+
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
@@ -10534,7 +10649,16 @@ static void kernel_thunk_dispatch(void)
         }
     }
 
-    if (bridge) {
+    if (bridge && kw_on()) {
+        uint32_t a[5];
+        uint64_t t0;
+        int i;
+        for (i = 0; i < 5; i++)
+            a[i] = STACK_ARG(i);
+        t0 = xbox_HostNowNs();
+        bridge();
+        kw_record(ordinal, g_xbox_kernel_caller, a, t0, xbox_HostNowNs());
+    } else if (bridge) {
         bridge();
     } else {
         /* No specific bridge - return 0. Warn once per ordinal rather than
