@@ -110,7 +110,10 @@ the stock settings.
 |---|---|---|---|---|
 | `render.scale` | int | internal resolution factor: 1, 2, 3, ... | `1` | `RECOMP_RENDER_SCALE` |
 | `display.aspect` | string | `"4:3"` only for now (`"16:9"`, `"16:10"`, `"21:9"` are reported as not implemented, and 4:3 is used) | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
+| `display.widescreen` | bool | the dashboard's 16:9 setting, as the kernel reports it to the title | `false` | `RECOMP_DISPLAY_WIDESCREEN` |
+| `display.hdtv` | string | the dashboard's HDTV modes: `"off"`, `"480p"`, `"720p"` (480p too), `"1080i"` (all three) | `"off"` | `RECOMP_DISPLAY_HDTV` |
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
+| `present.aspect` | string | the window's frame shape: `"auto"`, `"frame"`, `"4:3"`, `"16:9"` | `"auto"` | `RECOMP_PRESENT_ASPECT` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
 | `fps.mode` | string | `"lock30"` (stock), `"lock60"`, `"free"` | `"lock30"` | the game's `RECOMP_FPS_MODE` |
@@ -140,6 +143,7 @@ is stock. One line shows the values in force:
 
 ```
 [ENHANCE] render.scale=2 present.filter=integer present.fullscreen=0 present.pacing=spin (display.aspect=4:3)
+[ENHANCE] display.widescreen=1 display.hdtv=480p (XC_VIDEO=0x00090000) present.aspect=auto (16:9)
 ```
 
 - **`render.scale = N`** (1..4; outside that it is clamped, with a line).
@@ -172,6 +176,28 @@ is stock. One line shows the values in force:
   still copies the frame into its 640x480 back buffer, and anything else
   goes through a scaling blit. The Win32 GDI window of the CPU backend does
   not follow these keys yet.
+- **`display.widescreen`, `display.hdtv`.** The Xbox dashboard's video
+  settings, which the title reads and acts on itself; nothing in the
+  renderer changes. The kernel reports them where the console keeps them
+  (`src/kernel/kernel.h`, `XC_VIDEO_AV_*`): `ExQueryNonVolatileSetting(XC_VIDEO)`
+  returns 0x00010000 for widescreen, 0x00080000 / 0x00020000 / 0x00040000
+  for 480p / 720p / 1080i; `AvSendTVEncoderOption(6)` ORs the same bits into
+  the pack word D3D builds its mode list from; and with an HDTV mode set,
+  `HalBootSMCVideoMode` is 1 (HDTV pack), without which XAPI's
+  `XGetVideoFlags` clears the HDTV modes. A title only gets a mode it
+  supports: Burnout 3 reads widescreen and 480p (D3DPRESENTFLAG_WIDESCREEN,
+  D3DPRESENTFLAG_PROGRESSIVE) and never asks for 720p. Stock (both off) is
+  what titles saw before: the old `XC_VIDEO` word, 0x03, had its bits below
+  the 16 that `XGetVideoFlags` shifts away.
+- **`present.aspect`.** The shape the window gives a frame. A title in its
+  widescreen mode draws 16:9 anamorphic into the same 640x480 buffer, and
+  the TV stretched it. `frame` keeps the frame's own shape (stock: 640x480
+  shows 4:3); `16:9` and `4:3` force one; `auto` is 16:9 with
+  `display.widescreen` and `frame` without. With `integer` at a forced
+  aspect the height is a whole multiple and the width is stretched to the
+  aspect, filtered linearly. The SDL window opens at that shape (853x480
+  times the window scale at 16:9). Frame dumps (`RECOMP_FB_DUMP`) stay the
+  guest's 640x480: the stretch is the window's only.
 - **`present.fullscreen`.** A borderless window covering the display at
   start, with no mode change (SDL `FULLSCREEN_DESKTOP`; D3D11 a `WS_POPUP`
   the primary monitor's size). There is no hotkey yet.
@@ -209,7 +235,10 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_ENHANCE_CONFIG` | path of the one file to read, or `none` |
 | `RECOMP_RENDER_SCALE` | overrides `render.scale` |
 | `RECOMP_DISPLAY_ASPECT` | overrides `display.aspect` |
+| `RECOMP_DISPLAY_WIDESCREEN` | overrides `display.widescreen` |
+| `RECOMP_DISPLAY_HDTV` | overrides `display.hdtv` |
 | `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
+| `RECOMP_PRESENT_ASPECT` | overrides `present.aspect` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 | `RECOMP_PRESENT_PACING` | overrides `present.pacing` |
 

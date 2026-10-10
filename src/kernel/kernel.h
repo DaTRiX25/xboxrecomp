@@ -1140,11 +1140,49 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
 #define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
 
-/* Video standard flags in XC_VIDEO */
+/* What XAPI's XGetVideoFlags returns: XC_VIDEO >> 16, masked with 0x5F (and
+ * the HDTV modes cleared unless HalBootSMCVideoMode says HDTV pack). These are
+ * not the EEPROM word; that is XC_VIDEO_AV_* below. */
 #define XC_VIDEO_FLAGS_WIDESCREEN   0x01
 #define XC_VIDEO_FLAGS_HDTV         0x02
 #define XC_VIDEO_FLAGS_PAL_I        0x04
 #define XC_VIDEO_FLAGS_LETTERBOX    0x10
+
+/* ---- The dashboard's video settings: the XC_VIDEO word ----
+ *
+ * The EEPROM keeps them in the bit positions of the AV-capabilities word,
+ * and the title reads them twice:
+ *
+ * - XGetVideoFlags (XAPI, linked into the title; Burnout 3's sub_001CF913):
+ *   ExQueryNonVolatileSetting(XC_VIDEO), then (value >> 16) & 0x5F, then the
+ *   three HDTV bits cleared unless HalBootSMCVideoMode is 1 (HDTV pack) and
+ *   the factory AV region is not PAL-I. So widescreen is 0x00010000 here
+ *   and 0x01 to the title.
+ * - D3D's mode table (Burnout 3's sub_0035BB10, sub_00357648): the word
+ *   AvSendTVEncoderOption(6) returns, masked with 0x10000 (widescreen),
+ *   0xE0000 (HDTV modes) and 0xC00000 (refresh), the pack in the low byte.
+ *   The real kernel ORs the XC_VIDEO bits into that word. */
+#define XC_VIDEO_AV_WIDESCREEN      0x00010000
+#define XC_VIDEO_AV_HDTV_720p       0x00020000
+#define XC_VIDEO_AV_HDTV_1080i      0x00040000
+#define XC_VIDEO_AV_HDTV_480p       0x00080000
+#define XC_VIDEO_AV_LETTERBOX       0x00100000
+#define XC_VIDEO_AV_HDTV_MASK       0x000E0000
+#define XC_VIDEO_AV_USER_MASK       0x001F0000
+
+/* HalBootSMCVideoMode: the AV pack as the SMC reports it (the same numbers
+ * XGetAVPack returns). XGetVideoFlags hands out 480p/720p/1080i only on 1. */
+#define SMC_VIDEO_MODE_SCART        0x00
+#define SMC_VIDEO_MODE_HDTV         0x01
+
+/* The video settings the kernel reports: XC_VIDEO (XC_VIDEO_AV_* bits) and
+ * HalBootSMCVideoMode. Stock is 0 and 0: no widescreen, no HDTV modes, which
+ * is what titles saw before (the old XC_VIDEO word, 0x03, had its bits below
+ * the 16 XGetVideoFlags shifts away). Set before xbox_kernel_bridge_init,
+ * which copies the SMC mode into guest memory; the enhancements layer does
+ * it from display.widescreen / display.hdtv. */
+void  xbox_SetVideoSettings(ULONG xc_video, ULONG smc_video_mode);
+ULONG xbox_GetVideoSettings(void);
 
 /* Unknown ordinals - stub */
 VOID    __stdcall xbox_Unknown_8(void);

@@ -74,6 +74,31 @@ int main(void)
     CHECK(nv2a_present_rect(0, 480, 640, 480, NV2A_PRESENT_NEAREST, &r) == 0 && rect_is(&r, 0, 0, 0, 0));
     CHECK(nv2a_present_rect(640, 480, 0, 0, NV2A_PRESENT_INTEGER, &r) == 0 && rect_is(&r, 0, 0, 0, 0));
 
+    /* ---- present aspect: an anamorphic 16:9 frame in a 4:3 buffer ---- */
+    CHECK(nv2a_host_opts()->present_aspect == NV2A_ASPECT_FRAME);
+    CHECK(nv2a_present_width(640, 480) == 640);
+    /* 16:9 fills a 16:9 output, at any render scale. */
+    CHECK(nv2a_present_rect_aspect(640, 480, NV2A_ASPECT_16_9, 1920, 1080, NV2A_PRESENT_NEAREST, &r) == 0 && rect_is(&r, 0, 0, 1920, 1080));
+    CHECK(nv2a_present_rect_aspect(2560, 1920, NV2A_ASPECT_16_9, 1920, 1080, NV2A_PRESENT_LINEAR, &r) == 0 && rect_is(&r, 0, 0, 1920, 1080));
+    /* In a 4:3 output it is letterboxed. */
+    CHECK(nv2a_present_rect_aspect(640, 480, NV2A_ASPECT_16_9, 1280, 960, NV2A_PRESENT_NEAREST, &r) == 0 && rect_is(&r, 0, 120, 1280, 720));
+    /* Integer: whole multiples of the height, the width stretched, a fit. */
+    CHECK(nv2a_present_rect_aspect(640, 480, NV2A_ASPECT_16_9, 1920, 1080, NV2A_PRESENT_INTEGER, &r) == 0 && rect_is(&r, 106, 60, 1707, 960));
+    CHECK(nv2a_present_rect_aspect(640, 480, NV2A_ASPECT_16_9, 2560, 1440, NV2A_PRESENT_INTEGER, &r) == 0 && rect_is(&r, 0, 0, 2560, 1440));
+    /* 4:3 of a 4:3 frame is the frame's own: integer stays integer. */
+    CHECK(nv2a_present_rect_aspect(640, 480, NV2A_ASPECT_4_3, 1920, 1080, NV2A_PRESENT_INTEGER, &r) == 1 && rect_is(&r, 320, 60, 1280, 960));
+    /* 4:3 of a 720x480 frame narrows it. */
+    CHECK(nv2a_present_rect_aspect(720, 480, NV2A_ASPECT_4_3, 1920, 1080, NV2A_PRESENT_NEAREST, &r) == 0 && rect_is(&r, 240, 0, 1440, 1080));
+    {
+        struct nv2a_host_opts o = *nv2a_host_opts();
+        o.present_aspect = NV2A_ASPECT_16_9;
+        nv2a_host_opts_set(&o);
+        CHECK(nv2a_present_width(640, 480) == 853);
+        CHECK(nv2a_present_rect(640, 480, 1920, 1080, NV2A_PRESENT_NEAREST, &r) == 0 && rect_is(&r, 0, 0, 1920, 1080));
+        o.present_aspect = NV2A_ASPECT_FRAME;
+        nv2a_host_opts_set(&o);
+    }
+
     /* ---- upscale / downscale ---- */
     {
         enum { W = 5, H = 3 };
@@ -140,7 +165,7 @@ int main(void)
 
     /* ---- the options round-trip; init picks the scale up ---- */
     {
-        struct nv2a_host_opts o = { 3, NV2A_PRESENT_INTEGER, 1 };
+        struct nv2a_host_opts o = { 3, NV2A_PRESENT_INTEGER, 1, NV2A_ASPECT_FRAME };
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_render_scale() == 3);
         CHECK(nv2a_host_opts()->present_filter == NV2A_PRESENT_INTEGER && nv2a_host_opts()->fullscreen == 1);

@@ -608,34 +608,81 @@ unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim
     return n;
 }
 
+/* The display aspect as aw:ah; the frame's own at FRAME. */
+static void present_aspect_ratio(uint32_t src_w, uint32_t src_h, int aspect,
+                                 uint32_t *aw, uint32_t *ah)
+{
+    switch (aspect) {
+    case NV2A_ASPECT_4_3:  *aw = 4;  *ah = 3; break;
+    case NV2A_ASPECT_16_9: *aw = 16; *ah = 9; break;
+    default:               *aw = src_w; *ah = src_h; break;
+    }
+}
+
+uint32_t nv2a_present_width(uint32_t src_w, uint32_t src_h)
+{
+    uint32_t aw, ah;
+    present_aspect_ratio(src_w, src_h, s_host_opts.present_aspect, &aw, &ah);
+    if (!src_h || !ah)
+        return src_w;
+    return (uint32_t)(((uint64_t)src_h * aw + ah / 2) / ah);
+}
+
 int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
                       int filter, struct nv2a_rect *r)
 {
+    return nv2a_present_rect_aspect(src_w, src_h, s_host_opts.present_aspect,
+                                    dst_w, dst_h, filter, r);
+}
+
+int nv2a_present_rect_aspect(uint32_t src_w, uint32_t src_h, int aspect,
+                             uint32_t dst_w, uint32_t dst_h, int filter,
+                             struct nv2a_rect *r)
+{
     uint64_t fw, fh;
+    uint32_t aw, ah;
 
     r->x = r->y = r->w = r->h = 0;
     if (!src_w || !src_h || !dst_w || !dst_h)
         return 0;
+    present_aspect_ratio(src_w, src_h, aspect, &aw, &ah);
+    /* The frame's own aspect, whatever the setting says. */
+    if ((uint64_t)aw * src_h == (uint64_t)ah * src_w)
+        aw = src_w, ah = src_h;
     if (filter == NV2A_PRESENT_INTEGER) {
         uint32_t k = dst_w / src_w, kh = dst_h / src_h;
-        if (kh < k)
-            k = kh;
-        if (k >= 1) {
-            r->w = (int32_t)(src_w * k);
-            r->h = (int32_t)(src_h * k);
-            r->x = (int32_t)(dst_w - (uint32_t)r->w) / 2;
-            r->y = (int32_t)(dst_h - (uint32_t)r->h) / 2;
-            return 1;
+        if (aw == src_w && ah == src_h) {
+            if (kh < k)
+                k = kh;
+            if (k >= 1) {
+                r->w = (int32_t)(src_w * k);
+                r->h = (int32_t)(src_h * k);
+                r->x = (int32_t)(dst_w - (uint32_t)r->w) / 2;
+                r->y = (int32_t)(dst_h - (uint32_t)r->h) / 2;
+                return 1;
+            }
+        } else {
+            /* Whole multiples of the height, the width at the aspect. */
+            for (k = kh; k >= 1; k--) {
+                uint64_t w = ((uint64_t)src_h * k * aw + ah / 2) / ah;
+                if (w <= dst_w) {
+                    r->w = (int32_t)w;
+                    r->h = (int32_t)(src_h * k);
+                    r->x = (int32_t)(dst_w - (uint32_t)r->w) / 2;
+                    r->y = (int32_t)(dst_h - (uint32_t)r->h) / 2;
+                    return 0;
+                }
+            }
         }
     }
     /* Fit: the axis that limits gets the whole output, the other the
-     * frame's aspect, rounded to the nearest pixel. */
-    if ((uint64_t)dst_w * src_h <= (uint64_t)dst_h * src_w) {
+     * display aspect, rounded to the nearest pixel. */
+    if ((uint64_t)dst_w * ah <= (uint64_t)dst_h * aw) {
         fw = dst_w;
-        fh = ((uint64_t)dst_w * src_h + src_w / 2) / src_w;
+        fh = ((uint64_t)dst_w * ah + aw / 2) / aw;
     } else {
         fh = dst_h;
-        fw = ((uint64_t)dst_h * src_w + src_h / 2) / src_h;
+        fw = ((uint64_t)dst_h * aw + ah / 2) / ah;
     }
     r->w = (int32_t)fw;
     r->h = (int32_t)fh;

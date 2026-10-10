@@ -6,6 +6,7 @@
  */
 #include "enhance.h"
 #include "enhance_cfg.h"
+#include "kernel.h"                 /* ULONG, XC_VIDEO_AV_* */
 #include "nv2a_backend_common.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
@@ -446,6 +447,14 @@ static void test_layers(void)
 static int s_pacing_mode = -1;
 void xbox_PacingSetMode(int mode);
 void xbox_PacingSetMode(int mode) { s_pacing_mode = mode; }
+/* The kernel's video settings (kernel.h), stubbed as the pacing mode is. */
+static ULONG s_xc_video = 1, s_smc_mode = 1;
+void xbox_SetVideoSettings(ULONG xc_video, ULONG smc_video_mode);
+void xbox_SetVideoSettings(ULONG xc_video, ULONG smc_video_mode)
+{
+    s_xc_video = xc_video;
+    s_smc_mode = smc_video_mode;
+}
 
 static void enhance_reset_env(void)
 {
@@ -455,6 +464,9 @@ static void enhance_reset_env(void)
     recomp_env_set(RENV_PRESENT_FILTER, NULL);
     recomp_env_set(RENV_PRESENT_FULLSCREEN, NULL);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
+    recomp_env_set(RENV_DISPLAY_WIDESCREEN, NULL);
+    recomp_env_set(RENV_DISPLAY_HDTV, NULL);
+    recomp_env_set(RENV_PRESENT_ASPECT, NULL);
 }
 
 static void test_enhance_init(void)
@@ -527,6 +539,36 @@ static void test_enhance_init(void)
     recomp_env_set(RENV_PRESENT_PACING, "sleep");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
+
+    /* The dashboard video settings and the present aspect: stock is no
+     * widescreen, no HDTV mode, SCART pack, the frame's own shape. */
+    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    CHECK(xbox_enhance_init(".", NULL) == 0);
+    CHECK(s_xc_video == 0 && s_smc_mode == SMC_VIDEO_MODE_SCART);
+    CHECK(o->present_aspect == NV2A_ASPECT_FRAME);
+    /* Widescreen: the EEPROM bit, and auto shows 16:9. */
+    recomp_env_set(RENV_DISPLAY_WIDESCREEN, "1");
+    CHECK(xbox_enhance_init(".", NULL) == 0);
+    CHECK(s_xc_video == XC_VIDEO_AV_WIDESCREEN && s_smc_mode == SMC_VIDEO_MODE_SCART);
+    CHECK(o->present_aspect == NV2A_ASPECT_16_9);
+    /* An explicit aspect wins over auto. */
+    recomp_env_set(RENV_PRESENT_ASPECT, "frame");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->present_aspect == NV2A_ASPECT_FRAME);
+    recomp_env_set(RENV_PRESENT_ASPECT, NULL);
+    recomp_env_set(RENV_DISPLAY_WIDESCREEN, NULL);
+    /* HDTV modes are cumulative and need the HDTV pack; from a file too. */
+    write_file("ecfg_video.toml",
+               "[display]\nwidescreen = true\nhdtv = \"720p\"\n[present]\naspect = \"4:3\"\n");
+    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_video.toml");
+    CHECK(xbox_enhance_init(".", NULL) == 0);
+    CHECK(s_xc_video == (XC_VIDEO_AV_WIDESCREEN | XC_VIDEO_AV_HDTV_480p | XC_VIDEO_AV_HDTV_720p));
+    CHECK(s_smc_mode == SMC_VIDEO_MODE_HDTV && o->present_aspect == NV2A_ASPECT_4_3);
+    recomp_env_set(RENV_DISPLAY_HDTV, "480p");
+    CHECK(xbox_enhance_init(".", NULL) == 0);
+    CHECK(s_xc_video == (XC_VIDEO_AV_WIDESCREEN | XC_VIDEO_AV_HDTV_480p));
+    recomp_env_set(RENV_DISPLAY_HDTV, NULL);
+    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_xc_video == 0);
 
     /* A file that does not parse: -1, stock. */
     write_file("ecfg_broken.toml", "[render]\nscale = \n");
