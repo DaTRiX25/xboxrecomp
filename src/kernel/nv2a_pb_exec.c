@@ -2302,6 +2302,37 @@ static float vsh_zmax(void)
     return nv2a_zmax(s_gpu.format);
 }
 
+/* A triangle's screen depth as a plane through its first vertex, in [0,1]
+ * (z / zmax): z = z0 + lb * dzb + lc * dzc, lb and lc the barycentric
+ * weights of b and c. This is xemu's form (hw/xbox/nv2a/pgraph/glsl/psh.c,
+ * "zvalue = vtxPos0.z + (bc1*(vtxPos1.z - vtxPos0.z) + ...)") and it is exact
+ * where the hardware's is: a triangle of constant depth gets that depth at
+ * every pixel. The obvious la*za + lb*zb + lc*zc rounds three products and
+ * lands an ulp off, and an ulp matters at the far plane. A 2D quad at
+ * z = zmax (Burnout 3 draws its XMV movies so, LEQUAL against a depth
+ * cleared to zmax) came out at 1.00000012 on a regular grid of pixels, which
+ * failed the test and left the clear colour there: a lattice of black dots
+ * over every movie. The NV2A compares integer depth, where both are 0xFFFFFF.
+ * The divides (not a multiply by 1/zmax, which is 2^-24 in float and puts
+ * zmax at 0.99999994) keep z0 the value nv2a_zclear_depth gives a clear of
+ * the same depth. */
+typedef struct { float z0, dzb, dzc; } ZPlane;
+
+static void zplane_setup(const XfVert *a, const XfVert *b, const XfVert *c,
+                         ZPlane *zp)
+{
+    float zmax = vsh_zmax();
+
+    zp->z0  = a->z / zmax;
+    zp->dzb = (b->z - a->z) / zmax;
+    zp->dzc = (c->z - a->z) / zmax;
+}
+
+static inline float zplane_at(const ZPlane *zp, float lb, float lc)
+{
+    return zp->z0 + (lb * zp->dzb + lc * zp->dzc);
+}
+
 /* One depth/stencil buffer per zeta offset and clip extent, picked by
  * zb_select (nv2a_zbuf_cache.h, which also says why one shared buffer is not
  * enough, and what the key leaves out). s_zbuf/s_sbuf/s_zbuf_w/s_zbuf_h name the live entry. */
@@ -3074,9 +3105,10 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
-    float area, inv_w[3], zscale = 1.0f / vsh_zmax();
+    float area, inv_w[3];
     int minx, maxx, miny, maxy, x, y, use_z, use_s, use_rc, n;
     LodTri lod;
+    ZPlane zpl;
 
     if (bpp != 4 && bpp != 2)
         return;
@@ -3124,6 +3156,7 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
 
     inv_w[0] = 1.0f / a->w; inv_w[1] = 1.0f / b->w; inv_w[2] = 1.0f / c->w;
     lod_tri_setup(a, b, c, area, inv_w, &lod);
+    zplane_setup(a, b, c, &zpl);
 
     for (y = miny; y < maxy; y++) {
         for (x = minx; x < maxx; x++) {
@@ -3144,7 +3177,7 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
             la = w1 / area; lb = w2 / area; lc = w0 / area;
 
             if (use_z) {
-                z = (la * a->z + lb * b->z + lc * c->z) * zscale;
+                z = zplane_at(&zpl, lb, lc);
                 zp = &s_zbuf[(size_t)y * s_zbuf_w + (size_t)x];
             }
             if (use_s)
@@ -3708,7 +3741,8 @@ typedef struct {
     const XfVert *a, *b, *c;
     uint8_t *mem;
     uint32_t bpp;
-    float area, inv_w[3], zscale;
+    float area, inv_w[3];
+    ZPlane zp;
     float e0dx, e0dy, e1dx, e1dy, e2dx, e2dy;
     int minx, maxx, miny, maxy, use_z, use_s, use_rc, textured, unit_w;
     LodTri lod;
@@ -3731,7 +3765,7 @@ static inline int ctz32(uint32_t v) { return __builtin_ctz(v); }
 static void fast_rows(const FastTri *T, int y0, int step)
 {
     const XfVert *a = T->a, *b = T->b, *c = T->c;
-    const float area = T->area, zscale = T->zscale;
+    const float area = T->area;
     const float e0dx = T->e0dx, e0dy = T->e0dy, e1dx = T->e1dx, e1dy = T->e1dy;
     const float e2dx = T->e2dx, e2dy = T->e2dy;
     const int minx = T->minx, maxx = T->maxx, use_z = T->use_z, use_s = T->use_s;
@@ -3787,7 +3821,7 @@ static void fast_rows(const FastTri *T, int y0, int step)
             la = w1 / area; lb = w2 / area; lc = w0 / area;
 
             if (use_z) {
-                z = (la * a->z + lb * b->z + lc * c->z) * zscale;
+                z = zplane_at(&T->zp, lb, lc);
                 zp = &s_zbuf[(size_t)y * s_zbuf_w + (size_t)x];
             }
             if (use_s)
@@ -4094,7 +4128,6 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
     T.use_s = vsh_stencil_ready();
     T.use_rc = vsh_rc_active();
     T.textured = textured;
-    T.zscale = 1.0f / vsh_zmax();
 
     minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
     maxx = (int)ceilf (fmaxf(a->x, fmaxf(b->x, c->x)));
@@ -4115,6 +4148,7 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
     T.inv_w[0] = 1.0f / a->w; T.inv_w[1] = 1.0f / b->w; T.inv_w[2] = 1.0f / c->w;
     T.unit_w = a->w == 1.0f && b->w == 1.0f && c->w == 1.0f;
     lod_tri_setup(a, b, c, area, T.inv_w, &T.lod);
+    zplane_setup(a, b, c, &T.zp);
     T.e0dx = b->x - a->x; T.e0dy = b->y - a->y;
     T.e1dx = c->x - b->x; T.e1dy = c->y - b->y;
     T.e2dx = a->x - c->x; T.e2dy = a->y - c->y;
