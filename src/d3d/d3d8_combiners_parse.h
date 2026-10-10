@@ -247,6 +247,16 @@ typedef struct NV2ACombinerState {
      * unsigned values in the signed order, and the shader maps each such
      * channel back to [-1, 1] after sampling. 0: none (the default). */
     uint8_t tex_signed[NV2A_MAX_TEXTURES];
+
+    /* Per stage, the stage a dependent mode (BUMPENVMAP) reads: stage 1
+     * reads 0; stages 2 and 3 as SET_SHADER_OTHER_STAGE_INPUT says
+     * (NV_PGRAPH_SHADERCTL [19:16], [23:20]; xemu psh.c ps.input_tex). */
+    uint8_t input_tex[NV2A_MAX_TEXTURES];
+
+    /* Per CLIPPLANE stage, SET_SHADER_CLIP_PLANE_MODE's 4 bits: component
+     * x y z w (bit 0..3) kills the pixel at >= 0 when set, < 0 when clear
+     * (xemu psh.c compare_mode). */
+    uint8_t clip_mode[NV2A_MAX_TEXTURES];
 } NV2ACombinerState;
 
 /**

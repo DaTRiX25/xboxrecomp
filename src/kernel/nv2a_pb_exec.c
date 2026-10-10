@@ -2075,6 +2075,11 @@ static int vsh_method(uint32_t method, uint32_t param)
     case NV097_SET_SPECULAR_FOG_FACTOR_M + 4: s_vsh.rc_sf[1] = param; return 1;
     case NV097_SET_SHADER_STAGE_PROGRAM_M:
         s_vsh.shader_prog = param; s_vsh.shader_set = 1; return 1;
+    /* xemu pgraph.c: both land in NV_PGRAPH_SHADERCTL under their masks. */
+    case 0x1E74:                        /* SET_DOT_RGBMAPPING */
+        s_vsh.shader_ctl = (s_vsh.shader_ctl & ~0xFFFu) | (param & 0xFFFu); return 1;
+    case 0x1E78:                        /* SET_SHADER_OTHER_STAGE_INPUT */
+        s_vsh.shader_ctl = (s_vsh.shader_ctl & ~0xFFFF000u) | (param & 0xFFFF000u); return 1;
     case NV097_SET_FOG_ENABLE_M:        s_vsh.fog_enable = param != 0;  return 1;
     case NV097_SET_FOG_COLOR_M:         s_vsh.fog_color = param;        return 1;
     case NV097_SET_ALPHA_TEST_ENABLE_M: s_vsh.atest_enable = param != 0; return 1;
