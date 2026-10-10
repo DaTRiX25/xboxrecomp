@@ -1484,7 +1484,7 @@ int main(int argc, char **argv)
         failures += inflight_case(gpu);
     if (gpu)
         failures += poly_offset_case(gpu);
-    if (gpu == nv2a_pb_metal_backend())
+    if (gpu)
         failures += swizzled_case(gpu);
 #endif
     if (failures) {
