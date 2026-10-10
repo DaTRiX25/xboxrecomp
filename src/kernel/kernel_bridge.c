@@ -10399,6 +10399,19 @@ static void kernel_thunk_dispatch(void)
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
+#if !defined(_WIN32)
+            /* guest_cpus=token (kernel_thread.c): how often the holder was
+             * made to hand over, and how long a thread that should have run
+             * at once waited (vyanhursky/xboxrecomp dc00f70). */
+            if (guest_turn_joined()) {
+                uint64_t handoffs, kicks;
+                guest_turn_counts(&handoffs, &kicks);
+                fprintf(stderr, "  [KERNEL] guest CPU: %llu preemptions, %llu requests,"
+                                " longest wait %ld ms\n",
+                        (unsigned long long)handoffs, (unsigned long long)kicks,
+                        guest_turn_longest_wait_ms());
+            }
+#endif
             /* And which ones, ranked. "Latest" names whatever the sample
              * happened to land on; the question behind this line is what a
              * title sitting still is actually asking the kernel for, and
@@ -10517,6 +10530,11 @@ static void kernel_thunk_dispatch(void)
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
         fflush(stderr);
     }
+#if !defined(_WIN32)
+    /* Back to the title: a thread asked for the guest CPU while this one was
+     * in host code gets it here (guest_cpus=token; dc00f70). */
+    guest_turn_checkpoint();
+#endif
 }
 
 /* ── Dispatch lookup ────────────────────────────────────── */

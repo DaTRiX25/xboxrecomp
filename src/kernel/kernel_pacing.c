@@ -160,6 +160,12 @@ void xbox_SpinWait(uint32_t va)
      * spinning here at DISPATCH takes a posted interrupt, as a CPU would.
      * At "spin" pacing the macro calls only for that. */
     xbox_IrqSafePoint();
+#if !defined(_WIN32)
+    /* And a hand-over point for guest_cpus=token (kernel_thread.c): a loop
+     * still waiting lets a thread that wants the guest CPU run now rather
+     * than at the holder's next preemption. */
+    guest_turn_yield();
+#endif
     if (!g_xbox_spin_sleep)
         return;
     site = site_for(va);
