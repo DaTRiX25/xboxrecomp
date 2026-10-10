@@ -33,6 +33,10 @@ target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 target_link_libraries(xbox_video PUBLIC xbox_d3d8)
+if(XBOXRECOMP_HAVE_OVERLAY)
+    # fb_present_sdl.c and the two layer presenters draw the overlay.
+    target_link_libraries(xbox_video PUBLIC xbox_overlay)
+endif()
 if(WIN32)
     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32)
 endif()

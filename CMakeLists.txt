@@ -66,6 +66,23 @@ if(NOT WIN32)
     endif()
 endif()
 
+# The in-game settings overlay (src/overlay): Dear ImGui over the window's
+# Metal or Vulkan present, opened with Back+Start, F1 or Cmd+, ; it edits the
+# RECOMP_* settings and keeps them in settings.toml. Opt-in: it needs the
+# enhancements layer, a POSIX window (Windows follows with D3D11) and C++.
+option(XBOXRECOMP_OVERLAY "Build the in-game settings overlay (Dear ImGui)" OFF)
+if(XBOXRECOMP_OVERLAY AND XBOXRECOMP_ENHANCE AND NOT WIN32)
+    enable_language(CXX)
+    if(APPLE)
+        enable_language(OBJCXX)
+    endif()
+    set(XBOXRECOMP_HAVE_OVERLAY ON)
+    add_compile_definitions(XBOXRECOMP_HAVE_OVERLAY=1)
+    message(STATUS "xboxrecomp: settings overlay on")
+elseif(XBOXRECOMP_OVERLAY)
+    message(STATUS "xboxrecomp: settings overlay off (needs XBOXRECOMP_ENHANCE and a POSIX host)")
+endif()
+
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 
@@ -88,6 +105,10 @@ add_subdirectory(src/usb)
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
 
+if(XBOXRECOMP_HAVE_OVERLAY)
+    add_subdirectory(src/overlay)
+endif()
+
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
@@ -108,6 +129,9 @@ target_link_libraries(xboxrecomp INTERFACE
 if(XBOXRECOMP_ENHANCE)
     target_link_libraries(xboxrecomp INTERFACE xbox_enhance)
 endif()
+if(XBOXRECOMP_HAVE_OVERLAY)
+    target_link_libraries(xboxrecomp INTERFACE xbox_overlay)
+endif()
 # GNU ld reads an archive once, in order, and the runtime's libraries call
 # each other both ways: the kernel's bridge calls into the window and the
 # movie player (xbox_video), its fault path into the APU hook (xbox_apu),
@@ -119,5 +143,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(xbox_kernel PUBLIC xbox_video xbox_apu xbox_d3d8 ${CMAKE_DL_LIBS})
     set_property(TARGET xbox_kernel xbox_video xbox_apu xbox_d3d8
                  PROPERTY LINK_INTERFACE_MULTIPLICITY 3)
+    if(XBOXRECOMP_HAVE_OVERLAY)
+        # The window's presenter calls the overlay (src/video links it); the
+        # overlay calls the kernel (pause) and the APU (volume).
+        target_link_libraries(xbox_overlay PUBLIC xbox_kernel xbox_apu xbox_input)
+        set_property(TARGET xbox_overlay PROPERTY LINK_INTERFACE_MULTIPLICITY 3)
+    endif()
 endif()
 

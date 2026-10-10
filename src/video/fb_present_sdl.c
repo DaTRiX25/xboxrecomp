@@ -37,6 +37,11 @@
  * (SDL_Vulkan_CreateSurface) and the backend adopts it, slots are images the
  * backend copies its frame into, and the main thread presents them FIFO.
  *
+ * The settings overlay (src/overlay, overlay.h) rides on both layer presenters:
+ * every event of the loop goes to it first, it is drawn into the drawable after
+ * the game's image, and while it is open the loop presents on every turn, not
+ * only on a new game frame. The SDL renderer path has none.
+ *
  * RECOMP_HEADLESS=1 (or no display, or SDL video failing to start) skips all
  * of it: the guest runs on the main thread exactly as before.
  *
@@ -95,6 +100,9 @@
 #include "fb_present_vulkan.h"
 #endif
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+#include "overlay.h"          /* src/overlay: the settings overlay */
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
@@ -131,6 +139,8 @@ static int             s_layer;
 /* Vulkan slot mode (RECOMP_PB_BACKEND=vulkan): s_layer is set too, and a
  * slot is an image in fb_present_vulkan.c. */
 static int             s_vk;
+/* The settings overlay is open: the main loop turns fast and presents. */
+static int             s_overlay_open;
 
 /* Ack-thread side counters, read by the stats line. */
 static uint64_t s_flips, s_copy_ns;          /* relaxed atomics */
@@ -704,6 +714,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_RenderPresent(ren);
     }
 
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+    if (s_layer)
+        xbox_OverlaySetWindow(win);
+#endif
     s_guest_done_event = SDL_RegisterEvents(2);
     if (s_guest_done_event == (Uint32)-1) {
         fprintf(stderr, "[PRESENT] SDL_RegisterEvents failed; running headless\n");
@@ -733,14 +747,25 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     while (!quit && !guest_done) {
         SDL_Event ev;
         uint64_t seq;
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+        /* The overlay's Display page changes the filter while running. */
+        filter = nv2a_host_opts()->present_filter;
+        xbox_OverlayPoll();
+#endif
 
         /* One event loop for the window and the controllers: SDL_PumpEvents
          * (inside the wait) also updates the game controllers, which
          * xinput_device.c then only reads. */
-        if (SDL_WaitEventTimeout(&ev, 100)) {
+        if (SDL_WaitEventTimeout(&ev, s_overlay_open ? (vsync ? 1 : 8) : 100)) {
             do {
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+                if (s_layer)
+                    xbox_OverlayEvent(&ev);
+#endif
                 /* Keys for the pad stand-in, and the window events that
-                 * release them; it only reads the event. */
+                 * release them; it only reads the event. (An open overlay
+                 * has the pad and keys neutral at the source,
+                 * xbox_InputSetBlocked, so the key table keeps its state.) */
                 xbox_InputSdlEvent(&ev);
                 if (ev.type == SDL_QUIT)
                     quit = 1;
@@ -755,6 +780,12 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             } while (SDL_PollEvent(&ev));
         }
 
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+        /* An open overlay is redrawn on every turn (it animates, and the
+         * title behind it is paused, so no frame would wake the loop). */
+        s_overlay_open = s_layer && xbox_OverlayOpen();
+        dirty |= s_overlay_open;
+#endif
         pthread_mutex_lock(&s_lock);
         seq = s_ready_seq;
         if (seq != shown_seq) {
@@ -837,6 +868,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 dirty = 0;
                 shoot = 0;
                 presents++;
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+                xbox_OverlayFramePresented();
+#endif
             }
             upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
         }
@@ -858,6 +892,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 dirty = 0;
                 shoot = 0;
                 presents++;
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+                xbox_OverlayFramePresented();
+#endif
             }
             /* else no drawable (display asleep, window occluded): try again
              * at the next event or the 100 ms wake. */
@@ -944,6 +981,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
     }
 
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+    /* Let the title go if the overlay had it paused, and write the settings. */
+    if (s_layer)
+        xbox_OverlayShutdown();
+#endif
     /* No present may be mid-publish (it pushes an SDL event) once SDL goes. */
     __atomic_store_n(&s_running, 0, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&s_in_present, __ATOMIC_SEQ_CST))

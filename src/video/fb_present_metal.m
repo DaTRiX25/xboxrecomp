@@ -47,6 +47,10 @@
 #include "recomp_env.h"
 #include "fb_present_metal.h"
 #include "latency_trace.h"
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+#include "overlay.h"
+#include "overlay_metal.h"
+#endif
 #include "host_time.h"
 #include <mach/mach_time.h>
 
@@ -457,6 +461,12 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             }
         }
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+        /* The settings overlay, over the game's image and under the present
+         * (overlay.h): more of the same encoder. */
+        if (xbox_OverlayWants())
+            xbox_OverlayMetalDraw((void *)s_dev, (void *)cb, (void *)rp, (void *)enc);
+#endif
         [enc endEncoding];
         if (shot_path) {
             shot = [s_dev newBufferWithLength:(NSUInteger)dw * dh * 4

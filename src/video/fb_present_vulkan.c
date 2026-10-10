@@ -55,6 +55,10 @@
 #include "d3d/nv2a_vk_core.h"
 #include "recomp_env.h"
 #include "latency_trace.h"
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+#include "overlay.h"
+#include "overlay_vulkan.h"
+#endif
 
 uint64_t xbox_HostNowNs(void);
 void xbox_PacingPresent(uint64_t when_ns);
@@ -68,11 +72,13 @@ void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
 static const struct nvk_core *C;
 static VkSwapchainKHR   s_sc;
 static VkImage          s_sc_img[SC_MAX];
+static VkImageView      s_sc_view[SC_MAX];   /* for the overlay pass */
 static uint32_t         s_sc_n;
 static VkFormat         s_sc_fmt;
 static VkExtent2D       s_sc_ext;
 static VkPresentModeKHR s_sc_mode;
 static int              s_sc_shots;      /* TRANSFER_SRC usage: shots possible */
+static int              s_sc_color;      /* COLOR_ATTACHMENT usage: the overlay can draw */
 static int              s_recreate;
 static int              s_vsync, s_shots;
 
@@ -275,6 +281,9 @@ static void destroy_swapchain(void)
         if (s_done[i])
             vkDestroySemaphore(C->dev, s_done[i], NULL);
         s_done[i] = VK_NULL_HANDLE;
+        if (s_sc_view[i])
+            vkDestroyImageView(C->dev, s_sc_view[i], NULL);
+        s_sc_view[i] = VK_NULL_HANDLE;
     }
     if (s_sc)
         vkDestroySwapchainKHR(C->dev, s_sc, NULL);
@@ -356,8 +365,10 @@ static int make_swapchain(SDL_Window *win)
     ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     ci.imageExtent = s_sc_ext;
     ci.imageArrayLayers = 1;
+    s_sc_color = (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                  | (s_sc_shots ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+                  | (s_sc_shots ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0)
+                  | (s_sc_color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
@@ -386,8 +397,22 @@ static int make_swapchain(SDL_Window *win)
     vkGetSwapchainImagesKHR(C->dev, s_sc, &s_sc_n, s_sc_img);
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    for (i = 0; i < s_sc_n; i++)
+    for (i = 0; i < s_sc_n; i++) {
         vkCreateSemaphore(C->dev, &si, NULL, &s_done[i]);
+        if (s_sc_color) {
+            VkImageViewCreateInfo vi;
+            memset(&vi, 0, sizeof vi);
+            vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vi.image = s_sc_img[i];
+            vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vi.format = s_sc_fmt;
+            vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vi.subresourceRange.levelCount = 1;
+            vi.subresourceRange.layerCount = 1;
+            if (vkCreateImageView(C->dev, &vi, NULL, &s_sc_view[i]) != VK_SUCCESS)
+                s_sc_view[i] = VK_NULL_HANDLE;
+        }
+    }
     s_recreate = 0;
     return 1;
 }
@@ -737,6 +762,20 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                            lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
         }
     }
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+    /* The settings overlay, over the game's image and under the present
+     * (overlay.h): a dynamic-rendering pass on the swapchain image. */
+    if (s_sc_view[idx] && xbox_OverlayWants()) {
+        nvk_image_barrier(cb, s_sc_img[idx], VK_IMAGE_ASPECT_COLOR_BIT,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        xbox_OverlayVulkanDraw(C, cb, s_sc_view[idx], s_sc_ext.width, s_sc_ext.height,
+                               s_sc_fmt, s_sc_n);
+        nvk_image_barrier(cb, s_sc_img[idx], VK_IMAGE_ASPECT_COLOR_BIT,
+                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    }
+#endif
     if (shot) {
         VkBufferImageCopy bc;
         nvk_image_barrier(cb, s_sc_img[idx], VK_IMAGE_ASPECT_COLOR_BIT,
