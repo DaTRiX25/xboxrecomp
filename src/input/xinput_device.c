@@ -71,9 +71,15 @@ const xbox_input_backend xbox_input_host_backend = {
 /* ======================================================================== */
 
 #include <SDL.h>
+#include <pthread.h>
+#include <stdio.h>
 #include <time.h>
 
+/* Port -> controller. Read by the pad thread (OHCI) under g_pads_lock;
+ * changed only by the thread that pumps SDL events (or, headless, by the
+ * pad thread itself). */
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
+static pthread_mutex_t g_pads_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Set by the window (src/video/fb_present_sdl.c) when the process main thread
  * runs the SDL event loop. Its SDL_PumpEvents already updates the
@@ -85,10 +91,13 @@ void xbox_InputSetMainPump(int on) { g_main_pump = on; }
 /* Whether a controller is open, i.e. whether SDL may still be in use here. */
 int xbox_InputAnyOpen(void)
 {
+    int any = 0;
+    pthread_mutex_lock(&g_pads_lock);
     for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
         if (g_pads[i])
-            return 1;
-    return 0;
+            any = 1;
+    pthread_mutex_unlock(&g_pads_lock);
+    return any;
 }
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
@@ -102,9 +111,124 @@ _Static_assert(SDL_CONTROLLER_AXIS_LEFTX == XBOX_SDL_AXIS_LEFTX
                && SDL_CONTROLLER_AXIS_TRIGGERRIGHT == XBOX_SDL_AXIS_TRIGGERRIGHT,
                "XBOX_SDL_AXIS_* must match SDL_GameControllerAxis");
 
-/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. Hotplug
- * (SDL_CONTROLLERDEVICEADDED/REMOVED in the main loop) is not handled yet:
- * the controllers present at init are the ones used. */
+/* ── With a window: every game controller open, ports by first input ──
+ *
+ * The window's thread pumps SDL events, and everything that opens, closes
+ * or enumerates controllers happens there (xbox_InputPadEvent): under
+ * sdl2-compat a joystick call from a second thread races the event pump
+ * (fb_present_sdl.c, BO-76). Every attached game controller is opened, and
+ * a port goes to a controller when it first presses a button: player 1 is
+ * the pad the player picked up. (Not an axis: a device whose trigger rests
+ * at full, a mapping off by a sign, would take port 1 by doing nothing.)
+ * Ports in SDL's device order put some other device on port 1 on the
+ * Bazzite and the Steam Controller (Steam Input's virtual pad) on port 2,
+ * while the title reads player 1. Hotplug: a controller added is opened,
+ * one removed frees its port.
+ *
+ * Without a window (headless, nothing pumps) the pad thread opens the
+ * controllers present at its first read, in device order, as before. */
+#define PAD_OPEN_MAX 8
+static struct {
+    SDL_GameController *c;
+    SDL_JoystickID id;
+    int port;                         /* -1: no input yet */
+} g_open[PAD_OPEN_MAX];
+
+static void pad_describe(SDL_GameController *c, char *out, size_t n)
+{
+    SDL_Joystick *j = SDL_GameControllerGetJoystick(c);
+    const char *name = SDL_GameControllerName(c);
+    snprintf(out, n, "\"%s\" %04x:%04x player %d", name ? name : "?",
+             SDL_GameControllerGetVendor(c), SDL_GameControllerGetProduct(c),
+             j ? SDL_JoystickGetPlayerIndex(j) : -1);
+}
+
+/* Window thread: open the controller at device index i if it is not open. */
+static void pad_open_index(int i)
+{
+    SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
+    int k, free_k = -1;
+    char d[160];
+
+    if (!SDL_IsGameController(i))
+        return;
+    for (k = 0; k < PAD_OPEN_MAX; k++) {
+        if (g_open[k].c && g_open[k].id == id)
+            return;
+        if (!g_open[k].c && free_k < 0)
+            free_k = k;
+    }
+    if (free_k < 0)
+        return;
+    g_open[free_k].c = SDL_GameControllerOpen(i);
+    if (!g_open[free_k].c)
+        return;
+    g_open[free_k].id = id;
+    g_open[free_k].port = -1;
+    pad_describe(g_open[free_k].c, d, sizeof d);
+    fprintf(stderr, "[INPUT] controller %s opened; it gets a port at its first input\n", d);
+}
+
+/* Window thread: the lowest free port for the controller with this
+ * instance id, if it has none yet. */
+static void pad_claim(SDL_JoystickID id)
+{
+    char d[160];
+
+    for (int k = 0; k < PAD_OPEN_MAX; k++) {
+        if (!g_open[k].c || g_open[k].id != id || g_open[k].port >= 0)
+            continue;
+        pthread_mutex_lock(&g_pads_lock);
+        for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++) {
+            if (!g_pads[p]) {
+                g_pads[p] = g_open[k].c;
+                g_open[k].port = p;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_pads_lock);
+        if (g_open[k].port >= 0) {
+            pad_describe(g_open[k].c, d, sizeof d);
+            fprintf(stderr, "[INPUT] controller %s -> port %d (player %d), at its first input\n",
+                    d, g_open[k].port, g_open[k].port + 1);
+        }
+        return;
+    }
+}
+
+void xbox_InputPadEvent(const SDL_Event *ev)
+{
+    switch (ev->type) {
+    case SDL_CONTROLLERDEVICEADDED:
+        pad_open_index(ev->cdevice.which);
+        break;
+    case SDL_CONTROLLERDEVICEREMOVED:
+        for (int k = 0; k < PAD_OPEN_MAX; k++) {
+            if (!g_open[k].c || g_open[k].id != ev->cdevice.which)
+                continue;
+            pthread_mutex_lock(&g_pads_lock);
+            if (g_open[k].port >= 0)
+                g_pads[g_open[k].port] = NULL;
+            SDL_GameControllerClose(g_open[k].c);
+            pthread_mutex_unlock(&g_pads_lock);
+            if (g_open[k].port >= 0)
+                fprintf(stderr, "[INPUT] controller on port %d removed; the port is free\n",
+                        g_open[k].port);
+            else
+                fprintf(stderr, "[INPUT] controller removed (it had no port)\n");
+            g_open[k].c = NULL;
+        }
+        break;
+    case SDL_CONTROLLERBUTTONDOWN:
+        pad_claim(ev->cbutton.which);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Headless: up to XBOX_MAX_CONTROLLERS attached game controllers, in
+ * device order, on the pad thread (nothing else uses SDL then). */
 static void open_controllers(void)
 {
     int slot = 0;
@@ -123,16 +247,32 @@ static void sdl_init(void)
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+    if (g_main_pump) {
+        /* The window's thread (xbox_InputInit from fb_present_sdl.c): open
+         * what is attached now; the ADDED events SDL also sends for these
+         * find them open. */
+        for (int i = 0; i < SDL_NumJoysticks(); i++)
+            pad_open_index(i);
+        return;
+    }
+    pthread_mutex_lock(&g_pads_lock);
     open_controllers();
+    pthread_mutex_unlock(&g_pads_lock);
 }
 
 static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
 {
-    SDL_GameController *c = g_pads[port];
+    SDL_GameController *c;
     XBOX_HOST_SDL_GAMEPAD pad;
 
-    if (!c || !SDL_GameControllerGetAttached(c))
+    /* Held across the reads: the window's thread closes a removed
+     * controller only under the lock. */
+    pthread_mutex_lock(&g_pads_lock);
+    c = g_pads[port];
+    if (!c || !SDL_GameControllerGetAttached(c)) {
+        pthread_mutex_unlock(&g_pads_lock);
         return ERROR_DEVICE_NOT_CONNECTED;
+    }
     if (!g_main_pump)
         SDL_GameControllerUpdate();
 
@@ -140,6 +280,7 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
         pad.button[b] = SDL_GameControllerGetButton(c, (SDL_GameControllerButton)b) ? 1 : 0;
     for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++)
         pad.axis[a] = SDL_GameControllerGetAxis(c, (SDL_GameControllerAxis)a);
+    pthread_mutex_unlock(&g_pads_lock);
     out->dwPacketNumber = ++g_packet[port];
     xbox_InputMapSdl(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
@@ -183,16 +324,21 @@ static Uint16 rumble_level(WORD speed)
 
 static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
 {
-    SDL_GameController *c = g_pads[port];
+    SDL_GameController *c;
 
-    if (!c || !SDL_WasInit(SDL_INIT_GAMECONTROLLER))
+    pthread_mutex_lock(&g_pads_lock);
+    c = g_pads[port];
+    if (!c || !SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
+        pthread_mutex_unlock(&g_pads_lock);
         return ERROR_DEVICE_NOT_CONNECTED;
+    }
     /* SDL rumble needs a duration. The USB pad (usb_gamepad.c) re-issues a
      * held rumble every 150 ms, so 300 ms bridges one refresh and a lost
      * stop report ends within a third of a second. 0 stops it. */
     SDL_GameControllerRumble(c, rumble_level(v->wLeftMotorSpeed),
                              rumble_level(v->wRightMotorSpeed),
                              (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 300 : 0);
+    pthread_mutex_unlock(&g_pads_lock);
     return ERROR_SUCCESS;
 }
 
