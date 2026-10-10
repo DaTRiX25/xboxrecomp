@@ -5650,6 +5650,10 @@ static struct {
     uint32_t swaps;
     uint64_t stall_ns;     /* the executor held in flip_pacing_stall */
 } s_pace;
+/* Never reset: RECOMP_TRACE=frametime's running totals. */
+static uint64_t s_hold_all;
+static uint32_t s_last_iv = 1;
+static int      s_last_late;
 static int      s_swap_pending;
 static uint32_t s_swap_target;        /* vblank the pending flip waits for */
 static uint32_t s_swap_last;          /* the handler's last target */
@@ -5691,12 +5695,15 @@ static void flip_pacing_swap(uint32_t param)
     s_pace.iv[arg & 7]++;
     s_pace.imm += (arg & 8) != 0;
     s_pace.swaps++;
+    s_last_iv = arg & 7;
+    s_last_late = 0;
     if (!flip_pacing_on())
         return;
     now = xbox_VblankCount();
     target = s_swap_last + (arg & 7);
     if ((int32_t)(target - now) <= 0) {
         s_pace.late++;
+        s_last_late = 1;
         target = (arg & 8) ? now : now + 1;
     }
     s_swap_last = target;
@@ -5715,6 +5722,20 @@ static void flip_pacing_stall(void)
         return;
     s_swap_pending = 0;
     t0 = xbox_HostNowNs();
+    /* present.pacing=sleep: block on the vblank's condition variable (the
+     * timer thread signals it) instead of polling every 250 us. */
+    if (xbox_PacingMode() == XBOX_PACING_SLEEP) {
+        if (!xbox_VblankWaitUntil(s_swap_target, 100))
+            waited = 100000000ull;
+        else
+            timeouts = 0;
+        if (waited && ++timeouts >= 3) {
+            s_flip_pacing = 0;
+            fprintf(stderr, "  [GPU] flip pacing off: no vblank arrived"
+                    " in 100 ms three times (is RECOMP_VBLANK set?)\n");
+        }
+        goto done;
+    }
     while ((int32_t)(xbox_VblankCount() - s_swap_target) < 0) {
         if (waited >= 100000000ull) {        /* 100 ms: six vblanks */
             if (++timeouts >= 3) {
@@ -5729,7 +5750,12 @@ static void flip_pacing_stall(void)
     }
     if (waited < 100000000ull)
         timeouts = 0;
-    s_pace.stall_ns += xbox_HostNowNs() - t0;
+done:
+    {
+        uint64_t d = xbox_HostNowNs() - t0;
+        s_pace.stall_ns += d;
+        s_hold_all += d;
+    }
 }
 
 /* RECOMP_TRACE=pacing, every PACE_WINDOW flips: the intervals the swaps
@@ -6150,6 +6176,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                        + s_gpu.batches_no_tex + s_gpu_backend_batches;
             xbox_PacingFlip(s_gpu.flips, b - prev);
             pace_report(s_gpu.flips);
+            /* The scan is open at a flip: count it up to now. Present is
+             * the previous flip's (this one's runs below). */
+            xbox_FrametimeFlip(s_gpu.flips, s_last_iv, s_last_late, s_hold_all,
+                               s_perf.scan_all + (rt_now() - s_perf.scan_t0),
+                               s_perf.draw_all, s_perf.flip_all);
             prev = b;
         }
         /* Present the frame just finished: present_pick says which surface

@@ -71,6 +71,15 @@ void xbox_SpinWait(uint32_t va);
  * when the mode is spin. */
 void xbox_SpinWake(void);
 
+/* Block until the vblank count reaches target, or timeout_ms passes; 1 when
+ * it did, 0 on the timeout. Woken by xbox_VblankSignal, which the timer
+ * thread calls after counting each vblank: a condition variable, as plume
+ * waits for its vsync worker (Xerenge rexglue/src/plume_renderer/
+ * plume_graphics_system.cpp, PaceSwapToVblank), rather than a sleep-poll. */
+int  xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms);
+void xbox_VblankSignal(void);
+uint32_t xbox_VblankCount(void);
+
 /* Per-site counters, for the trace and the tests. */
 typedef struct {
     uint32_t va;
