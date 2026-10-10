@@ -14,6 +14,7 @@
 #include "usb_gamepad.h"
 #include "recomp_env.h"
 #include "latency_trace.h"
+#include "../input/xinput_xbox.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -213,8 +214,106 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
         return -1;
     }
 
+    /* SET_REPORT on the interface (xemu's xid_handle_control): the rumble
+     * report sent over the control pipe instead of the OUT endpoint. The
+     * data stage arrives through usb_gamepad_output(); this is the status
+     * stage, which only has to succeed. */
+    if ((setup->bmRequestType & 0x7Fu) == 0x21u && setup->bRequest == 0x09u)
+        return 0;
+
     /* Class requests: not ours to guess at. */
     return -1;
+}
+
+/* ---- the output report: rumble ----------------------------------------- */
+
+/* The XDK's XInputSetState reaches the pad as the XID output report, on the
+ * OUT interrupt endpoint (or as a SET_REPORT control transfer):
+ *
+ *   0      report id, 0
+ *   1      length, 6
+ *   2..3   left actuator,  little endian -- the big, low-frequency motor
+ *   4..5   right actuator, little endian -- the small, high-frequency motor
+ *
+ * Layout as in xemu hw/xbox/xid.c (XIDGamepadOutputReport, xid_handle_data /
+ * xid_handle_control). The values are the same 0..65535 XInput uses, so they
+ * go straight to xbox_InputSetState, which the SDL/XInput backends already
+ * implement (xinput_device.c).
+ *
+ * RECOMP_INPUT_RUMBLE=0 turns it off. RECOMP_TRACE=input_diag prints every
+ * report that changes the motors; the first non-zero one of each pad is
+ * always logged. */
+static struct {
+    uint16_t left, right;
+    unsigned long last_ms;      /* when the host pad was last told */
+    int      announced;         /* the first-use line has been printed */
+    int      seen;              /* any report has arrived */
+} s_rumble[USB_GAMEPAD_MAX];
+
+static int rumble_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = recomp_env(RENV_INPUT_RUMBLE);
+        on = !(v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N'
+                     || v[0] == 'f' || v[0] == 'F'));
+    }
+    return on;
+}
+
+static void rumble_apply(int pad, int log)
+{
+    XBOX_VIBRATION vib;
+    DWORD rc;
+
+    vib.wLeftMotorSpeed  = s_rumble[pad].left;
+    vib.wRightMotorSpeed = s_rumble[pad].right;
+    rc = xbox_InputSetState((DWORD)pad, &vib);
+    s_rumble[pad].last_ms = (unsigned long)GetTickCount();
+    if (log) {
+        fprintf(stderr, "  [RUMBLE] pad %d left=%u right=%u -> host rc=%lu\n",
+                pad, vib.wLeftMotorSpeed, vib.wRightMotorSpeed,
+                (unsigned long)rc);
+        fflush(stderr);
+    }
+}
+
+void usb_gamepad_output(int pad, const uint8_t *data, int len)
+{
+    uint16_t left, right;
+    int diag = recomp_env(RENV_INPUT_DIAG) != NULL;
+
+    pad &= 3;
+    if (len < 6 || data[1] < 6)
+        return;                         /* not a rumble report */
+    if (!rumble_enabled())
+        return;
+    left  = (uint16_t)(data[2] | (data[3] << 8));
+    right = (uint16_t)(data[4] | (data[5] << 8));
+
+    if (left == s_rumble[pad].left && right == s_rumble[pad].right
+            && s_rumble[pad].seen)
+        return;                         /* unchanged: usb_gamepad_report refreshes */
+    s_rumble[pad].left  = left;
+    s_rumble[pad].right = right;
+    s_rumble[pad].seen = 1;
+    if (!s_rumble[pad].announced && (left || right)) {
+        s_rumble[pad].announced = 1;
+        fprintf(stderr, "  [RUMBLE] pad %d: the title uses rumble\n", pad);
+        fflush(stderr);
+        diag = 1;
+    }
+    rumble_apply(pad, diag);
+}
+
+/* SDL rumble runs for a set time, and the title only sends a report when the
+ * motors change, so a held rumble is re-issued from the pad poll. */
+static void rumble_refresh(int pad)
+{
+    if (!(s_rumble[pad].left | s_rumble[pad].right) || !rumble_enabled())
+        return;
+    if ((unsigned long)GetTickCount() - s_rumble[pad].last_ms >= 150)
+        rumble_apply(pad, 0);
 }
 
 /* ---- the input report -------------------------------------------------- */
@@ -571,6 +670,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     memset(out, 0, 20);
     out[0] = 0;
     out[1] = 20;
+    rumble_refresh(pad & 3);
 
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */

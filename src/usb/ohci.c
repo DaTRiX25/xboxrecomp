@@ -664,6 +664,12 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * engine-rev rumble on the Crash countdown and then paused with the
          * pad unresponsive. */
         moved = len;
+        if (len >= 6 && guest_ptr(cbp, (uint32_t)len)
+                && (endpoint != 0
+                    || (g_setup_pending
+                        && (g_setup.bmRequestType & 0x7Fu) == 0x21u
+                        && g_setup.bRequest == 0x09u)))
+            usb_gamepad_output(pad, guest_ptr(cbp, (uint32_t)len), len);
         if (endpoint == 0) {
             g_setup_pending = 0;
             s_n_out_ep0++;
