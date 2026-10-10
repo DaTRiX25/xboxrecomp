@@ -23,7 +23,9 @@
  * the CPU path and on Metal, the whole frame compared: a clear bounded by its
  * clip, one bounded by SET_CLEAR_RECT, a target grown from 320x240 to
  * 640x480 (contents kept, margin seeded from the guest bytes, at scale 1 and
- * 2), and a flip of a grown target showing only the 320x240 frame. The CPU
+ * 2), a quad over the whole surface drawn under a 640x448 clip at y 16
+ * (the clip scissors draws, as xemu's glScissor does), and a flip of a grown
+ * target showing only the 320x240 frame. The CPU
  * halves of the first two also run before the backend check, for a Mac run
  * without the Metal backend; Proton's check is d3d11_backend_smoke's
  * cpu_clip_cases (this test builds on macOS only).
@@ -652,7 +654,7 @@ static void clear_rect(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
     M(0x1D9C, (y1 << 16) | y0);
 }
 
-enum { CC_CLIP, CC_RECT, CC_GROW, CC_GROW2 };
+enum { CC_CLIP, CC_RECT, CC_GROW, CC_GROW2, CC_DRAW };
 
 static void clip_stream(int cc)
 {
@@ -670,6 +672,19 @@ static void clip_stream(int cc)
         clear_to(0xFF00FF00u);
         clear_rect(0, 0, W - 1, H - 1);
         break;
+    case CC_DRAW: { /* red over 640x480, then a 640x448 clip at y 16 and a
+                     * blue quad over the whole surface: the clip is a
+                     * scissor (xemu glScissor), the bands keep their red */
+        static const uint32_t blue[4] = {0xFF0000FFu, 0xFF0000FFu, 0xFF0000FFu, 0xFF0000FFu};
+        int a;
+        surf_clip(BUF0, 0, 0, W, H);
+        clear_to(0xFFFF0000u);
+        surf_clip(BUF0, 0, 16, W, 448);
+        for (a = 0; a < 16; a++)
+            M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+        quad_uv(0.0f, 0.0f, (float)W, (float)H, blue, NULL);
+        break;
+    }
     default: {      /* 320x240 red, then 640x480 with its lower right green */
         uint32_t buf = cc == CC_GROW ? BUF3 : BUF4;
         surf_clip(buf, 0, 0, 320, 240);
@@ -692,14 +707,17 @@ static void fill(uint32_t buf, uint32_t argb)
 
 /* The pixels each clip case must show, on both paths. */
 /* The clear rect's (339,339) and (340,339) pin its inclusive max edge. */
-static const struct probe s_clip_probe[4][6] = {
+static const struct probe s_clip_probe[5][6] = {
     {{50, 50, 0xFFFF0000u}, {150, 150, 0xFF0000FFu}, {300, 300, 0xFFFF0000u}, {0}},
     {{320, 320, 0xFF00FF00u}, {350, 350, 0xFFFF0000u}, {299, 320, 0xFFFF0000u},
      {339, 339, 0xFF00FF00u}, {340, 339, 0xFFFF0000u}, {0}},
     {{100, 100, 0xFFFF0000u}, {400, 300, 0xFF00FF00u}, {400, 100, PATTERN}, {100, 300, PATTERN}},
     {{100, 100, 0xFFFF0000u}, {400, 300, 0xFF00FF00u}, {400, 100, PATTERN}, {100, 300, PATTERN}},
+    {{100, 15, 0xFFFF0000u}, {100, 16, 0xFF0000FFu}, {100, 463, 0xFF0000FFu},
+     {100, 464, 0xFFFF0000u}, {0}},
 };
-static const char *const s_clip_name[4] = {"clip clear", "clear rect", "grow", "grow x2"};
+static const char *const s_clip_name[5] = {"clip clear", "clear rect", "grow", "grow x2",
+                                           "clip draw"};
 
 static int clip_probes(int cc, const char *path, const uint32_t *px)
 {
@@ -748,7 +766,7 @@ static int clip_cases(const struct nv2a_pb_backend *b, uint32_t *cpu, uint32_t *
     uint32_t tw = 0, th = 0, sw = 0, sh = 0;
     int cc, f = 0, k;
 
-    for (cc = CC_CLIP; cc <= CC_GROW2; cc++) {
+    for (cc = CC_CLIP; cc <= CC_DRAW; cc++) {
         uint32_t buf = cc == CC_GROW ? BUF3 : cc == CC_GROW2 ? BUF4 : BUF0;
         const uint8_t *hp;
         uint32_t hw = 0, hh = 0;
