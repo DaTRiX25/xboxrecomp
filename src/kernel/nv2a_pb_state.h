@@ -326,6 +326,12 @@ struct nv2a_pb_backend {
      * Called on the ack thread only, like on_flip. NULL: guest memory is
      * already current (CPU) or never read (D3D11 dumps itself). */
     void (*sync_guest)(uint32_t offset, uint32_t pitch, uint32_t w, uint32_t h);
+    /* on_flip_ready (optional): the executor has reached the frame's
+     * FLIP_STALL -- every draw of it is in -- and may now hold for the
+     * vblank before on_flip. A backend submits the frame's GPU work here so
+     * the GPU draws it during the hold rather than after it (BO-74: the
+     * frame is done by the vblank, as the console's would be). Ack thread. */
+    void (*on_flip_ready)(void);
 };
 
 /* Route the executor's events to `backend`. NULL restores the CPU rasteriser.

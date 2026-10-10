@@ -79,6 +79,7 @@ extern "C" {
     /* ── config ─────────────────────────────────────────────────────── */ \
     X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "pushbuffer executor (draws frames); default on, 0: off") \
     X(PB_BACKEND,        CONFIG, "RECOMP_PB_BACKEND",        NULL, "executor backend: cpu (default), metal, d3d11, null") \
+    X(PRESENT_EARLY,     CONFIG, "RECOMP_PRESENT_EARLY",     NULL, "1: frames go to the host at FLIP_STALL, before the vblank hold (lower latency, same pacing)") \
     X(FLIP_PACING,       CONFIG, "RECOMP_FLIP_PACING",       NULL, "vblank: FLIP_STALL holds until the vblank the title's swap asked for (needs RECOMP_VBLANK); default off") \
     X(HEADLESS,          CONFIG, "RECOMP_HEADLESS",          NULL, "1: no window (SDL host)") \
     X(WINDOW_SCALE,      CONFIG, "RECOMP_WINDOW_SCALE",      NULL, "window scale factor (SDL host, default 2)") \
@@ -190,6 +191,8 @@ extern "C" {
     X(METAL_NO_MIPS,     DEBUG, "metal_no_mips",   "RECOMP_METAL_NO_MIPS",     "Metal uploads level 0 only") \
     X(METAL_POINT,       DEBUG, "metal_point",     "RECOMP_METAL_POINT",       "Metal point sampling") \
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
+    X(WINDOW_DISPLAY,    DEBUG, "window_display",  NULL,                       "=n: open the window centred on display n (0 = main)") \
+    X(EARLY_COMMIT,      DEBUG, "early_commit",    NULL,                       "=0: submit a frame's GPU work after the vblank hold, not at FLIP_STALL (A/B)") \
     X(METAL_FRAMES,      DEBUG, "metal_frames",    NULL,                       "=1: Metal waits for each frame at its flip; default 2 frames in flight") \
     X(METAL_PRESENT,     DEBUG, "metal_present",   NULL,                       "=layer|readback: Metal window present, CAMetalLayer from GPU slots (default) or the old texture readback") \
     X(METAL_WRITEBACK,   DEBUG, "metal_writeback", NULL,                       "=lazy|always: Metal writes guest memory when a dump reads it (default) or at every flip") \
@@ -230,6 +233,7 @@ extern "C" {
     X(FRAMETIME,         TRACE, "frametime",       NULL,                       "=file: one CSV line per flip: executor hold/busy/draw/present/idle and sampled guest time by section (game, d3d, xdk), spin, host, wait (tools/perf/framestats.py)") \
     X(FRAMETIME_SPIN,    TRACE, "frametime_spin",  NULL,                       "=va[+va...]: lifted functions whose sampled time counts as spin (a guest busy-wait), not as their section") \
     X(FRAMETIME_US,      TRACE, "frametime_us",    NULL,                       "=us: guest thread sampling period for frametime (500, min 100)") \
+    X(LATENCY_TRACE,     TRACE, "latency",         NULL,                       "=file: input-to-photon CSV: pad report changes, guest ISR, swap, vblank release, executor done, GPU done + frame signature, drawable acquire/present/on-glass (tools/perf/latency.py)") \
     X(PACING_TRACE,      TRACE, "pacing",          NULL,                       "[PACING] flip intervals, vblank gaps, CPU and spin-wait sites every 600 flips; =all also every flip") \
     X(VBLANK_CLOCK,      DEBUG, "vblank_clock",    NULL,                       "=ms: the old millisecond vblank schedule and timer loop (A/B)") \
     X(MISSING,           TRACE, "missing",         NULL,                       "missing game files, one line each and an exit summary; default on, =0 off, =all also absent directories, other trees, probes, every FAILED repeat and NtOpenFile/IoCreateFile successes") \

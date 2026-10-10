@@ -84,6 +84,9 @@
 #include "nv2a_backend_common.h"
 #include "d3d8_msl.h"
 #include "nv2a_pcache.h"
+#include "latency_trace.h"
+#include "host_time.h"
+#include <mach/mach_time.h>
 #include <dispatch/dispatch.h>
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
  * which collides with Objective-C and CoreServices: declare what is used. */
@@ -3482,6 +3485,82 @@ static void prof_flip_end(uint64_t t_flip0)
     }
 }
 
+
+/* RECOMP_TRACE=latency (BO-74): the G row, when the GPU has finished the
+ * frame. A copy of the frame into one of a few shared buffers rides after
+ * it on the queue; its completion handler (a Metal thread, nobody waits)
+ * stamps the time, converts GPUEndTime and writes the frame's signature,
+ * which tools/perf/latency.py diffs to find the frame that reacts to a pad
+ * change. Only with the trace on. */
+#define LAT_BUFS 4
+static id<MTLBuffer> s_lat_buf[LAT_BUFS];
+static int           s_lat_next;
+
+/* GPUStartTime/GPUEndTime and presentedTime are host time in seconds on the
+ * mach_absolute_time clock; latency rows are on xbox_HostNowNs. */
+static uint64_t lat_host_s_to_ns(double s)
+{
+    static mach_timebase_info_data_t tb;
+    uint64_t now_ns = xbox_HostNowNs(), mach_ns;
+    if (!tb.denom)
+        mach_timebase_info(&tb);
+    mach_ns = mach_absolute_time() * tb.numer / tb.denom;
+    if (s <= 0)
+        return 0;
+    return now_ns - mach_ns + (uint64_t)(s * 1e9);
+}
+
+static void lat_frame_done(id<MTLTexture> tex, uint32_t w, uint32_t h, uint32_t flip)
+{
+    NSUInteger need = (NSUInteger)w * h * 4;
+    id<MTLBuffer> buf;
+    id<MTLBlitCommandEncoder> b;
+    id<MTLCommandBuffer> cb;
+
+    if (!tex || !w || !h || [tex pixelFormat] != MTLPixelFormatBGRA8Unorm)
+        return;
+    buf = s_lat_buf[s_lat_next];
+    if (!buf || [buf length] < need) {
+        [buf release];
+        buf = [s_dev newBufferWithLength:need options:MTLResourceStorageModeShared];
+        s_lat_buf[s_lat_next] = buf;
+        if (!buf)
+            return;
+    }
+    s_lat_next = (s_lat_next + 1) % LAT_BUFS;
+    cb = [s_queue commandBuffer];
+    b = [cb blitCommandEncoder];
+    [b copyFromTexture:tex sourceSlice:0 sourceLevel:0
+          sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+              toBuffer:buf destinationOffset:0 destinationBytesPerRow:(NSUInteger)w * 4
+destinationBytesPerImage:need];
+    [b endEncoding];
+    [buf retain];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        uint64_t t = xbox_HostNowNs();
+        char row[480];
+        int n = snprintf(row, sizeof row, "%llu,",
+                         (unsigned long long)lat_host_s_to_ns([c GPUEndTime]));
+        xbox_LatSignature((const uint8_t *)[buf contents], w, h, w * 4, 4,
+                          row + n, (int)sizeof row - n);
+        xbox_LatRow('G', flip, t, row);
+        [buf release];
+    }];
+    [cb commit];
+}
+
+/* FLIP_STALL reached: commit what the frame has recorded so the GPU draws
+ * it while the executor holds for the vblank; on_flip then only adds the
+ * slot blit (BO-74). Before this the frame's command buffer was committed
+ * at on_flip, after the hold, and the GPU's 2-3 ms came after the vblank. */
+static void metal_on_flip_ready(void)
+{
+    @autoreleasepool {
+        if (s_cmd)
+            flush(0);
+    }
+}
+
 static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     RenderTarget *rt = NULL;
@@ -3543,6 +3622,10 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                     s_window_presents++;
                 }
                 prof_add(&s_pa.blit, t);
+            }
+            if (rt && xbox_LatOn()) {
+                flush(0);
+                lat_frame_done(rt->tex, hcw, hch, nv2a_pb_gpu_state()->flips);
             }
             /* The host-size readback only when something reads it: the
              * write-back below or the readback-mode window. */
@@ -3664,6 +3747,7 @@ static const struct nv2a_pb_backend s_metal_backend = {
     metal_on_poll,
     1,                  /* writes_back: dumps read guest memory, after sync_guest */
     metal_sync_guest,
+    metal_on_flip_ready,
 };
 
 const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)

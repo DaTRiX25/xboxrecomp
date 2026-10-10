@@ -30,6 +30,7 @@
 #include "kernel_pacing.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
+#include "platform/latency_trace.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -3020,6 +3021,8 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
         xbox_ProfCount(XBOX_PROF_SCHED_RESTART, (long long)(late / 1000000u));
     kernel_vblank_count(kernel_clock_ms());
     xbox_PacingVblank(now_ns);
+    if (xbox_LatOn())   /* RECOMP_TRACE=latency: B, the emulated vblank */
+        xbox_LatRow('B', xbox_VblankCount(), now_ns, NULL);
     kernel_vblank_raise();
     return 1;
 }

@@ -34,6 +34,7 @@
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "kernel_pacing.h"
 #include "host_time.h"            /* xbox_HostSleepNs, for flip pacing */
+#include "latency_trace.h"        /* RECOMP_TRACE=latency */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
@@ -5692,6 +5693,11 @@ static void flip_pacing_swap(uint32_t param)
             last_iv = arg & 7;
         }
     }
+    if (xbox_LatOn()) {
+        char b[16];
+        snprintf(b, sizeof b, "%u", arg & 7);
+        xbox_LatRow('S', s_gpu.flips, 0, b);
+    }
     s_pace.iv[arg & 7]++;
     s_pace.imm += (arg & 8) != 0;
     s_pace.swaps++;
@@ -5756,6 +5762,68 @@ done:
         s_pace.stall_ns += d;
         s_hold_all += d;
     }
+}
+
+/* Present the frame just finished: present_pick says which surface that is,
+ * for every backend. Before anything qualifies (no draw or clear yet), the
+ * old answer: the last surface drawn, else the current one. */
+static void flip_present(void)
+{
+    present_pick();
+    if (s_backend->on_flip) {
+        uint64_t t0 = rt_now();
+        if (s_present.offset)
+            s_backend->on_flip(s_present.offset, s_present.pitch);
+        else
+            s_backend->on_flip(s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                                  : s_gpu.color_offset,
+                               s_gpu.pitch);
+        uint64_t f_ns = rt_now() - t0;
+        if (xbox_LatOn())
+            xbox_LatRow('E', s_gpu.flips, 0, NULL);
+        s_perf.flip += f_ns;            /* Present, for the [PB-PERF] line */
+        s_perf.flip_all += f_ns;
+    }
+}
+
+/* RECOMP_DEBUG=early_commit=0: no on_flip_ready, the frame's GPU work is
+ * submitted at on_flip after the hold, as before BO-74 (A/B). */
+static int flip_commit_early(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_EARLY_COMMIT);
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* RECOMP_PRESENT_EARLY=1 (BO-74, opt-in): hand a frame to the host
+ * when the executor reaches its FLIP_STALL -- the frame is complete there,
+ * every draw of it is before the stall in the pushbuffer -- instead of after
+ * the vblank hold. The guest still waits for the vblank (the hold, the swap
+ * counter, the fences behind it are unchanged), so pacing and game speed
+ * are the same; only the host sees the frame sooner, by however long the
+ * hold is (the title is usually a frame ahead: the swap of frame N+1 reaches
+ * the executor about 1 ms after N's vblank, so up to a frame).
+ *
+ * Why: the console shows frame N from its vblank on a CRT with no further
+ * delay; a host shows it a display refresh or more after the present (the
+ * swap chain's vsync and the compositor). Presenting at the stall spends
+ * the hold on that, so the photon arrives no later than the console's.
+ * UnleashedRecomp and Xerenge (plume) likewise record and present on the
+ * swap without waiting on an emulated vblank first. */
+static int flip_present_early(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_PRESENT_EARLY);
+        on = e && *e && *e != '0';
+        if (on)
+            fprintf(stderr, "  [GPU] RECOMP_PRESENT_EARLY: frames go to the host at"
+                    " FLIP_STALL, before the vblank hold\n");
+    }
+    return on;
 }
 
 /* RECOMP_TRACE=pacing, every PACE_WINDOW flips: the intervals the swaps
@@ -6159,11 +6227,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         note_unhandled(method, param);   /* still listed in the survey */
         return;
 
-    case NV097_FLIP_STALL:
+    case NV097_FLIP_STALL: {
+        /* RECOMP_PRESENT_EARLY (BO-74): hand the finished frame to the host at the
+         * stall, then hold for the vblank; otherwise present after it. */
+        int early = flip_present_early();
+        if (early)
+            flip_present();
+        else if (s_backend->on_flip_ready && flip_commit_early())
+            s_backend->on_flip_ready();
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now -- or, with
          * RECOMP_FLIP_PACING=vblank, the vblank the swap asked for. */
         flip_pacing_stall();
+        if (xbox_LatOn())
+            xbox_LatRow('V', s_gpu.flips, 0, NULL);
         s_gpu.flip_read = s_gpu.flip_write;
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
@@ -6183,23 +6260,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                s_perf.draw_all, s_perf.flip_all);
             prev = b;
         }
-        /* Present the frame just finished: present_pick says which surface
-         * that is, for every backend. Before anything qualifies (no draw or
-         * clear yet), the old answer: the last surface drawn, else the
-         * current one. */
-        present_pick();
-        if (s_backend->on_flip) {
-            uint64_t t0 = rt_now();
-            if (s_present.offset)
-                s_backend->on_flip(s_present.offset, s_present.pitch);
-            else
-                s_backend->on_flip(s_gpu.drawn_offset ? s_gpu.drawn_offset
-                                                      : s_gpu.color_offset,
-                                   s_gpu.pitch);
-            uint64_t f_ns = rt_now() - t0;
-            s_perf.flip += f_ns;            /* Present, for the [PB-PERF] line */
-            s_perf.flip_all += f_ns;
-        }
+        if (!early)
+            flip_present();
         /* The window title's FPS and draws: one call per flip, with the
          * draws of the frame just finished. */
         {
@@ -6310,6 +6372,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         return;
+    }
 
     case NV097_SET_TEXTURE_FORMAT:
         s_gpu.tex.color = (param >> 8) & 0xFF;
