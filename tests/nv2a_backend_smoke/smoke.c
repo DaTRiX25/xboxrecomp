@@ -1437,7 +1437,7 @@ int main(int argc, char **argv)
         failures += far_quad_case(gpu, "gpu");
     if (gpu)
         failures += inflight_case(gpu);
-    if (gpu == nv2a_pb_metal_backend())
+    if (gpu)
         failures += poly_offset_case(gpu);
 #endif
     if (failures) {

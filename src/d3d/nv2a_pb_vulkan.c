@@ -3593,6 +3593,15 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
     xbox_FramebufferWindowPresent(addr, pitch);
 }
 
+/* FLIP_STALL reached: submit what the frame has recorded so the GPU draws it
+ * while the executor holds for the vblank (BO-74, as Metal's
+ * metal_on_flip_ready); on_flip then adds only the slot copy. */
+static void vk_on_flip_ready(void)
+{
+    if (!s_failed && (s_cmd || s_up))
+        flush(0);
+}
+
 /* ---- registration ---------------------------------------------------------- */
 
 static const struct nv2a_pb_backend s_vk_backend = {
@@ -3606,6 +3615,7 @@ static const struct nv2a_pb_backend s_vk_backend = {
     vk_on_poll,
     1,                  /* writes_back: dumps read guest memory, after sync_guest */
     vk_sync_guest,
+    vk_on_flip_ready,
 };
 
 const struct nv2a_pb_backend *nv2a_pb_vulkan_backend(void)

@@ -54,6 +54,11 @@
 
 #include "d3d/nv2a_vk_core.h"
 #include "recomp_env.h"
+#include "latency_trace.h"
+
+uint64_t xbox_HostNowNs(void);
+void xbox_PacingPresent(uint64_t when_ns);
+void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
 #include "kernel/nv2a_backend_common.h"
 #include "fb_present_vulkan.h"
 
@@ -106,6 +111,8 @@ static uint64_t        s_sc_first_id;       /* the first id of this swapchain */
 static int             s_waiter_run;
 static pthread_t       s_waiter;
 static FILE           *s_csv;
+#define ID_RING 64
+static uint32_t        s_id_flip[ID_RING];   /* present id -> the flip it showed */
 static uint64_t        s_vbl_ns, s_vbl_period_ns;
 static PFN_vkWaitForPresentKHR s_wait_present;   /* a device function */
 
@@ -210,6 +217,16 @@ static void *waiter_main(void *arg)
                 __atomic_store_n(&s_vbl_period_ns, p, __ATOMIC_RELAXED);
             }
             __atomic_store_n(&s_vbl_ns, t, __ATOMIC_RELEASE);
+            /* The real display refresh, for RECOMP_VBLANK_SYNC=display (the
+             * emulated vblank's edges snap to it) and the pacing trace. A
+             * frame shown is a refresh; FIFO shows every frame. */
+            xbox_VblankDisplayRefresh(t, __atomic_load_n(&s_vbl_period_ns, __ATOMIC_RELAXED));
+            xbox_PacingPresent(t);
+            if (xbox_LatOn()) {
+                char b[32];
+                snprintf(b, sizeof b, "%llu", (unsigned long long)t);
+                xbox_LatRow('D', s_id_flip[next % ID_RING], t, b);
+            }
             if (s_csv)
                 fprintf(s_csv, "%llu,display,%llu,\n", (unsigned long long)next,
                         (unsigned long long)t);
@@ -619,7 +636,15 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             return 0;
     }
     vkWaitForFences(C->dev, 1, &s_fence[s_fi], VK_TRUE, UINT64_MAX);
-    r = vkAcquireNextImageKHR(C->dev, s_sc, 1000000000ull, s_acq[s_fi], VK_NULL_HANDLE, &idx);
+    {
+        uint64_t t_acq0 = xbox_LatOn() ? xbox_HostNowNs() : 0;
+        r = vkAcquireNextImageKHR(C->dev, s_sc, 1000000000ull, s_acq[s_fi], VK_NULL_HANDLE, &idx);
+        if (t_acq0 && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) {
+            char b[32];
+            snprintf(b, sizeof b, "%llu", (unsigned long long)xbox_HostNowNs());
+            xbox_LatRow('W', flip, t_acq0, b);
+        }
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         s_recreate = 1;
         return 0;
@@ -767,8 +792,13 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         pthread_mutex_lock(&s_tm_mu);
         iv_add(&s_host_iv, t);
         pthread_mutex_unlock(&s_tm_mu);
+        if (xbox_LatOn())
+            xbox_LatRow('P', flip, 0, NULL);
+        if (!C->present_wait)
+            xbox_PacingPresent(t);
         pthread_mutex_lock(&s_id_mu);
         s_present_id++;
+        s_id_flip[s_present_id % ID_RING] = flip;
         if (s_csv)
             fprintf(s_csv, "%llu,present,%llu,%u\n", (unsigned long long)s_present_id,
                     (unsigned long long)t, flip);
