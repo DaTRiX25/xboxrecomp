@@ -59,6 +59,32 @@ void xbox_InputSetDeadzone(int dz)
     g_deadzone = dz < 0 ? -1 : dz > 32767 ? 32767 : dz;
 }
 
+static int g_trigger_dz = -1;        /* -1: not read yet */
+
+int xbox_InputTriggerDeadzone(void)
+{
+    if (g_trigger_dz < 0) {
+        const char *v = recomp_env(RENV_PAD_TRIGGER_DEADZONE);
+        long n = (v && *v) ? strtol(v, NULL, 10) : 0;
+        g_trigger_dz = n < 0 ? 0 : n > 254 ? 254 : (int)n;
+    }
+    return g_trigger_dz;
+}
+
+void xbox_InputSetTriggerDeadzone(int dz)
+{
+    g_trigger_dz = dz < 0 ? -1 : dz > 254 ? 254 : dz;
+}
+
+static BYTE trigger_dz(BYTE v, int dz)
+{
+    if (dz <= 0)
+        return v;
+    if (v <= dz)
+        return 0;
+    return (BYTE)(((int)v - dz) * 255 / (255 - dz));
+}
+
 static SHORT clamp16(double v)
 {
     v = v < 0 ? ceil(v - 0.5) : floor(v + 0.5);
@@ -102,6 +128,9 @@ static void finish(XBOX_GAMEPAD *g)
     int dz = xbox_InputDeadzone();
     xbox_InputApplyDeadzone(&g->sThumbLX, &g->sThumbLY, dz);
     xbox_InputApplyDeadzone(&g->sThumbRX, &g->sThumbRY, dz);
+    dz = xbox_InputTriggerDeadzone();
+    g->bAnalogButtons[XBOX_BUTTON_LTRIGGER] = trigger_dz(g->bAnalogButtons[XBOX_BUTTON_LTRIGGER], dz);
+    g->bAnalogButtons[XBOX_BUTTON_RTRIGGER] = trigger_dz(g->bAnalogButtons[XBOX_BUTTON_RTRIGGER], dz);
 }
 
 void xbox_InputMapXInput(const XBOX_HOST_XINPUT_GAMEPAD *in, XBOX_GAMEPAD *out)

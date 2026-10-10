@@ -155,9 +155,47 @@ int xa2_is_active(void)
 /* Hand one EP period to the queue. SDL copies the samples, so the caller's
  * buffer is free on return. Nothing is ever refused by depth: the queue is
  * unbounded and pacing by queue depth holds it at the marks. */
+static volatile float g_gain = 1.0f;
+static float g_gain_applied = 1.0f;     /* the submit side's, last period */
+
+void xa2_set_gain(float gain)
+{
+    g_gain = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain;
+}
+
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
+    int16_t scaled[1024 * SDLA_CHANNELS];
+    float target = g_gain;
+
     if (!g_initialized || !g_dev || num_samples <= 0) return 0;
+    if (target != 1.0f || g_gain_applied != 1.0f) {
+        /* Scaled in chunks, the gain stepping linearly from the last
+         * period's to the new one across this call. */
+        int done = 0;
+        float from = g_gain_applied;
+        while (done < num_samples) {
+            int n = num_samples - done < 1024 ? num_samples - done : 1024, i;
+            for (i = 0; i < n; i++) {
+                float g = from + (target - from) * (float)(done + i + 1) / (float)num_samples;
+                int c;
+                for (c = 0; c < SDLA_CHANNELS; c++) {
+                    int16_t v = samples[(size_t)(done + i) * SDLA_CHANNELS + c];
+                    scaled[i * SDLA_CHANNELS + c] = (int16_t)((float)v * g);
+                }
+            }
+            if (SDL_QueueAudio(g_dev, scaled,
+                               (Uint32)n * SDLA_CHANNELS * sizeof(int16_t)) != 0) {
+                fprintf(stderr, "[SDL2] SDL_QueueAudio failed: %s\n", SDL_GetError());
+                return 0;
+            }
+            done += n;
+        }
+        g_gain_applied = target;
+        g_frames_written++;
+        g_samples_queued += (uint64_t)num_samples;
+        return 1;
+    }
     if (SDL_QueueAudio(g_dev, samples,
                        (Uint32)num_samples * SDLA_CHANNELS * sizeof(int16_t)) != 0) {
         fprintf(stderr, "[SDL2] SDL_QueueAudio failed: %s\n", SDL_GetError());

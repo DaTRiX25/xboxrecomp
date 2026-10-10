@@ -24,6 +24,45 @@ static uint64_t g_last_probe[XBOX_MAX_CONTROLLERS];
 static int      g_probed[XBOX_MAX_CONTROLLERS];   /* ever probed */
 static int      g_rumbling[XBOX_MAX_CONTROLLERS];
 
+/* The in-game overlay: while open the title reads neutral state; after it
+ * closes, a port reads neutral until it was seen with nothing held. */
+static volatile int g_blocked;
+static volatile unsigned g_latched;   /* bit per port */
+
+static int any_held(const XBOX_GAMEPAD *g)
+{
+    int i;
+    if (g->wButtons)
+        return 1;
+    for (i = 0; i < 8; i++)
+        if (g->bAnalogButtons[i] > XBOX_ANALOG_BUTTON_THRESHOLD)
+            return 1;
+    return 0;
+}
+
+static void neutral(XBOX_GAMEPAD *g)
+{
+    memset(g, 0, sizeof *g);
+}
+
+int xbox_InputBlocked(void) { return g_blocked; }
+
+void xbox_InputSetBlocked(int on)
+{
+    static const XBOX_VIBRATION off = { 0, 0 };
+
+    on = on != 0;
+    if (g_blocked == on)
+        return;
+    if (!on)
+        g_latched = (1u << XBOX_MAX_CONTROLLERS) - 1u;
+    g_blocked = on;
+    if (on && g_inited)
+        for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+            if (g_connected[p])
+                g_be->set_state(p, &off);
+}
+
 static void shutdown_atexit(void) { xbox_InputShutdown(); }
 
 static DWORD probe(DWORD port, XBOX_INPUT_STATE *st)
@@ -103,6 +142,12 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
          * number reads as the same state and a key press never happens. */
         pState->dwPacketNumber = kb.dwPacketNumber;
     }
+    if (rc == ERROR_SUCCESS && (g_blocked || (g_latched & (1u << dwPort)))) {
+        if (!g_blocked && !any_held(&pState->Gamepad))
+            g_latched &= ~(1u << dwPort);
+        else
+            neutral(&pState->Gamepad);
+    }
     return rc;
 }
 
@@ -115,6 +160,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     xbox_InputInit();
     if (!g_connected[dwPort])
         return ERROR_DEVICE_NOT_CONNECTED;
+    if (g_blocked)
+        return ERROR_SUCCESS;       /* the overlay silenced the motors */
     rc = g_be->set_state(dwPort, pVibration);
     if (rc == ERROR_SUCCESS)
         g_rumbling[dwPort] = pVibration->wLeftMotorSpeed

@@ -33,6 +33,16 @@ typedef struct xbox_input_backend {
     uint64_t (*now_ms)(void);
 } xbox_input_backend;
 
+/* Rumble strength, live (xinput_device.c, SDL backend): see there. */
+void xbox_InputSetRumbleGain(double gain);
+
+/* The in-game overlay is open (input_core.c): the title reads neutral pads
+ * and keys, and its rumble is silenced, until it closes. After it closes a
+ * port stays neutral until its buttons have been let go once, so the press
+ * that closed the overlay is not also the title's. Any thread. */
+void xbox_InputSetBlocked(int on);
+int  xbox_InputBlocked(void);
+
 /* The host backend this build uses (xinput_device.c). */
 extern const xbox_input_backend xbox_input_host_backend;
 

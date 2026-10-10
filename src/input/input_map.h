@@ -129,6 +129,13 @@ void xbox_InputApplyDeadzone(SHORT *x, SHORT *y, int dz);
 int  xbox_InputDeadzone(void);
 void xbox_InputSetDeadzone(int dz);
 
+/* The trigger deadzone: RECOMP_PAD_TRIGGER_DEADZONE (0..255, default 0),
+ * read once. A trigger at or under it reads 0; above it the range is
+ * rescaled so the edge of the zone reads 0 and full pull still reads 255.
+ * xbox_InputSetTriggerDeadzone overrides it (live; -1 = back to env). */
+int  xbox_InputTriggerDeadzone(void);
+void xbox_InputSetTriggerDeadzone(int dz);
+
 /* Line i of the README's mapping table, as Markdown (no newline): 0 is the
  * header, 1 the separator, 2.. the rows of xbox_input_map[] in order.
  * Returns the length written, or 0 past the end of the table. */

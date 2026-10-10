@@ -291,12 +291,13 @@ static int f_plugged[4], f_get_calls[4], f_set_calls[4], f_init_calls, f_kb_on;
 static XBOX_VIBRATION f_last_vib[4];
 
 static void f_init(void) { f_init_calls++; }
+static int f_hold_start = 1;
 static DWORD f_get(DWORD p, XBOX_INPUT_STATE *s)
 {
     f_get_calls[p]++;
     if (!f_plugged[p]) return ERROR_DEVICE_NOT_CONNECTED;
     memset(s, 0, sizeof *s);
-    s->Gamepad.wButtons = XBOX_GAMEPAD_START;
+    s->Gamepad.wButtons = f_hold_start ? XBOX_GAMEPAD_START : 0;
     return ERROR_SUCCESS;
 }
 static DWORD f_set(DWORD p, const XBOX_VIBRATION *v)
@@ -391,6 +392,74 @@ static void test_cache(void)
     xbox_InputSetBackend(NULL);
 }
 
+/* The overlay's block: neutral while open, and after it until the buttons
+ * are let go; the motors silenced. */
+static void test_block(void)
+{
+    XBOX_INPUT_STATE st;
+    XBOX_VIBRATION vib = { 100, 200 };
+
+    f_now = 90000;
+    f_plugged[0] = 1;
+    f_kb_on = 0;
+    f_hold_start = 1;
+    xbox_InputSetBackend(&k_fake);
+    xbox_InputInit();
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && st.Gamepad.wButtons == XBOX_GAMEPAD_START,
+          "block: no pass-through before");
+    xbox_InputSetState(0, &vib);
+    {
+        int sets = f_set_calls[0];
+        xbox_InputSetBlocked(1);
+        CHECK(xbox_InputBlocked(), "block: not blocked");
+        CHECK(f_set_calls[0] == sets + 1 && !f_last_vib[0].wLeftMotorSpeed,
+              "block: motors not stopped");
+        sets = f_set_calls[0];
+        CHECK(xbox_InputSetState(0, &vib) == ERROR_SUCCESS && f_set_calls[0] == sets,
+              "block: rumble reached the pad");
+    }
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && !st.Gamepad.wButtons
+          && !st.Gamepad.bAnalogButtons[XBOX_BUTTON_A], "block: state not neutral");
+    f_kb_on = 1;
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && !st.Gamepad.bAnalogButtons[XBOX_BUTTON_A],
+          "block: keyboard got through");
+    f_kb_on = 0;
+    /* Closed with START still down: neutral until it is let go. */
+    xbox_InputSetBlocked(0);
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && !st.Gamepad.wButtons,
+          "block: the closing press reached the title");
+    f_hold_start = 0;
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && !st.Gamepad.wButtons, "block: released");
+    f_hold_start = 1;
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && st.Gamepad.wButtons == XBOX_GAMEPAD_START,
+          "block: still neutral after the release");
+    CHECK(xbox_InputSetState(0, &vib) == ERROR_SUCCESS && f_last_vib[0].wLeftMotorSpeed == 100,
+          "block: rumble stayed off after closing");
+    xbox_InputSetBackend(NULL);
+}
+
+static void test_trigger_deadzone(void)
+{
+    XBOX_HOST_XINPUT_GAMEPAD in;
+    XBOX_GAMEPAD out;
+
+    memset(&in, 0, sizeof in);
+    in.bLeftTrigger = 20;
+    in.bRightTrigger = 255;
+    xbox_InputSetTriggerDeadzone(0);
+    xbox_InputMapXInput(&in, &out);
+    CHECK(out.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 20, "trigger dz 0 is not the identity");
+    xbox_InputSetTriggerDeadzone(30);
+    xbox_InputMapXInput(&in, &out);
+    CHECK(out.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 0, "trigger under the deadzone reads");
+    CHECK(out.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255, "full pull not full");
+    in.bLeftTrigger = 142;                              /* (142 - 30) * 255 / 225 */
+    xbox_InputMapXInput(&in, &out);
+    CHECK(out.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 126, "trigger rescale %d",
+          out.bAnalogButtons[XBOX_BUTTON_LTRIGGER]);
+    xbox_InputSetTriggerDeadzone(0);
+}
+
 int main(int argc, char **argv)
 {
     xbox_InputSetDeadzone(0);
@@ -398,6 +467,8 @@ int main(int argc, char **argv)
     test_deadzone();
     test_readme(argc > 1 ? argv[1] : "input_README.md");
     test_cache();
+    test_block();
+    test_trigger_deadzone();
     printf("input_map: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

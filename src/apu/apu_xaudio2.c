@@ -212,6 +212,13 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     return ok;
 }
 
+void xa2_set_gain(float gain)
+{
+    if (!g_xa2_initialized || !g_xa2_source) return;
+    IXAudio2SourceVoice_SetVolume(g_xa2_source,
+                                  gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain, 0);
+}
+
 int xa2_get_buffer_size(void)
 {
     return XA2_BUF_SAMPLES;

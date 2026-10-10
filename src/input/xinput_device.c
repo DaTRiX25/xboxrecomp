@@ -151,23 +151,33 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
  * curve keeps zero at zero and full at full but lifts the middle, the way
  * the console motors' start-up threshold made small speeds felt.
  * RECOMP_INPUT_RUMBLE_GAIN scales it; "linear" passes the values through. */
+static int g_rumble_init, g_rumble_linear;
+static double g_rumble_gain = 1.0;
+
+/* The strength, live (the overlay's Input page): gain 0 silences the
+ * motors, a negative value passes the title's values through ("linear"). */
+void xbox_InputSetRumbleGain(double gain)
+{
+    g_rumble_init = 1;
+    g_rumble_linear = gain < 0.0;
+    g_rumble_gain = gain < 0.0 ? 1.0 : gain;
+}
+
 static Uint16 rumble_level(WORD speed)
 {
-    static int init, linear;
-    static double gain = 1.0;
     double f;
 
-    if (!init) {
+    if (!g_rumble_init) {
         const char *g = recomp_env(RENV_INPUT_RUMBLE_GAIN);
         if (g && !strcmp(g, "linear"))
-            linear = 1;
-        else if (g && atof(g) > 0.0)
-            gain = atof(g);
-        init = 1;
+            g_rumble_linear = 1;
+        else if (g && *g && atof(g) >= 0.0)
+            g_rumble_gain = atof(g);
+        g_rumble_init = 1;
     }
-    if (!speed || linear)
+    if (!speed || g_rumble_linear)
         return speed;
-    f = gain * sqrt(speed / 65535.0);
+    f = g_rumble_gain * sqrt(speed / 65535.0);
     return f >= 1.0 ? 65535 : (Uint16)(f * 65535.0);
 }
 

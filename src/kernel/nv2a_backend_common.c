@@ -636,17 +636,34 @@ uint32_t nv2a_present_width(uint32_t src_w, uint32_t src_h)
 
 /* RECOMP_PRESENT_OVERSCAN=crop / RECOMP_PRESENT_FIT=fill16x10 (see
  * nv2a_backend_common.h, nv2a_present_layout). */
+static volatile int s_crop = -1, s_fill = -1;   /* -1: not read yet */
+
+/* The same two, live (the overlay's Display page); the next present uses
+ * them. */
+void nv2a_present_set_overscan(int crop)
+{
+    s_crop = crop != 0;
+}
+
+void nv2a_present_set_fit(int fill)
+{
+    s_fill = fill != 0;
+}
+
 int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
                         struct nv2a_rect *src, struct nv2a_rect *dst)
 {
-    static int crop = -1, fill = -1;
-    int whole;
-    if (crop < 0) {
+    int whole, crop, fill;
+    if (s_crop < 0) {
         const char *e = recomp_env(RENV_PRESENT_OVERSCAN);
-        crop = e && !strcmp(e, "crop");
-        e = recomp_env(RENV_PRESENT_FIT);
-        fill = e && !strcmp(e, "fill16x10");
+        s_crop = e && !strcmp(e, "crop");
     }
+    if (s_fill < 0) {
+        const char *e = recomp_env(RENV_PRESENT_FIT);
+        s_fill = e && !strcmp(e, "fill16x10");
+    }
+    crop = s_crop;
+    fill = s_fill;
     src->x = src->y = 0;
     src->w = (int32_t)fw;
     src->h = (int32_t)fh;

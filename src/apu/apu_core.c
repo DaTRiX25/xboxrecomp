@@ -27,6 +27,7 @@
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 #include "../kernel/kernel_prof.h"          /* RECOMP_TRACE=dpc: ISR, se_frame */
+#include "../kernel/kernel_pause.h"         /* xbox_HostPauseListener */
 
 /* ============================================================
  * Globals
@@ -928,7 +929,7 @@ static void throttle(MCPXAPUState *d)
 {
     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
-    while (!d->pause_requested) {
+    while (!d->pause_requested && !d->host_paused) {
         int64_t wait_us = mcpx_apu_pace_step(
             d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
         if (wait_us <= 0)
@@ -1012,7 +1013,8 @@ static void *mcpx_apu_frame_thread(void *arg)
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
-        if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
+        if (d->host_paused
+            || (d->pause_requested && !g_test_tone.active && !g_mixer_active_count)) {
             d->is_idle = true;
             if (xa2_is_active())
                 xa2_expect_drain();     /* a pause, not an underrun */
@@ -1113,6 +1115,22 @@ static void *mcpx_apu_frame_thread(void *arg)
     return NULL;
 }
 
+/* The in-game overlay's pause (kernel_pause.h): the frame thread idles as
+ * for pause_requested, but the title's own register writes (which clear
+ * pause_requested to start the APU) do not wake it, and the software mixer's
+ * keep-alive does not override it. Resume signals it awake. */
+static void apu_host_pause(int paused)
+{
+    MCPXAPUState *d = g_state;
+
+    if (!d)
+        return;
+    qemu_mutex_lock(&d->lock);
+    d->host_paused = paused != 0;
+    qemu_cond_broadcast(&d->cond);
+    qemu_mutex_unlock(&d->lock);
+}
+
 /* ============================================================
  * Wait for idle / resume helpers
  * ============================================================ */
@@ -1183,6 +1201,8 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     d->exiting = false;
     d->is_idle = false;
     d->pause_requested = true;
+    d->host_paused = false;
+    xbox_HostPauseListener(apu_host_pause);
 
     qemu_mutex_init(&d->lock);
     qemu_mutex_lock(&d->lock);

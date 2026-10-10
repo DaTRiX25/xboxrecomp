@@ -103,6 +103,14 @@ extern "C" {
     X(INPUT_RUMBLE,      CONFIG, "RECOMP_INPUT_RUMBLE",      NULL, "forward the title's rumble (USB output report) to the host pad; default 1, 0: off") \
     X(INPUT_RUMBLE_GAIN, CONFIG, "RECOMP_INPUT_RUMBLE_GAIN", NULL, "rumble strength on the host pad: motor = 65535 * min(1, gain * sqrt(speed/65535)); default 1.0, \"linear\": the title's values as they are") \
     X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0)") \
+    X(PAD_TRIGGER_DEADZONE, CONFIG, "RECOMP_PAD_TRIGGER_DEADZONE", NULL, "trigger deadzone, 0..255 (default 0)") \
+    X(AUDIO_VOLUME,      CONFIG, "RECOMP_AUDIO_VOLUME",      NULL, "master volume of the title's audio, 0..1 (default 1)") \
+    X(AUDIO_MUTE,        CONFIG, "RECOMP_AUDIO_MUTE",        NULL, "1: no sound") \
+    X(AUDIO_MUTE_BG,     CONFIG, "RECOMP_AUDIO_MUTE_BG",     NULL, "1: no sound while the window is in the background") \
+    X(AUDIO_SPEAKERS,    CONFIG, "RECOMP_AUDIO_SPEAKERS",    NULL, "speaker mode: auto (default), stereo, 5.1 (5.1 is not implemented yet: BO-76)") \
+    X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
+    X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \
+    X(SETTINGS_FILE,     CONFIG, "RECOMP_SETTINGS",          NULL, "the overlay's settings file: a path, or none (default: <save dir>/settings.toml)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
     X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \

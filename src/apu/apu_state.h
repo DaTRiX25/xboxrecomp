@@ -475,6 +475,7 @@ struct MCPXAPUState {
     QemuCond cond;
     QemuCond idle_cond;
     bool pause_requested;
+    bool host_paused;           /* the in-game overlay (kernel_pause.h) */
     bool is_idle;
 
     MemoryRegion *ram;

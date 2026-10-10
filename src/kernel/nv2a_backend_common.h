@@ -1010,6 +1010,10 @@ unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim
 struct nv2a_rect { int32_t x, y, w, h; };
 int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
                       int filter, struct nv2a_rect *r);
+/* RECOMP_PRESENT_OVERSCAN=crop and RECOMP_PRESENT_FIT=fill16x10, changed
+ * while running; any thread, taken at the next present. */
+void nv2a_present_set_overscan(int crop);
+void nv2a_present_set_fit(int fill);
 /* The part of an fw x fh frame a window shows and where it goes:
  * nv2a_present_rect, after RECOMP_PRESENT_OVERSCAN=crop (16 rows of 480 off
  * the top and bottom, as a TV's overscan hid them, and the same share of

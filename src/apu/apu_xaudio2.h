@@ -26,6 +26,11 @@ int xa2_is_active(void);
 /* Submit interleaved stereo 16-bit samples. Returns 1 if accepted. */
 int xa2_submit_samples(const int16_t *samples, int num_samples);
 
+/* Output gain, 0..1 (master volume, mute): applied to what is submitted from
+ * now on, ramped across the next period so a change does not click. Any
+ * thread; 1 is the default. */
+void xa2_set_gain(float gain);
+
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);
 

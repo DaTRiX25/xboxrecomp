@@ -33,6 +33,7 @@
 #include <time.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "kernel_pacing.h"
+#include "kernel_pause.h"
 #include "host_time.h"            /* xbox_HostSleepNs, for flip pacing */
 #include "latency_trace.h"        /* RECOMP_TRACE=latency */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
@@ -6492,6 +6493,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 fflush(stderr);
             }
         }
+        /* The in-game overlay's pause (kernel_pause.h): the GPU stalls here,
+         * after the frame is presented, and the title's fence and pushbuffer
+         * waits hold it a frame or two behind. */
+        xbox_HostPauseHold();
         return;
     }
 
