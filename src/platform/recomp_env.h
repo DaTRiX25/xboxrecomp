@@ -110,7 +110,7 @@ extern "C" {
     X(AUDIO_MUTE,        CONFIG, "RECOMP_AUDIO_MUTE",        NULL, "1: no sound") \
     X(AUDIO_MUTE_BG,     CONFIG, "RECOMP_AUDIO_MUTE_BG",     NULL, "1: no sound while the window is in the background") \
     X(AUDIO_SPEAKERS,    CONFIG, "RECOMP_AUDIO_SPEAKERS",    NULL, "speaker mode: auto (default: 5.1 when the default output has 6+ channels), stereo, 5.1") \
-    X(ANDROID_VIBRATION, CONFIG, "RECOMP_ANDROID_VIBRATION", NULL, "Android: where the first pad's rumble goes: auto (the pad when it has motors, else the device's vibrator; default), controller, device, off") \
+    X(ANDROID_VIBRATION, CONFIG, "RECOMP_ANDROID_VIBRATION", NULL, "Android: where the first pad's rumble goes: auto (the pad when SDL can rumble it, else the device's vibrator when the pad is the device's built-in one; default), controller, device (the vibrator whatever the pad), off. SDL2 cannot rumble a pad on Android: an external pad does not rumble") \
     X(SPEED_UNITS,       CONFIG, "RECOMP_SPEED_UNITS",       NULL, "speed and distance units, for a title whose build has the metric display behind a patch (--patches, recomp_patch.h): mph (default, as shipped) or kmh") \
     X(GFX_HUD_FIX,       CONFIG, "RECOMP_GFX_HUD_FIX",       NULL, "1: the title's 2D HUD keeps its shape in a 16:9 picture, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
     X(DISPLAY_ULTRAWIDE, CONFIG, "RECOMP_DISPLAY_ULTRAWIDE", NULL, "a picture wider than 16:9 for the title's 3D, for a title whose build has that behind a patch (--patches, recomp_patch.h): off (default, as shipped), 21:9, 32:9, window (the window's own shape)") \
