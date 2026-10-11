@@ -211,6 +211,40 @@ static void power_env(double mode, const char **pacing, const char **lead)
     *lead = m == 1 ? "8" : "0";
 }
 
+/* Where Maximum ("stock") is not offered (BO-75, a stand-in decision to be
+ * confirmed: the Deck and Windows numbers show Balanced as steady and cooler;
+ * macOS is unmeasured and keeps all three). Revert: set an entry to 0. */
+static const unsigned char k_stock_hidden[] = {
+    [XS_HOST_MACOS]   = 0,
+    [XS_HOST_WINDOWS] = 1,
+    [XS_HOST_ANDROID] = 1,
+    [XS_HOST_LINUX]   = 1,
+};
+
+static xs_host s_host =
+#if defined(__ANDROID__)
+    XS_HOST_ANDROID;
+#elif defined(_WIN32)
+    XS_HOST_WINDOWS;
+#elif defined(__linux__)
+    XS_HOST_LINUX;
+#else
+    XS_HOST_MACOS;
+#endif
+
+xs_host xbox_SettingsHost(void) { return s_host; }
+void xbox_SettingsSetHost(xs_host h) { s_host = h; }
+
+int xbox_PowerStockHidden(xs_host h)
+{
+    return (unsigned)h < sizeof k_stock_hidden && k_stock_hidden[h];
+}
+
+double xbox_PowerModeAtLoad(xs_host h, double stored)
+{
+    return (int)stored == 0 && xbox_PowerStockHidden(h) ? 1 : stored;
+}
+
 /* The mode the two knobs make. */
 static double power_from(const char *pacing, const char *lead)
 {
@@ -568,7 +602,7 @@ void xbox_SettingsInit(const char *title)
             continue;
         if (i == XS_POWER_MODE) {
             const char *p, *l;
-            power_env(s->value, &p, &l);
+            power_env(xbox_PowerModeAtLoad(s_host, s->value), &p, &l);
             if (!s_power_locked_pacing) sx_setenv_keep("RECOMP_PRESENT_PACING", p);
             if (!s_power_locked_lead) sx_setenv_keep("RECOMP_PRESENT_SPIN_LEAD", l);
             continue;

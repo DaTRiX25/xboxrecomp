@@ -161,6 +161,26 @@ int main(void)
      * host's default is performance (sleep, 8 ms). */
     CHECK(xbox_SettingValue(XS_POWER_MODE) == 2 && xbox_SettingGet(XS_POWER_MODE)->def == 1);
     CHECK(!xbox_SettingsNeedRestart());
+    /* Maximum ("stock") is hidden on Windows, Android and Linux (BO-75): a
+     * stored stock reads as performance there, battery and performance are
+     * kept; macOS keeps all three. The host this was built for is one of
+     * them, and the table is the whole decision. */
+    {
+        static const xs_host hosts[] = { XS_HOST_WINDOWS, XS_HOST_ANDROID, XS_HOST_LINUX };
+        for (unsigned k = 0; k < 3; k++) {
+            CHECK(xbox_PowerStockHidden(hosts[k]));
+            CHECK(xbox_PowerModeAtLoad(hosts[k], 0) == 1);
+            CHECK(xbox_PowerModeAtLoad(hosts[k], 1) == 1);
+            CHECK(xbox_PowerModeAtLoad(hosts[k], 2) == 2);
+        }
+        CHECK(!xbox_PowerStockHidden(XS_HOST_MACOS));
+        CHECK(xbox_PowerModeAtLoad(XS_HOST_MACOS, 0) == 0);
+        CHECK(xbox_PowerModeAtLoad(XS_HOST_MACOS, 1) == 1);
+        CHECK(xbox_PowerModeAtLoad(XS_HOST_MACOS, 2) == 2);
+#if defined(__APPLE__)
+        CHECK(xbox_SettingsHost() == XS_HOST_MACOS);
+#endif
+    }
     /* The title's own effects (guest patches on the "0"): on unless the
      * file or the overlay says otherwise, and a stored "off" is kept. */
     CHECK(xbox_SettingValue(XS_GRAPHICS_BLOOM) == 0 && xbox_SettingGet(XS_GRAPHICS_BLOOM)->user);

@@ -317,7 +317,9 @@ static int page_rows(int page, Row *r)
              * Deck's pacing (Windows), the busy-wait where it sets none
              * (macOS). */
             const xs_setting *pm = xbox_SettingGet(XS_POWER_MODE);
-            if (pm && (int)pm->def == 1) {
+            if (xbox_PowerStockHidden(xbox_SettingsHost())) {
+                INFO("Tuned on the Steam Deck (Linux). Balanced is the default here too.");
+            } else if (pm && (int)pm->def == 1) {
                 INFO("Tuned on the Steam Deck (Linux). Here the default is Balanced");
                 INFO("too; Maximum is the game's own busy-wait.");
             } else if (pm && (int)pm->def == 2) {
@@ -494,7 +496,10 @@ static void adjust(xs_id id, int dir)
             n++;
         for (int k = 0; k < n; k++) {
             i = (i + dir + n) % n;
-            if (!(m.disabled & (1u << i)))
+            unsigned off = m.disabled;
+            if (id == XS_POWER_MODE && xbox_PowerStockHidden(xbox_SettingsHost()))
+                off |= 1u;      /* Maximum: not offered here (BO-75) */
+            if (!(off & (1u << i)))
                 break;
         }
         v = i;
@@ -1388,7 +1393,13 @@ static void build_pages(float fs)
             else
                 snprintf(hint, sizeof hint, "Set by the environment (%s); unset it to change it here.", recomp_env_name(s->env));
         } else {
-            snprintf(hint, sizeof hint, "%s", k_meta[rows[sel].id].hint);
+            if (rows[sel].id == XS_POWER_MODE && xbox_PowerStockHidden(xbox_SettingsHost()))
+                snprintf(hint, sizeof hint, "Balanced sleeps and spins only the last 8 ms before each frame (steady"
+                         " 60, recommended). Battery saver only sleeps (coolest, an occasional small dip)."
+                         " The busy-wait mode is not offered here: it measured no steadier and costs more"
+                         " power (diagnosis: RECOMP_PRESENT_PACING=spin).");
+            else
+                snprintf(hint, sizeof hint, "%s", k_meta[rows[sel].id].hint);
         }
     } else if (rows[sel].kind == R_SPEAKERS) {
         spk_hint(rows[sel].action, hint, sizeof hint);
