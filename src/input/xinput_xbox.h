@@ -118,6 +118,13 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
  */
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
 
+/* Bit n: pad n is driven by a pad script (RECOMP_PAD_SCRIPT /
+ * RECOMP_PAD_LIVE, src/usb/usb_gamepad.c) and no controller has taken it
+ * back. The overlay shows a note while any is set, so a run a test script is
+ * driving is not mistaken for one's own (BO-96). */
+void xbox_InputSetScriptedPads(unsigned mask);
+unsigned xbox_InputScriptedPads(void);
+
 #ifdef __cplusplus
 }
 #endif

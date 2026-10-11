@@ -22,6 +22,7 @@
 #include "xbox_shader_build.h"
 #include "nv2a_pcache.h"
 #include "recomp_patch.h"
+#include "recomp_env.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -906,6 +907,24 @@ static bool notice_on()
     return st.waiting != 0;
 }
 
+/* A pad script is driving a pad (RECOMP_PAD_LIVE / RECOMP_PAD_SCRIPT: a test
+ * run) and no controller has taken it back: said on the screen, so a run a
+ * script started is not picked up as one's own with the script's buttons
+ * still held (BO-96). */
+static bool scripted_on()
+{
+    /* RECOMP_DEBUG=pad_script_note=0: not shown (a scripted run whose
+     * window shots are compared). Drawn with the title's frames only: it
+     * does not make the window redraw by itself, so a measured run's
+     * pacing is what it was. */
+    static int show = -1;
+    if (show < 0) {
+        const char *v = recomp_env(RENV_PAD_SCRIPT_NOTE);
+        show = !(v && *v == '0');
+    }
+    return show && xbox_InputScriptedPads() != 0;
+}
+
 int xbox_OverlayNotice(void)
 {
     return s_enabled && notice_on();
@@ -914,7 +933,7 @@ int xbox_OverlayNotice(void)
 int xbox_OverlayWants(void)
 {
     return s_enabled && (s_open || s_alpha > 0.0f || xbox_SettingValue(XS_ADVANCED_PERF) != 0.0
-                         || notice_on());
+                         || notice_on() || scripted_on());
 }
 
 void xbox_OverlayFramePresented(void)
@@ -1369,8 +1388,8 @@ bool overlay_begin_frame()
     s_alpha += (s_open ? 1.0f : -1.0f) * dt / 0.14f;
     s_alpha = s_alpha < 0 ? 0 : s_alpha > 1 ? 1 : s_alpha;
     bool perf = xbox_SettingValue(XS_ADVANCED_PERF) != 0.0;
-    bool note = notice_on();
-    if (!s_open && s_alpha <= 0.0f && !perf && !note)
+    bool note = notice_on(), scripted = scripted_on();
+    if (!s_open && s_alpha <= 0.0f && !perf && !note && !scripted)
         return false;
 
     ImGuiIO &io = ImGui::GetIO();
@@ -1398,6 +1417,17 @@ bool overlay_begin_frame()
         dl->AddRectFilled(ImVec2(p.x - fs, p.y - fs * 0.5f), ImVec2(p.x + tw + fs, p.y + fs * 1.5f),
                           IM_COL32(18, 18, 20, 235), fs * 0.5f);
         dl->AddText(p, IM_COL32(235, 235, 240, 255), text);
+    }
+    if (scripted) {
+        /* Top centre, out of the HUD's way. */
+        static const char text[] = "Test script is driving the controller - press a button to take over";
+        ImDrawList *dl = ImGui::GetForegroundDrawList();
+        const ImVec2 disp = ImGui::GetIO().DisplaySize;
+        const float tw = ImGui::CalcTextSize(text).x;
+        const ImVec2 p((disp.x - tw) * 0.5f, fs * 1.2f);
+        dl->AddRectFilled(ImVec2(p.x - fs, p.y - fs * 0.5f), ImVec2(p.x + tw + fs, p.y + fs * 1.5f),
+                          IM_COL32(120, 30, 20, 235), fs * 0.5f);
+        dl->AddText(p, IM_COL32(255, 240, 230, 255), text);
     }
     if (s_open || s_alpha > 0.0f) {
         /* A closing overlay still draws, fading. */
