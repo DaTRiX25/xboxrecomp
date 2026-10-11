@@ -82,6 +82,8 @@ uint64_t nv2a_fnv64(const void *p, size_t n, uint64_t h);
  * Windows %LOCALAPPDATA%\<app>). "none", "off", "0" or "" turn it off.
  * Returns 1 with the path in `out`, 0 when off or not creatable. */
 int nv2a_pcache_dir(const char *dir, const char *app, char *out, size_t n);
+/* The <app> the backends pass: the executable's name. */
+const char *nv2a_pcache_app(void);
 
 /* ---- what the running backend's cache is doing ------------------------------
  *
@@ -110,6 +112,13 @@ void nv2a_pcache_stat_built(int prewarm, int kind, uint64_t ns);
  * pre-build) has appended to it. 0 when no backend with a key list is up. */
 int  nv2a_pcache_rescan(void);
 void nv2a_pcache_set_rescan(void (*fn)(void));
+
+/* Appends a key to the running backend's list without building it (a
+ * rescan then does, on the pre-warm thread): type NV2A_PC_VS with a vertex
+ * program's slots, NV2A_PC_FS with an NV2ACombinerState. 0 when no backend
+ * with a key list is up. Any thread. */
+int  nv2a_pcache_seed(uint32_t type, const void *data, uint32_t len);
+void nv2a_pcache_set_seed(void (*fn)(uint32_t type, const void *data, uint32_t len));
 
 /* ---- vertex programs in an executable ---------------------------------------
  *

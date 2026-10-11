@@ -54,21 +54,10 @@ static size_t    s_cap, s_count;
 static int       s_loaded, s_glslang_up;
 static uint64_t  s_hits, s_compiles;
 
-static const char *exe_name(void)
-{
-#if defined(__APPLE__)
-    return getprogname();
-#elif defined(__linux__)
-    return program_invocation_short_name;
-#else
-    return "xboxrecomp";
-#endif
-}
-
 /* render.shader_cache, as the Metal pipeline cache reads it. */
 int nvk_cache_dir(char *out, size_t n)
 {
-    return nv2a_pcache_dir(nv2a_host_opts()->shader_cache, exe_name(), out, n);
+    return nv2a_pcache_dir(nv2a_host_opts()->shader_cache, nv2a_pcache_app(), out, n);
 }
 
 static SpvEntry *slot(uint64_t key)

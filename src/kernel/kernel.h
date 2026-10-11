@@ -1241,6 +1241,13 @@ unsigned long xbox_log_ms(void);
  * pad waiting for a movie, say) installs it before the game starts. */
 extern void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
 
+/* Called with every guest path before it is translated to a host one, when
+ * set: a non-NULL return is the guest path to use instead (NULL: as asked).
+ * For a host that runs the title unattended and wants one file read in
+ * place of another (a shader pre-build plays a short movie where the title
+ * asks for a long one it cannot skip). Installed before the game starts. */
+extern const char *(*xbox_PathRedirectHook)(const char *xbox_path);
+
 /* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off).
  * Interlaced output shows one field per vblank, so its low bit is the field
  * parity that the field pin (port 0x80C0) reports. */

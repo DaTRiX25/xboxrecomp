@@ -3563,6 +3563,7 @@ static void pc_start(void)
         nv2a_pcache_stat_open(s_pc_path, none);
     }
     nv2a_pcache_set_rescan(pc_warm_start);
+    nv2a_pcache_set_seed(pc_put);
     if (nv2a_pcache_count(s_pcf))
         pc_warm_start();
 }

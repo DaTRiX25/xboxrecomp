@@ -324,6 +324,9 @@ int xbox_path_tree(const char *xbox_path)
     return XBOX_TREE_UNKNOWN;
 }
 
+/* See kernel.h. */
+const char *(*xbox_PathRedirectHook)(const char *xbox_path);
+
 #if defined(_WIN32)
 /* ======================================================================== */
 
@@ -509,6 +512,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 
     if (!s_initialized)
         xbox_path_init(NULL, NULL);
+    if (xbox_PathRedirectHook) {
+        const char *to = xbox_PathRedirectHook(xbox_path);
+        if (to)
+            xbox_path = to;
+    }
 
     {
         char linked[512];
@@ -779,6 +787,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 
     if (!s_initialized)
         xbox_path_init(NULL, NULL);
+    if (xbox_PathRedirectHook) {
+        const char *to = xbox_PathRedirectHook(xbox_path);
+        if (to)
+            xbox_path = to;
+    }
 
     {
         char linked[512];

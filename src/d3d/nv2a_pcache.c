@@ -314,6 +314,21 @@ static int make_dirs(char *p)
         || errno == EEXIST;
 }
 
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+#endif
+
+const char *nv2a_pcache_app(void)
+{
+#if defined(__APPLE__)
+    return getprogname();
+#elif defined(__linux__)
+    return program_invocation_short_name;
+#else
+    return "xboxrecomp";
+#endif
+}
+
 int nv2a_pcache_dir(const char *dir, const char *app, char *out, size_t n)
 {
     const char *home = getenv("HOME");
@@ -388,6 +403,21 @@ void nv2a_pcache_stat_built(int prewarm, int kind, uint64_t ns)
         if (us > s_stat.ack_max_us)
             s_stat.ack_max_us = us > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)us;
     }
+}
+
+static void (*s_seed)(uint32_t, const void *, uint32_t);
+
+void nv2a_pcache_set_seed(void (*fn)(uint32_t type, const void *data, uint32_t len))
+{
+    s_seed = fn;
+}
+
+int nv2a_pcache_seed(uint32_t type, const void *data, uint32_t len)
+{
+    if (!s_seed || !s_stat.active)
+        return 0;
+    s_seed(type, data, len);
+    return 1;
 }
 
 void nv2a_pcache_set_rescan(void (*fn)(void))

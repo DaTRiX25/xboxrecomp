@@ -2335,7 +2335,7 @@ static int pc_start(void)
     }
 
     s_pc_warm_done = 1;
-    if (!nv2a_pcache_dir(nv2a_host_opts()->shader_cache, getprogname(), dir, sizeof dir)) {
+    if (!nv2a_pcache_dir(nv2a_host_opts()->shader_cache, nv2a_pcache_app(), dir, sizeof dir)) {
         fprintf(stderr, LOGP "pcache: no disk cache (render.shader_cache=%s); %d entries"
                 " per table\n", nv2a_host_opts()->shader_cache ? nv2a_host_opts()->shader_cache
                                                                : "(default, unavailable)",
@@ -2359,6 +2359,7 @@ static int pc_start(void)
         nv2a_pcache_stat_open(s_pc_path, none);
     }
     nv2a_pcache_set_rescan(pc_warm_start);
+    nv2a_pcache_set_seed(pc_put);
     if (nv2a_pcache_count(s_pcf))
         pc_warm_start();
     return 1;
