@@ -101,6 +101,19 @@ static int              s_recreate;
 #else
 #define FBV_SUBOPTIMAL_RECREATES 1
 #endif
+/* Android: the swapchain may be smaller than the window, and the system's
+ * compositor scales it to the panel (RECOMP_ANDROID_SWAPCHAIN_HEIGHT=<rows>,
+ * the width follows the window's shape): this presenter's own scaling pass
+ * then writes that many pixels, not the panel's. The idea is Xerenge's
+ * Android build's. The window size the swapchain was made for is kept apart,
+ * for the "has the window changed" test. */
+#if defined(__ANDROID__)
+static uint32_t s_and_w, s_and_h;
+#define FBV_SIZE_CHANGED(dw, dh) ((uint32_t)(dw) != s_and_w || (uint32_t)(dh) != s_and_h)
+#else
+#define FBV_SIZE_CHANGED(dw, dh) \
+    ((uint32_t)(dw) != s_sc_ext.width || (uint32_t)(dh) != s_sc_ext.height)
+#endif
 static int              s_vsync, s_shots;
 
 static VkCommandPool    s_pool;          /* main thread */
@@ -495,6 +508,19 @@ static int make_swapchain(SDL_Window *win)
         pthread_mutex_unlock(&s_sc_mu);
         return 0;     /* minimised */
     }
+#if defined(__ANDROID__)
+    s_and_w = (uint32_t)dw;
+    s_and_h = (uint32_t)dh;
+    {
+        const char *e = getenv("RECOMP_ANDROID_SWAPCHAIN_HEIGHT");
+        uint32_t rows = e ? (uint32_t)strtoul(e, NULL, 10) : 0;
+        if (rows >= 240 && rows < s_sc_ext.height) {
+            s_sc_ext.width = ((s_sc_ext.width * rows / s_sc_ext.height) + 1u) & ~1u;
+            s_sc_ext.height = rows;
+            if (s_sc_ext.width < caps.minImageExtent.width) s_sc_ext.width = caps.minImageExtent.width;
+        }
+    }
+#endif
     /* The fewest images: one shown, at most one queued (BO-74 latency). */
     n = caps.minImageCount;
     if (n < 2) n = 2;
@@ -1476,7 +1502,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
     if (dw <= 0 || dh <= 0)
         return 0;
-    if (!s_sc || s_recreate || (uint32_t)dw != s_sc_ext.width || (uint32_t)dh != s_sc_ext.height) {
+    if (!s_sc || s_recreate || FBV_SIZE_CHANGED(dw, dh)) {
         if (!make_swapchain(win))
             return 0;
     }
