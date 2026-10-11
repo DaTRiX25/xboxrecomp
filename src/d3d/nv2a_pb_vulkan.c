@@ -3226,9 +3226,10 @@ static int occ_ready_on(void)
 {
     if (occ_mode() == 2 || !init() || !s_vkq)
         return 0;
-    if (!s_occ.ops)
+    if (!s_occ.ops) {
         nv2a_occ_init(&s_occ, &s_occ_ops, (uint8_t *)xbox_GetMemoryOffset());
         nv2a_occ_set_scale_x2(&s_occ, nv2a_host_render_scale_x2());
+    }
     return 1;
 }
 
