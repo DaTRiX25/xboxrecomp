@@ -552,6 +552,16 @@ shared code to the objects whose address the register holds there (Burnout
 patch is for the two HUD scenes). `display.hud_fix` (`RECOMP_GFX_HUD_FIX=1`)
 is the second overlay row of this kind.
 
+`"when": "!off"` is on for a setting that is set and reads anything but
+`off` (a choice with several "on" values). `"kind": "mark"` patches nothing:
+after the instruction at `va` the code calls `RECOMP_PATCH_MARK("name")`, and
+a host that registered a function for the name (`recomp_patch_on_mark`)
+learns the title got there ("a stage is being set up", "the 3D world was
+drawn in this frame", "a frame ends"). Burnout 3's ultrawide mode keeps its
+state from four such marks and shows each frame at the shape it was drawn
+for (`nv2a_present_frame_aspect_fn`, `docs/runtime/overlay.md`:
+`display.ultrawide`).
+
 A listed site that is not the shape its kind names, or that no lifted body
 contains, fails the run; the report is `patches.json` in `-o`. Without the
 flag the output is unchanged. Tests: `tools/recomp/test_patches.py`.

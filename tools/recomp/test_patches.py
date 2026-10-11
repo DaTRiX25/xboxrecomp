@@ -181,6 +181,40 @@ def test_two_guarded_patches_share_a_site():
         raise AssertionError("accepted an unguarded pair")
 
 
+def test_mark_calls_the_host_and_changes_nothing():
+    image = bytes.fromhex(STORE)
+    config._install([config.Section(".text", BASE, len(image), 0, len(image), True),
+                     config.Section(".data", DATA, 0x1000, len(image), 0, False)],
+                    entry_point=BASE, kernel_thunk_addr=BASE, origin="patch-test")
+    db = {BASE: {"start": hex(BASE), "end": BASE + len(image),
+                 "_addr": BASE, "size": len(image)}}
+    t = FunctionTranslator(image, db)
+    plain = t.translate_function(BASE, db[BASE])
+    p = Patch(BASE, "mark", "", "", None)
+    p.name = "stage_render"
+    report = PatchReport(PatchConfig([p]))
+    t = FunctionTranslator(image, db)
+    t.lifter.patches = report
+    code = t.translate_function(BASE, db[BASE])
+    line = 'RECOMP_PATCH_MARK("stage_render"); /* patch 0x00010000, mark */'
+    assert line in code and report.finish() == []
+    strip = lambda c: [l.strip() for l in c.splitlines() if l.strip() != line]
+    assert strip(code) == strip(plain)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "patches.json")
+        for doc, ok in (({"va": "0x10000", "kind": "mark", "name": "a_b"}, True),
+                        ({"va": "0x10000", "kind": "mark", "name": "A"}, False),
+                        ({"va": "0x10000", "kind": "mark", "name": "a", "when": "1"}, False),
+                        ({"va": "0x10000", "setting": "a.b", "when": "!off", "kind": "load_f32", "expr": "loaded"}, True)):
+            with open(path, "w") as f:
+                json.dump({"patches": [doc]}, f)
+            try:
+                PatchConfig.load(path)
+                assert ok, doc
+            except ValueError:
+                assert not ok, doc
+
+
 def test_float_store_rewrites_the_stored_value():
     code, report = _translate_f(STORE_XMM1, "store_f32", "loaded + " + OFF,
                                 latch="set")

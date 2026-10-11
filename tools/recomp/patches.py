@@ -58,6 +58,15 @@ moved as bits); "store_f32" takes `movss [mem], xmm` and `mov [mem], reg`
 and rewrites the stored float, for a value that shares its register with
 other uses.
 
+kind "mark" changes nothing in the guest: after the instruction at va (any
+instruction) the generated code calls RECOMP_PATCH_MARK("name"), and a host
+that registered a function for that name (recomp_patch_on_mark) learns the
+title got there: "a stage is being set up", "the 3D world was drawn this
+frame". It takes "name" instead of a setting; without a registered function
+the call does nothing.
+
+    {"va": "0x0001A6A0", "kind": "mark", "name": "stage_render"}
+
 Optional "if": {"reg": "edi", "in": ["0x60EA14", "0x60EA84"]}: the site is
 in code several objects share, and the patch is for those whose address the
 register holds there. The other calls run as they were. Float patches of one
@@ -68,7 +77,8 @@ another for those).
 import json
 import re
 
-_KINDS = frozenset({"load_u32", "load_f32", "store_f32"})
+_KINDS = frozenset({"load_u32", "load_f32", "store_f32", "mark"})
+_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _XMM = frozenset(f"xmm{i}" for i in range(8))
 _TOKEN_RE = re.compile(r"\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+)"
                        r"|(f32\[\s*e(?:ax|bx|cx|dx|si|di|bp|sp)\s*"
@@ -151,7 +161,7 @@ def compile_expr(text):
         raise ValueError(f"expression {text!r}: trailing text")
     return f"({out})", names
 _SETTING_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
-_WHEN_RE = re.compile(r"^[A-Za-z0-9_+./-]+$")
+_WHEN_RE = re.compile(r"^!?[A-Za-z0-9_+./:-]+$")
 _REG32 = frozenset({"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"})
 
 
@@ -205,12 +215,23 @@ class PatchConfig:
         out = []
         for s in doc.get("patches", []):
             bad = set(s) - {"va", "kind", "setting", "when", "value", "note",
-                            "latch", "expr", "if"}
+                            "latch", "expr", "if", "name"}
             if bad:
                 raise ValueError(f"{path}: unknown patch keys {sorted(bad)}")
             kind = s.get("kind", "load_u32")
             if kind not in _KINDS:
                 raise ValueError(f"{path}: unknown patch kind {kind!r}")
+            if kind == "mark":
+                if set(s) - {"va", "kind", "name", "note"} or not \
+                        _NAME_RE.match(str(s.get("name", ""))):
+                    raise ValueError(f"{path}: mark takes 'va' and a 'name'")
+                p = Patch(_parse_va(s["va"]), kind, "", "", None,
+                          s.get("note", ""))
+                p.name = s["name"]
+                out.append(p)
+                continue
+            if "name" in s:
+                raise ValueError(f"{path}: only a mark takes 'name'")
             setting, when = s["setting"], s["when"]
             if not _SETTING_RE.match(setting):
                 raise ValueError(f"{path}: bad setting key {setting!r}")
@@ -264,6 +285,10 @@ class PatchReport:
             return []
         stmts = []
         for p in [p] + self.config.more.get(insn.address, []):
+            if p.kind == "mark":
+                stmts.append(f'RECOMP_PATCH_MARK("{p.name}"); '
+                             f"/* patch 0x{p.va:08X}, mark */")
+                continue
             if p.kind == "load_u32":
                 out = self._load_u32(p, insn)
             else:
@@ -338,7 +363,8 @@ class PatchReport:
     def to_json(self):
         return {"sites": [{"va": f"0x{va:08X}", "patched": n > 0,
                            "kind": self.config.patches[va].kind,
-                           "setting": self.config.patches[va].setting,
+                           "setting": self.config.patches[va].setting
+                           or getattr(self.config.patches[va], "name", ""),
                            "note": self.config.patches[va].note}
                           for va, n in sorted(self.applied.items())],
                 "patched_sites": sum(1 for n in self.applied.values() if n),
