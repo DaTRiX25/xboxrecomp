@@ -754,6 +754,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     {
         Uint32 wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
                       | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+#if defined(__ANDROID__)
+        /* An app's window is the screen; fullscreen is what makes SDL hide
+         * the status and navigation bars (immersive mode). */
+        wflags |= SDL_WINDOW_FULLSCREEN;
+#endif
         const char *be = recomp_env(RENV_PB_BACKEND);
 #if defined(XBOXRECOMP_HAVE_VULKAN)
         /* The Vulkan backend's frames stay on the GPU too: a Vulkan window
