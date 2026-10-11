@@ -43,7 +43,12 @@
 
 #include <SDL.h>
 #include <SDL_vulkan.h>
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#include <SDL_syswm.h>
+#define COBJMACROS
+#include <dxgi.h>
+#else
 #include <dlfcn.h>
 #endif
 #include <sched.h>
@@ -68,6 +73,7 @@
 uint64_t xbox_HostNowNs(void);
 void xbox_PacingPresent(uint64_t when_ns);
 void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
+int xbox_VblankDisplayLockOn(void);
 #include "kernel/nv2a_backend_common.h"
 #include "fb_present_vulkan.h"
 
@@ -130,9 +136,13 @@ static PFN_vkWaitForPresentKHR s_wait_present;   /* a device function */
 
 static uint64_t mono_ns(void)
 {
+#if defined(_WIN32)
+    return xbox_HostNowNs();     /* the clock the pacing code compares against */
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
 }
 
 static void iv_add(Intervals *v, uint64_t t)
@@ -255,6 +265,118 @@ static void *waiter_main(void *arg)
     }
     return NULL;
 }
+
+#if defined(_WIN32)
+/* Windows: the drivers do not all offer VK_KHR_present_wait (AMD's did not on
+ * the RX 9060 XT, driver 25.x), the Linux source of the display's refresh
+ * times for RECOMP_VBLANK_SYNC=display. The D3D11 path's source is used
+ * instead: a thread that waits for each vertical blank of the output the
+ * window is on (IDXGIOutput::WaitForVBlank, as the D3D11 presenter and
+ * RetroArch/DuckStation-style "sync to host refresh" do) and reports it to
+ * the vblank timer (kernel_pacing.c). DXGI is loaded at run time, so the
+ * exe has no link dependency on it. */
+static volatile int s_dxgi_run;
+static HANDLE       s_dxgi_th;
+
+static DWORD WINAPI dxgi_vblank_main(LPVOID param)
+{
+    IDXGIOutput *out = (IDXGIOutput *)param;
+    uint64_t last = 0;
+    unsigned fails = 0;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    while (s_dxgi_run) {
+        uint64_t t;
+        if (FAILED(IDXGIOutput_WaitForVBlank(out))) {
+            /* A lost output (mode change, display off): back off, never spin. */
+            Sleep(fails < 8 ? 16 : 250);
+            fails++;
+            continue;
+        }
+        fails = 0;
+        t = mono_ns();
+        if (last && t - last < 60000000ull) {
+            pthread_mutex_lock(&s_tm_mu);
+            iv_add(&s_disp_iv, t);
+            pthread_mutex_unlock(&s_tm_mu);
+        }
+        last = t;
+        xbox_VblankDisplayRefresh(t, 0);
+        if (s_csv)
+            fprintf(s_csv, "0,display,%llu,\n", (unsigned long long)t);
+    }
+    IDXGIOutput_Release(out);
+    return 0;
+}
+
+static void dxgi_vblank_start(SDL_Window *win)
+{
+    typedef HRESULT (WINAPI *create_fn)(REFIID, void **);
+    static const GUID iid_factory1 = { 0x770aae78, 0xf26f, 0x4dba,
+        { 0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87 } };
+    SDL_SysWMinfo wm;
+    HMODULE dll;
+    create_fn create;
+    IDXGIFactory1 *fac = NULL;
+    IDXGIOutput *found = NULL;
+    HMONITOR mon;
+    UINT a, o;
+
+    if (!xbox_VblankDisplayLockOn())
+        return;
+    SDL_VERSION(&wm.version);
+    if (!SDL_GetWindowWMInfo(win, &wm) || wm.subsystem != SDL_SYSWM_WINDOWS)
+        return;
+    dll = LoadLibraryA("dxgi.dll");
+    create = dll ? (create_fn)(void (*)(void))GetProcAddress(dll, "CreateDXGIFactory1") : NULL;
+    if (!create || FAILED(create(&iid_factory1, (void **)&fac)) || !fac) {
+        fprintf(stderr, LOGP "vblank sync: no DXGI; the vblank keeps its own 60 Hz timer\n");
+        return;
+    }
+    mon = MonitorFromWindow(wm.info.win.window, MONITOR_DEFAULTTONEAREST);
+    for (a = 0; !found; a++) {
+        IDXGIAdapter1 *ad = NULL;
+        if (FAILED(IDXGIFactory1_EnumAdapters1(fac, a, &ad)) || !ad)
+            break;
+        for (o = 0; !found; o++) {
+            IDXGIOutput *out = NULL;
+            DXGI_OUTPUT_DESC od;
+            if (FAILED(IDXGIAdapter1_EnumOutputs(ad, o, &out)) || !out)
+                break;
+            if (SUCCEEDED(IDXGIOutput_GetDesc(out, &od)) && od.Monitor == mon)
+                found = out;
+            else
+                IDXGIOutput_Release(out);
+        }
+        IDXGIAdapter1_Release(ad);
+    }
+    IDXGIFactory1_Release(fac);
+    if (!found) {
+        fprintf(stderr, LOGP "vblank sync: the window's monitor has no DXGI output; the"
+                " vblank keeps its own 60 Hz timer\n");
+        return;
+    }
+    s_dxgi_run = 1;
+    s_dxgi_th = CreateThread(NULL, 0, dxgi_vblank_main, found, 0, NULL);
+    if (!s_dxgi_th) {
+        s_dxgi_run = 0;
+        IDXGIOutput_Release(found);
+        return;
+    }
+    fprintf(stderr, LOGP "vblank sync: the emulated vblank follows the output's vertical"
+            " blank (DXGI WaitForVBlank, RECOMP_VBLANK_SYNC=display)\n");
+}
+
+static void dxgi_vblank_stop(void)
+{
+    if (!s_dxgi_th)
+        return;
+    s_dxgi_run = 0;
+    /* The thread may be inside WaitForVBlank (one refresh at most). */
+    WaitForSingleObject(s_dxgi_th, 500);
+    CloseHandle(s_dxgi_th);
+    s_dxgi_th = NULL;
+}
+#endif
 
 int fbv_load_library(char *err, size_t errn)
 {
@@ -501,6 +623,10 @@ int fbv_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         if (pthread_create(&s_waiter, NULL, waiter_main, NULL) != 0)
             s_waiter_run = 0;
     }
+#if defined(_WIN32)
+    if (!s_waiter_run)
+        dxgi_vblank_start(win);
+#endif
     fprintf(stderr, LOGP "Vulkan swapchain: %ux%u, %u images, %s, %s%s\n", s_sc_ext.width,
             s_sc_ext.height, s_sc_n, s_sc_fmt == VK_FORMAT_B8G8R8A8_UNORM ? "BGRA8" : "RGBA8",
             s_sc_mode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO (vsync)"
@@ -514,6 +640,9 @@ void fbv_destroy(void)
     int k;
     if (!C)
         return;
+#if defined(_WIN32)
+    dxgi_vblank_stop();
+#endif
     if (s_waiter_run) {
         pthread_mutex_lock(&s_id_mu);
         s_waiter_run = 0;

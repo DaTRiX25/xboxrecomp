@@ -250,6 +250,11 @@ static int make_device(void)
         exts[ne++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
         s_core.present_wait = 1;
     }
+    if (s_core.surface && !s_core.present_wait)
+        fprintf(stderr, "[vulkan] no VK_KHR_present_wait on %s (extensions %s, features %d/%d):"
+                " the presenter cannot time each frame on the display\n", s_core.name,
+                want_pw ? "offered" : "missing", want_pw ? have_pid.presentId : 0,
+                want_pw ? have_pw.presentWait : 0);
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;
     memset(&f12, 0, sizeof f12);
