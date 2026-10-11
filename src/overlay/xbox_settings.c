@@ -305,9 +305,25 @@ static void write_value(FILE *f, const xs_setting *s, double v)
     }
 }
 
+/* Is the section of setting i already written by an earlier user setting? */
+static int section_written_before(int i)
+{
+    char a[32], b[32];
+    int j;
+    section_of(s_set[i].key, a, sizeof a);
+    for (j = 0; j < i; j++) {
+        if (!s_set[j].user)
+            continue;
+        section_of(s_set[j].key, b, sizeof b);
+        if (!strcmp(a, b))
+            return 1;
+    }
+    return 0;
+}
+
 void xbox_SettingsFlush(void)
 {
-    char tmp[sizeof s_path + 8], sec[32], last[32] = "";
+    char tmp[sizeof s_path + 8], sec[32];
     FILE *f;
     int i;
 
@@ -325,20 +341,29 @@ void xbox_SettingsFlush(void)
           "# A RECOMP_* environment variable overrides what is here.\n", f);
     for (i = 0; i < s_n_keep; i++)
         fprintf(f, "%s = %s\n", s_keep[i].key, s_keep[i].val);
+    /* One [table] per section, whatever order the enum keeps its keys in: a
+     * second header of the same name is an error for the reader (and for
+     * TOML). A section is written at its first key, with all of its keys. */
     for (i = 0; i < XS_COUNT; i++) {
-        const xs_setting *s = &s_set[i];
-        const char *name;
-        if (!s->user)
+        int j;
+        if (!s_set[i].user || section_written_before(i))
             continue;
-        name = section_of(s->key, sec, sizeof sec);
-        if (strcmp(sec, last)) {
-            fprintf(f, "\n[%s]\n", sec);
-            snprintf(last, sizeof last, "%s", sec);
+        section_of(s_set[i].key, sec, sizeof sec);
+        fprintf(f, "\n[%s]\n", sec);
+        for (j = i; j < XS_COUNT; j++) {
+            const xs_setting *s = &s_set[j];
+            char sj[32];
+            const char *name;
+            if (!s->user)
+                continue;
+            name = section_of(s->key, sj, sizeof sj);
+            if (strcmp(sec, sj))
+                continue;
+            fprintf(f, "%s = ", name);
+            /* A setting the environment overrides keeps what the file said. */
+            write_value(f, s, s->locked ? s->filev : s->value);
+            fputc('\n', f);
         }
-        fprintf(f, "%s = ", name);
-        /* A setting the environment overrides keeps what the file said. */
-        write_value(f, s, s->locked ? s->filev : s->value);
-        fputc('\n', f);
     }
     if (fclose(f) != 0) {
         fprintf(stderr, LOGP "cannot write %s\n", tmp);
@@ -394,7 +419,9 @@ static void load_file(void)
         return;
     }
     fclose(probe);
-    c = recomp_cfg_load_file(s_path, err, sizeof err);
+    /* Reopening a [table] is accepted: the writer used to split a section in
+     * two when its keys were not next to each other in the enum. */
+    c = recomp_cfg_load_file_flags(s_path, RCFG_REOPEN_TABLES, err, sizeof err);
     if (!c) {
         fprintf(stderr, LOGP "%s (file ignored, the next change replaces it)\n", err);
         return;
