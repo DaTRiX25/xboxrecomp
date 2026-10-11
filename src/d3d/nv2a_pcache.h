@@ -7,8 +7,14 @@
  * program's slots, the combiner state, the pipeline's fixed state), so the
  * next start compiles them before the title draws with them. It stores keys,
  * not compiled code: the backend regenerates the source from a key, so a
- * changed generator never runs stale code (the version string still drops a
- * file from another build, as the key layout may have changed with it).
+ * changed generator never runs stale code, and a rebuild of the toolkit
+ * keeps the list. The version string names what the keys mean (the backend's
+ * key-format number and the sizes of the structures written as they are);
+ * only a change there drops a file.
+ *
+ * The keys are the title's own data (a vertex program's slots are its
+ * microcode, byte for byte as in its executable), so a list is made on the
+ * player's machine and is not something to hand around.
  *
  * The approach is the one emulators converged on: Dolphin keeps a per-game
  * list of pipeline UIDs under a 'PUID' + GX_PIPELINE_UID_VERSION header and
@@ -48,8 +54,10 @@ typedef struct nv2a_pcache nv2a_pcache;
 /* Largest payload a record may have. */
 #define NV2A_PCACHE_MAX_LEN 65536u
 
-/* Opens <path>, creating it. `version` names the build that may read it;
- * a file written under another is deleted and started afresh. Returns NULL
+/* Opens <path>, creating it. `version` names the key format that may read
+ * it; a file written under another is deleted and started afresh (one whose
+ * version is this one plus "; toolkit <rev>", as written up to BO-93, is
+ * read as it is). Returns NULL
  * when the file can neither be read nor created (the cache is then off);
  * `msg` (may be NULL) gets one line on what was found: loaded, new, version
  * mismatch, a cut tail. */

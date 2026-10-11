@@ -116,9 +116,6 @@ extern void  xbox_FramebufferWindowPublishTexture(void);
 static int s_layer;                  /* the window takes GPU slot textures */
 static int pc_start(void);           /* the pipeline cache: tables, disk, pre-warm */
 static void pc_log(uint64_t presents);
-#ifndef XBOXRECOMP_GIT_REV
-#define XBOXRECOMP_GIT_REV "unknown"
-#endif
 static void guard_open(void);        /* metal_fb_guard: open the pages before we touch them */
 static int wb_always(void);
 static uint64_t s_window_presents;   /* frames sent to the window (slot or readback) */
@@ -2291,11 +2288,13 @@ static int pc_start(void)
         return 1;
     }
     snprintf(path, sizeof path, "%s/metal_pipelines.bin", dir);
-    /* The keys' layout and the build: a file from another build is dropped
-     * (nv2a_pcache_open), as a changed key layout would not read back. */
+    /* What the keys mean: the key-format number (raise it when a key's
+     * meaning changes at the same size) and the structures written as they
+     * are. Not the build: the file holds keys, the source is generated from
+     * them at every start, so a rebuild keeps it (nv2a_pcache.h). */
     snprintf(ver, sizeof ver, "metal pipelines 1; PsoKey %zu; NV2ACombinerState %zu;"
-             " vsh slots %d; toolkit %s", sizeof(PsoKey), sizeof(NV2ACombinerState),
-             (int)NV2A_VSH_SLOTS, XBOXRECOMP_GIT_REV);
+             " vsh slots %d", sizeof(PsoKey), sizeof(NV2ACombinerState),
+             (int)NV2A_VSH_SLOTS);
     s_pcf = nv2a_pcache_open(path, ver, msg, sizeof msg);
     fprintf(stderr, LOGP "pcache: %s: %s; %d entries per table\n", path, msg, s_pc_max);
     if (!s_pcf) {

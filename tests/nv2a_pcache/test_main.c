@@ -90,6 +90,25 @@ int main(int argc, char **argv)
           "another version starts afresh");
     nv2a_pcache_close(pc);
 
+    /* A list from before BO-93 carries the toolkit commit after the key
+     * format: the same keys, read as they are and appended to. */
+    remove(path);
+    pc = nv2a_pcache_open(path, "keys 1; K 40; toolkit v0.12.0-523-ge273044a4c6e-dirty", msg, sizeof msg);
+    CHECK(pc && nv2a_pcache_put(pc, 0, a, sizeof a) == 1, "a list named after a toolkit commit");
+    nv2a_pcache_close(pc);
+    pc = nv2a_pcache_open(path, "keys 1; K 40", msg, sizeof msg);
+    CHECK(pc && nv2a_pcache_count(pc) == 1 && strstr(msg, "loaded"),
+          "is read by the same key format without the commit");
+    CHECK(nv2a_pcache_put(pc, 1, b, sizeof b) == 1, "and appended to");
+    nv2a_pcache_close(pc);
+    pc = nv2a_pcache_open(path, "keys 1; K 40", msg, sizeof msg);
+    CHECK(pc && nv2a_pcache_count(pc) == 2, "both records load back");
+    nv2a_pcache_close(pc);
+    pc = nv2a_pcache_open(path, "keys 1; K 4", msg, sizeof msg);
+    CHECK(pc && nv2a_pcache_count(pc) == 0 && strstr(msg, "another version"),
+          "a prefix of another format is not that format");
+    nv2a_pcache_close(pc);
+
     /* Not a cache file at all. */
     f = fopen(path, "wb");
     fputs("hello", f);

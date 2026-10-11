@@ -143,6 +143,26 @@ static int rewrite(const char *path, const unsigned char *b, size_t len)
     return 1;
 }
 
+/* The header length of file image `b` when it reads as `version`, else 0.
+ * A version of ours followed by "; toolkit <rev>" is ours too: the key lists
+ * up to BO-93 named the toolkit commit, so every rebuild dropped them; the
+ * keys under that suffix are the same. */
+static size_t header_len(const unsigned char *b, size_t size, const char *version)
+{
+    static const char old[] = "; toolkit ";
+    size_t vl = strlen(version), n;
+    if (vl > VERSION_MAX)
+        vl = VERSION_MAX;
+    if (size < 16 || memcmp(b, MAGIC, 8) != 0 || get32(b + 8) != FORMAT)
+        return 0;
+    n = get32(b + 12);
+    if (n > VERSION_MAX || size - 16 < n || n < vl || memcmp(b + 16, version, vl) != 0)
+        return 0;
+    if (n > vl && (n - vl < sizeof old - 1 || memcmp(b + 16 + vl, old, sizeof old - 1) != 0))
+        return 0;
+    return 16 + n;
+}
+
 nv2a_pcache *nv2a_pcache_open(const char *path, const char *version,
                               char *msg, size_t msg_len)
 {
@@ -156,13 +176,14 @@ nv2a_pcache *nv2a_pcache_open(const char *path, const char *version,
     if (!pc)
         return NULL;
     b = slurp(path, &size);
-    if (b && (size < hlen || memcmp(b, hdr, hlen) != 0)) {
+    if (b && !(hlen = header_len(b, size, version))) {
         /* Another format, version or no header at all: start afresh. */
         what = size >= 16 && !memcmp(b, MAGIC, 8) ? "another version, started afresh"
                                                    : "not a cache file, started afresh";
         free(b);
         b = NULL;
         remove(path);
+        hlen = header(hdr, version);
     }
     if (!b) {
         if (!rewrite(path, hdr, hlen)) {

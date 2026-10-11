@@ -71,9 +71,6 @@
 
 ptrdiff_t xbox_GetMemoryOffset(void);
 
-#ifndef XBOXRECOMP_GIT_REV
-#define XBOXRECOMP_GIT_REV "unknown"
-#endif
 
 #define LOGP "[vulkan] "
 
@@ -3263,8 +3260,8 @@ static void pc_start(int driver_cache_warm)
         return;
     snprintf(path, sizeof path, "%s/vk_pipelines.bin", dir);
     snprintf(ver, sizeof ver, "vk pipelines 1; PsoDisk %zu; NV2ACombinerState %zu;"
-             " vsh slots %d; toolkit %s", sizeof(PsoDisk), sizeof(NV2ACombinerState),
-             (int)NV2A_VSH_SLOTS, XBOXRECOMP_GIT_REV);
+             " vsh slots %d", sizeof(PsoDisk), sizeof(NV2ACombinerState),
+             (int)NV2A_VSH_SLOTS);
     s_pcf = nv2a_pcache_open(path, ver, msg, sizeof msg);
     fprintf(stderr, LOGP "pcache: %s: %s%s\n", path, msg,
             s_pcf && nv2a_pcache_count(s_pcf) && driver_cache_warm
