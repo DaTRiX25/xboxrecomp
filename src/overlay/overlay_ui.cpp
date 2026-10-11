@@ -285,7 +285,7 @@ static int page_rows(int page, Row *r)
             const char *d = nvk_core_describe();
             if (d && *d) {
                 snprintf(drv, sizeof drv, "Graphics driver: %s. To change it, open"
-                         " \"Burnout 3: graphics driver\" from the app list.", d);
+                         " this app's \"graphics driver\" entry in the app list.", d);
                 INFO(drv);
             }
         }
