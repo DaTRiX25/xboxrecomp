@@ -20,6 +20,8 @@
 
 #include "android_vk.h"
 
+#include <SDL.h>
+#include <SDL_system.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -56,10 +58,34 @@ static void open_loader(void)
             fprintf(stderr, "[vulkan] replacement driver %s%s opened through libadrenotools\n",
                     d, name);
         } else {
+            /* A driver of the player's choosing that cannot be opened: the
+             * one the app came with (RECOMP_ANDROID_DRIVER_FALLBACK_DIR and
+             * _NAME, set by the activity for a chosen package), at this
+             * start, and said on the screen. */
+            const char *fdir = getenv("RECOMP_ANDROID_DRIVER_FALLBACK_DIR");
+            const char *fname = getenv("RECOMP_ANDROID_DRIVER_FALLBACK_NAME");
             s_failed = 1;
             fprintf(stderr, "[vulkan] replacement driver %s%s could not be opened through"
-                    " libadrenotools (hooks in %s); the system driver instead\n",
+                    " libadrenotools (hooks in %s)\n",
                     d, name, lib && *lib ? lib : "(RECOMP_ANDROID_LIB_DIR not set)");
+            if (fdir && *fdir && fname && *fname && lib && *lib) {
+                char fd[1024];
+                size_t fn = strlen(fdir);
+                snprintf(fd, sizeof fd, "%s%s", fdir, fn && fdir[fn - 1] == '/' ? "" : "/");
+                h = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, NULL, lib,
+                                               fd, fname, NULL, NULL);
+                if (h) {
+                    char msg[320];
+                    s_failed = 0;
+                    snprintf(s_driver, sizeof s_driver, "%s", fname);
+                    snprintf(msg, sizeof msg, "The chosen graphics driver (%s) could not be"
+                             " opened; the driver in the app is used.", name);
+                    fprintf(stderr, "[vulkan] %s (%s%s)\n", msg, fd, fname);
+                    SDL_AndroidShowToast(msg, 1, -1, 0, 0);
+                }
+            }
+            if (!h)
+                fprintf(stderr, "[vulkan] the system driver instead\n");
         }
 #else
         s_failed = 1;

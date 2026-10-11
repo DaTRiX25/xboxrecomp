@@ -4624,6 +4624,15 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
     if (s_pc_trace)
         tex_upload_log();
     s_presents++;
+#if defined(__ANDROID__)
+    if (s_presents == 120 && !s_failed) {
+        /* A driver on trial (the app's GpuDriver) has drawn two seconds of
+         * frames: it stays. */
+        const char *trial = getenv("RECOMP_ANDROID_DRIVER_TRIAL");
+        if (trial && *trial && remove(trial) == 0)
+            fprintf(stderr, LOGP "the chosen driver has shown its first frames: kept\n");
+    }
+#endif
     pc_flip(s_presents);
     flip_log(surface_offset, rt);
     if (s_presents == 1 || (s_presents % 300) == 0)

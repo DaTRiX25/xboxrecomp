@@ -166,6 +166,9 @@ static const Meta k_meta[XS_COUNT] = {
 
 /* R_SPEAKERS: the speaker test, six buttons in a row (action: 0 through
  * the game's mixbins and speaker map, 1 straight to the output). */
+#if defined(__ANDROID__)
+extern "C" const char *nvk_core_describe(void);   /* nv2a_vk_core.c */
+#endif
 enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS };
 enum Action { A_RESET_PAGE, A_RESET_ALL, A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER };
 
@@ -252,6 +255,19 @@ static int page_rows(int page, Row *r)
     case P_GRAPHICS:
         SET(XS_GRAPHICS_RENDER_SCALE); SET(XS_GRAPHICS_ANISO);
         SET(XS_GRAPHICS_AA); SET(XS_GRAPHICS_SHARPEN);
+#if defined(__ANDROID__)
+        {
+            /* Which driver draws: chosen before the game starts, in the app's
+             * second launcher entry (the title's process has loaded it). */
+            static char drv[420];
+            const char *d = nvk_core_describe();
+            if (d && *d) {
+                snprintf(drv, sizeof drv, "Graphics driver: %s. To change it, open"
+                         " \"Burnout 3: graphics driver\" from the app list.", d);
+                INFO(drv);
+            }
+        }
+#endif
         if (s_sb) {
             sb_texts();
             INFO(s_sb_info);

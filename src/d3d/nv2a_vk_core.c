@@ -314,6 +314,30 @@ const struct nvk_core *nvk_core_init(const char *const *inst_exts, unsigned n,
             }
             if ((!make_surface || s_core.surface) && make_device()) {
                 s_state = 1;
+#if defined(__ANDROID__)
+                {
+                    /* For the app's driver page: what this start runs on. */
+                    const char *info = getenv("RECOMP_ANDROID_DRIVER_INFO");
+                    FILE *f = info && *info ? fopen(info, "w") : NULL;
+                    if (f) {
+                        uint32_t dv = s_core.props.driverVersion;
+                        const char *drv = getenv("RECOMP_ANDROID_DRIVER_NAME");
+                        extern const char *xr_android_vk_driver(void);
+                        fprintf(f, "driver=%s\ndevice=%s\nvulkan=%u.%u.%u\n",
+                                xr_android_vk_driver(), s_core.name,
+                                VK_API_VERSION_MAJOR(s_core.props.apiVersion),
+                                VK_API_VERSION_MINOR(s_core.props.apiVersion),
+                                VK_API_VERSION_PATCH(s_core.props.apiVersion));
+                        /* Mesa packs its version as a Vulkan one; Turnip's
+                         * device name says it is Mesa's. */
+                        if (strstr(s_core.name, "Turnip"))
+                            fprintf(f, "mesa=%u.%u.%u\n", VK_API_VERSION_MAJOR(dv),
+                                    VK_API_VERSION_MINOR(dv), VK_API_VERSION_PATCH(dv));
+                        (void)drv;
+                        fclose(f);
+                    }
+                }
+#endif
                 fprintf(stderr, "[vulkan] device up: %s (Vulkan %u.%u.%u, driver 0x%X%s),"
                         " queue family %u, depth %s%s\n", s_core.name,
                         VK_API_VERSION_MAJOR(s_core.props.apiVersion),
@@ -359,6 +383,21 @@ int nvk_core_replace_surface(VkSurfaceKHR (*make_surface)(VkInstance, void *), v
 const struct nvk_core *nvk_core_get(void)
 {
     return __atomic_load_n(&s_state, __ATOMIC_ACQUIRE) > 0 ? &s_core : NULL;
+}
+
+/* One line for a settings page: the device and its Vulkan version, "" before
+ * the device is up. */
+const char *nvk_core_describe(void)
+{
+    static char line[320];
+    if (__atomic_load_n(&s_state, __ATOMIC_ACQUIRE) <= 0)
+        return "";
+    if (!line[0])
+        snprintf(line, sizeof line, "%s, Vulkan %u.%u.%u", s_core.name,
+                 VK_API_VERSION_MAJOR(s_core.props.apiVersion),
+                 VK_API_VERSION_MINOR(s_core.props.apiVersion),
+                 VK_API_VERSION_PATCH(s_core.props.apiVersion));
+    return line;
 }
 
 void nvk_queue_lock(void)   { pthread_mutex_lock(&s_queue_lock); }
