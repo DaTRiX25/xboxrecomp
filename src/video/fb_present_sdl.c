@@ -76,7 +76,7 @@
  * "Xbox Recomp" before the loader has read one. RECOMP_TRACE=title appends
  * FPS and draws, once a second (window_title.h).
  */
-#if !defined(_WIN32)
+#if !defined(_WIN32) || defined(XBOXRECOMP_WIN_VULKAN)
 
 #include <SDL.h>
 #include "recomp_env.h"
@@ -87,7 +87,9 @@
 #include <string.h>
 #include <time.h>
 #include <sched.h>
+#if !defined(_WIN32)
 #include <sys/resource.h>
+#endif
 
 #include "kernel/nv2a_pb_state.h"
 #include "kernel/nv2a_backend_common.h"
@@ -455,19 +457,91 @@ static const char *window_name(void)
     return s_xbe_title;
 }
 
+/* A new window is asked for scale x the frame size, centred on a display.
+ * On a screen with less room than that (1024x768, 1366x768, a 1080p panel at
+ * 150 % scaling, a taskbar or menu bar taking its strip) the title bar or the
+ * bottom edge ended up off the screen, and on Windows a window is not
+ * kept on screen by the system. Once the window exists (its border sizes are
+ * known only then): if the window with its frame does not fit the display's
+ * usable bounds, shrink it to fit (keeping the aspect), and put it in the
+ * middle of the usable area. A window that already fits is left alone.
+ * Skipped for fullscreen. The usable bounds and the border sizes are SDL's
+ * (SDL_GetDisplayUsableBounds, SDL_GetWindowBordersSize; the same calls
+ * other SDL ports use for this); platforms that cannot report the borders
+ * report 0 for them. */
+static void fit_window(SDL_Window *win)
+{
+    SDL_Rect db, ub;
+    int di, w, h, x, y, bt = 0, bl = 0, bb = 0, br = 0, fits;
+    float ddpi = 0.f;
+
+    if (!win || (SDL_GetWindowFlags(win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)))
+        return;
+    di = SDL_GetWindowDisplayIndex(win);
+    if (di < 0 || SDL_GetDisplayBounds(di, &db) != 0 || SDL_GetDisplayUsableBounds(di, &ub) != 0
+            || ub.w <= 0 || ub.h <= 0)
+        return;
+    SDL_GetDisplayDPI(di, &ddpi, NULL, NULL);
+    {
+        SDL_DisplayMode dm;
+        if (SDL_GetCurrentDisplayMode(di, &dm) == 0)
+            fprintf(stderr, "[PRESENT] display %d mode %dx%d at %d Hz\n", di, dm.w, dm.h,
+                    dm.refresh_rate);
+    }
+    SDL_GetWindowBordersSize(win, &bt, &bl, &bb, &br);
+    SDL_GetWindowSize(win, &w, &h);
+    SDL_GetWindowPosition(win, &x, &y);
+    fprintf(stderr, "[PRESENT] window: display %d \"%s\" %dx%d at %d,%d, usable %dx%d at %d,%d,"
+            " %.0f dpi; window %dx%d at %d,%d, borders t%d l%d b%d r%d\n",
+            di, SDL_GetDisplayName(di) ? SDL_GetDisplayName(di) : "", db.w, db.h, db.x, db.y,
+            ub.w, ub.h, ub.x, ub.y, (double)ddpi, w, h, x, y, bt, bl, bb, br);
+    fits = x - bl >= ub.x && y - bt >= ub.y
+        && x + w + br <= ub.x + ub.w && y + h + bb <= ub.y + ub.h;
+    if (fits)
+        return;
+    {
+        int max_w = ub.w - bl - br, max_h = ub.h - bt - bb;
+        if (max_w < 160)
+            max_w = 160;
+        if (max_h < 120)
+            max_h = 120;
+        if (w > max_w || h > max_h) {
+            /* aspect kept: the smaller of the two ratios */
+            if ((long long)max_w * h < (long long)max_h * w) {
+                h = (int)((long long)h * max_w / w);
+                w = max_w;
+            } else {
+                w = (int)((long long)w * max_h / h);
+                h = max_h;
+            }
+            SDL_SetWindowSize(win, w, h);
+            SDL_GetWindowSize(win, &w, &h);
+        }
+        x = ub.x + bl + (ub.w - bl - br - w) / 2;
+        y = ub.y + bt + (ub.h - bt - bb - h) / 2;
+        SDL_SetWindowPosition(win, x, y);
+        fprintf(stderr, "[PRESENT] window did not fit the usable area: now %dx%d at %d,%d\n",
+                w, h, x, y);
+    }
+}
+
 static int start_guest(void)
 {
     pthread_attr_t attr;
     pthread_t th;
+#if !defined(_WIN32)
     struct rlimit rl;
+#endif
     size_t stack = 64u << 20;
     int rc;
 
     /* At least the main thread's stack (8 MB by default), and generously
      * more: lifted code recurses on the native stack. */
+#if !defined(_WIN32)
     if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY
             && rl.rlim_cur > stack)
         stack = (size_t)rl.rlim_cur;
+#endif
 
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, stack);
@@ -646,13 +720,16 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             char why[256] = "";
             win = NULL;
             if (fbv_load_library(why, sizeof why))
-                win = SDL_CreateWindow(window_name(), SDL_WINDOWPOS_CENTERED,
-                                       SDL_WINDOWPOS_CENTERED, win_w * scale, 480 * scale,
+                win = SDL_CreateWindow(window_name(), win_pos, win_pos,
+                                       win_w * scale, 480 * scale,
                                        wflags | SDL_WINDOW_VULKAN);
-            if (!win && !why[0])
+            if (!win && !why[0]) {
                 snprintf(why, sizeof why, "%s", SDL_GetError());
-            else if (win && fbv_create(win, vsync, s_shot_n > 0, why, sizeof why))
-                s_layer = s_vk = dirty = 1;   /* paint black before the first frame */
+            } else if (win) {
+                fit_window(win);   /* before the swapchain takes the size */
+                if (fbv_create(win, vsync, s_shot_n > 0, why, sizeof why))
+                    s_layer = s_vk = dirty = 1;   /* paint black before the first frame */
+            }
             if (!s_vk) {
                 if (win) {
                     fbv_destroy();
@@ -674,8 +751,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                                    wflags | SDL_WINDOW_METAL);
             if (!win)
                 snprintf(why, sizeof why, "%s", SDL_GetError());
-            else if (fbm_create(win, vsync, s_shot_n > 0, why, sizeof why))
-                s_layer = dirty = 1;   /* paint black before the first frame */
+            else {
+                fit_window(win);
+                if (fbm_create(win, vsync, s_shot_n > 0, why, sizeof why))
+                    s_layer = dirty = 1;   /* paint black before the first frame */
+            }
             if (!s_layer) {
                 fbm_destroy();
                 if (win)
@@ -687,6 +767,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
 #endif
         if (!s_layer) {
             win = SDL_CreateWindow(window_name(), win_pos, win_pos, win_w * scale, 480 * scale, wflags);
+            fit_window(win);
             ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
                                            | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0))
                       : NULL;

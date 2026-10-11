@@ -6,7 +6,7 @@
 #             d3d8_combiners_msl.c (their MSL emitters): no graphics API
 #   POSIX  -> backed by OpenGL 3.3 core via SDL2 + libepoxy (d3d8_gl.c)
 
-if(WIN32)
+if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
     add_library(xbox_d3d8 STATIC
         d3d8_device.c
         d3d8_gamma.c
@@ -45,7 +45,6 @@ if(WIN32)
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d11_backend_smoke)
 else()
     add_library(xbox_d3d8 STATIC
-        d3d8_gl.c
         d3d8_vsh_parse.c
         d3d8_combiners_parse.c
         d3d8_vsh_hlsl.c
@@ -57,15 +56,22 @@ else()
         nv2a_pcache.c
     )
     find_package(SDL2 REQUIRED)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(EPOXY REQUIRED epoxy)
-    target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS})
+    if(WIN32)
+        # Windows + Vulkan: no OpenGL layer (d3d8_gl.c, libepoxy); the
+        # pushbuffer executor draws through nv2a_pb_vulkan.c alone.
+        target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2)
+    else()
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(EPOXY REQUIRED epoxy)
+        target_sources(xbox_d3d8 PRIVATE d3d8_gl.c)
+        target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS})
     # EPOXY_LINK_LIBRARIES, not EPOXY_LIBRARIES: the latter is the bare name
     # `epoxy`, which only resolves if EPOXY_LIBRARY_DIRS happens to be on the
     # link path. That holds for the top-level build and not when this is pulled
     # in via add_subdirectory from tests/, where the link fails with
     # "library 'epoxy' not found". The _LINK_LIBRARIES form is absolute paths.
-    target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
+        target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
+    endif()
     # The toolkit revision at configure time: the pipeline caches' version
     # key (nv2a_pcache.h), so a file from another build is dropped.
     execute_process(COMMAND git describe --always --dirty --abbrev=12
@@ -90,13 +96,22 @@ else()
         # A static glslang (the Steam Runtime SDK's) is C++: its runtime
         # comes with it, as this C program's link would not add it.
         # The GLSL emitters' output through glslang (no device needed).
-        add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_glsl_split
-                         ${CMAKE_CURRENT_BINARY_DIR}/d3d8_glsl_split)
+        if(NOT WIN32)
+            add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_glsl_split
+                             ${CMAKE_CURRENT_BINARY_DIR}/d3d8_glsl_split)
+        endif()
         get_target_property(_xr_glslang_type glslang::glslang TYPE)
         if(_xr_glslang_type STREQUAL "STATIC_LIBRARY")
             # Its config names SPIRV-Tools-opt but not what that needs
             # (SPIRV-Tools), and GNU ld wants them after it, in order.
-            target_link_libraries(xbox_d3d8 PUBLIC SPIRV-Tools-opt SPIRV-Tools stdc++ m pthread)
+            if(WIN32)
+                # glslang is built without the SPIR-V optimizer (ENABLE_OPT=OFF)
+                # and with llvm-mingw's libc++, linked statically so the .exe
+                # needs no libc++.dll.
+                target_link_libraries(xbox_d3d8 PUBLIC "-Wl,-Bstatic -lc++ -lunwind -Wl,-Bdynamic")
+            else()
+                target_link_libraries(xbox_d3d8 PUBLIC SPIRV-Tools-opt SPIRV-Tools stdc++ m pthread)
+            endif()
         endif()
     endif()
     if(APPLE)
@@ -115,7 +130,7 @@ else()
     endif()
     # The executor's backend, driven by a synthetic stream: Metal or Vulkan
     # against the CPU rasteriser, frame by frame.
-    if(APPLE OR XBOXRECOMP_HAVE_VULKAN)
+    if(NOT WIN32 AND (APPLE OR XBOXRECOMP_HAVE_VULKAN))
         add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_backend_smoke
                          ${CMAKE_CURRENT_BINARY_DIR}/nv2a_backend_smoke)
     endif()

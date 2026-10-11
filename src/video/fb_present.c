@@ -17,7 +17,7 @@
 #include <stdint.h>
 #include "recomp_env.h"
 
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(XBOXRECOMP_WIN_VULKAN)
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>

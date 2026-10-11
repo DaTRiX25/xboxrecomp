@@ -68,7 +68,7 @@ int  xbox_FramebufferDumpBmp(const char *path);
  * refreshed once a second from each flip's stats. */
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(XBOXRECOMP_WIN_VULKAN)
 /* That title bar text, for a Win32 window that keeps it current (the D3D11
  * backend's): fills tb (n wide chars) and returns 1 when the window should
  * write it -- when the name changes, or once a second with
@@ -82,7 +82,7 @@ int xbox_FramebufferWindowTitleText(wchar_t *tb, int n, struct xbox_title_clock 
  * before there is one. */
 void xbox_HostWindowSetTitle(const char *title);
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) || defined(XBOXRECOMP_WIN_VULKAN)
 /* POSIX: the process main thread runs the window's event loop and guest_main
  * runs on a thread of its own (fb_present_sdl.c). Returns guest_main's exit
  * code. */

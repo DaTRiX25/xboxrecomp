@@ -21,6 +21,26 @@ if(APPLE)
     enable_language(OBJC)
 endif()
 
+# Windows host with the SDL2 + Vulkan stack (the default on Windows): the
+# kernel and platform layers stay native Win32 (VirtualAlloc, vectored
+# exceptions, waitable timers), while the window, the audio device, the pad
+# and the 3D backend are the ones POSIX hosts use (SDL2, nv2a_pb_vulkan.c,
+# fb_present_vulkan.c, apu_sdl2.c). OFF keeps the older GDI + Direct3D 11 +
+# XAudio2 + XInput path. XR_SDL_HOST is true for either POSIX or this mode.
+if(WIN32)
+    option(XBOXRECOMP_WIN_VULKAN "Windows: SDL2 window/audio/pad and the Vulkan backend" ON)
+else()
+    set(XBOXRECOMP_WIN_VULKAN OFF)
+endif()
+if(NOT WIN32 OR XBOXRECOMP_WIN_VULKAN)
+    set(XR_SDL_HOST ON)
+else()
+    set(XR_SDL_HOST OFF)
+endif()
+if(WIN32 AND XBOXRECOMP_WIN_VULKAN)
+    add_compile_definitions(XBOXRECOMP_WIN_VULKAN=1)
+endif()
+
 # Common definitions for all targets
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
@@ -51,7 +71,7 @@ endif()
 # (src/video/fb_present_vulkan.c): POSIX hosts with a Vulkan loader and
 # glslang (shaders are GLSL compiled to SPIR-V at runtime). Native Linux
 # (Steam Deck) draws with it; on macOS it runs on MoltenVK as a test bed.
-if(NOT WIN32)
+if(XR_SDL_HOST)
     option(XBOXRECOMP_VULKAN "Build the Vulkan backend when Vulkan and glslang are found" ON)
     if(XBOXRECOMP_VULKAN)
         find_package(Vulkan QUIET)
@@ -60,6 +80,10 @@ if(NOT WIN32)
             set(XBOXRECOMP_HAVE_VULKAN ON)
             add_compile_definitions(XBOXRECOMP_HAVE_VULKAN=1)
             message(STATUS "xboxrecomp: Vulkan backend on (${Vulkan_LIBRARY}, glslang ${glslang_VERSION})")
+        elseif(WIN32)
+            message(FATAL_ERROR "xboxrecomp: the Windows build needs Vulkan headers/import library "
+                    "(Vulkan_INCLUDE_DIR, Vulkan_LIBRARY) and glslang (CMAKE_PREFIX_PATH); "
+                    "tools/win/fetch-deps.sh in the game repo makes them. Vulkan ${Vulkan_FOUND}, glslang ${glslang_FOUND}")
         else()
             message(STATUS "xboxrecomp: Vulkan backend off (Vulkan ${Vulkan_FOUND}, glslang ${glslang_FOUND})")
         endif()
@@ -71,7 +95,7 @@ endif()
 # RECOMP_* settings and keeps them in settings.toml. Opt-in: it needs the
 # enhancements layer, a POSIX window (Windows follows with D3D11) and C++.
 option(XBOXRECOMP_OVERLAY "Build the in-game settings overlay (Dear ImGui)" OFF)
-if(XBOXRECOMP_OVERLAY AND XBOXRECOMP_ENHANCE AND NOT WIN32)
+if(XBOXRECOMP_OVERLAY AND XBOXRECOMP_ENHANCE AND XR_SDL_HOST)
     enable_language(CXX)
     if(APPLE)
         enable_language(OBJCXX)

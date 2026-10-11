@@ -36,7 +36,7 @@ if(MSVC)
     )
 endif()
 
-if(WIN32)
+if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
     # xaudio2_8 for XAudio2Create, which apu_xaudio2.c calls directly.
     # It was missing: nothing had ever referenced this library from a linked
     # target, so the archive was built and never pulled in, and the first
@@ -44,10 +44,13 @@ if(WIN32)
     # XAudio2Create rather than at build time here.
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
-    # POSIX (macOS, Linux): platform layer (Win32 primitives on POSIX),
-    # SDL2 for the audio device (apu_sdl2.c) and libm
+    # POSIX (macOS, Linux) and Windows + Vulkan: SDL2 for the audio device
+    # (apu_sdl2.c) and libm; on POSIX the platform layer (Win32 primitives)
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
+    if(WIN32)
+        target_link_libraries(xbox_apu PRIVATE kernel32 winmm)
+    endif()
 endif()
 
 # Extracted from xemu, which QEMU builds with -fwrapv -fno-strict-aliasing

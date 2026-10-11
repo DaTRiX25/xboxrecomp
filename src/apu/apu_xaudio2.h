@@ -8,7 +8,7 @@
 
 /* The device backend behind these functions: XAudio2 on Windows
  * (apu_xaudio2.c), SDL2 on POSIX hosts (apu_sdl2.c). Same contract. */
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(XBOXRECOMP_WIN_VULKAN)
 #define XA2_BACKEND_NAME "XAudio2"
 #else
 #define XA2_BACKEND_NAME "SDL2"

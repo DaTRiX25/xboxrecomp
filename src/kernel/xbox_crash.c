@@ -210,15 +210,39 @@ static void tee_pump(TeeChan *c)
 {
     char buf[4096];
     for (;;) {
-        int n = (int)cr_read(c->rd, buf, sizeof buf);
+        int n;
+#if defined(_WIN32)
+        /* Wait for data by polling, never inside a read: PeekNamedPipe on a
+         * synchronous pipe handle blocks for as long as another thread sits
+         * in ReadFile/_read on it, and tee_pending() (the exit-time flush)
+         * peeks from another thread. With the read parked on a quiet pipe
+         * the flush, and so exit(), never returned: closing the window left
+         * the game running (Windows Vulkan build, BO-75). */
+        for (;;) {
+            DWORD avail = 0;
+            if (!PeekNamedPipe((HANDLE)_get_osfhandle(c->rd), NULL, 0, NULL, &avail, NULL))
+                return;   /* the write end is gone */
+            if (avail)
+                break;
+            Sleep(1);
+        }
+        c->busy = 1;   /* before the bytes leave the pipe: the flush must see them */
+        n = (int)cr_read(c->rd, buf, sizeof buf);
+#else
+        n = (int)cr_read(c->rd, buf, sizeof buf);
+#endif
         if (n <= 0) {
 #if !defined(_WIN32)
             if (n < 0 && errno == EINTR)
                 continue;
+#else
+            c->busy = 0;
 #endif
             break;
         }
+#if !defined(_WIN32)
         c->busy = 1;
+#endif
         write_all(c->out, buf, (size_t)n);
         ring_append(buf, (size_t)n);
         c->busy = 0;
