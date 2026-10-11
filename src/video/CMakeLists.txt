@@ -29,6 +29,10 @@ else()
         # The window's Vulkan swapchain for the Vulkan backend.
         target_sources(xbox_video PRIVATE fb_present_vulkan.c)
         target_link_libraries(xbox_video PUBLIC Vulkan::Vulkan)
+        if(ANDROID)
+            # Vulkan through android_vk.h's pointers (src/d3d/CMakeLists.txt).
+            target_compile_options(xbox_video PRIVATE -include ${XR_ANDROID_VK_H})
+        endif()
     endif()
     if(APPLE)
         # The window's CAMetalLayer present for the Metal backend (manual

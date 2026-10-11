@@ -787,6 +787,22 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 }
                 fprintf(stderr, "[PRESENT] window up: Vulkan swapchain unavailable (%s);"
                         " SDL renderer, readback present\n", why);
+#if defined(__ANDROID__)
+                /* A phone has no terminal to read that on, and what follows
+                 * is the CPU rasteriser at a few frames a second: say so on
+                 * the screen (RECOMP_ANDROID_NO_GPU_NOTE=1: not). */
+                if (!getenv("RECOMP_ANDROID_NO_GPU_NOTE")) {
+                    char msg[640];
+                    snprintf(msg, sizeof msg,
+                             "No usable Vulkan 1.3 graphics driver:\n%s\n\n"
+                             "The game will draw on the CPU, which is very slow. "
+                             "On an Adreno GPU a Mesa Turnip driver is needed; the "
+                             "log in the app's folder says which driver was "
+                             "tried.", why);
+                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING,
+                                             "Graphics driver", msg, NULL);
+                }
+#endif
             }
         }
 #endif
