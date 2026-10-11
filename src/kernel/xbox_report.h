@@ -148,11 +148,24 @@ void xbox_report_env_snapshot(void);
  * at start. (Not in a build of this file alone, XBOX_REPORT_STANDALONE.) */
 void xbox_BugReportRuntime(void);
 
-/* RECOMP_DEBUG=bug_report=<seconds>[:shot]: `fn(screenshot, path, n)` is
- * called that long after this, on a thread of its own, and the result
- * printed ("[REPORT] ..."): a report without a window, for tests and for a
- * machine reached over ssh. */
-void xbox_BugReportArm(int (*fn)(int screenshot, char *out_path, unsigned n));
+/* The host's way to make one: it fills the options (its name, its save
+ * folder, its variables' prefixes) and calls xbox_BugReport. Whoever offers
+ * a report asks through this: the settings overlay's action, the debug
+ * switch below, an Android start page. */
+typedef int (*xbox_bug_report_fn)(int screenshot, char *out_path, unsigned n);
+void xbox_BugReportSetMaker(xbox_bug_report_fn fn);
+int  xbox_BugReportHasMaker(void);
+/* 1 with the archive's path in out_path; 0 with a reason there. */
+int  xbox_BugReportMake(int screenshot, char *out_path, unsigned n);
+
+/* RECOMP_DEBUG=bug_report=<seconds>[:shot]: the maker is called that long
+ * after this, on a thread of its own, and the result printed
+ * ("[REPORT] bug_report: done: <path>"): a report without a window, for
+ * tests and for a machine reached over ssh. =@<file>: a report each time
+ * that file appears instead (it is removed; "shot" in it asks for the
+ * frame), so a script picks the moment. Call when the title is about to
+ * start. */
+void xbox_BugReportArm(void);
 
 #ifdef __cplusplus
 }

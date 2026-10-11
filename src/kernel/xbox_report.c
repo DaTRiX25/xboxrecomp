@@ -866,6 +866,17 @@ static int list_dir(const char *dir, rp_ent *out, int max)
 
 #define DIR_LIST_MAX 256
 
+static int is_dir(const char *path)
+{
+#if defined(_WIN32)
+    DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
 static void dir_total(const char *dir, int depth, unsigned long long *files,
                       unsigned long long *bytes)
 {
@@ -893,11 +904,24 @@ void xbox_report_dir_summary(xbox_report_buf *b, const char *label, const char *
 {
     rp_ent *e;
     unsigned long long files = 0, bytes = 0;
+    char parent[1100];
     int n, i;
 
     if (!dir || !*dir) {
         xbox_report_printf(b, "%s: none\n", label);
         return;
+    }
+    /* A file's name (a cache's own file): the folder it is in. */
+    if (!is_dir(dir)) {
+        size_t k = strlen(dir);
+        while (k > 1 && !is_sep(dir[k - 1]))
+            k--;
+        if (k > 1 && k < sizeof parent) {
+            memcpy(parent, dir, k - 1);
+            parent[k - 1] = 0;
+            if (is_dir(parent))
+                dir = parent;
+        }
     }
     e = (rp_ent *)malloc(sizeof(rp_ent) * DIR_LIST_MAX);
     if (!e)
@@ -1057,7 +1081,13 @@ static void write_effective(xbox_report_buf *b, const char *const *prefixes)
         const char *src;
         if (!v)
             continue;
-        src = source_text(env_at_start(list ? list : name));
+        {
+            /* Set under its older name (a host's default, a script): that
+             * variable's source, not the list's. */
+            const char *legacy = recomp_env_legacy_name((recomp_env_id)i);
+            const char *lv = legacy ? getenv(legacy) : NULL;
+            src = source_text(env_at_start(lv ? legacy : list ? list : name));
+        }
         if (list)
             xbox_report_printf(b, "%s: %s=%s", list, name, v);
         else
@@ -1668,26 +1698,66 @@ int xbox_BugReport(const xbox_bug_report_opts *o, char *out_path, size_t n)
 
 /* ── RECOMP_DEBUG=bug_report ───────────────────────────────────────── */
 
-static int (*s_arm_fn)(int, char *, unsigned);
+static xbox_bug_report_fn s_maker;
+
+void xbox_BugReportSetMaker(xbox_bug_report_fn fn) { s_maker = fn; }
+int xbox_BugReportHasMaker(void) { return s_maker != NULL; }
+
+int xbox_BugReportMake(int screenshot, char *out_path, unsigned n)
+{
+    if (!s_maker) {
+        snprintf(out_path, n, "this build has no bug report");
+        return 0;
+    }
+    return s_maker(screenshot, out_path, n);
+}
+
 static double s_arm_after;
 static int s_arm_shot;
+static const char *s_arm_file;
 
-static void arm_run(void)
+static void arm_sleep(unsigned ms)
 {
-    char path[1200];
-    unsigned ms = (unsigned)(s_arm_after * 1000.0);
-
 #if defined(_WIN32)
     Sleep(ms);
 #else
     struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
 #endif
-    path[0] = 0;
-    if (s_arm_fn(s_arm_shot, path, sizeof path))
+}
+
+static void arm_make(int shot)
+{
+    char path[1200] = "";
+
+    if (xbox_BugReportMake(shot, path, sizeof path))
         fprintf(stderr, LOGP "bug_report: done: %s\n", path);
     else
         fprintf(stderr, LOGP "bug_report: failed: %s\n", path);
+}
+
+static void arm_run(void)
+{
+    if (!s_arm_file) {
+        arm_sleep((unsigned)(s_arm_after * 1000.0));
+        arm_make(s_arm_shot);
+        return;
+    }
+    /* =@file: a report each time the file appears (a script makes it when
+     * the title is where it wants the report); "shot" in it asks for the
+     * frame. The file is removed first, so it can be made again. */
+    for (;;) {
+        FILE *f = fopen(s_arm_file, "rb");
+        if (f) {
+            char word[16] = "";
+            size_t n = fread(word, 1, sizeof word - 1, f);
+            word[n] = 0;
+            fclose(f);
+            remove(s_arm_file);
+            arm_make(strstr(word, "shot") != NULL);
+        }
+        arm_sleep(100);
+    }
 }
 
 #if defined(_WIN32)
@@ -1696,17 +1766,23 @@ static DWORD WINAPI arm_thread(LPVOID p) { (void)p; arm_run(); return 0; }
 static void *arm_thread(void *p) { (void)p; arm_run(); return NULL; }
 #endif
 
-void xbox_BugReportArm(int (*fn)(int screenshot, char *out_path, unsigned n))
+void xbox_BugReportArm(void)
 {
+    static int armed;
     const char *e = recomp_env(RENV_BUG_REPORT);
 
-    if (!e || !fn || s_arm_fn)
+    if (!e || armed)
         return;
-    s_arm_fn = fn;
-    s_arm_after = atof(e);
-    s_arm_shot = strstr(e, ":shot") != NULL;
-    fprintf(stderr, LOGP "bug_report: a report in %.1f s%s\n", s_arm_after,
-            s_arm_shot ? ", with the frame" : "");
+    armed = 1;
+    if (e[0] == '@' && e[1]) {
+        s_arm_file = e + 1;
+        fprintf(stderr, LOGP "bug_report: a report whenever %s appears\n", s_arm_file);
+    } else {
+        s_arm_after = atof(e);
+        s_arm_shot = strstr(e, ":shot") != NULL;
+        fprintf(stderr, LOGP "bug_report: a report in %.1f s%s\n", s_arm_after,
+                s_arm_shot ? ", with the frame" : "");
+    }
     {
 #if defined(_WIN32)
         HANDLE h = CreateThread(NULL, 0, arm_thread, NULL, 0, NULL);

@@ -259,7 +259,7 @@ extern "C" {
     X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \
     X(WINDOW_SHOT,       DEBUG, "window_shot",     "RECOMP_WINDOW_SHOT",       "=flips: SDL window shots") \
     X(WINDOW_SHOT_PREFIX, DEBUG, "window_shot_prefix", "RECOMP_WINDOW_SHOT_PREFIX", "=prefix: window shot files") \
-    X(BUG_REPORT,        DEBUG, "bug_report",      NULL,                       "=seconds[:shot]: write a bug report archive that long after the start (xbox_report.h), :shot with the last frame; no window needed") \
+    X(BUG_REPORT,        DEBUG, "bug_report",      NULL,                       "=seconds[:shot]: write a bug report archive that long after the start (xbox_report.h), :shot with the last frame; =@file: whenever that file appears; no window needed") \
     X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=prefix: textures, first use") \
     X(TEX_DUMP_EVERY,    DEBUG, "tex_dump_every",  "RECOMP_TEX_DUMP_EVERY",    "=n: tex_dump every nth bind too") \
     X(VSH_DUMP,          DEBUG, "vsh_dump",        "RECOMP_VSH_DUMP",          "=prefix: vertex programs, raw") \
@@ -351,6 +351,9 @@ double recomp_env_double(recomp_env_id id, double def);
 
 /* The variable or list key, for messages. */
 const char *recomp_env_name(recomp_env_id id);
+/* The older variable a key still answers to, or NULL (for a report that
+ * says where a value came from). */
+const char *recomp_env_legacy_name(recomp_env_id id);
 /* The list variable a key belongs to ("RECOMP_TRACE", "RECOMP_DEBUG"), or
  * NULL for a config-tier variable, whose name is the variable. */
 const char *recomp_env_list_var(recomp_env_id id);
