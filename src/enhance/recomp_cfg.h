@@ -47,6 +47,11 @@ typedef enum {
 recomp_cfg *recomp_cfg_load_file(const char *path, char *err, size_t errlen);
 recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
                                    char *err, size_t errlen);
+/* Flags for recomp_cfg_load_file_flags. RCFG_REOPEN_TABLES: a [table] header
+ * may appear again and adds keys to the table (a duplicate key is still an
+ * error); for a file an older writer wrote with a section split in two. */
+#define RCFG_REOPEN_TABLES 1
+recomp_cfg *recomp_cfg_load_file_flags(const char *path, int flags, char *err, size_t errlen);
 void recomp_cfg_free(recomp_cfg *cfg);
 
 /* Parse a C-locale number ("0.5", "-1e3", "inf", "nan"; no hex floats or

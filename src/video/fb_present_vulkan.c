@@ -1576,8 +1576,10 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     if (s_slot[k].img && s_slot[k].layout == VK_IMAGE_LAYOUT_GENERAL && fw && fh) {
         struct nv2a_rect r2, sr;
         uint32_t sw = fw < s_slot[k].w ? fw : s_slot[k].w, sh = fh < s_slot[k].h ? fh : s_slot[k].h;
-        int whole = nv2a_present_layout(sw, sh, (uint32_t)s_sc_ext.width,
-                                        (uint32_t)s_sc_ext.height, filter, &sr, &r2);
+        int whole;
+        nv2a_present_frame(flip);
+        whole = nv2a_present_layout(sw, sh, (uint32_t)s_sc_ext.width,
+                                    (uint32_t)s_sc_ext.height, filter, &sr, &r2);
         if (r2.w > 0 && r2.h > 0) {
             int lin = filter == NV2A_PRESENT_LINEAR
                       || (filter == NV2A_PRESENT_INTEGER && !whole);

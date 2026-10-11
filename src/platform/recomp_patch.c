@@ -43,7 +43,9 @@ int recomp_patch_on(const char *key, const char *when, int mode)
     for (i = 0; i < n; i++)
         if (s_en[i].key == key || !strcmp(s_en[i].key, key)) {
             const char *v = recomp_env(s_en[i].env);
-            int on = v && !strcmp(v, when);
+            /* "!x": set, and anything but x (a choice with several "on"s). */
+            int on = when[0] == '!' ? (v && *v && strcmp(v, when + 1) != 0)
+                                    : (v && !strcmp(v, when));
             if (mode == RECOMP_PATCH_LATCH_SET)
                 s_en[i].latched = on;
             else if (mode == RECOMP_PATCH_LATCH_USE && s_en[i].latched >= 0)
@@ -118,4 +120,31 @@ double recomp_patch_var(const char *name)
         if (s_var[i].name == name || !strcmp(s_var[i].name, name))
             return s_var[i].fn ? s_var[i].fn() : s_var[i].value;
     return 0.0;
+}
+
+/* Marks: written before the guest runs, as the settings are. */
+#define MARK_MAX 16
+static struct {
+    const char *name;
+    void (*fn)(void);
+} s_mark[MARK_MAX];
+static volatile int s_nmark;
+
+void recomp_patch_on_mark(const char *name, void (*fn)(void))
+{
+    if (s_nmark == MARK_MAX)
+        return;
+    s_mark[s_nmark].name = name;
+    s_mark[s_nmark].fn = fn;
+    s_nmark = s_nmark + 1;
+}
+
+void recomp_patch_mark(const char *name)
+{
+    int i, n = s_nmark;
+    for (i = 0; i < n; i++)
+        if (s_mark[i].name == name || !strcmp(s_mark[i].name, name)) {
+            s_mark[i].fn();
+            return;
+        }
 }

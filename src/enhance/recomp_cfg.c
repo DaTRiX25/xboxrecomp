@@ -36,6 +36,7 @@ struct recomp_cfg {
     char **dotted;    /* tables made by dotted keys (a.b = 1 makes a) */
     size_t n_dotted, cap_dotted;
     char *name;
+    int reopen_tables;   /* RCFG_REOPEN_TABLES: a [header] may repeat */
 };
 
 typedef struct {
@@ -578,8 +579,11 @@ static int parse_table_header(P *ps, Buf *table)
         return fail(ps, "expected ']' after table name");
     ps->p++;
     for (i = 0; i < ps->cfg->n_tables; i++)
-        if (!strcmp(ps->cfg->tables[i], table->b))
+        if (!strcmp(ps->cfg->tables[i], table->b)) {
+            if (ps->cfg->reopen_tables)   /* its keys are still checked one by one */
+                return expect_eol(ps);
             return fail(ps, "table [%s] defined twice", table->b);
+        }
     if (list_has(ps->cfg->dotted, ps->cfg->n_dotted, table->b, table->n))
         return fail(ps, "table [%s] was already defined by a dotted key", table->b);
     for (i = 0; i < ps->cfg->n; i++)
@@ -677,8 +681,8 @@ static const char *utf8_invalid(const char *s, const char *end)
 
 /* ── loading ───────────────────────────────────────────────────────── */
 
-recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
-                                   char *err, size_t errlen)
+static recomp_cfg *load_string_flags(const char *text, const char *name, int flags,
+                                     char *err, size_t errlen)
 {
     recomp_cfg *cfg = (recomp_cfg *)calloc(1, sizeof *cfg);
     Buf table = {0};
@@ -692,6 +696,7 @@ recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
         free(cfg);
         return NULL;
     }
+    cfg->reopen_tables = (flags & RCFG_REOPEN_TABLES) != 0;
     memset(&ps, 0, sizeof ps);
     ps.p = text ? text : "";
     ps.end = ps.p + strlen(ps.p);
@@ -730,7 +735,13 @@ recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
     return cfg;
 }
 
-recomp_cfg *recomp_cfg_load_file(const char *path, char *err, size_t errlen)
+recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
+                                   char *err, size_t errlen)
+{
+    return load_string_flags(text, name, 0, err, errlen);
+}
+
+recomp_cfg *recomp_cfg_load_file_flags(const char *path, int flags, char *err, size_t errlen)
 {
     FILE *f = fopen(path, "rb");
     char *text;
@@ -759,9 +770,14 @@ recomp_cfg *recomp_cfg_load_file(const char *path, char *err, size_t errlen)
         free(text);
         return NULL;
     }
-    cfg = recomp_cfg_load_string(text, path, err, errlen);
+    cfg = load_string_flags(text, path, flags, err, errlen);
     free(text);
     return cfg;
+}
+
+recomp_cfg *recomp_cfg_load_file(const char *path, char *err, size_t errlen)
+{
+    return recomp_cfg_load_file_flags(path, 0, err, errlen);
 }
 
 void recomp_cfg_free(recomp_cfg *cfg)

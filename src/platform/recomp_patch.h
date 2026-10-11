@@ -8,7 +8,7 @@
  *
  * which lands in recomp_patch_u32: the value the guest loaded comes back
  * unchanged unless the setting named by `key` currently reads `when`, then
- * `value` does. A host opts a setting in with recomp_patch_enable, naming
+ * `value` does (`when` "!off": the setting is set and reads anything else). A host opts a setting in with recomp_patch_enable, naming
  * the environment variable that carries it; that variable is the one the
  * overlay and settings.toml drive (xbox_settings.h), so a change is seen by
  * the next load, and the environment (RECOMP_SPEED_UNITS=kmh) works with no
@@ -60,6 +60,12 @@ void recomp_patch_set_var(const char *name, double value);
 void recomp_patch_set_var_fn(const char *name, double (*fn)(void));
 int recomp_patch_has_var(const char *name);
 double recomp_patch_var(const char *name);
+/* A "mark" patch (tools/recomp/patches.py): `fn` runs, on the guest's
+ * thread, each time the title reaches a site marked `name`. Call from the
+ * host's main, before the guest runs. recomp_patch_mark is what the
+ * generated code calls; a name nobody registered costs a short loop. */
+void recomp_patch_on_mark(const char *name, void (*fn)(void));
+void recomp_patch_mark(const char *name);
 /* What the generated code calls. Safe from any thread. */
 uint32_t recomp_patch_u32(const char *key, const char *when, uint32_t value,
                           uint32_t loaded);

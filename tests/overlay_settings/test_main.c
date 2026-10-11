@@ -7,6 +7,7 @@
 #include "xbox_settings.h"
 #include "nv2a_backend_common.h"
 #include "recomp_env.h"
+#include "recomp_cfg.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,7 +94,9 @@ int main(void)
         "[input]\n"
         "deadzone = 3277\n"
         "[power]\n"
-        "mode = \"battery\"\n");
+        "mode = \"battery\"\n"
+        "[display]\n"                 /* an older writer's split section */
+        "hud_fix = false\n");
     set_env("RECOMP_SETTINGS", path);
     set_env("RECOMP_AUDIO_VOLUME", "0.25");          /* the user's own */
     set_env("RECOMP_AUDIO_MUTE", NULL);
@@ -113,6 +116,9 @@ int main(void)
     CHECK(getenv("RECOMP_PRESENT_PACING") && !strcmp(getenv("RECOMP_PRESENT_PACING"), "sleep"));
     CHECK(getenv("RECOMP_PRESENT_SPIN_LEAD") && !strcmp(getenv("RECOMP_PRESENT_SPIN_LEAD"), "0"));
     CHECK(!getenv("RECOMP_PRESENT_FILTER"));
+    /* The second [display] table was read, not refused (the whole file would
+     * have been ignored): its key is the user's own. */
+    CHECK(xbox_SettingGet(XS_DISPLAY_HUD_FIX)->user && xbox_SettingValue(XS_DISPLAY_HUD_FIX) == 0);
 
     /* The host's defaults: setenv without replacing, then told. */
     setenv("RECOMP_PRESENT_OVERSCAN", "crop", 0); xbox_SettingsGameDefault("RECOMP_PRESENT_OVERSCAN", "crop");
@@ -176,10 +182,30 @@ int main(void)
     xbox_SettingSet(XS_INPUT_RUMBLE, 9.0);
     CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 2.0);
 
+    xbox_SettingSet(XS_DISPLAY_HUD_FIX, 1);          /* last in the enum, section display */
     xbox_SettingsFlush();
     text = read_file(path);
     CHECK(text != NULL);
     if (text) {
+        /* Each section once, its keys together (hud_fix after the other
+         * display keys, before the next section), and the strict reader
+         * takes the file back. */
+        const char *d = strstr(text, "[display]");
+        const char *a = strstr(text, "[audio]");
+        const char *h = strstr(text, "hud_fix = true");
+        CHECK(d && !strstr(d + 1, "[display]"));
+        CHECK(d && h && h > d);
+        CHECK(h && a && (h < a || a < d));
+        {
+            char err[256];
+            recomp_cfg *c = recomp_cfg_load_file(path, err, sizeof err);
+            CHECK(c != NULL);
+            if (c) {
+                CHECK(recomp_cfg_bool(c, "display.hud_fix", 0) == 1);
+                CHECK(recomp_cfg_choice(c, "display.fit", (const char *const[]){ "letterbox", "fill16x10", NULL }, -1) == 1);
+                recomp_cfg_free(c);
+            }
+        }
         CHECK(strstr(text, "mystery.key = 7"));                  /* kept */
         CHECK(strstr(text, "mode = \"performance\""));
         CHECK(strstr(text, "deadzone = 6554"));
@@ -200,17 +226,23 @@ int main(void)
     text = read_file(path);
     CHECK(text && !strstr(text, "overscan"));
 
-    /* A section is written once, whatever the order of its settings:
-     * display.hud_fix comes after the other sections' settings, and a second
-     * [display] table made the file one the reader refused. */
-    xbox_SettingSet(XS_DISPLAY_HUD_FIX, 1);
-    xbox_SettingsFlush();
-    text = read_file(path);
-    CHECK(text != NULL);
-    if (text) {
-        const char *first = strstr(text, "[display]");
-        CHECK(first && !strstr(first + 1, "[display]"));
-        CHECK(strstr(text, "hud_fix = true") && strstr(text, "fit = \"fill16x10\""));
+    /* The shape an older writer left (a split [display]): the strict reader
+     * refuses it, the settings reader (RCFG_REOPEN_TABLES) takes it; a key
+     * repeated inside it is still an error. */
+    {
+        char err[256];
+        const char *split = "[display]\nfullscreen = true\n[game]\nspeed_units = \"kmh\"\n[display]\nhud_fix = false\n";
+        recomp_cfg *c;
+        write_file(path, split);
+        CHECK(recomp_cfg_load_file(path, err, sizeof err) == NULL && strstr(err, "defined twice"));
+        c = recomp_cfg_load_file_flags(path, RCFG_REOPEN_TABLES, err, sizeof err);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(recomp_cfg_bool(c, "display.fullscreen", 0) == 1 && recomp_cfg_type_of(c, "display.hud_fix") == RCFG_BOOL);
+            recomp_cfg_free(c);
+        }
+        write_file(path, "[display]\nfullscreen = true\n[display]\nfullscreen = false\n");
+        CHECK(recomp_cfg_load_file_flags(path, RCFG_REOPEN_TABLES, err, sizeof err) == NULL);
     }
 
     remove(path);

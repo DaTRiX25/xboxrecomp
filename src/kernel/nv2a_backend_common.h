@@ -1040,6 +1040,22 @@ void nv2a_present_set_fit(int fill);
  * 16:10 panel). src is in frame pixels; returns `whole` as nv2a_present_rect. */
 int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
                         struct nv2a_rect *src, struct nv2a_rect *dst);
+/* A frame's own shape. A host whose title draws some frames for a wider
+ * picture than the configured aspect (its 3D, but not its menus) gives a
+ * function: the frame of that flip number is width:height `fn(flip)`, or 0
+ * for the configured aspect. The backends call nv2a_present_frame(flip)
+ * before nv2a_present_layout for that frame (present thread). Without a
+ * function every layout is what it was. */
+void nv2a_present_frame_aspect_fn(double (*fn)(uint32_t flip));
+void nv2a_present_frame(uint32_t flip);
+/* The shape a new window opens at, when it is not the configured aspect
+ * (0: that one, nv2a_present_width), and the width that gives a src_h-high
+ * frame. Set before the window is made. */
+void nv2a_present_window_aspect(double aspect);
+uint32_t nv2a_present_window_width(uint32_t src_w, uint32_t src_h);
+/* Width:height of the output of the last present (the window's drawable);
+ * 0 before the first, and headless. Any thread. */
+double nv2a_present_output_aspect(void);
 /* The columns of an fw x fh frame the window shows, [x0, x1) in frame
  * pixels: the src of nv2a_present_layout at the current overscan and fit
  * settings and the last present's output size (before the first present, or
@@ -1051,6 +1067,10 @@ void nv2a_present_visible_x(uint32_t fw, uint32_t fh, double *x0, double *x1);
  * layout that keeps the 4:3 margins in a wider picture (the 16:10 fill crops
  * a 16:9 picture's sides, not a 4:3 one's). */
 void nv2a_present_visible_x_at(uint32_t fw, uint32_t fh, int aspect, double *x0, double *x1);
+/* And for a frame of its own shape (width:height `ratio`, as
+ * nv2a_present_frame_aspect_fn answers) at the configured settings: what the
+ * window will show of a frame drawn for that picture. */
+void nv2a_present_visible_x_ratio(uint32_t fw, uint32_t fh, double ratio, double *x0, double *x1);
 /* The output's size as soon as the window exists (the presenter calls this
  * once it has one), so the helpers above do not have to wait for the first
  * present. A present's own size replaces it. */

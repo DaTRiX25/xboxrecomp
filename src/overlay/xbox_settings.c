@@ -45,6 +45,7 @@ static const char *const k_aniso[]    = { "off", "2x", "4x", "8x", "16x", NULL }
 static const char *const k_aniso_env[] = { "1", "2", "4", "8", "16", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
 static const char *const k_units[]    = { "mph", "kmh", NULL };
+static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
@@ -73,6 +74,7 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_ADVANCED_PERF]      = SETTING("advanced.perf_overlay", XS_BOOL, 0, RENV_OVERLAY_PERF, NULL, NULL, 0, 0, 0),
     [XS_GAME_SPEED_UNITS]   = SETTING("game.speed_units", XS_CHOICE, 0, RENV_SPEED_UNITS, k_units, NULL, 0, 0, 0),
     [XS_DISPLAY_HUD_FIX]    = SETTING("display.hud_fix", XS_BOOL, 0, RENV_GFX_HUD_FIX, NULL, NULL, 0, 0, 0),
+    [XS_DISPLAY_ULTRAWIDE]  = SETTING("display.ultrawide", XS_CHOICE, 0, RENV_DISPLAY_ULTRAWIDE, k_ultrawide, NULL, 0, 0, 0),
 };
 
 /* The power mode is two knobs. */
@@ -305,9 +307,25 @@ static void write_value(FILE *f, const xs_setting *s, double v)
     }
 }
 
+/* Is the section of setting i already written by an earlier user setting? */
+static int section_written_before(int i)
+{
+    char a[32], b[32];
+    int j;
+    section_of(s_set[i].key, a, sizeof a);
+    for (j = 0; j < i; j++) {
+        if (!s_set[j].user)
+            continue;
+        section_of(s_set[j].key, b, sizeof b);
+        if (!strcmp(a, b))
+            return 1;
+    }
+    return 0;
+}
+
 void xbox_SettingsFlush(void)
 {
-    char tmp[sizeof s_path + 8], sec[32], last[32];
+    char tmp[sizeof s_path + 8], sec[32];
     FILE *f;
     int i;
 
@@ -325,33 +343,23 @@ void xbox_SettingsFlush(void)
           "# A RECOMP_* environment variable overrides what is here.\n", f);
     for (i = 0; i < s_n_keep; i++)
         fprintf(f, "%s = %s\n", s_keep[i].key, s_keep[i].val);
-    /* One table per section, at its first setting, with every setting of
-     * that section under it: the settings are not in section order (the
-     * guest patches' display.hud_fix and game.speed_units come last), and a
-     * table written twice is a file the reader refuses, so a changed
-     * display.aspect beside display.hud_fix lost every setting at the next
-     * start. */
+    /* One [table] per section, whatever order the enum keeps its keys in: a
+     * second header of the same name is an error for the reader (and for
+     * TOML). A section is written at its first key, with all of its keys. */
     for (i = 0; i < XS_COUNT; i++) {
-        int j, seen = 0;
-        if (!s_set[i].user)
+        int j;
+        if (!s_set[i].user || section_written_before(i))
             continue;
         section_of(s_set[i].key, sec, sizeof sec);
-        for (j = 0; j < i && !seen; j++) {
-            if (s_set[j].user) {
-                section_of(s_set[j].key, last, sizeof last);
-                seen = !strcmp(sec, last);
-            }
-        }
-        if (seen)
-            continue;       /* written under its section's first setting */
         fprintf(f, "\n[%s]\n", sec);
         for (j = i; j < XS_COUNT; j++) {
             const xs_setting *s = &s_set[j];
+            char sj[32];
             const char *name;
             if (!s->user)
                 continue;
-            name = section_of(s->key, last, sizeof last);
-            if (strcmp(sec, last))
+            name = section_of(s->key, sj, sizeof sj);
+            if (strcmp(sec, sj))
                 continue;
             fprintf(f, "%s = ", name);
             /* A setting the environment overrides keeps what the file said. */
@@ -413,7 +421,9 @@ static void load_file(void)
         return;
     }
     fclose(probe);
-    c = recomp_cfg_load_file(s_path, err, sizeof err);
+    /* Reopening a [table] is accepted: the writer used to split a section in
+     * two when its keys were not next to each other in the enum. */
+    c = recomp_cfg_load_file_flags(s_path, RCFG_REOPEN_TABLES, err, sizeof err);
     if (!c) {
         fprintf(stderr, LOGP "%s (file ignored, the next change replaces it)\n", err);
         return;

@@ -110,6 +110,7 @@ extern "C" {
     X(AUDIO_SPEAKERS,    CONFIG, "RECOMP_AUDIO_SPEAKERS",    NULL, "speaker mode: auto (default: 5.1 when the default output has 6+ channels), stereo, 5.1") \
     X(SPEED_UNITS,       CONFIG, "RECOMP_SPEED_UNITS",       NULL, "speed and distance units, for a title whose build has the metric display behind a patch (--patches, recomp_patch.h): mph (default, as shipped) or kmh") \
     X(GFX_HUD_FIX,       CONFIG, "RECOMP_GFX_HUD_FIX",       NULL, "1: the title's 2D HUD keeps its shape in a 16:9 picture, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
+    X(DISPLAY_ULTRAWIDE, CONFIG, "RECOMP_DISPLAY_ULTRAWIDE", NULL, "a picture wider than 16:9 for the title's 3D, for a title whose build has that behind a patch (--patches, recomp_patch.h): off (default, as shipped), 21:9, 32:9, window (the window's own shape)") \
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
     X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \
     X(OVERLAY_TEST,      CONFIG, "RECOMP_OVERLAY_TEST",      NULL, "=file: a test drives the overlay through it, one line each as appended: key <up|down|left|right|enter|esc|f1|pgup|pgdn|del>, pad <a|b|y|up|down|left|right|lb|rb|back+start> (SDL events pushed into the window's loop), shot <path> (the window as presented, BMP), state <path> (the open page's rows as text)") \
@@ -209,6 +210,7 @@ extern "C" {
     X(POKE,              DEBUG, "poke",            "RECOMP_POKE",              "=va:value,...: write guest words") \
     X(WORKERS,           DEBUG, "workers",         "RECOMP_WORKERS",           "=inline: run worker threads inline") \
     X(GUEST_CPUS,        DEBUG, "guest_cpus",      "RECOMP_GUEST_CPUS",        "=all: the title's threads on every host core; =<n>: that core; =token: one at a time by a token, for hosts without thread affinity (macOS) (default: one core, as on the console)") \
+    X(HOST_PRIORITY,     DEBUG, "host_priority",   NULL,                       "Windows: the process's priority class while the title's threads are pinned to one core: above (default), high, normal, or keep (as started); never lowered") \
     X(CS_MODE,           DEBUG, "cs_mode",         "RECOMP_CS_MODE",           "=single: one lock for every guest lock") \
     X(ASYNC_IO,          DEBUG, "async_io",        "RECOMP_ASYNC_IO",          "asynchronous file I/O") \
     X(UNIMPL_TRAP,       DEBUG, "unimpl_trap",     "RECOMP_UNIMPL_TRAP",       "stop at an unimplemented instruction") \
