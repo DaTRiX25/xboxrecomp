@@ -58,6 +58,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "nv2a_vk_core.h"
 #include "nv2a_vk_glsl.h"
@@ -1141,6 +1142,21 @@ static void pc_note(int prewarm, int kind, uint64_t t_start, const char *what)
                 s_pc_kind[kind], what, prewarm ? "pre-warm" : "ack", ms, at);
 }
 
+/* The ack thread missed while the pre-warm thread is still going through the
+ * key list (the first frames of a start, which race it): what it needs is
+ * most likely on its way, so it waits for the pre-warm, up to 3 s, instead
+ * of compiling the same thing beside it; the caller then looks again. Only
+ * at a start (or after a rescan, with the title paused): no draw waits here
+ * once the pre-warm is done. */
+static int s_pc_warming;                /* a pre-warm thread is running (atomic) */
+static void pc_wait_warm(void)
+{
+    uint64_t t0 = now_ns();
+    while (__atomic_load_n(&s_pc_warming, __ATOMIC_ACQUIRE) && now_ns() - t0 < 3000000000ull)
+        usleep(500);
+}
+#define PC_WARMING() __atomic_load_n(&s_pc_warming, __ATOMIC_ACQUIRE)
+
 /* Any thread. */
 static VkShaderModule module_from_glsl(enum nvk_stage stage, const char *src, const char *what)
 {
@@ -1268,6 +1284,12 @@ static VsEntry *vs_cache(void)
     pthread_mutex_lock(&s_pc_mu);
     e = vs_find(hash);
     pthread_mutex_unlock(&s_pc_mu);
+    if (!e && PC_WARMING()) {
+        pc_wait_warm();
+        pthread_mutex_lock(&s_pc_mu);
+        e = vs_find(hash);
+        pthread_mutex_unlock(&s_pc_mu);
+    }
     if (!e) {
         const uint32_t *slots = &v->prog[v->start][0];
         uint16_t inputs = 0;
@@ -1423,6 +1445,12 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     pthread_mutex_lock(&s_pc_mu);
     e = fs_find(hash, &st);
     pthread_mutex_unlock(&s_pc_mu);
+    if (!e && PC_WARMING()) {
+        pc_wait_warm();
+        pthread_mutex_lock(&s_pc_mu);
+        e = fs_find(hash, &st);
+        pthread_mutex_unlock(&s_pc_mu);
+    }
     if (!e) {
         VkShaderModule mod = fs_build(&st, hash, glsl, 0);
         pthread_mutex_lock(&s_pc_mu);
@@ -1701,6 +1729,14 @@ static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
         return s_pso[last].p;
     pthread_mutex_lock(&s_pc_mu);
     i = pso_slot(&k, &found);
+    pthread_mutex_unlock(&s_pc_mu);
+    if (!found && PC_WARMING()) {
+        pc_wait_warm();
+        pthread_mutex_lock(&s_pc_mu);
+        i = pso_slot(&k, &found);
+        pthread_mutex_unlock(&s_pc_mu);
+    }
+    pthread_mutex_lock(&s_pc_mu);
     full = !found && s_pso_n + 1 >= PSO_CAP * 3 / 4;
     pthread_mutex_unlock(&s_pc_mu);
     if (!found) {
@@ -3333,7 +3369,6 @@ static VkPipelineCache pcache_load(void)
 /* ---- the key list and the pre-warm thread ---------------------------------------- */
 
 static pthread_mutex_t s_pcf_mu = PTHREAD_MUTEX_INITIALIZER;   /* s_pcf itself */
-static int      s_pc_warming;           /* a pre-warm thread is running (atomic) */
 static int      s_pc_rescan;            /* asked for while one ran */
 static uint64_t s_pc_warm[3], s_pc_warm_ns;
 static char     s_pc_path[1100], s_pc_ver[256];

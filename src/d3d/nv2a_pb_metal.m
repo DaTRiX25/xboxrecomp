@@ -1317,6 +1317,20 @@ static void pc_note(int prewarm, int kind, uint64_t t_start, const char *what)
                 s_pc_kind[kind], what, prewarm ? "pre-warm" : "ack", ms, at);
 }
 
+/* The ack thread missed while the pre-warm thread is still going through the
+ * key list (the first frames of a start, which race it): what it needs is
+ * most likely on its way, so it waits for the pre-warm, up to 3 s, instead
+ * of compiling the same thing beside it; the caller then looks again. Only
+ * at a start (or after a rescan, with the title paused): no draw waits here
+ * once the pre-warm is done. */
+static int s_pc_warm_done;              /* no pre-warm thread is running (atomic) */
+static void pc_wait_warm(void)
+{
+    uint64_t t0 = pc_now();
+    while (!__atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE) && pc_now() - t0 < 3000000000ull)
+        usleep(500);
+}
+
 /* A pipeline: its two functions (by id) and the blend, colour-mask and
  * depth-format state, which Metal bakes into the pipeline. */
 typedef struct {
@@ -1462,6 +1476,12 @@ static id<MTLRenderPipelineState> pipeline(uint64_t vs_id, id<MTLFunction> vs,
     pthread_mutex_lock(&s_pc_mu);
     i = pso_find(&pk);
     pthread_mutex_unlock(&s_pc_mu);
+    if (i < 0 && !__atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE)) {
+        pc_wait_warm();
+        pthread_mutex_lock(&s_pc_mu);
+        i = pso_find(&pk);
+        pthread_mutex_unlock(&s_pc_mu);
+    }
     if (i < 0) {
         if (!(pso = pso_build(&pk, vs, fs, 0)))
             return nil;
@@ -1926,6 +1946,12 @@ static VsEntry *vs_cache(void)
     pthread_mutex_lock(&s_pc_mu);
     e = vs_find(kid);
     pthread_mutex_unlock(&s_pc_mu);
+    if (!e && !__atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE)) {
+        pc_wait_warm();
+        pthread_mutex_lock(&s_pc_mu);
+        e = vs_find(kid);
+        pthread_mutex_unlock(&s_pc_mu);
+    }
     if (!e) {
         fn = vs_build(slots, (int)len, hash, &inputs, 0);
         pthread_mutex_lock(&s_pc_mu);
@@ -2080,6 +2106,12 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     pthread_mutex_lock(&s_pc_mu);
     e = fs_find(kid, &st);
     pthread_mutex_unlock(&s_pc_mu);
+    if (!e && !__atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE)) {
+        pc_wait_warm();
+        pthread_mutex_lock(&s_pc_mu);
+        e = fs_find(kid, &st);
+        pthread_mutex_unlock(&s_pc_mu);
+    }
     if (!e) {
         fn = fs_build(&st, kid, 0);
         pthread_mutex_lock(&s_pc_mu);
@@ -2112,7 +2144,6 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
 static nv2a_pcache *s_pcf;              /* the key list, or NULL (off) */
 static pthread_mutex_t s_pcf_mu = PTHREAD_MUTEX_INITIALIZER;   /* s_pcf itself */
 static uint64_t     s_pc_loaded[3], s_pc_warm[3], s_pc_warm_ns;
-static int          s_pc_warm_done;     /* no pre-warm thread is running (atomic) */
 static int          s_pc_rescan;        /* asked for while one ran (atomic) */
 static char         s_pc_path[1100], s_pc_ver[256];
 
