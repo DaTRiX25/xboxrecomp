@@ -24,6 +24,7 @@ if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
         d3d8_vsh_glsl.c
         d3d8_combiners_glsl.c
         nv2a_pcache.c
+        nv2a_pcache_psdef.c
         nv2a_pb_d3d11.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
@@ -54,6 +55,7 @@ else()
         d3d8_vsh_glsl.c
         d3d8_combiners_glsl.c
         nv2a_pcache.c
+        nv2a_pcache_psdef.c
     )
     find_package(SDL2 REQUIRED)
     if(WIN32)

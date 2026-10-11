@@ -136,6 +136,23 @@ size_t nv2a_pcache_scan_vsh(const void *image, size_t size,
                             void (*fn)(void *ctx, const uint32_t *slots, uint32_t n),
                             void *ctx);
 
+/* ---- pixel-shader definitions in an executable -------------------------------
+ *
+ * A title's pixel shaders are D3DPIXELSHADERDEF blocks in its executable,
+ * 60 words whose input, output, count and final-combiner words D3D writes
+ * to the NV2A as they are. Calls fn with each combiner state they can lead
+ * to (an NV2ACombinerState as the backends key a fragment shader, `len` its
+ * size): one per way the definition's sampling stages can be bound (off, 2D,
+ * cube), since a stage's mode follows the texture bound to it. Returns the
+ * number of definitions found. A pre-build seeds the key list with them
+ * (type NV2A_PC_FS), so a material the played scenes did not show has its
+ * fragment shader built all the same. States the title sets through the
+ * fixed-function texture stages are not in a definition and are not found.
+ * (nv2a_pcache_psdef.c; needs d3d8_combiners_parse.c.) */
+size_t nv2a_pcache_scan_psdef(const void *image, size_t size,
+                              void (*fn)(void *ctx, const void *state, uint32_t len),
+                              void *ctx);
+
 #ifdef __cplusplus
 }
 #endif
