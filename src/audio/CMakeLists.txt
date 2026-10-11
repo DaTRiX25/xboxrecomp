@@ -17,7 +17,7 @@ target_link_libraries(xbox_dsound PUBLIC platform)
 
 # Windows uses the same Media Foundation stack as xbox_video so ordinary WMA
 # assets can be decoded to PCM without adding another codec dependency.
-if(WIN32)
+if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
     target_link_libraries(xbox_dsound PUBLIC mfplat mfreadwrite mfuuid mf ole32)
 endif()
 

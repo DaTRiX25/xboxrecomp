@@ -9,7 +9,7 @@
  * The guest decides when. A title opens its movie file at the point its own
  * logic reaches the intro; the runtime notices that open and plays that file.
  */
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(XBOXRECOMP_WIN_VULKAN)
 #define COBJMACROS
 #include <windows.h>
 #include "recomp_env.h"

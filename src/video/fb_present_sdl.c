@@ -76,7 +76,7 @@
  * "Xbox Recomp" before the loader has read one. RECOMP_TRACE=title appends
  * FPS and draws, once a second (window_title.h).
  */
-#if !defined(_WIN32)
+#if !defined(_WIN32) || defined(XBOXRECOMP_WIN_VULKAN)
 
 #include <SDL.h>
 #include "recomp_env.h"
@@ -87,7 +87,9 @@
 #include <string.h>
 #include <time.h>
 #include <sched.h>
+#if !defined(_WIN32)
 #include <sys/resource.h>
+#endif
 
 #include "kernel/nv2a_pb_state.h"
 #include "kernel/nv2a_backend_common.h"
@@ -459,15 +461,19 @@ static int start_guest(void)
 {
     pthread_attr_t attr;
     pthread_t th;
+#if !defined(_WIN32)
     struct rlimit rl;
+#endif
     size_t stack = 64u << 20;
     int rc;
 
     /* At least the main thread's stack (8 MB by default), and generously
      * more: lifted code recurses on the native stack. */
+#if !defined(_WIN32)
     if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY
             && rl.rlim_cur > stack)
         stack = (size_t)rl.rlim_cur;
+#endif
 
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, stack);

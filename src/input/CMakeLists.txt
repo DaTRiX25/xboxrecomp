@@ -14,7 +14,7 @@ add_library(xbox_input STATIC
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-if(WIN32)
+if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
     target_link_libraries(xbox_input PUBLIC platform xinput)
 else()
     find_package(SDL2 REQUIRED)
@@ -36,7 +36,7 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_map
 # and focus rules against synthetic events (POSIX).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard
                  ${CMAKE_CURRENT_BINARY_DIR}/input_keyboard)
-if(NOT WIN32)
+if(XR_SDL_HOST)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard_sdl
                      ${CMAKE_CURRENT_BINARY_DIR}/input_keyboard_sdl)
 endif()

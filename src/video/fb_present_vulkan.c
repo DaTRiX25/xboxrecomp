@@ -39,11 +39,13 @@
  * fbv_slot/fbv_upload on the NV2A ack thread (each with its own command
  * pool). Every submit and present holds nvk_queue_lock.
  */
-#if !defined(_WIN32)
+#if !defined(_WIN32) || defined(XBOXRECOMP_WIN_VULKAN)
 
 #include <SDL.h>
 #include <SDL_vulkan.h>
+#if !defined(_WIN32)
 #include <dlfcn.h>
+#endif
 #include <sched.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -256,13 +258,16 @@ static void *waiter_main(void *arg)
 
 int fbv_load_library(char *err, size_t errn)
 {
-    Dl_info di;
     const char *path = NULL;
 
     /* The loader linked into this binary: SDL_Vulkan_CreateSurface must use
-     * the same instance functions as the instance made here. */
+     * the same instance functions as the instance made here. On Windows that
+     * is vulkan-1.dll, which SDL's default load finds already mapped. */
+#if !defined(_WIN32)
+    Dl_info di;
     if (dladdr((void *)&vkGetInstanceProcAddr, &di) && di.dli_fname)
         path = di.dli_fname;
+#endif
     if (SDL_Vulkan_LoadLibrary(path) != 0 && (!path || SDL_Vulkan_LoadLibrary(NULL) != 0)) {
         snprintf(err, errn, "SDL_Vulkan_LoadLibrary(%s): %s", path ? path : "default",
                  SDL_GetError());

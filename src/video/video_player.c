@@ -14,7 +14,7 @@
  * Media Foundation session on one thread, so nothing here touches the guest's
  * execution or its memory.
  */
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(XBOXRECOMP_WIN_VULKAN)
 #define COBJMACROS
 #include <windows.h>
 #include <mfapi.h>

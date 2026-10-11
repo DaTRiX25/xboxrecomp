@@ -5974,7 +5974,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * and for the immediate-mode snapshot alike. */
         for (a = 0; a < NV_VERTEX_ATTRS; a++)
             s_vsh.inl[a][3] = 1.0f;
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(XBOXRECOMP_WIN_VULKAN)
         {   /* RECOMP_PB_BACKEND=d3d11: src/d3d/nv2a_pb_d3d11.c */
             extern void nv2a_pb_d3d11_register_from_env(void);
             nv2a_pb_d3d11_register_from_env();
