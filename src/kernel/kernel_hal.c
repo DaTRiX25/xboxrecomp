@@ -921,7 +921,14 @@ static void xbox_update_tick_count(void)
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER counter;
+    uint64_t skew = xbox_GuestSkewNs();     /* the guest's clock (host_time.h) */
     QueryPerformanceCounter(&counter);
+    if (skew) {
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency(&freq);
+        counter.QuadPart += (LONGLONG)(skew / 1000000000ull) * freq.QuadPart
+            + (LONGLONG)(skew % 1000000000ull) * freq.QuadPart / 1000000000ll;
+    }
     return counter;
 }
 
@@ -988,7 +995,8 @@ VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
     delta = now.QuadPart - s_time_anchor_counts;
     CurrentTime->QuadPart = s_time_anchor_100ns
         + (delta / s_time_freq_counts) * 10000000LL
-        + (delta % s_time_freq_counts) * 10000000LL / s_time_freq_counts;
+        + (delta % s_time_freq_counts) * 10000000LL / s_time_freq_counts
+        + (LONGLONG)(xbox_GuestSkewNs() / 100u);
 }
 
 /* ============================================================================
@@ -1648,7 +1656,7 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
      * scale by 10,000. Resolution is coarser than the real kernel's, but it is
      * monotonic, which is the property callers actually depend on.
      */
-    return (ULONGLONG)GetTickCount64() * 10000ULL;
+    return (ULONGLONG)GetTickCount64() * 10000ULL + xbox_GuestSkewNs() / 100u;
 }
 
 /* ============================================================================
@@ -1690,8 +1698,13 @@ uint64_t xbox_ReadTimeStampCounter(void)
          * first, then the remainder. */
         uint64_t secs = ticks / (uint64_t)freq.QuadPart;
         uint64_t rem  = ticks % (uint64_t)freq.QuadPart;
+        /* On the guest's clock (host_time.h): plus what a run that does
+         * not wait for it has skipped, 0 in any other. */
+        uint64_t skew = xbox_GuestSkewNs();
         return secs * XBOX_TSC_HZ
-             + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
+             + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart
+             + (skew / 1000000000ull) * XBOX_TSC_HZ
+             + (skew % 1000000000ull) * XBOX_TSC_HZ / 1000000000ull;
     }
 }
 

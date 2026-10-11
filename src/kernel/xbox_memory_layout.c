@@ -2023,7 +2023,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * hardware whether or not anyone is asleep. GetTickCount() shares the
          * millisecond unit, so the rate matches. */
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
+                               + g_memory_offset) =
+            GetTickCount() + (uint32_t)(xbox_GuestSkewNs() / 1000000u);
 
         /* Sleep, don't yield. Sleep(0) is sched_yield on macOS and under
          * Wine, and it returns at once when a core is free, so this loop

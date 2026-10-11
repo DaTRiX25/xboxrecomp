@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
 #include "recomp_env.h"           /* RECOMP_GUEST_CPUS */
 #include "platform/android_host.h"  /* the fast core (Android) */
+#include "platform/host_time.h"     /* the guest's clock */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -202,6 +203,15 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         if (diff <= 0)
             return STATUS_SUCCESS; /* Already past */
         ms = (DWORD)(diff / 10000);
+    }
+
+    /* A run that does not wait for the clock (host_time.h): the delay is on
+     * the guest's clock and ends when that has been moved past it. */
+    if (xbox_TimeWarpOn()) {
+        xbox_GuestSleepNs((uint64_t)ms * 1000000u);
+        if (Alertable && SleepEx(0, TRUE) == WAIT_IO_COMPLETION)
+            return STATUS_ALERTED;
+        return STATUS_SUCCESS;
     }
 
     if (Alertable) {

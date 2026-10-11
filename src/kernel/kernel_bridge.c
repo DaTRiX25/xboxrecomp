@@ -2638,7 +2638,7 @@ static int kernel_call_isr(uint32_t vector)
  * up to ~16 ms, so a schedule run on it fires vblanks 4-33 ms apart while
  * still averaging 60 Hz, and a title that does its streaming work once per
  * vblank misses its deadlines on the long gaps. */
-static long long kernel_clock_ms(void)
+static long long kernel_host_ms(void)
 {
     static LARGE_INTEGER freq;
     LARGE_INTEGER now;
@@ -2648,6 +2648,15 @@ static long long kernel_clock_ms(void)
     QueryPerformanceCounter(&now);
     return (long long)(now.QuadPart / freq.QuadPart) * 1000
            + (long long)(now.QuadPart % freq.QuadPart) * 1000 / freq.QuadPart;
+}
+
+/* The same on the guest's clock (host_time.h: the host's, plus what a run
+ * that does not wait has skipped; the same clock without one): what the
+ * kernel's timers are due on. The vblank ack's waits are the host's own
+ * and stay on kernel_host_ms. */
+static long long kernel_clock_ms(void)
+{
+    return kernel_host_ms() + (long long)(xbox_GuestSkewNs() / 1000000u);
 }
 
 /* The vblank acknowledgement, done when the guest gives it.
@@ -2687,7 +2696,7 @@ enum { VBL_ACK_FAST_MS = 2, VBL_ACK_LATE_MS = 1000, VBL_ACK_SLOW_STEP_MS = 16 };
 int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
                        volatile LONG *tick_busy, HANDLE rearm, long *late_ms)
 {
-    long long start = kernel_clock_ms(), now = start;
+    long long start = kernel_host_ms(), now = start;
 
     *late_ms = 0;
     for (;;) {
@@ -2707,7 +2716,7 @@ int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_int
             return XBOX_VBL_ACK_NONE;   /* nobody is waiting on it */
         if (now - start <= VBL_ACK_FAST_MS) {
             SwitchToThread();
-            now = kernel_clock_ms();
+            now = kernel_host_ms();
             continue;
         }
         step = now - start <= VBL_ACK_LATE_MS ? 1 : VBL_ACK_SLOW_STEP_MS;
@@ -2715,7 +2724,7 @@ int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_int
             /* The next vblank: it is that one's ack now. */
             return XBOX_VBL_ACK_REARMED;
         }
-        now = kernel_clock_ms();
+        now = kernel_host_ms();
     }
 }
 
@@ -2732,7 +2741,7 @@ static volatile LONG g_vbl_declined;
  * the ISR has returned and the watch is re-armed. */
 static volatile LONG g_vbl_tick_busy;
 /* When the vblank-ack thread last saw the PCRTC bit acked or down: the low
- * 32 bits of kernel_clock_ms(), compared by unsigned difference. */
+ * 32 bits of kernel_host_ms(), compared by unsigned difference. */
 static volatile LONG g_vbl_ack_seen_ms;
 
 static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
@@ -2751,7 +2760,7 @@ static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
             &BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
             &g_vbl_tick_busy, g_vbl_ack_event, &late_ms);
         if (r != XBOX_VBL_ACK_REARMED)
-            InterlockedExchange(&g_vbl_ack_seen_ms, (LONG)(uint32_t)kernel_clock_ms());
+            InterlockedExchange(&g_vbl_ack_seen_ms, (LONG)(uint32_t)kernel_host_ms());
         if (r == XBOX_VBL_ACK_LATE) {
             InterlockedIncrement(&g_vbl_ack_late);
             if (late_ms > g_vbl_ack_late_max)
@@ -2776,7 +2785,7 @@ int xbox_VblankAckHeld(void)
         return 0;
     if (g_vbl_tick_busy)
         return 1;
-    return (uint32_t)kernel_clock_ms() - (uint32_t)g_vbl_ack_seen_ms
+    return (uint32_t)kernel_host_ms() - (uint32_t)g_vbl_ack_seen_ms
            <= VBL_ACK_LATE_MS;
 }
 
@@ -2790,7 +2799,7 @@ static void kernel_vblank_arm_ack(void)
             InterlockedExchange(&g_vbl_tick_busy, 0);
             return;
         }
-        InterlockedExchange(&g_vbl_ack_seen_ms, (LONG)(uint32_t)kernel_clock_ms());
+        InterlockedExchange(&g_vbl_ack_seen_ms, (LONG)(uint32_t)kernel_host_ms());
         t = CreateThread(NULL, 0, kernel_vblank_ack_thread, NULL, 0, NULL);
         if (!t) {
             CloseHandle(g_vbl_ack_event);
@@ -3036,8 +3045,8 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
     if (late && xbox_ProfOn())
         xbox_ProfCount(XBOX_PROF_SCHED_RESTART, (long long)(late / 1000000u));
     xbox_VblankNextDue(*next_due_ns);   /* before the count a held flip reads */
-    kernel_vblank_count(kernel_clock_ms());
-    xbox_PacingVblank(now_ns);
+    kernel_vblank_count(kernel_host_ms());
+    xbox_PacingVblank(now_ns - xbox_GuestSkewNs());   /* the host's clock */
     if (xbox_LatOn())   /* RECOMP_TRACE=latency: B, the emulated vblank */
         xbox_LatRow('B', xbox_VblankCount(), now_ns, NULL);
     kernel_vblank_raise();
@@ -3409,7 +3418,10 @@ static void kernel_timer_loop_ms(void)
 static void kernel_timer_loop_ns(void)
 {
     const uint64_t ms = 1000000u;
-    uint64_t wait = 10 * ms;
+    uint64_t wait = 10 * ms, wake = 0;
+    /* A run that does not wait for the clock (host_time.h): the sleeps end
+     * when the guest clock is moved to what they wait for. */
+    const int warp = xbox_TimeWarpOn();
 
     xbox_HostTimerThreadInit();
     for (;;) {
@@ -3417,7 +3429,12 @@ static void kernel_timer_loop_ns(void)
         long long now_ms, timer_due;
         int raised, ran, busy, fired;
 
-        if (xbox_ProfOn()) {
+        if (warp) {
+            if (wake)
+                xbox_GuestSleepUntilNs(wake);
+            else
+                xbox_HostSleepNs(wait);
+        } else if (xbox_ProfOn()) {
             long long t0 = xbox_ProfNowUs();
             xbox_HostSleepNs(wait);
             xbox_ProfCount(XBOX_PROF_SLEEP_OVER, xbox_ProfNowUs() - t0
@@ -3426,7 +3443,7 @@ static void kernel_timer_loop_ns(void)
         } else {
             xbox_HostSleepNs(wait);
         }
-        raised = kernel_vblank_tick_ns(xbox_HostNowNs(), &vbl_next);
+        raised = kernel_vblank_tick_ns(xbox_GuestNowNs(), &vbl_next);
         busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
         now_ms = kernel_clock_ms();
         fired = kernel_fire_timers(now_ms, &timer_due);
@@ -3435,7 +3452,7 @@ static void kernel_timer_loop_ns(void)
         if (raised || ran || fired)
             xbox_SpinWake();
 
-        now = xbox_HostNowNs();
+        now = xbox_GuestNowNs();
         target = now + 10 * ms;
         if (vbl_next) {
             /* Behind the grid (a late pass): catch up one vblank per
@@ -3453,6 +3470,7 @@ static void kernel_timer_loop_ns(void)
         if (busy && now + ms < target)
             target = now + ms;
         wait = target > now ? target - now : 0;
+        wake = target;
     }
 }
 
@@ -7364,7 +7382,7 @@ static void bridge_MmGlobalData(void)
 static void bridge_KeInterruptTime(void)
 {
     /* Refresh the 100ns-since-boot counter before handing out the pointer. */
-    ULONGLONG t = (ULONGLONG)GetTickCount64() * 10000ull;
+    ULONGLONG t = (ULONGLONG)GetTickCount64() * 10000ull + xbox_GuestSkewNs() / 100u;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)t;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(t >> 32);
     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME;
@@ -7375,9 +7393,11 @@ static void bridge_KeSystemTime(void)
 {
     /* Refresh the 100ns-since-1601 clock before handing out the pointer. */
     FILETIME ft;
+    ULONGLONG t;
     GetSystemTimeAsFileTime(&ft);
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
+    t = (((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + xbox_GuestSkewNs() / 100u;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = (uint32_t)t;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = (uint32_t)(t >> 32);
     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME;
 }
 
