@@ -168,6 +168,12 @@ static int sb_state(float *fraction, char *text, unsigned n)
     return s_sb && s_sb->poll ? s_sb->poll(fraction, text, n) : XBOX_SHADERS_IDLE;
 }
 
+static int page_rows(int page, struct Row *r);
+
+/* The offer's rows come and go: the selection goes (back) to the build's
+ * row, never to whatever row slid into its place. */
+static void sb_select();
+
 /* The action row's label and the line above it, as the build stands. */
 static void sb_texts()
 {
@@ -186,7 +192,7 @@ static void sb_texts()
         break;
     case XBOX_SHADERS_FAILED:
         snprintf(s_sb_label, sizeof s_sb_label, "Build shaders now");
-        snprintf(s_sb_info, sizeof s_sb_info, "Shaders: the last build stopped (%.120s).", text);
+        snprintf(s_sb_info, sizeof s_sb_info, "Shaders: not finished (%.120s).", text);
         break;
     default:
         snprintf(s_sb_label, sizeof s_sb_label, "Build shaders now");
@@ -266,6 +272,40 @@ static int page_rows(int page, Row *r)
 #undef INFO
 #undef SPK
     return n;
+}
+
+static void value_text(xs_id id, char *out, size_t n);
+
+static void test_state(const char *path)
+{
+    static const char *const kinds[] = { "setting", "action", "info", "speakers" };
+    Row r[16];
+    int n = page_rows(s_page, r);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "open %d\npage %s\noffer %d\npaused %d\n", s_open ? 1 : 0, k_page_name[s_page],
+            s_sb_offer ? 1 : 0, xbox_HostPaused());
+    for (int i = 0; i < n; i++) {
+        char v[96] = "";
+        const char *label = r[i].text;
+        if (r[i].kind == R_SETTING) {
+            label = k_meta[r[i].id].label;
+            value_text(r[i].id, v, sizeof v);
+        }
+        fprintf(f, "%c %s: %s%s%s\n", s_open && i == s_sel[s_page] ? '>' : ' ', kinds[r[i].kind],
+                label ? label : "", v[0] ? " = " : "", v);
+    }
+    fclose(f);
+}
+
+static void sb_select()
+{
+    Row r[16];
+    int n = page_rows(P_GRAPHICS, r);
+    for (int i = 0; i < n; i++)
+        if (r[i].kind == R_ACTION && r[i].action == A_SHADERS)
+            s_sel[P_GRAPHICS] = i;
 }
 
 static bool page_has(int page, xs_id id)
@@ -406,6 +446,7 @@ static void activate(const Row &r)
             else
                 s_sb->start();
             s_sb_offer = false;
+            sb_select();
         } else {
             if (r.action == A_SHADERS_NEVER && s_sb->offer_never)
                 s_sb->offer_never();
@@ -463,7 +504,10 @@ static void set_open(bool on)
             s_sb->cancel();
             fprintf(stderr, LOGP "the shader build is stopped with the overlay\n");
         }
-        s_sb_offer = false;
+        if (s_sb_offer) {
+            s_sb_offer = false;
+            sb_select();
+        }
         mcpx_apu_speaker_test(-1, 0);
         xbox_HostPause(0);
         xbox_InputSetBlocked(0);
@@ -641,10 +685,108 @@ static void collect_steps()
     }
 }
 
+/* ── RECOMP_OVERLAY_TEST: a test drives the overlay ────────────────── */
+
+extern "C" void xbox_HostWindowShot(const char *path);     /* video_player.h */
+
+/* Each line appended to the file is done once: keys and pad buttons go into
+ * the window's event queue as SDL events, so they take the same road as a
+ * real press (xbox_OverlayEvent and the input layer after it); a shot is the
+ * window as presented; a state dump is the open page's rows, the selected
+ * one marked, for a test to assert on. */
+static void test_key(SDL_Keycode sym)
+{
+    SDL_Event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.type = SDL_KEYDOWN;
+    ev.key.state = SDL_PRESSED;
+    ev.key.keysym.sym = sym;
+    SDL_PushEvent(&ev);
+    ev.type = SDL_KEYUP;
+    ev.key.state = SDL_RELEASED;
+    SDL_PushEvent(&ev);
+}
+
+static void test_pad(int button, bool down)
+{
+    SDL_Event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.type = down ? SDL_CONTROLLERBUTTONDOWN : SDL_CONTROLLERBUTTONUP;
+    ev.cbutton.which = 30;            /* no such controller: the overlay only */
+    ev.cbutton.button = (Uint8)button;
+    ev.cbutton.state = down ? SDL_PRESSED : SDL_RELEASED;
+    SDL_PushEvent(&ev);
+}
+
+static void test_state(const char *path);
+
+static void test_poll()
+{
+    static const char *path;
+    static bool checked;
+    static long consumed;
+    static uint32_t next;
+    static const struct { const char *name; SDL_Keycode sym; } keys[] = {
+        {"up", SDLK_UP}, {"down", SDLK_DOWN}, {"left", SDLK_LEFT}, {"right", SDLK_RIGHT},
+        {"enter", SDLK_RETURN}, {"esc", SDLK_ESCAPE}, {"f1", SDLK_F1},
+        {"pgup", SDLK_PAGEUP}, {"pgdn", SDLK_PAGEDOWN}, {"del", SDLK_DELETE},
+    };
+    static const struct { const char *name; int b; } pads[] = {
+        {"a", SDL_CONTROLLER_BUTTON_A}, {"b", SDL_CONTROLLER_BUTTON_B},
+        {"y", SDL_CONTROLLER_BUTTON_Y}, {"up", SDL_CONTROLLER_BUTTON_DPAD_UP},
+        {"down", SDL_CONTROLLER_BUTTON_DPAD_DOWN}, {"left", SDL_CONTROLLER_BUTTON_DPAD_LEFT},
+        {"right", SDL_CONTROLLER_BUTTON_DPAD_RIGHT},
+        {"lb", SDL_CONTROLLER_BUTTON_LEFTSHOULDER}, {"rb", SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
+    };
+    char line[600];
+    FILE *f;
+
+    if (!checked) {
+        checked = true;
+        path = getenv("RECOMP_OVERLAY_TEST");
+        if (path && *path)
+            fprintf(stderr, LOGP "driven by %s\n", path);
+    }
+    if (!path || !*path || (int32_t)(now_ms() - next) < 0)
+        return;
+    next = now_ms() + 30;
+    if (!(f = fopen(path, "rb")))
+        return;
+    /* One line a turn: the events of one are handled before the next. */
+    if (fseek(f, consumed, SEEK_SET) == 0 && fgets(line, sizeof line, f)
+            && strchr(line, '\n')) {
+        consumed += (long)strlen(line);
+        line[strcspn(line, "\r\n")] = 0;
+        fprintf(stderr, LOGP "test: %s\n", line);
+        if (!strncmp(line, "key ", 4)) {
+            for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++)
+                if (!strcmp(line + 4, keys[i].name))
+                    test_key(keys[i].sym);
+        } else if (!strcmp(line, "pad back+start")) {
+            test_pad(SDL_CONTROLLER_BUTTON_BACK, true);
+            test_pad(SDL_CONTROLLER_BUTTON_START, true);
+            test_pad(SDL_CONTROLLER_BUTTON_START, false);
+            test_pad(SDL_CONTROLLER_BUTTON_BACK, false);
+        } else if (!strncmp(line, "pad ", 4)) {
+            for (size_t i = 0; i < sizeof pads / sizeof pads[0]; i++)
+                if (!strcmp(line + 4, pads[i].name)) {
+                    test_pad(pads[i].b, true);
+                    test_pad(pads[i].b, false);
+                }
+        } else if (!strncmp(line, "shot ", 5)) {
+            xbox_HostWindowShot(line + 5);
+        } else if (!strncmp(line, "state ", 6)) {
+            test_state(line + 6);
+        }
+    }
+    fclose(f);
+}
+
 void xbox_OverlayPoll(void)
 {
     if (!s_enabled)
         return;
+    test_poll();
 
     while (s_toggle_i < s_toggle_n && (int32_t)(now_ms() - s_t0_ms - s_toggle_ms[s_toggle_i]) >= 0) {
         s_toggle_i++;
@@ -661,14 +803,9 @@ void xbox_OverlayPoll(void)
     if (!s_sb_offer_checked && s_win && s_sb && (int32_t)(now_ms() - s_t0_ms - 1500) >= 0) {
         s_sb_offer_checked = true;
         if (!s_open && s_sb->offer && s_sb->offer()) {
-            Row r[16];
-            int n;
             s_sb_offer = true;
             s_page = P_GRAPHICS;
-            n = page_rows(P_GRAPHICS, r);
-            for (int i = 0; i < n; i++)
-                if (r[i].kind == R_ACTION && r[i].action == A_SHADERS)
-                    s_sel[P_GRAPHICS] = i;
+            sb_select();
             set_open(true);
             s_sb_offer = true;        /* set_open(false) clears it; opening does not */
             fprintf(stderr, LOGP "first start: offering the shader build\n");
@@ -1109,8 +1246,8 @@ static void build_pages(float fs)
     } else if (rows[sel].kind == R_SPEAKERS) {
         spk_hint(rows[sel].action, hint, sizeof hint);
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_SHADERS && s_sb && s_sb->cost) {
-        snprintf(hint, sizeof hint, "%s The game stays paused while it builds; closing the"
-                 " settings stops it, and it goes on from there next time.", s_sb->cost);
+        snprintf(hint, sizeof hint, "%s Paused meanwhile; closing the settings stops it"
+                 " (it goes on from there next time).", s_sb->cost);
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_SHADERS_LATER) {
         snprintf(hint, sizeof hint, "Asks again at the next start. It is also here, on the Graphics page, at any time.");
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_SHADERS_NEVER) {

@@ -1317,23 +1317,38 @@ static void pc_note(int prewarm, int kind, uint64_t t_start, const char *what)
                 s_pc_kind[kind], what, prewarm ? "pre-warm" : "ack", ms, at);
 }
 
-/* The ack thread missed while the pre-warm thread is still on the pipelines
- * of the key list and their functions (the first frames of a start, which
- * race it): what it needs is most likely on its way, so it waits for that
- * part instead of compiling the same thing beside it, and the caller then
- * looks again. Bounded: 3 s from the pre-warm's start for all such waits
- * together (a list whose compiled code the system has dropped takes longer
- * to build than that; the ack thread then compiles what it needs itself, as
- * without a list). Only at a start, or after a rescan with the title
- * paused: no draw waits here once that part is done. */
+/* The ack thread missed while the start-up pre-warm is still on the
+ * pipelines of the key list and their functions (the first frames of a
+ * start, which race it): what it needs is most likely on its way, so it
+ * waits for that key instead of compiling the same thing beside it
+ * (PC_WAIT: look again every half millisecond until it is there, the
+ * pipelines' part is done, or the time is up).
+ *
+ * Bounded so that it cannot reach gameplay: only the pre-warm the backend
+ * starts with has this part (a later one, after a pre-build has added to the
+ * list, is never waited for), and all waits together end 3 s after it
+ * started, which is 3 s after the title's first draw. Past that the ack
+ * thread compiles what it needs itself, as without a list. Each wait is
+ * logged. */
 static int      s_pc_warm_done;         /* no pre-warm thread is running (atomic) */
-static int      s_pc_warm_urgent;       /* it is on the pipelines' part (atomic) */
+static int      s_pc_warm_urgent;       /* the first one is on the pipelines' part (atomic) */
 static uint64_t s_pc_wait_until;        /* the ack thread's waits end here */
+static uint64_t s_pc_waits, s_pc_wait_ns;
 #define PC_URGENT() __atomic_load_n(&s_pc_warm_urgent, __ATOMIC_ACQUIRE)
-static void pc_wait_warm(void)
+static int pc_wait_more(void)
 {
-    while (PC_URGENT() && pc_now() < __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE))
-        usleep(500);
+    if (!PC_URGENT() || pc_now() >= __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE))
+        return 0;
+    usleep(500);
+    return 1;
+}
+static void pc_waited(uint64_t t0, const char *what)
+{
+    uint64_t t = pc_now();
+    s_pc_waits++;
+    s_pc_wait_ns += t - t0;
+    fprintf(stderr, LOGP "pcache: the ack thread waited %.1f ms for the pre-warm's %s"
+            " at %.3f s\n", (double)(t - t0) / 1e6, what, (double)(t - s_t0_ns) / 1e9);
 }
 
 /* A pipeline: its two functions (by id) and the blend, colour-mask and
@@ -1482,10 +1497,13 @@ static id<MTLRenderPipelineState> pipeline(uint64_t vs_id, id<MTLFunction> vs,
     i = pso_find(&pk);
     pthread_mutex_unlock(&s_pc_mu);
     if (i < 0 && PC_URGENT()) {
-        pc_wait_warm();
-        pthread_mutex_lock(&s_pc_mu);
-        i = pso_find(&pk);
-        pthread_mutex_unlock(&s_pc_mu);
+        uint64_t t0 = pc_now();
+        do {
+            pthread_mutex_lock(&s_pc_mu);
+            i = pso_find(&pk);
+            pthread_mutex_unlock(&s_pc_mu);
+        } while (i < 0 && pc_wait_more());
+        pc_waited(t0, "pipeline");
     }
     if (i < 0) {
         if (!(pso = pso_build(&pk, vs, fs, 0)))
@@ -1952,10 +1970,13 @@ static VsEntry *vs_cache(void)
     e = vs_find(kid);
     pthread_mutex_unlock(&s_pc_mu);
     if (!e && PC_URGENT()) {
-        pc_wait_warm();
-        pthread_mutex_lock(&s_pc_mu);
-        e = vs_find(kid);
-        pthread_mutex_unlock(&s_pc_mu);
+        uint64_t t0 = pc_now();
+        do {
+            pthread_mutex_lock(&s_pc_mu);
+            e = vs_find(kid);
+            pthread_mutex_unlock(&s_pc_mu);
+        } while (!e && pc_wait_more());
+        pc_waited(t0, "vertex function");
     }
     if (!e) {
         fn = vs_build(slots, (int)len, hash, &inputs, 0);
@@ -2112,10 +2133,13 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     e = fs_find(kid, &st);
     pthread_mutex_unlock(&s_pc_mu);
     if (!e && PC_URGENT()) {
-        pc_wait_warm();
-        pthread_mutex_lock(&s_pc_mu);
-        e = fs_find(kid, &st);
-        pthread_mutex_unlock(&s_pc_mu);
+        uint64_t t0 = pc_now();
+        do {
+            pthread_mutex_lock(&s_pc_mu);
+            e = fs_find(kid, &st);
+            pthread_mutex_unlock(&s_pc_mu);
+        } while (!e && pc_wait_more());
+        pc_waited(t0, "fragment function");
     }
     if (!e) {
         fn = fs_build(&st, kid, 0);
@@ -2362,16 +2386,20 @@ static void *pc_prewarm(void *arg)
     return NULL;
 }
 
-/* Starts the pre-warm thread, or has the one running go round again. */
-static void pc_warm_start(void)
+/* Starts the pre-warm thread, or has the one running go round again.
+ * `first`: the one the backend starts with, whose pipelines the ack thread
+ * may wait for (pc_wait_more). */
+static void pc_warm_begin(int first)
 {
     pthread_t th;
     __atomic_store_n(&s_pc_rescan, 1, __ATOMIC_RELEASE);
     if (!__atomic_exchange_n(&s_pc_warm_done, 0, __ATOMIC_ACQ_REL))
         return;                         /* one is running: it will see the flag */
     nv2a_pcache_stat_warming(1);
-    __atomic_store_n(&s_pc_wait_until, pc_now() + 3000000000ull, __ATOMIC_RELEASE);
-    __atomic_store_n(&s_pc_warm_urgent, 1, __ATOMIC_RELEASE);
+    if (first) {
+        __atomic_store_n(&s_pc_wait_until, pc_now() + 3000000000ull, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_pc_warm_urgent, 1, __ATOMIC_RELEASE);
+    }
     if (pthread_create(&th, NULL, pc_prewarm, NULL) == 0) {
         pthread_detach(th);
     } else {
@@ -2379,6 +2407,12 @@ static void pc_warm_start(void)
         nv2a_pcache_stat_warming(0);
         __atomic_store_n(&s_pc_warm_done, 1, __ATOMIC_RELEASE);
     }
+}
+
+/* nv2a_pcache_rescan: the list gained keys (a pre-build in another process). */
+static void pc_warm_start(void)
+{
+    pc_warm_begin(0);
 }
 
 /* With the device up: the tables, the trace, the key list and its
@@ -2435,7 +2469,7 @@ static int pc_start(void)
     nv2a_pcache_set_rescan(pc_warm_start);
     nv2a_pcache_set_seed(pc_put);
     if (nv2a_pcache_count(s_pcf))
-        pc_warm_start();
+        pc_warm_begin(1);
     return 1;
 }
 
@@ -2473,7 +2507,7 @@ static void pc_log(uint64_t presents)
     fprintf(stderr, LOGP "pcache at present #%llu: cached %d vs, %d fs, %d pipelines (max %d);"
             " ack-thread compiles %llu vs + %llu fs + %llu pipelines in %.1f ms (max %.1f,"
             " %llu in the first 10 s); pre-warm %llu + %llu + %llu in %.1f ms (%s);"
-            " evicted %llu + %llu + %llu\n",
+            " evicted %llu + %llu + %llu; start-up waits %llu, %.1f ms\n",
             (unsigned long long)presents, nv, nf, np, s_pc_max,
             (unsigned long long)s_cs.n[0][PC_VS], (unsigned long long)s_cs.n[0][PC_FS],
             (unsigned long long)s_cs.n[0][PC_PSO],
@@ -2484,7 +2518,8 @@ static void pc_log(uint64_t presents)
             (double)(s_cs.ns[1][0] + s_cs.ns[1][1] + s_cs.ns[1][2]) / 1e6,
             __atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE) ? "done" : "running",
             (unsigned long long)s_cs.evicted[PC_VS], (unsigned long long)s_cs.evicted[PC_FS],
-            (unsigned long long)s_cs.evicted[PC_PSO]);
+            (unsigned long long)s_cs.evicted[PC_PSO],
+            (unsigned long long)s_pc_waits, (double)s_pc_wait_ns / 1e6);
     pthread_mutex_unlock(&s_pc_mu);
 }
 
