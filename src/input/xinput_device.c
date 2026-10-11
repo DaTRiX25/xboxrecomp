@@ -341,8 +341,18 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
      * is told to stop. */
     if (port == 0) {
         extern int xbox_AndroidVibration(unsigned left, unsigned right, int pad_can_rumble);
-        if (!xbox_AndroidVibration(rumble_level(v->wLeftMotorSpeed),
-                                   rumble_level(v->wRightMotorSpeed),
+        /* RECOMP_ANDROID_VIBRATION_FLOOR=<0..65535>: the title's motor
+         * speeds under it are silence (its idle hum, lifted by the strength
+         * setting, is otherwise a constant buzz in the hand). Default 0. */
+        static int floor_v = -1;
+        unsigned l = v->wLeftMotorSpeed, r = v->wRightMotorSpeed;
+        if (floor_v < 0) {
+            const char *f = getenv("RECOMP_ANDROID_VIBRATION_FLOOR");
+            floor_v = f ? atoi(f) : 0;
+        }
+        if ((int)l < floor_v) l = 0;
+        if ((int)r < floor_v) r = 0;
+        if (!xbox_AndroidVibration(rumble_level((WORD)l), rumble_level((WORD)r),
                                    SDL_GameControllerHasRumble(c) == SDL_TRUE)) {
             SDL_GameControllerRumble(c, 0, 0, 0);
             pthread_mutex_unlock(&g_pads_lock);
