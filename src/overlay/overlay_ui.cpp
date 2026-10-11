@@ -451,6 +451,7 @@ static void activate(const Row &r)
             if (r.action == A_SHADERS_NEVER && s_sb->offer_never)
                 s_sb->offer_never();
             s_sb_offer = false;
+            sb_select();
             s_back++;                 /* answered: close */
         }
         return;
