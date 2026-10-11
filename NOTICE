@@ -29,6 +29,26 @@ LGPL-2.1-or-later — extracted from xemu
     src/apu/fpconv.h      (c) 2020-2025 Matt Borgerson
     src/nv2a/nv2a_regs.h  NV2A register definitions
                           (c) 2012 espes; 2015 Jannik Vogel
+    src/nv2a/nv2a_core.c  NV2A register handlers, adapted from xemu's
+                          hw/xbox/nv2a/nv2a.c
+                          (c) 2012 espes; 2015 Jannik Vogel;
+                          2018-2025 Matt Borgerson
+    src/nv2a/nv2a_state.h NV2A state, adapted from xemu's
+                          hw/xbox/nv2a/nv2a_int.h
+                          (c) 2012 espes; 2015 Jannik Vogel;
+                          2018-2025 Matt Borgerson
+
+  src/apu/apu_state.h also holds the HRTF filter of xemu's
+  hw/xbox/mcpx/apu/vp/hrtf.h ((c) 2025 Matt Borgerson, the same licence), and
+  two pieces that are NOT under this licence: see "BSD-3-Clause" and
+  "GPL-2.0" below.
+
+  The upstream files say "version 2 of the License, or (at your option) any
+  later version" of the GNU Lesser General Public License; that wording is
+  kept in each file here. src/nv2a/nv2a_core.c and nv2a_state.h carry a short
+  form of it ("LGPL v2+") and build into the xbox_nv2a library, which the
+  toolkit's umbrella target links; a program that calls nothing in it (the
+  Burnout 3 port) ends up without that code.
 
   src/apu/apu_shim.h is this project's own file but is released under the
   same licence, because it exists only to host the extracted APU code.
@@ -48,6 +68,45 @@ LGPL-2.1-or-later — extracted from xemu
   release it was built from (this repository at the release's commit, and
   the build scripts of the program), so that whoever has it can change these
   files and build the program again.
+
+
+BSD-3-Clause — ADPCM decoder from ADPCM-XQ (through xemu)
+--------------------------------------------------------
+
+  https://github.com/dbry/adpcm-xq
+
+  src/apu/apu_state.h, adpcm_decode_block() and its tables: taken from xemu's
+  hw/xbox/mcpx/apu/vp/adpcm.h, which is the ADPCM-XQ decoder,
+  Copyright (c) David Bryant, all rights reserved. Its licence, which must be
+  reproduced with binaries, is LICENSES/ADPCM-XQ-BSD-3-Clause.txt.
+
+
+GPL-2.0 — state variable filter (through xemu)  *** UNRESOLVED ***
+-----------------------------------------------------------------
+
+  src/apu/apu_state.h, the sv_filter struct with setup_svf() and run_svf():
+  taken from xemu's hw/xbox/mcpx/apu/vp/svf.h, whose header reads, in full:
+
+      Adapted from SWH LADSPA Plugins package, modified for xemu
+      Source:  https://github.com/swh/ladspa/blob/master/svf_1214.xml
+      Author:  Steve Harris, andy@vellocet
+      License: GPLv2
+
+  It is used: src/apu/apu_vp.c runs every voice that has its filter enabled
+  through run_svf(), so the code is in every program built on the APU.
+  apu_state.h's own header says LGPL; for these lines that is wrong. GPL-2.0
+  code linked into a program puts the whole program under the GPL's terms
+  when it is distributed, which the MIT and LGPL parts allow but which a
+  program that also contains code that cannot be published as source (a
+  recompiled game) cannot meet. This has to be decided by the project's owner
+  before binaries are distributed: replace the filter with an independent
+  implementation (it is about twenty lines: a Chamberlin state variable
+  filter, widely documented), or leave the voice filter out, or accept the
+  GPL for the whole. Until then this notice says what is there.
+
+  xemu's DSP56300 interpreter (hw/xbox/mcpx/dsp, GPL-2.0-or-later, adapted
+  from Hatari) is NOT in this repository: src/apu/apu_dsp.c is a stand-in
+  written against the LGPL apu.c, with no code from it.
 
 
 Derived algorithms — credited, independently implemented
