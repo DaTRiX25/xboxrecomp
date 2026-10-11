@@ -505,6 +505,13 @@ static int make_swapchain(SDL_Window *win)
                   | (s_sc_color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
+#if defined(__ANDROID__)
+    /* A panel mounted sideways reports a rotation here, and a swapchain made
+     * with it must be drawn rotated. This presenter does not: identity, and
+     * the compositor turns the picture. */
+    if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+        ci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+#endif
     ci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
                       ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
                       : (VkCompositeAlphaFlagBitsKHR)(caps.supportedCompositeAlpha

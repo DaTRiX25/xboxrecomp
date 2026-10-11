@@ -58,9 +58,10 @@ else()
         nv2a_pcache_psdef.c
     )
     find_package(SDL2 REQUIRED)
-    if(WIN32)
-        # Windows + Vulkan: no OpenGL layer (d3d8_gl.c, libepoxy); the
-        # pushbuffer executor draws through nv2a_pb_vulkan.c alone.
+    if(WIN32 OR ANDROID)
+        # Windows + Vulkan, and Android: no OpenGL layer (d3d8_gl.c is desktop
+        # OpenGL 3.3 through libepoxy); the pushbuffer executor draws through
+        # nv2a_pb_vulkan.c alone.
         target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2)
     else()
         find_package(PkgConfig REQUIRED)
@@ -100,6 +101,11 @@ else()
                 # and with llvm-mingw's libc++, linked statically so the .exe
                 # needs no libc++.dll.
                 target_link_libraries(xbox_d3d8 PUBLIC "-Wl,-Bstatic -lc++ -lunwind -Wl,-Bdynamic")
+            elseif(ANDROID)
+                # Built without the optimizer too; the C++ runtime is the
+                # NDK's (ANDROID_STL), which the C++ link brings, and bionic
+                # has no separate libpthread.
+                target_link_libraries(xbox_d3d8 PUBLIC m)
             else()
                 target_link_libraries(xbox_d3d8 PUBLIC SPIRV-Tools-opt SPIRV-Tools stdc++ m pthread)
             endif()

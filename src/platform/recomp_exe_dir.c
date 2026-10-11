@@ -4,6 +4,7 @@
  * macOS: _NSGetExecutablePath, then realpath (it may name a symlink).
  * Windows: GetModuleFileNameA (under Wine a Z:\ path, which fopen takes).
  * Linux and other POSIX: readlink("/proc/self/exe").
+ * Android: RECOMP_ANDROID_DIR, the app's files directory (android_host.h).
  * Anything failing: "." (the working directory, the old behaviour).
  */
 #include "recomp_exe_dir.h"
@@ -67,6 +68,15 @@ static int resolve(char *out, size_t cap)
     }
     strcpy(s_path, out);
     return cut_dir(out);
+#elif defined(__ANDROID__)
+    /* The process image is the system's app_process; the app's own directory
+     * is the one its activity names (android_host.h). No executable path:
+     * an app cannot start itself again. */
+    const char *d = getenv("RECOMP_ANDROID_DIR");
+    if (!d || !*d || strlen(d) >= cap)
+        return 0;
+    strcpy(out, d);
+    return 1;
 #else
     ssize_t n = readlink("/proc/self/exe", out, cap - 1);
     if (n <= 0)

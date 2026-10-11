@@ -49,7 +49,14 @@ else()
     # pulls in <pthread.h> first (win32_compat.h) settles it for the whole
     # file, so a #define in one .c is too late for the others. Every target
     # that links the platform layer gets it on the command line.
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR ANDROID)
         target_compile_definitions(platform PUBLIC _GNU_SOURCE)
     endif()
+endif()
+
+# Android: the host's directories, stdout/stderr to logcat, the fast core
+# (android_host.h). liblog is the NDK's.
+if(ANDROID)
+    target_sources(recomp_env PRIVATE android_host.c)
+    target_link_libraries(recomp_env PUBLIC log)
 endif()
