@@ -20,6 +20,12 @@
  *    "spin" instead (a busy-wait for the GPU, say). A running thread
  *    anywhere else is in host code reached from the title ("host": kernel
  *    HLE, MMIO traps, spin-wait lowering); a blocked one is "wait".
+ *    A sample is worth the time since the sampler's previous pass, not the
+ *    period it asked to sleep: a pass takes its own time (every thread is
+ *    stopped and read) and a sleep overshoots, so passes were 0.66 ms apart
+ *    on an M5 and each counted as 0.5 ms, and every column read 24% low
+ *    (BO-102: the menu film's decode 1.70 ms a frame where `sample` had
+ *    2.14). A thread's columns now add up to the frame.
  *
  * The lifted function under a PC is found by a sorted table of every
  * function recomp_lookup knows, built once from the XBE's own section
@@ -133,13 +139,16 @@ static int s_nspin;
 static unsigned s_period_us = 500;
 static int s_nosample;              /* frametime_us=0: no sampler thread */
 
-/* Per-frame sample counts, by bucket: the sampler adds, the flip takes.
- * s_mcount: the guest-main thread's alone. s_runq_ns / s_mrunq_ns: time
+/* Per-frame sampled time in microseconds, by bucket: the sampler adds, the
+ * flip takes. s_mcount: the guest-main thread's alone. s_pass_us: what one
+ * sample of the current pass is worth, the time since the pass before it
+ * (the Linux handler reads it on the sampled thread). s_runq_ns / s_mrunq_ns: time
  * runnable but not running (Linux schedstat), summed / main only. */
 static volatile LONG s_count[B_COUNT];
 static volatile LONG s_mcount[B_COUNT];
 static volatile LONG s_nthreads;
 static volatile LONG s_main_slot = -1;
+static volatile LONG s_pass_us = 500;
 #if defined(__linux__)
 static volatile int64_t s_runq_ns, s_mrunq_ns;
 #endif
@@ -149,15 +158,16 @@ static volatile int64_t s_runq_ns, s_mrunq_ns;
 #define HS_FRAMES 12
 typedef struct { int n; uintptr_t pc[HS_FRAMES]; } HostStack;
 static FILE *s_hout;
-static unsigned s_host_min = 8;    /* samples: frametime_host_ms / period */
+static unsigned s_host_min = 4000; /* microseconds: frametime_host_ms */
 static HostStack s_hs[HS_MAX];
 static volatile LONG s_hs_n;
 
 static void count_sample(LONG slot, int b)
 {
-    InterlockedIncrement(&s_count[b]);
+    LONG us = s_pass_us;
+    InterlockedExchangeAdd(&s_count[b], us);
     if (slot >= 0 && slot == s_main_slot)
-        InterlockedIncrement(&s_mcount[b]);
+        InterlockedExchangeAdd(&s_mcount[b], us);
 }
 
 #if defined(__APPLE__)
@@ -451,8 +461,16 @@ static DWORD WINAPI sampler_main(LPVOID p)
 static void *sampler_main(void *p)
 #endif
 {
+    uint64_t prev = 0;
     (void)p;
     for (;;) {
+        /* What this pass's samples stand for: the time since the last one.
+         * A pass that came very late (the process was stopped) is not a
+         * tenth of a second of anything. */
+        uint64_t now = xbox_HostNowNs();
+        uint64_t us = prev ? (now - prev + 500u) / 1000u : s_period_us;
+        prev = now;
+        s_pass_us = (LONG)(us > 100000u ? 100000u : us);
         sample_once();
         xbox_HostSleepNs((uint64_t)s_period_us * 1000u);
     }
@@ -504,7 +522,7 @@ static int frametime_on(void)
                     fprintf(stderr, "  [FRAMETIME] cannot write %s\n", hp);
             }
             if (ms > 0)
-                s_host_min = (unsigned)(ms * 1000.0 / s_period_us + 0.5);
+                s_host_min = (unsigned)(ms * 1000.0 + 0.5);
             if (!s_host_min)
                 s_host_min = 1;
         }
@@ -622,7 +640,7 @@ static void host_dump(uint32_t flip, double frame_ms, LONG mhost)
     if (mhost < (LONG)s_host_min || n <= 0)
         return;
     fprintf(s_hout, "flip %u frame_ms %.2f m_host %.2f stacks %ld\n", flip, frame_ms,
-            mhost * (s_period_us / 1000.0), (long)n);
+            mhost / 1000.0, (long)n);
     memset(seen, 0, sizeof seen);
     for (i = 0; i < n; i++) {
         int count = 1, k;
@@ -675,7 +693,7 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
     uint64_t now, cpu, self, frame, d_hold, d_scan;
     LONG c[B_COUNT], m[B_COUNT];
     int64_t rq, mrq;
-    double per;
+    const double per = 1.0 / 1000.0;   /* the buckets hold microseconds */
     int b;
 
     if (s_state == 0 || (s_state < 0 && !frametime_on()))
@@ -704,7 +722,6 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
     frame = now - last;
     d_hold = hold - p_hold;
     d_scan = scan - p_scan;
-    per = s_period_us / 1000.0;
     fprintf(s_out, "%u,%.3f,%.3f,%u,%d,%.3f,%.3f,%.3f,%.3f,%.3f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%ld,%.3f,"
             "%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f\n",
