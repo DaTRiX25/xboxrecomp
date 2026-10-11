@@ -13,6 +13,16 @@
  * overlay and settings.toml drive (xbox_settings.h), so a change is seen by
  * the next load, and the environment (RECOMP_SPEED_UNITS=kmh) works with no
  * overlay built. A setting nobody enabled is "off": the title runs as it was.
+ *
+ * A float patch ("load_f32", "store_f32") carries an expression instead of a
+ * constant:
+ *
+ *     xmm0.f[0] = RECOMP_PATCH_F32("display.hud_fix", "1", 0,
+ *         ((double)(xmm0.f[0]) + (640.0 - 480.0 * recomp_patch_var("aspect")) / 2.0),
+ *         xmm0.f[0]);
+ *
+ * evaluated only while the setting is on. The names in it are the host's:
+ * recomp_patch_set_var("aspect", 16.0 / 9.0), before the guest runs.
  */
 #ifndef RECOMP_PATCH_H
 #define RECOMP_PATCH_H
@@ -38,6 +48,14 @@ int recomp_patch_enabled(const char *key);
 enum { RECOMP_PATCH_LATCH_SET = 1, RECOMP_PATCH_LATCH_USE = 2 };
 uint32_t recomp_patch_u32_latch(const char *key, const char *when,
                                 uint32_t value, uint32_t loaded, int mode);
+/* The setting `key` reads `when` (mode 0), with the latch (mode 1 set, 2
+ * use). What the float patches' macros test before they evaluate. */
+int recomp_patch_on(const char *key, const char *when, int mode);
+/* A name a float patch's expression may read. Call from the host's main,
+ * before the guest runs. A name nobody set reads 0. */
+void recomp_patch_set_var(const char *name, double value);
+int recomp_patch_has_var(const char *name);
+double recomp_patch_var(const char *name);
 /* What the generated code calls. Safe from any thread. */
 uint32_t recomp_patch_u32(const char *key, const char *when, uint32_t value,
                           uint32_t loaded);

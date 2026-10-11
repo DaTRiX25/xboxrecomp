@@ -64,6 +64,7 @@ typedef enum {
     XS_POWER_MODE,
     XS_ADVANCED_PERF,
     XS_GAME_SPEED_UNITS,     /* an opt-in guest patch (recomp_patch.h) */
+    XS_DISPLAY_HUD_FIX,      /* another: the HUD's shape in 16:9 */
     XS_COUNT
 } xs_id;
 

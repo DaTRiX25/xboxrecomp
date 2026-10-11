@@ -522,7 +522,35 @@ HUD is made, and its number every frame): a `use` site follows what the last
 `set` site sampled, so a change mid-race shows whole at the next set-up
 instead of as 171 "mph".
 
-A listed site that is not a 32-bit register load, or that no lifted body
+A float goes by `"kind": "load_f32"` (after `movss xmm, [mem]`, or a 32-bit
+`mov reg, [mem]` that carries a float as bits) or `"store_f32"` (after
+`movss [mem], xmm` / `mov [mem], reg`: the stored float is rewritten, for a
+value whose register has other uses). Its value is an `"expr"`, arithmetic
+over numbers, `loaded` (the float the instruction moved) and names the host
+sets with `recomp_patch_set_var` before the guest runs, because a layout
+value depends on the picture's shape:
+
+```json
+{"va": "0x00053858", "kind": "load_f32", "setting": "display.hud_fix",
+ "when": "1", "expr": "loaded + (640 - 480 * aspect) / 2"}
+```
+
+```c
+xmm0 = XMM_SCALAR(MEMF(0x3A7964)); /* movss */
+xmm0.f[0] = RECOMP_PATCH_F32("display.hud_fix", "1", 0,
+    ((double)(xmm0.f[0]) + (640.0 - 480.0 * recomp_patch_var("aspect")) / 2.0),
+    xmm0.f[0]);
+```
+
+The expression is parsed by the recompiler (nothing unparsed reaches the
+generated code), evaluated in double, and only while the setting is on.
+`"if": {"reg": "edi", "in": ["0x60EA14", "0x60EA84"]}` limits a site in
+shared code to the objects whose address the register holds there (Burnout
+3's 2D scene code serves the HUD, the menus and the loading screen; the
+patch is for the two HUD scenes). `display.hud_fix` (`RECOMP_GFX_HUD_FIX=1`)
+is the second overlay row of this kind.
+
+A listed site that is not the shape its kind names, or that no lifted body
 contains, fails the run; the report is `patches.json` in `-o`. Without the
 flag the output is unchanged. Tests: `tools/recomp/test_patches.py`.
 
