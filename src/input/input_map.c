@@ -133,6 +133,31 @@ static void finish(XBOX_GAMEPAD *g)
     g->bAnalogButtons[XBOX_BUTTON_RTRIGGER] = trigger_dz(g->bAnalogButtons[XBOX_BUTTON_RTRIGGER], dz);
 }
 
+static volatile int s_face_nintendo;
+
+void xbox_InputSetFaceLayoutNintendo(int on) { s_face_nintendo = on != 0; }
+int  xbox_InputFaceLayoutNintendo(void)     { return s_face_nintendo; }
+
+void xbox_InputMirrorFaceXInput(XBOX_HOST_XINPUT_GAMEPAD *pad)
+{
+    uint16_t b = pad->wButtons, o = (uint16_t)(b & ~(XBOX_XI_A | XBOX_XI_B | XBOX_XI_X | XBOX_XI_Y));
+    if (b & XBOX_XI_A) o |= XBOX_XI_B;
+    if (b & XBOX_XI_B) o |= XBOX_XI_A;
+    if (b & XBOX_XI_X) o |= XBOX_XI_Y;
+    if (b & XBOX_XI_Y) o |= XBOX_XI_X;
+    pad->wButtons = o;
+}
+
+void xbox_InputMirrorFaceSdl(XBOX_HOST_SDL_GAMEPAD *pad)
+{
+    uint8_t t = pad->button[XBOX_SDL_BUTTON_A];
+    pad->button[XBOX_SDL_BUTTON_A] = pad->button[XBOX_SDL_BUTTON_B];
+    pad->button[XBOX_SDL_BUTTON_B] = t;
+    t = pad->button[XBOX_SDL_BUTTON_X];
+    pad->button[XBOX_SDL_BUTTON_X] = pad->button[XBOX_SDL_BUTTON_Y];
+    pad->button[XBOX_SDL_BUTTON_Y] = t;
+}
+
 void xbox_InputMapXInput(const XBOX_HOST_XINPUT_GAMEPAD *in, XBOX_GAMEPAD *out)
 {
     memset(out, 0, sizeof *out);

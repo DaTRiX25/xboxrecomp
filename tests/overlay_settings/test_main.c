@@ -30,6 +30,8 @@ static struct nv2a_host_opts st_opts;
 void xbox_InputSetDeadzone(int dz) { st_deadzone = dz; }
 void xbox_InputSetTriggerDeadzone(int dz) { st_trigger = dz; }
 void xbox_InputSetRumbleGain(double g) { st_rumble = g; }
+static int st_face;
+void xbox_InputSetFaceLayoutNintendo(int on) { st_face = on; }
 void xbox_PacingSetMode(int m) { st_pacing = m; }
 void xbox_PacingSetSpinLead(uint64_t ns) { st_lead = ns; }
 void nv2a_present_set_overscan(int c) { st_overscan = c; }
@@ -246,6 +248,12 @@ int main(void)
         write_file(path, "[display]\nfullscreen = true\n[display]\nfullscreen = false\n");
         CHECK(recomp_cfg_load_file_flags(path, RCFG_REOPEN_TABLES, err, sizeof err) == NULL);
     }
+
+    /* The face-button layout reaches the input layer as it is set. */
+    xbox_SettingSet(XS_INPUT_FACE_LAYOUT, 1);
+    CHECK(st_face == 1);
+    xbox_SettingReset(XS_INPUT_FACE_LAYOUT);
+    CHECK(st_face == 0);
 
     remove(path);
     fprintf(stderr, "overlay_settings: %d checks, %d failed\n", s_checks, s_fail);

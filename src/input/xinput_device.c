@@ -44,6 +44,8 @@ static DWORD xi_get_state(DWORD port, XBOX_INPUT_STATE *out)
         return rc;
     memcpy(&pad, &xi.Gamepad, sizeof pad);
     out->dwPacketNumber = xi.dwPacketNumber;
+    if (xbox_InputFaceLayoutNintendo())
+        xbox_InputMirrorFaceXInput(&pad);
     xbox_InputMapXInput(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
 }
@@ -282,6 +284,8 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
         pad.axis[a] = SDL_GameControllerGetAxis(c, (SDL_GameControllerAxis)a);
     pthread_mutex_unlock(&g_pads_lock);
     out->dwPacketNumber = ++g_packet[port];
+    if (xbox_InputFaceLayoutNintendo())
+        xbox_InputMirrorFaceSdl(&pad);
     xbox_InputMapSdl(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
 }

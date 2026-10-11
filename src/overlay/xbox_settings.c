@@ -48,6 +48,7 @@ static const char *const k_aniso[]    = { "off", "2x", "4x", "8x", "16x", NULL }
 static const char *const k_aniso_env[] = { "1", "2", "4", "8", "16", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
 static const char *const k_units[]    = { "mph", "kmh", NULL };
+static const char *const k_face[]     = { "xbox", "nintendo", NULL };
 #if defined(__ANDROID__)
 static const char *const k_vibration[] = { "auto", "controller", "device", "off", NULL };
 #endif
@@ -82,6 +83,7 @@ static xs_setting s_set[XS_COUNT] = {
     /* 0..3: gain x sqrt(speed), clamped to full (xinput_device.c). A weak
      * motor (a handheld's own vibrator) wants more than a pad's. */
     [XS_INPUT_RUMBLE]       = SETTING("input.rumble", XS_FLOAT, 0, RENV_INPUT_RUMBLE_GAIN, NULL, NULL, 0, 3, 1),
+    [XS_INPUT_FACE_LAYOUT]  = SETTING("input.face_layout", XS_CHOICE, 0, RENV_INPUT_FACE_LAYOUT, k_face, NULL, 0, 0, 0),
     [XS_POWER_MODE]         = SETTING("power.mode", XS_CHOICE, XS_VIRTUAL, RENV_COUNT, k_power, NULL, 0, 0, 0),
     [XS_ADVANCED_PERF]      = SETTING("advanced.perf_overlay", XS_BOOL, 0, RENV_OVERLAY_PERF, NULL, NULL, 0, 0, 0),
     [XS_GAME_SPEED_UNITS]   = SETTING("game.speed_units", XS_CHOICE, 0, RENV_SPEED_UNITS, k_units, NULL, 0, 0, 0),
@@ -273,6 +275,9 @@ static void apply(xs_id id)
         break;
     case XS_INPUT_RUMBLE:
         xbox_InputSetRumbleGain(v);
+        break;
+    case XS_INPUT_FACE_LAYOUT:
+        xbox_InputSetFaceLayoutNintendo(v != 0.0);
         break;
     case XS_POWER_MODE: {
         const char *p, *l;
@@ -605,6 +610,7 @@ void xbox_SettingsFinish(void)
     /* What nothing else reads at start. */
     apply_audio();
     xbox_InputSetRumbleGain(s_set[XS_INPUT_RUMBLE].value);
+    xbox_InputSetFaceLayoutNintendo(s_set[XS_INPUT_FACE_LAYOUT].value != 0.0);
 }
 
 /* ── access ────────────────────────────────────────────────────────── */

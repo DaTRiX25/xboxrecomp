@@ -114,6 +114,17 @@ extern const size_t xbox_input_map_count;
 
 /* Map one host pad to the guest gamepad (every field of *out is written).
  * Sticks go through xbox_InputApplyDeadzone() with xbox_InputDeadzone(). */
+/* The face buttons' layout (input.face_layout, the overlay's Input page):
+ * a pad printed the Nintendo way has A on the right and B below, X above and
+ * Y on the left, where the Xbox layout has B, A, Y and X. With the Nintendo
+ * layout on, A and B and X and Y change places as the host pad is read, so
+ * the button printed A is the title's A. Pure helpers, for both host
+ * structures; scripted input never passes through them. */
+void xbox_InputSetFaceLayoutNintendo(int on);
+int  xbox_InputFaceLayoutNintendo(void);
+void xbox_InputMirrorFaceXInput(XBOX_HOST_XINPUT_GAMEPAD *pad);
+void xbox_InputMirrorFaceSdl(XBOX_HOST_SDL_GAMEPAD *pad);
+
 void xbox_InputMapXInput(const XBOX_HOST_XINPUT_GAMEPAD *in, XBOX_GAMEPAD *out);
 void xbox_InputMapSdl(const XBOX_HOST_SDL_GAMEPAD *in, XBOX_GAMEPAD *out);
 
