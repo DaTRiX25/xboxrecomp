@@ -137,6 +137,7 @@ extern "C" {
     X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip") \
     X(PCACHE_TRACE,      TRACE, "pcache",          NULL,                       "pipeline cache: each shader/pipeline compile (thread, ms), the pre-warm summary; =<file>: also one CSV line per flip (t_ms, interval_ms, compiles)") \
     X(VK_PROF,           TRACE, "vk_prof",         NULL,                       "Vulkan flip cost every 300 flips: frame waits, write-backs, submits, GPU time") \
+    X(VK_FRAME,          TRACE, "vk_frame",        NULL,                       "=<file>: Vulkan backend, one CSV line per flip: draws, render passes (cleared, loaded, resumed on a target already drawn that frame, empty), queue submits by reason, time in submits, timeline polls, waits and the flip's steps, GPU time from timestamp queries") \
     X(VK_PRESENT_LOG,    TRACE, "vk_present",      NULL,                       "=<file>: Vulkan window, one CSV line per present and per frame displayed (present_wait)") \
     X(POST_GPU,          TRACE, "post_gpu",        NULL,                       "window presenter: each post-process pass's GPU time (FXAA, SMAA's three, CAS) and the scale and overlay's, averaged every 300 presents (Metal; Vulkan: the post passes together)") \
     X(VK_TRACE,          TRACE, "vk",              NULL,                       "Vulkan render-target events, pipeline and shader compiles") \
