@@ -285,6 +285,13 @@ void nv2a_pb_set_flip_hook(void (*fn)(uint32_t flip));
  * which decides by what it finds which flips are worth a picture. 0 when
  * there is no frame to write. */
 int nv2a_pb_dump_frame(const char *path);
+/* The same from any other thread (the bug report, xbox_report.h): asks the
+ * executor for the frame it presented last and waits up to timeout_ms for
+ * it. The executor writes it at its next flip, or at once while it holds
+ * for a pause (kernel_pause.h), so a paused title's frame is the one on
+ * screen. 1 when `path` was written; 0 when no flip came in time or there
+ * was no frame. One request at a time. */
+int nv2a_pb_capture_frame(const char *path, unsigned timeout_ms);
 
 /* One batch, at SET_BEGIN_END(0).
  *

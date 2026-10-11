@@ -968,6 +968,44 @@ static void (*s_flip_hook)(uint32_t flip);
 void nv2a_pb_set_flip_hook(void (*fn)(uint32_t flip)) { s_flip_hook = fn; }
 int nv2a_pb_dump_frame(const char *path) { return write_present_bmp(path); }
 
+/* nv2a_pb_capture_frame (nv2a_pb_state.h): a request another thread leaves
+ * for the executor. 0 idle, 1 asked, 4 being written, 2 written, 3 no frame. */
+static char s_capture_path[1300];
+static volatile LONG s_capture_state;
+
+static void capture_service(void)
+{
+    if (s_capture_state != 1 || InterlockedCompareExchange(&s_capture_state, 4, 1) != 1)
+        return;
+    InterlockedExchange(&s_capture_state, write_present_bmp(s_capture_path) ? 2 : 3);
+}
+
+int nv2a_pb_capture_frame(const char *path, unsigned timeout_ms)
+{
+    static volatile LONG busy;
+    uint64_t until = xbox_HostNowNs() + (uint64_t)timeout_ms * 1000000u;
+    LONG st;
+
+    if (!path || strlen(path) >= sizeof s_capture_path
+            || InterlockedCompareExchange(&busy, 1, 0) != 0)
+        return 0;
+    snprintf(s_capture_path, sizeof s_capture_path, "%s", path);
+    xbox_HostPauseHoldFn(capture_service);
+    InterlockedExchange(&s_capture_state, 1);
+    while (s_capture_state == 1 && xbox_HostNowNs() < until)
+        xbox_HostSleepNs(2000000u);
+    /* Timed out: take the request back. If the executor has just claimed
+     * it, the file is being written: that is a result, wait for it. */
+    if (InterlockedCompareExchange(&s_capture_state, 0, 1) != 1) {
+        until = xbox_HostNowNs() + 2000000000u;
+        while (s_capture_state == 4 && xbox_HostNowNs() < until)
+            xbox_HostSleepNs(2000000u);
+    }
+    st = InterlockedExchange(&s_capture_state, 0);
+    InterlockedExchange(&busy, 0);
+    return st == 2;
+}
+
 int nv2a_pb_dump_at_listed(uint32_t flip)
 {
     static uint32_t last_flip = 0xFFFFFFFFu;
@@ -6390,6 +6428,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         dump_at_flip(s_gpu.flips);
         if (s_flip_hook)
             s_flip_hook(s_gpu.flips);
+        capture_service();      /* a frame asked for by nv2a_pb_capture_frame */
         /* RECOMP_FB_DUMP_FLIPS=<n>: with RECOMP_FB_DUMP, the finished frame
          * at every nth flip that drew something (up to 200), so a run leaves
          * whole frames behind rather than only the mid-frame 3D dumps. */

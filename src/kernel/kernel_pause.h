@@ -47,6 +47,27 @@ void xbox_HostPauseHold(void);
  * thread; a read racing the executor may see one stale entry. */
 int  xbox_HostFlipTimes(uint64_t *ns, int max);
 
+/* The session's frame times, flip to flip, counted at every flip (a pause is
+ * a gap, not a frame). Cheap enough to be always on: one histogram slot a
+ * flip. For the bug report (xbox_report.h). */
+typedef struct xbox_flip_stats {
+    uint64_t flips;           /* flips since start */
+    uint64_t intervals;       /* frame times counted */
+    uint32_t pauses;
+    double   span_s;          /* first flip to last */
+    double   mean_ms, p50_ms, p90_ms, p95_ms, p99_ms, max_ms;
+    uint32_t late;            /* longer than 1.5 x the median */
+    uint32_t over[5];         /* longer than 20, 25, 34, 50, 100 ms */
+    uint32_t recent;          /* of the last frames (the flip ring): */
+    double   recent_p50_ms, recent_p95_ms, recent_max_ms;
+} xbox_flip_stats;
+void xbox_HostFlipStats(xbox_flip_stats *out);
+
+/* fn() is called by the executor while it holds for a pause, every tick and
+ * outside the lock: work that must run on the executor's thread while the
+ * title is stopped (a frame capture for the bug report). One; NULL: none. */
+void xbox_HostPauseHoldFn(void (*fn)(void));
+
 /* fn(paused) is called, after the flag changes, on every xbox_HostPause that
  * changes it. At most 4; call before the guest starts. */
 void xbox_HostPauseListener(void (*fn)(int paused));
