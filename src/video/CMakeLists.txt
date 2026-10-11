@@ -22,6 +22,8 @@ else()
         # Vulkan on Windows: the FMV player (Media Foundation) is not built, as
         # on the POSIX hosts; main.c's pthread/dlfcn needs come from mingw.
         target_compile_definitions(xbox_video PUBLIC XBOXRECOMP_WIN_VULKAN=1)
+        # winpthreads (pthread_*, sched_yield, clock_gettime) from llvm-mingw.
+        target_link_libraries(xbox_video PUBLIC pthread)
     endif()
     if(XBOXRECOMP_HAVE_VULKAN)
         # The window's Vulkan swapchain for the Vulkan backend.
