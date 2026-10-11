@@ -1066,11 +1066,104 @@ void xbox_OverlayShutdown(void)
     xbox_SettingsFlush();
 }
 
+/* ── the colours ───────────────────────────────────────────────────── */
+
+/* Every colour the overlay draws comes from one of these tables; nothing
+ * below names a number. "game" is the main menu's own scheme (sampled from
+ * its front end: ink-navy panels, steel-blue rules and accent, pale blue
+ * text, the title red); "classic" is the earlier neutral grey and orange.
+ * RECOMP_OVERLAY_THEME=classic picks the second; there is no setting for it
+ * (a compile-time table plus that variable). Colours only. */
+struct Rgb { uint8_t r, g, b; };
+
+struct Theme {
+    const char *name;
+    Rgb scrim;          /* over the game, behind the panel */
+    Rgb panel;          /* the settings window */
+    Rgb edge;           /* the window's outline; border 0 = none */
+    float border;       /* its width in points */
+    Rgb rule;           /* thin separators */
+    Rgb sel_fill;       /* the selected row's wash (alpha sel_fill_a) */
+    float sel_fill_a;
+    Rgb sel_bar;        /* the selected row's left bar */
+    Rgb tab_on, tab_on_text, tab_text, tab_hint;
+    Rgb text;           /* labels */
+    Rgb text_hi;        /* the selected row's label and the values */
+    Rgb text_dim;       /* locked rows, hints, the key line */
+    Rgb text_info;      /* info rows */
+    Rgb action;         /* action rows */
+    Rgb track, track_off, fill, fill_dim, knob, on_accent;
+    Rgb warn;           /* a locked row's reason, the restart note */
+    Rgb notice_bg, notice_text;     /* the red scripted-input banner */
+    Rgb toast_bg, toast_text;       /* the "Preparing shaders" line */
+    Rgb perf_bg, perf_text, perf_text2, perf_good, perf_warn, perf_bad, perf_line;
+};
+
+static const Theme k_theme_game = {
+    "game",
+    {0x00, 0x00, 0x00},             /* scrim: black */
+    {0x16, 0x1d, 0x26},             /* panel: the menu body navy */
+    {0x5a, 0x99, 0xc0}, 1.0f,       /* edge: the steel-blue rule */
+    {0x3f, 0x4d, 0x5d},             /* rule: the grid line */
+    {0x5a, 0x99, 0xc0}, 0.24f,      /* selected wash: steel blue */
+    {0xc4, 0x1c, 0x1c},             /* selected bar: the title crimson */
+    {0x5a, 0x99, 0xc0}, {0x0f, 0x13, 0x19}, {0xac, 0xd4, 0xfc}, {0x82, 0x96, 0xab},
+    {0xac, 0xd4, 0xfc},             /* text: the menu entries */
+    {0xff, 0xff, 0xff},             /* hi: the lit entry */
+    {0x82, 0x96, 0xab},             /* dim: derived, a desaturated step of the entries */
+    {0x5a, 0x99, 0xc0},             /* info: the footer blue */
+    {0xd4, 0xe4, 0xfc},             /* action */
+    {0x2f, 0x39, 0x42}, {0x3f, 0x4d, 0x5d}, {0x5a, 0x99, 0xc0}, {0x4a, 0x5a, 0x6a},
+    {0xd4, 0xe4, 0xfc}, {0x0f, 0x13, 0x19},
+    {0xff, 0x8a, 0x80},             /* warn: the title red, lifted to read as text */
+    {0x94, 0x0c, 0x14}, {0xff, 0xff, 0xff},     /* notice: the title red band */
+    {0x11, 0x15, 0x1a}, {0xd4, 0xe4, 0xfc},     /* toast: the header/footer plate */
+    {0x0f, 0x13, 0x19}, {0xe6, 0xf0, 0xff}, {0xac, 0xd4, 0xfc},
+    {0x5c, 0xb0, 0x1a}, {0xe8, 0xc8, 0x46}, {0xe8, 0x48, 0x40}, {0xd4, 0xe4, 0xfc},
+};
+
+static const Theme k_theme_classic = {
+    "classic",
+    {0, 0, 0},
+    {18, 18, 20},
+    {0, 0, 0}, 0.0f,
+    {51, 51, 53},
+    {255, 120, 20}, 0.22f,
+    {255, 140, 30},
+    {255, 140, 30}, {20, 14, 8}, {190, 190, 198}, {120, 120, 128},
+    {240, 240, 244},
+    {255, 255, 255},
+    {130, 130, 136},
+    {160, 160, 168},
+    {255, 190, 120},
+    {60, 60, 66}, {70, 70, 76}, {255, 140, 30}, {110, 110, 116},
+    {250, 250, 252}, {20, 14, 8},
+    {240, 170, 90},
+    {120, 30, 20}, {255, 240, 230},
+    {18, 18, 20}, {235, 235, 240},
+    {8, 8, 10}, {255, 255, 255}, {190, 190, 195},
+    {90, 210, 120}, {235, 200, 70}, {235, 90, 80}, {255, 255, 255},
+};
+
+static const Theme *T = &k_theme_game;
+
+static void theme_pick()
+{
+    const char *e = getenv("RECOMP_OVERLAY_THEME");
+    T = e && !strcmp(e, "classic") ? &k_theme_classic : &k_theme_game;
+}
+
 /* ── drawing ───────────────────────────────────────────────────────── */
 
-static ImU32 col(int r, int g, int b, float a = 1.0f)
+static ImU32 col(Rgb c, float a = 1.0f)
 {
-    return IM_COL32(r, g, b, (int)(a * s_alpha * 255.0f));
+    return IM_COL32(c.r, c.g, c.b, (int)(a * s_alpha * 255.0f));
+}
+
+/* Always drawn whole: the perf graph and the notices do not fade. */
+static ImU32 solid(Rgb c, float a = 1.0f)
+{
+    return IM_COL32(c.r, c.g, c.b, (int)(a * 255.0f));
 }
 
 static void accent_style()
@@ -1078,9 +1171,10 @@ static void accent_style()
     ImGuiStyle &st = ImGui::GetStyle();
     ImGui::StyleColorsDark(&st);
     st.WindowRounding = 10.0f;
-    st.WindowBorderSize = 0.0f;
+    st.WindowBorderSize = T->border;
     st.ScrollbarRounding = 6.0f;
-    st.Colors[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.07f, 0.08f, 0.96f);
+    st.Colors[ImGuiCol_WindowBg] = ImVec4(T->panel.r / 255.0f, T->panel.g / 255.0f, T->panel.b / 255.0f, 0.96f);
+    st.Colors[ImGuiCol_Border] = ImVec4(T->edge.r / 255.0f, T->edge.g / 255.0f, T->edge.b / 255.0f, 0.8f);
     st.Colors[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
 }
 
@@ -1096,6 +1190,7 @@ bool overlay_core_init(bool vulkan)
     /* Navigation is the overlay's own (see the top); ImGui is the renderer
      * and the mouse. */
     io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
+    theme_pick();
     accent_style();
     bool ok = vulkan ? ImGui_ImplSDL2_InitForVulkan(s_win) : ImGui_ImplSDL2_InitForMetal(s_win);
     if (!ok) {
@@ -1171,9 +1266,9 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
     if (tw2 > tw) tw = tw2;
     const float w = tw + 2 * pad > fs * 15.0f ? tw + 2 * pad : fs * 15.0f;
     ImVec2 a = origin, b(origin.x + w, origin.y + h);
-    dl->AddRectFilled(a, b, IM_COL32(8, 8, 10, 200), fs * 0.5f);
-    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f), IM_COL32(255, 255, 255, 255), l1);
-    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + fs * 1.15f), IM_COL32(190, 190, 195, 255), l2);
+    dl->AddRectFilled(a, b, solid(T->perf_bg, 200 / 255.0f), fs * 0.5f);
+    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f), solid(T->perf_text), l1);
+    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + fs * 1.15f), solid(T->perf_text2), l2);
 
     /* Bars: the last 120 flip intervals against a 50 ms ceiling; the line
      * is one frame at 60 Hz. */
@@ -1184,13 +1279,13 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
         float v = iv[m - 1 - i];
         float f = v / 50.0f;
         if (f > 1.0f) f = 1.0f;
-        ImU32 c = v <= 17.5f ? IM_COL32(90, 210, 120, 255)
-                : v <= 25.0f ? IM_COL32(235, 200, 70, 255) : IM_COL32(235, 90, 80, 255);
+        ImU32 c = v <= 17.5f ? solid(T->perf_good)
+                : v <= 25.0f ? solid(T->perf_warn) : solid(T->perf_bad);
         float x1 = gx + gw - i * bw;
         dl->AddRectFilled(ImVec2(x1 - bw + 0.5f, gy1 - gh * f), ImVec2(x1, gy1), c);
     }
     float ly = gy1 - gh * (16.667f / 50.0f);
-    dl->AddLine(ImVec2(gx, ly), ImVec2(gx + gw, ly), IM_COL32(255, 255, 255, 90));
+    dl->AddLine(ImVec2(gx, ly), ImVec2(gx + gw, ly), solid(T->perf_line, 90 / 255.0f));
 }
 
 /* ── the pages ─────────────────────────────────────────────────────── */
@@ -1212,17 +1307,17 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     ImGui::PopID();
 
     if (sel)
-        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + rh), col(255, 120, 20, 0.22f), fs * 0.35f);
+        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.35f);
     if (sel)
-        dl->AddRectFilled(p, ImVec2(p.x + fs * 0.22f, p.y + rh), col(255, 140, 30), fs * 0.11f);
+        dl->AddRectFilled(p, ImVec2(p.x + fs * 0.22f, p.y + rh), col(T->sel_bar), fs * 0.11f);
 
     const float ty = p.y + (rh - fs) * 0.5f;
     if (r.kind == R_INFO) {
-        dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(160, 160, 168), r.text);
+        dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(T->text_info), r.text);
         return;
     }
     if (r.kind == R_ACTION) {
-        dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(255, 190, 120), r.text);
+        dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(T->action), r.text);
         return;
     }
     if (r.kind == R_SPEAKERS) {
@@ -1232,15 +1327,15 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         const float bw = fs * 3.0f, gap = fs * 0.35f, bh = fs * 1.4f;
         float bx = p.x + width - fs * 0.8f - 6 * bw - 5 * gap;
         const float by = p.y + (rh - bh) * 0.5f;
-        dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(240, 240, 244), r.text);
+        dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(sel ? T->text_hi : T->text), r.text);
         for (int k = 0; k < 6; k++, bx += bw + gap) {
             bool lit = playing == k && (via != 0) == (r.action == 0);
             ImVec2 a(bx, by), b(bx + bw, by + bh);
-            dl->AddRectFilled(a, b, lit ? col(255, 140, 30) : col(60, 60, 66), bh * 0.3f);
+            dl->AddRectFilled(a, b, lit ? col(T->fill) : col(T->track), bh * 0.3f);
             if (sel && s_spk_sel[r.action] == k)
-                dl->AddRect(a, b, col(255, 255, 255), bh * 0.3f, 0, fs * 0.12f);
+                dl->AddRect(a, b, col(T->text_hi), bh * 0.3f, 0, fs * 0.12f);
             float tw = ImGui::CalcTextSize(k_spk_short[k]).x;
-            dl->AddText(ImVec2(bx + (bw - tw) * 0.5f, ty), lit ? col(20, 14, 8) : col(240, 240, 244),
+            dl->AddText(ImVec2(bx + (bw - tw) * 0.5f, ty), lit ? col(T->on_accent) : col(T->text),
                         k_spk_short[k]);
             if (*clicked && mp.x >= a.x && mp.x < b.x) {
                 s_spk_sel[r.action] = k;
@@ -1259,7 +1354,7 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         snprintf(lab, sizeof lab, "%s  (restart)", m.label);
     else
         snprintf(lab, sizeof lab, "%s", m.label);
-    dl->AddText(ImVec2(p.x + fs * 0.8f, ty), dim ? col(130, 130, 136) : col(240, 240, 244), lab);
+    dl->AddText(ImVec2(p.x + fs * 0.8f, ty), dim ? col(T->text_dim) : col(sel ? T->text_hi : T->text), lab);
 
     const float vx1 = p.x + width - fs * 0.8f;
     if (s->type == XS_INT || s->type == XS_FLOAT) {
@@ -1269,10 +1364,10 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         const float bx1 = vx1 - fs * 4.4f, bx0 = bx1 - bw, by = p.y + (rh - bh) * 0.5f;
         double t = (s->value - s->min) / (s->max - s->min);
         t = t < 0 ? 0 : t > 1 ? 1 : t;
-        dl->AddRectFilled(ImVec2(bx0, by), ImVec2(bx1, by + bh), col(60, 60, 66), bh * 0.5f);
+        dl->AddRectFilled(ImVec2(bx0, by), ImVec2(bx1, by + bh), col(T->track), bh * 0.5f);
         dl->AddRectFilled(ImVec2(bx0, by), ImVec2(bx0 + bw * (float)t, by + bh),
-                          dim ? col(110, 110, 116) : col(255, 140, 30), bh * 0.5f);
-        dl->AddText(ImVec2(vx1 - tw, ty), dim ? col(130, 130, 136) : col(255, 255, 255), v);
+                          dim ? col(T->fill_dim) : col(T->fill), bh * 0.5f);
+        dl->AddText(ImVec2(vx1 - tw, ty), dim ? col(T->text_dim) : col(T->text_hi), v);
         if (drag_t && ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::IsItemActive()) {
             double f = (ImGui::GetIO().MousePos.x - bx0) / bw;
             *drag_t = f < 0 ? 0 : f > 1 ? 1 : f;
@@ -1281,18 +1376,18 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         char t[128];
         snprintf(t, sizeof t, sel && !dim ? "<  %s  >" : "%s", v);
         float tw = ImGui::CalcTextSize(t).x;
-        dl->AddText(ImVec2(vx1 - tw, ty), dim ? col(130, 130, 136) : col(255, 255, 255), t);
+        dl->AddText(ImVec2(vx1 - tw, ty), dim ? col(T->text_dim) : col(T->text_hi), t);
     } else {
         const float pw = fs * 3.0f, ph = fs * 1.4f;
         const float px = vx1 - pw, py = p.y + (rh - ph) * 0.5f;
         bool on = s->value != 0.0;
         dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-                          on && !dim ? col(255, 140, 30) : col(70, 70, 76), ph * 0.5f);
+                          on && !dim ? col(T->fill) : col(T->track_off), ph * 0.5f);
         float kx = on ? px + pw - ph * 0.5f : px + ph * 0.5f;
-        dl->AddCircleFilled(ImVec2(kx, py + ph * 0.5f), ph * 0.38f, col(250, 250, 252));
+        dl->AddCircleFilled(ImVec2(kx, py + ph * 0.5f), ph * 0.38f, col(T->knob));
         const char *txt = on ? "On" : "Off";
         float tw = ImGui::CalcTextSize(txt).x;
-        dl->AddText(ImVec2(px - tw - fs * 0.6f, ty), dim ? col(130, 130, 136) : col(255, 255, 255), txt);
+        dl->AddText(ImVec2(px - tw - fs * 0.6f, ty), dim ? col(T->text_dim) : col(T->text_hi), txt);
     }
 }
 
@@ -1303,7 +1398,7 @@ static void build_pages(float fs)
     const ImVec2 disp = io.DisplaySize;
 
     /* Dim the game. */
-    bg->AddRectFilled(ImVec2(0, 0), disp, col(0, 0, 0, 0.55f));
+    bg->AddRectFilled(ImVec2(0, 0), disp, col(T->scrim, 0.55f));
 
     float pw = fs * 44.0f, ph = fs * 28.0f;
     if (pw > disp.x * 0.94f) pw = disp.x * 0.94f;
@@ -1336,14 +1431,14 @@ static void build_pages(float fs)
             ImGui::PopID();
             bool on = i == s_page;
             if (on)
-                dl->AddRectFilled(ImVec2(x, p.y), ImVec2(x + tw, p.y + th), col(255, 140, 30), fs * 0.35f);
+                dl->AddRectFilled(ImVec2(x, p.y), ImVec2(x + tw, p.y + th), col(T->tab_on), fs * 0.35f);
             dl->AddText(ImVec2(x + fs * 0.7f, p.y + (th - fs) * 0.5f),
-                        on ? col(20, 14, 8) : col(190, 190, 198), k_page_name[i]);
+                        on ? col(T->tab_on_text) : col(T->tab_text), k_page_name[i]);
             x += tw + fs * 0.25f;
         }
         const char *hint = pad_hints() ? "LB / RB" : "PgUp / PgDn";
         float hw = ImGui::CalcTextSize(hint).x;
-        dl->AddText(ImVec2(p.x + pw - fs * 2.0f - hw, p.y + (th - fs) * 0.5f), col(120, 120, 128), hint);
+        dl->AddText(ImVec2(p.x + pw - fs * 2.0f - hw, p.y + (th - fs) * 0.5f), col(T->tab_hint), hint);
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + th + fs * 0.5f));
     }
 
@@ -1475,19 +1570,19 @@ static void build_pages(float fs)
 
     {
         ImVec2 p = ImGui::GetCursorScreenPos();
-        dl->AddLine(ImVec2(p.x, p.y + fs * 0.2f), ImVec2(p.x + avail.x, p.y + fs * 0.2f), col(255, 255, 255, 0.14f));
+        dl->AddLine(ImVec2(p.x, p.y + fs * 0.2f), ImVec2(p.x + avail.x, p.y + fs * 0.2f), col(T->rule));
         float y = p.y + fs * 0.5f;
         if (hint[0])
-            dl->AddText(ImGui::GetFont(), fs, ImVec2(p.x, y), hint_locked ? col(240, 170, 90) : col(180, 180, 188),
+            dl->AddText(ImGui::GetFont(), fs, ImVec2(p.x, y), hint_locked ? col(T->warn) : col(T->text_dim),
                         hint, nullptr, wrap_w);
         y += hint_h + fs * 0.3f;
         if (xbox_SettingsNeedRestart())
-            dl->AddText(ImVec2(p.x, y), col(240, 200, 90), "Restart the game for the changes marked (restart) to apply.");
+            dl->AddText(ImVec2(p.x, y), col(T->warn), "Restart the game for the changes marked (restart) to apply.");
         y += fs * 1.3f;
         const char *keys = pad_hints()
             ? "D-pad  select / change      A  toggle      Y  default      B  close"
             : "Arrows  select / change      Enter  toggle      Del  default      Esc  close";
-        dl->AddText(ImVec2(p.x, y), col(110, 110, 118), keys);
+        dl->AddText(ImVec2(p.x, y), col(T->text_dim), keys);
     }
     ImGui::End();
     ImGui::PopStyleVar(2);
@@ -1538,8 +1633,8 @@ bool overlay_begin_frame()
         const float tw = ImGui::CalcTextSize("Preparing shaders...").x;
         const ImVec2 p((disp.x - tw) * 0.5f, disp.y * 0.72f);
         dl->AddRectFilled(ImVec2(p.x - fs, p.y - fs * 0.5f), ImVec2(p.x + tw + fs, p.y + fs * 1.5f),
-                          IM_COL32(18, 18, 20, 235), fs * 0.5f);
-        dl->AddText(p, IM_COL32(235, 235, 240, 255), text);
+                          solid(T->toast_bg, 235 / 255.0f), fs * 0.5f);
+        dl->AddText(p, solid(T->toast_text), text);
     }
     if (scripted) {
         /* Top centre, out of the HUD's way. */
@@ -1549,8 +1644,8 @@ bool overlay_begin_frame()
         const float tw = ImGui::CalcTextSize(text).x;
         const ImVec2 p((disp.x - tw) * 0.5f, fs * 1.2f);
         dl->AddRectFilled(ImVec2(p.x - fs, p.y - fs * 0.5f), ImVec2(p.x + tw + fs, p.y + fs * 1.5f),
-                          IM_COL32(120, 30, 20, 235), fs * 0.5f);
-        dl->AddText(p, IM_COL32(255, 240, 230, 255), text);
+                          solid(T->notice_bg, 235 / 255.0f), fs * 0.5f);
+        dl->AddText(p, solid(T->notice_text), text);
     }
     if (s_open || s_alpha > 0.0f) {
         /* A closing overlay still draws, fading. */
