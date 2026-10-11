@@ -825,6 +825,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             }
         }
     }
+    /* The output's shape, for whoever lays something out by the visible
+     * picture before the first present (nv2a_present_visible_x). */
+    {
+        int ww = 0, wh = 0;
+        SDL_GetWindowSize(win, &ww, &wh);
+        if (ww > 0 && wh > 0)
+            nv2a_present_note_output((uint32_t)ww, (uint32_t)wh);
+    }
     if (s_vk) {
         fprintf(stderr, "[PRESENT] window up: Vulkan swapchain (zero-copy), vsync %s;"
                 " guest runs on a pthread\n", vsync ? "on" : "off");
