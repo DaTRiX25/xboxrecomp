@@ -180,6 +180,8 @@ int main(void)
     CHECK(!xbox_SettingsNeedRestart());
     /* A value is clamped to its range. */
     xbox_SettingSet(XS_INPUT_RUMBLE, 9.0);
+    CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 3.0);     /* the range ends at 3 */
+    xbox_SettingSet(XS_INPUT_RUMBLE, 2.0);
     CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 2.0);
 
     xbox_SettingSet(XS_DISPLAY_HUD_FIX, 1);          /* last in the enum, section display */

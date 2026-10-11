@@ -103,7 +103,7 @@ title's defaults when those change. Keys it does not know are kept.
 | `display.ultrawide` (`off`, `21:9`, `32:9`, `window`) | `RECOMP_DISPLAY_ULTRAWIDE` | live, from the title's next 3D set-up; Display page, only when the title enabled a guest patch for it |
 | `display.hud_fix` (bool) | `RECOMP_GFX_HUD_FIX` | live, shown whole from the title's next HUD set-up; Display page, only when the title enabled a guest patch for it |
 | `input.deadzone`, `input.trigger_deadzone` | `RECOMP_PAD_DEADZONE`, `RECOMP_PAD_TRIGGER_DEADZONE` | yes |
-| `input.rumble` (strength, 0 off) | `RECOMP_INPUT_RUMBLE_GAIN` | yes |
+| `input.rumble` (strength, 0 to 3, 0 off; motor = min(1, strength x sqrt(speed))) | `RECOMP_INPUT_RUMBLE_GAIN` | yes |
 | `power.mode` (`stock`, `performance`, `battery`) | `RECOMP_PRESENT_PACING` + `RECOMP_PRESENT_SPIN_LEAD` | yes |
 | `advanced.perf_overlay` | `RECOMP_OVERLAY_PERF` | yes |
 
