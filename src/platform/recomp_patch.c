@@ -37,8 +37,7 @@ int recomp_patch_enabled(const char *key)
     return 0;
 }
 
-uint32_t recomp_patch_u32_latch(const char *key, const char *when,
-                                uint32_t value, uint32_t loaded, int mode)
+int recomp_patch_on(const char *key, const char *when, int mode)
 {
     int i, n = s_n;
     for (i = 0; i < n; i++)
@@ -49,13 +48,74 @@ uint32_t recomp_patch_u32_latch(const char *key, const char *when,
                 s_en[i].latched = on;
             else if (mode == RECOMP_PATCH_LATCH_USE && s_en[i].latched >= 0)
                 on = s_en[i].latched;
-            return on ? value : loaded;
+            return on;
         }
-    return loaded;
+    return 0;
+}
+
+uint32_t recomp_patch_u32_latch(const char *key, const char *when,
+                                uint32_t value, uint32_t loaded, int mode)
+{
+    return recomp_patch_on(key, when, mode) ? value : loaded;
 }
 
 uint32_t recomp_patch_u32(const char *key, const char *when, uint32_t value,
                           uint32_t loaded)
 {
     return recomp_patch_u32_latch(key, when, value, loaded, 0);
+}
+
+/* The names a float patch's expression reads. Set before the guest runs,
+ * read from its threads: a slot is written whole before the count moves. */
+#define VAR_MAX 8
+static struct {
+    const char *name;
+    double value;
+    double (*fn)(void);            /* a live value, or NULL: `value` */
+} s_var[VAR_MAX];
+static volatile int s_nvar;
+
+static void var_set(const char *name, double value, double (*fn)(void))
+{
+    int i;
+    for (i = 0; i < s_nvar; i++)
+        if (!strcmp(s_var[i].name, name)) {
+            s_var[i].value = value;
+            s_var[i].fn = fn;
+            return;
+        }
+    if (s_nvar == VAR_MAX)
+        return;
+    s_var[s_nvar].name = name;
+    s_var[s_nvar].value = value;
+    s_var[s_nvar].fn = fn;
+    s_nvar = s_nvar + 1;
+}
+
+void recomp_patch_set_var(const char *name, double value)
+{
+    var_set(name, value, NULL);
+}
+
+void recomp_patch_set_var_fn(const char *name, double (*fn)(void))
+{
+    var_set(name, 0.0, fn);
+}
+
+int recomp_patch_has_var(const char *name)
+{
+    int i, n = s_nvar;
+    for (i = 0; i < n; i++)
+        if (s_var[i].name == name || !strcmp(s_var[i].name, name))
+            return 1;
+    return 0;
+}
+
+double recomp_patch_var(const char *name)
+{
+    int i, n = s_nvar;
+    for (i = 0; i < n; i++)
+        if (s_var[i].name == name || !strcmp(s_var[i].name, name))
+            return s_var[i].fn ? s_var[i].fn() : s_var[i].value;
+    return 0.0;
 }

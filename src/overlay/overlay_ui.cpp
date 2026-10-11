@@ -140,6 +140,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits all the time (steadiest, hottest). Balanced sleeps and spins only the last 8 ms before each frame (steady 60). Battery saver only sleeps (coolest, an occasional small dip). Watts measured on a Steam Deck.", 1, FMT_PLAIN, n_power, 0 },
     /* XS_ADVANCED_PERF */      { "Performance overlay", "FPS and frame-time graph in the corner. Greetings to the DF team!", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speedometer and distances in km/h and metres instead of mph and miles: the game's own metric display, which the US disc keeps for its other languages. A change shows from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
+    /* XS_DISPLAY_HUD_FIX */    { "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On: the HUD keeps its 4:3 shape and stays at the screen edges, by the game's own layout values. A change shows from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
 };
 
 /* R_SPEAKERS: the speaker test, six buttons in a row (action: 0 through
@@ -167,6 +168,8 @@ static int page_rows(int page, Row *r)
         SET(XS_DISPLAY_OVERSCAN); SET(XS_DISPLAY_FIT);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_SPEED_UNITS)->key))
             SET(XS_GAME_SPEED_UNITS);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_HUD_FIX)->key))
+            SET(XS_DISPLAY_HUD_FIX);
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_GRAPHICS:

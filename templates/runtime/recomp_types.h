@@ -553,6 +553,27 @@ uint32_t recomp_patch_u32_latch(const char *key, const char *when,
 /* mode 1: this load samples the setting; 2: it follows the last sample. */
 #define RECOMP_PATCH_U32_LATCH(key, when, value, loaded, mode) \
     recomp_patch_u32_latch((key), (when), (value), (loaded), (mode))
+/* The float kinds (load_f32, store_f32): `expr` is a double expression of
+ * the moved float and of the host's names (recomp_patch_var), evaluated only
+ * while the setting is on. _BITS is the same for a float a `mov` carries in
+ * a general register or stores from one. */
+int recomp_patch_on(const char *key, const char *when, int mode);
+double recomp_patch_var(const char *name);
+static inline float RECOMP_F32_OF_BITS(uint32_t bits) {
+    union { uint32_t u; float f; } v;
+    v.u = bits;
+    return v.f;
+}
+static inline uint32_t RECOMP_BITS_OF_F32(float f) {
+    union { uint32_t u; float f; } v;
+    v.f = f;
+    return v.u;
+}
+#define RECOMP_PATCH_F32(key, when, mode, expr, loaded) \
+    (recomp_patch_on((key), (when), (mode)) ? (float)(expr) : (loaded))
+#define RECOMP_PATCH_F32_BITS(key, when, mode, expr, loaded) \
+    (recomp_patch_on((key), (when), (mode)) \
+        ? RECOMP_BITS_OF_F32((float)(expr)) : (loaded))
 
 /* x86 port I/O (`in`/`out`). width is 1, 2 or 4 bytes. The runtime models
  * the ports titles are known to read (the field pin at 0x80C0) and logs the
