@@ -961,6 +961,11 @@ static void dump_at_parse(void)
     dump_at_parse_text(e, 0);
 }
 
+/* nv2a_pb_set_flip_hook (nv2a_pb_state.h). */
+static void (*s_flip_hook)(uint32_t flip);
+void nv2a_pb_set_flip_hook(void (*fn)(uint32_t flip)) { s_flip_hook = fn; }
+int nv2a_pb_dump_frame(const char *path) { return write_present_bmp(path); }
+
 int nv2a_pb_dump_at_listed(uint32_t flip)
 {
     static uint32_t last_flip = 0xFFFFFFFFu;
@@ -6378,6 +6383,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             last_draws = s_gpu.draws;
         }
         dump_at_flip(s_gpu.flips);
+        if (s_flip_hook)
+            s_flip_hook(s_gpu.flips);
         /* RECOMP_FB_DUMP_FLIPS=<n>: with RECOMP_FB_DUMP, the finished frame
          * at every nth flip that drew something (up to 200), so a run leaves
          * whole frames behind rather than only the mid-frame 3D dumps. */
