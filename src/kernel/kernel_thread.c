@@ -527,6 +527,24 @@ DWORD_PTR xbox_GuestCpuMask(void)
                         " use (mask %#lx); taking the lowest\n", mode,
                 (unsigned long)proc);
     }
+#if defined(_WIN32)
+    /* Not core 0 or its SMT sibling: Windows steers most device interrupts
+     * and DPCs (GPU, audio, USB, NIC) and a good deal of other processes'
+     * work at the first core, and a title thread pinned there stalled for
+     * 20-90 ms at a time (the guest ran 1.6 % of 60 Hz race frames late on
+     * a Ryzen 7 5800X + RX 9060 XT, none in 20 000 on another core; BO-75).
+     * The first even-numbered logical processor from 2 on, the first thread
+     * of the second physical core on an SMT part; a one- or two-thread host
+     * has no choice. */
+    {
+        DWORD_PTR rest = proc & ~(DWORD_PTR)3;
+        DWORD_PTR even = rest & (DWORD_PTR)0x5555555555555555ull;
+        if (even)
+            return even & (DWORD_PTR)(-(intptr_t)even);
+        if (rest)
+            return rest & (DWORD_PTR)(-(intptr_t)rest);
+    }
+#endif
     /* The lowest core the process may use: fixed, so every thread lands
      * on the same one whatever core it was created from. */
     return proc & (DWORD_PTR)(-(intptr_t)proc);

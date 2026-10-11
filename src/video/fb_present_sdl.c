@@ -664,7 +664,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     int vsync = !recomp_env(RENV_PRESENT_VSYNC) || recomp_env_on(RENV_PRESENT_VSYNC);
     int stats = recomp_env_on(RENV_PRESENT_STATS);
     int scale = recomp_env(RENV_WINDOW_SCALE) ? atoi(recomp_env(RENV_WINDOW_SCALE)) : 2;
-    int win_w, win_pos;
+    int win_w, win_pos, win_pw, win_ph;
     int quit = 0, guest_done = 0, dirty = 0, shoot = 0;
     double quit_after = recomp_env(RENV_WINDOW_QUIT_AFTER)
                       ? atof(recomp_env(RENV_WINDOW_QUIT_AFTER)) : 0.0;
@@ -689,6 +689,17 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     shot_parse();
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+#if defined(_WIN32) && defined(SDL_HINT_WINDOWS_DPI_AWARENESS)
+    /* Per-monitor (v2) DPI awareness, so that Windows does not bitmap-stretch
+     * the window by the desktop's scale factor (150 % on a 4K panel: a 1280x960
+     * swapchain stretched to 1920x1440) and the swapchain is the real pixel
+     * size. As SDL2's own documentation of the hint recommends it ("the
+     * preferred DPI awareness level"); the default is left to the environment
+     * (SDL_WINDOWS_DPI_AWARENESS=unaware restores the old behaviour).
+     * SDL_HINT_WINDOWS_DPI_SCALING stays off: 1 SDL coordinate = 1 pixel, and
+     * the starting size is scaled below. Must precede SDL_Init(VIDEO). */
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "[PRESENT] SDL video unavailable (%s); running headless\n",
                 SDL_GetError());
@@ -706,6 +717,22 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         win_pos = e ? (int)SDL_WINDOWPOS_CENTERED_DISPLAY(atoi(e))
                     : (int)SDL_WINDOWPOS_CENTERED;
     }
+    win_pw = win_w * scale;
+    win_ph = 480 * scale;
+#if defined(_WIN32) && defined(SDL_HINT_WINDOWS_DPI_AWARENESS)
+    {
+        /* DPI aware: SDL sizes are pixels, so a window meant to look as big
+         * as it does on a 100 % desktop is the desktop's scale factor larger. */
+        const char *aw = SDL_GetHint(SDL_HINT_WINDOWS_DPI_AWARENESS);
+        const char *de = recomp_env(RENV_WINDOW_DISPLAY);
+        float ddpi = 0.f;
+        if (aw && (!strcmp(aw, "permonitorv2") || !strcmp(aw, "permonitor") || !strcmp(aw, "system"))
+                && SDL_GetDisplayDPI(de ? atoi(de) : 0, &ddpi, NULL, NULL) == 0 && ddpi > 96.f) {
+            win_pw = (int)((float)win_pw * ddpi / 96.f + 0.5f);
+            win_ph = (int)((float)win_ph * ddpi / 96.f + 0.5f);
+        }
+    }
+#endif
     {
         Uint32 wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
                       | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -721,7 +748,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             win = NULL;
             if (fbv_load_library(why, sizeof why))
                 win = SDL_CreateWindow(window_name(), win_pos, win_pos,
-                                       win_w * scale, 480 * scale,
+                                       win_pw, win_ph,
                                        wflags | SDL_WINDOW_VULKAN);
             if (!win && !why[0]) {
                 snprintf(why, sizeof why, "%s", SDL_GetError());
@@ -747,7 +774,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         const char *mp = recomp_env(RENV_METAL_PRESENT);
         if (be && !strcasecmp(be, "metal") && !(mp && !strcasecmp(mp, "readback"))) {
             char why[256] = "";
-            win = SDL_CreateWindow(window_name(), win_pos, win_pos, win_w * scale, 480 * scale,
+            win = SDL_CreateWindow(window_name(), win_pos, win_pos, win_pw, win_ph,
                                    wflags | SDL_WINDOW_METAL);
             if (!win)
                 snprintf(why, sizeof why, "%s", SDL_GetError());
@@ -766,7 +793,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
 #endif
         if (!s_layer) {
-            win = SDL_CreateWindow(window_name(), win_pos, win_pos, win_w * scale, 480 * scale, wflags);
+            win = SDL_CreateWindow(window_name(), win_pos, win_pos, win_pw, win_ph, wflags);
             fit_window(win);
             ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
                                            | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0))
