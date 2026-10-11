@@ -37,14 +37,24 @@ int xbox_enhance_init(const char *root, const char *title)
     struct nv2a_host_opts o;
     const char *aspect;
     long long scale;
-    int rc, pacing, wide, hdtv, pa;
+    int rc, pacing, wide, hdtv, pa, half;
     double lead;
     ULONG xc_video;
 
     rc = enhance_cfg_init(root, title) < 0 ? -1 : 0;
     memset(&o, 0, sizeof o);
 
-    scale = enhance_cfg_int("render.scale", 1);
+    /* 1.5 is the one fraction: 960x720 for a 640x480 title, on a backend
+     * that sizes in halves (Vulkan); the others draw at 1 then. */
+    {
+        double f = enhance_cfg_float("render.scale", 1.0);
+        if (f > 1.49 && f < 1.51) {
+            o.render_scale_half = 1;
+            scale = 1;
+        } else {
+            scale = enhance_cfg_int("render.scale", 1);
+        }
+    }
     if (scale < 1 || scale > SCALE_MAX) {
         long long c = scale < 1 ? 1 : SCALE_MAX;
         fprintf(stderr, LOGP "render.scale=%lld out of range 1..%d; using %lld\n",
@@ -52,6 +62,7 @@ int xbox_enhance_init(const char *root, const char *title)
         scale = c;
     }
     o.render_scale = (unsigned)scale;
+    half = o.render_scale_half;
     /* Indexes match enum nv2a_present_filter. */
     o.present_filter = enhance_cfg_choice("present.filter", s_filters, NV2A_PRESENT_NEAREST);
     o.fullscreen = enhance_cfg_bool("present.fullscreen", 0);
@@ -103,8 +114,9 @@ int xbox_enhance_init(const char *root, const char *title)
     }
 
     nv2a_host_opts_set(&o);
-    fprintf(stderr, LOGP "render.scale=%u present.filter=%s present.fullscreen=%d"
-            " present.pacing=%s (display.aspect=%s)\n", o.render_scale,
+    fprintf(stderr, LOGP "render.scale=%s%u%s present.filter=%s present.fullscreen=%d"
+            " present.pacing=%s (display.aspect=%s)\n", half ? "1.5 (a backend without it: " : "",
+            o.render_scale, half ? ")" : "",
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], aspect);
     fprintf(stderr, LOGP "display.widescreen=%d display.hdtv=%s (XC_VIDEO=0x%08lX)"
             " present.aspect=%s (%s)\n", wide, s_hdtv[hdtv], (unsigned long)xc_video,
