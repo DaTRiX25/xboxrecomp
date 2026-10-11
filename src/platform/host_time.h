@@ -36,6 +36,50 @@ void xbox_HostSleepNs(uint64_t ns);
  * Call on the thread itself. */
 void xbox_HostTimerThreadInit(void);
 
+/* ── The guest's clock, and a run that does not wait for it ──
+ *
+ * Everything the title can read time from (the vblank schedule, rdtsc and
+ * the performance counter, KeTickCount, the system and interrupt time, the
+ * kernel's timers and delays, the APU's frame clock, a scripted pad's
+ * presses) is the host's monotonic clock plus one process-wide skew. The
+ * skew is 0 and stays 0 unless the host program calls xbox_TimeWarpEnable:
+ * then a flip that would sit out the time to its vblank moves the clock to
+ * that vblank instead (xbox_TimeWarpTo, from xbox_VblankWaitUntil), and the
+ * title goes on at once. Time the title spends working passes as it does
+ * anyway; only the waiting is skipped, on every clock at the same moment,
+ * so to the title each frame still took its 16.7 or 33.3 ms.
+ *
+ * It is for a title that plays by itself with nobody watching (a shader
+ * pre-build's scenes, xbox_autoplay.h). No setting or environment variable
+ * turns it on.
+ *
+ * What it does not move: work the host does for the title on its own
+ * threads (file reads, decoding), which takes the wall time it takes and so
+ * looks slower to a title whose clock runs ahead. max_speed bounds that: a
+ * vblank is never given sooner than 1/max_speed of its period after the
+ * last one, so the guest clock runs at most max_speed times the host's
+ * (0: no bound). */
+void     xbox_TimeWarpEnable(unsigned max_speed);
+int      xbox_TimeWarpOn(void);
+/* What has been skipped so far, in ns (0 without a warp). */
+uint64_t xbox_GuestSkewNs(void);
+/* xbox_HostNowNs() + xbox_GuestSkewNs(). */
+uint64_t xbox_GuestNowNs(void);
+/* Move the guest clock to guest_ns if it is not there yet, first sleeping
+ * out what max_speed asks for, and wake the threads asleep in xbox_GuestSleepUntilNs. Does
+ * nothing without a warp. */
+void     xbox_TimeWarpTo(uint64_t guest_ns);
+/* Sleep until the guest clock reads guest_ns, however it gets there. For a
+ * thread that keeps a schedule on the guest clock (the kernel's timer
+ * thread, the APU's frame thread). Without a warp it is one xbox_HostSleepNs
+ * of the difference, which may return early. */
+void     xbox_GuestSleepUntilNs(uint64_t guest_ns);
+/* Sleep until `ns` have passed on the guest clock: a title's own delay. */
+void     xbox_GuestSleepNs(uint64_t ns);
+/* Since the warp was enabled: guest time skipped and the times it was, for
+ * a log line. */
+void     xbox_TimeWarpStats(uint64_t *skipped_ns, uint64_t *jumps);
+
 #ifdef __cplusplus
 }
 #endif

@@ -15,6 +15,7 @@
  */
 
 #include "kernel.h"
+#include "platform/host_time.h"     /* the guest's clock */
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -45,10 +46,46 @@ static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
     /* Absolute: compute delta from now */
     LARGE_INTEGER now;
     GetSystemTimeAsFileTime((LPFILETIME)&now);
+    now.QuadPart += (LONGLONG)(xbox_GuestSkewNs() / 100u);  /* the guest's clock */
     LONGLONG diff = Timeout->QuadPart - now.QuadPart;
     if (diff <= 0)
         return 0;
     return (DWORD)(diff / 10000);
+}
+
+/* A wait with a time-out, in a run that does not wait for the clock
+ * (host_time.h): the time-out is on the guest's clock, which may be moved
+ * past it while the thread sleeps, so the wait is taken a millisecond at a
+ * time and the clock looked at between. A thread that wakes every 10 ms to
+ * do a piece of work (a title's streaming) then does it every 10 ms of the
+ * title's time, as when the clock is the host's. Any other run, and a wait
+ * with no time-out, goes straight through. */
+static DWORD wait_one(HANDLE h, DWORD ms, BOOL alertable)
+{
+    uint64_t deadline;
+
+    if (!xbox_TimeWarpOn() || ms == 0 || ms == INFINITE)
+        return WaitForSingleObjectEx(h, ms, alertable);
+    deadline = xbox_GuestNowNs() + (uint64_t)ms * 1000000u;
+    for (;;) {
+        DWORD r = WaitForSingleObjectEx(h, 1, alertable);
+        if (r != WAIT_TIMEOUT || xbox_GuestNowNs() >= deadline)
+            return r;
+    }
+}
+
+static DWORD wait_many(DWORD count, const HANDLE *h, BOOL all, DWORD ms, BOOL alertable)
+{
+    uint64_t deadline;
+
+    if (!xbox_TimeWarpOn() || ms == 0 || ms == INFINITE)
+        return WaitForMultipleObjectsEx(count, h, all, ms, alertable);
+    deadline = xbox_GuestNowNs() + (uint64_t)ms * 1000000u;
+    for (;;) {
+        DWORD r = WaitForMultipleObjectsEx(count, h, all, 1, alertable);
+        if (r != WAIT_TIMEOUT || xbox_GuestNowNs() >= deadline)
+            return r;
+    }
 }
 
 /* ============================================================================
@@ -200,7 +237,7 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     PLARGE_INTEGER Timeout)
 {
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    DWORD result = wait_one(Handle, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -220,7 +257,7 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      */
     (void)WaitMode;
 
-    result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    result = wait_one(Handle, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -238,7 +275,7 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     /* WaitType: 0 = WaitAll, 1 = WaitAny (matches NT definitions) */
     bWaitAll = (WaitType == 0) ? TRUE : FALSE;
 
-    result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);
+    result = wait_many(Count, Handles, bWaitAll, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -259,7 +296,7 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
 
     HANDLE hObject = (HANDLE)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    DWORD result = wait_one(hObject, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -281,8 +318,7 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
 
     /* Objects[] is an array of PVOID which we treat as HANDLE[] */
-    DWORD result = WaitForMultipleObjectsEx(Count, (HANDLE*)Objects,
-                                            bWaitAll, ms, Alertable);
+    DWORD result = wait_many(Count, (HANDLE*)Objects, bWaitAll, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 

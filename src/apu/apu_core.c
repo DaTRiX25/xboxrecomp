@@ -29,6 +29,7 @@
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 #include "../kernel/kernel_prof.h"          /* RECOMP_TRACE=dpc: ISR, se_frame */
 #include "../kernel/kernel_pause.h"         /* xbox_HostPauseListener */
+#include "../platform/host_time.h"          /* the guest's clock */
 
 /* ============================================================
  * Globals
@@ -52,6 +53,21 @@ uint64_t g_dbg_muted_voices[4] = { 0 };
 
 /* Global audio mute — disables all AWD/mixer sound playback */
 volatile int g_audio_muted = 0;  /* 0 = audio enabled */
+
+/* The host's audio device paces the frame thread and takes its periods,
+ * unless the run does not wait for the clock (host_time.h, a title playing
+ * by itself unheard): then the guest's clock alone paces it, however fast
+ * that runs, and what it renders is dropped. */
+static int dev_paces(void)
+{
+    return xa2_is_active() && !xbox_TimeWarpOn();
+}
+
+/* QEMU_CLOCK_REALTIME on the guest's clock, in microseconds. */
+static int64_t guest_clock_us(void)
+{
+    return qemu_clock_get_us(QEMU_CLOCK_REALTIME) + (int64_t)(xbox_GuestSkewNs() / 1000u);
+}
 
 /* ============================================================
  * Debug frame markers (minimal stubs)
@@ -413,7 +429,8 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 
     switch (addr) {
     case NV_PAPU_XGSCNT:
-        r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
+        r = (uint64_t)((qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                        + (int64_t)xbox_GuestSkewNs()) / 100);
         break;
     default:
         if (addr < 0x20000) {
@@ -985,7 +1002,7 @@ static void submit_51(MCPXAPUState *d, int16_t period[][APU_SPK_CHANNELS])
 {
     int16_t folded[MIXER_FRAME_SAMPLES][2];
 
-    if (xa2_is_active()) {
+    if (dev_paces()) {
         int ch = xa2_channels();
         hs_submit(MIXER_FRAME_SAMPLES);
         if (ch == APU_SPK_CHANNELS) {
@@ -1092,7 +1109,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
     apu_wav_write((const int16_t *)period, MIXER_FRAME_SAMPLES);
 
-    if (xa2_is_active()) {
+    if (dev_paces()) {
         hs_submit(MIXER_FRAME_SAMPLES);
         xa2_submit_samples((const int16_t *)period, MIXER_FRAME_SAMPLES);
         return;
@@ -1135,7 +1152,7 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
     if (d->ep_frame_div % 8)
         return 0;
 
-    if (xa2_is_active()) {
+    if (dev_paces()) {
         int q    = xa2_queued_samples();
         int low  = d->monitor.queued_bytes_low / SAMPLE_BYTES;
         int high = d->monitor.queued_bytes_high / SAMPLE_BYTES;
@@ -1147,8 +1164,12 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
             mid_band = 1;
     }
 
+    /* A run that does not wait for the clock moves it a frame at a time:
+     * the periods of the time skipped are rendered one after another (up to
+     * a quarter of a second's), so the APU's time stays the title's. */
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US)
+        now_us - d->next_frame_time_us
+            > (xbox_TimeWarpOn() ? 250000 : EP_FRAME_US))
         d->next_frame_time_us = now_us;
 
     /* In the band the lead a render-ahead built is already in the queue;
@@ -1169,8 +1190,7 @@ static void throttle(MCPXAPUState *d)
     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
     while ((!d->pause_requested && !d->host_paused) || g_spk.active) {
-        int64_t wait_us = mcpx_apu_pace_step(
-            d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
+        int64_t wait_us = mcpx_apu_pace_step(d, guest_clock_us());
         if (wait_us <= 0)
             break;
         /* The pace renders a whole 256-sample EP period at once and then
@@ -1199,6 +1219,10 @@ static void throttle(MCPXAPUState *d)
             apu_deliver_irq(d);
             continue;
         }
+        /* The wait is the host's; a guest clock that may be moved under it
+         * is looked at again every millisecond. */
+        if (xbox_TimeWarpOn() && wait_us > 1000)
+            wait_us = 1000;
         qemu_cond_timedwait(&d->cond, &d->lock,
                             (int)((wait_us + 999) / 1000));
     }
@@ -1255,7 +1279,7 @@ static void *mcpx_apu_frame_thread(void *arg)
         if (!g_spk.active && (d->host_paused
             || (d->pause_requested && !g_test_tone.active && !g_mixer_active_count))) {
             d->is_idle = true;
-            if (xa2_is_active())
+            if (dev_paces())
                 xa2_expect_drain();     /* a pause, not an underrun */
             hs_rebase();
             qemu_cond_signal(&d->idle_cond);

@@ -540,6 +540,25 @@ int xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms)
             ok = 0;
             break;
         }
+        /* A run that does not wait for the clock (host_time.h): move the
+         * guest clock to the next vblank's edge, which wakes the timer
+         * thread to raise it, and wait for the count. One vblank at a time.
+         * (One raised while the title's handler for the last is still
+         * queued behind the one-CPU gate is declined by its ISR, as a
+         * vblank that comes too soon is in any run: 2 to 20 in a hundred at
+         * these rates, none in real time. Burnout 3 steps by its flips and
+         * plays the same; waiting for the handler here changed nothing.) */
+        if (xbox_TimeWarpOn()) {
+            uint64_t due = (uint64_t)s_vbl_next_ns;
+            LeaveCriticalSection(&s_vbl_lock);
+            xbox_TimeWarpTo(due);
+            EnterCriticalSection(&s_vbl_lock);
+            if ((int32_t)(xbox_VblankCount() - target) < 0) {
+                ms = (DWORD)((deadline - now + 999999u) / 1000000u);
+                SleepConditionVariableCS(&s_vbl_cv, &s_vbl_lock, ms);
+            }
+            continue;
+        }
         /* One vblank to go, and its edge is known: sleep to the lead, then
          * spin to the edge. An edge already well past (the timer thread is
          * behind, or has not published one) falls back to the condition

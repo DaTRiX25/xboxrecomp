@@ -18,6 +18,7 @@
 
 #include "kernel.h"             /* xbox_FileOpenHook */
 #include "xbox_crash.h"         /* g_xbox_flip_count */
+#include "platform/host_time.h" /* xbox_TimeWarpOn */
 
 #define LOGP "[AUTOPLAY] "
 
@@ -44,9 +45,24 @@ static void nap(unsigned ms)
 #endif
 }
 
+/* How often a wait looks at the flip count: 20 ms is a flip or two; a run
+ * that does not wait for the clock (host_time.h) makes a flip in a
+ * millisecond or two. */
+static unsigned poll_ms(void)
+{
+    return xbox_TimeWarpOn() ? 1 : 20;
+}
+
 static time_t now_s(void)
 {
     return time(NULL);
+}
+
+/* Paths and what a step looks for in them are compared in lower case and
+ * with one separator, so a step's "dir\\file" finds "DIR/File" too. */
+static char fold(char c)
+{
+    return c == '/' ? '\\' : (char)tolower((unsigned char)c);
 }
 
 static void on_open(const char *path, uint32_t status)
@@ -62,7 +78,7 @@ static void on_open(const char *path, uint32_t status)
         pthread_mutex_lock(&s_mu);
         e = &s_ev[s_nev % EV_MAX];
         for (k = 0; tail[k]; k++)
-            e->name[k] = (char)tolower((unsigned char)tail[k]);
+            e->name[k] = fold(tail[k]);
         e->name[k] = 0;
         e->flip = g_xbox_flip_count;
         s_nev++;
@@ -92,7 +108,7 @@ static void lower(char *out, size_t n, const char *in)
 {
     size_t k;
     for (k = 0; in && in[k] && k + 1 < n; k++)
-        out[k] = (char)tolower((unsigned char)in[k]);
+        out[k] = fold(in[k]);
     out[k] = 0;
 }
 
@@ -116,7 +132,7 @@ static int press(const xap_run *r, const char *what, int timeout)
             return -1;
         if (now_s() - t0 > timeout)
             return 0;
-        nap(20);
+        nap(poll_ms());
     }
     return 1;
 }
@@ -136,7 +152,7 @@ static int wait_flip(const xap_run *r, uint32_t target, const char *file, unsign
             return -1;
         if (now_s() - t0 > timeout)
             return 0;
-        nap(20);
+        nap(poll_ms());
     }
 }
 
@@ -149,15 +165,23 @@ static void *driver(void *arg)
     uint32_t anchor = 0;
     char why[160] = "", a[EV_NAME];
     int rc = 1;
+    uint64_t t_start = xbox_HostNowNs();
 
     for (st = r->steps; st->op != XAP_END && rc == 1; st++) {
         switch (st->op) {
         case XAP_WAIT_FILE:
             lower(a, sizeof a, st->s);
-            rc = wait_flip(r, g_xbox_flip_count + 0x40000000u, a, sync, &anchor, timeout);
-            rc = rc == 2 ? 1 : rc;
-            if (rc == 1)
+            rc = wait_flip(r, g_xbox_flip_count + (st->n > 0 ? (uint32_t)st->n : 0x40000000u),
+                           a, sync, &anchor, timeout);
+            if (rc == 2) {
+                rc = 1;
                 fprintf(stderr, LOGP "%s opened at flip %u\n", st->s, (unsigned)anchor);
+            } else if (rc == 1) {
+                /* The n flips passed first: go on from here. */
+                anchor = g_xbox_flip_count;
+                fprintf(stderr, LOGP "%s not opened in %d flips: going on at flip %u\n",
+                        st->s, st->n, (unsigned)anchor);
+            }
             break;
         case XAP_PRESS:
             rc = press(r, st->s, timeout);
@@ -198,8 +222,8 @@ static void *driver(void *arg)
             pthread_mutex_unlock(&s_mu);
             break;
         case XAP_MARK:
-            fprintf(stderr, LOGP "%s (flip %u)\n", st->s ? st->s : "mark",
-                    (unsigned)g_xbox_flip_count);
+            fprintf(stderr, LOGP "%s (flip %u, %.1f s)\n", st->s ? st->s : "mark",
+                    (unsigned)g_xbox_flip_count, (double)(xbox_HostNowNs() - t_start) / 1e9);
             if (r->mark)
                 r->mark(r->ctx, st->s, st->n);
             break;

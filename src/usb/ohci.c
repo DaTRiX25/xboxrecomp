@@ -9,6 +9,7 @@
 #include "ohci.h"
 #include "recomp_env.h"
 #include "latency_trace.h"
+#include "host_time.h"
 #include "../platform/mmio_decode.h"
 #include "../platform/mmio_decode_a64.h"
 #include "../kernel/xbox_memory_layout.h"
@@ -1078,7 +1079,16 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         uint32_t control, enable, status;
         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
 
-        Sleep(OHCI_TICK_MS);
+        /* The bus's frames are the guest's time: in a run that does not
+         * wait for the clock (host_time.h) a tick comes every 4 ms of the
+         * guest's clock, so a scripted press of a few frames reaches the
+         * title's driver in that run as surely as in any other. (On the
+         * host's clock the title played 8 or 40 frames between two reports,
+         * and a press and the release after it could fall into one.) */
+        if (xbox_TimeWarpOn())
+            xbox_GuestSleepNs((uint64_t)OHCI_TICK_MS * 1000000u);
+        else
+            Sleep(OHCI_TICK_MS);
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 

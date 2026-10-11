@@ -5852,7 +5852,9 @@ static void flip_pacing_stall(void)
     t0 = xbox_HostNowNs();
     /* present.pacing=sleep: block on the vblank's condition variable (the
      * timer thread signals it) instead of polling every 250 us. */
-    if (xbox_PacingMode() == XBOX_PACING_SLEEP) {
+    /* And in a run that does not wait for the clock (host_time.h): the
+     * wait is what moves it to the vblank. */
+    if (xbox_PacingMode() == XBOX_PACING_SLEEP || xbox_TimeWarpOn()) {
         if (!xbox_VblankWaitUntil(s_swap_target, 100))
             waited = 100000000ull;
         else

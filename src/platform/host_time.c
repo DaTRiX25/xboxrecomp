@@ -20,8 +20,8 @@
 #endif
 #else
 #include <time.h>
-#ifdef __APPLE__
 #include <pthread.h>
+#ifdef __APPLE__
 #include <stdio.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -117,4 +117,137 @@ void xbox_HostTimerThreadInit(void)
                     " (%d); vblank wake-ups may run late by a few ms\n", (int)kr);
     }
 #endif
+}
+
+/* ── The guest's clock ────────────────────────────────────── */
+
+/* The skew is read on every guest clock read, from any thread, without the
+ * lock: a 64-bit load, atomic on the 64-bit hosts this runs on. It only
+ * grows, and only under the lock. */
+static volatile uint64_t s_skew_ns;
+static volatile int s_warp;
+static unsigned s_warp_max;             /* 0: no bound */
+static uint64_t s_warp_grant_ns;        /* host time of the last jump */
+static uint64_t s_warp_jumps;
+
+#ifdef _WIN32
+static CRITICAL_SECTION s_warp_mu;
+static CONDITION_VARIABLE s_warp_cv;
+#define warp_lock()    EnterCriticalSection(&s_warp_mu)
+#define warp_unlock()  LeaveCriticalSection(&s_warp_mu)
+#define warp_wake()    WakeAllConditionVariable(&s_warp_cv)
+#else
+static pthread_mutex_t s_warp_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_warp_cv = PTHREAD_COND_INITIALIZER;
+#define warp_lock()    pthread_mutex_lock(&s_warp_mu)
+#define warp_unlock()  pthread_mutex_unlock(&s_warp_mu)
+#define warp_wake()    pthread_cond_broadcast(&s_warp_cv)
+#endif
+
+void xbox_TimeWarpEnable(unsigned max_speed)
+{
+#ifdef _WIN32
+    if (!s_warp) {
+        InitializeCriticalSection(&s_warp_mu);
+        InitializeConditionVariable(&s_warp_cv);
+    }
+#endif
+    s_warp_max = max_speed;
+    s_warp = 1;
+}
+
+int xbox_TimeWarpOn(void)
+{
+    return s_warp;
+}
+
+uint64_t xbox_GuestSkewNs(void)
+{
+    return s_skew_ns;
+}
+
+uint64_t xbox_GuestNowNs(void)
+{
+    return xbox_HostNowNs() + s_skew_ns;
+}
+
+void xbox_TimeWarpTo(uint64_t guest_ns)
+{
+    uint64_t host, now;
+
+    if (!s_warp)
+        return;
+    warp_lock();
+    host = xbox_HostNowNs();
+    now = host + s_skew_ns;
+    if (guest_ns > now) {
+        uint64_t d = guest_ns - now;
+        if (s_warp_max) {
+            /* No sooner than 1/max of what is skipped after the last jump:
+             * the guest clock then runs at most max times the host's. */
+            uint64_t earliest = s_warp_grant_ns + d / s_warp_max;
+            if (earliest > host && earliest - host < d) {
+                warp_unlock();
+                xbox_HostSleepNs(earliest - host);
+                warp_lock();
+                host = xbox_HostNowNs();
+                now = host + s_skew_ns;
+            }
+        }
+        if (guest_ns > now) {
+            s_skew_ns += guest_ns - now;
+            s_warp_jumps++;
+        }
+        s_warp_grant_ns = host;
+    }
+    warp_unlock();
+    warp_wake();
+}
+
+void xbox_GuestSleepUntilNs(uint64_t guest_ns)
+{
+    uint64_t now;
+
+    if (!s_warp) {
+        now = xbox_HostNowNs();
+        if (guest_ns > now)
+            xbox_HostSleepNs(guest_ns - now);
+        return;
+    }
+    /* The clock is only moved under the lock, so a jump cannot slip in
+     * between the look at it and the wait. */
+    warp_lock();
+    while ((now = xbox_HostNowNs() + s_skew_ns) < guest_ns) {
+        uint64_t d = guest_ns - now;
+#ifdef _WIN32
+        /* Whole milliseconds, rounded up: a sleeper is woken by the jump it
+         * waits for, and is otherwise late by under a millisecond. */
+        SleepConditionVariableCS(&s_warp_cv, &s_warp_mu, (DWORD)((d + 999999u) / 1000000u));
+#else
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += (time_t)(d / 1000000000u);
+        ts.tv_nsec += (long)(d % 1000000000u);
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&s_warp_cv, &s_warp_mu, &ts);
+#endif
+    }
+    warp_unlock();
+}
+
+void xbox_GuestSleepNs(uint64_t ns)
+{
+    if (!s_warp)
+        xbox_HostSleepNs(ns);
+    else
+        xbox_GuestSleepUntilNs(xbox_GuestNowNs() + ns);
+}
+
+void xbox_TimeWarpStats(uint64_t *skipped_ns, uint64_t *jumps)
+{
+    *skipped_ns = s_skew_ns;
+    *jumps = s_warp_jumps;
 }
