@@ -16,7 +16,8 @@
  *
  * RECOMP_ANDROID_VIBRATION = auto | controller | device | off (default auto):
  *   auto        the pad when SDL says it can rumble; else the device, when
- *               the pad is the device's own (InputDevice.isExternal() false).
+ *               the pad is the device's own (pad_is_own: not external, or a
+ *               motorless first or only pad, as a handheld's built-in one).
  *               An external pad without rumble gets nothing: the handheld
  *               does not shake on the table for a pad held elsewhere.
  *   controller  the pad only (what every other host does)
@@ -94,36 +95,51 @@ static int mode(void)
     return s_mode;
 }
 
-/* Whether the pad with this USB vendor and product is the device's own:
- * android.view.InputDevice.isExternal() (API 29) of the game pad or joystick
- * with those ids. Its own when nothing says otherwise (no such device, an
- * older Android), which is what auto did before it asked. Worker thread. */
+/* Whether the pad with this USB vendor and product is the device's own.
+ * android.view.InputDevice.isExternal() (API 29) is not enough: a handheld's
+ * built-in pad is often a USB or virtual device inside the case and reports
+ * itself external (the Retroid Pocket 5's "Xbox Wireless Controller"
+ * 2022:3002: bus USB, IsExternal true), and auto mode then went silent on
+ * the very device it was written for. So a pad counts as the device's own
+ * when Android says it is not external, or when it has no vibrator of its
+ * own (InputDevice.getVibrator().hasVibrator(); the pads Android can rumble,
+ * an Xbox or DualShock pad over Bluetooth or USB, report one) and it is the
+ * only pad or the first one (getControllerNumber() 1: a built-in pad is
+ * there from boot, a pad paired later gets the next number). What this still
+ * gets wrong: a single motorless pad on a phone without controls of its own
+ * shakes the phone; Input > Vibration > Controller or Off is the answer
+ * there. Its own when nothing says otherwise (no such device, an older
+ * Android). Worker thread. */
 static int pad_is_own(JNIEnv *env, int vendor, int product)
 {
     jclass idc = (*env)->FindClass(env, "android/view/InputDevice");
-    jmethodID ids_m, get_m, vid_m, pid_m, src_m, ext_m;
+    jclass vbc = (*env)->FindClass(env, "android/os/Vibrator");
+    jmethodID ids_m, get_m, vid_m, pid_m, src_m, ext_m, num_m, gv_m, hv_m = NULL;
     jintArray ids;
     jint *id;
     jsize n, i;
-    int own = 1, found = 0;
+    int own = 1, found = 0, pads = 0, ext = 0, padvib = 0, num = 0;
 
-    if (!idc) {
-        (*env)->ExceptionClear(env);
+    (*env)->ExceptionClear(env);
+    if (!idc)
         return 1;
-    }
     ids_m = (*env)->GetStaticMethodID(env, idc, "getDeviceIds", "()[I");
     get_m = (*env)->GetStaticMethodID(env, idc, "getDevice", "(I)Landroid/view/InputDevice;");
     vid_m = (*env)->GetMethodID(env, idc, "getVendorId", "()I");
     pid_m = (*env)->GetMethodID(env, idc, "getProductId", "()I");
     src_m = (*env)->GetMethodID(env, idc, "getSources", "()I");
     ext_m = (*env)->GetMethodID(env, idc, "isExternal", "()Z");
+    num_m = (*env)->GetMethodID(env, idc, "getControllerNumber", "()I");
+    gv_m = (*env)->GetMethodID(env, idc, "getVibrator", "()Landroid/os/Vibrator;");
+    if (vbc)
+        hv_m = (*env)->GetMethodID(env, vbc, "hasVibrator", "()Z");
     (*env)->ExceptionClear(env);
     ids = ids_m && get_m && vid_m && pid_m && src_m && ext_m
         ? (jintArray)(*env)->CallStaticObjectMethod(env, idc, ids_m) : NULL;
     if (ids && !(*env)->ExceptionCheck(env)) {
         n = (*env)->GetArrayLength(env, ids);
         id = (*env)->GetIntArrayElements(env, ids, NULL);
-        for (i = 0; id && i < n && !found; i++) {
+        for (i = 0; id && i < n; i++) {
             jobject d = (*env)->CallStaticObjectMethod(env, idc, get_m, id[i]);
             jint src;
             if (!d || (*env)->ExceptionCheck(env)) {
@@ -132,12 +148,25 @@ static int pad_is_own(JNIEnv *env, int vendor, int product)
             }
             src = (*env)->CallIntMethod(env, d, src_m);
             /* SOURCE_GAMEPAD 0x401, SOURCE_JOYSTICK 0x1000010 */
-            if (((src & 0x401) == 0x401 || (src & 0x1000010) == 0x1000010)
-                    && (*env)->CallIntMethod(env, d, vid_m) == vendor
-                    && (*env)->CallIntMethod(env, d, pid_m) == product) {
-                found = 1;
-                own = !(*env)->CallBooleanMethod(env, d, ext_m);
+            if ((src & 0x401) == 0x401 || (src & 0x1000010) == 0x1000010) {
+                pads++;
+                if (!found && (*env)->CallIntMethod(env, d, vid_m) == vendor
+                        && (*env)->CallIntMethod(env, d, pid_m) == product) {
+                    jobject v;
+                    found = 1;
+                    ext = (*env)->CallBooleanMethod(env, d, ext_m) ? 1 : 0;
+                    num = num_m ? (*env)->CallIntMethod(env, d, num_m) : 0;
+                    v = gv_m ? (*env)->CallObjectMethod(env, d, gv_m) : NULL;
+                    if ((*env)->ExceptionCheck(env)) {
+                        (*env)->ExceptionClear(env);
+                        v = NULL;
+                    }
+                    padvib = v && hv_m && (*env)->CallBooleanMethod(env, v, hv_m) ? 1 : 0;
+                    if (v)
+                        (*env)->DeleteLocalRef(env, v);
+                }
             }
+            (*env)->ExceptionClear(env);
             (*env)->DeleteLocalRef(env, d);
         }
         if (id)
@@ -146,12 +175,19 @@ static int pad_is_own(JNIEnv *env, int vendor, int product)
     (*env)->ExceptionClear(env);
     if (ids)
         (*env)->DeleteLocalRef(env, ids);
+    if (vbc)
+        (*env)->DeleteLocalRef(env, vbc);
     (*env)->DeleteLocalRef(env, idc);
-    fprintf(stderr, "  [RUMBLE] pad %04x:%04x is %s%s\n", vendor, product,
+    if (found)
+        own = !ext || (!padvib && (pads == 1 || num == 1));
+    fprintf(stderr, "  [RUMBLE] pad %04x:%04x is %s%s (Android: %s, %s, controller %d of %d)\n",
+            vendor, product,
             own ? "this device's own: its rumble goes to the device's vibrator"
                 : "an external pad: no rumble (SDL2 cannot rumble a pad on Android;"
                   " Input > Vibration > This device shakes the device anyway)",
-            found ? "" : " (no answer from the input devices for it, taken as its own)");
+            found ? "" : " (no answer from the input devices for it, taken as its own)",
+            ext ? "external" : "not external", padvib ? "has a vibrator" : "no vibrator of its own",
+            num, pads);
     return own;
 }
 

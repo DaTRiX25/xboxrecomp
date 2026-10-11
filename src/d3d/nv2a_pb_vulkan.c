@@ -208,11 +208,29 @@ typedef struct {
     VkCommandBuffer  *cbs;
     uint32_t          ncbs, used;
     uint64_t          serial;          /* last submit while this frame was current */
+    VkFence           fence;           /* vk_poll=0: signalled by the submit fence_serial */
+    uint64_t          fence_serial;    /* 0: not armed */
     VkDescriptorPool *dps;
     uint32_t          ndps, dp_cur;
 } Frame;
 static Frame    s_fr[FRAMES_MAX];
 static int      s_fi;                  /* the frame being recorded */
+
+/* What the main command buffer has bound and set (vk_on_draw); nothing is
+ * known of a new one. */
+typedef struct {
+    VkPipeline    pso;
+    VkBool32      ztest, zwrite, stest;
+    VkCompareOp   zcmp, scmp;
+    VkStencilOp   sop[3];
+    uint32_t      srmask, swmask, sref, vw, vh;
+    float         slope, bf[4];
+    VkRect2D      sr;
+    VkFrontFace   front;
+    VkCullModeFlags cull;
+} DynState;
+static DynState s_dyn;
+static int      s_dyn_valid;
 
 static VkCommandBuffer s_cmd;          /* main, begun lazily */
 static VkCommandBuffer s_up;           /* uploads, submitted ahead of s_cmd */
@@ -249,30 +267,134 @@ static int vk_trace(void)
     return on;
 }
 
+/* ---- RECOMP_TRACE=vk_frame=<file> -------------------------------------------
+ *
+ * One CSV line per flip, to say what a frame cost the backend beyond its
+ * draws: how many queue submits and why, how many render passes and how many
+ * of them went back to a target the frame had already drawn (a tile-based
+ * GPU stores and loads the whole target for each), and where the backend
+ * called into the driver's waits. The frame's GPU time comes from a pair of
+ * timestamp queries round each submit, read four flips later, so a line is
+ * written that much after its frame. Off, each site is one load and a
+ * branch (s_vf is NULL). */
+enum { FL_FLIP, FL_READY, FL_REPORT, FL_POLL, FL_RING, FL_SAMPLER, FL_READBACK, FL_BATCH, FL_N };
+#define VF_RING 8
+#define VF_LAG  4
+#define VF_TS   24                     /* submits a frame with a timestamp pair */
+typedef struct {
+    uint64_t present, t_ns;
+    uint32_t flip, draws, passes, p_clear, p_load, p_resumed, p_empty, p_maxdraws,
+             rt_switch, zload, zresumed, pass_draws;
+    uint32_t sub[FL_N];
+    uint32_t polls, waits, qres, nts, ready_done;
+    uint64_t submit_ns, submit_max_ns, qlock_ns, poll_ns, poll_max_ns, wait_ns,
+             qres_ns, endpass_ns, f_total, f_back, f_copy, f_submit, f_pub, f_adv;
+} VkFrameRec;
+static VkFrameRec   s_vfr[VF_RING];
+static VkFrameRec  *s_vf;              /* the frame being recorded; NULL: off */
+static FILE        *s_vf_out;
+static VkQueryPool  s_vf_qp;
+static int          s_vf_ts_open;      /* s_cmd has its start timestamp */
+static void        *s_vf_last_rt;
+
 /* ---- serials and garbage ---------------------------------------------------- */
+
+/* How far the GPU is. With a timeline semaphore of the driver's own that is
+ * one cheap question (vkGetSemaphoreCounterValue), asked wherever it helps.
+ * Mesa's Turnip on Qualcomm's KGSL kernel interface (Android) has no such
+ * semaphore: Mesa emulates it with a list of pending submits and answers the
+ * question by "polling" each with IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID and
+ * timeout 0 (vk_sync_timeline_gc_locked -> kgsl_syncobj_wait ->
+ * wait_timestamp_safe, Mesa 26.2.4), and on the Retroid Pocket 5's 4.19
+ * kernel that call does not return until the GPU has retired the submit:
+ * measured 6 ms a call in a heavy frame at 2x, up to 11.9 ms (BO-85). Every
+ * question was a wait for all the GPU work submitted so far, so the two
+ * frames in flight never overlapped. A submit that signals such a semaphore
+ * asks the same question of the oldest pending one
+ * (vk_sync_timeline_alloc_point_locked), and waited as long. There
+ * (vk_poll=0, the default on Android) the semaphore is not used and the
+ * question is never asked: the last submit of a frame signals
+ * the frame's fence, the fence is waited for when the frame's slot is taken
+ * again (two flips on, long done), and what is known done is what such a
+ * wait has shown. Garbage and occlusion slots are freed that much later;
+ * occlusion counts are read from the query pool as soon as they are there. */
+static int poll_ok(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_VK_POLL);
+#if defined(__ANDROID__)
+        on = e && *e == '1';
+#else
+        on = !(e && *e == '0');
+#endif
+    }
+    return on;
+}
+
+static void serial_known(uint64_t v)
+{
+    if (v > s_done_serial)
+        s_done_serial = v;
+}
 
 static uint64_t serial_done(void)
 {
-    uint64_t v = 0;
+    uint64_t v = 0, t0;
+    if (!poll_ok())
+        return s_done_serial;
+    t0 = s_vf ? now_ns() : 0;
     if (vkGetSemaphoreCounterValue(s_dev, s_timeline, &v) == VK_SUCCESS && v > s_done_serial)
         s_done_serial = v;
+    if (s_vf) {
+        uint64_t d = now_ns() - t0;
+        s_vf->polls++;
+        s_vf->poll_ns += d;
+        if (d > s_vf->poll_max_ns)
+            s_vf->poll_max_ns = d;
+    }
     return s_done_serial;
 }
 
 static void serial_wait(uint64_t v)
 {
     VkSemaphoreWaitInfo wi;
+    uint64_t t0;
+    int ok;
     if (!v || serial_done() >= v)
         return;
+    t0 = s_vf ? now_ns() : 0;
+    if (!poll_ok()) {
+        /* No semaphore to wait on (see poll_ok): everything submitted. A
+         * readback or a full ring, not a frame's normal path. */
+        uint64_t last = s_next_serial - 1;
+        nvk_queue_lock();
+        ok = vkQueueWaitIdle(C->queue) == VK_SUCCESS;
+        nvk_queue_unlock();
+        if (ok)
+            serial_known(last);
+        if (s_vf) {
+            s_vf->waits++;
+            s_vf->wait_ns += now_ns() - t0;
+        }
+        return;
+    }
     memset(&wi, 0, sizeof wi);
     wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
     wi.semaphoreCount = 1;
     wi.pSemaphores = &s_timeline;
     wi.pValues = &v;
-    if (vkWaitSemaphores(s_dev, &wi, 5000000000ull) != VK_SUCCESS) {
+    ok = vkWaitSemaphores(s_dev, &wi, 5000000000ull) == VK_SUCCESS;
+    if (ok)
+        serial_known(v);
+    if (!ok) {
         static int said;
         if (said++ < 4)
             fprintf(stderr, LOGP "GPU wait for serial %llu timed out\n", (unsigned long long)v);
+    }
+    if (s_vf) {
+        s_vf->waits++;
+        s_vf->wait_ns += now_ns() - t0;
     }
     serial_done();
 }
@@ -359,8 +481,15 @@ static VkCommandBuffer cb_new(void)
 
 static void ensure_cmd(void)
 {
-    if (!s_cmd)
+    if (!s_cmd) {
         s_cmd = cb_new();
+        s_dyn_valid = 0;
+        if (s_vf && s_vf_qp && s_cmd && s_vf->nts < VF_TS) {
+            vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, s_vf_qp,
+                                (uint32_t)((s_vf - s_vfr) * 2 * VF_TS + 2 * s_vf->nts));
+            s_vf_ts_open = 1;
+        }
+    }
 }
 
 static void ensure_up(void)
@@ -383,7 +512,17 @@ static void end_encoder(void)
 {
     if (s_pass) {
         occ_pass_end();
-        vkCmdEndRendering(s_cmd);
+        if (s_vf) {
+            uint64_t t0 = now_ns();
+            vkCmdEndRendering(s_cmd);
+            s_vf->endpass_ns += now_ns() - t0;
+            if (!s_vf->pass_draws)
+                s_vf->p_empty++;
+            if (s_vf->pass_draws > s_vf->p_maxdraws)
+                s_vf->p_maxdraws = s_vf->pass_draws;
+        } else {
+            vkCmdEndRendering(s_cmd);
+        }
         s_pass = 0;
     }
     s_enc_rt = NULL;
@@ -414,16 +553,49 @@ static void rings_reset(void)
 /* End the open pass, submit what is recorded (uploads first) and, with
  * `wait`, block until the GPU is done with it. After a wait every ring is
  * free again. */
-static void flush(int wait)
+static int s_flush_fence;    /* the next submit signals the frame's fence */
+
+/* vk_batch: a frame's commands go to the GPU in parts, at the boundaries
+ * between render passes, so it draws the first part while the rest is being
+ * recorded. With one submit a frame the GPU began only when the CPU had
+ * finished, and a frame heavy on both (dense traffic) had the two times one
+ * after the other. Never in the middle of a pass: a pass cut in two is
+ * stored and loaded again by a tile-based GPU. */
+static uint64_t s_batch_draw0, s_batch_t0;   /* s_draws and the time at the last submit */
+static int      s_report_defer;              /* a report's counts wait for the pass to end */
+static uint64_t s_report_defer_t;
+
+static unsigned batch_draws(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char *e = recomp_env(RENV_VK_BATCH);
+#if defined(__ANDROID__)
+        n = e && *e ? atoi(e) : 300;
+#else
+        n = e && *e ? atoi(e) : 0;
+#endif
+        if (n < 0)
+            n = 0;
+    }
+    return (unsigned)n;
+}
+
+static void flush(int wait, int why)
 {
     VkCommandBuffer cbs[2];
     VkSubmitInfo si;
     VkTimelineSemaphoreSubmitInfo ti;
     uint64_t serial;
     uint32_t n = 0;
+    uint64_t t0 = 0, t1 = 0;
+    VkFence fence = VK_NULL_HANDLE;
     VkResult r;
 
     end_encoder();
+    if (s_flush_fence && (s_cmd || s_up) && s_fr[s_fi].fence && !s_fr[s_fi].fence_serial)
+        fence = s_fr[s_fi].fence;
+    s_flush_fence = 0;
     if (!s_cmd && !s_up) {
         if (wait) {
             serial_wait(s_next_serial - 1);
@@ -438,6 +610,12 @@ static void flush(int wait)
         cbs[n++] = s_up;
     }
     if (s_cmd) {
+        if (s_vf_ts_open && s_vf && s_vf_qp) {
+            vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, s_vf_qp,
+                                (uint32_t)((s_vf - s_vfr) * 2 * VF_TS + 2 * s_vf->nts + 1));
+            s_vf->nts++;
+        }
+        s_vf_ts_open = 0;
         vkEndCommandBuffer(s_cmd);
         cbs[n++] = s_cmd;
     }
@@ -451,11 +629,29 @@ static void flush(int wait)
     si.pNext = &ti;
     si.commandBufferCount = n;
     si.pCommandBuffers = cbs;
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &s_timeline;
+    if (poll_ok()) {
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &s_timeline;
+    } else {
+        si.pNext = NULL;
+    }
+    if (s_vf)
+        t0 = now_ns();
     nvk_queue_lock();
-    r = vkQueueSubmit(C->queue, 1, &si, VK_NULL_HANDLE);
+    if (s_vf)
+        t1 = now_ns();
+    r = vkQueueSubmit(C->queue, 1, &si, fence);
     nvk_queue_unlock();
+    if (fence && r == VK_SUCCESS)
+        s_fr[s_fi].fence_serial = serial;
+    if (s_vf) {
+        uint64_t d = now_ns() - t1;
+        s_vf->sub[why]++;
+        s_vf->qlock_ns += t1 - t0;
+        s_vf->submit_ns += d;
+        if (d > s_vf->submit_max_ns)
+            s_vf->submit_max_ns = d;
+    }
     if (r != VK_SUCCESS) {
         s_submit_errors++;
         if (s_submit_errors <= 4)
@@ -469,6 +665,11 @@ static void flush(int wait)
     s_cmd = VK_NULL_HANDLE;
     s_up = VK_NULL_HANDLE;
     s_flushes++;
+    s_report_defer = 0;
+    if (batch_draws()) {
+        s_batch_draw0 = s_draws;
+        s_batch_t0 = now_ns();
+    }
     if (wait) {
         serial_wait(serial);
         rings_reset();
@@ -485,7 +686,7 @@ static void *ring_alloc(int k, VkDeviceSize bytes, VkDeviceSize align, VkDeviceS
     if (bytes > s_ring_size[k])
         return NULL;
     if (at + bytes > s_ring_size[k]) {
-        flush(1);   /* resets every ring */
+        flush(1, FL_RING);   /* resets every ring */
         at = 0;
     }
     s_ring_pos[k] = at + bytes;
@@ -502,6 +703,7 @@ struct DepthTarget {
     struct nvk_image im;
     uint64_t         last_use;
     int              fresh;      /* contents undefined: the next pass clears */
+    uint64_t         pass_flip;  /* vk_frame: s_presents + 1 at its last pass */
 };
 
 /* As Metal: 32 slots hold any frame Burnout 3 draws (14 surfaces in Crash
@@ -521,6 +723,7 @@ struct RenderTarget {
     int              dirty;      /* drawn since its last write-back */
     uint64_t         gen;        /* s_rt_seq at its last clear or draw */
     int              presented;  /* ever picked by present_target */
+    uint64_t         pass_flip;  /* vk_frame: s_presents + 1 at its last pass */
     struct nv2a_rt_own own;      /* is the guest memory under it still its own */
 };
 
@@ -652,6 +855,10 @@ static void begin_pass(RenderTarget *rt, int clear, const float c[4],
     VkRenderingInfo ri;
 
     end_encoder();
+    if (s_cmd && batch_draws()
+            && (s_report_defer || s_draws - s_batch_draw0 >= batch_draws()
+                || (s_draws != s_batch_draw0 && now_ns() - s_batch_t0 > 2000000ull)))
+        flush(0, s_report_defer ? FL_REPORT : FL_BATCH);
     ensure_cmd();
     rt->dirty = 1;
     rt->gen = ++s_rt_seq;
@@ -690,6 +897,28 @@ static void begin_pass(RenderTarget *rt, int clear, const float c[4],
         dt->fresh = 0;
     }
     vkCmdBeginRendering(s_cmd, &ri);
+    if (s_vf) {
+        s_vf->passes++;
+        s_vf->pass_draws = 0;
+        if (clear)
+            s_vf->p_clear++;
+        else
+            s_vf->p_load++;
+        if (!clear && rt->pass_flip == s_presents + 1)
+            s_vf->p_resumed++;
+        if (s_vf_last_rt != (void *)rt)
+            s_vf->rt_switch++;
+        s_vf_last_rt = rt;
+        rt->pass_flip = s_presents + 1;
+        if (dt) {
+            if (da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                s_vf->zload++;
+                if (dt->pass_flip == s_presents + 1)
+                    s_vf->zresumed++;
+            }
+            dt->pass_flip = s_presents + 1;
+        }
+    }
     s_pass = 1;
     s_enc_rt = rt;
     s_enc_dt = dt;
@@ -1001,6 +1230,30 @@ static void vk_on_clear(uint32_t param);
 static int init(void);
 static void occ_query_begin(void);
 
+/* A CLEAR_SURFACE of depth and colour reaches the backend as on_zclear and
+ * then on_clear. Each used to open its own pass: one that cleared the depth
+ * buffer and loaded the colour, ended at once without a draw, then one that
+ * cleared the colour and loaded the depth; on a tile-based GPU the second
+ * loads a whole buffer that was just cleared. on_zclear leaves its clear
+ * here when on_clear is to follow, and on_clear opens one pass that clears
+ * both (or, when its box is not the whole target, the depth-clearing pass
+ * as before). */
+static struct {
+    RenderTarget *rt;
+    unsigned      zmask;
+    float         z;
+    uint32_t      st;
+} s_zpend;
+
+static void zpend_flush(void)
+{
+    if (s_zpend.rt) {
+        RenderTarget *rt = s_zpend.rt;
+        s_zpend.rt = NULL;
+        begin_pass(rt, 0, NULL, s_zpend.zmask, s_zpend.z, s_zpend.st);
+    }
+}
+
 static void vk_on_clear(uint32_t param)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -1013,17 +1266,26 @@ static void vk_on_clear(uint32_t param)
     if (!(param & 0xF0) || !init())
         return;
     rt = surface();
-    if (!rt || !nv2a_clear_box(g, rt->w, rt->h, b))
+    if (!rt || !nv2a_clear_box(g, rt->w, rt->h, b)) {
+        zpend_flush();
         return;
+    }
     c[0] = (float)((g->clear_color >> 16) & 0xFF) / 255.0f;
     c[1] = (float)((g->clear_color >> 8) & 0xFF) / 255.0f;
     c[2] = (float)(g->clear_color & 0xFF) / 255.0f;
     c[3] = (float)(g->clear_color >> 24) / 255.0f;
     s_clears++;
     if (b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
-        begin_encoder(rt, 1, c);
+        if (s_zpend.rt == rt) {
+            s_zpend.rt = NULL;
+            begin_pass(rt, 1, c, s_zpend.zmask, s_zpend.z, s_zpend.st);
+        } else {
+            zpend_flush();
+            begin_encoder(rt, 1, c);
+        }
         return;
     }
+    zpend_flush();
     if (!s_pass || s_enc_rt != rt)
         begin_encoder(rt, 0, NULL);
     memset(&ca, 0, sizeof ca);
@@ -1063,11 +1325,45 @@ static void vk_on_zclear(uint32_t param)
     dt = depth_target(rt->w, rt->h);
     if (!dt)
         return;
+    if (param & 1u)
+        s_zclears++;
+    zpend_flush();
+    if (param & 0xF0) {
+        /* on_clear follows for the same CLEAR_SURFACE and opens the pass. */
+        rt->dt = dt;
+        s_zpend.rt = rt;
+        s_zpend.zmask = param & 3u;
+        s_zpend.z = nv2a_zclear_depth(g->format, v->zclear);
+        s_zpend.st = v->zclear & 0xFFu;
+        return;
+    }
+    if (s_pass && s_enc_rt == rt && s_enc_dt == dt && rt->dt == dt) {
+        /* The pass on this target is open with this depth buffer: clear in
+         * it. Ending it for a clearing pass would store and load the colour
+         * for nothing. As a colour clear, not a zpass sample. */
+        VkClearAttachment ca;
+        VkClearRect cr;
+        int counting = s_occ_slot >= 0;
+        memset(&ca, 0, sizeof ca);
+        ca.aspectMask = ((param & 1u) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0)
+                      | ((param & 2u) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+        ca.clearValue.depthStencil.depth = nv2a_zclear_depth(g->format, v->zclear);
+        ca.clearValue.depthStencil.stencil = v->zclear & 0xFFu;
+        memset(&cr, 0, sizeof cr);
+        cr.rect.extent.width = rt->hw < dt->hw ? rt->hw : dt->hw;
+        cr.rect.extent.height = rt->hh < dt->hh ? rt->hh : dt->hh;
+        cr.layerCount = 1;
+        if (counting)
+            occ_pass_end();
+        vkCmdClearAttachments(s_cmd, 1, &ca, 1, &cr);
+        if (counting)
+            occ_query_begin();
+        rt->gen = ++s_rt_seq;
+        return;
+    }
     rt->dt = dt;
     begin_pass(rt, 0, NULL, param & 3u, nv2a_zclear_depth(g->format, v->zclear),
                v->zclear & 0xFFu);
-    if (param & 1u)
-        s_zclears++;
 }
 
 /* ---- vertices ---------------------------------------------------------------- */
@@ -2118,7 +2414,7 @@ static VkSampler sampler(const Stage *t)
         static unsigned next;
         i = (int)(next++ % SMP_MAX);
         /* A recorded draw may still use it. */
-        flush(1);
+        flush(1, FL_SAMPLER);
         vkDestroySampler(s_dev, s_smp[i].s, NULL);
     }
     s_smp[i].key = key;
@@ -2764,7 +3060,99 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         s_draws_skipped++;
         return;
     }
-    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+    {
+        /* The draw's dynamic state, and what of it differs from what this
+         * command buffer already has (every pipeline here leaves the same
+         * states dynamic, so they outlive a bind and a pass): a title draws
+         * hundreds of batches in a row with the same depth, stencil, cull
+         * and viewport state, and each vkCmdSet* is a call into the driver. */
+        DynState n;
+        int z = s_enc_dt && use_z && v->depth_enable;
+        int st = s_enc_dt && use_s;
+        VkRect2D sr;
+        if (!draw_scissor(g, rt, &sr)) {
+            s_draws_skipped++;
+            return;
+        }
+        memset(&n, 0, sizeof n);
+        n.pso = pso;
+        /* Depth and stencil only with an attachment and when enabled; the
+         * compare and op codes are in VkCompareOp / VkStencilOp order. */
+        n.ztest = z ? VK_TRUE : VK_FALSE;
+        n.zwrite = z && v->depth_mask ? VK_TRUE : VK_FALSE;
+        n.zcmp = z ? (VkCompareOp)nv2a_cmp_from_gl(v->depth_func) : VK_COMPARE_OP_ALWAYS;
+        n.stest = st ? VK_TRUE : VK_FALSE;
+        n.sop[0] = (VkStencilOp)nv2a_stencil_op_from_gl(v->stencil_op[0]);
+        n.sop[1] = (VkStencilOp)nv2a_stencil_op_from_gl(v->stencil_op[2]);
+        n.sop[2] = (VkStencilOp)nv2a_stencil_op_from_gl(v->stencil_op[1]);
+        n.scmp = (VkCompareOp)(v->stencil_func & 7u);
+        n.srmask = v->stencil_rmask & 0xFFu;
+        n.swmask = v->stencil_wmask & 0xFFu;
+        n.sref = st ? (v->stencil_ref & 0xFFu) : 0u;
+        /* BO-10 polygon offset, as Metal: the constant part in the vertex
+         * stage (vp_scale.w); the slope part per host pixel, so times
+         * render.scale (xemu PR #2240). */
+        n.slope = (s_enc_dt && use_z && v->poly_offset)
+                ? v->poly_factor * (float)nv2a_host_render_scale_x2() * 0.5f : 0.0f;
+        /* A negative height: D3D's y-up clip space onto rows from the top,
+         * as Metal's viewport. */
+        n.vw = rt->hw;
+        n.vh = rt->hh;
+        n.sr = sr;
+        n.front = v->front_face != 0x900 ? VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                         : VK_FRONT_FACE_CLOCKWISE;
+        n.cull = cull == 1 ? VK_CULL_MODE_BACK_BIT
+               : cull == 2 ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_NONE;
+        (void)nv2a_blend_constant(g->blend_enable, g->blend_sfactor,
+                                  g->blend_dfactor, g->blend_color, n.bf, &(int){0});
+        if (s_enc_dt && use_z)
+            s_draws_z++;
+#define DYN(cond) (!s_dyn_valid || (cond))
+        if (DYN(n.pso != s_dyn.pso))
+            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+        if (DYN(n.ztest != s_dyn.ztest))
+            vkCmdSetDepthTestEnable(s_cmd, n.ztest);
+        if (DYN(n.zwrite != s_dyn.zwrite))
+            vkCmdSetDepthWriteEnable(s_cmd, n.zwrite);
+        if (DYN(n.zcmp != s_dyn.zcmp))
+            vkCmdSetDepthCompareOp(s_cmd, n.zcmp);
+        if (DYN(n.stest != s_dyn.stest))
+            vkCmdSetStencilTestEnable(s_cmd, n.stest);
+        if (DYN(memcmp(n.sop, s_dyn.sop, sizeof n.sop) || n.scmp != s_dyn.scmp))
+            vkCmdSetStencilOp(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, n.sop[0], n.sop[1],
+                              n.sop[2], n.scmp);
+        if (DYN(n.srmask != s_dyn.srmask))
+            vkCmdSetStencilCompareMask(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, n.srmask);
+        if (DYN(n.swmask != s_dyn.swmask))
+            vkCmdSetStencilWriteMask(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, n.swmask);
+        if (DYN(n.sref != s_dyn.sref))
+            vkCmdSetStencilReference(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, n.sref);
+        if (DYN(memcmp(&n.slope, &s_dyn.slope, sizeof n.slope))) {
+            vkCmdSetDepthBiasEnable(s_cmd, n.slope != 0.0f ? VK_TRUE : VK_FALSE);
+            vkCmdSetDepthBias(s_cmd, 0.0f, 0.0f, n.slope);
+        }
+        if (DYN(n.vw != s_dyn.vw || n.vh != s_dyn.vh)) {
+            VkViewport vp;
+            vp.x = 0.0f;
+            vp.y = (float)rt->hh;
+            vp.width = (float)rt->hw;
+            vp.height = -(float)rt->hh;
+            vp.minDepth = 0.0f;
+            vp.maxDepth = 1.0f;
+            vkCmdSetViewport(s_cmd, 0, 1, &vp);
+        }
+        if (DYN(memcmp(&n.sr, &s_dyn.sr, sizeof n.sr)))
+            vkCmdSetScissor(s_cmd, 0, 1, &n.sr);
+        if (DYN(n.front != s_dyn.front))
+            vkCmdSetFrontFace(s_cmd, n.front);
+        if (DYN(n.cull != s_dyn.cull))
+            vkCmdSetCullMode(s_cmd, n.cull);
+        if (DYN(memcmp(n.bf, s_dyn.bf, sizeof n.bf)))
+            vkCmdSetBlendConstants(s_cmd, n.bf);
+#undef DYN
+        s_dyn = n;
+        s_dyn_valid = 1;
+    }
     dyn_off[0] = (uint32_t)uo[0];
     dyn_off[1] = (uint32_t)uo[1];
     dyn_off[2] = (uint32_t)uo[2];
@@ -2772,69 +3160,14 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                             &s_set0, 3, dyn_off);
     vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 1, 1,
                             &tset, 0, NULL);
-    {
-        /* Depth and stencil only with an attachment and when enabled; the
-         * compare and op codes are in VkCompareOp / VkStencilOp order. */
-        int z = s_enc_dt && use_z && v->depth_enable;
-        int s = s_enc_dt && use_s;
-        vkCmdSetDepthTestEnable(s_cmd, z ? VK_TRUE : VK_FALSE);
-        vkCmdSetDepthWriteEnable(s_cmd, z && v->depth_mask ? VK_TRUE : VK_FALSE);
-        vkCmdSetDepthCompareOp(s_cmd, z ? (VkCompareOp)nv2a_cmp_from_gl(v->depth_func)
-                                        : VK_COMPARE_OP_ALWAYS);
-        vkCmdSetStencilTestEnable(s_cmd, s ? VK_TRUE : VK_FALSE);
-        vkCmdSetStencilOp(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
-                          (VkStencilOp)nv2a_stencil_op_from_gl(v->stencil_op[0]),
-                          (VkStencilOp)nv2a_stencil_op_from_gl(v->stencil_op[2]),
-                          (VkStencilOp)nv2a_stencil_op_from_gl(v->stencil_op[1]),
-                          (VkCompareOp)(v->stencil_func & 7u));
-        vkCmdSetStencilCompareMask(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, v->stencil_rmask & 0xFFu);
-        vkCmdSetStencilWriteMask(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, v->stencil_wmask & 0xFFu);
-        vkCmdSetStencilReference(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
-                                 s ? (v->stencil_ref & 0xFFu) : 0u);
-        /* BO-10 polygon offset, as Metal: the constant part in the vertex
-         * stage (vp_scale.w); the slope part per host pixel, so times
-         * render.scale (xemu PR #2240). */
-        {
-            float slope = (s_enc_dt && use_z && v->poly_offset)
-                        ? v->poly_factor * (float)nv2a_host_render_scale_x2() * 0.5f : 0.0f;
-            vkCmdSetDepthBiasEnable(s_cmd, slope != 0.0f ? VK_TRUE : VK_FALSE);
-            vkCmdSetDepthBias(s_cmd, 0.0f, 0.0f, slope);
-        }
-        if (s_enc_dt && use_z)
-            s_draws_z++;
-    }
-    {
-        /* A negative height: D3D's y-up clip space onto rows from the top,
-         * as Metal's viewport. */
-        VkViewport vp;
-        VkRect2D sr;
-        if (!draw_scissor(g, rt, &sr)) {
-            s_draws_skipped++;
-            return;
-        }
-        vp.x = 0.0f;
-        vp.y = (float)rt->hh;
-        vp.width = (float)rt->hw;
-        vp.height = -(float)rt->hh;
-        vp.minDepth = 0.0f;
-        vp.maxDepth = 1.0f;
-        vkCmdSetViewport(s_cmd, 0, 1, &vp);
-        vkCmdSetScissor(s_cmd, 0, 1, &sr);
-    }
-    vkCmdSetFrontFace(s_cmd, v->front_face != 0x900 ? VK_FRONT_FACE_COUNTER_CLOCKWISE
-                                                    : VK_FRONT_FACE_CLOCKWISE);
-    vkCmdSetCullMode(s_cmd, cull == 1 ? VK_CULL_MODE_BACK_BIT
-                          : cull == 2 ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_NONE);
-    {
-        float bf[4];
-        (void)nv2a_blend_constant(g->blend_enable, g->blend_sfactor,
-                                  g->blend_dfactor, g->blend_color, bf, &(int){0});
-        vkCmdSetBlendConstants(s_cmd, bf);
-    }
     vkCmdBindVertexBuffers(s_cmd, 0, 1, &s_ring[RING_VB].buf, &vb_off);
     vkCmdBindIndexBuffer(s_cmd, s_ring[RING_IB].buf, ib_off, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(s_cmd, nidx, 1, 0, 0, 0);
     s_draws++;
+    if (s_vf) {
+        s_vf->draws++;
+        s_vf->pass_draws++;
+    }
     rt->gen = ++s_rt_seq;
 }
 
@@ -2883,7 +3216,7 @@ static const uint8_t *host_readback(RenderTarget *rt)
     int k;
 
     if (s_rb.size < need) {
-        flush(1);
+        flush(1, FL_READBACK);
         nvk_buffer_free(&s_rb);
         if (!nvk_buffer_new(&s_rb, need, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -2919,7 +3252,7 @@ static const uint8_t *host_readback(RenderTarget *rt)
     }
     for (k = 0; k < RING_N; k++)
         pos[k] = s_ring_pos[k];
-    flush(1);
+    flush(1, FL_READBACK);
     for (k = 0; k < RING_N; k++)
         s_ring_pos[k] = pos[k];
     return (const uint8_t *)s_rb.map;
@@ -3229,17 +3562,27 @@ static int occ_result(void *ctx, void *qv, int flush_gpu, uint64_t *count)
         if (q->serial[i] == s_next_serial) {     /* not submitted yet */
             if (!flush_gpu)
                 return 0;
-            flush(0);
+            flush(0, FL_POLL);
         }
     }
-    done = serial_done();
-    for (i = 0; i < q->n; i++)
-        if (q->serial[i] > done)
-            return 0;
+    /* Submitted. With a cheap poll the counts are read once their submits
+     * are done; without one the query pool itself says which are there. */
+    if (poll_ok()) {
+        done = serial_done();
+        for (i = 0; i < q->n; i++)
+            if (q->serial[i] > done)
+                return 0;
+    }
     for (i = 0; i < q->n; i++) {
         uint64_t v = 0;
-        if (vkGetQueryPoolResults(s_dev, s_vkq, (uint32_t)q->slot[i], 1, sizeof v, &v,
-                                  sizeof v, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+        uint64_t t0 = s_vf ? now_ns() : 0;
+        VkResult qr = vkGetQueryPoolResults(s_dev, s_vkq, (uint32_t)q->slot[i], 1, sizeof v,
+                                            &v, sizeof v, VK_QUERY_RESULT_64_BIT);
+        if (s_vf) {
+            s_vf->qres++;
+            s_vf->qres_ns += now_ns() - t0;
+        }
+        if (qr == VK_SUCCESS)
             sum += v;
         else
             return 0;
@@ -3298,15 +3641,30 @@ static int vk_on_report(uint32_t va)
     nv2a_occ_report(&s_occ, va, occ_mode() == 1);
     if (occ_mode() == 0 && (s_cmd || s_up) && report_in_cmd(va)) {
         s_report_commits++;
-        flush(0);
+        if (s_pass && batch_draws()) {
+            /* vk_batch: the open pass is not ended for it; the counts go to
+             * the GPU with the next submit, at the latest when the frame is
+             * complete (or from on_poll, if the title seems to wait). */
+            if (!s_report_defer) {
+                s_report_defer = 1;
+                s_report_defer_t = now_ns();
+            }
+        } else {
+            flush(0, FL_REPORT);
+        }
     }
     return 1;
 }
 
 static void vk_on_poll(void)
 {
-    if (s_occ.npend)
-        nv2a_occ_poll(&s_occ, 1);
+    if (!s_occ.npend)
+        return;
+    /* A deferred report's counts are not asked for by ending the pass, unless
+     * half a frame has gone and the title may be waiting for them. */
+    if (s_report_defer && now_ns() - s_report_defer_t > 8000000ull)
+        flush(0, FL_REPORT);
+    nv2a_occ_poll(&s_occ, !s_report_defer);
 }
 
 /* Retired slots whose submit is done are free again. */
@@ -3339,6 +3697,24 @@ static void frame_advance(void)
 
     s_fi = (s_fi + 1) % s_frames;
     f = &s_fr[s_fi];
+    if (f->fence_serial) {
+        /* vk_poll=0: the frame's fence, signalled long ago as a rule; the
+         * wait is the question and, when the GPU is behind, the answer. */
+        t0 = now_ns();
+        if (vkWaitForFences(s_dev, 1, &f->fence, VK_TRUE, 5000000000ull) == VK_SUCCESS)
+            serial_known(f->fence_serial);
+        vkResetFences(s_dev, 1, &f->fence);
+        f->fence_serial = 0;
+        t0 = now_ns() - t0;
+        if (t0 > 500000ull) {
+            s_frame_waits++;
+            s_frame_wait_ns += t0;
+        }
+        if (s_vf) {
+            s_vf->waits++;
+            s_vf->wait_ns += t0;
+        }
+    }
     if (f->serial && serial_done() < f->serial) {
         t0 = now_ns();
         serial_wait(f->serial);
@@ -3831,6 +4207,13 @@ static int init(void)
         cp.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         cp.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
         cp.queueFamilyIndex = C->qfam;
+        if (!poll_ok()) {
+            VkFenceCreateInfo fci;
+            memset(&fci, 0, sizeof fci);
+            fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            if (vkCreateFence(s_dev, &fci, NULL, &s_fr[i].fence) != VK_SUCCESS)
+                s_fr[i].fence = VK_NULL_HANDLE;
+        }
         if (vkCreateCommandPool(s_dev, &cp, NULL, &s_fr[i].pool) != VK_SUCCESS) {
             fprintf(stderr, LOGP "command pool failed\n");
             return 0;
@@ -3970,10 +4353,11 @@ static int init(void)
     }
     atexit(at_exit_save);
     fprintf(stderr, LOGP "backend up on %s: %d frames in flight, present %s, write-back %s,"
-            " occlusion %s%s\n", C->name, s_frames,
+            " occlusion %s%s, GPU progress %s\n", C->name, s_frames,
             s_win ? "window slots" : C->surface ? "texture readback" : "headless",
             wb_always() ? "every flip" : "on demand",
-            s_vkq ? "queries" : "fixed", s_qprecise ? " (precise)" : "");
+            s_vkq ? "queries" : "fixed", s_qprecise ? " (precise)" : "",
+            poll_ok() ? "polled (timeline semaphore)" : "from a fence per frame (vk_poll=0)");
     s_failed = 0;
     return 1;
 }
@@ -4019,6 +4403,102 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
     p_fl = s_flushes;
 }
 
+/* vk_frame: the file and the timestamp pool, at the first flip. */
+static void vf_open(void)
+{
+    static int tried;
+    const char *path;
+    if (tried)
+        return;
+    tried = 1;
+    path = recomp_env(RENV_VK_FRAME);
+    if (!path || !*path || !strcmp(path, "0") || !strcmp(path, "1"))
+        return;
+    s_vf_out = fopen(path, "w");
+    if (!s_vf_out) {
+        fprintf(stderr, LOGP "vk_frame: cannot write %s\n", path);
+        return;
+    }
+    if (C->props.limits.timestampPeriod > 0.0f) {
+        VkQueryPoolCreateInfo qi;
+        memset(&qi, 0, sizeof qi);
+        qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = VF_RING * 2 * VF_TS;
+        if (vkCreateQueryPool(s_dev, &qi, NULL, &s_vf_qp) != VK_SUCCESS)
+            s_vf_qp = VK_NULL_HANDLE;
+        else
+            vkResetQueryPool(s_dev, s_vf_qp, 0, VF_RING * 2 * VF_TS);
+    }
+    fprintf(s_vf_out, "present,flip,t_ms,draws,passes,p_clear,p_load,p_resumed,p_empty,"
+            "p_maxdraws,rt_switch,zload,zresumed,s_flip,s_ready,s_report,s_poll,s_ring,"
+            "s_sampler,s_readback,s_batch,submit_ms,submit_max_ms,qlock_ms,polls,poll_ms,"
+            "poll_max_ms,waits,wait_ms,qres,qres_ms,endpass_ms,f_total,f_back,f_copy,"
+            "f_submit,f_pub,f_adv,ready_done,g_n,g_first_ms,g_last_ms,g_active_ms\n");
+    memset(s_vfr, 0, sizeof s_vfr);
+    s_vf = &s_vfr[0];
+    fprintf(stderr, LOGP "vk_frame: one line per flip into %s (GPU timestamps %s)\n", path,
+            s_vf_qp ? "on" : "not available");
+}
+
+/* The frame just presented is closed; the one VF_LAG flips back is written
+ * with its GPU times, and the next slot is made ready. */
+static void vf_flip(void)
+{
+    static uint64_t g0;
+    VkFrameRec *done = s_vf, *w;
+    int idx = (int)(s_vf - s_vfr), wi = (idx + VF_RING - VF_LAG) % VF_RING, k;
+    int ni = (idx + 1) % VF_RING;
+
+    done->present = s_presents;
+    done->flip = nv2a_pb_gpu_state()->flips;
+    done->t_ns = now_ns();
+    w = &s_vfr[wi];
+    if (w->t_ns) {
+        uint64_t ts[2 * VF_TS][2];
+        double per = (double)C->props.limits.timestampPeriod * 1e-6, first = 0, last = 0,
+               act = 0;
+        uint32_t n = 0;
+        memset(ts, 0, sizeof ts);
+        if (s_vf_qp && w->nts
+                && vkGetQueryPoolResults(s_dev, s_vf_qp, (uint32_t)(wi * 2 * VF_TS), 2 * w->nts,
+                                         sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT
+                                         | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) >= 0) {
+            for (k = 0; k < (int)w->nts; k++) {
+                if (!ts[2 * k][1] || !ts[2 * k + 1][1])
+                    continue;
+                if (!g0)
+                    g0 = ts[2 * k][0];
+                if (!n)
+                    first = (double)(int64_t)(ts[2 * k][0] - g0) * per;
+                last = (double)(int64_t)(ts[2 * k + 1][0] - g0) * per;
+                act += (double)(int64_t)(ts[2 * k + 1][0] - ts[2 * k][0]) * per;
+                n++;
+            }
+        }
+        fprintf(s_vf_out, "%llu,%u,%.3f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,"
+                "%.3f,%.3f,%.3f,%u,%.3f,%.3f,%u,%.3f,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+                "%.3f,%u,%u,%.3f,%.3f,%.3f\n",
+                (unsigned long long)w->present, w->flip, w->t_ns / 1e6, w->draws, w->passes,
+                w->p_clear, w->p_load, w->p_resumed, w->p_empty, w->p_maxdraws, w->rt_switch,
+                w->zload, w->zresumed, w->sub[FL_FLIP], w->sub[FL_READY], w->sub[FL_REPORT],
+                w->sub[FL_POLL], w->sub[FL_RING], w->sub[FL_SAMPLER], w->sub[FL_READBACK],
+                w->sub[FL_BATCH],
+                w->submit_ns / 1e6, w->submit_max_ns / 1e6, w->qlock_ns / 1e6, w->polls,
+                w->poll_ns / 1e6, w->poll_max_ns / 1e6, w->waits, w->wait_ns / 1e6, w->qres,
+                w->qres_ns / 1e6, w->endpass_ns / 1e6, w->f_total / 1e6, w->f_back / 1e6,
+                w->f_copy / 1e6, w->f_submit / 1e6, w->f_pub / 1e6, w->f_adv / 1e6,
+                w->ready_done, n, first, last, act);
+        if ((w->present & 63) == 0)
+            fflush(s_vf_out);
+    }
+    s_vf = &s_vfr[ni];
+    memset(s_vf, 0, sizeof *s_vf);
+    if (s_vf_qp)
+        vkResetQueryPool(s_dev, s_vf_qp, (uint32_t)(ni * 2 * VF_TS), 2 * VF_TS);
+    s_vf_last_rt = NULL;
+}
+
 /* RECOMP_TRACE=vk_prof: on_flip's cost every 300 flips. */
 static struct { uint64_t n, flip, wait, wb, blit, waits; } s_pa;
 
@@ -4038,6 +4518,13 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
         t_flip0 = now_ns();
     if (init()) {
         int wb;
+        uint64_t vt0 = 0, vt1 = 0, vt2 = 0, vt3 = 0, vt4 = 0;
+        vf_open();
+        if (s_vf) {
+            /* Is the GPU done with what the frame has submitted so far? */
+            vt0 = now_ns();
+            s_vf->ready_done = s_done_serial >= s_next_serial - 1;
+        }
         rt = present_target(surface_offset);
         if (rt) {
             present_extent(rt, &cw, &ch);
@@ -4056,7 +4543,11 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
              * queue. */
             struct nvk_image *slot;
             t = prof ? now_ns() : 0;
+            if (s_vf)
+                vt1 = now_ns();
             slot = (struct nvk_image *)xbox_FramebufferWindowBackTexture(hcw, hch);
+            if (s_vf)
+                vt2 = now_ns();
             if (slot) {
                 VkImageCopy ic;
                 end_encoder();
@@ -4077,8 +4568,20 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
                 ic.extent.depth = 1;
                 vkCmdCopyImage(s_cmd, rt->im.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                slot->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
-                flush(0);
+                if (s_vf)
+                    vt3 = now_ns();
+                /* The frame's last submit, unless a readback follows. */
+                s_flush_fence = !(rt && wb);
+                flush(0, FL_FLIP);
+                if (s_vf)
+                    vt4 = now_ns();
                 xbox_FramebufferWindowPublishTexture();
+                if (s_vf) {
+                    s_vf->f_back = vt2 - vt1;
+                    s_vf->f_copy = vt3 - vt2;
+                    s_vf->f_submit = vt4 - vt3;
+                    s_vf->f_pub = now_ns() - vt4;
+                }
             }
             if (prof)
                 s_pa.blit += now_ns() - t;
@@ -4096,11 +4599,19 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
         }
         /* Submit the frame and move on: the GPU runs it while the next
          * one is recorded. */
-        flush(0);
+        s_flush_fence = 1;
+        flush(0, FL_FLIP);
         t = prof ? now_ns() : 0;
         {
             uint64_t w0 = s_frame_waits;
+            uint64_t va = s_vf ? now_ns() : 0;
             frame_advance();
+            if (s_vf) {
+                uint64_t vn = now_ns();
+                s_vf->f_adv = vn - va;
+                s_vf->f_total = vn - vt0;
+                vf_flip();
+            }
             if (prof) {
                 s_pa.wait += now_ns() - t;
                 s_pa.waits += s_frame_waits - w0;
@@ -4178,7 +4689,7 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
 static void vk_on_flip_ready(void)
 {
     if (!s_failed && (s_cmd || s_up))
-        flush(0);
+        flush(0, FL_READY);
 }
 
 /* ---- registration ---------------------------------------------------------- */

@@ -138,6 +138,7 @@ extern "C" {
     X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip") \
     X(PCACHE_TRACE,      TRACE, "pcache",          NULL,                       "pipeline cache: each shader/pipeline compile (thread, ms), the pre-warm summary; =<file>: also one CSV line per flip (t_ms, interval_ms, compiles)") \
     X(VK_PROF,           TRACE, "vk_prof",         NULL,                       "Vulkan flip cost every 300 flips: frame waits, write-backs, submits, GPU time") \
+    X(VK_FRAME,          TRACE, "vk_frame",        NULL,                       "=<file>: Vulkan backend, one CSV line per flip: draws, render passes (cleared, loaded, resumed on a target already drawn that frame, empty), queue submits by reason, time in submits, timeline polls, waits and the flip's steps, GPU time from timestamp queries") \
     X(VK_PRESENT_LOG,    TRACE, "vk_present",      NULL,                       "=<file>: Vulkan window, one CSV line per present and per frame displayed (present_wait)") \
     X(POST_GPU,          TRACE, "post_gpu",        NULL,                       "window presenter: each post-process pass's GPU time (FXAA, SMAA's three, CAS) and the scale and overlay's, averaged every 300 presents (Metal; Vulkan: the post passes together)") \
     X(VK_TRACE,          TRACE, "vk",              NULL,                       "Vulkan render-target events, pipeline and shader compiles") \
@@ -243,6 +244,8 @@ extern "C" {
     X(VK_POINT,          DEBUG, "vk_point",        NULL,                       "Vulkan point sampling") \
     X(VK_NO_RTT,         DEBUG, "vk_no_rtt",       NULL,                       "Vulkan decodes render targets from memory (implies vk_writeback=always)") \
     X(VK_WRITEBACK,      DEBUG, "vk_writeback",    NULL,                       "=lazy|always: Vulkan writes guest memory when a dump reads it (default) or at every flip") \
+    X(VK_POLL,           DEBUG, "vk_poll",         NULL,                       "=0|1: Vulkan backend asks the timeline semaphore how far the GPU is (1: default off Android) or never asks and learns it from a fence per frame, waited for when the frame's slot is reused (0: default on Android, where Turnip on KGSL answers the question by waiting for the GPU)") \
+    X(VK_BATCH,          DEBUG, "vk_batch",        NULL,                       "=<draws>: Vulkan backend submits what a frame has recorded when a render pass begins and that many draws (or 2 ms with any draw) have gone since the last submit, so the GPU starts on the frame while the rest is recorded; an occlusion report then waits for the pass to end instead of ending it. 0: one submit when the frame is complete (default; Android: 300)") \
     X(VK_OCC,            DEBUG, "vk_occ",          NULL,                       "=sync|fixed: Vulkan occlusion mode") \
     X(VK_PRESENT,        DEBUG, "vk_present",      NULL,                       "=window|readback: Vulkan window present, swapchain from GPU slots (default) or texture readback into the SDL renderer") \
     X(VK_FRAMES,         DEBUG, "vk_frames",       NULL,                       "=1|2: Vulkan frames in flight (default 2)") \

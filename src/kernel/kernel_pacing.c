@@ -487,6 +487,45 @@ void xbox_VblankSignal(void)
     WakeAllConditionVariable(&s_vbl_cv);
 }
 
+#if defined(__ANDROID__) && defined(__aarch64__)
+/* The spin's clock on Android. clock_gettime goes into the kernel on the
+ * Retroid Pocket 5 (Snapdragon 865, Linux 4.19: the vDSO falls back to the
+ * system call), and the spin to the vblank's edge was 44 % of the executor
+ * thread's cycles, most of it that call (BO-85). The spin needs no time of
+ * day, only "has the edge's deadline passed": it reads the CPU's virtual
+ * counter (cntvct_el0, ticking at cntfrq_el0) against a limit worked out
+ * once from the host clock. Not used when the counter's frequency reads as
+ * nonsense or a read of it costs as much as the call it replaces (a kernel
+ * that traps and emulates it). */
+static inline uint64_t cnt_read(void)
+{
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+
+static uint64_t cnt_freq(void)
+{
+    static uint64_t freq;          /* 0: not looked at; 1: not usable */
+    if (!freq) {
+        uint64_t f, t0, t1, c0, c1 = 0;
+        int i;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        t0 = xbox_HostNowNs();
+        c0 = cnt_read();
+        for (i = 0; i < 256; i++)
+            c1 = cnt_read();
+        t1 = xbox_HostNowNs();
+        freq = (f >= 1000000u && f <= 10000000000ull && c1 > c0 && (t1 - t0) / 256u < 200u)
+             ? f : 1;
+        fprintf(stderr, "[PACING] vblank spin clock: %s (cntfrq %llu Hz, %llu ns a read)\n",
+                freq > 1 ? "the CPU's counter" : "clock_gettime", (unsigned long long)f,
+                (unsigned long long)((t1 - t0) / 256u));
+    }
+    return freq > 1 ? freq : 0;
+}
+#endif
+
 int xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms)
 {
     uint64_t deadline = xbox_HostNowNs() + (uint64_t)timeout_ms * 1000000u;
@@ -513,6 +552,15 @@ int xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms)
                     uint64_t d = due - s_spin_lead_ns - now;
                     xbox_HostSleepNs(d < deadline - now ? d : deadline - now);
                 } else {
+#if defined(__ANDROID__) && defined(__aarch64__)
+                    uint64_t f = cnt_freq();
+                    if (f) {
+                        /* The same deadline, due + SPIN_LATE_NS, in ticks. */
+                        uint64_t lim = cnt_read() + (due + SPIN_LATE_NS - now) * f / 1000000000ull;
+                        while ((int32_t)(xbox_VblankCount() - target) < 0 && cnt_read() < lim)
+                            cpu_relax();
+                    } else
+#endif
                     while ((int32_t)(xbox_VblankCount() - target) < 0
                            && xbox_HostNowNs() < due + SPIN_LATE_NS)
                         cpu_relax();
