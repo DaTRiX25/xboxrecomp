@@ -280,6 +280,11 @@ int nv2a_pb_dump_at_listed(uint32_t flip);
  * (the one in fb_flip_NNNNN.bmp and in the flip log). NULL, the default:
  * nothing is called. Set it before the guest runs. */
 void nv2a_pb_set_flip_hook(void (*fn)(uint32_t flip));
+/* The frame of the last flip as a BMP at `path`, as RECOMP_FB_DUMP_AT writes
+ * it (guest memory, made current by the backend first); for the flip hook,
+ * which decides by what it finds which flips are worth a picture. 0 when
+ * there is no frame to write. */
+int nv2a_pb_dump_frame(const char *path);
 
 /* One batch, at SET_BEGIN_END(0).
  *

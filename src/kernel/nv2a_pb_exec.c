@@ -964,6 +964,7 @@ static void dump_at_parse(void)
 /* nv2a_pb_set_flip_hook (nv2a_pb_state.h). */
 static void (*s_flip_hook)(uint32_t flip);
 void nv2a_pb_set_flip_hook(void (*fn)(uint32_t flip)) { s_flip_hook = fn; }
+int nv2a_pb_dump_frame(const char *path) { return write_present_bmp(path); }
 
 int nv2a_pb_dump_at_listed(uint32_t flip)
 {
