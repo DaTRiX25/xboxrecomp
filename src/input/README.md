@@ -225,6 +225,51 @@ controller found at init. `xbox_InputSetState` reaches only connected ports;
 `xbox_InputShutdown` (also registered with `atexit` by `xbox_InputInit`)
 stops every motor.
 
+### The rumble curve
+
+A title's motor speeds were written for the Duke's and the S pad's
+eccentric-mass motors. What a host motor is given is worked out in one place,
+`input_core.c` with the arithmetic in `rumble_curve.c`, before any backend
+sees it: an SDL pad, Windows XInput and an Android device's own vibrator all
+get the same level.
+
+```
+u    = min(1, speed / peak)     peak: RECOMP_INPUT_RUMBLE_PEAK, the title's own
+                                strongest speed (default 65535)
+gate : 0 while speed < 800; once off, on again only from 1200 (per motor)
+out  = u ^ (1 / strength)       strength: RECOMP_INPUT_RUMBLE_GAIN, the
+                                overlay's "Rumble strength"; 1.0 the title's
+                                speeds as the console played them, 0 off
+time : a rise is immediate; a fall follows down exponentially, release
+       about 90 ms (37 % of a step left after 90 ms), and ends in a zero
+```
+
+The strength is the exponent, never a multiplier before a clip: only the
+peak is full, at any strength, so a strong rumble and a weak one stay apart.
+Above 1 it lifts the low speeds (a pad whose motors barely answer them, a
+phone's vibrator); the setting goes from 0 to 3 in steps of 0.25. The gate is
+the console motors' start-up threshold: an idle hum of a hundredth of full
+did not turn them. The release is their spin-down.
+
+The release needs a clock: `xbox_InputRumbleTick(port)`, which
+`xbox_InputGetState` calls and the emulated USB pad calls at every poll
+(`src/usb/usb_gamepad.c`). The same tick gives a held rumble to the host
+again every 150 ms (SDL's rumble runs for a set time) and writes a falling
+level to the pad at most every 16 ms.
+
+Nothing is sent, the refresh included, while the settings overlay is open
+(`xbox_InputSetBlocked`) or the window is not in front
+(`xbox_InputSetBackground`, from the window's focus events): a zero goes out
+first, and what the title last asked for plays again after.
+
+`RECOMP_TRACE=input_diag` prints each change handed to the host, with the
+title's speeds beside it; it runs without a pad too (`(no pad)`).
+
+On Android SDL2 cannot rumble a pad (2.32's joystick driver has no rumble):
+the first pad's rumble goes to the device's own vibrator when that pad is the
+device's built-in one (`android_vibration.c`, `RECOMP_ANDROID_VIBRATION`),
+and an external pad does not rumble.
+
 ## Ports
 
 ```c
