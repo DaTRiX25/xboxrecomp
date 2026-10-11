@@ -27,6 +27,7 @@ set(KERNEL_SOURCES
     kernel_bridge.c
     xbox_memory_layout.c
     xbox_crash.c
+    xbox_report.c
     icall_feedback.c
     recomp_trace.c
     nv2a_pb_scan.c
@@ -47,10 +48,23 @@ target_include_directories(xbox_kernel PUBLIC
     ${XBOXRECOMP_SRC_DIR}
 )
 
+# The toolkit's commit, for the bug report (xbox_report.c): a header made at
+# every build and rewritten only when the commit changes.
+set(XR_BUILD_ID_DIR ${CMAKE_CURRENT_BINARY_DIR}/build_id)
+add_custom_target(xr_build_id
+    COMMAND ${CMAKE_COMMAND} -DSRC=${XBOXRECOMP_SRC_DIR}/.. -DOUT=${XR_BUILD_ID_DIR}/xr_build_id.h
+            -DMACRO=XR_BUILD_COMMIT -P ${XBOXRECOMP_SRC_DIR}/../cmake/build_id.cmake
+    BYPRODUCTS ${XR_BUILD_ID_DIR}/xr_build_id.h
+    VERBATIM)
+add_dependencies(xbox_kernel xr_build_id)
+target_include_directories(xbox_kernel PRIVATE ${XR_BUILD_ID_DIR})
+set_source_files_properties(xbox_report.c PROPERTIES COMPILE_DEFINITIONS XR_HAVE_BUILD_ID)
+
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+    # advapi32: the registry (xbox_report.c reads the OS and CPU names).
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt advapi32)
 elseif(ANDROID)
     # Android: the platform layer alone. The crypto exports (kernel_crypto.c)
     # are portable C, and the NDK has no OpenSSL to link.
