@@ -24,7 +24,7 @@ LOAD_BYTE = f"0fb60d{D32}c3"
 STORE = f"a3{D32}c3"
 
 
-def _translate(hexcode, patch=None, va=BASE):
+def _translate(hexcode, patch=None, va=BASE, latch=None):
     image = bytes.fromhex(hexcode)
     config._install([config.Section(".text", BASE, len(image), 0, len(image), True),
                      config.Section(".data", DATA, 0x1000, len(image), 0, False)],
@@ -36,7 +36,7 @@ def _translate(hexcode, patch=None, va=BASE):
     report = None
     if patch is not None:
         report = PatchReport(PatchConfig([Patch(
-            va, "load_u32", "game.speed_units", "kmh", 2)]))
+            va, "load_u32", "game.speed_units", "kmh", 2, latch=latch)]))
         t.lifter.patches = report
     return t.translate_function(BASE, db[BASE]), report
 
@@ -47,6 +47,14 @@ def test_load_is_followed_by_the_call():
             in code), code
     assert code.index("MEM32(0x20000)") < code.index("RECOMP_PATCH_U32")
     assert report.finish() == []
+
+
+def test_latch_sites_use_the_latch_call():
+    for latch, mode in (("set", 1), ("use", 2)):
+        code, report = _translate(LOAD_EAX, patch=True, latch=latch)
+        assert ('eax = RECOMP_PATCH_U32_LATCH("game.speed_units", "kmh", '
+                f"0x2u, eax, {mode});") in code, code
+        assert report.finish() == []
 
 
 def test_the_register_is_the_loaded_one():

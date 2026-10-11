@@ -516,6 +516,12 @@ shows at the next load with no restart. A setting the host did not enable
 leaves the load alone. `game.speed_units` (`RECOMP_SPEED_UNITS=mph|kmh`) is
 an overlay row on the Display page, shown only when enabled.
 
+An optional `"latch": "set"` or `"use"` pairs sites that read one choice at
+different times (Burnout 3 builds the speedometer's unit label once, when the
+HUD is made, and its number every frame): a `use` site follows what the last
+`set` site sampled, so a change mid-race shows whole at the next set-up
+instead of as 171 "mph".
+
 A listed site that is not a 32-bit register load, or that no lifted body
 contains, fails the run; the report is `patches.json` in `-o`. Without the
 flag the output is unchanged. Tests: `tools/recomp/test_patches.py`.

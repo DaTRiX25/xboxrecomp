@@ -30,6 +30,14 @@ extern "C" {
 void recomp_patch_enable(const char *key, recomp_env_id env);
 /* The setting was enabled (the overlay shows its row only then). */
 int recomp_patch_enabled(const char *key);
+/* A latched pair: a "set" site (the title builds something from the setting,
+ * once) samples the setting; "use" sites (it reads the same choice every
+ * frame) follow that sample, so a change made mid-way shows together, at the
+ * next "set", and never as half a display. Before any "set" a "use" site
+ * follows the setting. */
+enum { RECOMP_PATCH_LATCH_SET = 1, RECOMP_PATCH_LATCH_USE = 2 };
+uint32_t recomp_patch_u32_latch(const char *key, const char *when,
+                                uint32_t value, uint32_t loaded, int mode);
 /* What the generated code calls. Safe from any thread. */
 uint32_t recomp_patch_u32(const char *key, const char *when, uint32_t value,
                           uint32_t loaded);

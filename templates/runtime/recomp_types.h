@@ -546,8 +546,13 @@ void xbox_SpinWait(uint32_t va);
  * recomp_patch.h). A setting the host never enabled leaves the load alone. */
 uint32_t recomp_patch_u32(const char *key, const char *when, uint32_t value,
                           uint32_t loaded);
+uint32_t recomp_patch_u32_latch(const char *key, const char *when,
+                                uint32_t value, uint32_t loaded, int mode);
 #define RECOMP_PATCH_U32(key, when, value, loaded) \
     recomp_patch_u32((key), (when), (value), (loaded))
+/* mode 1: this load samples the setting; 2: it follows the last sample. */
+#define RECOMP_PATCH_U32_LATCH(key, when, value, loaded, mode) \
+    recomp_patch_u32_latch((key), (when), (value), (loaded), (mode))
 
 /* x86 port I/O (`in`/`out`). width is 1, 2 or 4 bytes. The runtime models
  * the ports titles are known to read (the field pin at 0x80C0) and logs the

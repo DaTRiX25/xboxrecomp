@@ -23,6 +23,12 @@ The file (JSON):
                   "setting": "game.speed_units", "when": "kmh", "value": 2,
                   "note": "..."}]}
 
+Optional "latch": "set" or "use" (RECOMP_PATCH_U32_LATCH): the title builds
+part of a display once from the choice and reads it again every frame (the
+speedometer's unit label and its number). The "set" site samples the setting
+and the "use" sites follow that sample, so a change made mid-race shows
+whole, at the next set-up, and never as 171 "mph".
+
 kind "load_u32": the instruction at va must be a 32-bit `mov reg, [mem]`.
 Its address may sit in several lifted bodies (the lifter splits a function
 that another one jumps into); every body gets the call. A listed site that
@@ -44,9 +50,10 @@ def _parse_va(v):
 
 
 class Patch:
-    def __init__(self, va, kind, setting, when, value, note=""):
+    def __init__(self, va, kind, setting, when, value, note="", latch=None):
         self.va, self.kind, self.setting = va, kind, setting
         self.when, self.value, self.note = when, value, note
+        self.latch = latch
 
 
 class PatchConfig:
@@ -70,7 +77,8 @@ class PatchConfig:
             raise ValueError(f"{path}: unknown keys {sorted(unknown)}")
         out = []
         for s in doc.get("patches", []):
-            bad = set(s) - {"va", "kind", "setting", "when", "value", "note"}
+            bad = set(s) - {"va", "kind", "setting", "when", "value", "note",
+                            "latch"}
             if bad:
                 raise ValueError(f"{path}: unknown patch keys {sorted(bad)}")
             kind = s.get("kind", "load_u32")
@@ -84,8 +92,11 @@ class PatchConfig:
             value = _parse_va(s["value"])
             if not 0 <= value <= 0xFFFFFFFF:
                 raise ValueError(f"{path}: value {value} is not a uint32")
+            latch = s.get("latch")
+            if latch not in (None, "set", "use"):
+                raise ValueError(f"{path}: latch must be 'set' or 'use'")
             out.append(Patch(_parse_va(s["va"]), kind, setting, when, value,
-                             s.get("note", "")))
+                             s.get("note", ""), latch))
         return cls(out)
 
 
@@ -116,6 +127,11 @@ class PatchReport:
             return []
         reg = ops[0].reg
         self.applied[p.va] += 1
+        if p.latch:
+            return [f'{reg} = RECOMP_PATCH_U32_LATCH("{p.setting}", '
+                    f'"{p.when}", 0x{p.value:X}u, {reg}, '
+                    f"{1 if p.latch == 'set' else 2}); "
+                    f"/* patch 0x{p.va:08X}, latch {p.latch} */"]
         return [f'{reg} = RECOMP_PATCH_U32("{p.setting}", "{p.when}", '
                 f"0x{p.value:X}u, {reg}); /* patch 0x{p.va:08X} */"]
 
