@@ -689,6 +689,15 @@ static int android_lifecycle(void *user, SDL_Event *ev)
             s_bg_paused = 1;
             xbox_HostPause(1);
         }
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+        /* An app in the background may be ended without a word (swiped out
+         * of the recent apps): a setting changed in the overlay is written
+         * now, not at the overlay's next frame or when it closes. */
+        if (ev->type == SDL_APP_WILLENTERBACKGROUND) {
+            extern void xbox_SettingsFlush(void);
+            xbox_SettingsFlush();
+        }
+#endif
 #if defined(XBOXRECOMP_HAVE_VULKAN)
         fbv_android_surface_gone();
 #endif

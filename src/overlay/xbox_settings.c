@@ -360,13 +360,20 @@ void xbox_SettingsFlush(void)
     FILE *f;
     int i;
 
+    /* Also called from the Android life-cycle callback, on another thread
+     * than the overlay's: one writer at a time, the other's change stays
+     * dirty for the next call. */
+    static volatile LONG writing;
     if (!s_dirty || !s_path[0])
+        return;
+    if (InterlockedExchange(&writing, 1))
         return;
     s_dirty = 0;
     snprintf(tmp, sizeof tmp, "%s.tmp", s_path);
     f = fopen(tmp, "wb");
     if (!f) {
         fprintf(stderr, LOGP "cannot write %s\n", tmp);
+        InterlockedExchange(&writing, 0);
         return;
     }
     fputs("# Written by the in-game settings overlay (Back+Start, F1).\n"
@@ -400,6 +407,7 @@ void xbox_SettingsFlush(void)
     }
     if (fclose(f) != 0) {
         fprintf(stderr, LOGP "cannot write %s\n", tmp);
+        InterlockedExchange(&writing, 0);
         return;
     }
 #if defined(_WIN32)
@@ -407,6 +415,9 @@ void xbox_SettingsFlush(void)
 #endif
     if (rename(tmp, s_path) != 0)
         fprintf(stderr, LOGP "cannot replace %s\n", s_path);
+    else
+        fprintf(stderr, LOGP "saved\n");
+    InterlockedExchange(&writing, 0);
 }
 
 static void keep_unknown(const recomp_cfg *c, const char *key)
