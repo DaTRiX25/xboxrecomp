@@ -49,4 +49,7 @@ int usb_gamepad_configured(int pad);
  * XInput pad n and by pad-script steps prefixed "p<n+1>-". */
 #define USB_GAMEPAD_MAX 4
 
+/* Lines of RECOMP_PAD_LIVE the pad has taken (scheduled) since start. */
+unsigned usb_gamepad_live_taken(void);
+
 #endif /* XBOX_USB_GAMEPAD_H */

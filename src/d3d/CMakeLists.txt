@@ -24,6 +24,7 @@ if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
         d3d8_vsh_glsl.c
         d3d8_combiners_glsl.c
         nv2a_pcache.c
+        nv2a_pcache_psdef.c
         nv2a_pb_d3d11.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
@@ -54,6 +55,7 @@ else()
         d3d8_vsh_glsl.c
         d3d8_combiners_glsl.c
         nv2a_pcache.c
+        nv2a_pcache_psdef.c
     )
     find_package(SDL2 REQUIRED)
     if(WIN32)
@@ -72,23 +74,12 @@ else()
     # "library 'epoxy' not found". The _LINK_LIBRARIES form is absolute paths.
         target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
     endif()
-    # The toolkit revision at configure time: the pipeline caches' version
-    # key (nv2a_pcache.h), so a file from another build is dropped.
-    execute_process(COMMAND git describe --always --dirty --abbrev=12
-                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                    OUTPUT_VARIABLE XR_GIT_REV OUTPUT_STRIP_TRAILING_WHITESPACE
-                    ERROR_QUIET)
-    if(NOT XR_GIT_REV)
-        set(XR_GIT_REV "unknown")
-    endif()
     if(XBOXRECOMP_HAVE_VULKAN)
         # The pushbuffer executor's Vulkan backend (RECOMP_PB_BACKEND=vulkan),
         # its device (shared with the window's swapchain) and glslang.
         target_sources(xbox_d3d8 PRIVATE nv2a_vk_core.c nv2a_vk_glsl.c nv2a_pb_vulkan.c)
         # For a title's own sources too (its default backend).
         target_compile_definitions(xbox_d3d8 PUBLIC XBOXRECOMP_HAVE_VULKAN=1)
-        set_source_files_properties(nv2a_pb_vulkan.c PROPERTIES
-            COMPILE_DEFINITIONS "XBOXRECOMP_GIT_REV=\"${XR_GIT_REV}\"")
         target_include_directories(xbox_d3d8 PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_link_libraries(xbox_d3d8 PUBLIC Vulkan::Vulkan glslang::glslang
@@ -119,10 +110,6 @@ else()
         # Manual retain/release (no -fobjc-arc); shaders are MSL compiled at
         # runtime, so no metallib build step.
         target_sources(xbox_d3d8 PRIVATE nv2a_pb_metal.m)
-        # The pipeline cache's version key (nv2a_pcache.h): the toolkit
-        # revision at configure time, so a file from another build is dropped.
-        set_source_files_properties(nv2a_pb_metal.m PROPERTIES
-            COMPILE_DEFINITIONS "XBOXRECOMP_GIT_REV=\"${XR_GIT_REV}\"")
         target_include_directories(xbox_d3d8 PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_link_libraries(xbox_d3d8 PUBLIC

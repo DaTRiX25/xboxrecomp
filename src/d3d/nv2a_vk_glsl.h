@@ -28,6 +28,10 @@ enum nvk_stage { NVK_STAGE_VERTEX = 0, NVK_STAGE_FRAGMENT = 1 };
 int nvk_glsl_spirv(enum nvk_stage stage, const char *src, const uint32_t **words,
                    size_t *n, int *compiled, char *err, size_t errn);
 
+/* Reads the cache file again: what another process (a pre-build) appended
+ * since it was loaded. Thread-safe. */
+void nvk_glsl_reload(void);
+
 /* The cache directory (created), or 0 when the disk cache is off. */
 int nvk_cache_dir(char *out, size_t n);
 

@@ -544,6 +544,14 @@ static void pad_script_compact(unsigned long t)
     s_script_len = n;
 }
 
+/* Lines of RECOMP_PAD_LIVE taken so far: an in-process driver
+ * (xbox_autoplay.c) waits on it as the scene scripts wait on the log line. */
+static volatile unsigned s_live_taken;
+unsigned usb_gamepad_live_taken(void)
+{
+    return s_live_taken;
+}
+
 /* Read whatever has been appended to RECOMP_PAD_LIVE since last time, and
  * schedule each complete line at t. Polled at most every 50 ms. */
 static void pad_live_poll(unsigned long t)
@@ -600,6 +608,7 @@ static void pad_live_poll(unsigned long t)
                     next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
                 fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
                 fflush(stderr);
+                s_live_taken++;
                 npending = 0;
             }
         } else if (npending < sizeof pending - 1) {

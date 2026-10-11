@@ -7,8 +7,14 @@
  * program's slots, the combiner state, the pipeline's fixed state), so the
  * next start compiles them before the title draws with them. It stores keys,
  * not compiled code: the backend regenerates the source from a key, so a
- * changed generator never runs stale code (the version string still drops a
- * file from another build, as the key layout may have changed with it).
+ * changed generator never runs stale code, and a rebuild of the toolkit
+ * keeps the list. The version string names what the keys mean (the backend's
+ * key-format number and the sizes of the structures written as they are);
+ * only a change there drops a file.
+ *
+ * The keys are the title's own data (a vertex program's slots are its
+ * microcode, byte for byte as in its executable), so a list is made on the
+ * player's machine and is not something to hand around.
  *
  * The approach is the one emulators converged on: Dolphin keeps a per-game
  * list of pipeline UIDs under a 'PUID' + GX_PIPELINE_UID_VERSION header and
@@ -48,8 +54,10 @@ typedef struct nv2a_pcache nv2a_pcache;
 /* Largest payload a record may have. */
 #define NV2A_PCACHE_MAX_LEN 65536u
 
-/* Opens <path>, creating it. `version` names the build that may read it;
- * a file written under another is deleted and started afresh. Returns NULL
+/* Opens <path>, creating it. `version` names the key format that may read
+ * it; a file written under another is deleted and started afresh (one whose
+ * version is this one plus "; toolkit <rev>", as written up to BO-93, is
+ * read as it is). Returns NULL
  * when the file can neither be read nor created (the cache is then off);
  * `msg` (may be NULL) gets one line on what was found: loaded, new, version
  * mismatch, a cut tail. */
@@ -74,6 +82,80 @@ uint64_t nv2a_fnv64(const void *p, size_t n, uint64_t h);
  * Windows %LOCALAPPDATA%\<app>). "none", "off", "0" or "" turn it off.
  * Returns 1 with the path in `out`, 0 when off or not creatable. */
 int nv2a_pcache_dir(const char *dir, const char *app, char *out, size_t n);
+/* The <app> the backends pass: the executable's name. */
+const char *nv2a_pcache_app(void);
+
+/* ---- what the running backend's cache is doing ------------------------------
+ *
+ * One process-wide record the backend with the key list keeps up to date,
+ * for whoever shows it (a settings page, a pre-build's progress line). Read
+ * from any thread: the numbers only grow, a torn read is one count off. */
+enum { NV2A_PC_VS = 0, NV2A_PC_FS = 1, NV2A_PC_PSO = 2 };
+typedef struct nv2a_pcache_stat {
+    int      active;          /* a backend is up and has a key list on disk */
+    int      warming;         /* its pre-warm thread is running */
+    int      waiting;         /* its render thread is waiting for the start-up
+                               * pre-warm right now (no frame comes meanwhile:
+                               * the window says so, overlay.h) */
+    uint32_t listed[3];       /* keys in the list: vertex, fragment, pipeline */
+    uint32_t warmed[3];       /* built by the pre-warm thread */
+    uint32_t ack[3];          /* built by the render thread: the list lacked them */
+    uint32_t ack_max_us;      /* the longest of those */
+    uint64_t ack_ns;          /* and their sum */
+    char     dir[512];        /* the cache directory, "" when off */
+} nv2a_pcache_stat;
+void nv2a_pcache_stat_get(nv2a_pcache_stat *out);
+/* The backend's side. */
+void nv2a_pcache_stat_open(const char *dir, const uint32_t listed[3]);
+void nv2a_pcache_stat_warming(int on);
+void nv2a_pcache_stat_waiting(int on);
+void nv2a_pcache_stat_built(int prewarm, int kind, uint64_t ns);
+
+/* Asks the running backend to read its key list again and build what it
+ * does not have yet, on its pre-warm thread: for after another process (a
+ * pre-build) has appended to it. 0 when no backend with a key list is up. */
+int  nv2a_pcache_rescan(void);
+void nv2a_pcache_set_rescan(void (*fn)(void));
+
+/* Appends a key to the running backend's list without building it (a
+ * rescan then does, on the pre-warm thread): type NV2A_PC_VS with a vertex
+ * program's slots, NV2A_PC_FS with an NV2ACombinerState. 0 when no backend
+ * with a key list is up. Any thread. */
+int  nv2a_pcache_seed(uint32_t type, const void *data, uint32_t len);
+void nv2a_pcache_set_seed(void (*fn)(uint32_t type, const void *data, uint32_t len));
+
+/* ---- vertex programs in an executable ---------------------------------------
+ *
+ * A title's vertex shaders are compiled into its executable as the XDK
+ * assembler wrote them: u16 0x2078, u16 n, then n slots of 16 bytes, the
+ * NV2A's microcode as SET_TRANSFORM_PROGRAM uploads it (a shader with
+ * "#pragma screenspace" is uploaded as it is; D3D appends a viewport
+ * epilogue to the others, which then do not match and cost nothing but an
+ * unused entry). Calls fn for each one found in `image`: a slot's first
+ * word is 0, FINAL (bit 0 of the fourth) is set on the last slot and only
+ * there. Returns how many. A pre-build seeds a backend's key list with them
+ * (type 0, the slots: the record both backends write for a vertex program),
+ * so every vertex function is built before the title draws with it. */
+size_t nv2a_pcache_scan_vsh(const void *image, size_t size,
+                            void (*fn)(void *ctx, const uint32_t *slots, uint32_t n),
+                            void *ctx);
+
+/* ---- pixel-shader definitions in an executable -------------------------------
+ *
+ * A title's pixel shaders are D3DPIXELSHADERDEF blocks in its executable,
+ * 60 words whose input, output, count and final-combiner words D3D writes
+ * to the NV2A as they are. Calls fn with each combiner state they can lead
+ * to (an NV2ACombinerState as the backends key a fragment shader, `len` its
+ * size): one per way the definition's sampling stages can be bound (off, 2D,
+ * cube), since a stage's mode follows the texture bound to it. Returns the
+ * number of definitions found. A pre-build seeds the key list with them
+ * (type NV2A_PC_FS), so a material the played scenes did not show has its
+ * fragment shader built all the same. States the title sets through the
+ * fixed-function texture stages are not in a definition and are not found.
+ * (nv2a_pcache_psdef.c; needs d3d8_combiners_parse.c.) */
+size_t nv2a_pcache_scan_psdef(const void *image, size_t size,
+                              void (*fn)(void *ctx, const void *state, uint32_t len),
+                              void *ctx);
 
 #ifdef __cplusplus
 }

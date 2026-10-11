@@ -112,6 +112,7 @@ extern "C" {
     X(GFX_HUD_FIX,       CONFIG, "RECOMP_GFX_HUD_FIX",       NULL, "1: the title's 2D HUD keeps its shape in a 16:9 picture, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
     X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \
+    X(OVERLAY_TEST,      CONFIG, "RECOMP_OVERLAY_TEST",      NULL, "=file: a test drives the overlay through it, one line each as appended: key <up|down|left|right|enter|esc|f1|pgup|pgdn|del>, pad <a|b|y|up|down|left|right|lb|rb|back+start> (SDL events pushed into the window's loop), shot <path> (the window as presented, BMP), state <path> (the open page's rows as text)") \
     X(SETTINGS_FILE,     CONFIG, "RECOMP_SETTINGS",          NULL, "the overlay's settings file: a path, or none (default: <save dir>/settings.toml)") \
     X(GFX_ANISO,         CONFIG, "RECOMP_GFX_ANISO",         NULL, "anisotropic filtering of mipmapped, linearly minified textures: off (default), 2, 4, 8, 16 (Metal, Vulkan; clamped to the device's limit)") \
     X(GFX_AA,            CONFIG, "RECOMP_GFX_AA",            NULL, "post-process anti-aliasing of the frame at the game's resolution, before the scale to the window: off (default), fxaa, smaa (Metal, Vulkan windows)") \

@@ -27,6 +27,7 @@
 #endif
 
 static char s_dir[PATH_MAX];
+static char s_path[PATH_MAX];       /* the executable itself, kept by resolve() */
 
 /* Cut `p` at its last separator; 0 if it has none. */
 static int cut_dir(char *p)
@@ -52,6 +53,7 @@ static int resolve(char *out, size_t cap)
     DWORD n = GetModuleFileNameA(NULL, out, (DWORD)cap);
     if (n == 0 || n >= cap)
         return 0;
+    strcpy(s_path, out);
     return cut_dir(out);
 #elif defined(__APPLE__)
     char raw[PATH_MAX];
@@ -63,12 +65,14 @@ static int resolve(char *out, size_t cap)
             return 0;
         strcpy(out, raw);
     }
+    strcpy(s_path, out);
     return cut_dir(out);
 #else
     ssize_t n = readlink("/proc/self/exe", out, cap - 1);
     if (n <= 0)
         return 0;
     out[n] = 0;
+    strcpy(s_path, out);
     return cut_dir(out);
 #endif
 }
@@ -78,4 +82,10 @@ const char *recomp_exe_dir(void)
     if (!s_dir[0] && !resolve(s_dir, sizeof s_dir))
         strcpy(s_dir, ".");
     return s_dir;
+}
+
+const char *recomp_exe_path(void)
+{
+    (void)recomp_exe_dir();
+    return s_path;
 }

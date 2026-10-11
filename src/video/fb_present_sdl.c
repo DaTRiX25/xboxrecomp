@@ -145,6 +145,7 @@ static int             s_layer;
 static int             s_vk;
 /* The settings overlay is open: the main loop turns fast and presents. */
 static int             s_overlay_open;
+static int             s_overlay_note;  /* the overlay shows a line without being open */
 
 /* Ack-thread side counters, read by the stats line. */
 static uint64_t s_flips, s_copy_ns;          /* relaxed atomics */
@@ -583,6 +584,23 @@ static void shot_parse(void)
     }
 }
 
+/* A shot asked for by name (xbox_HostWindowShot): the next present is read
+ * back into that file, whatever it shows (black before the first frame, an
+ * open overlay over the paused title). The window's thread only. */
+static char s_shot_req[512];
+
+void xbox_HostWindowShot(const char *path)
+{
+    snprintf(s_shot_req, sizeof s_shot_req, "%s", path ? path : "");
+}
+
+/* Shots may be asked for while running: the presenters keep their images
+ * readable (RECOMP_WINDOW_SHOT, or a test driving the overlay). */
+static int shots_wanted(void)
+{
+    return s_shot_n > 0 || recomp_env(RENV_OVERLAY_TEST) != NULL;
+}
+
 /* The first pending target this frame reaches, removed; -1 if none. */
 static int shot_due(uint32_t flip)
 {
@@ -754,7 +772,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 snprintf(why, sizeof why, "%s", SDL_GetError());
             } else if (win) {
                 fit_window(win);   /* before the swapchain takes the size */
-                if (fbv_create(win, vsync, s_shot_n > 0, why, sizeof why))
+                if (fbv_create(win, vsync, shots_wanted(), why, sizeof why))
                     s_layer = s_vk = dirty = 1;   /* paint black before the first frame */
             }
             if (!s_vk) {
@@ -780,7 +798,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 snprintf(why, sizeof why, "%s", SDL_GetError());
             else {
                 fit_window(win);
-                if (fbm_create(win, vsync, s_shot_n > 0, why, sizeof why))
+                if (fbm_create(win, vsync, shots_wanted(), why, sizeof why))
                     s_layer = dirty = 1;   /* paint black before the first frame */
             }
             if (!s_layer) {
@@ -886,7 +904,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* One event loop for the window and the controllers: SDL_PumpEvents
          * (inside the wait) also updates the game controllers, which
          * xinput_device.c then only reads. */
-        if (SDL_WaitEventTimeout(&ev, s_overlay_open ? (vsync ? 1 : 8) : 100)) {
+        if (SDL_WaitEventTimeout(&ev, s_overlay_open ? (vsync ? 1 : 8)
+                                      : s_overlay_note ? 16 : 100)) {
             do {
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
                 if (s_layer)
@@ -916,13 +935,18 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* An open overlay is redrawn on every turn (it animates, and the
          * title behind it is paused, so no frame would wake the loop). */
         s_overlay_open = s_layer && xbox_OverlayOpen();
-        dirty |= s_overlay_open;
+        s_overlay_note = s_layer && xbox_OverlayNotice();
+        dirty |= s_overlay_open || s_overlay_note;
         /* The title is paused behind an open overlay, so no new frame comes
          * to take a pending RECOMP_WINDOW_SHOT: any pending one is taken now,
          * of what is shown (the overlay over the last frame). */
         if (s_overlay_open && shown_seq)
             shoot |= s_shot_n && shot_due(0xFFFFFFFFu);
 #endif
+        if (s_shot_req[0] && s_layer) {
+            shoot = 1;                  /* of whatever the next present shows */
+            dirty = 1;
+        }
         pthread_mutex_lock(&s_lock);
         seq = s_ready_seq;
         if (seq != shown_seq) {
@@ -998,12 +1022,15 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             struct fb_slot *f = &s_slot[s_front];
             uint64_t t0 = now_ns(CLOCK_MONOTONIC);
             char path[512];
-            if (shoot)
+            if (shoot && s_shot_req[0])
+                snprintf(path, sizeof path, "%s", s_shot_req);
+            else if (shoot)
                 shot_path(path, sizeof path, shown_flip);
             if (fbv_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
                             filter, shoot ? path : NULL, shown_flip)) {
                 dirty = 0;
                 shoot = 0;
+                s_shot_req[0] = 0;
                 presents++;
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
                 xbox_OverlayFramePresented();
@@ -1021,13 +1048,16 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             struct fb_slot *f = &s_slot[s_front];
             uint64_t t0 = now_ns(CLOCK_MONOTONIC);
             char path[512];
-            if (shoot)
+            if (shoot && s_shot_req[0])
+                snprintf(path, sizeof path, "%s", s_shot_req);
+            else if (shoot)
                 shot_path(path, sizeof path, shown_flip);
             if (fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
                             filter, shoot ? path : NULL, shown_flip)
                     && ((s_last_present_ns = now_ns(CLOCK_MONOTONIC) - t0), 1)) {
                 dirty = 0;
                 shoot = 0;
+                s_shot_req[0] = 0;
                 presents++;
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
                 xbox_OverlayFramePresented();
