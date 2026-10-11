@@ -1406,6 +1406,8 @@ class Lifter:
         # The translator reports this at the end of a run, so the next one
         # costs a line of output instead of an afternoon.
         self.unimplemented = {}
+        # --patches: a patches.PatchReport, or None (nothing is patched).
+        self.patches = None
 
         # Detect if either is missing, so overriding one does not silently
         # leave the other unset -- that is the bug this whole path fixes.
@@ -4192,6 +4194,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                     stmts.append(f"_flags = ({zf[0]}) ? 1 : 0;"
                                  " /* ZF in: a zero count keeps it */")
         stmts.extend(results)
+        if lifter.patches is not None:
+            stmts.extend(lifter.patches.after(curr))
 
         # Track flag-setting instructions
         if (curr.mnemonic in _BARE_STRING_COMPARES

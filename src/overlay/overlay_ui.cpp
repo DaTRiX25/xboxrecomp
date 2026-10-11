@@ -19,6 +19,7 @@
 #include "overlay.h"
 #include "overlay_internal.h"
 #include "xbox_settings.h"
+#include "recomp_patch.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -114,6 +115,7 @@ static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the s
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1 (coming soon)", NULL };
+static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
 
 static const Meta k_meta[XS_COUNT] = {
@@ -135,6 +137,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "0 turns the rumble off.", 0.05, FMT_GAIN, NULL, 0 },
     /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits all the time (steadiest, hottest). Balanced sleeps and spins only the last 8 ms before each frame (steady 60). Battery saver only sleeps (coolest, an occasional small dip). Watts measured on a Steam Deck.", 1, FMT_PLAIN, n_power, 0 },
     /* XS_ADVANCED_PERF */      { "Performance overlay", "FPS and frame-time graph in the corner. Greetings to the DF team!", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speedometer and distances in km/h and metres instead of mph and miles: the game's own metric display, which the US disc keeps for its other languages. A change shows from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
 };
 
 enum RowKind { R_SETTING, R_ACTION, R_INFO };
@@ -157,6 +160,8 @@ static int page_rows(int page, Row *r)
     case P_DISPLAY:
         SET(XS_DISPLAY_FULLSCREEN); SET(XS_DISPLAY_ASPECT); SET(XS_DISPLAY_FILTER);
         SET(XS_DISPLAY_OVERSCAN); SET(XS_DISPLAY_FIT);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_SPEED_UNITS)->key))
+            SET(XS_GAME_SPEED_UNITS);
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_GRAPHICS:
