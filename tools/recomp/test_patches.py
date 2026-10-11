@@ -24,7 +24,16 @@ LOAD_BYTE = f"0fb60d{D32}c3"
 STORE = f"a3{D32}c3"
 
 
-def _translate(hexcode, patch=None, va=BASE, latch=None):
+# mov al, [DATA] ; ret
+LOAD_AL = f"a0{D32}c3"
+# mov cl, [DATA] ; ret
+LOAD_CL = f"8a0d{D32}c3"
+# mov ah, [DATA] ; ret
+LOAD_AH = f"8a25{D32}c3"
+
+
+def _translate(hexcode, patch=None, va=BASE, latch=None, kind="load_u32",
+               value=2):
     image = bytes.fromhex(hexcode)
     config._install([config.Section(".text", BASE, len(image), 0, len(image), True),
                      config.Section(".data", DATA, 0x1000, len(image), 0, False)],
@@ -36,7 +45,7 @@ def _translate(hexcode, patch=None, va=BASE, latch=None):
     report = None
     if patch is not None:
         report = PatchReport(PatchConfig([Patch(
-            va, "load_u32", "game.speed_units", "kmh", 2, latch=latch)]))
+            va, kind, "game.speed_units", "kmh", value, latch=latch)]))
         t.lifter.patches = report
     return t.translate_function(BASE, db[BASE]), report
 
@@ -81,6 +90,29 @@ def test_a_byte_load_or_store_is_refused():
         assert any("is not a 32-bit" in e for e in report.finish()), hexcode
 
 
+def test_byte_load_changes_only_the_low_byte():
+    code, report = _translate(LOAD_AL, patch=True, kind="load_u8", value=0)
+    assert ('SET_LO8(eax, RECOMP_PATCH_U32("game.speed_units", "kmh", 0x0u, '
+            "LO8(eax)));") in code, code
+    assert code.index("MEM8(0x20000)") < code.index("RECOMP_PATCH_U32")
+    assert report.finish() == []
+    code, report = _translate(LOAD_CL, patch=True, kind="load_u8", value=1,
+                              latch="use")
+    assert ('SET_LO8(ecx, RECOMP_PATCH_U32_LATCH("game.speed_units", "kmh", '
+            "0x1u, LO8(ecx), 2));") in code, code
+    assert report.finish() == []
+    code, _ = _translate(LOAD_AL)
+    assert "RECOMP_PATCH" not in code
+
+
+def test_byte_kind_refuses_other_shapes():
+    # A 32-bit load, a zero-extending one, a store, the high byte register.
+    for hexcode in (LOAD_EAX, LOAD_BYTE, STORE, LOAD_AH):
+        code, report = _translate(hexcode, patch=True, kind="load_u8", value=0)
+        assert "RECOMP_PATCH_U32" not in code, hexcode
+        assert any("is not an 8-bit" in e for e in report.finish()), hexcode
+
+
 def test_file_round_trip_and_bad_keys():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "patches.json")
@@ -90,11 +122,22 @@ def test_file_round_trip_and_bad_keys():
                                     "when": "kmh", "value": 2}]}, f)
         cfg = PatchConfig.load(path)
         assert cfg.patches[0x10000].value == 2
+        with open(path, "w") as f:
+            json.dump({"patches": [{"va": "0x00010000", "kind": "load_u8",
+                                    "setting": "graphics.motion_blur",
+                                    "when": "0", "value": 0}]}, f)
+        cfg = PatchConfig.load(path)
+        assert cfg.patches[0x10000].kind == "load_u8"
+        assert cfg.patches[0x10000].value == 0
         for bad in ({"va": "0x1", "setting": "Speed", "when": "kmh", "value": 2},
                     {"va": "0x1", "setting": "a.b", "when": "k mh", "value": 2},
                     {"va": "0x1", "setting": "a.b", "when": "k", "value": -1},
                     {"va": "0x1", "setting": "a.b", "when": "k", "value": 1,
-                     "kind": "store"}):
+                     "kind": "store"},
+                    {"va": "0x1", "setting": "a.b", "when": "k", "value": 256,
+                     "kind": "load_u8"},
+                    {"va": "0x1", "setting": "a.b", "when": "k", "expr": "1",
+                     "kind": "load_u8"}):
             with open(path, "w") as f:
                 json.dump({"patches": [bad]}, f)
             try:

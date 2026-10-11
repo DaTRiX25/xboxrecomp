@@ -46,6 +46,13 @@ static float st_sharpen = -2;
 void nv2a_host_set_post_aa(int a) { st_aa = a; }
 void nv2a_host_set_sharpen(float v) { st_sharpen = v; }
 void nv2a_host_set_aniso(int n) { st_aniso = n; }
+#if !defined(_WIN32)
+/* The file writer's one-at-a-time flag (src/platform/win32_compat.c). */
+int32_t InterlockedExchange(volatile int32_t *p, int32_t v)
+{
+    return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST);
+}
+#endif
 
 static void set_env(const char *k, const char *v)
 {
@@ -99,7 +106,9 @@ int main(void)
         "[power]\n"
         "mode = \"battery\"\n"
         "[display]\n"                 /* an older writer's split section */
-        "hud_fix = false\n");
+        "hud_fix = false\n"
+        "[graphics]\n"
+        "bloom = false\n");            /* a title's effect, on by default: switched off */
     set_env("RECOMP_SETTINGS", path);
     set_env("RECOMP_AUDIO_VOLUME", "0.25");          /* the user's own */
     set_env("RECOMP_AUDIO_MUTE", NULL);
@@ -108,6 +117,8 @@ int main(void)
     set_env("RECOMP_PRESENT_SPIN_LEAD", NULL);
     set_env("RECOMP_INPUT_RUMBLE_GAIN", NULL);
     set_env("RECOMP_PAD_DEADZONE", NULL);
+    set_env("RECOMP_GFX_BLOOM", NULL);
+    set_env("RECOMP_GFX_MOTION_BLUR", NULL);
 
     xbox_SettingsInit("Test");
     CHECK(!strcmp(xbox_SettingsPath(), path));
@@ -150,6 +161,23 @@ int main(void)
      * host's default is performance (sleep, 8 ms). */
     CHECK(xbox_SettingValue(XS_POWER_MODE) == 2 && xbox_SettingGet(XS_POWER_MODE)->def == 1);
     CHECK(!xbox_SettingsNeedRestart());
+    /* The title's own effects (guest patches on the "0"): on unless the
+     * file or the overlay says otherwise, and a stored "off" is kept. */
+    CHECK(xbox_SettingValue(XS_GRAPHICS_BLOOM) == 0 && xbox_SettingGet(XS_GRAPHICS_BLOOM)->user);
+    CHECK(xbox_SettingGet(XS_GRAPHICS_BLOOM)->def == 1);
+    CHECK(recomp_env(RENV_GFX_BLOOM) && !strcmp(recomp_env(RENV_GFX_BLOOM), "0"));
+    CHECK(xbox_SettingValue(XS_GRAPHICS_MOTION_BLUR) == 1 && !xbox_SettingGet(XS_GRAPHICS_MOTION_BLUR)->user);
+    {
+        /* Untouched, the variable never reads "0": no patch is active. */
+        const char *e = recomp_env(RENV_GFX_MOTION_BLUR);
+        CHECK(!e || strcmp(e, "0") != 0);
+    }
+    xbox_SettingSet(XS_GRAPHICS_MOTION_BLUR, 0);
+    CHECK(recomp_env(RENV_GFX_MOTION_BLUR) && !strcmp(recomp_env(RENV_GFX_MOTION_BLUR), "0"));
+    CHECK(!xbox_SettingsNeedRestart());              /* live */
+    xbox_SettingSet(XS_GRAPHICS_BLOOM, 1);
+    CHECK(recomp_env(RENV_GFX_BLOOM) && !strcmp(recomp_env(RENV_GFX_BLOOM), "1"));
+    xbox_SettingSet(XS_GRAPHICS_BLOOM, 0);
 
     /* A live change reaches the runtime, the cached environment and the file. */
     xbox_SettingSet(XS_POWER_MODE, 1);
@@ -213,7 +241,7 @@ int main(void)
     xbox_SettingSet(XS_INPUT_RUMBLE, 2.0);
     CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 2.0);
 
-    xbox_SettingSet(XS_DISPLAY_HUD_FIX, 1);          /* last in the enum, section display */
+    xbox_SettingSet(XS_DISPLAY_HUD_FIX, 1);          /* late in the enum, section display */
     xbox_SettingsFlush();
     text = read_file(path);
     CHECK(text != NULL);
@@ -247,7 +275,23 @@ int main(void)
         CHECK(strstr(text, "aniso = \"8x\""));
         CHECK(strstr(text, "volume = 0.5"));                     /* locked: the file's own */
         CHECK(!strstr(text, "fullscreen"));                      /* never touched */
+        {
+            /* The effects' "off" is stored, in the one [graphics] table. */
+            const char *g = strstr(text, "[graphics]");
+            const char *b = strstr(text, "bloom = false");
+            const char *m = strstr(text, "motion_blur = false");
+            CHECK(g && !strstr(g + 1, "[graphics]"));
+            CHECK(g && b && m && b > g && m > g);
+        }
     }
+
+    /* Back on: the default, and the file forgets it. */
+    xbox_SettingReset(XS_GRAPHICS_MOTION_BLUR);
+    CHECK(xbox_SettingValue(XS_GRAPHICS_MOTION_BLUR) == 1 && !xbox_SettingGet(XS_GRAPHICS_MOTION_BLUR)->user);
+    CHECK(recomp_env(RENV_GFX_MOTION_BLUR) && !strcmp(recomp_env(RENV_GFX_MOTION_BLUR), "1"));
+    xbox_SettingsFlush();
+    text = read_file(path);
+    CHECK(text && !strstr(text, "motion_blur") && strstr(text, "bloom = false"));
 
     /* Reset goes back to the host's default and forgets the setting. */
     xbox_SettingReset(XS_DISPLAY_OVERSCAN);

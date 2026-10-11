@@ -35,6 +35,14 @@ that another one jumps into); every body gets the call. A listed site that
 is not such an instruction, or that no body contains, is an error: a shape
 the patcher does not know is never forced through.
 
+kind "load_u8": the same for a byte, `mov r8, [mem]` into al, bl, cl or dl
+(a title's own on/off flag, tested right after the load: Burnout 3's "blur
+enabled" byte of its graphics manager). The value is 0..255 and only the
+register's low byte changes:
+
+    SET_LO8(eax, MEM8(0x4D61D2));
+    SET_LO8(eax, RECOMP_PATCH_U32("graphics.motion_blur", "0", 0x0u, LO8(eax))); /* patch 0x... */
+
 kind "load_f32" and "store_f32": the value is a float, and it is not a
 constant but an expression ("expr" instead of "value"), because a layout
 value depends on the picture's shape:
@@ -77,7 +85,9 @@ another for those).
 import json
 import re
 
-_KINDS = frozenset({"load_u32", "load_f32", "store_f32", "mark"})
+_KINDS = frozenset({"load_u32", "load_u8", "load_f32", "store_f32", "mark"})
+_INT_KINDS = frozenset({"load_u32", "load_u8"})
+_REG8 = {"al": "eax", "bl": "ebx", "cl": "ecx", "dl": "edx"}
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _XMM = frozenset(f"xmm{i}" for i in range(8))
 _TOKEN_RE = re.compile(r"\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+)"
@@ -194,7 +204,7 @@ class PatchConfig:
             if p.va in self.patches:
                 first = self.patches[p.va]
                 if (p.guard is None or first.guard is None
-                        or p.kind != first.kind or p.kind == "load_u32"):
+                        or p.kind != first.kind or p.kind in _INT_KINDS):
                     raise ValueError(
                         f"patch 0x{p.va:08X} listed twice (only float "
                         f"patches of one kind, each with an 'if', may share "
@@ -238,12 +248,15 @@ class PatchConfig:
             if not _WHEN_RE.match(when):
                 raise ValueError(f"{path}: bad 'when' {when!r}")
             value = expr = None
-            if kind == "load_u32":
+            if kind in _INT_KINDS:
                 if "expr" in s:
-                    raise ValueError(f"{path}: load_u32 takes 'value'")
+                    raise ValueError(f"{path}: {kind} takes 'value'")
                 value = _parse_va(s["value"])
-                if not 0 <= value <= 0xFFFFFFFF:
-                    raise ValueError(f"{path}: value {value} is not a uint32")
+                top = 0xFF if kind == "load_u8" else 0xFFFFFFFF
+                if not 0 <= value <= top:
+                    raise ValueError(
+                        f"{path}: value {value} is not a "
+                        f"{'uint8' if kind == 'load_u8' else 'uint32'}")
             else:
                 if "value" in s or not isinstance(s.get("expr"), str):
                     raise ValueError(f"{path}: {kind} takes 'expr', a string")
@@ -291,6 +304,8 @@ class PatchReport:
                 continue
             if p.kind == "load_u32":
                 out = self._load_u32(p, insn)
+            elif p.kind == "load_u8":
+                out = self._load_u8(p, insn)
             else:
                 out = self._float(p, insn)
             if out is None:
@@ -320,6 +335,24 @@ class PatchReport:
                     f"{1 if p.latch == 'set' else 2});"]
         return [f'{reg} = RECOMP_PATCH_U32("{p.setting}", "{p.when}", '
                 f"0x{p.value:X}u, {reg});"]
+
+    def _load_u8(self, p, insn):
+        """`mov r8, [mem]` into a low byte register: only that byte changes."""
+        ops = insn.operands
+        if (insn.mnemonic != "mov" or len(ops) != 2 or ops[0].type != "reg"
+                or ops[0].reg not in _REG8 or ops[1].type != "mem"
+                or ops[1].mem_size != 1):
+            self._err(
+                f"patch 0x{p.va:08X}: {insn.mnemonic} is not an 8-bit "
+                f"`mov al|bl|cl|dl, [mem]` load")
+            return None
+        reg = _REG8[ops[0].reg]
+        if p.latch:
+            return [f'SET_LO8({reg}, RECOMP_PATCH_U32_LATCH("{p.setting}", '
+                    f'"{p.when}", 0x{p.value:X}u, LO8({reg}), '
+                    f"{1 if p.latch == 'set' else 2}));"]
+        return [f'SET_LO8({reg}, RECOMP_PATCH_U32("{p.setting}", "{p.when}", '
+                f"0x{p.value:X}u, LO8({reg})));"]
 
     def _float(self, p, insn):
         """load_f32 / store_f32: the moved float, as an lvalue of the right
