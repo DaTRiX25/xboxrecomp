@@ -34,8 +34,10 @@ extern "C" {
 typedef enum {
     XAP_END = 0,
     /* Until the title has opened a file whose path contains `s` (ASCII,
-     * case-insensitive), counted from the last XAP_SYNC. Sets the anchor to
-     * the flip of that open. */
+     * case-insensitive, '/' and '\\' the same), counted from the last
+     * XAP_SYNC. Sets the anchor to the flip of that open. With n > 0: for n
+     * flips at most, then the run goes on with the anchor at that flip (an
+     * event that is usually marked by a file, but need not be). */
     XAP_WAIT_FILE,
     /* Press `s` ("a:400", "down:200", "rt:30000": button[+button][:hold ms],
      * as RECOMP_PAD_LIVE), wait until the pad took it, then `n` flips. */
