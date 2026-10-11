@@ -710,7 +710,7 @@ static volatile uint32_t s_last_dw, s_last_dh;
 static volatile int s_last_filter;
 
 static int present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
-                          struct nv2a_rect *src, struct nv2a_rect *dst);
+                          int aspect, struct nv2a_rect *src, struct nv2a_rect *dst);
 
 int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
                         struct nv2a_rect *src, struct nv2a_rect *dst)
@@ -718,10 +718,18 @@ int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int 
     s_last_dw = dw;
     s_last_dh = dh;
     s_last_filter = filter;
-    return present_layout(fw, fh, dw, dh, filter, src, dst);
+    return present_layout(fw, fh, dw, dh, filter, s_host_opts.present_aspect, src, dst);
 }
 
-void nv2a_present_visible_x(uint32_t fw, uint32_t fh, double *x0, double *x1)
+void nv2a_present_note_output(uint32_t dw, uint32_t dh)
+{
+    if (!s_last_dw || !s_last_dh) {
+        s_last_dw = dw;
+        s_last_dh = dh;
+    }
+}
+
+void nv2a_present_visible_x_at(uint32_t fw, uint32_t fh, int aspect, double *x0, double *x1)
 {
     struct nv2a_rect src, dst;
     if (!fw || !fh) {
@@ -729,13 +737,18 @@ void nv2a_present_visible_x(uint32_t fw, uint32_t fh, double *x0, double *x1)
         *x1 = (double)fw;
         return;
     }
-    present_layout(fw, fh, s_last_dw, s_last_dh, s_last_filter, &src, &dst);
+    present_layout(fw, fh, s_last_dw, s_last_dh, s_last_filter, aspect, &src, &dst);
     *x0 = (double)src.x;
     *x1 = (double)(src.x + src.w);
 }
 
+void nv2a_present_visible_x(uint32_t fw, uint32_t fh, double *x0, double *x1)
+{
+    nv2a_present_visible_x_at(fw, fh, s_host_opts.present_aspect, x0, x1);
+}
+
 static int present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
-                          struct nv2a_rect *src, struct nv2a_rect *dst)
+                          int aspect, struct nv2a_rect *src, struct nv2a_rect *dst)
 {
     int whole, crop, fill;
     if (s_crop < 0) {
@@ -761,7 +774,8 @@ static int present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, in
         src->w = (int32_t)fw - 2 * cx;
         src->h = (int32_t)fh - 2 * cy;
     }
-    whole = nv2a_present_rect((uint32_t)src->w, (uint32_t)src->h, dw, dh, filter, dst);
+    whole = nv2a_present_rect_aspect((uint32_t)src->w, (uint32_t)src->h, aspect, dw, dh,
+                                     filter, dst);
     if (fill && dst->h > 0 && (uint32_t)dst->h < dh) {
         /* Fill the height; what is wider than the window is cropped from
          * the frame's sides. */
