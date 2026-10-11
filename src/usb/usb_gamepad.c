@@ -687,9 +687,11 @@ static int pad_scripted(void)
     if (s_scripted < 0) {
         const char *a = recomp_env(RENV_PAD_SCRIPT), *b = recomp_env(RENV_PAD_LIVE);
         const char *k = recomp_env(RENV_PAD_SCRIPT_KEEP), *h = recomp_env(RENV_HEADLESS);
+        const char *o = recomp_env(RENV_PAD_SCRIPT_ONLY);
         s_scripted = (a && *a) || (b && *b);
         s_script_keep = k && *k && *k != '0';
-        s_script_only = s_scripted && !s_script_keep && h && *h && *h != '0';
+        s_script_only = s_scripted && !s_script_keep
+                     && ((h && *h && *h != '0') || (o && *o && *o != '0'));
         if (s_scripted) {
             fprintf(stderr, "  PAD: SCRIPTED INPUT drives the pads in this run (%s)%s\n",
                     (b && *b) ? "RECOMP_PAD_LIVE" : "RECOMP_PAD_SCRIPT",
