@@ -199,6 +199,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         /* Positive = absolute time. Calculate relative delay from now. */
         LARGE_INTEGER now;
         GetSystemTimeAsFileTime((LPFILETIME)&now);
+        now.QuadPart += (LONGLONG)(xbox_GuestSkewNs() / 100u);  /* the guest's clock */
         LONGLONG diff = Interval->QuadPart - now.QuadPart;
         if (diff <= 0)
             return STATUS_SUCCESS; /* Already past */
