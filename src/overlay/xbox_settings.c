@@ -307,7 +307,7 @@ static void write_value(FILE *f, const xs_setting *s, double v)
 
 void xbox_SettingsFlush(void)
 {
-    char tmp[sizeof s_path + 8], sec[32], last[32] = "";
+    char tmp[sizeof s_path + 8], sec[32], last[32];
     FILE *f;
     int i;
 
@@ -325,20 +325,39 @@ void xbox_SettingsFlush(void)
           "# A RECOMP_* environment variable overrides what is here.\n", f);
     for (i = 0; i < s_n_keep; i++)
         fprintf(f, "%s = %s\n", s_keep[i].key, s_keep[i].val);
+    /* One table per section, at its first setting, with every setting of
+     * that section under it: the settings are not in section order (the
+     * guest patches' display.hud_fix and game.speed_units come last), and a
+     * table written twice is a file the reader refuses, so a changed
+     * display.aspect beside display.hud_fix lost every setting at the next
+     * start. */
     for (i = 0; i < XS_COUNT; i++) {
-        const xs_setting *s = &s_set[i];
-        const char *name;
-        if (!s->user)
+        int j, seen = 0;
+        if (!s_set[i].user)
             continue;
-        name = section_of(s->key, sec, sizeof sec);
-        if (strcmp(sec, last)) {
-            fprintf(f, "\n[%s]\n", sec);
-            snprintf(last, sizeof last, "%s", sec);
+        section_of(s_set[i].key, sec, sizeof sec);
+        for (j = 0; j < i && !seen; j++) {
+            if (s_set[j].user) {
+                section_of(s_set[j].key, last, sizeof last);
+                seen = !strcmp(sec, last);
+            }
         }
-        fprintf(f, "%s = ", name);
-        /* A setting the environment overrides keeps what the file said. */
-        write_value(f, s, s->locked ? s->filev : s->value);
-        fputc('\n', f);
+        if (seen)
+            continue;       /* written under its section's first setting */
+        fprintf(f, "\n[%s]\n", sec);
+        for (j = i; j < XS_COUNT; j++) {
+            const xs_setting *s = &s_set[j];
+            const char *name;
+            if (!s->user)
+                continue;
+            name = section_of(s->key, last, sizeof last);
+            if (strcmp(sec, last))
+                continue;
+            fprintf(f, "%s = ", name);
+            /* A setting the environment overrides keeps what the file said. */
+            write_value(f, s, s->locked ? s->filev : s->value);
+            fputc('\n', f);
+        }
     }
     if (fclose(f) != 0) {
         fprintf(stderr, LOGP "cannot write %s\n", tmp);

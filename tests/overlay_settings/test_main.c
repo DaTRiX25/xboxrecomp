@@ -200,6 +200,19 @@ int main(void)
     text = read_file(path);
     CHECK(text && !strstr(text, "overscan"));
 
+    /* A section is written once, whatever the order of its settings:
+     * display.hud_fix comes after the other sections' settings, and a second
+     * [display] table made the file one the reader refused. */
+    xbox_SettingSet(XS_DISPLAY_HUD_FIX, 1);
+    xbox_SettingsFlush();
+    text = read_file(path);
+    CHECK(text != NULL);
+    if (text) {
+        const char *first = strstr(text, "[display]");
+        CHECK(first && !strstr(first + 1, "[display]"));
+        CHECK(strstr(text, "hud_fix = true") && strstr(text, "fit = \"fill16x10\""));
+    }
+
     remove(path);
     fprintf(stderr, "overlay_settings: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;
