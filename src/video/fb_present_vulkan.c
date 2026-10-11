@@ -543,7 +543,11 @@ void *fbv_slot(int k, uint32_t w, uint32_t h)
             nvk_image_free(s);
         }
         if (!nvk_image_new(s, VK_FORMAT_B8G8R8A8_UNORM, w, h, 1,
-                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                           /* The post passes (AA, sharpen) sample the slot: without
+                            * SAMPLED the read is undefined (black on AMD's Windows
+                            * driver; RADV happened to tolerate it). */
+                           | VK_IMAGE_USAGE_SAMPLED_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT))
             return NULL;
     }
