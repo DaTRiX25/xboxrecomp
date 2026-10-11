@@ -279,6 +279,7 @@ static int        s_blend_n;
  * than included so this file keeps no dependency on src/input's headers. */
 extern void xbox_InputKeySet(int vk, int down);
 extern void xbox_InputKeysClear(void);
+extern void xbox_InputSetBackground(int on);    /* src/input/input_core.c */
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -302,10 +303,16 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SYSKEYUP:
         xbox_InputKeySet((int)w, 0);
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
-    /* Alt-tabbing away with a key held would leave it held for ever. */
+    /* Alt-tabbing away with a key held would leave it held for ever, and a
+     * pad in the hand would go on shaking: the motors stop until the window
+     * is in front again (input_core.c). */
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
+        xbox_InputSetBackground(1);
         return 0;
+    case WM_SETFOCUS:
+        xbox_InputSetBackground(0);
+        break;
     }
     if (m == WM_CLOSE) {
         /* Closing the window ends the run, like the CPU path's window.

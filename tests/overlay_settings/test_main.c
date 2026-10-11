@@ -29,7 +29,7 @@ static struct nv2a_host_opts st_opts;
 
 void xbox_InputSetDeadzone(int dz) { st_deadzone = dz; }
 void xbox_InputSetTriggerDeadzone(int dz) { st_trigger = dz; }
-void xbox_InputSetRumbleGain(double g) { st_rumble = g; }
+void xbox_InputSetRumbleStrength(double g) { st_rumble = g; }
 static int st_face;
 void xbox_InputSetFaceLayoutNintendo(int on) { st_face = on; }
 void xbox_PacingSetMode(int m) { st_pacing = m; }
@@ -95,6 +95,7 @@ int main(void)
         "mute = true\n"
         "[input]\n"
         "deadzone = 3277\n"
+        "rumble = 1.8\n"               /* an older slider's value, between two steps */
         "[power]\n"
         "mode = \"battery\"\n"
         "[display]\n"                 /* an older writer's split section */
@@ -139,8 +140,12 @@ int main(void)
     CHECK(xbox_SettingGet(XS_DISPLAY_OVERSCAN)->def == 1);
     CHECK(xbox_SettingValue(XS_DISPLAY_FILTER) == 0 && !xbox_SettingGet(XS_DISPLAY_FILTER)->user);
     CHECK(xbox_SettingValue(XS_INPUT_DEADZONE) == 3277);
-    CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 1.25 && !xbox_SettingGet(XS_INPUT_RUMBLE)->user);
-    CHECK(st_rumble == 1.25);
+    /* The file's rumble strength outranks the host's default (1.25 here) and
+     * keeps its number, at the nearest quarter. */
+    CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 1.75 && xbox_SettingGet(XS_INPUT_RUMBLE)->user);
+    CHECK(xbox_SettingGet(XS_INPUT_RUMBLE)->def == 1.25);
+    CHECK(st_rumble == 1.75);
+    CHECK(getenv("RECOMP_INPUT_RUMBLE_GAIN") && !strcmp(getenv("RECOMP_INPUT_RUMBLE_GAIN"), "1.75"));
     /* The power mode: the file said battery (sleep, no spin lead); the
      * host's default is performance (sleep, 8 ms). */
     CHECK(xbox_SettingValue(XS_POWER_MODE) == 2 && xbox_SettingGet(XS_POWER_MODE)->def == 1);
@@ -180,9 +185,31 @@ int main(void)
     CHECK(xbox_SettingsNeedRestart());
     xbox_SettingSet(XS_GRAPHICS_RENDER_SCALE, 1);
     CHECK(!xbox_SettingsNeedRestart());
-    /* A value is clamped to its range. */
+    /* A value is clamped to its range. The rumble strength: 0 (off) to 3,
+     * in quarters, and the runtime is given the stepped value. */
     xbox_SettingSet(XS_INPUT_RUMBLE, 9.0);
     CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 3.0);     /* the range ends at 3 */
+    xbox_SettingSet(XS_INPUT_RUMBLE, -1.0);
+    CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 0.0 && st_rumble == 0.0);
+    CHECK(xbox_SettingGet(XS_INPUT_RUMBLE)->min == 0.0 && xbox_SettingGet(XS_INPUT_RUMBLE)->max == 3.0
+          && xbox_SettingGet(XS_INPUT_RUMBLE)->step == 0.25);
+    xbox_SettingSet(XS_INPUT_RUMBLE, 1.75);               /* on the step: as it is */
+    CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 1.75 && st_rumble == 1.75);
+    xbox_SettingSet(XS_INPUT_RUMBLE, 1.3);                /* the old slider's 0.05 steps */
+    CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 1.25 && st_rumble == 1.25);
+    xbox_SettingSet(XS_INPUT_RUMBLE, 1.4);
+    CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 1.5);
+    xbox_SettingSet(XS_INPUT_RUMBLE, 2.95);
+    CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 3.0);
+    for (double q = 0.0; q <= 3.0; q += 0.25) {           /* every step is a value */
+        xbox_SettingSet(XS_INPUT_RUMBLE, q);
+        CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == q);
+    }
+    {
+        char e[32];
+        xbox_SettingEnvString(xbox_SettingGet(XS_INPUT_RUMBLE), 1.75, e, sizeof e);
+        CHECK(!strcmp(e, "1.75"));
+    }
     xbox_SettingSet(XS_INPUT_RUMBLE, 2.0);
     CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 2.0);
 
