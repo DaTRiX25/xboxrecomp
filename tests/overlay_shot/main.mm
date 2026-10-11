@@ -26,6 +26,20 @@ extern "C" void xbox_HostPauseHold(void);
 extern "C" void *recomp_lookup(unsigned va) { (void)va; return NULL; }
 extern "C" void *recomp_lookup_manual(unsigned va) { (void)va; return NULL; }
 
+/* The bug report's maker (xbox_report.h), stood in for: the overlay's two
+ * actions call it and show where the archive went, the home folder as ~. */
+extern "C" void xbox_BugReportSetMaker(int (*fn)(int screenshot, char *out_path, unsigned n));
+static int s_reports, s_report_shot;
+static int fake_report(int screenshot, char *out, unsigned n)
+{
+    const char *home = getenv("HOME");
+    s_reports++;
+    s_report_shot = screenshot;
+    snprintf(out, n, "%s/Library/Application Support/Test/reports/test-report-20260101-000000.zip",
+             home ? home : "");
+    return 1;
+}
+
 static int s_fail;
 #define CHECK(c) do { if (!(c)) { s_fail++; fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); } } while (0)
 
@@ -117,6 +131,7 @@ int main(int argc, char **argv)
     dev = MTLCreateSystemDefaultDevice();
     q = [dev newCommandQueue];
     xbox_OverlaySetWindow(win);
+    xbox_BugReportSetMaker(fake_report);
 
     /* Flips for the graph: mostly 60 Hz, a few long ones. */
     for (int i = 0; i < 150; i++) {
@@ -170,6 +185,24 @@ int main(int argc, char **argv)
         }
         snprintf(path, sizeof path, "%spage%d.bmp", pre, p);
         frame(path);
+        if (p == 5) {                                         /* advanced: the bug report */
+            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, true);       /* past the info line */
+            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, false);
+            run(2);
+            pad(SDL_CONTROLLER_BUTTON_A, true);
+            pad(SDL_CONTROLLER_BUTTON_A, false);
+            run(2);
+            CHECK(s_reports == 1 && s_report_shot == 0);
+            snprintf(path, sizeof path, "%sreport.bmp", pre);
+            frame(path);
+            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, true);
+            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, false);
+            run(2);
+            pad(SDL_CONTROLLER_BUTTON_A, true);
+            pad(SDL_CONTROLLER_BUTTON_A, false);
+            run(2);
+            CHECK(s_reports == 2 && s_report_shot == 1);
+        }
     }
     CHECK(xbox_SettingValue(XS_AUDIO_VOLUME) < 1.0);
 
