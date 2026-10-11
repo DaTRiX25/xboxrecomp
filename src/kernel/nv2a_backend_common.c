@@ -419,6 +419,38 @@ void nv2a_occ_init(struct nv2a_occ *o, const struct nv2a_occ_ops *ops,
 void nv2a_occ_set_scale(struct nv2a_occ *o, unsigned scale)
 {
     o->scale = scale;
+    o->scale_x2 = 0;
+}
+
+void nv2a_occ_set_scale_x2(struct nv2a_occ *o, unsigned x2)
+{
+    o->scale_x2 = x2 > 2 ? x2 : 0;
+    if (!o->scale_x2)
+        o->scale = 1;
+}
+
+uint32_t nv2a_occ_scale_count_x2(uint64_t samples, unsigned x2)
+{
+    if (x2 > 2 && samples) {
+        uint64_t d = (uint64_t)x2 * x2;         /* the area factor, times 4 */
+        samples = (samples * 4u + d / 2) / d;
+        if (!samples)
+            samples = 1;
+    }
+    return samples > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)samples;
+}
+
+void nv2a_resample_nearest32(const uint8_t *src, uint32_t src_pitch, uint32_t sw, uint32_t sh,
+                             uint8_t *dst, uint32_t dst_pitch, uint32_t dw, uint32_t dh)
+{
+    uint32_t x, y;
+    for (y = 0; y < dh; y++) {
+        const uint32_t *in = (const uint32_t *)(const void *)
+            (src + (size_t)(((uint64_t)y * 2u + 1u) * sh / (2u * dh)) * src_pitch);
+        uint32_t *out = (uint32_t *)(void *)(dst + (size_t)y * dst_pitch);
+        for (x = 0; x < dw; x++)
+            out[x] = in[((uint64_t)x * 2u + 1u) * sw / (2u * dw)];
+    }
 }
 
 uint32_t nv2a_occ_scale_count(uint64_t samples, unsigned scale)
@@ -468,7 +500,8 @@ static int occ_ready(struct nv2a_occ *o, const struct nv2a_occ_report *p,
             return 0;
         sum += v;
     }
-    *count = nv2a_occ_scale_count(sum, o->scale);
+    *count = o->scale_x2 ? nv2a_occ_scale_count_x2(sum, o->scale_x2)
+                         : nv2a_occ_scale_count(sum, o->scale);
     return 1;
 }
 
@@ -655,6 +688,24 @@ void nv2a_host_set_sharpen(float strength)
 unsigned nv2a_host_render_scale(void)
 {
     return s_host_opts.render_scale > 1 ? s_host_opts.render_scale : 1;
+}
+
+unsigned nv2a_host_render_scale_x2(void)
+{
+    if (s_host_opts.render_scale_half && s_host_opts.render_scale <= 1)
+        return 3;
+    return 2u * nv2a_host_render_scale();
+}
+
+unsigned nv2a_host_size_x2(uint32_t w, uint32_t h, unsigned x2, uint32_t max_dim,
+                           uint32_t *hw, uint32_t *hh)
+{
+    unsigned n = x2 > 2 ? x2 : 2;
+    while (n > 2 && (((uint64_t)w * n + 1) / 2 > max_dim || ((uint64_t)h * n + 1) / 2 > max_dim))
+        n--;
+    *hw = (uint32_t)(((uint64_t)w * n + 1) / 2);
+    *hh = (uint32_t)(((uint64_t)h * n + 1) / 2);
+    return n;
 }
 
 unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim,

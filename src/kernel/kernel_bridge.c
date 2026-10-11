@@ -30,6 +30,7 @@
 #include "kernel_pacing.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
+#include "platform/android_host.h"   /* the fastest core (Android) */
 #include "platform/latency_trace.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
@@ -530,6 +531,18 @@ static void thread_set_os_name(const char *name)
 
 void xbox_log_thread_role(const char *role, uint32_t routine)
 {
+#if defined(__ANDROID__)
+    /* The executor on the fastest core (see xbox_GuestCpuMask), unless the
+     * guest threads are unpinned too (RECOMP_GUEST_CPUS=all) or
+     * RECOMP_ANDROID_EXEC_CPU=off; =<n> names the core. */
+    if (role && !strcmp(role, "nv2a-ack")) {
+        const char *e = getenv("RECOMP_ANDROID_EXEC_CPU"), *g = recomp_env(RENV_GUEST_CPUS);
+        int cpu = e && *e >= '0' && *e <= '9' ? atoi(e) : recomp_android_fast_cpu();
+        if (!(e && !strcmp(e, "off")) && !(g && !strcmp(g, "all")) && cpu >= 0
+                && SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpu))
+            fprintf(stderr, "  [KERNEL] executor thread on cpu %d (the fastest core)\n", cpu);
+    }
+#endif
     static DWORD main_tid;   /* the thread that logged process-main */
     char os[16];
 

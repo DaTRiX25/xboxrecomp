@@ -62,11 +62,15 @@ typedef enum {
     XS_INPUT_DEADZONE,
     XS_INPUT_TRIGGER_DEADZONE,
     XS_INPUT_RUMBLE,
+    XS_INPUT_FACE_LAYOUT,    /* xbox / nintendo (A-B and X-Y mirrored) */
     XS_POWER_MODE,
     XS_ADVANCED_PERF,
     XS_GAME_SPEED_UNITS,     /* an opt-in guest patch (recomp_patch.h) */
     XS_DISPLAY_HUD_FIX,      /* another: the HUD's shape in 16:9 */
     XS_DISPLAY_ULTRAWIDE,    /* another: the 3D wider than 16:9 */
+#if defined(__ANDROID__)
+    XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
+#endif
     XS_COUNT
 } xs_id;
 

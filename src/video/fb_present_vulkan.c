@@ -91,6 +91,29 @@ static VkPresentModeKHR s_sc_mode;
 static int              s_sc_shots;      /* TRANSFER_SRC usage: shots possible */
 static int              s_sc_color;      /* COLOR_ATTACHMENT usage: the overlay can draw */
 static int              s_recreate;
+/* VK_SUBOPTIMAL_KHR asks for a new swapchain, except on Android: there it is
+ * returned for as long as the swapchain's transform is not the display's,
+ * which with the identity transform on a sideways-mounted panel (the Retroid
+ * Pocket 5's is 1080x1920) is every frame, and rebuilding it every frame is
+ * what that cost. A size change is caught by the extent check. */
+#if defined(__ANDROID__)
+#define FBV_SUBOPTIMAL_RECREATES 0
+#else
+#define FBV_SUBOPTIMAL_RECREATES 1
+#endif
+/* Android: the swapchain may be smaller than the window, and the system's
+ * compositor scales it to the panel (RECOMP_ANDROID_SWAPCHAIN_HEIGHT=<rows>,
+ * the width follows the window's shape): this presenter's own scaling pass
+ * then writes that many pixels, not the panel's. The idea is Xerenge's
+ * Android build's. The window size the swapchain was made for is kept apart,
+ * for the "has the window changed" test. */
+#if defined(__ANDROID__)
+static uint32_t s_and_w, s_and_h;
+#define FBV_SIZE_CHANGED(dw, dh) ((uint32_t)(dw) != s_and_w || (uint32_t)(dh) != s_and_h)
+#else
+#define FBV_SIZE_CHANGED(dw, dh) \
+    ((uint32_t)(dw) != s_sc_ext.width || (uint32_t)(dh) != s_sc_ext.height)
+#endif
 static int              s_vsync, s_shots;
 
 static VkCommandPool    s_pool;          /* main thread */
@@ -485,6 +508,19 @@ static int make_swapchain(SDL_Window *win)
         pthread_mutex_unlock(&s_sc_mu);
         return 0;     /* minimised */
     }
+#if defined(__ANDROID__)
+    s_and_w = (uint32_t)dw;
+    s_and_h = (uint32_t)dh;
+    {
+        const char *e = getenv("RECOMP_ANDROID_SWAPCHAIN_HEIGHT");
+        uint32_t rows = e ? (uint32_t)strtoul(e, NULL, 10) : 0;
+        if (rows >= 240 && rows < s_sc_ext.height) {
+            s_sc_ext.width = ((s_sc_ext.width * rows / s_sc_ext.height) + 1u) & ~1u;
+            s_sc_ext.height = rows;
+            if (s_sc_ext.width < caps.minImageExtent.width) s_sc_ext.width = caps.minImageExtent.width;
+        }
+    }
+#endif
     /* The fewest images: one shown, at most one queued (BO-74 latency). */
     n = caps.minImageCount;
     if (n < 2) n = 2;
@@ -505,6 +541,13 @@ static int make_swapchain(SDL_Window *win)
                   | (s_sc_color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
+#if defined(__ANDROID__)
+    /* A panel mounted sideways reports a rotation here, and a swapchain made
+     * with it must be drawn rotated. This presenter does not: identity, and
+     * the compositor turns the picture. */
+    if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+        ci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+#endif
     ci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
                       ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
                       : (VkCompositeAlphaFlagBitsKHR)(caps.supportedCompositeAlpha
@@ -627,6 +670,15 @@ int fbv_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
     if (!s_waiter_run)
         dxgi_vblank_start(win);
 #endif
+#if defined(__ANDROID__)
+    /* No present_wait through Android's loader: the Choreographer's refresh
+     * times instead (android_vsync.c). RECOMP_ANDROID_VSYNC=0: the old
+     * free-running timer, for A/B. */
+    if (!s_waiter_run && !(getenv("RECOMP_ANDROID_VSYNC") && getenv("RECOMP_ANDROID_VSYNC")[0] == '0')) {
+        extern void xbox_AndroidVsyncStart(void);
+        xbox_AndroidVsyncStart();
+    }
+#endif
     fprintf(stderr, LOGP "Vulkan swapchain: %ux%u, %u images, %s, %s%s\n", s_sc_ext.width,
             s_sc_ext.height, s_sc_n, s_sc_fmt == VK_FORMAT_B8G8R8A8_UNORM ? "BGRA8" : "RGBA8",
             s_sc_mode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO (vsync)"
@@ -642,6 +694,12 @@ void fbv_destroy(void)
         return;
 #if defined(_WIN32)
     dxgi_vblank_stop();
+#endif
+#if defined(__ANDROID__)
+    {
+        extern void xbox_AndroidVsyncStop(void);
+        xbox_AndroidVsyncStop();
+    }
 #endif
     if (s_waiter_run) {
         pthread_mutex_lock(&s_id_mu);
@@ -1459,7 +1517,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
     if (dw <= 0 || dh <= 0)
         return 0;
-    if (!s_sc || s_recreate || (uint32_t)dw != s_sc_ext.width || (uint32_t)dh != s_sc_ext.height) {
+    if (!s_sc || s_recreate || FBV_SIZE_CHANGED(dw, dh)) {
         if (!make_swapchain(win))
             return 0;
     }
@@ -1479,7 +1537,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
         return 0;     /* timeout: try again at the next wake */
-    if (r == VK_SUBOPTIMAL_KHR)
+    if (r == VK_SUBOPTIMAL_KHR && FBV_SUBOPTIMAL_RECREATES)
         s_recreate = 1;
     vkResetFences(C->dev, 1, &s_fence[s_fi]);
     shot = shot_path && s_sc_shots;
@@ -1672,7 +1730,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         }
         return 0;
     }
-    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR)
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && FBV_SUBOPTIMAL_RECREATES))
         s_recreate = 1;
     if (shot) {
         vkWaitForFences(C->dev, 1, &s_fence[s_fi], VK_TRUE, UINT64_MAX);

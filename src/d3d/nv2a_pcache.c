@@ -314,7 +314,7 @@ static int make_dirs(char *p)
         || errno == EEXIST;
 }
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
 extern char *program_invocation_short_name;
 #endif
 
@@ -322,7 +322,7 @@ const char *nv2a_pcache_app(void)
 {
 #if defined(__APPLE__)
     return getprogname();
-#elif defined(__linux__)
+#elif defined(__linux__) && !defined(__ANDROID__)
     return program_invocation_short_name;
 #else
     return "xboxrecomp";

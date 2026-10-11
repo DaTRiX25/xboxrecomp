@@ -944,6 +944,7 @@ struct nv2a_occ {
     /* Render scale of the targets counted (0 or 1 = guest size): a count
      * is samples, N*N of them per guest pixel, so it is divided back. */
     unsigned scale;
+    unsigned scale_x2;          /* in halves when set (nv2a_occ_set_scale_x2), else `scale` */
 };
 
 void nv2a_occ_init(struct nv2a_occ *o, const struct nv2a_occ_ops *ops,
@@ -989,6 +990,10 @@ struct nv2a_host_opts {
     /* render.shader_cache: the pipeline cache's directory (nv2a_pcache_dir),
      * "none" for no disk cache; NULL is the per-user default. */
     const char *shader_cache;
+    /* Last, so positional initialisers keep their meaning. 1: render.scale
+     * is 1.5 (render_scale is 1 then), for a backend that sizes in halves
+     * (Vulkan). */
+    unsigned render_scale_half;
 };
 
 /* RECOMP_GFX_ANISO: the anisotropic filtering level the Metal and Vulkan
@@ -1013,6 +1018,22 @@ void nv2a_host_opts_set(const struct nv2a_host_opts *o);
 const struct nv2a_host_opts *nv2a_host_opts(void);
 /* render_scale as a factor: 1 when unset. */
 unsigned nv2a_host_render_scale(void);
+
+/* The same in halves, for a backend that can draw at 1.5x: 2, 3 (1.5x), 4,
+ * 6, 8. nv2a_host_size_x2 sizes a w x h guest surface at x2 halves (an odd
+ * product rounds up: 3 guest pixels are 5 host pixels at 1.5x), going down a
+ * half at a time while a side passes max_dim; it returns the halves used.
+ * nv2a_occ_scale_count_x2 is nv2a_occ_scale_count for such a factor. */
+unsigned nv2a_host_render_scale_x2(void);
+unsigned nv2a_host_size_x2(uint32_t w, uint32_t h, unsigned x2, uint32_t max_dim,
+                           uint32_t *hw, uint32_t *hh);
+uint32_t nv2a_occ_scale_count_x2(uint64_t samples, unsigned x2);
+struct nv2a_occ;
+void nv2a_occ_set_scale_x2(struct nv2a_occ *o, unsigned x2);
+/* Nearest-neighbour resample of 32-bit pixels, any two sizes (the integer
+ * helpers above are the fast paths). */
+void nv2a_resample_nearest32(const uint8_t *src, uint32_t src_pitch, uint32_t sw, uint32_t sh,
+                             uint8_t *dst, uint32_t dst_pitch, uint32_t dw, uint32_t dh);
 
 /* Host size of a guest w x h target at `scale`: w*N x h*N, N lowered for
  * this target until both fit max_dim. Returns the N used (>= 1). */

@@ -41,10 +41,17 @@ static const char *const k_filters[]  = { "nearest", "linear", "integer", NULL }
 static const char *const k_overscan[] = { "off", "crop", NULL };
 static const char *const k_fits[]     = { "letterbox", "fill16x10", NULL };
 static const char *const k_speakers[] = { "auto", "stereo", "5.1", NULL };
+#if defined(__ANDROID__)
+static const char *const k_scale[]    = { "1", "1.5", "2", "3", "4", NULL };
+#endif
 static const char *const k_aniso[]    = { "off", "2x", "4x", "8x", "16x", NULL };
 static const char *const k_aniso_env[] = { "1", "2", "4", "8", "16", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
 static const char *const k_units[]    = { "mph", "kmh", NULL };
+static const char *const k_face[]     = { "xbox", "nintendo", NULL };
+#if defined(__ANDROID__)
+static const char *const k_vibration[] = { "auto", "controller", "device", "off", NULL };
+#endif
 static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
 
@@ -58,7 +65,11 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_DISPLAY_FILTER]     = SETTING("display.filter", XS_CHOICE, 0, RENV_PRESENT_FILTER, k_filters, NULL, 0, 0, 0),
     [XS_DISPLAY_OVERSCAN]   = SETTING("display.overscan", XS_CHOICE, 0, RENV_PRESENT_OVERSCAN, k_overscan, NULL, 0, 0, 0),
     [XS_DISPLAY_FIT]        = SETTING("display.fit", XS_CHOICE, 0, RENV_PRESENT_FIT, k_fits, NULL, 0, 0, 0),
+#if defined(__ANDROID__)     /* with 1.5 (the Vulkan backend's half step): a choice there */
+    [XS_GRAPHICS_RENDER_SCALE] = SETTING("graphics.render_scale", XS_CHOICE, XS_RESTART, RENV_RENDER_SCALE, k_scale, k_scale, 0, 0, 0),
+#else
     [XS_GRAPHICS_RENDER_SCALE] = SETTING("graphics.render_scale", XS_INT, XS_RESTART, RENV_RENDER_SCALE, NULL, NULL, 1, 4, 1),
+#endif
     [XS_GRAPHICS_ANISO]     = SETTING("graphics.aniso", XS_CHOICE, 0, RENV_GFX_ANISO, k_aniso, k_aniso_env, 0, 0, 0),
     [XS_GRAPHICS_AA]        = SETTING("graphics.aa", XS_CHOICE, 0, RENV_GFX_AA, k_aa, NULL, 0, 0, 0),
     [XS_GRAPHICS_SHARPEN]   = SETTING("graphics.sharpen", XS_FLOAT, 0, RENV_GFX_SHARPEN, NULL, NULL, 0, 1, 0),
@@ -69,12 +80,18 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_AUDIO_FX_LEVEL]     = SETTING("audio.fx_level", XS_FLOAT, 0, RENV_AUDIO_FX_LEVEL, NULL, NULL, 0, 1, 0.25),
     [XS_INPUT_DEADZONE]     = SETTING("input.deadzone", XS_INT, 0, RENV_PAD_DEADZONE, NULL, NULL, 0, 32767, 0),
     [XS_INPUT_TRIGGER_DEADZONE] = SETTING("input.trigger_deadzone", XS_INT, 0, RENV_PAD_TRIGGER_DEADZONE, NULL, NULL, 0, 254, 0),
-    [XS_INPUT_RUMBLE]       = SETTING("input.rumble", XS_FLOAT, 0, RENV_INPUT_RUMBLE_GAIN, NULL, NULL, 0, 2, 1),
+    /* 0..3: gain x sqrt(speed), clamped to full (xinput_device.c). A weak
+     * motor (a handheld's own vibrator) wants more than a pad's. */
+    [XS_INPUT_RUMBLE]       = SETTING("input.rumble", XS_FLOAT, 0, RENV_INPUT_RUMBLE_GAIN, NULL, NULL, 0, 3, 1),
+    [XS_INPUT_FACE_LAYOUT]  = SETTING("input.face_layout", XS_CHOICE, 0, RENV_INPUT_FACE_LAYOUT, k_face, NULL, 0, 0, 0),
     [XS_POWER_MODE]         = SETTING("power.mode", XS_CHOICE, XS_VIRTUAL, RENV_COUNT, k_power, NULL, 0, 0, 0),
     [XS_ADVANCED_PERF]      = SETTING("advanced.perf_overlay", XS_BOOL, 0, RENV_OVERLAY_PERF, NULL, NULL, 0, 0, 0),
     [XS_GAME_SPEED_UNITS]   = SETTING("game.speed_units", XS_CHOICE, 0, RENV_SPEED_UNITS, k_units, NULL, 0, 0, 0),
     [XS_DISPLAY_HUD_FIX]    = SETTING("display.hud_fix", XS_BOOL, 0, RENV_GFX_HUD_FIX, NULL, NULL, 0, 0, 0),
     [XS_DISPLAY_ULTRAWIDE]  = SETTING("display.ultrawide", XS_CHOICE, 0, RENV_DISPLAY_ULTRAWIDE, k_ultrawide, NULL, 0, 0, 0),
+#if defined(__ANDROID__)
+    [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
+#endif
 };
 
 /* The power mode is two knobs. */
@@ -258,6 +275,9 @@ static void apply(xs_id id)
         break;
     case XS_INPUT_RUMBLE:
         xbox_InputSetRumbleGain(v);
+        break;
+    case XS_INPUT_FACE_LAYOUT:
+        xbox_InputSetFaceLayoutNintendo(v != 0.0);
         break;
     case XS_POWER_MODE: {
         const char *p, *l;
@@ -590,6 +610,7 @@ void xbox_SettingsFinish(void)
     /* What nothing else reads at start. */
     apply_audio();
     xbox_InputSetRumbleGain(s_set[XS_INPUT_RUMBLE].value);
+    xbox_InputSetFaceLayoutNintendo(s_set[XS_INPUT_FACE_LAYOUT].value != 0.0);
 }
 
 /* ── access ────────────────────────────────────────────────────────── */

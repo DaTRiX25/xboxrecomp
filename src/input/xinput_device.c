@@ -44,6 +44,8 @@ static DWORD xi_get_state(DWORD port, XBOX_INPUT_STATE *out)
         return rc;
     memcpy(&pad, &xi.Gamepad, sizeof pad);
     out->dwPacketNumber = xi.dwPacketNumber;
+    if (xbox_InputFaceLayoutNintendo())
+        xbox_InputMirrorFaceXInput(&pad);
     xbox_InputMapXInput(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
 }
@@ -282,6 +284,8 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
         pad.axis[a] = SDL_GameControllerGetAxis(c, (SDL_GameControllerAxis)a);
     pthread_mutex_unlock(&g_pads_lock);
     out->dwPacketNumber = ++g_packet[port];
+    if (xbox_InputFaceLayoutNintendo())
+        xbox_InputMirrorFaceSdl(&pad);
     xbox_InputMapSdl(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
 }
@@ -335,6 +339,31 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
     /* SDL rumble needs a duration. The USB pad (usb_gamepad.c) re-issues a
      * held rumble every 150 ms, so 300 ms bridges one refresh and a lost
      * stop report ends within a third of a second. 0 stops it. */
+#if defined(__ANDROID__)
+    /* A handheld's built-in pad has no motors: the first pad's rumble goes
+     * to the device's own vibrator then (android_vibration.c), and the pad
+     * is told to stop. */
+    if (port == 0) {
+        extern int xbox_AndroidVibration(unsigned left, unsigned right, int pad_can_rumble);
+        /* RECOMP_ANDROID_VIBRATION_FLOOR=<0..65535>: the title's motor
+         * speeds under it are silence (its idle hum, lifted by the strength
+         * setting, is otherwise a constant buzz in the hand). Default 0. */
+        static int floor_v = -1;
+        unsigned l = v->wLeftMotorSpeed, r = v->wRightMotorSpeed;
+        if (floor_v < 0) {
+            const char *f = getenv("RECOMP_ANDROID_VIBRATION_FLOOR");
+            floor_v = f ? atoi(f) : 0;
+        }
+        if ((int)l < floor_v) l = 0;
+        if ((int)r < floor_v) r = 0;
+        if (!xbox_AndroidVibration(rumble_level((WORD)l), rumble_level((WORD)r),
+                                   SDL_GameControllerHasRumble(c) == SDL_TRUE)) {
+            SDL_GameControllerRumble(c, 0, 0, 0);
+            pthread_mutex_unlock(&g_pads_lock);
+            return ERROR_SUCCESS;
+        }
+    }
+#endif
     SDL_GameControllerRumble(c, rumble_level(v->wLeftMotorSpeed),
                              rumble_level(v->wRightMotorSpeed),
                              (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 300 : 0);

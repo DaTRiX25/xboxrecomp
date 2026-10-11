@@ -101,6 +101,7 @@ extern "C" {
     X(PRESENT_LATENCY,   CONFIG, "RECOMP_PRESENT_LATENCY",   NULL, "D3D11 RECOMP_PRESENT_VSYNC=fifo: SetMaximumFrameLatency, 1-3 (default 1)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
     X(INPUT_RUMBLE,      CONFIG, "RECOMP_INPUT_RUMBLE",      NULL, "forward the title's rumble (USB output report) to the host pad; default 1, 0: off") \
+    X(INPUT_FACE_LAYOUT, CONFIG, "RECOMP_INPUT_FACE_LAYOUT", NULL, "the host pad's face buttons: xbox (default), nintendo (A and B, X and Y change places: a pad printed the Nintendo way)") \
     X(INPUT_RUMBLE_GAIN, CONFIG, "RECOMP_INPUT_RUMBLE_GAIN", NULL, "rumble strength on the host pad: motor = 65535 * min(1, gain * sqrt(speed/65535)); default 1.0, \"linear\": the title's values as they are") \
     X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0)") \
     X(PAD_TRIGGER_DEADZONE, CONFIG, "RECOMP_PAD_TRIGGER_DEADZONE", NULL, "trigger deadzone, 0..255 (default 0)") \
@@ -108,6 +109,7 @@ extern "C" {
     X(AUDIO_MUTE,        CONFIG, "RECOMP_AUDIO_MUTE",        NULL, "1: no sound") \
     X(AUDIO_MUTE_BG,     CONFIG, "RECOMP_AUDIO_MUTE_BG",     NULL, "1: no sound while the window is in the background") \
     X(AUDIO_SPEAKERS,    CONFIG, "RECOMP_AUDIO_SPEAKERS",    NULL, "speaker mode: auto (default: 5.1 when the default output has 6+ channels), stereo, 5.1") \
+    X(ANDROID_VIBRATION, CONFIG, "RECOMP_ANDROID_VIBRATION", NULL, "Android: where the first pad's rumble goes: auto (the pad when it has motors, else the device's vibrator; default), controller, device, off") \
     X(SPEED_UNITS,       CONFIG, "RECOMP_SPEED_UNITS",       NULL, "speed and distance units, for a title whose build has the metric display behind a patch (--patches, recomp_patch.h): mph (default, as shipped) or kmh") \
     X(GFX_HUD_FIX,       CONFIG, "RECOMP_GFX_HUD_FIX",       NULL, "1: the title's 2D HUD keeps its shape in a 16:9 picture, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
     X(DISPLAY_ULTRAWIDE, CONFIG, "RECOMP_DISPLAY_ULTRAWIDE", NULL, "a picture wider than 16:9 for the title's 3D, for a title whose build has that behind a patch (--patches, recomp_patch.h): off (default, as shipped), 21:9, 32:9, window (the window's own shape)") \
@@ -273,6 +275,7 @@ extern "C" {
     X(USB_PADS,          CONFIG, "RECOMP_USB_PADS",          NULL, "emulated USB pads plugged in, 1..4 (default 1)") \
     X(PAD_SCRIPT,        DEBUG, "pad_script",      "RECOMP_PAD_SCRIPT",        "=ms:btn[+btn][:hold],... or =@file: timed pad presses") \
     X(PAD_LIVE,          DEBUG, "pad_live",        "RECOMP_PAD_LIVE",          "=file: press each line appended to it (btn[+btn][:hold])") \
+    X(PAD_SCRIPT_ONLY,   DEBUG, "pad_script_only", NULL,                       "=1: a scripted run with a window does not read the host's controllers either, as a headless one (a test on a handheld, whose built-in pad is always there)") \
     X(PAD_SCRIPT_KEEP,   DEBUG, "pad_script_keep", NULL,                       "=1: a pad script keeps driving a pad after a controller is used on it (merged, the script's buttons on top), and a headless scripted run reads the controllers") \
     X(PAD_SCRIPT_NOTE,   DEBUG, "pad_script_note", NULL,                       "=0: no on-screen note while a pad script drives a pad") \
     X(PB_REPORT_MS,      TRACE, "pb_report_ms",    "RECOMP_PB_REPORT_MS",      "=ms: [PB] report / fb_dump interval (10000, min 100)") \

@@ -622,7 +622,7 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
         garbage_push(&e->im, VK_NULL_HANDLE, NULL);
         memset(e, 0, sizeof *e);
     }
-    nv2a_host_size(w, h, nv2a_host_render_scale(), s_max_dim, &e->hw, &e->hh);
+    nv2a_host_size_x2(w, h, nv2a_host_render_scale_x2(), s_max_dim, &e->hw, &e->hh);
     if (!nvk_image_new(&e->im, C->depth_format, e->hw, e->hh, 1,
                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
@@ -798,8 +798,10 @@ static void rt_seed(struct nvk_image *im, uint32_t addr, uint32_t pitch, uint32_
             uint32_t y;
             for (y = 0; y < h; y++)
                 memcpy(dst + (size_t)y * w * 4u, src + (size_t)y * pitch, (size_t)w * 4u);
-        } else {
+        } else if (hw % w == 0 && hh == h * (hw / w)) {
             nv2a_upscale_nearest32(src, pitch, w, h, hw / w, dst, hw * 4u);
+        } else {            /* 1.5x */
+            nv2a_resample_nearest32(src, pitch, w, h, dst, hw * 4u, hw, hh);
         }
         ensure_up();
         nvk_image_to(s_up, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -835,11 +837,16 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     static int said;
     struct nvk_image im;
     uint32_t hw, hh;
-    unsigned n;
     int keep;
 
-    n = nv2a_host_size(w, h, nv2a_host_render_scale(), s_max_dim, &hw, &hh);
-    keep = rt->hw == rt->w * n && rt->hh == rt->h * n;
+    /* The scale it has now against the scale it would get (in halves: 1.5x
+     * is 3), by the sizes each gives its present guest size. */
+    {
+        uint32_t kw, kh;
+        nv2a_host_size_x2(rt->w, rt->h, nv2a_host_render_scale_x2(), s_max_dim, &kw, &kh);
+        keep = rt->hw == kw && rt->hh == kh;
+    }
+    nv2a_host_size_x2(w, h, nv2a_host_render_scale_x2(), s_max_dim, &hw, &hh);
     if (!keep)
         rt_sync(rt, rt->pitch);
     end_encoder();
@@ -946,7 +953,7 @@ static RenderTarget *surface(void)
         if (free_rt->im.img)
             rt_free(free_rt);
     }
-    nv2a_host_size(w, h, nv2a_host_render_scale(), s_max_dim, &hw, &hh);
+    nv2a_host_size_x2(w, h, nv2a_host_render_scale_x2(), s_max_dim, &hw, &hh);
     if (!rt_image_new(&free_rt->im, hw, hh))
         return NULL;
     free_rt->offset = g->color_offset;
@@ -2759,7 +2766,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
          * render.scale (xemu PR #2240). */
         {
             float slope = (s_enc_dt && use_z && v->poly_offset)
-                        ? v->poly_factor * (float)nv2a_host_render_scale() : 0.0f;
+                        ? v->poly_factor * (float)nv2a_host_render_scale_x2() * 0.5f : 0.0f;
             vkCmdSetDepthBiasEnable(s_cmd, slope != 0.0f ? VK_TRUE : VK_FALSE);
             vkCmdSetDepthBias(s_cmd, 0.0f, 0.0f, slope);
         }
@@ -2896,6 +2903,24 @@ static void write_back_px(RenderTarget *rt, const uint8_t *px, uint32_t addr, ui
     uint32_t bpp = pitch / rt->w, w = rt->w, n = rt->hw / rt->w, y, x;
     static uint32_t *row;
     static uint32_t row_cap;
+    static uint8_t *frac;
+    static size_t frac_cap;
+
+    /* A fractional scale (1.5x): to guest size first, nearest, then as an
+     * unscaled target. */
+    if (rt->hw % rt->w != 0 || rt->hh != rt->h * n) {
+        size_t need = (size_t)w * rt->h * 4u;
+        if (frac_cap < need) {
+            uint8_t *nf = (uint8_t *)realloc(frac, need);
+            if (!nf)
+                return;
+            frac = nf;
+            frac_cap = need;
+        }
+        nv2a_resample_nearest32(px, rt->hw * 4u, rt->hw, rt->hh, frac, w * 4u, w, rt->h);
+        px = frac;
+        n = 1;
+    }
 
     if (rt_swz_ok(rt->swz, rt->w, rt->h) && (bpp == 4 || bpp == 2)) {
         /* Swizzled: linear first (box-filtered when scaled), then Z order. */
@@ -3203,6 +3228,7 @@ static int occ_ready_on(void)
         return 0;
     if (!s_occ.ops)
         nv2a_occ_init(&s_occ, &s_occ_ops, (uint8_t *)xbox_GetMemoryOffset());
+        nv2a_occ_set_scale_x2(&s_occ, nv2a_host_render_scale_x2());
     return 1;
 }
 

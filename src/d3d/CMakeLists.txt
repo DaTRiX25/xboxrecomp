@@ -58,9 +58,10 @@ else()
         nv2a_pcache_psdef.c
     )
     find_package(SDL2 REQUIRED)
-    if(WIN32)
-        # Windows + Vulkan: no OpenGL layer (d3d8_gl.c, libepoxy); the
-        # pushbuffer executor draws through nv2a_pb_vulkan.c alone.
+    if(WIN32 OR ANDROID)
+        # Windows + Vulkan, and Android: no OpenGL layer (d3d8_gl.c is desktop
+        # OpenGL 3.3 through libepoxy); the pushbuffer executor draws through
+        # nv2a_pb_vulkan.c alone.
         target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2)
     else()
         find_package(PkgConfig REQUIRED)
@@ -84,6 +85,33 @@ else()
             ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_link_libraries(xbox_d3d8 PUBLIC Vulkan::Vulkan glslang::glslang
                               glslang::glslang-default-resource-limits)
+        if(ANDROID)
+            # Android: every Vulkan call goes through pointers filled from the
+            # loader android_vk.c opens (the system's, or a replacement driver
+            # through libadrenotools). The header is force-included, so the
+            # Vulkan sources are the ones every host compiles. XR_ANDROID_VK_H
+            # is for the other libraries that call Vulkan (video, overlay).
+            set(XR_ANDROID_VK_H ${CMAKE_CURRENT_SOURCE_DIR}/android_vk.h
+                CACHE INTERNAL "the Android Vulkan dispatch header")
+            target_sources(xbox_d3d8 PRIVATE android_vk.c)
+            target_compile_options(xbox_d3d8 PRIVATE -include ${XR_ANDROID_VK_H})
+            # libadrenotools, built for the same ABI: <prefix>/include and
+            # <prefix>/lib/libadrenotools.a, liblinkernsbypass.a. Its hook
+            # libraries go into the APK beside the game's. Empty: the system
+            # driver only.
+            set(XBOXRECOMP_ANDROID_ADRENOTOOLS "" CACHE PATH
+                "Android: libadrenotools prefix (a replacement GPU driver)")
+            if(XBOXRECOMP_ANDROID_ADRENOTOOLS)
+                target_compile_definitions(xbox_d3d8 PRIVATE XBOXRECOMP_HAVE_ADRENOTOOLS=1)
+                target_include_directories(xbox_d3d8 PRIVATE
+                    ${XBOXRECOMP_ANDROID_ADRENOTOOLS}/include)
+                target_link_libraries(xbox_d3d8 PUBLIC
+                    ${XBOXRECOMP_ANDROID_ADRENOTOOLS}/lib/libadrenotools.a
+                    ${XBOXRECOMP_ANDROID_ADRENOTOOLS}/lib/liblinkernsbypass.a
+                    android log)
+                message(STATUS "xboxrecomp: libadrenotools from ${XBOXRECOMP_ANDROID_ADRENOTOOLS}")
+            endif()
+        endif()
         # A static glslang (the Steam Runtime SDK's) is C++: its runtime
         # comes with it, as this C program's link would not add it.
         # The GLSL emitters' output through glslang (no device needed).
@@ -100,6 +128,11 @@ else()
                 # and with llvm-mingw's libc++, linked statically so the .exe
                 # needs no libc++.dll.
                 target_link_libraries(xbox_d3d8 PUBLIC "-Wl,-Bstatic -lc++ -lunwind -Wl,-Bdynamic")
+            elseif(ANDROID)
+                # Built without the optimizer too; the C++ runtime is the
+                # NDK's (ANDROID_STL), which the C++ link brings, and bionic
+                # has no separate libpthread.
+                target_link_libraries(xbox_d3d8 PUBLIC m)
             else()
                 target_link_libraries(xbox_d3d8 PUBLIC SPIRV-Tools-opt SPIRV-Tools stdc++ m pthread)
             endif()

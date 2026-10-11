@@ -51,6 +51,10 @@ if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+elseif(ANDROID)
+    # Android: the platform layer alone. The crypto exports (kernel_crypto.c)
+    # are portable C, and the NDK has no OpenSSL to link.
+    target_link_libraries(xbox_kernel PUBLIC platform)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)

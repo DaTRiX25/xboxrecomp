@@ -14,6 +14,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
 #include "recomp_env.h"           /* RECOMP_GUEST_CPUS */
+#include "platform/android_host.h"  /* the fast core (Android) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -543,6 +544,21 @@ DWORD_PTR xbox_GuestCpuMask(void)
             return even & (DWORD_PTR)(-(intptr_t)even);
         if (rest)
             return rest & (DWORD_PTR)(-(intptr_t)rest);
+    }
+#endif
+#if defined(__ANDROID__)
+    /* Not the lowest: on a phone's little/big/prime layout that is a little
+     * core, a fraction of the speed. The fastest core is left to the
+     * executor, the heavier thread (kernel_bridge.c pins it there; measured
+     * on a Snapdragon 865: 60 % of a core against the guest's 29 %); the
+     * guest's threads take a core of the next kind, or the fastest when
+     * there is only one kind (android_host.h). */
+    {
+        int fast = recomp_android_cpu_rank(1);
+        if (fast < 0)
+            fast = recomp_android_fast_cpu();
+        if (fast >= 0 && fast < (int)(8 * sizeof proc) && (proc & ((DWORD_PTR)1 << fast)))
+            return (DWORD_PTR)1 << fast;
     }
 #endif
     /* The lowest core the process may use: fixed, so every thread lands

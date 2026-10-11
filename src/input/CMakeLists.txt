@@ -19,6 +19,10 @@ if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
 else()
     find_package(SDL2 REQUIRED)
     target_sources(xbox_input PRIVATE keyboard_sdl.c)
+    if(ANDROID)
+        # The title's rumble on the device's own vibrator (JNI).
+        target_sources(xbox_input PRIVATE android_vibration.c)
+    endif()
     target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2 m)
 endif()
 

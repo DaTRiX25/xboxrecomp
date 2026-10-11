@@ -29,6 +29,7 @@
 #include "backends/imgui_impl_sdl2.h"
 
 #include "input_backend.h"
+#include "input_map.h"
 #include "kernel_pause.h"
 #include "apu.h"                /* the speaker test */
 
@@ -119,6 +120,13 @@ static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the s
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
+#if defined(__ANDROID__)
+static const char *const n_vibration[] = { "Auto", "Controller", "This device", "Off", NULL };
+#endif
+#if defined(__ANDROID__)
+static const char *const n_scale[]     = { "1x (640x480)", "1.5x (960x720)", "2x (1280x960)", "3x", "4x", NULL };
+#endif
+static const char *const n_face[]      = { "Xbox layout", "Nintendo layout", NULL };
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
@@ -129,7 +137,11 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_FILTER */     { "Filter", "How the picture is scaled to the window.", 1, FMT_PLAIN, n_filter, 0 },
     /* XS_DISPLAY_OVERSCAN */   { "Overscan", "Crop the border a TV would have hidden.", 1, FMT_PLAIN, n_overscan, 0 },
     /* XS_DISPLAY_FIT */        { "Present fit", "Fill the window's height on a 16:10 screen.", 1, FMT_PLAIN, n_fit, 0 },
+#if defined(__ANDROID__)
+    /* XS_GRAPHICS_RENDER_SCALE */ { "Render scale", "Internal resolution, a multiple of the Xbox's 640x480. 1.5x is 960x720.", 1, FMT_PLAIN, n_scale, 0 },
+#else
     /* XS_GRAPHICS_RENDER_SCALE */ { "Render scale", "Internal resolution, a multiple of the Xbox's.", 1, FMT_TIMES, NULL, 0 },
+#endif
     /* XS_GRAPHICS_ANISO */    { "Anisotropic filtering", "Sharper textures at a slant, the road ahead. Costs GPU time.", 1, FMT_PLAIN, n_aniso, 0 },
     /* XS_GRAPHICS_AA */       { "Anti-aliasing", "Smooths jagged edges after the frame is drawn. FXAA is one cheap pass; SMAA is three, and cleaner.", 1, FMT_PLAIN, n_aa, 0 },
     /* XS_GRAPHICS_SHARPEN */  { "Sharpening", "Contrast-adaptive sharpening (AMD CAS), against the softness of the anti-aliasing and the scale-up.", 0.05, FMT_PERCENT, NULL, 0 },
@@ -141,11 +153,15 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_INPUT_DEADZONE */     { "Stick deadzone", "The part of the stick's travel that reads as centre.", 1638.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_TRIGGER_DEADZONE */ { "Trigger deadzone", "The part of a trigger's pull that reads as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "0 turns the rumble off.", 0.05, FMT_GAIN, NULL, 0 },
+    /* XS_INPUT_FACE_LAYOUT */  { "Face buttons", "Nintendo layout: for a pad printed with A on the right and B below. A and B, X and Y change places, here and in the game.", 1, FMT_PLAIN, n_face, 0 },
     /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits all the time (steadiest, hottest). Balanced sleeps and spins only the last 8 ms before each frame (steady 60). Battery saver only sleeps (coolest, an occasional small dip). Watts measured on a Steam Deck.", 1, FMT_PLAIN, n_power, 0 },
     /* XS_ADVANCED_PERF */      { "Performance overlay", "FPS and frame-time graph in the corner. Greetings to the DF team!", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speedometer and distances in km/h and metres instead of mph and miles: the game's own metric display, which the US disc keeps for its other languages. A change shows from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
     /* XS_DISPLAY_HUD_FIX */    { "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On: the HUD keeps its 4:3 shape and stays at the screen edges, by the game's own layout values. A change shows from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For a display wider than 16:9, with Aspect at 16:9: the race is drawn for the whole width (more to see at the sides, nothing stretched). Menus, loading screens and videos keep their 16:9 shape in the middle. Window follows the window's or the screen's own shape. A change shows from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
+#if defined(__ANDROID__)
+    /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: the controller when it has motors, else this device's own vibrator.", 1, FMT_PLAIN, n_vibration, 0 },
+#endif
 };
 
 /* R_SPEAKERS: the speaker test, six buttons in a row (action: 0 through
@@ -258,6 +274,10 @@ static int page_rows(int page, Row *r)
         break;
     case P_INPUT:
         SET(XS_INPUT_DEADZONE); SET(XS_INPUT_TRIGGER_DEADZONE); SET(XS_INPUT_RUMBLE);
+        SET(XS_INPUT_FACE_LAYOUT);
+#if defined(__ANDROID__)
+        SET(XS_INPUT_VIBRATION);
+#endif
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_POWER:
@@ -642,6 +662,14 @@ int xbox_OverlayEvent(const SDL_Event *ev)
         if (!s_open)
             break;
         s_last_input_pad = true;
+        /* The Nintendo face layout (Input > Face buttons) holds here too:
+         * the button printed A confirms, the one printed B goes back. */
+        if (xbox_InputFaceLayoutNintendo()) {
+            if (b == SDL_CONTROLLER_BUTTON_A) b = SDL_CONTROLLER_BUTTON_B;
+            else if (b == SDL_CONTROLLER_BUTTON_B) b = SDL_CONTROLLER_BUTTON_A;
+            else if (b == SDL_CONTROLLER_BUTTON_X) b = SDL_CONTROLLER_BUTTON_Y;
+            else if (b == SDL_CONTROLLER_BUTTON_Y) b = SDL_CONTROLLER_BUTTON_X;
+        }
         switch (b) {
         case SDL_CONTROLLER_BUTTON_DPAD_UP:    dir_set(s_dpad, D_UP, down); break;
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  dir_set(s_dpad, D_DOWN, down); break;

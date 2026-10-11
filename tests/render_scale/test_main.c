@@ -139,6 +139,29 @@ int main(void)
     }
 
     /* ---- visibility counts ---- */
+    /* In halves: 1.5x is 3. Whole factors agree with the integer helpers. */
+    CHECK(nv2a_host_size_x2(640, 480, 3, 16384, &hw, &hh) == 3 && hw == 960 && hh == 720);
+    CHECK(nv2a_host_size_x2(512, 512, 3, 16384, &hw, &hh) == 3 && hw == 768 && hh == 768);
+    CHECK(nv2a_host_size_x2(3, 5, 3, 16384, &hw, &hh) == 3 && hw == 5 && hh == 8);     /* odd: up */
+    CHECK(nv2a_host_size_x2(640, 480, 4, 16384, &hw, &hh) == 4 && hw == 1280 && hh == 960);
+    CHECK(nv2a_host_size_x2(640, 480, 2, 16384, &hw, &hh) == 2 && hw == 640 && hh == 480);
+    CHECK(nv2a_host_size_x2(640, 480, 0, 16384, &hw, &hh) == 2 && hw == 640);
+    CHECK(nv2a_host_size_x2(4096, 64, 3, 4096, &hw, &hh) == 2 && hw == 4096 && hh == 64);
+    CHECK(nv2a_occ_scale_count_x2(900, 3) == 400);          /* 2.25 host samples a guest pixel */
+    CHECK(nv2a_occ_scale_count_x2(1, 3) == 1);              /* a sliver stays visible */
+    CHECK(nv2a_occ_scale_count_x2(0, 3) == 0);
+    CHECK(nv2a_occ_scale_count_x2(400, 4) == nv2a_occ_scale_count(400, 2));
+    CHECK(nv2a_occ_scale_count_x2(77, 2) == 77);
+    {
+        /* 2x2 -> 3x3 and back: every source pixel is somewhere, and the
+         * way back gives the original. */
+        static const uint32_t src4[4] = { 1, 2, 3, 4 };
+        uint32_t up[9], back[4];
+        nv2a_resample_nearest32((const uint8_t *)src4, 8, 2, 2, (uint8_t *)up, 12, 3, 3);
+        CHECK(up[0] == 1 && up[2] == 2 && up[6] == 3 && up[8] == 4);
+        nv2a_resample_nearest32((const uint8_t *)up, 12, 3, 3, (uint8_t *)back, 8, 2, 2);
+        CHECK(back[0] == 1 && back[1] == 2 && back[2] == 3 && back[3] == 4);
+    }
     CHECK(nv2a_occ_scale_count(0, 1) == 0);
     CHECK(nv2a_occ_scale_count(12345, 1) == 12345);
     CHECK(nv2a_occ_scale_count(12345, 0) == 12345);

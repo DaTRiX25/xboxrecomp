@@ -485,6 +485,37 @@ static void test_trigger_deadzone(void)
     xbox_InputSetTriggerDeadzone(0);
 }
 
+/* The Nintendo face layout: A and B, X and Y change places, nothing else. */
+static void test_face_layout(void)
+{
+    XBOX_HOST_XINPUT_GAMEPAD xi;
+    XBOX_HOST_SDL_GAMEPAD sdl;
+    XBOX_GAMEPAD out;
+
+    CHECK(!xbox_InputFaceLayoutNintendo(), "the default is the Xbox layout");
+    memset(&xi, 0, sizeof xi);
+    xi.wButtons = XBOX_XI_A | XBOX_XI_X | XBOX_XI_START | XBOX_XI_DPAD_UP;
+    xbox_InputMirrorFaceXInput(&xi);
+    CHECK(xi.wButtons == (XBOX_XI_B | XBOX_XI_Y | XBOX_XI_START | XBOX_XI_DPAD_UP),
+          "xinput mirror %04X", xi.wButtons);
+    xbox_InputMirrorFaceXInput(&xi);
+    CHECK(xi.wButtons == (XBOX_XI_A | XBOX_XI_X | XBOX_XI_START | XBOX_XI_DPAD_UP),
+          "xinput mirror twice %04X", xi.wButtons);
+    memset(&sdl, 0, sizeof sdl);
+    sdl.button[XBOX_SDL_BUTTON_B] = 1;          /* the button printed A on such a pad */
+    sdl.button[XBOX_SDL_BUTTON_Y] = 1;
+    xbox_InputMirrorFaceSdl(&sdl);
+    CHECK(sdl.button[XBOX_SDL_BUTTON_A] && !sdl.button[XBOX_SDL_BUTTON_B]
+          && sdl.button[XBOX_SDL_BUTTON_X] && !sdl.button[XBOX_SDL_BUTTON_Y], "sdl mirror");
+    xbox_InputMapSdl(&sdl, &out);
+    CHECK(out.bAnalogButtons[XBOX_BUTTON_A] == 255 && out.bAnalogButtons[XBOX_BUTTON_B] == 0
+          && out.bAnalogButtons[XBOX_BUTTON_X] == 255 && out.bAnalogButtons[XBOX_BUTTON_Y] == 0,
+          "the title's A and X after the mirror");
+    xbox_InputSetFaceLayoutNintendo(1);
+    CHECK(xbox_InputFaceLayoutNintendo(), "the setting is kept");
+    xbox_InputSetFaceLayoutNintendo(0);
+}
+
 int main(int argc, char **argv)
 {
     xbox_InputSetDeadzone(0);
@@ -495,6 +526,7 @@ int main(int argc, char **argv)
     test_block();
     test_combo_guard();
     test_trigger_deadzone();
+    test_face_layout();
     printf("input_map: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
