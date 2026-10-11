@@ -455,6 +455,43 @@ static void queue_idle(void)
     nvk_queue_unlock();
 }
 
+#if defined(__ANDROID__)
+/* An Android app that leaves the screen (Home, recents, screen off) has its
+ * window's surface destroyed, and gets another when it comes back. The
+ * VkSurfaceKHR and the swapchain made on the old one are dead then: both are
+ * dropped and made again on the window's new surface. Marked from the app's
+ * life-cycle events (fbv_android_surface_gone, fb_present_sdl.c) and from
+ * any VK_ERROR_SURFACE_LOST_KHR. */
+static volatile int s_surface_lost;
+static VkSurfaceKHR make_surface(VkInstance inst, void *ctx);
+static void destroy_swapchain(void);
+
+void fbv_android_surface_gone(void)
+{
+    s_surface_lost = 1;
+}
+
+static int android_resurface(SDL_Window *win)
+{
+    static unsigned said;
+    if (!C)
+        return 0;
+    queue_idle();
+    pthread_mutex_lock(&s_sc_mu);
+    destroy_swapchain();
+    pthread_mutex_unlock(&s_sc_mu);
+    if (!nvk_core_replace_surface(make_surface, win)) {
+        if (said++ < 3)
+            fprintf(stderr, LOGP "no surface for the window yet; trying again\n");
+        return 0;
+    }
+    s_surface_lost = 0;
+    s_recreate = 1;
+    fprintf(stderr, LOGP "the window's surface was replaced: a new VkSurfaceKHR and swapchain\n");
+    return 1;
+}
+#endif
+
 static int make_swapchain(SDL_Window *win)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -468,7 +505,12 @@ static int make_swapchain(SDL_Window *win)
     VkResult r;
 
     queue_idle();
-    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(C->phys, C->surface, &caps) != VK_SUCCESS)
+    r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(C->phys, C->surface, &caps);
+#if defined(__ANDROID__)
+    if (r == VK_ERROR_SURFACE_LOST_KHR)
+        s_surface_lost = 1;
+#endif
+    if (r != VK_SUCCESS)
         return 0;
     pthread_mutex_lock(&s_sc_mu);
     vkGetPhysicalDeviceSurfaceFormatsKHR(C->phys, C->surface, &nf, fmts);
@@ -1517,6 +1559,10 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
     if (dw <= 0 || dh <= 0)
         return 0;
+#if defined(__ANDROID__)
+    if (s_surface_lost && !android_resurface(win))
+        return 0;
+#endif
     if (!s_sc || s_recreate || FBV_SIZE_CHANGED(dw, dh)) {
         if (!make_swapchain(win))
             return 0;
@@ -1535,6 +1581,10 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         s_recreate = 1;
         return 0;
     }
+#if defined(__ANDROID__)
+    if (r == VK_ERROR_SURFACE_LOST_KHR)
+        s_surface_lost = 1;
+#endif
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
         return 0;     /* timeout: try again at the next wake */
     if (r == VK_SUBOPTIMAL_KHR && FBV_SUBOPTIMAL_RECREATES)
@@ -1732,6 +1782,10 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && FBV_SUBOPTIMAL_RECREATES))
         s_recreate = 1;
+#if defined(__ANDROID__)
+    if (pr == VK_ERROR_SURFACE_LOST_KHR)
+        s_surface_lost = 1;
+#endif
     if (shot) {
         vkWaitForFences(C->dev, 1, &s_fence[s_fi], VK_TRUE, UINT64_MAX);
         save_shot((const uint8_t *)s_shot_buf.map, s_sc_ext.width, s_sc_ext.height,

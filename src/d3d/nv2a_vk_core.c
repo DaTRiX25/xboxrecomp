@@ -346,6 +346,16 @@ const struct nvk_core *nvk_core_init(const char *const *inst_exts, unsigned n,
     return s_state > 0 ? &s_core : NULL;
 }
 
+int nvk_core_replace_surface(VkSurfaceKHR (*make_surface)(VkInstance, void *), void *ctx)
+{
+    if (s_state != 1 || !make_surface)
+        return 0;
+    if (s_core.surface)
+        vkDestroySurfaceKHR(s_core.inst, s_core.surface, NULL);
+    s_core.surface = make_surface(s_core.inst, ctx);
+    return s_core.surface != VK_NULL_HANDLE;
+}
+
 const struct nvk_core *nvk_core_get(void)
 {
     return __atomic_load_n(&s_state, __ATOMIC_ACQUIRE) > 0 ? &s_core : NULL;
