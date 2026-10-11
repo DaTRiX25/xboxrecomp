@@ -1062,6 +1062,19 @@ double nv2a_present_output_aspect(void);
  * headless: the overscan crop alone). For a host that places things by the
  * visible picture (a guest patch's layout values). Any thread. */
 void nv2a_present_visible_x(uint32_t fw, uint32_t fh, double *x0, double *x1);
+/* The same for a frame shown at `aspect` (enum nv2a_present_aspect) in the
+ * same output: what a 4:3 picture would show there is the reference for a
+ * layout that keeps the 4:3 margins in a wider picture (the 16:10 fill crops
+ * a 16:9 picture's sides, not a 4:3 one's). */
+void nv2a_present_visible_x_at(uint32_t fw, uint32_t fh, int aspect, double *x0, double *x1);
+/* And for a frame of its own shape (width:height `ratio`, as
+ * nv2a_present_frame_aspect_fn answers) at the configured settings: what the
+ * window will show of a frame drawn for that picture. */
+void nv2a_present_visible_x_ratio(uint32_t fw, uint32_t fh, double ratio, double *x0, double *x1);
+/* The output's size as soon as the window exists (the presenter calls this
+ * once it has one), so the helpers above do not have to wait for the first
+ * present. A present's own size replaces it. */
+void nv2a_present_note_output(uint32_t dw, uint32_t dh);
 /* The same at a display aspect (enum nv2a_present_aspect); nv2a_present_rect
  * is this at nv2a_host_opts()->present_aspect. At any aspect but the frame's
  * own, INTEGER scales the height by a whole number and stretches the width

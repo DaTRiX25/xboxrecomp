@@ -1,7 +1,7 @@
 # present_layout - nv2a_present_layout (src/kernel/nv2a_backend_common.c):
 # the source and destination rectangles of every configured mode against a
-# table recorded before the per-frame aspect existed, and the per-frame
-# aspect itself. Standalone:
+# table recorded before the visible-columns helpers took an aspect, and those helpers
+# themselves. Standalone:
 #   cmake -S tests/present_layout -B build/present_layout
 #   cmake --build build/present_layout && ctest --test-dir build/present_layout
 cmake_minimum_required(VERSION 3.20)
