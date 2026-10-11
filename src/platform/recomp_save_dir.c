@@ -258,6 +258,34 @@ static int same_tree(const char *a, const char *b)
 
 /* ── the API ───────────────────────────────────────────────────────── */
 
+int recomp_user_dir(int kind, const char *name, char *out, unsigned out_size)
+{
+    int w;
+#if defined(_WIN32)
+    const char *base = getenv(kind == RECOMP_DIR_DATA ? "APPDATA" : "LOCALAPPDATA");
+    w = snprintf(out, out_size, kind == RECOMP_DIR_CACHE ? "%s/%s/cache" : "%s/%s",
+                 base && *base ? base : ".", name);
+#elif defined(__APPLE__)
+    const char *home = getenv("HOME");
+    w = snprintf(out, out_size, "%s/Library/%s/%s", home && *home ? home : ".",
+                 kind == RECOMP_DIR_CACHE ? "Caches" : "Application Support", name);
+#else
+    char lower[128];
+    const char *xdg = getenv(kind == RECOMP_DIR_CACHE ? "XDG_CACHE_HOME" : "XDG_DATA_HOME");
+    const char *home = getenv("HOME");
+    size_t i;
+    for (i = 0; name[i] && i + 1 < sizeof lower; i++)
+        lower[i] = (char)tolower((unsigned char)name[i]);
+    lower[i] = '\0';
+    if (xdg && *xdg)
+        w = snprintf(out, out_size, "%s/%s", xdg, lower);
+    else
+        w = snprintf(out, out_size, "%s/%s/%s", home && *home ? home : ".",
+                     kind == RECOMP_DIR_CACHE ? ".cache" : ".local/share", lower);
+#endif
+    return w > 0 && (unsigned)w < out_size;
+}
+
 const char *recomp_save_dir(const char *name)
 {
     static char dir[RS_PATH];
@@ -266,29 +294,10 @@ const char *recomp_save_dir(const char *name)
     if (dir[0])
         return dir;
     ov = recomp_env(RENV_SAVE_DIR);
-    if (ov && *ov) {
+    if (ov && *ov)
         snprintf(dir, sizeof dir, "%s", ov);
-    } else {
-#if defined(_WIN32)
-        const char *base = getenv("APPDATA");
-        snprintf(dir, sizeof dir, "%s/%s", base && *base ? base : ".", name);
-#elif defined(__APPLE__)
-        const char *home = getenv("HOME");
-        snprintf(dir, sizeof dir, "%s/Library/Application Support/%s",
-                 home && *home ? home : ".", name);
-#else
-        char lower[128];
-        const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
-        size_t i;
-        for (i = 0; name[i] && i + 1 < sizeof lower; i++)
-            lower[i] = (char)tolower((unsigned char)name[i]);
-        lower[i] = '\0';
-        if (xdg && *xdg)
-            snprintf(dir, sizeof dir, "%s/%s", xdg, lower);
-        else
-            snprintf(dir, sizeof dir, "%s/.local/share/%s", home && *home ? home : ".", lower);
-#endif
-    }
+    else
+        recomp_user_dir(RECOMP_DIR_DATA, name, dir, sizeof dir);
     {
         size_t n = strlen(dir);
         while (n > 1 && (dir[n - 1] == '/' || dir[n - 1] == '\\'))
@@ -296,6 +305,35 @@ const char *recomp_save_dir(const char *name)
     }
     mkdir_p(dir);
     return dir;
+}
+
+static int exists(const char *p)
+{
+#if defined(_WIN32)
+    return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES;
+#else
+    struct stat st;
+    return lstat(p, &st) == 0;
+#endif
+}
+
+int recomp_dir_migrate(const char *old_dir, const char *new_dir)
+{
+    char parent[RS_PATH];
+    size_t n = strlen(new_dir);
+
+    if (!is_dir(old_dir) || exists(new_dir) || n >= sizeof parent)
+        return 0;
+    memcpy(parent, new_dir, n + 1);
+    while (n > 1 && parent[n - 1] != '/' && parent[n - 1] != '\\')
+        n--;
+    if (n > 1) {
+        parent[n - 1] = '\0';
+        mkdir_p(parent);
+    }
+    /* rename does not replace a folder that came to be there meanwhile
+     * unless it is empty, and never crosses to another disk. */
+    return rename(old_dir, new_dir) == 0 ? 1 : -1;
 }
 
 int recomp_save_dir_migrate(const char *legacy, const char *dir)

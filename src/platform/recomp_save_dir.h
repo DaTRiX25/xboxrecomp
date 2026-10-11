@@ -23,6 +23,26 @@ extern "C" {
  * `name` (lower-cased on Linux). Resolved once; the same string after. */
 const char *recomp_save_dir(const char *name);
 
+/* A per-user folder by platform, not created. 1 with the path in `out`.
+ *
+ *   RECOMP_DIR_DATA   the save root above, without RECOMP_SAVE_DIR
+ *   RECOMP_DIR_LOCAL  for what is large and stays on this machine (a title's
+ *                     data): Windows %LOCALAPPDATA%\<Name>; elsewhere the same
+ *                     folder as RECOMP_DIR_DATA
+ *   RECOMP_DIR_CACHE  macOS ~/Library/Caches/<Name>, Linux $XDG_CACHE_HOME/<name>
+ *                     else ~/.cache/<name>, Windows %LOCALAPPDATA%\<Name>\cache
+ *                     (where nv2a_pcache.h keeps the shader cache)
+ */
+enum { RECOMP_DIR_DATA, RECOMP_DIR_LOCAL, RECOMP_DIR_CACHE };
+int recomp_user_dir(int kind, const char *name, char *out, unsigned out_size);
+
+/* A folder that got a new name: move `old_dir` to `new_dir`, once. Only when
+ * `old_dir` is a folder and nothing is at `new_dir`; nothing is ever deleted
+ * or written over, so a second call, or both being there, changes nothing.
+ * 1 moved, 0 nothing to do, -1 it could not be moved (both are as they
+ * were). Call it before anything makes `new_dir` (recomp_save_dir does). */
+int recomp_dir_migrate(const char *old_dir, const char *new_dir);
+
 /* Copy a save folder from before this (the working directory's saves/) into
  * `dir`, once: only when `legacy` has a UDATA, `dir` has none and `legacy`
  * has no MOVED.txt from an earlier copy. The
