@@ -36,6 +36,46 @@ double apu_hook_fault_bench(unsigned n);
  * variable is unset, or off Windows). */
 void apu_hook_trace_start(void);
 
+/* The speaker layout the title mixes for, 2 or 6 (RECOMP_AUDIO_SPEAKERS,
+ * decided when the APU comes up), and the dashboard audio word (XC_AUDIO)
+ * that tells the title so: 0 for stereo, SURROUND | ENABLE_AC3 for 5.1. */
+int mcpx_apu_title_channels(void);
+uint32_t mcpx_apu_xc_audio(void);
+
+/* Which speaker each of the 32 mixbins feeds in 5.1, 0..5 = FL FR FC LFE
+ * SL SR, -1 = left out (apu_speakers.h). Without it: DirectSound's layout,
+ * the FX sends folded to the front pair. A title that mixes its 5.1 sounds
+ * into FX sends routes them with this, as its GP effects image does. Call
+ * before mcpx_apu_init_standalone. */
+void mcpx_apu_set_speaker_map(const int8_t map[32]);
+
+/* The settings overlay's speaker test: about a second of noise on one
+ * speaker, 0..5 = FL FR FC LFE SL SR (a 60 Hz tone on the LFE), through the
+ * device and layout the title plays on. via_map: put into the mixbins the
+ * speaker map sends to that speaker (stereo: DirectSound's bin for it) and
+ * mixed as the title's sounds are; else straight into that output channel.
+ * Meant for while the title is paused; a new call replaces a test playing,
+ * a speaker of -1 stops it.
+ * _playing: the speaker playing now, -1 when none. */
+void mcpx_apu_speaker_test(int speaker, int via_map);
+int mcpx_apu_speaker_test_playing(int *via_map);
+
+/* 5.1: the bins (a mask, bit = bin) the title's wiring names as effect
+ * sends, and their level, 0..1 (RECOMP_AUDIO_FX_LEVEL, audio.fx_level,
+ * default 0.25; live). No effect runs here, so a send reaches its speaker
+ * dry; this keeps it down. Stereo does not use it. */
+void mcpx_apu_set_fx_bins(uint32_t mask);
+void mcpx_apu_set_fx_level(float level);
+
+/* 5.1: bin passes through the biquad EQ the title's GP effects image runs
+ * on it, its coefficients read live from GP scratch memory at
+ * scratch_offset (b0 b1 b2 a1 a2, s24, halved; apu_dsp.c). Stereo does not
+ * use it. Call before mcpx_apu_init_standalone. */
+void mcpx_apu_set_bin_eq(int bin, uint32_t scratch_offset);
+
+/* The speaker map in use (mcpx_apu_set_speaker_map, or the default). */
+void mcpx_apu_speaker_map_get(int8_t map[32]);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);

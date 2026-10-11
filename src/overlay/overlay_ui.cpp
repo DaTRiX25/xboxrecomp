@@ -27,6 +27,7 @@
 
 #include "input_backend.h"
 #include "kernel_pause.h"
+#include "apu.h"                /* the speaker test */
 
 #include <math.h>
 #include <stdint.h>
@@ -114,7 +115,7 @@ static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", NU
 static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the sides)", NULL };
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
-static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1 (coming soon)", NULL };
+static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
 
@@ -131,7 +132,8 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_AUDIO_VOLUME */       { "Master volume", "The game's sound level.", 0.05, FMT_PERCENT, NULL, 0 },
     /* XS_AUDIO_MUTE */         { "Mute", "No sound.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_MUTE_BG */      { "Mute in the background", "No sound while the window is not in front.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_AUDIO_SPEAKERS */     { "Speakers", "5.1 output is not built yet.", 1, FMT_PLAIN, n_speakers, 1u << 2 },
+    /* XS_AUDIO_SPEAKERS */     { "Speakers", "Auto plays 5.1 when the system's sound output is set to 5.1 (or more), else stereo. The game picks its mix at start.", 1, FMT_PLAIN, n_speakers, 0 },
+    /* XS_AUDIO_FX_LEVEL */     { "Surround effects (reverb) level", "5.1 only: the level of the game's effect sends, which play dry here (no effect DSP runs). Tune by ear.", 0.05, FMT_PERCENT, NULL, 0 },
     /* XS_INPUT_DEADZONE */     { "Stick deadzone", "The part of the stick's travel that reads as centre.", 1638.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_TRIGGER_DEADZONE */ { "Trigger deadzone", "The part of a trigger's pull that reads as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "0 turns the rumble off.", 0.05, FMT_GAIN, NULL, 0 },
@@ -140,7 +142,9 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speedometer and distances in km/h and metres instead of mph and miles: the game's own metric display, which the US disc keeps for its other languages. A change shows from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
 };
 
-enum RowKind { R_SETTING, R_ACTION, R_INFO };
+/* R_SPEAKERS: the speaker test, six buttons in a row (action: 0 through
+ * the game's mixbins and speaker map, 1 straight to the output). */
+enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS };
 enum Action { A_RESET_PAGE, A_RESET_ALL };
 
 struct Row {
@@ -156,6 +160,7 @@ static int page_rows(int page, Row *r)
 #define SET(i)  r[n++] = Row{ R_SETTING, (i), 0, NULL }
 #define ACT(a, t) r[n++] = Row{ R_ACTION, XS_COUNT, (a), (t) }
 #define INFO(t) r[n++] = Row{ R_INFO, XS_COUNT, 0, (t) }
+#define SPK(a, t) r[n++] = Row{ R_SPEAKERS, XS_COUNT, (a), (t) }
     switch (page) {
     case P_DISPLAY:
         SET(XS_DISPLAY_FULLSCREEN); SET(XS_DISPLAY_ASPECT); SET(XS_DISPLAY_FILTER);
@@ -171,6 +176,11 @@ static int page_rows(int page, Row *r)
         break;
     case P_AUDIO:
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
+        SET(XS_AUDIO_FX_LEVEL);
+        SPK(0, "Speaker test, game mix");
+        SPK(1, "Speaker test, direct");
+        if (mcpx_apu_title_channels() != 6)
+            INFO("The output is stereo: each speaker is folded to left/right.");
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_INPUT:
@@ -193,6 +203,7 @@ static int page_rows(int page, Row *r)
 #undef SET
 #undef ACT
 #undef INFO
+#undef SPK
     return n;
 }
 
@@ -207,6 +218,45 @@ static bool page_has(int page, xs_id id)
 }
 
 static bool selectable(const Row &r) { return r.kind != R_INFO; }
+
+/* ── the speaker test ──────────────────────────────────────────────── */
+
+static const char *const k_spk_short[6] = { "FL", "FR", "C", "LFE", "SL", "SR" };
+static const char *const k_spk_name[6] = { "Front Left", "Front Right", "Center", "LFE",
+                                           "Surround Left", "Surround Right" };
+static int s_spk_sel[2];              /* the button picked on each row */
+
+static void spk_play(int row)
+{
+    mcpx_apu_speaker_test(s_spk_sel[row], row == 0);
+}
+
+/* The hint for a speaker row: which mixbins the game-mix row feeds. */
+static void spk_hint(int row, char *out, size_t n)
+{
+    int sp = s_spk_sel[row];
+    if (row == 1) {
+        snprintf(out, n, "%s: noise straight into that output channel, after the mix. "
+                 "If this row and the game-mix row disagree, the speaker map is wrong; "
+                 "if both are wrong, the output order is.", k_spk_name[sp]);
+        return;
+    }
+    if (mcpx_apu_title_channels() != 6) {
+        snprintf(out, n, "%s: noise into mixbin %d (DirectSound's), through the stereo mix "
+                 "(even bins left, odd right: C plays left, LFE right).",
+                 k_spk_name[sp], sp);
+        return;
+    }
+    int8_t map[32];
+    char bins[128] = "";
+    size_t len = 0;
+    mcpx_apu_speaker_map_get(map);
+    for (int b = 0; b < 32; b++)
+        if (map[b] == sp && len < sizeof bins - 8)
+            len += snprintf(bins + len, sizeof bins - len, "%s%d", len ? ", " : "", b);
+    snprintf(out, n, "%s: noise into the mixbins the speaker map sends there (%s), "
+             "mixed as the game's sounds are.", k_spk_name[sp], bins);
+}
 
 /* ── value text ────────────────────────────────────────────────────── */
 
@@ -282,6 +332,10 @@ static void adjust(xs_id id, int dir)
 /* Activate: a bool flips, a choice moves on, an action runs. */
 static void activate(const Row &r)
 {
+    if (r.kind == R_SPEAKERS) {
+        spk_play(r.action);
+        return;
+    }
     if (r.kind == R_ACTION) {
         if (r.action == A_RESET_ALL) {
             xbox_SettingsResetAll();
@@ -325,6 +379,7 @@ static void set_open(bool on)
         xbox_HostPause(1);
         fprintf(stderr, LOGP "open: the title is paused, its input is held\n");
     } else {
+        mcpx_apu_speaker_test(-1, 0);
         xbox_HostPause(0);
         xbox_InputSetBlocked(0);
         xbox_SettingsFlush();
@@ -772,6 +827,30 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(255, 190, 120), r.text);
         return;
     }
+    if (r.kind == R_SPEAKERS) {
+        /* Six buttons on the right; the one playing lit, the picked one
+         * outlined while the row is selected. A click plays its button. */
+        int via = 0, playing = mcpx_apu_speaker_test_playing(&via);
+        const float bw = fs * 3.0f, gap = fs * 0.35f, bh = fs * 1.4f;
+        float bx = p.x + width - fs * 0.8f - 6 * bw - 5 * gap;
+        const float by = p.y + (rh - bh) * 0.5f;
+        dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(240, 240, 244), r.text);
+        for (int k = 0; k < 6; k++, bx += bw + gap) {
+            bool lit = playing == k && (via != 0) == (r.action == 0);
+            ImVec2 a(bx, by), b(bx + bw, by + bh);
+            dl->AddRectFilled(a, b, lit ? col(255, 140, 30) : col(60, 60, 66), bh * 0.3f);
+            if (sel && s_spk_sel[r.action] == k)
+                dl->AddRect(a, b, col(255, 255, 255), bh * 0.3f, 0, fs * 0.12f);
+            float tw = ImGui::CalcTextSize(k_spk_short[k]).x;
+            dl->AddText(ImVec2(bx + (bw - tw) * 0.5f, ty), lit ? col(20, 14, 8) : col(240, 240, 244),
+                        k_spk_short[k]);
+            if (*clicked && mp.x >= a.x && mp.x < b.x) {
+                s_spk_sel[r.action] = k;
+                *click_dir = 0;
+            }
+        }
+        return;
+    }
 
     const xs_setting *s = xbox_SettingGet(r.id);
     const Meta &m = k_meta[r.id];
@@ -896,6 +975,10 @@ static void build_pages(float fs)
     if (rows[sel].kind == R_SETTING) {
         while (s_steps[D_LEFT]-- > 0) adjust(rows[sel].id, -1);
         while (s_steps[D_RIGHT]-- > 0) adjust(rows[sel].id, 1);
+    } else if (rows[sel].kind == R_SPEAKERS) {
+        int &k = s_spk_sel[rows[sel].action];
+        while (s_steps[D_LEFT]-- > 0) k = (k + 5) % 6;
+        while (s_steps[D_RIGHT]-- > 0) k = (k + 1) % 6;
     }
     s_steps[D_LEFT] = s_steps[D_RIGHT] = 0;
     while (s_activate-- > 0) activate(rows[sel]);
@@ -920,6 +1003,8 @@ static void build_pages(float fs)
         } else {
             snprintf(hint, sizeof hint, "%s", k_meta[rows[sel].id].hint);
         }
+    } else if (rows[sel].kind == R_SPEAKERS) {
+        spk_hint(rows[sel].action, hint, sizeof hint);
     }
     const float wrap_w = ImGui::GetContentRegionAvail().x;
     const float hint_h = hint[0] ? ImGui::CalcTextSize(hint, nullptr, false, wrap_w).y : fs;
@@ -963,6 +1048,10 @@ static void build_pages(float fs)
         } else if (clicked && rows[i].kind == R_ACTION) {
             sel = i;
             activate(rows[i]);
+        } else if (clicked && rows[i].kind == R_SPEAKERS) {
+            sel = i;
+            if (cdir == 0)              /* on a button */
+                activate(rows[i]);
         }
         if (i == sel && s_scroll_to_sel) {
             ImGui::SetScrollHereY(0.5f);

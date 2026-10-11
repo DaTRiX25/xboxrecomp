@@ -23,9 +23,11 @@
  */
 
 #include "apu_state.h"
+#include "apu_speakers.h"
 #include "recomp_env.h"
 #include "fpconv.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -188,6 +190,203 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
     (void)d;
 }
 
+/* The bin -> speaker map of the 5.1 path (apu_speakers.c): DirectSound's
+ * layout unless the title's wiring set its own. Read once a frame; set
+ * before the APU starts. */
+static apu_spk_map s_spk_map;
+static int s_spk_map_set;
+
+void mcpx_apu_set_speaker_map(const int8_t map[32])
+{
+    memcpy(s_spk_map, map, sizeof(s_spk_map));
+    s_spk_map_set = 1;
+}
+
+/* RECOMP_AUDIO_FX_LEVEL (audio.fx_level): in 5.1, the level of the bins
+ * the title's wiring names as effect sends (mcpx_apu_set_fx_bins), which
+ * reach the speakers dry here since no effect runs. Live. */
+static uint32_t s_fx_bins;
+static float s_bin_gain[NUM_MIXBINS];
+static volatile float s_fx_level = -1.0f;      /* < 0: not read yet */
+
+static void fx_gains(void)
+{
+    if (s_fx_level < 0.0f) {
+        const char *e = recomp_env(RENV_AUDIO_FX_LEVEL);
+        float v = e && *e ? (float)atof(e) : 0.25f;
+        s_fx_level = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+    }
+    for (int b = 0; b < NUM_MIXBINS; b++)
+        s_bin_gain[b] = (s_fx_bins >> b) & 1u ? s_fx_level : 1.0f;
+}
+
+void mcpx_apu_set_fx_bins(uint32_t mask)
+{
+    s_fx_bins = mask;
+}
+
+void mcpx_apu_set_fx_level(float level)
+{
+    s_fx_level = level < 0.0f ? 0.0f : level > 1.0f ? 1.0f : level;
+}
+
+/* The title's GP EQs, 5.1 only. A bin set with mcpx_apu_set_bin_eq passes
+ * through the biquad its effects image applies to it, with the
+ * coefficients the title keeps in GP scratch memory: five s24 words, b0 b1
+ * b2 a1 a2, stored halved,
+ *
+ *     y[n] = 2 (b0 x[n] + b1 x[n-1] + b2 x[n-2] + a1 y[n-1] + a2 y[n-2])
+ *
+ * -- the form in which Burnout 3's image defaults (0x400000 0xAD7746
+ * 0x23434C 0x5288B9 0xDCBCB3) are exactly unity. The title rewrites them
+ * while it runs (DirectSound's SetEffectData lands in the scratch copy the
+ * GP's DMA loads from), so they are read again every EP period; the GP's
+ * memory itself is not emulated. On the APU frame thread, 32 samples a bin
+ * a frame. */
+#define EQ_NONE 0xFFFFFFFFu
+static uint32_t s_eq_off[NUM_MIXBINS];
+static int s_eq_any;
+static struct { float c[5]; float x1, x2, y1, y2; int bypass; } s_eq[NUM_MIXBINS];
+
+void mcpx_apu_set_bin_eq(int bin, uint32_t scratch_offset)
+{
+    if (!s_eq_any)
+        for (int b = 0; b < NUM_MIXBINS; b++)
+            s_eq_off[b] = EQ_NONE;
+    if (bin < 0 || bin >= NUM_MIXBINS)
+        return;
+    s_eq_off[bin] = scratch_offset;
+    s_eq_any = 1;
+}
+
+/* A dword of GP scratch, through the GPSADDR scatter-gather table (8 bytes
+ * an entry, the page's physical address first, as xemu's scratch_rw walks
+ * it). 0 with the table not set up yet. */
+static uint32_t gp_scratch_word(MCPXAPUState *d, uint32_t off)
+{
+    uint32_t sge = qatomic_read(&d->regs[NV_PAPU_GPSADDR]), page;
+    if (!sge || !d->ram_ptr || (off >> 12) > d->regs[NV_PAPU_GPSMAXSGE])
+        return 0;
+    page = *(const uint32_t *)mcpx_apu_phys(sge + (off >> 12) * 8);
+    if (!page || (page & 0xFFF))
+        return 0;
+    return *(const uint32_t *)(mcpx_apu_phys(page) + (off & 0xFFF));
+}
+
+static float s24f(uint32_t v)
+{
+    v &= 0xFFFFFF;
+    return (float)((int32_t)(v << 8) >> 8) / 8388608.0f;
+}
+
+static void eq_read(MCPXAPUState *d)
+{
+    static int logged;
+    for (int b = 0; b < NUM_MIXBINS; b++) {
+        float c[5], c1, c2;
+        if (s_eq_off[b] == EQ_NONE)
+            continue;
+        for (int k = 0; k < 5; k++)
+            c[k] = 2.0f * s24f(gp_scratch_word(d, s_eq_off[b] + 4 * k));
+        /* 1 - c1 z^-1 - c2 z^-2 must have its poles inside the circle. */
+        c1 = c[3];
+        c2 = c[4];
+        s_eq[b].bypass = !(c2 > -1.0f && c2 < 1.0f && fabsf(c1) < 1.0f - c2);
+        if (s_eq[b].bypass && logged++ < 4)
+            fprintf(stderr, "[APU] bin %d EQ %.4f %.4f %.4f / %.4f %.4f is not"
+                            " stable: passed through\n", b, c[0], c[1], c[2], c1, c2);
+        memcpy(s_eq[b].c, c, sizeof(c));
+    }
+}
+
+static void eq_run(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    for (int b = 0; b < NUM_MIXBINS; b++) {
+        float *x = mixbins[b];
+        if (s_eq_off[b] == EQ_NONE || s_eq[b].bypass)
+            continue;
+        const float b0 = s_eq[b].c[0], b1 = s_eq[b].c[1], b2 = s_eq[b].c[2];
+        const float a1 = s_eq[b].c[3], a2 = s_eq[b].c[4];
+        float x1 = s_eq[b].x1, x2 = s_eq[b].x2, y1 = s_eq[b].y1, y2 = s_eq[b].y2;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float y = b0 * x[i] + b1 * x1 + b2 * x2 + a1 * y1 + a2 * y2;
+            x2 = x1; x1 = x[i];
+            y2 = y1; y1 = y;
+            x[i] = y;
+        }
+        /* Denormals in a silent tail cost more than they are worth. */
+        if (fabsf(y1) < 1e-20f) y1 = 0.0f;
+        if (fabsf(y2) < 1e-20f) y2 = 0.0f;
+        s_eq[b].x1 = x1; s_eq[b].x2 = x2; s_eq[b].y1 = y1; s_eq[b].y2 = y2;
+    }
+}
+
+void mcpx_apu_speaker_map_get(int8_t map[32])
+{
+    if (!s_spk_map_set) {
+        apu_spk_default_map(s_spk_map);
+        s_spk_map_set = 1;
+    }
+    memcpy(map, s_spk_map, sizeof(s_spk_map));
+}
+
+/* RECOMP_TRACE=audio_channels: what reaches each mixbin and each output
+ * channel, once a second (1500 frames of 32 samples):
+ *
+ *   [AUDIO-CH] t=12s layout=5.1 bins 0=-31.2 1=-30.8 4=-40.1 ... (dBFS RMS)
+ *   [AUDIO-CH] t=12s out FL=-29.0 FR=-28.7 FC=-90 LFE=-90 SL=-38.2 SR=-37.9
+ *
+ * Bins that stayed silent are left out. Off: one branch a frame. */
+static int s_ch_trace = -1;
+static double s_ch_bin_sq[NUM_MIXBINS];
+static double s_ch_out_sq[APU_SPK_CHANNELS];
+static unsigned s_ch_frames, s_ch_secs;
+
+static double ch_db(double sq, double n)
+{
+    return sq > 0 ? 10.0 * log10(sq / n) : -90.0;
+}
+
+static void ch_trace(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
+                     const int16_t *out, int nch)
+{
+    char line[1024];
+    int len = 0;
+    double n;
+
+    for (int b = 0; b < NUM_MIXBINS; b++)
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            s_ch_bin_sq[b] += (double)mixbins[b][i] * mixbins[b][i];
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        for (int c = 0; c < nch; c++) {
+            double x = out[i * nch + c] / 32768.0;
+            s_ch_out_sq[c] += x * x;
+        }
+    if (++s_ch_frames < 1500)
+        return;
+
+    n = (double)s_ch_frames * NUM_SAMPLES_PER_FRAME;
+    s_ch_secs++;
+    for (int b = 0; b < NUM_MIXBINS; b++)
+        if (s_ch_bin_sq[b] > 0 && len < (int)sizeof(line) - 16)
+            len += snprintf(line + len, sizeof(line) - len, " %d=%.1f", b,
+                            ch_db(s_ch_bin_sq[b], n));
+    fprintf(stderr, "[AUDIO-CH] t=%us layout=%s bins%s\n", s_ch_secs,
+            nch == APU_SPK_CHANNELS ? "5.1" : "stereo", len ? line : " (silent)");
+    if (nch == APU_SPK_CHANNELS)
+        fprintf(stderr, "[AUDIO-CH] t=%us out FL=%.1f FR=%.1f FC=%.1f LFE=%.1f"
+                        " SL=%.1f SR=%.1f\n", s_ch_secs,
+                ch_db(s_ch_out_sq[0], n), ch_db(s_ch_out_sq[1], n),
+                ch_db(s_ch_out_sq[2], n), ch_db(s_ch_out_sq[3], n),
+                ch_db(s_ch_out_sq[4], n), ch_db(s_ch_out_sq[5], n));
+    else
+        fprintf(stderr, "[AUDIO-CH] t=%us out L=%.1f R=%.1f\n", s_ch_secs,
+                ch_db(s_ch_out_sq[0], n), ch_db(s_ch_out_sq[1], n));
+    memset(s_ch_bin_sq, 0, sizeof(s_ch_bin_sq));
+    memset(s_ch_out_sq, 0, sizeof(s_ch_out_sq));
+    s_ch_frames = 0;
+}
+
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -206,6 +405,35 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      */
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+
+    if (s_ch_trace < 0)
+        s_ch_trace = recomp_env_on(RENV_AUDIO_CHANNELS);
+
+    /* 5.1: the six speaker feeds (apu_speakers.c), and the stereo fold
+     * below is not run at all, so the stereo path is the same code it
+     * always was. */
+    if (d->monitor.channels == APU_SPK_CHANNELS &&
+        d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        if (!s_spk_map_set) {
+            apu_spk_default_map(s_spk_map);
+            s_spk_map_set = 1;
+        }
+        fx_gains();
+        if (s_eq_any) {
+            if (off == 0)
+                eq_read(d);
+            eq_run(mixbins);
+        }
+        apu_spk_mix51(&mixbins[0][0], NUM_SAMPLES_PER_FRAME, s_spk_map,
+                      s_fx_bins ? s_bin_gain : NULL,
+                      &d->monitor.frame_buf6[off], NUM_SAMPLES_PER_FRAME);
+        if (s_ch_trace)
+            ch_trace((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins,
+                     &d->monitor.frame_buf6[off][0], APU_SPK_CHANNELS);
+        g_dbg.gp.cycles = 0;
+        g_dbg.ep.cycles = 0;
+        return;
+    }
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -259,6 +487,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
         }
+        if (s_ch_trace)
+            ch_trace((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins,
+                     &d->monitor.frame_buf[off][0], 2);
     }
 
     g_dbg.gp.cycles = 0;

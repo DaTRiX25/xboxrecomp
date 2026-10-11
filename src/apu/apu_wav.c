@@ -40,7 +40,9 @@ static void wav_nap(void)
 }
 #endif
 
-#define FRAME_BYTES (APU_WAV_CHANNELS * 2)
+static int      s_channels = APU_WAV_CHANNELS;  /* 2, or 6 for 5.1 */
+#define FRAME_BYTES (s_channels * 2)
+#define APU_WAV_CHANNELS_MAX 6
 
 static FILE    *s_fp;
 static uint64_t s_frames;        /* sample frames written */
@@ -67,10 +69,10 @@ static void write_header(void)
     memcpy(h + 8, "WAVEfmt ", 8);
     put_le32(h + 16, 16);
     h[20] = 1; h[21] = 0;                                   /* PCM        */
-    h[22] = APU_WAV_CHANNELS; h[23] = 0;
+    h[22] = (uint8_t)s_channels; h[23] = 0;
     put_le32(h + 24, APU_WAV_RATE);
     put_le32(h + 28, APU_WAV_RATE * FRAME_BYTES);
-    h[32] = FRAME_BYTES; h[33] = 0;                         /* block align */
+    h[32] = (uint8_t)FRAME_BYTES; h[33] = 0;                         /* block align */
     h[34] = 16; h[35] = 0;                                  /* bits        */
     memcpy(h + 36, "data", 4);
     put_le32(h + 40, data);
@@ -143,8 +145,9 @@ int apu_wav_open(const char *path, double max_secs)
             s_next_refresh = APU_WAV_RATE;
             write_header();
             ok = 1;
-            fprintf(stderr, "[AUDIO-WAV] writing %s (48000 Hz s16 stereo%s)\n",
-                    path, s_cap ? ", capped" : "");
+            fprintf(stderr, "[AUDIO-WAV] writing %s (48000 Hz s16 %s%s)\n",
+                    path, s_channels == 6 ? "5.1, FL FR FC LFE SL SR" : "stereo",
+                    s_cap ? ", capped" : "");
         } else {
             fprintf(stderr, "[AUDIO-WAV] cannot open %s\n", path);
         }
@@ -162,7 +165,7 @@ int apu_wav_open(const char *path, double max_secs)
 
 void apu_wav_write(const int16_t *samples, int count)
 {
-    uint8_t buf[1024 * FRAME_BYTES];
+    uint8_t buf[1024 * APU_WAV_CHANNELS_MAX * 2];
 
     if (!s_fp || !samples || count <= 0)        /* unlocked fast path */
         return;
@@ -172,13 +175,13 @@ void apu_wav_write(const int16_t *samples, int count)
         if (s_cap && s_frames + (uint64_t)n > s_cap)
             n = (int)(s_cap - s_frames);
         /* Little-endian on disk whatever the host. */
-        for (i = 0; i < n * APU_WAV_CHANNELS; i++) {
+        for (i = 0; i < n * s_channels; i++) {
             buf[2 * i]     = (uint8_t)samples[i];
             buf[2 * i + 1] = (uint8_t)((uint16_t)samples[i] >> 8);
         }
         fwrite(buf, FRAME_BYTES, (size_t)n, s_fp);
         s_frames += (uint64_t)n;
-        samples += n * APU_WAV_CHANNELS;
+        samples += n * s_channels;
         count -= n;
         if (s_cap && s_frames >= s_cap) {
             close_locked();
@@ -189,6 +192,15 @@ void apu_wav_write(const int16_t *samples, int count)
             s_next_refresh = s_frames + APU_WAV_RATE;
         }
     }
+    wav_unlock();
+}
+
+void apu_wav_set_channels(int channels)
+{
+    wav_lock();
+    if (!s_fp)
+        s_channels = channels == APU_WAV_CHANNELS_MAX ? APU_WAV_CHANNELS_MAX
+                                                      : APU_WAV_CHANNELS;
     wav_unlock();
 }
 

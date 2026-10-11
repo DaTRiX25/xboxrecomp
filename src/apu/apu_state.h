@@ -511,6 +511,11 @@ struct MCPXAPUState {
     struct {
         McpxApuDebugMonitorPoint point;
         int16_t frame_buf[256][2];
+        /* 5.1 (channels 6): the DSP stage writes the six speaker feeds here
+         * instead of frame_buf (apu_speakers.h order). channels is the
+         * layout the title mixes for, fixed at init: 2 or 6. */
+        int channels;
+        int16_t frame_buf6[256][6];
         void *stream; /* SDL_AudioStream* - stubbed */
         int queued_bytes_low, queued_bytes_high;
     } monitor;
