@@ -123,6 +123,11 @@ const char *xbox_SettingsPath(void);
 /* The window is in the background: audio.mute_background silences it. */
 void xbox_SettingsSetBackground(int bg);
 
+/* The bug report's parts that come from here (xbox_report.h): settings.toml
+ * attached, the settings with their sources, the shader cache's counts.
+ * Once, at start (xbox_settings_report.c). */
+void xbox_SettingsReportRegister(void);
+
 /* The environment spelling of a value, for the overlay's hints. */
 void xbox_SettingEnvString(const xs_setting *s, double v, char *out, unsigned n);
 
