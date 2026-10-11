@@ -281,6 +281,7 @@ extern "C" {
     X(FRAMETIME_HOST,    TRACE, "frametime_host",  NULL,                       "=file: with frametime, the host stacks of guest-main's host-code samples in every frame where they reach frametime_host_ms (Mach, Linux)") \
     X(FRAMETIME_HOST_MS, TRACE, "frametime_host_ms", NULL,                     "=ms: the m_host a frame needs for frametime_host to write its stacks (4)") \
     X(LATENCY_TRACE,     TRACE, "latency",         NULL,                       "=file: input-to-photon CSV: pad report changes, guest ISR, swap, vblank release, executor done, GPU done + frame signature, drawable acquire/present/on-glass (tools/perf/latency.py)") \
+    X(PB_SLOW,           TRACE, "pb_slow",         NULL,                       "=ms: a [PB] line for every pushbuffer method the executor spends that long in (default 5): which command a frame stood in; two clock reads a method") \
     X(PACING_TRACE,      TRACE, "pacing",          NULL,                       "[PACING] flip intervals, vblank gaps, CPU and spin-wait sites every 600 flips; =all also every flip") \
     X(VBLANK_CLOCK,      DEBUG, "vblank_clock",    NULL,                       "=ms: the old millisecond vblank schedule and timer loop (A/B)") \
     X(MISSING,           TRACE, "missing",         NULL,                       "missing game files, one line each and an exit summary; default on, =0 off, =all also absent directories, other trees, probes, every FAILED repeat and NtOpenFile/IoCreateFile successes") \
