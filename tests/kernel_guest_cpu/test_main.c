@@ -15,6 +15,11 @@
  *    is made that way);
  *  - on Win32 the pin took: a second SetThreadAffinityMask reports the
  *    core as the previous mask;
+ *  - on Windows a process with a pinned thread is in the above-normal
+ *    priority class at least (a pinned thread cannot move away from a
+ *    thread of its own priority that Windows puts on its core): started
+ *    below normal or normal it is raised, started higher it is left, and
+ *    RECOMP_DEBUG=host_priority=keep leaves it as started;
  *  - off Windows, RECOMP_GUEST_CPUS=token is no mask, and a thread that
  *    pins itself joins the guest-CPU token instead while one that does not
  *    stays off it (the token itself: tests/guest_turn_posix).
@@ -126,10 +131,12 @@ static void join(HANDLE th)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     DWORD_PTR proc = 0, sys = 0, mask, again;
     HANDLE th;
+
+    (void)argc; (void)argv;
 
     recomp_env_set(RENV_GUEST_CPUS, NULL);
     mask = xbox_GuestCpuMask();
@@ -165,6 +172,29 @@ int main(void)
     CHECK(th != NULL, "early thread");
     join(th);
 
+#if defined(_WIN32)
+    {
+        /* The class the test asks for (the first argument: below, normal,
+         * high; default below, as Task Scheduler starts a process) and what
+         * the first pin makes of it. */
+        const char *from = argc > 1 ? argv[1] : "below";
+        const char *keep = recomp_env(RENV_HOST_PRIORITY);
+        DWORD start = !strcmp(from, "high") ? HIGH_PRIORITY_CLASS
+                    : !strcmp(from, "normal") ? NORMAL_PRIORITY_CLASS
+                    : BELOW_NORMAL_PRIORITY_CLASS;
+        DWORD want = keep && !strcmp(keep, "keep") ? start
+                   : start == HIGH_PRIORITY_CLASS ? start : ABOVE_NORMAL_PRIORITY_CLASS;
+        DWORD got;
+
+        CHECK(SetPriorityClass(GetCurrentProcess(), start), "start class %s", from);
+        CHECK(GetPriorityClass(GetCurrentProcess()) == start, "start class %s took", from);
+        xbox_GuestThreadPin("test-main");
+        got = GetPriorityClass(GetCurrentProcess());
+        CHECK(got == want, "started %s%s: class %#lx after the first pin, wanted %#lx",
+              from, keep ? " (host_priority=keep)" : "", (unsigned long)got,
+              (unsigned long)want);
+    }
+#endif
     xbox_GuestThreadPin("test-main");
     th = CreateThread(NULL, 0, worker, NULL, 0, NULL);
     CHECK(th != NULL, "worker thread");

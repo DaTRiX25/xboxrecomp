@@ -575,6 +575,120 @@ static BOOL CALLBACK guest_turn_setup(PINIT_ONCE once, PVOID param, PVOID *ctx)
 }
 #endif
 
+#if defined(_WIN32)
+/* ============================================================================
+ * Windows: the priority class of a process with pinned threads
+ *
+ * A pinned thread cannot move. Windows gives each processor to the
+ * highest-priority thread ready for it, and a thread that may use one core
+ * waits in that core's queue while a thread of equal or higher priority
+ * runs there, however many other cores are idle. The title's threads sleep
+ * most of each frame (the guest core was idle 85 % of a race on a Ryzen 7
+ * 5800X), so Windows keeps placing other threads on that core, and a title
+ * thread that then wakes gets it at once only from a thread it outranks.
+ *
+ * Its rank was whatever the process was started with. From Explorer that is
+ * the normal class: title threads at 8, 10 after a wait while the window
+ * has the foreground. From Task Scheduler, which is how a PC is driven
+ * over SSH, it is the below-normal class (a task's default priority is 7):
+ * 6, and 8 in the foreground. Ordinary work runs at 8 and up. Races on that
+ * PC, with a CPU-bound normal-priority loop pinned to the guest core for
+ * 3-6 s, and with sixteen CPU-bound jobs at once anywhere for 30 s (what a
+ * parallel build on the same PC does), by kernel context-switch traces and
+ * flip times (BO-75):
+ *
+ *   class, window        the loop on the core       sixteen jobs
+ *   below normal, front  flips 150-420 ms apart     10 flips/s, 139 over 100 ms
+ *   below normal, back   one gap of 5.9 s           3 flips/s, gaps to 4.7 s
+ *   normal, front        60 flips/s, none late      60 flips/s, none over 42 ms
+ *   normal, back         2 over 100 ms (156 ms)     39 flips/s, 23 over 100 ms
+ *   above normal, front  60 flips/s, none late      56 flips/s, none over 66 ms
+ *   above normal, back   60 flips/s, none late      55 flips/s, none over 68 ms
+ *
+ * (Flips per second with the title's own 30 Hz crash cameras in them: an
+ * undisturbed race reads 55-60.) In the trace of the first row the loop
+ * had the core 99 % of the time and
+ * the title's main thread got it for under a millisecond at each of the
+ * loop's quantum ends. The 0.3-5 s stalls first seen in some races fell in
+ * an hour when another job built on that PC, with the game below normal.
+ *
+ * So while its threads are pinned the process is in the above-normal class
+ * at least, whatever it was started in, window or headless, test or not:
+ * what is measured is what a player gets. DOSBox runs the same way by
+ * default while it has the focus ("priority = higher,normal"). It is the
+ * whole process that moves, so the title's own relative priorities and the
+ * boosts that order its threads among themselves are as they were; the
+ * compositor, the audio engine and input (13 and up) stay above it. For
+ * everything else on the PC it means what the class means: where one of
+ * this process's threads and a normal-priority thread want the same core,
+ * this one runs first. The title's threads use about an eighth of their
+ * core and the executor most of another; the other cores are untouched.
+ * RECOMP_DEBUG=host_priority=keep leaves the class as started, =normal and
+ * =high pick another; a class is only ever raised.
+ * ============================================================================ */
+static const char *priority_class_name(DWORD cls)
+{
+    switch (cls) {
+    case IDLE_PRIORITY_CLASS:         return "idle";
+    case BELOW_NORMAL_PRIORITY_CLASS: return "below normal";
+    case NORMAL_PRIORITY_CLASS:       return "normal";
+    case ABOVE_NORMAL_PRIORITY_CLASS: return "above normal";
+    case HIGH_PRIORITY_CLASS:         return "high";
+    case REALTIME_PRIORITY_CLASS:     return "realtime";
+    default:                          return "unknown";
+    }
+}
+
+static int priority_class_rank(DWORD cls)
+{
+    switch (cls) {
+    case IDLE_PRIORITY_CLASS:         return 0;
+    case BELOW_NORMAL_PRIORITY_CLASS: return 1;
+    case ABOVE_NORMAL_PRIORITY_CLASS: return 3;
+    case HIGH_PRIORITY_CLASS:         return 4;
+    case REALTIME_PRIORITY_CLASS:     return 5;
+    default:                          return 2;     /* normal */
+    }
+}
+
+static BOOL CALLBACK host_priority_apply(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    const char *want = recomp_env(RENV_HOST_PRIORITY);
+    DWORD cur = GetPriorityClass(GetCurrentProcess());
+    DWORD cls = ABOVE_NORMAL_PRIORITY_CLASS;
+
+    (void)once; (void)param; (void)ctx;
+    if (want && !strcmp(want, "keep"))
+        cls = 0;
+    else if (want && !strcmp(want, "normal"))
+        cls = NORMAL_PRIORITY_CLASS;
+    else if (want && !strcmp(want, "high"))
+        cls = HIGH_PRIORITY_CLASS;
+    else if (want && *want && strcmp(want, "above"))
+        fprintf(stderr, "  [KERNEL] host_priority=%s: not keep, normal, above"
+                        " or high; taking above\n", want);
+    if (!cur)
+        fprintf(stderr, "  [KERNEL] process priority class: not readable"
+                        " (error %lu)\n", (unsigned long)GetLastError());
+    else if (!cls || priority_class_rank(cur) >= priority_class_rank(cls))
+        fprintf(stderr, "  [KERNEL] process priority class: %s, as started%s\n",
+                priority_class_name(cur),
+                priority_class_rank(cur) < priority_class_rank(NORMAL_PRIORITY_CLASS)
+                ? ": any normal-priority thread on the title's core holds"
+                  " the title up" : "");
+    else if (SetPriorityClass(GetCurrentProcess(), cls))
+        fprintf(stderr, "  [KERNEL] process priority class: %s, started %s"
+                        " (RECOMP_DEBUG=host_priority=keep: as started)\n",
+                priority_class_name(cls), priority_class_name(cur));
+    else
+        fprintf(stderr, "  [KERNEL] process priority class: %s; raising it to"
+                        " %s failed (error %lu)\n", priority_class_name(cur),
+                priority_class_name(cls), (unsigned long)GetLastError());
+    fflush(stderr);
+    return TRUE;
+}
+#endif /* _WIN32 */
+
 void xbox_GuestThreadPin(const char *role)
 {
     static int announced, failed;
@@ -598,6 +712,13 @@ void xbox_GuestThreadPin(const char *role)
         return;
     while (!((mask >> core) & 1))
         core++;
+#if defined(_WIN32)
+    {
+        /* Before the first pin: a pinned thread needs the class. */
+        static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+        InitOnceExecuteOnce(&once, host_priority_apply, NULL, NULL);
+    }
+#endif
     if (!SetThreadAffinityMask(GetCurrentThread(), mask)) {
         if (!failed) {
             failed = 1;

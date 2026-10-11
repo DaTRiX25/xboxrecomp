@@ -209,6 +209,7 @@ extern "C" {
     X(POKE,              DEBUG, "poke",            "RECOMP_POKE",              "=va:value,...: write guest words") \
     X(WORKERS,           DEBUG, "workers",         "RECOMP_WORKERS",           "=inline: run worker threads inline") \
     X(GUEST_CPUS,        DEBUG, "guest_cpus",      "RECOMP_GUEST_CPUS",        "=all: the title's threads on every host core; =<n>: that core; =token: one at a time by a token, for hosts without thread affinity (macOS) (default: one core, as on the console)") \
+    X(HOST_PRIORITY,     DEBUG, "host_priority",   NULL,                       "Windows: the process's priority class while the title's threads are pinned to one core: above (default), high, normal, or keep (as started); never lowered") \
     X(CS_MODE,           DEBUG, "cs_mode",         "RECOMP_CS_MODE",           "=single: one lock for every guest lock") \
     X(ASYNC_IO,          DEBUG, "async_io",        "RECOMP_ASYNC_IO",          "asynchronous file I/O") \
     X(UNIMPL_TRAP,       DEBUG, "unimpl_trap",     "RECOMP_UNIMPL_TRAP",       "stop at an unimplemented instruction") \
