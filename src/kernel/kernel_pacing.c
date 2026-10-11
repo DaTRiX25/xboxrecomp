@@ -82,6 +82,9 @@ static int s_disp_lock = -1;               /* RECOMP_VBLANK_SYNC=display */
 static uint64_t s_disp_cand;               /* a shorter period the steps show */
 static int s_disp_cand_n;                  /* steps that showed it */
 static int s_disp_off;                     /* steps in a row on no period */
+/* Steps off the period's grid: 240 each (two seconds of steps at 120 Hz),
+ * less one per step on it, up to a minute's worth. */
+static int s_disp_jitter;
 
 static int display_lock_on(void)
 {
@@ -165,6 +168,29 @@ void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns)
             }
         }
     }
+    /* Reports whose steps are not whole periods are not a display's
+     * refreshes: a CVDisplayLink on an external 120 Hz display (BO-77)
+     * steps 3.7-13.7 ms on its stated 8.333, as it extrapolates its own
+     * timeline. Snapped to those, the vblank ran at 63 Hz with 12-21 ms
+     * gaps. While any such step is on the books the lock stands down and
+     * the timer keeps its own 60 Hz. (A measured period is fitted to the
+     * steps above; this holds a stated one to them.) */
+    cur = (uint64_t)s_disp_period;
+    if (period_ns && cur && prev && when_ns > prev && when_ns - prev <= 100000000u) {
+        uint64_t r = (when_ns - prev) % cur;
+        if (r > cur / 8 && cur - r > cur / 8) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "[PACING] display refresh reports are irregular (a"
+                        " %.2f ms step on a %.3f ms period): the vblank keeps its"
+                        " own 60 Hz timer while they are\n",
+                        (when_ns - prev) / 1e6, cur / 1e6);
+            if (s_disp_jitter < 7200)
+                s_disp_jitter += 240;
+        } else if (s_disp_jitter) {
+            s_disp_jitter--;
+        }
+    }
     s_disp_ns = (LONGLONG)when_ns;
 }
 
@@ -179,7 +205,8 @@ static int display_grid(uint64_t now_ns, uint64_t *ref_ns, uint64_t *period_ns)
         return 0;
     ref = (uint64_t)s_disp_ns;
     pd = (uint64_t)s_disp_period;
-    if (!ref || !pd || (now_ns > ref && now_ns - ref > DISPLAY_STALE_NS))
+    if (!ref || !pd || (now_ns > ref && now_ns - ref > DISPLAY_STALE_NS)
+            || s_disp_jitter)
         return 0;
     m = (nominal + pd / 2) / pd;           /* refreshes per guest vblank */
     if (!m)
