@@ -202,6 +202,41 @@ static double display_run(double hz, int fps30)
     return (double)(n - n_mid) * 1e9 / (double)(t_last - t_mid);
 }
 
+/* A CVDisplayLink's reports: every refresh, with its period, each up to
+ * `jitter` either side of the refresh (an external display's link that
+ * extrapolates its timeline steps 3.7-13.7 ms on 8.333). Returns the vblank
+ * rate over the last 20 of 40 simulated seconds, edge to edge. */
+static double link_run(double hz, uint64_t jitter)
+{
+    XboxVblankSchedule s = {0};
+    const uint64_t t0 = 3 * NS_PER_S, end = t0 + 40 * NS_PER_S;
+    const double rp = 1e9 / hz;
+    uint64_t now = t0, next = t0, late, k = 1, n = 0, n_mid = 0, t_mid = 0, t_last = 0;
+    unsigned rng = 777;
+
+    while (now < end) {
+        uint64_t r = t0 + (uint64_t)((double)k * rp);
+        if (r <= next) {
+            rng = rng * 1103515245u + 12345u;
+            now = r;
+            xbox_VblankDisplayRefresh(jitter ? r - jitter + (rng >> 8) % (2 * jitter) : r,
+                                      (uint64_t)rp);
+            k++;
+            continue;
+        }
+        now = next;
+        if (!xbox_VblankSchedule(&s, now, &next, &late))
+            continue;
+        n++;
+        t_last = now;
+        if (now >= t0 + 20 * NS_PER_S && !n_mid) {
+            n_mid = n;
+            t_mid = now;
+        }
+    }
+    return (double)(n - n_mid) * 1e9 / (double)(t_last - t_mid);
+}
+
 static void display_lock(void)
 {
     static const double hz[] = { 60.0, 59.94, 90.0, 100.0, 119.88, 120.0, 144.0 };
@@ -226,6 +261,17 @@ static void display_lock(void)
     }
 }
 
+static void display_link(void)
+{
+    double clean = link_run(119.88, 0), jit = link_run(120.0, 4 * MS);
+    char what[96];
+
+    snprintf(what, sizeof what, "link 119.88 Hz, clean: vblank %.3f Hz", clean);
+    check(clean > 59.935 && clean < 59.945, what);
+    snprintf(what, sizeof what, "link 120 Hz, +-4 ms stamps: vblank %.3f Hz", jit);
+    check(jit > 59.995 && jit < 60.005, what);
+}
+
 int main(void)
 {
     printf("vblank_schedule:\n");
@@ -238,6 +284,7 @@ int main(void)
     no_drift();
     large_epoch();
     display_lock();
+    display_link();
     printf(failures ? "FAILED (%d)\n" : "all passed\n", failures);
     return failures ? 1 : 0;
 }
