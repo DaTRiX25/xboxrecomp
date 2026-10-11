@@ -112,6 +112,16 @@ Power modes: *stock* is the busy-wait; *performance* sleeps and spins the
 last 8 ms before each frame (steady frame time, about 10 W on the Deck);
 *battery* sleeps throughout (about 8 W, small dips).
 
+*stock* (shown as Maximum) is offered on macOS only. On Windows, Android and
+Linux / Steam Deck the Power page has Balanced (`performance`) and Battery
+saver; a stored `stock` is read as `performance` at load (the file is not
+rewritten for that; the next save writes the new value). The spin pacing
+stays reachable for diagnosis with `RECOMP_PRESENT_PACING=spin`, which also
+locks the row. The choice is one table, `k_stock_hidden` in
+`src/overlay/xbox_settings.c` (BO-75; set an entry to 0 to offer Maximum
+again); `xbox_PowerModeAtLoad(host, stored)` is the rule, testable per host
+(`tests/overlay_settings`).
+
 ## Shader pre-build
 
 A host that can build its shaders ahead of time gives the overlay five calls

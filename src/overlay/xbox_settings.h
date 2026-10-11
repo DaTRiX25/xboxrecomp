@@ -122,6 +122,19 @@ void xbox_SettingsFlush(void);
 /* The file in use, or "" (none). */
 const char *xbox_SettingsPath(void);
 
+/* The power mode's "stock" (Maximum, the busy-wait) is offered on some hosts
+ * only (BO-75: on the Deck and Windows it measured no steadier than Balanced
+ * and costs 2.7 W / stutters). Where it is hidden the overlay steps over it
+ * and a stored "stock" is read as "performance" at load (the file itself is
+ * left as it is until the next save). The spin pacing stays reachable with
+ * RECOMP_PRESENT_PACING=spin. The choice is one table in xbox_settings.c. */
+typedef enum { XS_HOST_MACOS, XS_HOST_WINDOWS, XS_HOST_ANDROID, XS_HOST_LINUX } xs_host;
+xs_host xbox_SettingsHost(void);               /* the host this was built for */
+void    xbox_SettingsSetHost(xs_host h);       /* tests */
+int     xbox_PowerStockHidden(xs_host h);
+/* The power mode (0 stock, 1 performance, 2 battery) a stored value means on h. */
+double  xbox_PowerModeAtLoad(xs_host h, double stored);
+
 /* The window is in the background: audio.mute_background silences it. */
 void xbox_SettingsSetBackground(int bg);
 
