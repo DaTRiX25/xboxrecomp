@@ -5,7 +5,9 @@
 #
 # writes  #define <name> "<commit>[-dirty] (<branch>)"  and leaves the file
 # alone when that is what it already says, so nothing recompiles for it.
-# Without git, or outside a repository (a source archive): "unknown".
+# Without git, or outside a repository (a source archive, a copy made for a
+# build on another machine): the first line of <repository>/BUILD_COMMIT when
+# whoever made the copy left one there, else "unknown".
 set(_id "unknown")
 find_program(_git git)
 if(_git)
@@ -24,6 +26,12 @@ if(_git)
             string(REGEX REPLACE "[^A-Za-z0-9_./-]" "_" _branch "${_branch}")
             string(APPEND _id " (${_branch})")
         endif()
+    endif()
+endif()
+if(_id STREQUAL "unknown" AND EXISTS "${SRC}/BUILD_COMMIT")
+    file(STRINGS "${SRC}/BUILD_COMMIT" _lines LIMIT_COUNT 1)
+    if(_lines MATCHES "^[0-9a-f]+[-A-Za-z0-9_./ ()]*$")
+        set(_id "${_lines}")
     endif()
 endif()
 set(_text "/* Made by cmake/build_id.cmake at build time. */\n#define ${MACRO} \"${_id}\"\n")
