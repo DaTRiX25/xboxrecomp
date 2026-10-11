@@ -47,6 +47,12 @@ static void neutral(XBOX_GAMEPAD *g)
 
 static volatile int g_combo_guard;
 
+/* Pads a script drives (src/usb/usb_gamepad.c), for the overlay's note. */
+static volatile unsigned g_scripted;
+
+void xbox_InputSetScriptedPads(unsigned mask) { g_scripted = mask; }
+unsigned xbox_InputScriptedPads(void) { return g_scripted; }
+
 void xbox_InputSetComboGuard(int on) { g_combo_guard = on != 0; }
 
 int xbox_InputBlocked(void) { return g_blocked; }
