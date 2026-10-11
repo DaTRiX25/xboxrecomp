@@ -1317,17 +1317,22 @@ static void pc_note(int prewarm, int kind, uint64_t t_start, const char *what)
                 s_pc_kind[kind], what, prewarm ? "pre-warm" : "ack", ms, at);
 }
 
-/* The ack thread missed while the pre-warm thread is still going through the
- * key list (the first frames of a start, which race it): what it needs is
- * most likely on its way, so it waits for the pre-warm, up to 3 s, instead
- * of compiling the same thing beside it; the caller then looks again. Only
- * at a start (or after a rescan, with the title paused): no draw waits here
- * once the pre-warm is done. */
-static int s_pc_warm_done;              /* no pre-warm thread is running (atomic) */
+/* The ack thread missed while the pre-warm thread is still on the pipelines
+ * of the key list and their functions (the first frames of a start, which
+ * race it): what it needs is most likely on its way, so it waits for that
+ * part instead of compiling the same thing beside it, and the caller then
+ * looks again. Bounded: 3 s from the pre-warm's start for all such waits
+ * together (a list whose compiled code the system has dropped takes longer
+ * to build than that; the ack thread then compiles what it needs itself, as
+ * without a list). Only at a start, or after a rescan with the title
+ * paused: no draw waits here once that part is done. */
+static int      s_pc_warm_done;         /* no pre-warm thread is running (atomic) */
+static int      s_pc_warm_urgent;       /* it is on the pipelines' part (atomic) */
+static uint64_t s_pc_wait_until;        /* the ack thread's waits end here */
+#define PC_URGENT() __atomic_load_n(&s_pc_warm_urgent, __ATOMIC_ACQUIRE)
 static void pc_wait_warm(void)
 {
-    uint64_t t0 = pc_now();
-    while (!__atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE) && pc_now() - t0 < 3000000000ull)
+    while (PC_URGENT() && pc_now() < __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE))
         usleep(500);
 }
 
@@ -1476,7 +1481,7 @@ static id<MTLRenderPipelineState> pipeline(uint64_t vs_id, id<MTLFunction> vs,
     pthread_mutex_lock(&s_pc_mu);
     i = pso_find(&pk);
     pthread_mutex_unlock(&s_pc_mu);
-    if (i < 0 && !__atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE)) {
+    if (i < 0 && PC_URGENT()) {
         pc_wait_warm();
         pthread_mutex_lock(&s_pc_mu);
         i = pso_find(&pk);
@@ -1946,7 +1951,7 @@ static VsEntry *vs_cache(void)
     pthread_mutex_lock(&s_pc_mu);
     e = vs_find(kid);
     pthread_mutex_unlock(&s_pc_mu);
-    if (!e && !__atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE)) {
+    if (!e && PC_URGENT()) {
         pc_wait_warm();
         pthread_mutex_lock(&s_pc_mu);
         e = vs_find(kid);
@@ -2106,7 +2111,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     pthread_mutex_lock(&s_pc_mu);
     e = fs_find(kid, &st);
     pthread_mutex_unlock(&s_pc_mu);
-    if (!e && !__atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE)) {
+    if (!e && PC_URGENT()) {
         pc_wait_warm();
         pthread_mutex_lock(&s_pc_mu);
         e = fs_find(kid, &st);
@@ -2160,9 +2165,24 @@ static void pc_put(uint32_t type, const void *data, uint32_t len)
     pthread_mutex_unlock(&s_pcf_mu);
 }
 
+/* The function ids the list's pipelines name: built first. */
+static uint64_t *s_pc_need;
+static size_t    s_pc_need_n;
+
+static int pc_needed(uint64_t kid)
+{
+    size_t k;
+    for (k = 0; k < s_pc_need_n; k++)
+        if (s_pc_need[k] == kid)
+            return 1;
+    return 0;
+}
+
 /* One record of the file built and cached, as the ack thread would have:
- * pass 0 builds the functions, pass 1 the pipelines (which need them).
- * Never evicts: a full table leaves the rest to the ack thread. */
+ * pass 0 builds the functions the list's pipelines use, pass 1 the pipelines,
+ * pass 2 the other functions (keys seeded from the title's executable that
+ * nothing drew yet: nobody waits for those). Never evicts: a full table
+ * leaves the rest to the ack thread. */
 static void pc_warm_one(size_t i, int pass)
 {
     const void *data;
@@ -2171,7 +2191,7 @@ static void pc_warm_one(size_t i, int pass)
 
     if (!nv2a_pcache_get(s_pcf, i, &type, &data, &len))
         return;
-    if (pass == 0 && type == PC_VS && len >= 16 && len % 16 == 0
+    if (pass != 1 && type == PC_VS && len >= 16 && len % 16 == 0
             && len <= NV2A_VSH_SLOTS * 16u) {
         uint32_t hash = 2166136261u, k;
         uint16_t inputs = 0;
@@ -2181,6 +2201,8 @@ static void pc_warm_one(size_t i, int pass)
             hash = (hash ^ ((const uint32_t *)data)[k]) * 16777619u;
         if (!(kid = nv2a_fnv64(data, len, NV2A_FNV64_INIT)))
             kid = 1;
+        if (pass == 0 && !pc_needed(kid))
+            return;
         pthread_mutex_lock(&s_pc_mu);
         e = vs_find(kid);
         pthread_mutex_unlock(&s_pc_mu);
@@ -2197,13 +2219,15 @@ static void pc_warm_one(size_t i, int pass)
         }
         pthread_mutex_unlock(&s_pc_mu);
         [fn release];
-    } else if (pass == 0 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
+    } else if (pass != 1 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
         NV2ACombinerState st;
         id<MTLFunction> fn;
         FsEntry *e;
         memcpy(&st, data, sizeof st);
         if (!(kid = nv2a_fnv64(&st, sizeof st, NV2A_FNV64_INIT)))
             kid = 1;
+        if (pass == 0 && !pc_needed(kid))
+            return;
         pthread_mutex_lock(&s_pc_mu);
         e = fs_find(kid, &st);
         pthread_mutex_unlock(&s_pc_mu);
@@ -2294,18 +2318,33 @@ static void *pc_prewarm(void *arg)
             before[i] = s_pc_warm[i];
         }
         nv2a_pcache_stat_open(s_pc_path, listed);
+        free(s_pc_need);
+        s_pc_need = (uint64_t *)malloc((listed[PC_PSO] ? listed[PC_PSO] : 1) * 2 * sizeof *s_pc_need);
+        s_pc_need_n = 0;
+        for (i = 0; s_pc_need && i < n; i++) {
+            const void *d;
+            uint32_t type, len;
+            if (nv2a_pcache_get(s_pcf, i, &type, &d, &len) && type == PC_PSO
+                    && len == sizeof(PsoKey) && s_pc_need_n + 2 <= (size_t)listed[PC_PSO] * 2) {
+                memcpy(&s_pc_need[s_pc_need_n], d, 16);     /* PsoKey's vs, fs */
+                s_pc_need_n += 2;
+            }
+        }
         /* The compiler service's full width while the pre-warm runs (WWDC23
          * 10127, "Optimize GPU renderers with Metal"); back to balanced after. */
         if (@available(macOS 13.3, *)) {
             if (n && s_dev.maximumConcurrentCompilationTaskCount)
                 s_dev.shouldMaximizeConcurrentCompilation = YES;
         }
-        for (pass = 0; pass < 2; pass++)
+        for (pass = 0; pass < 3; pass++) {
             dispatch_apply(n, q, ^(size_t k) {
                 @autoreleasepool {
                     pc_warm_one(k, pass);
                 }
             });
+            if (pass == 1)              /* the pipelines are in: nobody waits now */
+                __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
+        }
         s_pc_warm_ns += pc_now() - t;
         if (@available(macOS 13.3, *))
             s_dev.shouldMaximizeConcurrentCompilation = NO;
@@ -2317,6 +2356,7 @@ static void *pc_prewarm(void *arg)
                 listed[0], listed[1], listed[2],
                 (double)(pc_now() - t) / 1e6, (double)(pc_now() - s_t0_ns) / 1e9);
     } while (__atomic_load_n(&s_pc_rescan, __ATOMIC_ACQUIRE));
+    __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
     nv2a_pcache_stat_warming(0);
     __atomic_store_n(&s_pc_warm_done, 1, __ATOMIC_RELEASE);
     return NULL;
@@ -2330,9 +2370,12 @@ static void pc_warm_start(void)
     if (!__atomic_exchange_n(&s_pc_warm_done, 0, __ATOMIC_ACQ_REL))
         return;                         /* one is running: it will see the flag */
     nv2a_pcache_stat_warming(1);
+    __atomic_store_n(&s_pc_wait_until, pc_now() + 3000000000ull, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_pc_warm_urgent, 1, __ATOMIC_RELEASE);
     if (pthread_create(&th, NULL, pc_prewarm, NULL) == 0) {
         pthread_detach(th);
     } else {
+        __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
         nv2a_pcache_stat_warming(0);
         __atomic_store_n(&s_pc_warm_done, 1, __ATOMIC_RELEASE);
     }

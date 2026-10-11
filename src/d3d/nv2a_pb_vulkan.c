@@ -1142,20 +1142,24 @@ static void pc_note(int prewarm, int kind, uint64_t t_start, const char *what)
                 s_pc_kind[kind], what, prewarm ? "pre-warm" : "ack", ms, at);
 }
 
-/* The ack thread missed while the pre-warm thread is still going through the
- * key list (the first frames of a start, which race it): what it needs is
- * most likely on its way, so it waits for the pre-warm, up to 3 s, instead
- * of compiling the same thing beside it; the caller then looks again. Only
- * at a start (or after a rescan, with the title paused): no draw waits here
- * once the pre-warm is done. */
-static int s_pc_warming;                /* a pre-warm thread is running (atomic) */
+/* The ack thread missed while the pre-warm thread is still on the pipelines
+ * of the key list and their shaders (the first frames of a start, which
+ * race it): what it needs is most likely on its way, so it waits for that
+ * part instead of compiling the same thing beside it, and the caller then
+ * looks again. Bounded: 3 s from the pre-warm's start for all such waits
+ * together (a list whose compiled code is gone, after a driver update, can
+ * take longer to build than that; the ack thread then compiles what it
+ * needs itself, as without a list). Only at a start, or after a rescan with
+ * the title paused: no draw waits here once that part is done. */
+static int      s_pc_warming;           /* a pre-warm thread is running (atomic) */
+static int      s_pc_warm_urgent;       /* it is on the pipelines' part (atomic) */
+static uint64_t s_pc_wait_until;        /* the ack thread's waits end here */
+#define PC_WARMING() __atomic_load_n(&s_pc_warm_urgent, __ATOMIC_ACQUIRE)
 static void pc_wait_warm(void)
 {
-    uint64_t t0 = now_ns();
-    while (__atomic_load_n(&s_pc_warming, __ATOMIC_ACQUIRE) && now_ns() - t0 < 3000000000ull)
+    while (PC_WARMING() && now_ns() < __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE))
         usleep(500);
 }
-#define PC_WARMING() __atomic_load_n(&s_pc_warming, __ATOMIC_ACQUIRE)
 
 /* Any thread. */
 static VkShaderModule module_from_glsl(enum nvk_stage stage, const char *src, const char *what)
@@ -3317,7 +3321,6 @@ static void at_exit_save(void)
         pcache_save();
 }
 
-static int s_pcache_warm;
 static int s_pc_save;                    /* the pre-warm thread asks for a save (atomic) */
 
 static VkPipelineCache pcache_load(void)
@@ -3356,10 +3359,9 @@ static VkPipelineCache pcache_load(void)
     }
     free(data);
     {
-        /* Warm: the driver kept most of what the file held. */
+        /* What the driver kept of the file (it drops one of another driver). */
         size_t kept = 0;
         vkGetPipelineCacheData(s_dev, pc, &kept, NULL);
-        s_pcache_warm = n > 4096 && kept * 2 >= n;
         fprintf(stderr, LOGP "pipeline cache: %s (%zu bytes, %zu kept by the driver)\n",
                 n ? path : "empty", n, kept);
     }
@@ -3405,9 +3407,10 @@ static VkShaderModule module_by_kid(uint64_t kid, int fragment)
     return VK_NULL_HANDLE;
 }
 
-/* Builds every key of the list into the ack thread's own tables, shaders
- * first, then the pipelines (which need them), so the ack thread finds them
- * built: with the SPIR-V cache and the driver's pipeline cache warm this is
+/* Builds every key of the list into the ack thread's own tables: first the
+ * shaders the list's pipelines use, then the pipelines, then the other
+ * shaders (keys seeded from the title's executable that nothing drew yet:
+ * nobody waits for those), so the ack thread finds them built: with the SPIR-V cache and the driver's pipeline cache warm this is
  * a few lookups, and after a driver update or a changed shader generator it
  * is the compiling the ack thread would otherwise do mid-game. One thread,
  * below the title's: it shares the machine with a title that is starting. */
@@ -3418,8 +3421,8 @@ static void *pc_prewarm(void *arg)
     (void)arg;
     do {
         nv2a_pcache *pc;
-        size_t n, i;
-        uint64_t t0 = now_ns(), nb[3] = {0, 0, 0};
+        size_t n, i, nneed;
+        uint64_t t0 = now_ns(), nb[3] = {0, 0, 0}, *need;
         uint32_t listed[3] = {0, 0, 0};
         int pass;
 
@@ -3443,13 +3446,35 @@ static void *pc_prewarm(void *arg)
                 listed[type]++;
         }
         nv2a_pcache_stat_open(s_pc_path, listed);
-        for (pass = 0; parsed && pass < 2; pass++)
+        /* The shader ids the list's pipelines name. */
+        need = (uint64_t *)malloc((listed[PC_PSO] ? listed[PC_PSO] : 1) * 2 * sizeof *need);
+        nneed = 0;
+        for (i = 0; need && i < n; i++) {
+            const void *d;
+            uint32_t type, len;
+            if (nv2a_pcache_get(pc, i, &type, &d, &len) && type == PC_PSO
+                    && len == sizeof(PsoDisk) && nneed + 2 <= (size_t)listed[PC_PSO] * 2) {
+                memcpy(&need[nneed], d, 16);            /* PsoDisk's vs, fs */
+                nneed += 2;
+            }
+        }
+        for (pass = 0; parsed && pass < 3; pass++) {
+            if (pass == 2)              /* the pipelines are in: nobody waits now */
+                __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
             for (i = 0; i < n; i++) {
                 const void *d;
                 uint32_t type, len;
+                size_t q;
                 if (!nv2a_pcache_get(pc, i, &type, &d, &len))
                     continue;
-                if (pass == 0 && type == PC_VS && len >= 16 && len % 16 == 0
+                if (pass == 0 && (type == PC_VS || type == PC_FS)) {
+                    uint64_t kid = vs_kid(d, len);      /* the id rule is one for both */
+                    for (q = 0; q < nneed && need[q] != kid; q++)
+                        ;
+                    if (q == nneed)
+                        continue;       /* pass 2 */
+                }
+                if (pass != 1 && type == PC_VS && len >= 16 && len % 16 == 0
                         && len <= NV2A_VSH_SLOTS * 16u) {
                     uint32_t hash = 2166136261u, k;
                     uint16_t inputs = 0;
@@ -3473,7 +3498,7 @@ static void *pc_prewarm(void *arg)
                     pthread_mutex_unlock(&s_pc_mu);
                     if (!e)
                         vkDestroyShaderModule(s_dev, mod, NULL);
-                } else if (pass == 0 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
+                } else if (pass != 1 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
                     NV2ACombinerState st;
                     VkShaderModule mod;
                     uint32_t hash;
@@ -3532,6 +3557,8 @@ static void *pc_prewarm(void *arg)
                         vkDestroyPipeline(s_dev, p, NULL);
                 }
             }
+        }
+        free(need);
         for (i = 0; i < 3; i++)
             s_pc_warm[i] += nb[i];
         s_pc_warm_ns += now_ns() - t0;
@@ -3542,6 +3569,7 @@ static void *pc_prewarm(void *arg)
                 (double)(now_ns() - t0) / 1e6, (double)(now_ns() - s_t0_ns) / 1e9);
     } while (__atomic_load_n(&s_pc_rescan, __ATOMIC_ACQUIRE));
     free(parsed);
+    __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
     nv2a_pcache_stat_warming(0);
     __atomic_store_n(&s_pc_warming, 0, __ATOMIC_RELEASE);
     /* What a pre-build made is on disk for the next start. */
@@ -3557,9 +3585,12 @@ static void pc_warm_start(void)
     if (__atomic_exchange_n(&s_pc_warming, 1, __ATOMIC_ACQ_REL))
         return;
     nv2a_pcache_stat_warming(1);
+    __atomic_store_n(&s_pc_wait_until, now_ns() + 3000000000ull, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_pc_warm_urgent, 1, __ATOMIC_RELEASE);
     if (pthread_create(&th, NULL, pc_prewarm, NULL) == 0) {
         pthread_detach(th);
     } else {
+        __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
         nv2a_pcache_stat_warming(0);
         __atomic_store_n(&s_pc_warming, 0, __ATOMIC_RELEASE);
     }

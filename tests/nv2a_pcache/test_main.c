@@ -24,6 +24,14 @@ static long file_size(const char *p)
     return n;
 }
 
+static unsigned s_scan_n, s_scan_slots;
+static void scan_cb(void *ctx, const uint32_t *slots, uint32_t n)
+{
+    (void)ctx;
+    s_scan_n++;
+    s_scan_slots = n + (slots[11] == 1 ? 0 : 100);     /* the third slot's FINAL word */
+}
+
 int main(int argc, char **argv)
 {
     char dir[1024], path[1100], msg[256];
@@ -108,6 +116,21 @@ int main(int argc, char **argv)
     CHECK(pc && nv2a_pcache_count(pc) == 0 && strstr(msg, "another version"),
           "a prefix of another format is not that format");
     nv2a_pcache_close(pc);
+
+    /* Vertex programs in an executable image: the XDK's blob (0x2078, the
+     * slot count, the slots; FINAL on the last slot and only there). */
+    {
+        unsigned char img[4 + 3 * 16 + 8 + 4 + 2 * 16];
+        uint32_t w[12] = {0, 1, 2, 0,  0, 3, 4, 0,  0, 5, 6, 1}, bad[8] = {0, 1, 2, 1,  0, 3, 4, 1};
+        s_scan_n = s_scan_slots = 0;
+        memset(img, 0xEE, sizeof img);
+        img[0] = 0x78; img[1] = 0x20; img[2] = 3; img[3] = 0;
+        memcpy(img + 4, w, sizeof w);
+        img[60] = 0x78; img[61] = 0x20; img[62] = 2; img[63] = 0;  /* FINAL on both slots */
+        memcpy(img + 64, bad, sizeof bad);
+        CHECK(nv2a_pcache_scan_vsh(img, sizeof img, scan_cb, NULL) == 1 && s_scan_n == 1
+              && s_scan_slots == 3, "one vertex program is found in an image, a malformed one is not");
+    }
 
     /* Not a cache file at all. */
     f = fopen(path, "wb");
