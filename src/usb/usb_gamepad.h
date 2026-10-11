@@ -52,4 +52,8 @@ int usb_gamepad_configured(int pad);
 /* Lines of RECOMP_PAD_LIVE the pad has taken (scheduled) since start. */
 unsigned usb_gamepad_live_taken(void);
 
+/* Whether a pad script (RECOMP_PAD_SCRIPT / RECOMP_PAD_LIVE) drives `pad`:
+ * one is set for the run and no controller has taken the pad back. */
+int usb_gamepad_script_drives(int pad);
+
 #endif /* XBOX_USB_GAMEPAD_H */

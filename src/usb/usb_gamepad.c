@@ -21,6 +21,8 @@
 
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
+#include <sys/stat.h>
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -395,7 +397,8 @@ static uint8_t synthetic_buttons(void)
  * the same syntax from a file, one entry per line or comma separated.
  *
  * Buttons: up down left right start back lthumb rthumb (the digital byte),
- * a b x y black white lt rt (the analog bytes, reported fully pressed), and
+ * a b x y black white lt rt (the analog bytes, reported fully pressed, or
+ * at a value with "=": lt=200 is the left trigger at 200 of 255), and
  * lleft lright lup ldown / rleft rright rup rdown (a stick at full throw).
  * Every entry is printed as it fires, so a run log says what was pressed when.
  *
@@ -414,6 +417,7 @@ typedef struct {
     unsigned long at_ms, hold_ms;
     uint8_t digital;         /* report byte 2 */
     uint8_t analog;          /* bit n = report byte 4 + n */
+    uint8_t level[8];        /* that byte's value; 0: fully pressed (255) */
     uint8_t pad;             /* which controller: "p2-a" is pad 1 */
     uint8_t stick;           /* full deflection: 1 L-left 2 L-right 4 L-up
                                 8 L-down, then the same four for the right */
@@ -422,6 +426,8 @@ typedef struct {
 
 static PadStep s_script[PAD_SCRIPT_MAX];
 static int     s_script_len = -1;
+static uint8_t s_taken;         /* bit per pad: a controller took it back
+                                   from the script (see pad_scripted) */
 
 static int same_word(const char *a, const char *b, size_t n)
 {
@@ -493,9 +499,25 @@ static void pad_script_parse(const char *text)
             b += 3;
         }
         for (;;) {
-            size_t n = strcspn(b, "+:,\r\n ");
-            if (!pad_button_bits(b, n, &st.digital, &st.analog, &st.stick))
+            size_t n = strcspn(b, "+:,\r\n "), nn = n;
+            const char *eq = memchr(b, '=', n);
+            uint8_t ana = 0;
+            int j;
+            /* "lt=200": an analog button at that value instead of 255. */
+            if (eq)
+                nn = (size_t)(eq - b);
+            if (!pad_button_bits(b, nn, &st.digital, &ana, &st.stick))
                 fprintf(stderr, "  PAD: unknown button \"%.*s\"\n", (int)n, b);
+            else if (eq && !ana)
+                fprintf(stderr, "  PAD: \"%.*s\": only an analog button takes a value\n", (int)n, b);
+            st.analog |= ana;
+            for (j = 0; j < 8; j++)
+                if ((ana & (1u << j)) && eq) {
+                    unsigned long v = strtoul(eq + 1, NULL, 0);
+                    st.level[j] = (uint8_t)(v > 255 ? 255 : v);
+                    if (!v)
+                        st.analog &= (uint8_t)~(1u << j);
+                }
             b += n;
             if (*b != '+')
                 break;
@@ -552,6 +574,8 @@ unsigned usb_gamepad_live_taken(void)
     return s_live_taken;
 }
 
+#define PAD_LIVE_STALE_S 30
+
 /* Read whatever has been appended to RECOMP_PAD_LIVE since last time, and
  * schedule each complete line at t. Polled at most every 50 ms. */
 static void pad_live_poll(unsigned long t)
@@ -570,7 +594,22 @@ static void pad_live_poll(unsigned long t)
         checked = 1;
         path = recomp_env(RENV_PAD_LIVE);
         if (path && *path) {
+            struct stat sb;
             fprintf(stderr, "  PAD: live input from %s\n", path);
+            /* Lines from an earlier run are not this run's: a driver empties
+             * the file before it starts the game and appends while it runs.
+             * A file that already has lines, last written more than
+             * PAD_LIVE_STALE_S before the title's first pad read, was left
+             * behind (a driver killed before its clean-up, with the variable
+             * still set in a launcher's environment file); replaying it
+             * would press buttons in somebody's own session (BO-96). */
+            if (stat(path, &sb) == 0 && sb.st_size > 0
+                    && time(NULL) - sb.st_mtime > PAD_LIVE_STALE_S) {
+                consumed = (long)sb.st_size;
+                fprintf(stderr, "  PAD: %s has %ld bytes from an earlier run "
+                        "(written %ld s ago): ignored, only new lines are pressed\n",
+                        path, consumed, (long)(time(NULL) - sb.st_mtime));
+            }
             fflush(stderr);
         }
     }
@@ -606,7 +645,8 @@ static void pad_live_poll(unsigned long t)
                 pad_script_parse(line);
                 if (s_script_len > 0)
                     next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
-                fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
+                fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms%s\n", pending, at,
+                        (s_taken & (1u << pd)) ? " (ignored: a controller has the pad)" : "");
                 fflush(stderr);
                 s_live_taken++;
                 npending = 0;
@@ -616,6 +656,76 @@ static void pad_live_poll(unsigned long t)
         }
     }
     fclose(f);
+}
+
+/* Scripted input and a person's controller on the same pad (BO-96).
+ *
+ * A step sets its buttons in the report whatever the host pad says, so while
+ * a driver holds the accelerator ("rt:600000", the scene drivers' race) the
+ * title reads the right trigger at 255 however the controller is held: a
+ * person who picks up a run a script is driving brakes to a stop with the
+ * left trigger and then cannot reverse, because the title is still told to
+ * accelerate. So:
+ *
+ *   - a pad the script drives is announced (the log line below, and
+ *     xbox_InputSetScriptedPads for the overlay's note);
+ *   - the first button or trigger a controller holds on that pad takes the
+ *     pad back: the script's steps stop reaching it for the rest of the run
+ *     (the lines of RECOMP_PAD_LIVE are still read and logged, as ignored);
+ *   - a headless run, which nobody is looking at, does not read the host's
+ *     controllers while a script is set: the pad in a player's hands, who
+ *     may be playing another instance, neither steers a test nor ends it.
+ *
+ * RECOMP_DEBUG=pad_script_keep=1 is the old behaviour: script and controller
+ * merged, the script's buttons on top. */
+static int s_scripted = -1;     /* a script is set for this run */
+static int s_script_keep;
+static int s_script_only;       /* headless: host controllers not read */
+
+static int pad_scripted(void)
+{
+    if (s_scripted < 0) {
+        const char *a = recomp_env(RENV_PAD_SCRIPT), *b = recomp_env(RENV_PAD_LIVE);
+        const char *k = recomp_env(RENV_PAD_SCRIPT_KEEP), *h = recomp_env(RENV_HEADLESS);
+        s_scripted = (a && *a) || (b && *b);
+        s_script_keep = k && *k && *k != '0';
+        s_script_only = s_scripted && !s_script_keep && h && *h && *h != '0';
+        if (s_scripted) {
+            fprintf(stderr, "  PAD: SCRIPTED INPUT drives the pads in this run (%s)%s\n",
+                    (b && *b) ? "RECOMP_PAD_LIVE" : "RECOMP_PAD_SCRIPT",
+                    s_script_keep ? "; pad_script_keep: merged with the controllers"
+                    : s_script_only ? "; headless: the host's controllers are not read"
+                    : "; a controller's first button takes its pad back");
+            fflush(stderr);
+            xbox_InputSetScriptedPads((1u << USB_GAMEPAD_MAX) - 1u);
+        }
+    }
+    return s_scripted;
+}
+
+/* A controller holds something on `pad`: from now on the script leaves that
+ * pad alone. Sticks do not count (a stick that drifts is not a person). */
+static void pad_script_takeover(int pad, const XBOX_GAMEPAD *g)
+{
+    int i, held = g->wButtons != 0;
+
+    if (!s_scripted || s_script_keep || (s_taken & (1u << pad)))
+        return;
+    for (i = 0; i < 8; i++)
+        if (g->bAnalogButtons[i] > XBOX_ANALOG_BUTTON_THRESHOLD)
+            held = 1;
+    if (!held)
+        return;
+    s_taken |= (uint8_t)(1u << pad);
+    xbox_InputSetScriptedPads(((1u << USB_GAMEPAD_MAX) - 1u) & ~(unsigned)s_taken);
+    fprintf(stderr, "  PAD: a controller is used on pad %d: the script no longer "
+            "drives that pad (RECOMP_DEBUG=pad_script_keep=1 keeps both)\n", pad);
+    fflush(stderr);
+}
+
+int usb_gamepad_script_drives(int pad)
+{
+    return pad_scripted() && !(s_taken & (1u << (pad & 3)));
 }
 
 static void pad_script_apply(int pad, uint8_t *out)
@@ -635,7 +745,7 @@ static void pad_script_apply(int pad, uint8_t *out)
         return;
     for (i = 0; i < s_script_len; i++) {
         PadStep *st = &s_script[i];
-        if (st->pad != pad)
+        if (st->pad != pad || (s_taken & (1u << pad)))
             continue;
         if (t < st->at_ms || t >= st->at_ms + st->hold_ms)
             continue;
@@ -648,7 +758,7 @@ static void pad_script_apply(int pad, uint8_t *out)
         out[2] |= st->digital;
         for (j = 0; j < 8; j++)
             if (st->analog & (1u << j))
-                out[4 + j] = 0xFF;
+                out[4 + j] = st->level[j] ? st->level[j] : 0xFF;
         if (st->stick) {
             /* Axes at 12..19: LX LY RX RY, signed 16-bit, up positive. */
             static const int16_t full = 32767;
@@ -724,7 +834,9 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     /* The synthetic press and the host pad drive pad n from host pad n. */
     if (pad != 0)
         synth = 0;
-    if (xbox_InputGetState((DWORD)pad, &state) != 0) {
+    /* Headless with a script: the host's controllers are left alone. */
+    if ((pad_scripted() && s_script_only)
+            || xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out);
         xbox_LatPadReport(pad, out, 20);
@@ -732,6 +844,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     }
 
     g = &state.Gamepad;
+    pad_script_takeover(pad & 3, g);
     out[2] = (uint8_t)((g->wButtons & 0xFF) | synth);
     out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
     for (i = 0; i < 8; i++)
