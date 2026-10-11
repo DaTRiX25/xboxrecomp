@@ -2519,8 +2519,9 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None, spin_waits=None):
-        """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None."""
+                 icall_sites_json_path=None, spin_waits=None, patches=None):
+        """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None.
+        patches: a patches.PatchConfig (--patches), or None."""
         self.xbe_path = xbe_path
         # Starts of the seeds a run saw (--seeds, `"observed": true`): the
         # flag-fallback report names its sites in these functions.
@@ -2587,6 +2588,9 @@ class BatchTranslator:
         if spin_waits is not None:
             from .spin_waits import SpinWaitReport
             self.translator.spin_waits = SpinWaitReport(spin_waits)
+        if patches is not None:
+            from .patches import PatchReport
+            self.translator.lifter.patches = PatchReport(patches)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):

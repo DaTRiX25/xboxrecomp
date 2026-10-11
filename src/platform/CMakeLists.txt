@@ -25,7 +25,7 @@ get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOL
 # of the runtime's libraries, so the host clock (host_time.h) and the window
 # exit hook (recomp_exit_hook.h) ride with it.
 add_library(recomp_env STATIC recomp_env.c recomp_exe_dir.c recomp_exit_hook.c host_time.c
-            latency_trace.c recomp_save_dir.c)
+            latency_trace.c recomp_save_dir.c recomp_patch.c)
 target_include_directories(recomp_env PUBLIC
     ${XBOXRECOMP_SRC_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}

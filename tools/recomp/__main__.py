@@ -271,7 +271,26 @@ def main():
                              "it nothing is matched and the output is "
                              "unchanged")
 
+    parser.add_argument("--patches", metavar="JSON",
+                        help="Opt-in guest patches: after a listed 32-bit "
+                             "`mov reg, [mem]` the loaded value is replaced "
+                             "(RECOMP_PATCH_U32) while a runtime setting "
+                             "says so: {\"patches\": [{\"va\": ..., "
+                             "\"kind\": \"load_u32\", \"setting\": ..., "
+                             "\"when\": ..., \"value\": ...}]}. Writes "
+                             "patches.json to -o. Without it the output is "
+                             "unchanged")
+
     args = parser.parse_args()
+
+    patches = None
+    if args.patches:
+        from .patches import PatchConfig
+        try:
+            patches = PatchConfig.load(args.patches)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"ERROR: --patches {args.patches}: {e}", file=sys.stderr)
+            sys.exit(1)
 
     spin_waits = None
     if args.spin_waits:
@@ -347,6 +366,7 @@ def main():
             os.path.dirname(os.path.abspath(__file__)), "output",
             "icall_sites.json"),
         spin_waits=spin_waits,
+        patches=patches,
     )
     translator.observed_seeds = _load_observed_seeds(args.seeds)
 
@@ -548,6 +568,8 @@ def main():
 
     if translator.translator.spin_waits is not None:
         _finish_spin_waits(translator.translator.spin_waits, output_dir)
+    if translator.translator.lifter.patches is not None:
+        _finish_patches(translator.translator.lifter.patches, output_dir)
     print(f"MMIO: {translator.translator.mmio_lowered} constant device-register"
           f" accesses lowered to direct calls", file=sys.stderr)
 
@@ -578,6 +600,24 @@ def _write_flag_fallbacks(translator, output_dir):
     if doc["observed_functions"]:
         print("  in observed seeds: " + ", ".join(doc["observed_functions"]),
               file=sys.stderr)
+
+
+def _finish_patches(report, output_dir):
+    """Write the report; a listed site that did not patch fails the run (the
+    generated files are already written, so gen/ counts as stale)."""
+    errors = report.finish()
+    doc = report.to_json()
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "patches.json")
+    with open(path, "w", newline="\n") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
+    print(f"Patches: {doc['patched_sites']} of {len(doc['sites'])} sites "
+          f"({path})", file=sys.stderr)
+    if errors:
+        for e in errors:
+            print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _finish_spin_waits(report, output_dir):

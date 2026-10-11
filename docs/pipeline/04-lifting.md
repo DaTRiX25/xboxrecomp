@@ -432,6 +432,8 @@ Options:
 - `--verbose`: print per-function translation progress
 - `--spin-waits FILE`: lower the busy-wait loops the file selects (see
   [Spin waits](#spin-waits))
+- `--patches FILE`: follow listed 32-bit loads with a runtime-steered
+  replacement (see [Guest patches](#guest-patches))
 
 The output directory is typically gitignored because the generated files are large (200+ MB total) and can be regenerated from the XBE at any time.
 
@@ -490,6 +492,33 @@ The file is JSON:
 
 Without the flag the matcher does not run, and the output is byte for byte
 what it was. Tests: `tools/recomp/test_spin_waits.py`.
+
+## Guest patches
+
+A title can carry a behaviour it never turns on for the player's region
+(Burnout 3's US build keeps the km/h speedometer of its other languages,
+chosen by the language index it loads at nine places). `--patches FILE`
+follows a listed `mov reg, [mem]` with `reg = RECOMP_PATCH_U32(key, when,
+value, reg)`: the loaded value stands unless the setting `key` reads `when`,
+then it is `value`. Memory is not touched, so every other reader of the
+variable (the title's text, here) sees the real value.
+
+```json
+{"patches": [{"va": "0x00059BF7", "kind": "load_u32",
+              "setting": "game.speed_units", "when": "kmh", "value": 2,
+              "note": "..."}]}
+```
+
+The runtime side is `src/platform/recomp_patch.h`: the host opts the setting
+in (`recomp_patch_enable(key, env_id)`), and the call reads that environment
+variable, which the overlay and `settings.toml` already drive, so a change
+shows at the next load with no restart. A setting the host did not enable
+leaves the load alone. `game.speed_units` (`RECOMP_SPEED_UNITS=mph|kmh`) is
+an overlay row on the Display page, shown only when enabled.
+
+A listed site that is not a 32-bit register load, or that no lifted body
+contains, fails the run; the report is `patches.json` in `-o`. Without the
+flag the output is unchanged. Tests: `tools/recomp/test_patches.py`.
 
 ## Post-Generation Patches
 
