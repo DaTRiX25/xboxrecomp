@@ -727,7 +727,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         scale = 2;
     /* 640 wide, or 853 at present.aspect 16:9: the window starts the shape
      * the frame is shown at. */
-    win_w = (int)nv2a_present_width(640, 480);
+    win_w = (int)nv2a_present_window_width(640, 480);
     /* RECOMP_DEBUG=window_display=<n>: open on display n (0 = main), e.g. a
      * 60 Hz screen next to a 120 Hz one for latency runs (BO-74). */
     {

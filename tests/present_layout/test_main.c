@@ -4,7 +4,8 @@
  * golden.inc is the output of the loop in same_as_golden at the commit
  * before these helpers took an aspect: three aspects x overscan off/crop x
  * fit off/fill16x10 x three filters x four frame sizes x nine outputs.
- * Every one must give the same rectangles. */
+ * Every one must give the same rectangles, with no frame-aspect function,
+ * with one that answers 0, and after one was used and removed. */
 #include <stdio.h>
 #include <stdlib.h>
 #include "nv2a_backend_common.h"
@@ -62,6 +63,80 @@ static int visible(int aspect, int crop, int fill, uint32_t dw, uint32_t dh,
     return 1;
 }
 
+/* A frame's own aspect, by flip number (nv2a_present_frame_aspect_fn). */
+static double s_answer;
+static uint32_t s_asked;
+static double aspect_of(uint32_t flip) { s_asked = flip; return flip == 7 ? s_answer : 0.0; }
+
+static int frame_aspect(void)
+{
+    struct nv2a_rect s, d;
+    double x0, x1;
+
+    /* A function that answers 0 for the frame: every layout as recorded. */
+    nv2a_present_frame_aspect_fn(aspect_of);
+    nv2a_present_frame(3);
+    CHECK(s_asked == 3);
+    CHECK(same_as_golden());
+
+    /* 16:9 configured, the overscan crop, a 21:9 output (2560x1080). An
+     * ordinary frame: 16:9 in the middle, bars at the sides. */
+    mode(NV2A_ASPECT_16_9, 1, 0);
+    nv2a_present_frame(3);
+    nv2a_present_layout(640, 480, 2560, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(s.x == 21 && s.y == 16 && s.w == 598 && s.h == 448);
+    CHECK(d.x == 320 && d.y == 0 && d.w == 1920 && d.h == 1080);
+    /* The wide frame (flip 7, 64:27): the whole output, the same crop. */
+    s_answer = 64.0 / 27.0;
+    nv2a_present_frame(7);
+    nv2a_present_layout(640, 480, 2560, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(s.x == 21 && s.y == 16 && s.w == 598 && s.h == 448);
+    CHECK(d.x == 0 && d.y == 0 && d.w == 2560 && d.h == 1080);
+    /* Its visible columns, and a 4:3 picture's in the same output. */
+    nv2a_present_visible_x(640, 480, &x0, &x1);
+    CHECK(x0 == 21.0 && x1 == 619.0);
+    nv2a_present_visible_x_at(640, 480, NV2A_ASPECT_4_3, &x0, &x1);
+    CHECK(x0 == 21.0 && x1 == 619.0);
+    /* The wide frame in a 16:9 output: letterboxed, never cropped. */
+    nv2a_present_layout(640, 480, 1920, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(s.w == 598 && d.x == 0 && d.w == 1920 && d.h == 810 && d.y == 135);
+    /* 32:9 in a 32:9 output. */
+    s_answer = 32.0 / 9.0;
+    nv2a_present_frame(7);
+    nv2a_present_layout(640, 480, 3840, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(d.x == 0 && d.y == 0 && d.w == 3840 && d.h == 1080);
+    CHECK(nv2a_present_output_aspect() > 3.55 && nv2a_present_output_aspect() < 3.56);
+    /* The next frame is an ordinary one again. */
+    nv2a_present_frame(8);
+    nv2a_present_layout(640, 480, 3840, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(d.x == 960 && d.w == 1920 && d.h == 1080);
+    /* What a frame of a given shape will show, asked before it is presented
+     * (a stage set up for 64:27 while the loading screen is up): in a 21:9
+     * output all of the crop; in the Deck's 16:10 with the fill, the middle. */
+    mode(NV2A_ASPECT_16_9, 1, 0);
+    nv2a_present_layout(640, 480, 2560, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    nv2a_present_visible_x_ratio(640, 480, 64.0 / 27.0, &x0, &x1);
+    CHECK(x0 == 21.0 && x1 == 619.0);
+    mode(NV2A_ASPECT_16_9, 1, 1);
+    nv2a_present_layout(640, 480, 1280, 800, NV2A_PRESENT_LINEAR, &s, &d);
+    nv2a_present_visible_x_ratio(640, 480, 64.0 / 27.0, &x0, &x1);
+    CHECK(x0 == 118.0 && x1 == 521.0);
+    nv2a_present_visible_x_ratio(640, 480, 0.0, &x0, &x1);
+    CHECK(x0 == 51.0 && x1 == 589.0);
+
+    /* The window's opening shape is its own knob. */
+    CHECK(nv2a_present_window_width(640, 480) == nv2a_present_width(640, 480));
+    nv2a_present_window_aspect(64.0 / 27.0);
+    mode(NV2A_ASPECT_16_9, 1, 0);
+    CHECK(nv2a_present_window_width(640, 480) == 1138 && nv2a_present_width(640, 480) == 853);
+    nv2a_present_window_aspect(0.0);
+
+    /* The function removed: every layout as recorded. */
+    nv2a_present_frame_aspect_fn(NULL);
+    CHECK(same_as_golden());
+    return 0;
+}
+
 int main(void)
 {
     double x0, x1;
@@ -105,6 +180,8 @@ int main(void)
     CHECK(x0 == 21.0 && x1 == 619.0);       /* the 2560x1080 present still stands */
 
     CHECK(same_as_golden());
+    if (frame_aspect())
+        return 1;
     printf("present_layout: ok (%u golden rows, visible columns)\n",
            (unsigned)(sizeof k_golden / sizeof k_golden[0]));
     return 0;

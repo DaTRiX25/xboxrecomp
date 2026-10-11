@@ -569,6 +569,10 @@ static inline uint32_t RECOMP_BITS_OF_F32(float f) {
     v.f = f;
     return v.u;
 }
+/* kind "mark": the host learns the title reached this instruction (a
+ * function registered for the name, recomp_patch_on_mark); nothing else. */
+void recomp_patch_mark(const char *name);
+#define RECOMP_PATCH_MARK(name) recomp_patch_mark(name)
 #define RECOMP_PATCH_F32(key, when, mode, expr, loaded) \
     (recomp_patch_on((key), (when), (mode)) ? (float)(expr) : (loaded))
 #define RECOMP_PATCH_F32_BITS(key, when, mode, expr, loaded) \
