@@ -668,10 +668,47 @@ unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim
     return n;
 }
 
+/* nv2a_present_frame_aspect_fn: a host that shows some frames at another
+ * shape than the configured one (a title whose 3D is set up wider than its
+ * menus). The backends name the frame they are about to lay out
+ * (nv2a_present_frame); the function answers its width:height, or 0 for
+ * "as configured". Without a function nothing here changes. */
+static double (*volatile s_frame_aspect_fn)(uint32_t flip);
+static volatile double s_frame_aspect;      /* of the frame being laid out; 0: configured */
+static volatile double s_window_aspect;     /* nv2a_present_window_aspect; 0: configured */
+
+void nv2a_present_frame_aspect_fn(double (*fn)(uint32_t flip))
+{
+    s_frame_aspect_fn = fn;
+    if (!fn)
+        s_frame_aspect = 0.0;
+}
+
+void nv2a_present_frame(uint32_t flip)
+{
+    double (*fn)(uint32_t) = s_frame_aspect_fn;
+    if (fn) {
+        double a = fn(flip);
+        s_frame_aspect = a > 0.0 ? a : 0.0;
+    }
+}
+
+void nv2a_present_window_aspect(double aspect)
+{
+    s_window_aspect = aspect > 0.0 ? aspect : 0.0;
+}
+
 /* The display aspect as aw:ah; the frame's own at FRAME. */
 static void present_aspect_ratio(uint32_t src_w, uint32_t src_h, int aspect,
                                  uint32_t *aw, uint32_t *ah)
 {
+    double fa = s_frame_aspect;
+    if (fa > 0.0 && aspect == s_host_opts.present_aspect) {
+        /* In 1/3600: 4:3, 16:9, 64:27 and 32:9 are whole. */
+        *aw = (uint32_t)(fa * 3600.0 + 0.5);
+        *ah = 3600;
+        return;
+    }
     switch (aspect) {
     case NV2A_ASPECT_4_3:  *aw = 4;  *ah = 3; break;
     case NV2A_ASPECT_16_9: *aw = 16; *ah = 9; break;
@@ -719,6 +756,20 @@ int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int 
     s_last_dh = dh;
     s_last_filter = filter;
     return present_layout(fw, fh, dw, dh, filter, src, dst);
+}
+
+uint32_t nv2a_present_window_width(uint32_t src_w, uint32_t src_h)
+{
+    double wa = s_window_aspect;
+    if (wa > 0.0 && src_h)
+        return (uint32_t)((double)src_h * wa + 0.5);
+    return nv2a_present_width(src_w, src_h);
+}
+
+double nv2a_present_output_aspect(void)
+{
+    uint32_t w = s_last_dw, h = s_last_dh;
+    return w && h ? (double)w / (double)h : 0.0;
 }
 
 void nv2a_present_visible_x(uint32_t fw, uint32_t fh, double *x0, double *x1)
