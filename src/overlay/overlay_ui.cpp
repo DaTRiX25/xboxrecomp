@@ -282,8 +282,23 @@ static int page_rows(int page, Row *r)
         break;
     case P_POWER:
 #if !defined(__linux__)
-        INFO("Tuned on the Steam Deck (Linux). Here the default is Stock, the");
-        INFO("game's own busy-wait; the other two sleep between frames.");
+        {
+            /* The note names the default this build has: the title's own
+             * choice (xbox_SettingsGameDefault), Balanced where it takes the
+             * Deck's pacing (Windows), the busy-wait where it sets none
+             * (macOS). */
+            const xs_setting *pm = xbox_SettingGet(XS_POWER_MODE);
+            if (pm && (int)pm->def == 1) {
+                INFO("Tuned on the Steam Deck (Linux). Here the default is Balanced");
+                INFO("too; Maximum is the game's own busy-wait.");
+            } else if (pm && (int)pm->def == 2) {
+                INFO("Tuned on the Steam Deck (Linux). Here the default is Battery");
+                INFO("saver; Maximum is the game's own busy-wait.");
+            } else {
+                INFO("Tuned on the Steam Deck (Linux). Here the default is Stock, the");
+                INFO("game's own busy-wait; the other two sleep between frames.");
+            }
+        }
 #endif
         SET(XS_POWER_MODE);
         ACT(A_RESET_PAGE, "Reset this page to the defaults");

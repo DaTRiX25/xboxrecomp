@@ -51,6 +51,15 @@
  *                      only, 0 elsewhere
  *   m_game ... m_runq  the same buckets for the guest-main thread alone
  *                      (the one the executor waits for)
+ *   ex_cpu             CPU time of the executor's own thread in the frame:
+ *                      beside ex_busy it tells a frame the executor worked
+ *                      through from one it sat out, blocked or descheduled
+ *                      (Windows: QueryThreadCycleTime over the TSC's rate,
+ *                      GetThreadTimes there moves in 15.6 ms steps)
+ *
+ * RECOMP_TRACE=frametime_us=0 starts no sampler: the executor's columns
+ * only (ex_*, cpu_proc), with no thread stopped 2000 times a second, for a
+ * run whose pacing is itself the measurement.
  *
  * RECOMP_TRACE=frametime_host=<file> says where guest-main's host time
  * goes: each of its samples in host code also records the host stack (the
@@ -83,6 +92,11 @@
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include <pthread.h>
+#elif defined(_WIN32)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#include <intrin.h>
+#define FT_HAVE_TSC 1
+#endif
 #elif defined(__linux__)
 #include <pthread.h>
 #include <execinfo.h>
@@ -117,6 +131,7 @@ static uintptr_t s_code_lo, s_code_hi;
 static uint32_t s_spin[FT_MAX_SPIN];
 static int s_nspin;
 static unsigned s_period_us = 500;
+static int s_nosample;              /* frametime_us=0: no sampler thread */
 
 /* Per-frame sample counts, by bucket: the sampler adds, the flip takes.
  * s_mcount: the guest-main thread's alone. s_runq_ns / s_mrunq_ns: time
@@ -473,9 +488,11 @@ static int frametime_on(void)
         }
         if (us && atoi(us) >= 100)
             s_period_us = (unsigned)atoi(us);
+        else if (us && !strcmp(us, "0"))
+            s_nosample = 1;     /* the executor's columns only */
         fprintf(s_out, "flip,t_ms,frame_ms,iv,late,ex_hold,ex_busy,ex_draw,ex_present,"
                 "ex_idle,g_game,g_d3d,g_xdk,g_spin,g_host,g_wait,g_threads,cpu_proc,"
-                "g_io,g_runq,m_game,m_d3d,m_xdk,m_spin,m_host,m_wait,m_io,m_runq\n");
+                "g_io,g_runq,m_game,m_d3d,m_xdk,m_spin,m_host,m_wait,m_io,m_runq,ex_cpu\n");
         build_table();
         {
             const char *hp = recomp_env(RENV_FRAMETIME_HOST);
@@ -490,6 +507,11 @@ static int frametime_on(void)
                 s_host_min = (unsigned)(ms * 1000.0 / s_period_us + 0.5);
             if (!s_host_min)
                 s_host_min = 1;
+        }
+        if (s_nosample) {
+            fprintf(stderr, "  [FRAMETIME] frametime_us=0: no guest thread sampling\n");
+            s_state = 1;
+            return s_state;
         }
 #if defined(__APPLE__)
         {
@@ -523,7 +545,7 @@ static int frametime_on(void)
 void xbox_FrametimeThread(const char *role)
 {
     LONG i;
-    if (!frametime_on())
+    if (!frametime_on() || s_nosample)
         return;
     i = InterlockedIncrement(&s_nthreads) - 1;
     if (i >= FT_MAX_THREADS)
@@ -623,12 +645,34 @@ static void host_dump(uint32_t flip, double frame_ms, LONG mhost)
     fflush(s_hout);
 }
 
+/* The calling thread's CPU time, ns. Windows: its cycle count over the
+ * TSC's rate, measured against the host clock since the first call (the
+ * rate settles within the first second; GetThreadTimes is in clock ticks). */
+static uint64_t self_cpu_ns(uint64_t now)
+{
+#if defined(_WIN32) && defined(FT_HAVE_TSC)
+    static uint64_t tsc0, ns0;
+    ULONG64 cyc = 0;
+    uint64_t tsc = __rdtsc();
+    if (!ns0) {
+        tsc0 = tsc;
+        ns0 = now;
+    }
+    if (!QueryThreadCycleTime(GetCurrentThread(), &cyc) || now - ns0 < 1000000u)
+        return 0;
+    return (uint64_t)((double)cyc * (double)(now - ns0) / (double)(tsc - tsc0));
+#else
+    (void)now;
+    return xbox_ThreadCpuNs();
+#endif
+}
+
 /* At FLIP_STALL, from the executor: its running totals in ns. */
 void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
                         uint64_t scan, uint64_t draw, uint64_t present)
 {
-    static uint64_t t0, last, p_hold, p_scan, p_draw, p_pres, p_cpu;
-    uint64_t now, cpu, frame, d_hold, d_scan;
+    static uint64_t t0, last, p_hold, p_scan, p_draw, p_pres, p_cpu, p_self;
+    uint64_t now, cpu, self, frame, d_hold, d_scan;
     LONG c[B_COUNT], m[B_COUNT];
     int64_t rq, mrq;
     double per;
@@ -638,6 +682,7 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
         return;
     now = xbox_HostNowNs();
     cpu = xbox_ProcessCpuNs();
+    self = self_cpu_ns(now);
     for (b = 0; b < B_COUNT; b++) {
         c[b] = InterlockedExchange(&s_count[b], 0);
         m[b] = InterlockedExchange(&s_mcount[b], 0);
@@ -653,6 +698,7 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
     if (!last) {
         t0 = last = now;
         p_hold = hold; p_scan = scan; p_draw = draw; p_pres = present; p_cpu = cpu;
+        p_self = self;
         return;
     }
     frame = now - last;
@@ -661,7 +707,7 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
     per = s_period_us / 1000.0;
     fprintf(s_out, "%u,%.3f,%.3f,%u,%d,%.3f,%.3f,%.3f,%.3f,%.3f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%ld,%.3f,"
-            "%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f\n",
+            "%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f\n",
             flip, (now - t0) / 1e6, frame / 1e6, iv, late,
             d_hold / 1e6, (double)(int64_t)(d_scan - d_hold) / 1e6,
             (draw - p_draw) / 1e6, (present - p_pres) / 1e6,
@@ -671,9 +717,11 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
             (cpu - p_cpu) / 1e6,
             c[B_IO] * per, rq / 1e6,
             m[B_GAME] * per, m[B_D3D] * per, m[B_XDK] * per, m[B_SPIN] * per,
-            m[B_HOST] * per, m[B_WAIT] * per, m[B_IO] * per, mrq / 1e6);
+            m[B_HOST] * per, m[B_WAIT] * per, m[B_IO] * per, mrq / 1e6,
+            self > p_self && p_self ? (self - p_self) / 1e6 : 0.0);
     if ((flip & 63) == 0)
         fflush(s_out);
     last = now;
     p_hold = hold; p_scan = scan; p_draw = draw; p_pres = present; p_cpu = cpu;
+    p_self = self;
 }

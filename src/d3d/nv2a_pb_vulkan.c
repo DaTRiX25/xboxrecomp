@@ -1880,6 +1880,9 @@ static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
     return h;
 }
 
+/* RECOMP_TRACE=pcache: this frame's new textures (tex_upload_log). */
+static struct { uint32_t n; uint64_t texels, decode, image, copy; } s_fup;
+
 /* Decoded on the CPU by the shared decode, uploaded as BGRA8 into a new
  * image: a draw already recorded this frame keeps the texels it was
  * recorded with, as Metal's new MTLTexture per change. */
@@ -1888,6 +1891,7 @@ static int tex_upload(const Stage *t, struct nvk_image *out)
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
     const uint32_t *pal = NULL, *src;
+    uint64_t t0, t1, t2;
     uint32_t l;
 
     if (n > s_texels_cap) {
@@ -1899,6 +1903,7 @@ static int tex_upload(const Stage *t, struct nvk_image *out)
     }
     if (t->color == NV2A_TEX_P8)
         pal = (const uint32_t *)(mem + t->palette);
+    t0 = s_pc_trace ? now_ns() : 0;
     nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
                     t->levels, pal, pal ? t->pal_len : 0, s_texels);
     if (stage_signed(t)) {
@@ -1907,10 +1912,12 @@ static int tex_upload(const Stage *t, struct nvk_image *out)
         for (i = 0; i < n; i++)
             s_texels[i] ^= x;
     }
+    t1 = s_pc_trace ? now_ns() : 0;
     if (!nvk_image_new(out, RT_FORMAT, t->width, t->height, t->levels,
                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                        VK_IMAGE_ASPECT_COLOR_BIT))
         return 0;
+    t2 = s_pc_trace ? now_ns() : 0;
     for (l = 0, src = s_texels; l < t->levels; l++) {
         uint32_t w = nv2a_tex_level_dim(t->width, l), h = nv2a_tex_level_dim(t->height, l);
         if (!upload_level(out, l, w, h, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -1922,7 +1929,30 @@ static int tex_upload(const Stage *t, struct nvk_image *out)
         src += (size_t)w * h;
     }
     s_tex_uploads++;
+    if (s_pc_trace) {
+        uint64_t t3 = now_ns();
+        s_fup.n++;
+        s_fup.texels += n;
+        s_fup.decode += t1 - t0;
+        s_fup.image += t2 - t1;
+        s_fup.copy += t3 - t2;
+    }
     return 1;
+}
+
+/* RECOMP_TRACE=pcache: a frame that spent 2 ms or more on new textures says
+ * so at its flip. Pipelines are not the only first-use cost: a scene's first
+ * frame decodes and uploads every texture it draws with (a race's first
+ * frame: some 150, 70 ms on the RX 9060 XT). */
+static void tex_upload_log(void)
+{
+    uint64_t ns = s_fup.decode + s_fup.image + s_fup.copy;
+    if (s_fup.n && ns >= 2000000u)
+        fprintf(stderr, LOGP "textures: the frame before present #%llu uploaded %u"
+                " (%.1f M texels) in %.2f ms: decode %.2f, image %.2f, copy %.2f\n",
+                (unsigned long long)s_presents + 1, s_fup.n, s_fup.texels / 1e6,
+                ns / 1e6, s_fup.decode / 1e6, s_fup.image / 1e6, s_fup.copy / 1e6);
+    memset(&s_fup, 0, sizeof s_fup);
 }
 
 static void rt_sync(RenderTarget *rt, uint32_t pitch);
@@ -4080,6 +4110,8 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
                 || __atomic_exchange_n(&s_pc_save, 0, __ATOMIC_ACQ_REL))
             pcache_save();
     }
+    if (s_pc_trace)
+        tex_upload_log();
     s_presents++;
     pc_flip(s_presents);
     flip_log(surface_offset, rt);
