@@ -335,6 +335,21 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
     /* SDL rumble needs a duration. The USB pad (usb_gamepad.c) re-issues a
      * held rumble every 150 ms, so 300 ms bridges one refresh and a lost
      * stop report ends within a third of a second. 0 stops it. */
+#if defined(__ANDROID__)
+    /* A handheld's built-in pad has no motors: the first pad's rumble goes
+     * to the device's own vibrator then (android_vibration.c), and the pad
+     * is told to stop. */
+    if (port == 0) {
+        extern int xbox_AndroidVibration(unsigned left, unsigned right, int pad_can_rumble);
+        if (!xbox_AndroidVibration(rumble_level(v->wLeftMotorSpeed),
+                                   rumble_level(v->wRightMotorSpeed),
+                                   SDL_GameControllerHasRumble(c) == SDL_TRUE)) {
+            SDL_GameControllerRumble(c, 0, 0, 0);
+            pthread_mutex_unlock(&g_pads_lock);
+            return ERROR_SUCCESS;
+        }
+    }
+#endif
     SDL_GameControllerRumble(c, rumble_level(v->wLeftMotorSpeed),
                              rumble_level(v->wRightMotorSpeed),
                              (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 300 : 0);
