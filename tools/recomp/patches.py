@@ -50,7 +50,9 @@ value depends on the picture's shape:
 The expression is arithmetic (+ - * / and parentheses) over numbers,
 `loaded` (the float the instruction moved) and names the host gives a value
 with recomp_patch_set_var ("aspect": the picture's width over its height).
-It is evaluated in double and only while the setting reads `when`.
+`f32[esp + 0x30]` reads another guest float at the site (a width squeezed
+about an anchor needs the anchor). It is evaluated in double and only while
+the setting reads `when`.
 "load_f32" takes `movss xmm, [mem]` and the 32-bit `mov reg, [mem]` (a float
 moved as bits); "store_f32" takes `movss [mem], xmm` and `mov [mem], reg`
 and rewrites the stored float, for a value that shares its register with
@@ -58,7 +60,9 @@ other uses.
 
 Optional "if": {"reg": "edi", "in": ["0x60EA14", "0x60EA84"]}: the site is
 in code several objects share, and the patch is for those whose address the
-register holds there. The other calls run as they were.
+register holds there. The other calls run as they were. Float patches of one
+kind may share a va when each has its own "if" (one value for these objects,
+another for those).
 """
 
 import json
@@ -67,14 +71,19 @@ import re
 _KINDS = frozenset({"load_u32", "load_f32", "store_f32"})
 _XMM = frozenset(f"xmm{i}" for i in range(8))
 _TOKEN_RE = re.compile(r"\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+)"
-                       r"|([A-Za-z_][A-Za-z0-9_]*)|([-+*/()]))")
+                       r"|(f32\[\s*e(?:ax|bx|cx|dx|si|di|bp|sp)\s*"
+                       r"(?:[+-]\s*0x[0-9A-Fa-f]{1,4}\s*)?\]"
+                       r"|[A-Za-z_][A-Za-z0-9_]*)|([-+*/()]))")
+_F32_RE = re.compile(r"f32\[\s*(e..)\s*(?:([+-])\s*0x([0-9A-Fa-f]+)\s*)?\]")
 
 
 def compile_expr(text):
     """A patch expression as a C expression of type double.
 
     Grammar: + - * / (unary minus too), parentheses, decimal numbers,
-    `loaded`, and variable names. Returns (c_text, names); `loaded` stays a
+    `loaded`, variable names, and `f32[reg + 0xNN]`: another guest float,
+    read as it is at the site (a neighbour of the patched value on the
+    guest's stack frame or in its object). Returns (c_text, names); `loaded` stays a
     placeholder, `{loaded}`, for the site to fill in. Anything else is a
     ValueError: the text goes into generated code, so nothing unparsed does.
     """
@@ -101,6 +110,13 @@ def compile_expr(text):
         if name is not None:
             if name == "loaded":
                 return "{loaded}"
+            m = _F32_RE.fullmatch(name)
+            if m:
+                reg, sign, disp = m.groups()
+                addr = reg if disp is None else f"{reg} {sign} 0x{int(disp, 16):X}"
+                return f"(double)MEMF({addr})"
+            if name.startswith("f32"):
+                raise ValueError(f"expression {text!r}: bad {name!r}")
             if name not in names:
                 names.append(name)
             return f'recomp_patch_var("{name}")'
@@ -161,9 +177,20 @@ class PatchConfig:
 
     def __init__(self, patches=()):
         self.patches = {}
+        # A site in shared code may carry one patch per set of objects: the
+        # further ones at a va, each with its own "if" (as the first has).
+        self.more = {}
         for p in patches:
             if p.va in self.patches:
-                raise ValueError(f"patch 0x{p.va:08X} listed twice")
+                first = self.patches[p.va]
+                if (p.guard is None or first.guard is None
+                        or p.kind != first.kind or p.kind == "load_u32"):
+                    raise ValueError(
+                        f"patch 0x{p.va:08X} listed twice (only float "
+                        f"patches of one kind, each with an 'if', may share "
+                        f"a site)")
+                self.more.setdefault(p.va, []).append(p)
+                continue
             self.patches[p.va] = p
 
     @classmethod
@@ -235,19 +262,22 @@ class PatchReport:
         p = self.config.patches.get(insn.address)
         if p is None:
             return []
-        if p.kind == "load_u32":
-            out = self._load_u32(p, insn)
-        else:
-            out = self._float(p, insn)
-        if out is None:
-            return []
-        self.applied[p.va] += 1
-        if p.guard:
-            reg, vas = p.guard
-            cond = " || ".join(f"{reg} == 0x{v:X}u" for v in vas)
-            out = [f"if ({cond}) {{ {out[0]} }}"]
-        return [f"{out[0]} /* patch 0x{p.va:08X}"
-                + (f", latch {p.latch}" if p.latch else "") + " */"]
+        stmts = []
+        for p in [p] + self.config.more.get(insn.address, []):
+            if p.kind == "load_u32":
+                out = self._load_u32(p, insn)
+            else:
+                out = self._float(p, insn)
+            if out is None:
+                return []
+            if p.guard:
+                reg, vas = p.guard
+                cond = " || ".join(f"{reg} == 0x{v:X}u" for v in vas)
+                out = [f"if ({cond}) {{ {out[0]} }}"]
+            stmts.append(f"{out[0]} /* patch 0x{p.va:08X}"
+                         + (f", latch {p.latch}" if p.latch else "") + " */")
+        self.applied[insn.address] += 1
+        return stmts
 
     def _load_u32(self, p, insn):
         ops = insn.operands

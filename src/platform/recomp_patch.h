@@ -54,6 +54,10 @@ int recomp_patch_on(const char *key, const char *when, int mode);
 /* A name a float patch's expression may read. Call from the host's main,
  * before the guest runs. A name nobody set reads 0. */
 void recomp_patch_set_var(const char *name, double value);
+/* The same for a value that can change while the title runs (what part of
+ * the frame the window shows): `fn` is called at each evaluation, from the
+ * guest's threads. */
+void recomp_patch_set_var_fn(const char *name, double (*fn)(void));
 int recomp_patch_has_var(const char *name);
 double recomp_patch_var(const char *name);
 /* What the generated code calls. Safe from any thread. */

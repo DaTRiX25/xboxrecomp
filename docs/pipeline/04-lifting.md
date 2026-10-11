@@ -542,6 +542,8 @@ xmm0.f[0] = RECOMP_PATCH_F32("display.hud_fix", "1", 0,
     xmm0.f[0]);
 ```
 
+`f32[reg + 0xNN]` in an expression reads another guest float at the site, for
+a value that depends on a neighbour (a width squeezed about an anchor x).
 The expression is parsed by the recompiler (nothing unparsed reaches the
 generated code), evaluated in double, and only while the setting is on.
 `"if": {"reg": "edi", "in": ["0x60EA14", "0x60EA84"]}` limits a site in

@@ -153,6 +153,34 @@ def test_float_load_as_bits_with_guard_and_latch():
     assert report.finish() == []
 
 
+def test_two_guarded_patches_share_a_site():
+    image = bytes.fromhex(LOAD_ECX_EAX8)
+    config._install([config.Section(".text", BASE, len(image), 0, len(image), True),
+                     config.Section(".data", DATA, 0x1000, len(image), 0, False)],
+                    entry_point=BASE, kernel_thunk_addr=BASE, origin="patch-test")
+    db = {BASE: {"start": hex(BASE), "end": BASE + len(image),
+                 "_addr": BASE, "size": len(image)}}
+    t = FunctionTranslator(image, db)
+    mk = lambda expr, va: Patch(BASE, "load_f32", "display.hud_fix", "1", None,
+                                expr=expr, guard=("edi", [va]))
+    report = PatchReport(PatchConfig([mk("loaded * 2", 0x100), mk("loaded * 3", 0x200)]))
+    t.lifter.patches = report
+    code = t.translate_function(BASE, db[BASE])
+    a = code.index("if (edi == 0x100u)")
+    b = code.index("if (edi == 0x200u)")
+    assert a < b and "* 2.0" in code[a:b] and "* 3.0" in code[b:], code
+    assert report.finish() == []
+    for bad in ([Patch(BASE, "load_f32", "a.b", "1", None, expr="loaded"),
+                 mk("loaded", 0x100)],
+                [Patch(BASE, "load_u32", "a.b", "1", 2),
+                 Patch(BASE, "load_u32", "a.b", "1", 3)]):
+        try:
+            PatchConfig(bad)
+        except ValueError:
+            continue
+        raise AssertionError("accepted an unguarded pair")
+
+
 def test_float_store_rewrites_the_stored_value():
     code, report = _translate_f(STORE_XMM1, "store_f32", "loaded + " + OFF,
                                 latch="set")
@@ -187,8 +215,16 @@ def test_expressions():
         py = c.replace('recomp_patch_var("aspect")', "(4.0 / 3.0)").replace(
             "{loaded}", repr(loaded))
         assert eval(py) == loaded, (expr, eval(py))
+    c, names = compile_expr(
+        "f32[esp + 0x30] + (loaded - f32[esp+0x30]) * (4 / 3) / aspect")
+    assert names == ["aspect"]
+    assert c == ('((double)MEMF(esp + 0x30) + ({loaded} - (double)MEMF(esp + 0x30))'
+                 ' * (4.0 / 3.0) / recomp_patch_var("aspect"))'), c
+    assert compile_expr("f32[eax] - f32[ebp - 0x8]")[0] == \
+        "((double)MEMF(eax) - (double)MEMF(ebp - 0x8))"
     for bad in ("a b", "1 +", "f(x)", "x; y", "(1", '"a"', "", "1 ** 2",
-                "x ? 1 : 2", "a[0]"):
+                "x ? 1 : 2", "a[0]", "f32[xmm0]", "f32[esp + 48]",
+                "f32[esp + eax]", "f32[0x1000]", "f32"):
         try:
             compile_expr(bad)
         except ValueError:

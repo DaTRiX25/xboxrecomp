@@ -704,8 +704,38 @@ void nv2a_present_set_fit(int fill)
     s_fill = fill != 0;
 }
 
+/* The output size of the last present, for nv2a_present_visible_x: 0 until a
+ * window has shown a frame (a headless run never does). */
+static volatile uint32_t s_last_dw, s_last_dh;
+static volatile int s_last_filter;
+
+static int present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
+                          struct nv2a_rect *src, struct nv2a_rect *dst);
+
 int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
                         struct nv2a_rect *src, struct nv2a_rect *dst)
+{
+    s_last_dw = dw;
+    s_last_dh = dh;
+    s_last_filter = filter;
+    return present_layout(fw, fh, dw, dh, filter, src, dst);
+}
+
+void nv2a_present_visible_x(uint32_t fw, uint32_t fh, double *x0, double *x1)
+{
+    struct nv2a_rect src, dst;
+    if (!fw || !fh) {
+        *x0 = 0.0;
+        *x1 = (double)fw;
+        return;
+    }
+    present_layout(fw, fh, s_last_dw, s_last_dh, s_last_filter, &src, &dst);
+    *x0 = (double)src.x;
+    *x1 = (double)(src.x + src.w);
+}
+
+static int present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
+                          struct nv2a_rect *src, struct nv2a_rect *dst)
 {
     int whole, crop, fill;
     if (s_crop < 0) {

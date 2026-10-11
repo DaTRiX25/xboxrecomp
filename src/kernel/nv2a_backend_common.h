@@ -1040,6 +1040,12 @@ void nv2a_present_set_fit(int fill);
  * 16:10 panel). src is in frame pixels; returns `whole` as nv2a_present_rect. */
 int nv2a_present_layout(uint32_t fw, uint32_t fh, uint32_t dw, uint32_t dh, int filter,
                         struct nv2a_rect *src, struct nv2a_rect *dst);
+/* The columns of an fw x fh frame the window shows, [x0, x1) in frame
+ * pixels: the src of nv2a_present_layout at the current overscan and fit
+ * settings and the last present's output size (before the first present, or
+ * headless: the overscan crop alone). For a host that places things by the
+ * visible picture (a guest patch's layout values). Any thread. */
+void nv2a_present_visible_x(uint32_t fw, uint32_t fh, double *x0, double *x1);
 /* The same at a display aspect (enum nv2a_present_aspect); nv2a_present_rect
  * is this at nv2a_host_opts()->present_aspect. At any aspect but the frame's
  * own, INTEGER scales the height by a whole number and stretches the width
