@@ -94,6 +94,9 @@ enum { NV2A_PC_VS = 0, NV2A_PC_FS = 1, NV2A_PC_PSO = 2 };
 typedef struct nv2a_pcache_stat {
     int      active;          /* a backend is up and has a key list on disk */
     int      warming;         /* its pre-warm thread is running */
+    int      waiting;         /* its render thread is waiting for the start-up
+                               * pre-warm right now (no frame comes meanwhile:
+                               * the window says so, overlay.h) */
     uint32_t listed[3];       /* keys in the list: vertex, fragment, pipeline */
     uint32_t warmed[3];       /* built by the pre-warm thread */
     uint32_t ack[3];          /* built by the render thread: the list lacked them */
@@ -105,6 +108,7 @@ void nv2a_pcache_stat_get(nv2a_pcache_stat *out);
 /* The backend's side. */
 void nv2a_pcache_stat_open(const char *dir, const uint32_t listed[3]);
 void nv2a_pcache_stat_warming(int on);
+void nv2a_pcache_stat_waiting(int on);
 void nv2a_pcache_stat_built(int prewarm, int kind, uint64_t ns);
 
 /* Asks the running backend to read its key list again and build what it

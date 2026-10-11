@@ -145,6 +145,7 @@ static int             s_layer;
 static int             s_vk;
 /* The settings overlay is open: the main loop turns fast and presents. */
 static int             s_overlay_open;
+static int             s_overlay_note;  /* the overlay shows a line without being open */
 
 /* Ack-thread side counters, read by the stats line. */
 static uint64_t s_flips, s_copy_ns;          /* relaxed atomics */
@@ -903,7 +904,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* One event loop for the window and the controllers: SDL_PumpEvents
          * (inside the wait) also updates the game controllers, which
          * xinput_device.c then only reads. */
-        if (SDL_WaitEventTimeout(&ev, s_overlay_open ? (vsync ? 1 : 8) : 100)) {
+        if (SDL_WaitEventTimeout(&ev, s_overlay_open ? (vsync ? 1 : 8)
+                                      : s_overlay_note ? 16 : 100)) {
             do {
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
                 if (s_layer)
@@ -933,7 +935,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* An open overlay is redrawn on every turn (it animates, and the
          * title behind it is paused, so no frame would wake the loop). */
         s_overlay_open = s_layer && xbox_OverlayOpen();
-        dirty |= s_overlay_open;
+        s_overlay_note = s_layer && xbox_OverlayNotice();
+        dirty |= s_overlay_open || s_overlay_note;
         /* The title is paused behind an open overlay, so no new frame comes
          * to take a pending RECOMP_WINDOW_SHOT: any pending one is taken now,
          * of what is shown (the overlay over the last frame). */

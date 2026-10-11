@@ -46,6 +46,11 @@ void xbox_OverlayPoll(void);
  * a new game frame. */
 int  xbox_OverlayWants(void);
 int  xbox_OverlayOpen(void);
+/* A line of text is up without the overlay being open ("Preparing shaders":
+ * the render thread waits for the start-up pre-warm, nv2a_pcache.h, and no
+ * game frame comes meanwhile): the presenter presents on every turn so that
+ * it shows, over the last frame or over black. */
+int  xbox_OverlayNotice(void);
 
 /* The window showed a new frame (the graph counts presents). */
 void xbox_OverlayFramePresented(void);

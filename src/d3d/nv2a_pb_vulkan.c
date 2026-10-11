@@ -1164,12 +1164,14 @@ static int pc_wait_more(void)
 {
     if (!PC_WARMING() || now_ns() >= __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE))
         return 0;
+    nv2a_pcache_stat_waiting(1);        /* the window shows a line meanwhile */
     usleep(500);
     return 1;
 }
 static void pc_waited(uint64_t t0, const char *what)
 {
     uint64_t t = now_ns();
+    nv2a_pcache_stat_waiting(0);
     s_pc_waits++;
     s_pc_wait_ns += t - t0;
     fprintf(stderr, LOGP "pcache: the ack thread waited %.1f ms for the pre-warm's %s"

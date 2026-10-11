@@ -390,6 +390,11 @@ void nv2a_pcache_stat_warming(int on)
     s_stat.warming = on;
 }
 
+void nv2a_pcache_stat_waiting(int on)
+{
+    s_stat.waiting = on;
+}
+
 void nv2a_pcache_stat_built(int prewarm, int kind, uint64_t ns)
 {
     if (kind < 0 || kind > 2)

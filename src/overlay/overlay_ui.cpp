@@ -20,6 +20,7 @@
 #include "overlay_internal.h"
 #include "xbox_settings.h"
 #include "xbox_shader_build.h"
+#include "nv2a_pcache.h"
 #include "recomp_patch.h"
 
 #include "imgui.h"
@@ -890,9 +891,26 @@ int xbox_OverlayOpen(void)
     return s_enabled && s_open;
 }
 
+/* The render thread is held for the start-up pre-warm (a key list whose
+ * compiled shaders the system no longer has: up to 3 s, once, before the
+ * title's first pictures): the window says what it is doing instead of
+ * standing black. */
+static bool notice_on()
+{
+    nv2a_pcache_stat st;
+    nv2a_pcache_stat_get(&st);
+    return st.waiting != 0;
+}
+
+int xbox_OverlayNotice(void)
+{
+    return s_enabled && notice_on();
+}
+
 int xbox_OverlayWants(void)
 {
-    return s_enabled && (s_open || s_alpha > 0.0f || xbox_SettingValue(XS_ADVANCED_PERF) != 0.0);
+    return s_enabled && (s_open || s_alpha > 0.0f || xbox_SettingValue(XS_ADVANCED_PERF) != 0.0
+                         || notice_on());
 }
 
 void xbox_OverlayFramePresented(void)
@@ -1347,7 +1365,8 @@ bool overlay_begin_frame()
     s_alpha += (s_open ? 1.0f : -1.0f) * dt / 0.14f;
     s_alpha = s_alpha < 0 ? 0 : s_alpha > 1 ? 1 : s_alpha;
     bool perf = xbox_SettingValue(XS_ADVANCED_PERF) != 0.0;
-    if (!s_open && s_alpha <= 0.0f && !perf)
+    bool note = notice_on();
+    if (!s_open && s_alpha <= 0.0f && !perf && !note)
         return false;
 
     ImGuiIO &io = ImGui::GetIO();
@@ -1362,6 +1381,19 @@ bool overlay_begin_frame()
 
     if (perf) {
         draw_perf(ImGui::GetForegroundDrawList(), ImVec2(fs * 0.6f, fs * 0.6f), fs);
+    }
+    if (note) {
+        /* Centred, low on the screen; the dots move so it is seen to live. */
+        static const char *const dots[4] = { "", ".", "..", "..." };
+        char text[64];
+        snprintf(text, sizeof text, "Preparing shaders%s", dots[(now / 300u) & 3u]);
+        ImDrawList *dl = ImGui::GetForegroundDrawList();
+        const ImVec2 disp = ImGui::GetIO().DisplaySize;
+        const float tw = ImGui::CalcTextSize("Preparing shaders...").x;
+        const ImVec2 p((disp.x - tw) * 0.5f, disp.y * 0.72f);
+        dl->AddRectFilled(ImVec2(p.x - fs, p.y - fs * 0.5f), ImVec2(p.x + tw + fs, p.y + fs * 1.5f),
+                          IM_COL32(18, 18, 20, 235), fs * 0.5f);
+        dl->AddText(p, IM_COL32(235, 235, 240, 255), text);
     }
     if (s_open || s_alpha > 0.0f) {
         /* A closing overlay still draws, fading. */
