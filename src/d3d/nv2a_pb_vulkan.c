@@ -1178,6 +1178,30 @@ static void vk_on_clear(uint32_t param);
 static int init(void);
 static void occ_query_begin(void);
 
+/* A CLEAR_SURFACE of depth and colour reaches the backend as on_zclear and
+ * then on_clear. Each used to open its own pass: one that cleared the depth
+ * buffer and loaded the colour, ended at once without a draw, then one that
+ * cleared the colour and loaded the depth; on a tile-based GPU the second
+ * loads a whole buffer that was just cleared. on_zclear leaves its clear
+ * here when on_clear is to follow, and on_clear opens one pass that clears
+ * both (or, when its box is not the whole target, the depth-clearing pass
+ * as before). */
+static struct {
+    RenderTarget *rt;
+    unsigned      zmask;
+    float         z;
+    uint32_t      st;
+} s_zpend;
+
+static void zpend_flush(void)
+{
+    if (s_zpend.rt) {
+        RenderTarget *rt = s_zpend.rt;
+        s_zpend.rt = NULL;
+        begin_pass(rt, 0, NULL, s_zpend.zmask, s_zpend.z, s_zpend.st);
+    }
+}
+
 static void vk_on_clear(uint32_t param)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -1190,17 +1214,26 @@ static void vk_on_clear(uint32_t param)
     if (!(param & 0xF0) || !init())
         return;
     rt = surface();
-    if (!rt || !nv2a_clear_box(g, rt->w, rt->h, b))
+    if (!rt || !nv2a_clear_box(g, rt->w, rt->h, b)) {
+        zpend_flush();
         return;
+    }
     c[0] = (float)((g->clear_color >> 16) & 0xFF) / 255.0f;
     c[1] = (float)((g->clear_color >> 8) & 0xFF) / 255.0f;
     c[2] = (float)(g->clear_color & 0xFF) / 255.0f;
     c[3] = (float)(g->clear_color >> 24) / 255.0f;
     s_clears++;
     if (b[0] == 0 && b[1] == 0 && b[2] == rt->w && b[3] == rt->h) {
-        begin_encoder(rt, 1, c);
+        if (s_zpend.rt == rt) {
+            s_zpend.rt = NULL;
+            begin_pass(rt, 1, c, s_zpend.zmask, s_zpend.z, s_zpend.st);
+        } else {
+            zpend_flush();
+            begin_encoder(rt, 1, c);
+        }
         return;
     }
+    zpend_flush();
     if (!s_pass || s_enc_rt != rt)
         begin_encoder(rt, 0, NULL);
     memset(&ca, 0, sizeof ca);
@@ -1240,11 +1273,45 @@ static void vk_on_zclear(uint32_t param)
     dt = depth_target(rt->w, rt->h);
     if (!dt)
         return;
+    if (param & 1u)
+        s_zclears++;
+    zpend_flush();
+    if (param & 0xF0) {
+        /* on_clear follows for the same CLEAR_SURFACE and opens the pass. */
+        rt->dt = dt;
+        s_zpend.rt = rt;
+        s_zpend.zmask = param & 3u;
+        s_zpend.z = nv2a_zclear_depth(g->format, v->zclear);
+        s_zpend.st = v->zclear & 0xFFu;
+        return;
+    }
+    if (s_pass && s_enc_rt == rt && s_enc_dt == dt && rt->dt == dt) {
+        /* The pass on this target is open with this depth buffer: clear in
+         * it. Ending it for a clearing pass would store and load the colour
+         * for nothing. As a colour clear, not a zpass sample. */
+        VkClearAttachment ca;
+        VkClearRect cr;
+        int counting = s_occ_slot >= 0;
+        memset(&ca, 0, sizeof ca);
+        ca.aspectMask = ((param & 1u) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0)
+                      | ((param & 2u) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+        ca.clearValue.depthStencil.depth = nv2a_zclear_depth(g->format, v->zclear);
+        ca.clearValue.depthStencil.stencil = v->zclear & 0xFFu;
+        memset(&cr, 0, sizeof cr);
+        cr.rect.extent.width = rt->hw < dt->hw ? rt->hw : dt->hw;
+        cr.rect.extent.height = rt->hh < dt->hh ? rt->hh : dt->hh;
+        cr.layerCount = 1;
+        if (counting)
+            occ_pass_end();
+        vkCmdClearAttachments(s_cmd, 1, &ca, 1, &cr);
+        if (counting)
+            occ_query_begin();
+        rt->gen = ++s_rt_seq;
+        return;
+    }
     rt->dt = dt;
     begin_pass(rt, 0, NULL, param & 3u, nv2a_zclear_depth(g->format, v->zclear),
                v->zclear & 0xFFu);
-    if (param & 1u)
-        s_zclears++;
 }
 
 /* ---- vertices ---------------------------------------------------------------- */
