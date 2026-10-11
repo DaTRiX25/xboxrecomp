@@ -14,6 +14,7 @@
 #include "usb_gamepad.h"
 #include "recomp_env.h"
 #include "latency_trace.h"
+#include "host_time.h"
 #include "../input/xinput_xbox.h"
 
 #include <stdio.h>
@@ -738,7 +739,9 @@ static void pad_script_apply(int pad, uint8_t *out)
 
     if (s_script_len < 0)
         pad_script_load();
-    now = (unsigned long)GetTickCount();
+    /* On the guest's clock (host_time.h), so a step's hold is as long to
+     * the title in a run that does not wait for the clock as in any other. */
+    now = (unsigned long)GetTickCount() + (unsigned long)(xbox_GuestSkewNs() / 1000000u);
     if (!t0)
         t0 = now;
     t = now - t0;
