@@ -274,7 +274,7 @@ static void apply(xs_id id)
         xbox_InputSetTriggerDeadzone((int)v);
         break;
     case XS_INPUT_RUMBLE:
-        xbox_InputSetRumbleGain(v);
+        xbox_InputSetRumbleStrength(v);
         break;
     case XS_INPUT_FACE_LAYOUT:
         xbox_InputSetFaceLayoutNintendo(v != 0.0);
@@ -609,7 +609,7 @@ void xbox_SettingsFinish(void)
     }
     /* What nothing else reads at start. */
     apply_audio();
-    xbox_InputSetRumbleGain(s_set[XS_INPUT_RUMBLE].value);
+    xbox_InputSetRumbleStrength(s_set[XS_INPUT_RUMBLE].value);
     xbox_InputSetFaceLayoutNintendo(s_set[XS_INPUT_FACE_LAYOUT].value != 0.0);
 }
 

@@ -29,7 +29,7 @@ static struct nv2a_host_opts st_opts;
 
 void xbox_InputSetDeadzone(int dz) { st_deadzone = dz; }
 void xbox_InputSetTriggerDeadzone(int dz) { st_trigger = dz; }
-void xbox_InputSetRumbleGain(double g) { st_rumble = g; }
+void xbox_InputSetRumbleStrength(double g) { st_rumble = g; }
 static int st_face;
 void xbox_InputSetFaceLayoutNintendo(int on) { st_face = on; }
 void xbox_PacingSetMode(int m) { st_pacing = m; }
