@@ -133,6 +133,10 @@ void xbox_SettingsReportRegister(void);
 /* The environment spelling of a value, for the overlay's hints. */
 void xbox_SettingEnvString(const xs_setting *s, double v, char *out, unsigned n);
 
+/* The line at the top of the overlay's Advanced page: the port's name and
+ * version (NULL or "": none). Here and not in overlay.h, which needs SDL. */
+void xbox_OverlaySetAbout(const char *text);
+
 #ifdef __cplusplus
 }
 #endif

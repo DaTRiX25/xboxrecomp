@@ -181,6 +181,15 @@ enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
 static char s_rep_info[160] = "Bug report: a zip file on this device; nothing is sent.";
 static char s_rep_done[1400];         /* where the last one went, or why none */
 
+/* ── the port's name and version ───────────────────────────────────── */
+
+static char s_about[200];
+
+void xbox_OverlaySetAbout(const char *text)
+{
+    snprintf(s_about, sizeof s_about, "%s", text ? text : "");
+}
+
 /* ── the shader pre-build (xbox_shader_build.h) ────────────────────── */
 
 static const xbox_shader_build_ops *s_sb;
@@ -333,6 +342,8 @@ static int page_rows(int page, Row *r)
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     default:
+        if (s_about[0])
+            INFO(s_about);
         SET(XS_ADVANCED_PERF);
         if (xbox_BugReportHasMaker()) {
             INFO(s_rep_info);

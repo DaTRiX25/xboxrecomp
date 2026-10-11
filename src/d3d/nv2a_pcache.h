@@ -82,8 +82,10 @@ uint64_t nv2a_fnv64(const void *p, size_t n, uint64_t h);
  * Windows %LOCALAPPDATA%\<app>). "none", "off", "0" or "" turn it off.
  * Returns 1 with the path in `out`, 0 when off or not creatable. */
 int nv2a_pcache_dir(const char *dir, const char *app, char *out, size_t n);
-/* The <app> the backends pass: the executable's name. */
+/* The <app> the backends pass: the executable's name, or what a port set
+ * before the backend started (its own name, when the executable has another). */
 const char *nv2a_pcache_app(void);
+void nv2a_pcache_set_app(const char *app);
 
 /* ---- what the running backend's cache is doing ------------------------------
  *

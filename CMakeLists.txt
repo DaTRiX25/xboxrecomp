@@ -136,6 +136,9 @@ endif()
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
+# The data installer: a title's files from the user's disc, by manifest
+add_subdirectory(src/install)
+
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
@@ -149,6 +152,7 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_install
 )
 if(XBOXRECOMP_ENHANCE)
     target_link_libraries(xboxrecomp INTERFACE xbox_enhance)

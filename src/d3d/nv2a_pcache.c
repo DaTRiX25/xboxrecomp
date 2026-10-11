@@ -318,8 +318,17 @@ static int make_dirs(char *p)
 extern char *program_invocation_short_name;
 #endif
 
+static char s_app[64];
+
+void nv2a_pcache_set_app(const char *app)
+{
+    snprintf(s_app, sizeof s_app, "%s", app ? app : "");
+}
+
 const char *nv2a_pcache_app(void)
 {
+    if (s_app[0])
+        return s_app;
 #if defined(__APPLE__)
     return getprogname();
 #elif defined(__linux__) && !defined(__ANDROID__)
