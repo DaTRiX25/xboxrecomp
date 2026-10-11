@@ -742,6 +742,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         enc = [cb renderCommandEncoderWithDescriptor:rp];
         if (s_slot[k] && fw && fh) {
             struct nv2a_rect sr;
+            nv2a_present_frame(flip);
             whole = nv2a_present_layout(fw, fh, (uint32_t)dw, (uint32_t)dh, filter, &sr, &r);
             if (r.w > 0 && r.h > 0) {
                 float uv[4] = { (float)sr.x / (float)fw, (float)sr.y / (float)fh,
