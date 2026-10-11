@@ -487,6 +487,55 @@ static void ensure_cmd(void)
         s_cmd = [[s_queue commandBuffer] retain];
 }
 
+/* RECOMP_TRACE=metal_frame: the flip's passes in order, one line a flip:
+ *   [metal] frame 1234: 5 passes 2 copies | 0x03A52000 640x480 C 212 | ...
+ * a pass is a target's offset and guest size, C (cleared) or L (loaded) and
+ * its draws; "copy WxH" a self copy (the target copied to a texture so that
+ * a draw into it can sample it). What a title's post effect costs in passes
+ * and full-screen copies is read off two such lines. */
+#define MF_MAX 64
+static struct { uint32_t off, w, h, draws; char kind; } s_mf[MF_MAX];
+static int s_mf_n, s_mf_over, s_mf_on = -1;
+
+static void mf_add(char kind, const RenderTarget *rt)
+{
+    if (s_mf_on < 0)
+        s_mf_on = recomp_env(RENV_METAL_FRAME) != NULL;
+    if (!s_mf_on)
+        return;
+    if (s_mf_n == MF_MAX) {
+        s_mf_over++;
+        return;
+    }
+    s_mf[s_mf_n].off = rt->offset;
+    s_mf[s_mf_n].w = rt->w;
+    s_mf[s_mf_n].h = rt->h;
+    s_mf[s_mf_n].draws = 0;
+    s_mf[s_mf_n++].kind = kind;
+}
+
+static void mf_flip(void)
+{
+    char line[MF_MAX * 40 + 96];
+    int i, n = 0, passes = 0, copies = 0;
+    if (s_mf_on <= 0)
+        return;
+    for (i = 0; i < s_mf_n; i++)
+        if (s_mf[i].kind == 'X') copies++; else passes++;
+    n += snprintf(line + n, sizeof line - (size_t)n, "frame %llu: %d passes %d copies",
+                  (unsigned long long)s_presents, passes + s_mf_over, copies);
+    for (i = 0; i < s_mf_n; i++) {
+        if (s_mf[i].kind == 'X')
+            n += snprintf(line + n, sizeof line - (size_t)n, " | copy %ux%u",
+                          s_mf[i].w, s_mf[i].h);
+        else
+            n += snprintf(line + n, sizeof line - (size_t)n, " | 0x%08X %ux%u %c %u",
+                          s_mf[i].off, s_mf[i].w, s_mf[i].h, s_mf[i].kind, s_mf[i].draws);
+    }
+    fprintf(stderr, LOGP "%s\n", line);
+    s_mf_n = s_mf_over = 0;
+}
+
 /* Open a pass on rt: with `clear`, loadAction Clear to c; else Load. The
  * pass attaches rt->dt when it has one; zmask (CLEAR_SURFACE's bit 0 depth,
  * bit 1 stencil) clears it to z / st, and a fresh buffer clears to the far
@@ -527,6 +576,7 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     s_enc_rt = rt;
     s_enc_dt = dt;
     occ_pass_begin();
+    mf_add(clear ? 'C' : 'L', rt);
 }
 
 static void begin_encoder(RenderTarget *rt, int clear, const double c[4])
@@ -2890,6 +2940,7 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
     }
     s_self.offset = self->offset;
     s_self_copies++;
+    mf_add('X', self);
     {
         static int said;
         if (!said++)
@@ -3182,6 +3233,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         s_draws++;
         rt->gen = ++s_rt_seq;
+        if (s_mf_on > 0 && s_mf_n && s_mf[s_mf_n - 1].kind != 'X')
+            s_mf[s_mf_n - 1].draws++;
     }
 }
 
@@ -4157,6 +4210,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
     }
     s_presents++;
     flip_log(surface_offset, rt);
+    mf_flip();
     pc_flip(s_presents);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (%s), %llu clears,"

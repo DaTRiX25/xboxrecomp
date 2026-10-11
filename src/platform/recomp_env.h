@@ -138,6 +138,7 @@ extern "C" {
     X(PRESENT_STATS,     TRACE, "present_stats",   "RECOMP_PRESENT_STATS",     "SDL host present statistics") \
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
     X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip") \
+    X(METAL_FRAME,       TRACE, "metal_frame",     NULL,                       "Metal backend, one line per flip: the render passes in order (target offset, guest size, C cleared / L loaded, draws) and the self copies (a target copied to be sampled while it is drawn into)") \
     X(PCACHE_TRACE,      TRACE, "pcache",          NULL,                       "pipeline cache: each shader/pipeline compile (thread, ms), the pre-warm summary; =<file>: also one CSV line per flip (t_ms, interval_ms, compiles)") \
     X(VK_PROF,           TRACE, "vk_prof",         NULL,                       "Vulkan flip cost every 300 flips: frame waits, write-backs, submits, GPU time") \
     X(VK_FRAME,          TRACE, "vk_frame",        NULL,                       "=<file>: Vulkan backend, one CSV line per flip: draws, render passes (cleared, loaded, resumed on a target already drawn that frame, empty), queue submits by reason, time in submits, timeline polls, waits and the flip's steps, GPU time from timestamp queries") \
