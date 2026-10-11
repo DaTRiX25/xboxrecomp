@@ -522,6 +522,16 @@ HUD is made, and its number every frame): a `use` site follows what the last
 `set` site sampled, so a change mid-race shows whole at the next set-up
 instead of as 171 "mph".
 
+`"kind": "load_u8"` is the same for a byte flag, `mov al|bl|cl|dl, [mem]`:
+`SET_LO8(eax, RECOMP_PATCH_U32(key, when, value, LO8(eax)))`, the value
+0..255, only the register's low byte changed. A title's own on/off byte read
+back as 0 makes the title take its own "off" path (Burnout 3's graphics
+manager has one for its blur, on since the constructor and with no menu
+entry: `graphics.motion_blur`, `RECOMP_GFX_MOTION_BLUR=0`; `graphics.bloom`
+is a `load_u32` of the value its bloom call is gated by). These two settings
+default to on, so the patch is their `"when": "0"`; their rows are on the
+overlay's Graphics page.
+
 A float goes by `"kind": "load_f32"` (after `movss xmm, [mem]`, or a 32-bit
 `mov reg, [mem]` that carries a float as bits) or `"store_f32"` (after
 `movss [mem], xmm` / `mov [mem], reg`: the stored float is rewritten, for a

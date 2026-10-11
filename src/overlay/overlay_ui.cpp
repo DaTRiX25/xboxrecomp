@@ -159,6 +159,8 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speedometer and distances in km/h and metres instead of mph and miles: the game's own metric display, which the US disc keeps for its other languages. A change shows from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
     /* XS_DISPLAY_HUD_FIX */    { "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On: the HUD keeps its 4:3 shape and stays at the screen edges, by the game's own layout values. A change shows from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For a display wider than 16:9, with Aspect at 16:9: the race is drawn for the whole width (more to see at the sides, nothing stretched). Menus, loading screens and videos keep their 16:9 shape in the middle. Window follows the window's or the screen's own shape. A change shows from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
+    /* XS_GRAPHICS_BLOOM */     { "Bloom", "The game's own glow around bright parts of the picture (sky, lights, reflections). On is the original look; off skips its extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "The game's own blur: the streaks at the edges of the picture while boosting and the blur of the crash and takedown cameras. On is the original look; off skips its extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -252,6 +254,10 @@ static int page_rows(int page, Row *r)
     case P_GRAPHICS:
         SET(XS_GRAPHICS_RENDER_SCALE); SET(XS_GRAPHICS_ANISO);
         SET(XS_GRAPHICS_AA); SET(XS_GRAPHICS_SHARPEN);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_BLOOM)->key))
+            SET(XS_GRAPHICS_BLOOM);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_MOTION_BLUR)->key))
+            SET(XS_GRAPHICS_MOTION_BLUR);
         if (s_sb) {
             sb_texts();
             INFO(s_sb_info);
