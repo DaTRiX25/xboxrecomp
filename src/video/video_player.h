@@ -92,6 +92,13 @@ int xbox_HostWindowMain(int (*guest_main)(void));
  * The window's thread only (the overlay's test driver, RECOMP_OVERLAY_TEST);
  * the Metal and Vulkan presenters. */
 void xbox_HostWindowShot(const char *path);
+
+/* The bug report's system.txt gets this host's displays, controllers and
+ * GPUs (host_probe.c, xbox_report.h). may_init 0: a title runs, only what
+ * SDL already has is read; 1: nothing else runs in the process (a report
+ * from the command line), SDL's video and controllers are started for the
+ * listing and the graphics API is asked for its devices. SDL hosts. */
+void xbox_HostReportProbe(int may_init);
 #endif
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */
