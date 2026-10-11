@@ -13,7 +13,6 @@
 #include "recomp_env.h"
 #include "input_map.h"
 #include "keyboard.h"
-#include <math.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -224,6 +223,30 @@ void xbox_InputPadEvent(const SDL_Event *ev)
     case SDL_CONTROLLERBUTTONDOWN:
         pad_claim(ev->cbutton.which);
         break;
+    /* A pad in the hand must not go on shaking for a game that is not in
+     * front: the motors stop with the window's focus and come back with it
+     * (input_core.c). */
+    case SDL_WINDOWEVENT:
+        if (ev->window.event == SDL_WINDOWEVENT_FOCUS_LOST
+                || ev->window.event == SDL_WINDOWEVENT_MINIMIZED
+                || ev->window.event == SDL_WINDOWEVENT_HIDDEN)
+            xbox_InputSetBackground(1);
+        else if (ev->window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+            xbox_InputSetBackground(0);
+        else if (ev->window.event == SDL_WINDOWEVENT_SHOWN
+                 || ev->window.event == SDL_WINDOWEVENT_RESTORED) {
+            /* Back on screen, in front or not: as its focus says. */
+            SDL_Window *w = SDL_GetWindowFromID(ev->window.windowID);
+            if (w)
+                xbox_InputSetBackground(!(SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS));
+        }
+        break;
+    case SDL_APP_WILLENTERBACKGROUND:
+        xbox_InputSetBackground(1);
+        break;
+    case SDL_APP_DIDENTERFOREGROUND:
+        xbox_InputSetBackground(0);
+        break;
     default:
         break;
     }
@@ -249,6 +272,22 @@ static void sdl_init(void)
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+#if defined(__ANDROID__)
+    {
+        /* RECOMP_ANDROID_VIBRATION_FLOOR=<0..65535>: the title's motor
+         * speeds under it are silence, in place of the rumble gate's 800
+         * (and on again from half as much more, as the gate's 1200 is).
+         * 0: no gate. It was the only floor before the gate; an override
+         * now. */
+        const char *f = getenv("RECOMP_ANDROID_VIBRATION_FLOOR");
+        if (f && *f) {
+            int floor_v = atoi(f);
+            if (floor_v < 0) floor_v = 0;
+            if (floor_v > 43690) floor_v = 43690;
+            xbox_InputSetRumbleGate((unsigned)floor_v, (unsigned)floor_v * 3u / 2u);
+        }
+    }
+#endif
     if (g_main_pump) {
         /* The window's thread (xbox_InputInit from fb_present_sdl.c): open
          * what is attached now; the ADDED events SDL also sends for these
@@ -290,42 +329,8 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
     return ERROR_SUCCESS;
 }
 
-/* The title's motor speeds were written for the Duke/S pad's motors; a
- * DualShock or the Deck's haptics barely move at the low values Burnout 3
- * decays through (18349 at an impact, then 5734, 1791...). A square-root
- * curve keeps zero at zero and full at full but lifts the middle, the way
- * the console motors' start-up threshold made small speeds felt.
- * RECOMP_INPUT_RUMBLE_GAIN scales it; "linear" passes the values through. */
-static int g_rumble_init, g_rumble_linear;
-static double g_rumble_gain = 1.0;
-
-/* The strength, live (the overlay's Input page): gain 0 silences the
- * motors, a negative value passes the title's values through ("linear"). */
-void xbox_InputSetRumbleGain(double gain)
-{
-    g_rumble_init = 1;
-    g_rumble_linear = gain < 0.0;
-    g_rumble_gain = gain < 0.0 ? 1.0 : gain;
-}
-
-static Uint16 rumble_level(WORD speed)
-{
-    double f;
-
-    if (!g_rumble_init) {
-        const char *g = recomp_env(RENV_INPUT_RUMBLE_GAIN);
-        if (g && !strcmp(g, "linear"))
-            g_rumble_linear = 1;
-        else if (g && *g && atof(g) >= 0.0)
-            g_rumble_gain = atof(g);
-        g_rumble_init = 1;
-    }
-    if (!speed || g_rumble_linear)
-        return speed;
-    f = g_rumble_gain * sqrt(speed / 65535.0);
-    return f >= 1.0 ? 65535 : (Uint16)(f * 65535.0);
-}
-
+/* The motors' levels, after the rumble curve (input_core.c): given to the
+ * pad as they are. */
 static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
 {
     SDL_GameController *c;
@@ -336,36 +341,30 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
         pthread_mutex_unlock(&g_pads_lock);
         return ERROR_DEVICE_NOT_CONNECTED;
     }
-    /* SDL rumble needs a duration. The USB pad (usb_gamepad.c) re-issues a
-     * held rumble every 150 ms, so 300 ms bridges one refresh and a lost
-     * stop report ends within a third of a second. 0 stops it. */
+    /* SDL rumble needs a duration. input_core.c re-issues a held rumble
+     * every 150 ms, so 300 ms bridges one refresh and a lost stop ends
+     * within a third of a second. 0 stops it. */
 #if defined(__ANDROID__)
-    /* A handheld's built-in pad has no motors: the first pad's rumble goes
-     * to the device's own vibrator then (android_vibration.c), and the pad
-     * is told to stop. */
+    /* SDL2's Android joystick driver cannot rumble a pad (2.32.10,
+     * src/joystick/android/SDL_sysjoystick.c: ANDROID_JoystickRumble is
+     * SDL_Unsupported), and a handheld's built-in pad has no motors anyway:
+     * the first pad's rumble goes to the device's own vibrator when that pad
+     * is the built-in one (android_vibration.c), and the pad is told to
+     * stop. */
     if (port == 0) {
-        extern int xbox_AndroidVibration(unsigned left, unsigned right, int pad_can_rumble);
-        /* RECOMP_ANDROID_VIBRATION_FLOOR=<0..65535>: the title's motor
-         * speeds under it are silence (its idle hum, lifted by the strength
-         * setting, is otherwise a constant buzz in the hand). Default 0. */
-        static int floor_v = -1;
-        unsigned l = v->wLeftMotorSpeed, r = v->wRightMotorSpeed;
-        if (floor_v < 0) {
-            const char *f = getenv("RECOMP_ANDROID_VIBRATION_FLOOR");
-            floor_v = f ? atoi(f) : 0;
-        }
-        if ((int)l < floor_v) l = 0;
-        if ((int)r < floor_v) r = 0;
-        if (!xbox_AndroidVibration(rumble_level((WORD)l), rumble_level((WORD)r),
-                                   SDL_GameControllerHasRumble(c) == SDL_TRUE)) {
+        extern int xbox_AndroidVibration(unsigned left, unsigned right, int pad_can_rumble,
+                                         int vendor, int product);
+        if (!xbox_AndroidVibration(v->wLeftMotorSpeed, v->wRightMotorSpeed,
+                                   SDL_GameControllerHasRumble(c) == SDL_TRUE,
+                                   SDL_GameControllerGetVendor(c),
+                                   SDL_GameControllerGetProduct(c))) {
             SDL_GameControllerRumble(c, 0, 0, 0);
             pthread_mutex_unlock(&g_pads_lock);
             return ERROR_SUCCESS;
         }
     }
 #endif
-    SDL_GameControllerRumble(c, rumble_level(v->wLeftMotorSpeed),
-                             rumble_level(v->wRightMotorSpeed),
+    SDL_GameControllerRumble(c, v->wLeftMotorSpeed, v->wRightMotorSpeed,
                              (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 300 : 0);
     pthread_mutex_unlock(&g_pads_lock);
     return ERROR_SUCCESS;

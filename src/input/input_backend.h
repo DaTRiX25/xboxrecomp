@@ -23,7 +23,8 @@ typedef struct xbox_input_backend {
     /* Read port's pad. ERROR_SUCCESS with *out filled (already mapped
      * through input_map), or ERROR_DEVICE_NOT_CONNECTED. */
     DWORD (*get_state)(DWORD port, XBOX_INPUT_STATE *out);
-    /* Set port's motors. */
+    /* Set port's motors: host levels 0..65535, after input_core.c's rumble
+     * curve. The backend applies no curve of its own. */
     DWORD (*set_state)(DWORD port, const XBOX_VIBRATION *vib);
     /* Port 0 keyboard, merged on top of the pad when RECOMP_KEYBOARD is on.
      * Returns 1 when the keyboard is enabled and *out was filled; NULL when
@@ -33,8 +34,20 @@ typedef struct xbox_input_backend {
     uint64_t (*now_ms)(void);
 } xbox_input_backend;
 
-/* Rumble strength, live (xinput_device.c, SDL backend): see there. */
-void xbox_InputSetRumbleGain(double gain);
+/* Rumble (input_core.c, rumble_curve.h), every backend alike. The strength
+ * is the curve's exponent: 1.0 the title's speeds as the console played
+ * them, 0 off, above 1 the low speeds lifted; RECOMP_INPUT_RUMBLE_GAIN until
+ * this is called (the overlay's "Rumble strength"). The peak is the title's
+ * own full speed: RECOMP_INPUT_RUMBLE_PEAK, 65535 unless set. The gate's two
+ * speeds (off below, on from): 800 and 1200; on = 0 is no gate. Any thread. */
+void xbox_InputSetRumbleStrength(double strength);
+void xbox_InputSetRumblePeak(double peak);
+void xbox_InputSetRumbleGate(unsigned off, unsigned on);
+
+/* The window is not in front (or the app is in the background): the motors
+ * stop and nothing is sent, the refresh included, until it is back. The
+ * title's speeds are kept and play again then. Any thread. */
+void xbox_InputSetBackground(int on);
 
 /* The in-game overlay is open (input_core.c): the title reads neutral pads
  * and keys, and its rumble is silenced, until it closes. After it closes a

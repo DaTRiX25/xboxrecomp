@@ -83,6 +83,7 @@ typedef struct xs_setting {
     const char *const *env_vals;      /* the knob's spelling per choice, or NULL */
     double min, max;                  /* INT and FLOAT */
     double builtin;                   /* the toolkit's default */
+    double step;                      /* FLOAT: values are multiples of it; 0: any */
     /* state */
     double value;                     /* now */
     double filev;                     /* what the file said (kept while locked) */
