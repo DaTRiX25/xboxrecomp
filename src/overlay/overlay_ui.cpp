@@ -19,6 +19,7 @@
 #include "overlay.h"
 #include "overlay_internal.h"
 #include "xbox_settings.h"
+#include "xbox_shader_build.h"
 #include "recomp_patch.h"
 
 #include "imgui.h"
@@ -146,7 +147,55 @@ static const Meta k_meta[XS_COUNT] = {
 /* R_SPEAKERS: the speaker test, six buttons in a row (action: 0 through
  * the game's mixbins and speaker map, 1 straight to the output). */
 enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS };
-enum Action { A_RESET_PAGE, A_RESET_ALL };
+enum Action { A_RESET_PAGE, A_RESET_ALL, A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER };
+
+/* ── the shader pre-build (xbox_shader_build.h) ────────────────────── */
+
+static const xbox_shader_build_ops *s_sb;
+static bool s_sb_offer;               /* this start's offer is on screen */
+static bool s_sb_offer_checked;
+static char s_sb_label[200], s_sb_info[200];
+
+void xbox_OverlaySetShaderBuild(const xbox_shader_build_ops *ops)
+{
+    s_sb = ops;
+}
+
+static int sb_state(float *fraction, char *text, unsigned n)
+{
+    if (text && n)
+        text[0] = 0;
+    return s_sb && s_sb->poll ? s_sb->poll(fraction, text, n) : XBOX_SHADERS_IDLE;
+}
+
+/* The action row's label and the line above it, as the build stands. */
+static void sb_texts()
+{
+    float fr = 0;
+    char text[160];
+    int st = sb_state(&fr, text, sizeof text);
+    switch (st) {
+    case XBOX_SHADERS_RUNNING:
+        snprintf(s_sb_label, sizeof s_sb_label, "Stop building shaders");
+        snprintf(s_sb_info, sizeof s_sb_info, "Building shaders: %d%%  (%s)",
+                 (int)(fr * 100.0f + 0.5f), text);
+        break;
+    case XBOX_SHADERS_DONE:
+        snprintf(s_sb_label, sizeof s_sb_label, "Build shaders again");
+        snprintf(s_sb_info, sizeof s_sb_info, "Shaders: built.");
+        break;
+    case XBOX_SHADERS_FAILED:
+        snprintf(s_sb_label, sizeof s_sb_label, "Build shaders now");
+        snprintf(s_sb_info, sizeof s_sb_info, "Shaders: the last build stopped (%.120s).", text);
+        break;
+    default:
+        snprintf(s_sb_label, sizeof s_sb_label, "Build shaders now");
+        snprintf(s_sb_info, sizeof s_sb_info, s_sb_offer
+                 ? "First start: the shaders are not built yet. Build them now?"
+                 : "Shaders: not built; each compiles when it is first drawn.");
+        break;
+    }
+}
 
 struct Row {
     RowKind kind;
@@ -175,6 +224,15 @@ static int page_rows(int page, Row *r)
     case P_GRAPHICS:
         SET(XS_GRAPHICS_RENDER_SCALE); SET(XS_GRAPHICS_ANISO);
         SET(XS_GRAPHICS_AA); SET(XS_GRAPHICS_SHARPEN);
+        if (s_sb) {
+            sb_texts();
+            INFO(s_sb_info);
+            ACT(A_SHADERS, s_sb_label);
+            if (s_sb_offer) {
+                ACT(A_SHADERS_LATER, "Not now");
+                ACT(A_SHADERS_NEVER, "Do not ask again");
+            }
+        }
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_AUDIO:
@@ -339,6 +397,23 @@ static void activate(const Row &r)
         spk_play(r.action);
         return;
     }
+    if (r.kind == R_ACTION && r.action >= A_SHADERS) {
+        if (!s_sb)
+            return;
+        if (r.action == A_SHADERS) {
+            if (sb_state(NULL, NULL, 0) == XBOX_SHADERS_RUNNING)
+                s_sb->cancel();
+            else
+                s_sb->start();
+            s_sb_offer = false;
+        } else {
+            if (r.action == A_SHADERS_NEVER && s_sb->offer_never)
+                s_sb->offer_never();
+            s_sb_offer = false;
+            s_back++;                 /* answered: close */
+        }
+        return;
+    }
     if (r.kind == R_ACTION) {
         if (r.action == A_RESET_ALL) {
             xbox_SettingsResetAll();
@@ -382,6 +457,13 @@ static void set_open(bool on)
         xbox_HostPause(1);
         fprintf(stderr, LOGP "open: the title is paused, its input is held\n");
     } else {
+        /* A build beside a running title would cost it frames: it stops
+         * with the overlay, and goes on from there the next time. */
+        if (s_sb && sb_state(NULL, NULL, 0) == XBOX_SHADERS_RUNNING) {
+            s_sb->cancel();
+            fprintf(stderr, LOGP "the shader build is stopped with the overlay\n");
+        }
+        s_sb_offer = false;
         mcpx_apu_speaker_test(-1, 0);
         xbox_HostPause(0);
         xbox_InputSetBlocked(0);
@@ -573,6 +655,24 @@ void xbox_OverlayPoll(void)
         s_cycle_next = now_ms() + s_cycle_ms;
         s_cycle_i = (s_cycle_i + 1) % 3;
         xbox_SettingSet(XS_GRAPHICS_AA, s_cycle_i);
+    }
+    /* The first start's offer, once the window has been up for a moment:
+     * the overlay opens on the Graphics page, on the build's row. */
+    if (!s_sb_offer_checked && s_win && s_sb && (int32_t)(now_ms() - s_t0_ms - 1500) >= 0) {
+        s_sb_offer_checked = true;
+        if (!s_open && s_sb->offer && s_sb->offer()) {
+            Row r[16];
+            int n;
+            s_sb_offer = true;
+            s_page = P_GRAPHICS;
+            n = page_rows(P_GRAPHICS, r);
+            for (int i = 0; i < n; i++)
+                if (r[i].kind == R_ACTION && r[i].action == A_SHADERS)
+                    s_sel[P_GRAPHICS] = i;
+            set_open(true);
+            s_sb_offer = true;        /* set_open(false) clears it; opening does not */
+            fprintf(stderr, LOGP "first start: offering the shader build\n");
+        }
     }
     if (s_trigger[0] && (int32_t)(now_ms() - s_trigger_next) >= 0) {
         s_trigger_next = now_ms() + 200;
@@ -993,7 +1093,7 @@ static void build_pages(float fs)
         }
     s_reset = 0;
     /* The footer: the selected row's hint (wrapped), a restart note, the keys. */
-    char hint[320] = "";
+    char hint[640] = "";
     bool hint_locked = false;
     if (rows[sel].kind == R_SETTING) {
         const xs_setting *s = xbox_SettingGet(rows[sel].id);
@@ -1008,6 +1108,13 @@ static void build_pages(float fs)
         }
     } else if (rows[sel].kind == R_SPEAKERS) {
         spk_hint(rows[sel].action, hint, sizeof hint);
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_SHADERS && s_sb && s_sb->cost) {
+        snprintf(hint, sizeof hint, "%s The game stays paused while it builds; closing the"
+                 " settings stops it, and it goes on from there next time.", s_sb->cost);
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_SHADERS_LATER) {
+        snprintf(hint, sizeof hint, "Asks again at the next start. It is also here, on the Graphics page, at any time.");
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_SHADERS_NEVER) {
+        snprintf(hint, sizeof hint, "No question at start any more. \"Build shaders now\" stays here on the Graphics page.");
     }
     const float wrap_w = ImGui::GetContentRegionAvail().x;
     const float hint_h = hint[0] ? ImGui::CalcTextSize(hint, nullptr, false, wrap_w).y : fs;

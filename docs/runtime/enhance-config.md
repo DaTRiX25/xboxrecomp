@@ -117,7 +117,7 @@ the stock settings.
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
 | `present.spin_lead` | float | milliseconds before the vblank that a held flip spins instead of sleeping, at `sleep` pacing | `0` | `RECOMP_PRESENT_SPIN_LEAD` |
-| `render.shader_cache` | string | the pipeline cache's directory (`"~/..."` is under `$HOME`), or `"none"` for no disk cache | the per-user cache directory: macOS `~/Library/Caches/<executable>`, Linux `$XDG_CACHE_HOME/<executable>`, Windows `%LOCALAPPDATA%\<executable>\cache` | `RECOMP_RENDER_SHADER_CACHE` |
+| `render.shader_cache` | string | the shader cache's directory (`"~/..."` is under `$HOME`), or `"none"` for no disk cache: the key list the Metal and Vulkan backends pre-warm from, and on Vulkan the SPIR-V and the driver's pipeline cache. The key list is kept across rebuilds of the toolkit (its version names the key format, not the commit); a test or an installer's smoke run sets `RECOMP_RENDER_SHADER_CACHE` to a directory of its own so it does not write the player's | the per-user cache directory: macOS `~/Library/Caches/<executable>`, Linux `$XDG_CACHE_HOME/<executable>`, Windows `%LOCALAPPDATA%\<executable>\cache` | `RECOMP_RENDER_SHADER_CACHE` |
 | `fps.mode` | string | `"lock30"` (stock), `"lock60"`, `"free"` | `"lock30"` | the game's `RECOMP_FPS_MODE` |
 | `fx.glow` | string | `"on"` (stock), `"off"` (BLiNX 2: its post-mode-3 glow pass) | `"on"` | the game's `RECOMP_GLOW` |
 | `fx.glow_intensity` | float | `0.0` to `2.0`, a scale of that glow layer (BLiNX 2) | `1.0` | the game's `RECOMP_GLOW_INTENSITY` |
