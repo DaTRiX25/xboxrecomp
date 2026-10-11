@@ -69,8 +69,8 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_AUDIO_FX_LEVEL]     = SETTING("audio.fx_level", XS_FLOAT, 0, RENV_AUDIO_FX_LEVEL, NULL, NULL, 0, 1, 0.25),
     [XS_INPUT_DEADZONE]     = SETTING("input.deadzone", XS_INT, 0, RENV_PAD_DEADZONE, NULL, NULL, 0, 32767, 0),
     [XS_INPUT_TRIGGER_DEADZONE] = SETTING("input.trigger_deadzone", XS_INT, 0, RENV_PAD_TRIGGER_DEADZONE, NULL, NULL, 0, 254, 0),
-    #if defined(__ANDROID__)     /* a device's own vibrator is weaker than a pad's motors: up to 3 */
-    [XS_INPUT_RUMBLE]       = SETTING("input.rumble", XS_FLOAT, 0, RENV_INPUT_RUMBLE_GAIN, NULL, NULL, 0, 3, 1),
+    #if defined(__ANDROID__)     /* a device's own vibrator is weaker than a pad's motors: up to 4 */
+    [XS_INPUT_RUMBLE]       = SETTING("input.rumble", XS_FLOAT, 0, RENV_INPUT_RUMBLE_GAIN, NULL, NULL, 0, 4, 1),
 #else
     [XS_INPUT_RUMBLE]       = SETTING("input.rumble", XS_FLOAT, 0, RENV_INPUT_RUMBLE_GAIN, NULL, NULL, 0, 2, 1),
 #endif
