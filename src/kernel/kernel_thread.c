@@ -548,10 +548,15 @@ DWORD_PTR xbox_GuestCpuMask(void)
 #endif
 #if defined(__ANDROID__)
     /* Not the lowest: on a phone's little/big/prime layout that is a little
-     * core, a fraction of the speed. The fastest one the process may use
-     * (android_host.h). */
+     * core, a fraction of the speed. The fastest core is left to the
+     * executor, the heavier thread (kernel_bridge.c pins it there; measured
+     * on a Snapdragon 865: 60 % of a core against the guest's 29 %); the
+     * guest's threads take a core of the next kind, or the fastest when
+     * there is only one kind (android_host.h). */
     {
-        int fast = recomp_android_fast_cpu();
+        int fast = recomp_android_cpu_rank(1);
+        if (fast < 0)
+            fast = recomp_android_fast_cpu();
         if (fast >= 0 && fast < (int)(8 * sizeof proc) && (proc & ((DWORD_PTR)1 << fast)))
             return (DWORD_PTR)1 << fast;
     }

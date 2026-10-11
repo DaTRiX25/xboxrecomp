@@ -105,33 +105,47 @@ const char *recomp_android_host_init(const char *tag, const char *logname)
     return dir;
 }
 
-int recomp_android_fast_cpu(void)
+int recomp_android_cpu_rank(int rank)
 {
     cpu_set_t set;
-    long best_f = -1;
-    int best = -1, i;
+    long freq[64], limit = 0x7fffffffL;
+    int i, r, best = -1;
 
     if (sched_getaffinity(0, sizeof set, &set) != 0)
         return -1;
-    for (i = 0; i < CPU_SETSIZE && i < 64; i++) {
+    for (i = 0; i < 64; i++) {
         char path[96];
         FILE *f;
-        long hz = 0;
-
-        if (!CPU_ISSET(i, &set))
+        freq[i] = -1;
+        if (i >= CPU_SETSIZE || !CPU_ISSET(i, &set))
             continue;
         snprintf(path, sizeof path,
                  "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
         f = fopen(path, "r");
         if (!f)
             continue;
-        if (fscanf(f, "%ld", &hz) == 1 && hz >= best_f) {
-            best_f = hz;
-            best = i;
-        }
+        if (fscanf(f, "%ld", &freq[i]) != 1)
+            freq[i] = -1;
         fclose(f);
     }
+    for (r = 0; r <= rank; r++) {
+        long top = -1;
+        best = -1;
+        for (i = 0; i < 64; i++)
+            if (freq[i] >= 0 && freq[i] < limit && freq[i] >= top) {
+                top = freq[i];
+                best = i;
+            }
+        if (best < 0)
+            return -1;
+        limit = top;
+    }
     return best;
+}
+
+int recomp_android_fast_cpu(void)
+{
+    return recomp_android_cpu_rank(0);
 }
 
 #else

@@ -49,6 +49,11 @@ const char *recomp_android_dir(void);
  * cannot be read. */
 int recomp_android_fast_cpu(void);
 
+/* The same by rank: 0 the fastest core, 1 the highest-numbered core of the
+ * next slower kind (the "big" cluster under a "prime" core), and so on;
+ * -1 when there is no such kind. */
+int recomp_android_cpu_rank(int rank);
+
 #ifdef __cplusplus
 }
 #endif
