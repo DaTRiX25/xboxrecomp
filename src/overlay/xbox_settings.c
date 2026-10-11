@@ -41,6 +41,9 @@ static const char *const k_filters[]  = { "nearest", "linear", "integer", NULL }
 static const char *const k_overscan[] = { "off", "crop", NULL };
 static const char *const k_fits[]     = { "letterbox", "fill16x10", NULL };
 static const char *const k_speakers[] = { "auto", "stereo", "5.1", NULL };
+#if defined(__ANDROID__)
+static const char *const k_scale[]    = { "1", "1.5", "2", "3", "4", NULL };
+#endif
 static const char *const k_aniso[]    = { "off", "2x", "4x", "8x", "16x", NULL };
 static const char *const k_aniso_env[] = { "1", "2", "4", "8", "16", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
@@ -61,7 +64,11 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_DISPLAY_FILTER]     = SETTING("display.filter", XS_CHOICE, 0, RENV_PRESENT_FILTER, k_filters, NULL, 0, 0, 0),
     [XS_DISPLAY_OVERSCAN]   = SETTING("display.overscan", XS_CHOICE, 0, RENV_PRESENT_OVERSCAN, k_overscan, NULL, 0, 0, 0),
     [XS_DISPLAY_FIT]        = SETTING("display.fit", XS_CHOICE, 0, RENV_PRESENT_FIT, k_fits, NULL, 0, 0, 0),
+#if defined(__ANDROID__)     /* with 1.5 (the Vulkan backend's half step): a choice there */
+    [XS_GRAPHICS_RENDER_SCALE] = SETTING("graphics.render_scale", XS_CHOICE, XS_RESTART, RENV_RENDER_SCALE, k_scale, k_scale, 0, 0, 0),
+#else
     [XS_GRAPHICS_RENDER_SCALE] = SETTING("graphics.render_scale", XS_INT, XS_RESTART, RENV_RENDER_SCALE, NULL, NULL, 1, 4, 1),
+#endif
     [XS_GRAPHICS_ANISO]     = SETTING("graphics.aniso", XS_CHOICE, 0, RENV_GFX_ANISO, k_aniso, k_aniso_env, 0, 0, 0),
     [XS_GRAPHICS_AA]        = SETTING("graphics.aa", XS_CHOICE, 0, RENV_GFX_AA, k_aa, NULL, 0, 0, 0),
     [XS_GRAPHICS_SHARPEN]   = SETTING("graphics.sharpen", XS_FLOAT, 0, RENV_GFX_SHARPEN, NULL, NULL, 0, 1, 0),

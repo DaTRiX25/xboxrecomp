@@ -122,6 +122,9 @@ static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
 #if defined(__ANDROID__)
 static const char *const n_vibration[] = { "Auto", "Controller", "This device", "Off", NULL };
 #endif
+#if defined(__ANDROID__)
+static const char *const n_scale[]     = { "1x (640x480)", "1.5x (960x720)", "2x (1280x960)", "3x", "4x", NULL };
+#endif
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
@@ -132,7 +135,11 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_FILTER */     { "Filter", "How the picture is scaled to the window.", 1, FMT_PLAIN, n_filter, 0 },
     /* XS_DISPLAY_OVERSCAN */   { "Overscan", "Crop the border a TV would have hidden.", 1, FMT_PLAIN, n_overscan, 0 },
     /* XS_DISPLAY_FIT */        { "Present fit", "Fill the window's height on a 16:10 screen.", 1, FMT_PLAIN, n_fit, 0 },
+#if defined(__ANDROID__)
+    /* XS_GRAPHICS_RENDER_SCALE */ { "Render scale", "Internal resolution, a multiple of the Xbox's 640x480. 1.5x is 960x720.", 1, FMT_PLAIN, n_scale, 0 },
+#else
     /* XS_GRAPHICS_RENDER_SCALE */ { "Render scale", "Internal resolution, a multiple of the Xbox's.", 1, FMT_TIMES, NULL, 0 },
+#endif
     /* XS_GRAPHICS_ANISO */    { "Anisotropic filtering", "Sharper textures at a slant, the road ahead. Costs GPU time.", 1, FMT_PLAIN, n_aniso, 0 },
     /* XS_GRAPHICS_AA */       { "Anti-aliasing", "Smooths jagged edges after the frame is drawn. FXAA is one cheap pass; SMAA is three, and cleaner.", 1, FMT_PLAIN, n_aa, 0 },
     /* XS_GRAPHICS_SHARPEN */  { "Sharpening", "Contrast-adaptive sharpening (AMD CAS), against the softness of the anti-aliasing and the scale-up.", 0.05, FMT_PERCENT, NULL, 0 },
