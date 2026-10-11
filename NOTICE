@@ -42,8 +42,12 @@ LGPL-2.1-or-later — extracted from xemu
   proprietary code is expressly permitted by the LGPL — that is what
   distinguishes it from the GPL. What the LGPL asks in return is that the
   notices stay, that the source stays available, and that a user can relink
-  against a modified version. Distributing this repository, source included,
-  satisfies that.
+  against a modified version. For the source, this repository is that. A
+  program distributed in binary form that links these files must carry this
+  notice and the licence text, and must come with the complete source of the
+  release it was built from (this repository at the release's commit, and
+  the build scripts of the program), so that whoever has it can change these
+  files and build the program again.
 
 
 Derived algorithms — credited, independently implemented
