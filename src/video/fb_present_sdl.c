@@ -482,6 +482,12 @@ static void fit_window(SDL_Window *win)
             || ub.w <= 0 || ub.h <= 0)
         return;
     SDL_GetDisplayDPI(di, &ddpi, NULL, NULL);
+    {
+        SDL_DisplayMode dm;
+        if (SDL_GetCurrentDisplayMode(di, &dm) == 0)
+            fprintf(stderr, "[PRESENT] display %d mode %dx%d at %d Hz\n", di, dm.w, dm.h,
+                    dm.refresh_rate);
+    }
     SDL_GetWindowBordersSize(win, &bt, &bl, &bb, &br);
     SDL_GetWindowSize(win, &w, &h);
     SDL_GetWindowPosition(win, &x, &y);
