@@ -273,6 +273,14 @@ const struct nv2a_pb_present *nv2a_pb_present_state(void);
  * the frame itself, as <prefix>flip_NNNNN.bmp. */
 int nv2a_pb_dump_at_listed(uint32_t flip);
 
+/* A host's own work at every flip (a title's debug monitor: Burnout 3's
+ * BO3_HUD_MON walks its 2D scenes): `fn` is called on the thread that
+ * executes the flip, the guest's, after the frame was presented and the
+ * RECOMP_FB_DUMP_AT dump of this flip was written, with the flip's number
+ * (the one in fb_flip_NNNNN.bmp and in the flip log). NULL, the default:
+ * nothing is called. Set it before the guest runs. */
+void nv2a_pb_set_flip_hook(void (*fn)(uint32_t flip));
+
 /* One batch, at SET_BEGIN_END(0).
  *
  * attr[i].offset is a guest address, unless `inline_data` is set: then the
