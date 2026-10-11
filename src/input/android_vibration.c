@@ -9,25 +9,38 @@
  * (device vibration as a fallback for a pad without motors); the code is this
  * runtime's own.
  *
+ * SDL2 cannot rumble a pad on Android at all (2.32.10's joystick driver:
+ * ANDROID_JoystickRumble is SDL_Unsupported), so an external pad does not
+ * rumble here, whatever it is; only a pad SDL's HIDAPI drivers have opened
+ * (some USB pads) reports motors.
+ *
  * RECOMP_ANDROID_VIBRATION = auto | controller | device | off (default auto):
- *   auto        the pad when it can rumble, else the device
+ *   auto        the pad when SDL says it can rumble; else the device, when
+ *               the pad is the device's own (InputDevice.isExternal() false).
+ *               An external pad without rumble gets nothing: the handheld
+ *               does not shake on the table for a pad held elsewhere.
  *   controller  the pad only (what every other host does)
- *   device      the device only; the pad is told to stop
+ *   device      the device only, whatever the pad; the pad is told to stop
  *   off         neither
  *
- * xbox_AndroidVibration() is called where the title's motor speeds reach the
- * host pad (xinput_device.c). It never blocks: it leaves a strength for a
- * worker thread, which makes the binder calls.
+ * xbox_AndroidVibration() is called where the motors' levels reach the host
+ * pad (xinput_device.c), after the rumble curve (input_core.c: peak, gate,
+ * strength, release). It never blocks: it leaves an amplitude for a worker
+ * thread, which makes the binder calls.
  *
- *   - Strength 0..255: the big motor in full, the small one at half weight,
- *     in steps of 16, so a hum that wanders every frame does not restart the
- *     motor every frame.
- *   - Each strength is one long one-shot (5 s) that replaces what plays; it
+ *   - Amplitude 0..255: the big motor in full, the small one at half weight.
+ *     16 levels with one step of hysteresis (xbox_RumbleQuantise): the motor
+ *     is given a new amplitude only when what is wanted is a whole level
+ *     from what plays, so a level that wanders does not restart it.
+ *   - Each amplitude is one long one-shot (5 s) that replaces what plays; it
  *     is renewed after 4 s only while the title keeps asking, so the motor
  *     ends by itself if the title stops calling (a pause, a crash).
  *   - No replacement sooner than 30 ms after the last; a pulse lasts at
  *     least 40 ms (the title's shortest rumbles are a frame or two).
  *   - Without amplitude control the motor is on above a threshold, else off.
+ *   - The title's idle hum is silence by the rumble gate; before the gate
+ *     RECOMP_ANDROID_VIBRATION_FLOOR was what did it, and it still sets the
+ *     gate's speed when given (xinput_device.c).
  */
 #if defined(__ANDROID__)
 
@@ -42,6 +55,8 @@
 #include <SDL.h>
 #include <SDL_system.h>
 
+#include "rumble_curve.h"
+
 enum { VIB_AUTO, VIB_CONTROLLER, VIB_DEVICE, VIB_OFF };
 
 #define SHOT_MS       5000
@@ -54,7 +69,9 @@ enum { VIB_AUTO, VIB_CONTROLLER, VIB_DEVICE, VIB_OFF };
 static pthread_mutex_t s_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_cv;
 static int      s_started, s_mode = -1;
-static int      s_want;             /* 0..255, quantised */
+static int      s_want;             /* 0..255, as wanted (the worker quantises) */
+static int      s_own_only;         /* auto: only for the device's own pad */
+static int      s_vendor, s_product;    /* the first pad */
 static uint64_t s_asked_ms;         /* the title's last call */
 static unsigned s_sent, s_cancelled;
 
@@ -77,6 +94,67 @@ static int mode(void)
     return s_mode;
 }
 
+/* Whether the pad with this USB vendor and product is the device's own:
+ * android.view.InputDevice.isExternal() (API 29) of the game pad or joystick
+ * with those ids. Its own when nothing says otherwise (no such device, an
+ * older Android), which is what auto did before it asked. Worker thread. */
+static int pad_is_own(JNIEnv *env, int vendor, int product)
+{
+    jclass idc = (*env)->FindClass(env, "android/view/InputDevice");
+    jmethodID ids_m, get_m, vid_m, pid_m, src_m, ext_m;
+    jintArray ids;
+    jint *id;
+    jsize n, i;
+    int own = 1, found = 0;
+
+    if (!idc) {
+        (*env)->ExceptionClear(env);
+        return 1;
+    }
+    ids_m = (*env)->GetStaticMethodID(env, idc, "getDeviceIds", "()[I");
+    get_m = (*env)->GetStaticMethodID(env, idc, "getDevice", "(I)Landroid/view/InputDevice;");
+    vid_m = (*env)->GetMethodID(env, idc, "getVendorId", "()I");
+    pid_m = (*env)->GetMethodID(env, idc, "getProductId", "()I");
+    src_m = (*env)->GetMethodID(env, idc, "getSources", "()I");
+    ext_m = (*env)->GetMethodID(env, idc, "isExternal", "()Z");
+    (*env)->ExceptionClear(env);
+    ids = ids_m && get_m && vid_m && pid_m && src_m && ext_m
+        ? (jintArray)(*env)->CallStaticObjectMethod(env, idc, ids_m) : NULL;
+    if (ids && !(*env)->ExceptionCheck(env)) {
+        n = (*env)->GetArrayLength(env, ids);
+        id = (*env)->GetIntArrayElements(env, ids, NULL);
+        for (i = 0; id && i < n && !found; i++) {
+            jobject d = (*env)->CallStaticObjectMethod(env, idc, get_m, id[i]);
+            jint src;
+            if (!d || (*env)->ExceptionCheck(env)) {
+                (*env)->ExceptionClear(env);
+                continue;
+            }
+            src = (*env)->CallIntMethod(env, d, src_m);
+            /* SOURCE_GAMEPAD 0x401, SOURCE_JOYSTICK 0x1000010 */
+            if (((src & 0x401) == 0x401 || (src & 0x1000010) == 0x1000010)
+                    && (*env)->CallIntMethod(env, d, vid_m) == vendor
+                    && (*env)->CallIntMethod(env, d, pid_m) == product) {
+                found = 1;
+                own = !(*env)->CallBooleanMethod(env, d, ext_m);
+            }
+            (*env)->DeleteLocalRef(env, d);
+        }
+        if (id)
+            (*env)->ReleaseIntArrayElements(env, ids, id, JNI_ABORT);
+    }
+    (*env)->ExceptionClear(env);
+    if (ids)
+        (*env)->DeleteLocalRef(env, ids);
+    (*env)->DeleteLocalRef(env, idc);
+    fprintf(stderr, "  [RUMBLE] pad %04x:%04x is %s%s\n", vendor, product,
+            own ? "this device's own: its rumble goes to the device's vibrator"
+                : "an external pad: no rumble (SDL2 cannot rumble a pad on Android;"
+                  " Input > Vibration > This device shakes the device anyway)",
+            found ? "" : " (no answer from the input devices for it, taken as its own)");
+    return own;
+}
+
 /* The worker: owns every JNI object. */
 static void *worker(void *arg)
 {
@@ -85,6 +163,7 @@ static void *worker(void *arg)
     jclass cls, eff = NULL;
     jmethodID get, vibrate = NULL, cancel = NULL, one_shot = NULL, has, amp;
     int have = 0, has_amp = 0, playing = 0;
+    int own = 1, own_vendor = -1, own_product = -1;
     uint64_t last_call = 0, pulse_at = 0, shot_at = 0;
     struct timespec until;
 
@@ -126,11 +205,22 @@ static void *worker(void *arg)
         uint64_t t = now_ms();
         int want = s_want, level;
 
+        if (s_own_only && (s_vendor != own_vendor || s_product != own_product)) {
+            own_vendor = s_vendor;
+            own_product = s_product;
+            pthread_mutex_unlock(&s_mu);
+            own = pad_is_own(env, own_vendor, own_product);
+            pthread_mutex_lock(&s_mu);
+            continue;
+        }
+        if (s_own_only && !own)
+            want = 0;                           /* an external pad's rumble */
         if (want && t - s_asked_ms > ASK_STALE_MS)
             want = 0;                           /* the title went quiet */
         if (!has_amp)
-            want = want >= ONOFF_FLOOR ? 255 : 0;
-        level = want;
+            level = want >= ONOFF_FLOOR ? 255 : 0;
+        else
+            level = xbox_RumbleQuantise(playing, want);
         if (level != playing || (playing && t - shot_at >= RENEW_MS)) {
             uint64_t wait_until = last_call + MIN_GAP_MS;
             if (!level && playing && pulse_at + MIN_PULSE_MS > wait_until)
@@ -177,10 +267,12 @@ static void *worker(void *arg)
     return NULL;
 }
 
-/* The title's motor speeds for a pad (0..65535 each, after the host's rumble
- * curve); pad_can_rumble: SDL says the pad has motors. Returns 1 when the pad
- * itself should rumble, 0 when it should be told to stop. */
-int xbox_AndroidVibration(unsigned left, unsigned right, int pad_can_rumble)
+/* The first pad's motor levels (0..65535 each, after the rumble curve);
+ * pad_can_rumble: SDL says the pad has motors; vendor, product: the pad's.
+ * Returns 1 when the pad itself should rumble, 0 when it should be told to
+ * stop. */
+int xbox_AndroidVibration(unsigned left, unsigned right, int pad_can_rumble,
+                          int vendor, int product)
 {
     int m = mode(), device, q;
 
@@ -189,18 +281,17 @@ int xbox_AndroidVibration(unsigned left, unsigned right, int pad_can_rumble)
     if (m == VIB_CONTROLLER)
         return 1;
     device = m == VIB_DEVICE || !pad_can_rumble;
-    if (!device)
-        return 1;
-    q = (int)((left >> 8) + (right >> 9));          /* big in full, small at half */
-    if (q > 255)
-        q = 255;
-    q = q ? ((q + 15) & ~15) : 0;                   /* steps of 16, never rounded to 0 */
+    q = device ? (int)((left >> 8) + (right >> 9)) : 0;    /* big in full, small at half */
     if (q > 255)
         q = 255;
     pthread_mutex_lock(&s_mu);
     if (!s_started) {
         pthread_t th;
         pthread_condattr_t ca;
+        if (!device) {                  /* the pad rumbles, and no worker yet */
+            pthread_mutex_unlock(&s_mu);
+            return 1;
+        }
         pthread_condattr_init(&ca);
         pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
         pthread_cond_init(&s_cv, &ca);
@@ -209,12 +300,15 @@ int xbox_AndroidVibration(unsigned left, unsigned right, int pad_can_rumble)
             pthread_detach(th);
     }
     s_asked_ms = now_ms();
+    s_own_only = m == VIB_AUTO;
+    s_vendor = vendor;
+    s_product = product;
     if (q != s_want) {
         s_want = q;
         pthread_cond_signal(&s_cv);
     }
     pthread_mutex_unlock(&s_mu);
-    return 0;
+    return !device;
 }
 
 #else

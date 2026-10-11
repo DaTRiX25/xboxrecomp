@@ -11,7 +11,8 @@ set(INPUT_SRC ${CMAKE_CURRENT_LIST_DIR}/../../src/input)
 add_executable(input_map_test
     test_main.c
     ${INPUT_SRC}/input_map.c
-    ${INPUT_SRC}/input_core.c)
+    ${INPUT_SRC}/input_core.c
+    ${INPUT_SRC}/rumble_curve.c)
 target_include_directories(input_map_test PRIVATE ${INPUT_SRC})
 target_link_libraries(input_map_test PRIVATE platform)
 if(NOT WIN32)

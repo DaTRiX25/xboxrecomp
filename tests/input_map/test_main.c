@@ -324,7 +324,7 @@ const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f
 static void test_cache(void)
 {
     XBOX_INPUT_STATE st;
-    XBOX_VIBRATION vib = { 100, 200 };
+    XBOX_VIBRATION vib = { 2000, 3000 };  /* over the rumble gate */
 
     f_now = 5000;
     f_plugged[0] = 1;
@@ -397,7 +397,7 @@ static void test_cache(void)
 static void test_block(void)
 {
     XBOX_INPUT_STATE st;
-    XBOX_VIBRATION vib = { 100, 200 };
+    XBOX_VIBRATION vib = { 2000, 3000 };  /* over the rumble gate */
 
     f_now = 90000;
     f_plugged[0] = 1;
@@ -433,8 +433,193 @@ static void test_block(void)
     f_hold_start = 1;
     CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && st.Gamepad.wButtons == XBOX_GAMEPAD_START,
           "block: still neutral after the release");
-    CHECK(xbox_InputSetState(0, &vib) == ERROR_SUCCESS && f_last_vib[0].wLeftMotorSpeed == 100,
+    CHECK(xbox_InputSetState(0, &vib) == ERROR_SUCCESS && f_last_vib[0].wLeftMotorSpeed == 2000,
           "block: rumble stayed off after closing");
+    xbox_InputSetBackend(NULL);
+}
+
+/* The rumble curve between the title and a backend (input_core.c): what the
+ * fake pad is handed, with the clock in the test's hands. The curve's own
+ * numbers are tests/input_rumble's. */
+static void rumble_begin(const char *strength, const char *peak)
+{
+    set_env("RECOMP_INPUT_RUMBLE_GAIN", strength);
+    set_env("RECOMP_INPUT_RUMBLE_PEAK", peak);
+    memset(f_plugged, 0, sizeof f_plugged);
+    f_plugged[0] = 1;
+    f_kb_on = 0;
+    xbox_InputSetBackend(&k_fake);      /* also: the variables are read again */
+    xbox_InputInit();
+    memset(f_set_calls, 0, sizeof f_set_calls);
+    memset(f_last_vib, 0, sizeof f_last_vib);
+}
+
+#define FRAC(w) ((w) / 65535.0)
+#define NEAR(w, f) ((w) / 65535.0 > (f) - 0.005 && (w) / 65535.0 < (f) + 0.005)
+
+static void test_rumble(void)
+{
+    XBOX_VIBRATION v = { 0, 0 };
+    int sets;
+
+    /* No variables: the title's speeds as they are (strength 1, peak 65535),
+     * but for the gate. */
+    f_now = 200000;
+    rumble_begin(NULL, NULL);
+    v.wLeftMotorSpeed = 30000; v.wRightMotorSpeed = 658;
+    CHECK(xbox_InputSetState(0, &v) == ERROR_SUCCESS && f_set_calls[0] == 1
+          && f_last_vib[0].wLeftMotorSpeed == 30000 && f_last_vib[0].wRightMotorSpeed == 0,
+          "default: %u/%u", f_last_vib[0].wLeftMotorSpeed, f_last_vib[0].wRightMotorSpeed);
+
+    /* The title's peak and a strength: the decision's table, at the pad. */
+    f_now += 5000;
+    rumble_begin("1.5", "52054");
+    v.wLeftMotorSpeed = 52054; v.wRightMotorSpeed = 18349;
+    xbox_InputSetState(0, &v);
+    CHECK(f_last_vib[0].wLeftMotorSpeed == 65535 && NEAR(f_last_vib[0].wRightMotorSpeed, 0.50),
+          "1.5: %.3f/%.3f", FRAC(f_last_vib[0].wLeftMotorSpeed), FRAC(f_last_vib[0].wRightMotorSpeed));
+    /* The live setter (the overlay) replaces the variable. */
+    xbox_InputSetRumbleStrength(2.0);
+    v.wRightMotorSpeed = 52054;                 /* up and down again: a fresh level */
+    xbox_InputSetState(0, &v);
+    f_now += 5000;
+    xbox_InputRumbleTick(0);
+    v.wLeftMotorSpeed = 5734; v.wRightMotorSpeed = 1791;
+    xbox_InputSetState(0, &v);
+    f_now += 5000;
+    xbox_InputRumbleTick(0);
+    CHECK(NEAR(f_last_vib[0].wLeftMotorSpeed, 0.33) && NEAR(f_last_vib[0].wRightMotorSpeed, 0.19),
+          "2.0: %.3f/%.3f", FRAC(f_last_vib[0].wLeftMotorSpeed), FRAC(f_last_vib[0].wRightMotorSpeed));
+    /* Strength 0: off, and the pad is told. */
+    xbox_InputSetRumbleStrength(0.0);
+    f_now += 5000;
+    xbox_InputRumbleTick(0);
+    CHECK(!f_last_vib[0].wLeftMotorSpeed && !f_last_vib[0].wRightMotorSpeed, "strength 0 not off");
+    /* A spelling that is no number ("linear" was one once): the default. */
+    f_now += 5000;
+    rumble_begin("linear", NULL);
+    v.wLeftMotorSpeed = 30000; v.wRightMotorSpeed = 0;
+    xbox_InputSetState(0, &v);
+    CHECK(f_last_vib[0].wLeftMotorSpeed == 30000, "no number: %u", f_last_vib[0].wLeftMotorSpeed);
+
+    /* The release, by the pad poll's clock: full, then the title's zero. */
+    f_now += 5000;
+    rumble_begin("1", "52054");
+    v.wLeftMotorSpeed = 52054; v.wRightMotorSpeed = 0;
+    xbox_InputSetState(0, &v);
+    CHECK(f_last_vib[0].wLeftMotorSpeed == 65535, "release: no rise");
+    f_now += 1000;
+    xbox_InputRumbleTick(0);                    /* held: as it was */
+    CHECK(f_last_vib[0].wLeftMotorSpeed == 65535, "a held level moved");
+    v.wLeftMotorSpeed = 0;
+    sets = f_set_calls[0];
+    xbox_InputSetState(0, &v);
+    CHECK(f_set_calls[0] == sets && f_last_vib[0].wLeftMotorSpeed == 65535,
+          "the zero cut the motor at once");
+    for (int i = 0; i < 90; i++) {              /* a 1 ms poll */
+        XBOX_INPUT_STATE st;
+        f_now += 1;
+        if (i & 1)
+            xbox_InputRumbleTick(0);
+        else
+            xbox_InputGetState(0, &st);         /* the title's own poll ticks too */
+    }
+    CHECK(f_last_vib[0].wLeftMotorSpeed / 65535.0 > 0.36
+          && f_last_vib[0].wLeftMotorSpeed / 65535.0 < 0.44,
+          "90 ms after the zero: %.3f", FRAC(f_last_vib[0].wLeftMotorSpeed));
+    /* A falling level is not written to the pad at every poll. */
+    CHECK(f_set_calls[0] - sets >= 4 && f_set_calls[0] - sets <= 7,
+          "%d writes in 90 ms of falling", f_set_calls[0] - sets);
+    /* A rise in the fall goes out at once. */
+    v.wLeftMotorSpeed = 52054;
+    xbox_InputSetState(0, &v);
+    CHECK(f_last_vib[0].wLeftMotorSpeed == 65535, "rise in a fall held back");
+    /* And the fall ends in a zero that is sent, after which nothing is. */
+    v.wLeftMotorSpeed = 0;
+    xbox_InputSetState(0, &v);
+    for (int i = 0; i < 600; i++) {
+        f_now += 1;
+        xbox_InputRumbleTick(0);
+    }
+    CHECK(!f_last_vib[0].wLeftMotorSpeed && !f_last_vib[0].wRightMotorSpeed, "no final zero");
+    sets = f_set_calls[0];
+    for (int i = 0; i < 1000; i++) {
+        f_now += 1;
+        xbox_InputRumbleTick(0);
+    }
+    CHECK(f_set_calls[0] == sets, "%d writes to a stopped pad", f_set_calls[0] - sets);
+
+    /* A held rumble is given again every 150 ms (SDL's rumble runs out). */
+    v.wLeftMotorSpeed = 20000;
+    xbox_InputSetState(0, &v);
+    sets = f_set_calls[0];
+    for (int i = 0; i < 600; i++) {
+        f_now += 1;
+        xbox_InputRumbleTick(0);
+    }
+    CHECK(f_set_calls[0] - sets == 4, "%d refreshes in 600 ms", f_set_calls[0] - sets);
+
+    /* The window out of focus: a zero, then nothing, the refresh included;
+     * back in front, what the title last asked for plays again. */
+    sets = f_set_calls[0];
+    xbox_InputSetBackground(1);
+    CHECK(f_set_calls[0] == sets + 1 && !f_last_vib[0].wLeftMotorSpeed, "background: no stop");
+    sets = f_set_calls[0];
+    for (int i = 0; i < 600; i++) {
+        f_now += 1;
+        xbox_InputRumbleTick(0);
+    }
+    v.wLeftMotorSpeed = 52054;
+    CHECK(xbox_InputSetState(0, &v) == ERROR_SUCCESS && f_set_calls[0] == sets,
+          "background: %d writes", f_set_calls[0] - sets);
+    xbox_InputSetBackground(1);                 /* twice is once */
+    CHECK(f_set_calls[0] == sets, "background twice");
+    xbox_InputSetBackground(0);
+    f_now += 1;
+    xbox_InputRumbleTick(0);
+    CHECK(f_last_vib[0].wLeftMotorSpeed == 65535, "foreground: %u", f_last_vib[0].wLeftMotorSpeed);
+    /* The overlay over a window out of focus: silent until both are over. */
+    xbox_InputSetBlocked(1);
+    xbox_InputSetBackground(1);
+    xbox_InputSetBlocked(0);
+    {
+        /* (The block's latch on the buttons, let go: not this test's.) */
+        XBOX_INPUT_STATE st;
+        f_hold_start = 0;
+        xbox_InputGetState(0, &st);
+        f_hold_start = 1;
+    }
+    f_now += 200;
+    xbox_InputRumbleTick(0);
+    CHECK(!f_last_vib[0].wLeftMotorSpeed, "unblocked in the background: rumble");
+    xbox_InputSetBackground(0);
+    f_now += 1;
+    xbox_InputRumbleTick(0);
+    CHECK(f_last_vib[0].wLeftMotorSpeed == 65535, "both over: no rumble");
+
+    /* No pad: the title's speeds are kept, and a pad that appears gets them. */
+    f_now += 5000;
+    rumble_begin("1", NULL);
+    v.wLeftMotorSpeed = 40000; v.wRightMotorSpeed = 0;
+    CHECK(xbox_InputSetState(1, &v) == ERROR_DEVICE_NOT_CONNECTED && !f_set_calls[1],
+          "rumble reached an empty port");
+    f_plugged[1] = 1;
+    f_now += 1000;
+    CHECK(xbox_InputIsConnected(1), "port 1 not seen");
+    xbox_InputRumbleTick(1);
+    CHECK(f_set_calls[1] == 1 && f_last_vib[1].wLeftMotorSpeed == 40000,
+          "a pad that appeared: %d writes, %u", f_set_calls[1], f_last_vib[1].wLeftMotorSpeed);
+
+    /* Shutdown: every motor off and forgotten. */
+    xbox_InputShutdown();
+    CHECK(!f_last_vib[1].wLeftMotorSpeed, "shutdown left port 1 on");
+    sets = f_set_calls[1];
+    f_now += 1000;
+    xbox_InputRumbleTick(1);
+    CHECK(f_set_calls[1] == sets, "rumble after shutdown");
+
+    set_env("RECOMP_INPUT_RUMBLE_GAIN", NULL);
+    set_env("RECOMP_INPUT_RUMBLE_PEAK", NULL);
     xbox_InputSetBackend(NULL);
 }
 
@@ -524,6 +709,7 @@ int main(int argc, char **argv)
     test_readme(argc > 1 ? argv[1] : "input_README.md");
     test_cache();
     test_block();
+    test_rumble();
     test_combo_guard();
     test_trigger_deadzone();
     test_face_layout();

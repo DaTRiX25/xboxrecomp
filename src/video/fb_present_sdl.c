@@ -668,6 +668,43 @@ static void close_present(SDL_Renderer *ren)
         SDL_DestroyRenderer(ren);
 }
 
+#if defined(__ANDROID__)
+/* The app leaves the screen and comes back (Home, recents, screen off): SDL
+ * delivers these from the activity's thread, at once, which is why this is an
+ * event watch and not the event loop. While away the title is held as the
+ * overlay holds it (kernel_pause.h: it stops at its next flip, its sound
+ * stops with it), and the presenter is told its surface is gone; it makes a
+ * new one at its first present after the return. A pause the overlay made
+ * itself is left alone. */
+static int s_bg_paused;
+void xbox_HostPause(int on);
+int  xbox_HostPaused(void);
+void fbv_android_surface_gone(void);
+
+static int android_lifecycle(void *user, SDL_Event *ev)
+{
+    (void)user;
+    if (ev->type == SDL_APP_WILLENTERBACKGROUND || ev->type == SDL_APP_DIDENTERBACKGROUND) {
+        if (!s_bg_paused && !xbox_HostPaused()) {
+            s_bg_paused = 1;
+            xbox_HostPause(1);
+        }
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+        fbv_android_surface_gone();
+#endif
+        if (ev->type == SDL_APP_DIDENTERBACKGROUND)
+            fprintf(stderr, "[PRESENT] the app is in the background: the title is held\n");
+    } else if (ev->type == SDL_APP_DIDENTERFOREGROUND) {
+        fprintf(stderr, "[PRESENT] the app is back in front\n");
+        if (s_bg_paused) {
+            s_bg_paused = 0;
+            xbox_HostPause(0);
+        }
+    }
+    return 1;
+}
+#endif
+
 int xbox_HostWindowMain(int (*guest_main)(void))
 {
     SDL_Window *win;
@@ -717,6 +754,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * SDL_HINT_WINDOWS_DPI_SCALING stays off: 1 SDL coordinate = 1 pixel, and
      * the starting size is scaled below. Must precede SDL_Init(VIDEO). */
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
+#if defined(__ANDROID__)
+    SDL_AddEventWatch(android_lifecycle, NULL);
 #endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "[PRESENT] SDL video unavailable (%s); running headless\n",

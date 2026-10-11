@@ -40,6 +40,7 @@
 
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "nv2a_pb_state.h"
+#include "platform/host_time.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -290,6 +291,54 @@ static const char *stop_salvage(const uint8_t *mem, uint32_t from, uint32_t to,
 static uint32_t s_left, s_subch, s_method;
 static int s_noninc;
 
+/* RECOMP_TRACE=pb_slow[=ms]: the method the executor stood in. A frame that
+ * is long with little of it in draws (RECOMP_TRACE=frametime: ex_busy far
+ * above ex_draw) spent the time in one command or another: a report that
+ * waits for the GPU, the early submit at FLIP_STALL, a semaphore release.
+ * This names it. */
+static uint64_t s_slow_ns = UINT64_MAX;      /* unread; 0 off */
+
+/* The executor's own parts of FLIP_STALL (the method holds for the vblank,
+ * so it is not timed whole): 0 when the trace is off, else the time now. */
+uint64_t nv2a_pb_slow_begin(void)
+{
+    return s_slow_ns && s_slow_ns != UINT64_MAX ? xbox_HostNowNs() : 0;
+}
+
+void nv2a_pb_slow_end(const char *what, uint64_t t0)
+{
+    uint64_t d;
+    if (!t0)
+        return;
+    d = xbox_HostNowNs() - t0;
+    if (d >= s_slow_ns)
+        fprintf(stderr, "[PB] slow: %s: %.2f ms at %llu us\n", what, d / 1e6,
+                (unsigned long long)(t0 / 1000u));
+}
+
+/* One timing a method header, over all its parameters, not one a word: a
+ * frame's inline vertex data is some 100 000 parameter words, and two clock
+ * reads for each took 4 ms a frame (decode 1.6 -> 5.7 ms: the trace made
+ * frames late). The run is closed when its last parameter is done; a run
+ * still open when a walk ends is dropped (the title had not sent the rest). */
+static uint64_t s_run_t0;
+static uint32_t s_run_method, s_run_first;
+static int s_run_have;
+
+static void slow_run_end(uint32_t subch)
+{
+    uint64_t d;
+    if (!s_run_t0)
+        return;
+    d = xbox_HostNowNs() - s_run_t0;
+    if (d >= s_slow_ns && s_run_method != 0x0130u)   /* NV097_FLIP_STALL: see above */
+        fprintf(stderr, "[PB] slow method 0x%04X (subchannel %u, first param 0x%08X): %.2f ms"
+                " at %llu us\n", s_run_method, subch, s_run_first, d / 1e6,
+                (unsigned long long)(s_run_t0 / 1000u));
+    s_run_t0 = 0;
+}
+
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -307,6 +356,11 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         return;
     if (s_exec_enabled)
         nv2a_pb_perf_scan_begin();
+    if (s_slow_ns == UINT64_MAX) {
+        const char *e = recomp_env(RENV_PB_SLOW);
+        double ms = e && *e ? atof(e) : 0.0;
+        s_slow_ns = !e ? 0 : (uint64_t)((ms > 0.0 ? ms : 5.0) * 1e6);
+    }
     /* Test hook: RECOMP_PB_INJECT_STOP=N stops every Nth walk at its first
      * word, so the recovery from a stop can be seen without a real desync.
      * Never the first walk: it sets up the semaphore, and without that the
@@ -335,11 +389,16 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             /* Same walk, two consumers: the survey counts, the executor
              * acts. Keeping them on one decode means they can never
              * disagree about what the stream said. */
+            if (s_run_t0 && !s_run_have) {
+                s_run_first = w;
+                s_run_have = 1;
+            }
             if (s_exec_enabled)
                 nv2a_pb_exec_method(s_subch, s_method, w);
             if (!s_noninc)
                 s_method += 4;
-            s_left--;
+            if (--s_left == 0 && s_run_t0)
+                slow_run_end(s_subch);
             continue;
         }
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
@@ -370,6 +429,11 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             s_subch  = (w >> 13) & 7u;
             s_method =  w & 0x1FFCu;
             s_noninc = (w & 0xE0000000u) == 0x40000000u;
+            if (s_slow_ns && s_exec_enabled && s_left) {
+                s_run_t0 = xbox_HostNowNs();
+                s_run_method = s_method;
+                s_run_have = 0;
+            }
             continue;
         }
         unknown++;
@@ -389,6 +453,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                     start_va, end_va, at, w, words, why, fence, v);
     }
 
+    s_run_t0 = 0;                   /* a run the walk left open is not timed */
     if (s_exec_enabled)
         nv2a_pb_perf_scan_end();
     s_tot_words += words;

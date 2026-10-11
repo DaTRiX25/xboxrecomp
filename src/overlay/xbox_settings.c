@@ -59,6 +59,9 @@ static const char *const k_power[]    = { "stock", "performance", "battery", NUL
 #define SETTING(k, t, f, e, c, ev, mn, mx, b) \
     { .key = (k), .type = (t), .flags = (f), .env = (e), .choices = (c), \
       .env_vals = (ev), .min = (mn), .max = (mx), .builtin = (b) }
+#define SETTING_STEP(k, t, f, e, mn, mx, b, st) \
+    { .key = (k), .type = (t), .flags = (f), .env = (e), \
+      .min = (mn), .max = (mx), .builtin = (b), .step = (st) }
 static xs_setting s_set[XS_COUNT] = {
     [XS_DISPLAY_FULLSCREEN] = SETTING("display.fullscreen", XS_BOOL, 0, RENV_PRESENT_FULLSCREEN, NULL, NULL, 0, 0, 0),
     [XS_DISPLAY_ASPECT]     = SETTING("display.aspect", XS_CHOICE, XS_RESTART, RENV_DISPLAY_WIDESCREEN, k_aspects, k_aspect_env, 0, 0, 0),
@@ -80,9 +83,11 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_AUDIO_FX_LEVEL]     = SETTING("audio.fx_level", XS_FLOAT, 0, RENV_AUDIO_FX_LEVEL, NULL, NULL, 0, 1, 0.25),
     [XS_INPUT_DEADZONE]     = SETTING("input.deadzone", XS_INT, 0, RENV_PAD_DEADZONE, NULL, NULL, 0, 32767, 0),
     [XS_INPUT_TRIGGER_DEADZONE] = SETTING("input.trigger_deadzone", XS_INT, 0, RENV_PAD_TRIGGER_DEADZONE, NULL, NULL, 0, 254, 0),
-    /* 0..3: gain x sqrt(speed), clamped to full (xinput_device.c). A weak
-     * motor (a handheld's own vibrator) wants more than a pad's. */
-    [XS_INPUT_RUMBLE]       = SETTING("input.rumble", XS_FLOAT, 0, RENV_INPUT_RUMBLE_GAIN, NULL, NULL, 0, 3, 1),
+    /* 0..3 in quarters: the rumble curve's strength, motor = (speed /
+     * peak) ^ (1 / strength) (input_core.c, rumble_curve.h). 1 is the
+     * console's own, 0 off; a weak motor (a handheld's own vibrator) wants
+     * more than a pad's. */
+    [XS_INPUT_RUMBLE]       = SETTING_STEP("input.rumble", XS_FLOAT, 0, RENV_INPUT_RUMBLE_GAIN, 0, 3, 1, 0.25),
     [XS_INPUT_FACE_LAYOUT]  = SETTING("input.face_layout", XS_CHOICE, 0, RENV_INPUT_FACE_LAYOUT, k_face, NULL, 0, 0, 0),
     [XS_POWER_MODE]         = SETTING("power.mode", XS_CHOICE, XS_VIRTUAL, RENV_COUNT, k_power, NULL, 0, 0, 0),
     [XS_ADVANCED_PERF]      = SETTING("advanced.perf_overlay", XS_BOOL, 0, RENV_OVERLAY_PERF, NULL, NULL, 0, 0, 0),
@@ -137,6 +142,12 @@ static double clampd(const xs_setting *s, double v)
     }
     if (v < s->min) v = s->min;
     if (v > s->max) v = s->max;
+    /* A stepped value from anywhere (the file, a variable, the overlay) is
+     * the nearest step: a file's 1.3 from a finer slider reads as 1.25. */
+    if (s->type == XS_FLOAT && s->step > 0.0) {
+        v = floor(v / s->step + 0.5) * s->step;
+        if (v > s->max) v = s->max;
+    }
     return s->type == XS_INT ? floor(v + 0.5) : v;
 }
 
@@ -274,7 +285,7 @@ static void apply(xs_id id)
         xbox_InputSetTriggerDeadzone((int)v);
         break;
     case XS_INPUT_RUMBLE:
-        xbox_InputSetRumbleGain(v);
+        xbox_InputSetRumbleStrength(v);
         break;
     case XS_INPUT_FACE_LAYOUT:
         xbox_InputSetFaceLayoutNintendo(v != 0.0);
@@ -589,7 +600,7 @@ void xbox_SettingsFinish(void)
             if (e && parse_env(s, e, &v))
                 s->value = v;
             else if (e && *e)
-                s->locked = 1;     /* a spelling the overlay cannot show ("linear") */
+                s->locked = 1;     /* a spelling the overlay cannot show */
         }
     }
     {
@@ -609,7 +620,7 @@ void xbox_SettingsFinish(void)
     }
     /* What nothing else reads at start. */
     apply_audio();
-    xbox_InputSetRumbleGain(s_set[XS_INPUT_RUMBLE].value);
+    xbox_InputSetRumbleStrength(s_set[XS_INPUT_RUMBLE].value);
     xbox_InputSetFaceLayoutNintendo(s_set[XS_INPUT_FACE_LAYOUT].value != 0.0);
 }
 

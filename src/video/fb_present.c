@@ -111,6 +111,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
  * them. Declared rather than included, as src/input does for this side. */
 extern void xbox_InputKeySet(int vk, int down);
 extern void xbox_InputKeysClear(void);
+extern void xbox_InputSetBackground(int on);    /* src/input/input_core.c */
 
 /* Title bar (window_title.h): the game's name; with RECOMP_TRACE=title also
  * FPS and draws, the way ps3recomp's window shows them. The counts are
@@ -172,10 +173,16 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         xbox_InputKeySet((int)w, 0);
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
-    /* Alt-tabbing away with a key held would leave it held for ever. */
+    /* Alt-tabbing away with a key held would leave it held for ever, and a
+     * pad in the hand would go on shaking: the motors stop until the window
+     * is in front again (input_core.c). */
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
+        xbox_InputSetBackground(1);
         return 0;
+    case WM_SETFOCUS:
+        xbox_InputSetBackground(0);
+        break;
     }
     return DefWindowProcA(h, m, w, l);
 }

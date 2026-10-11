@@ -103,9 +103,18 @@ void xbox_InputShutdown(void);
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
 /**
- * Set controller vibration.
+ * Set controller vibration: the title's motor speeds. What the host motor is
+ * given is the rumble curve's (rumble_curve.h): the title's peak, a gate
+ * under its idle hum, the strength, and a release when a speed falls.
  */
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
+
+/**
+ * The rumble's clock: moves a port's falling motors on and re-issues a held
+ * rumble. xbox_InputGetState calls it; a caller that polls the pad some other
+ * way (a scripted pad, src/usb/usb_gamepad.c) calls it at its poll.
+ */
+void xbox_InputRumbleTick(DWORD dwPort);
 
 /**
  * Check if a controller is connected (the cache; refreshed at most once a

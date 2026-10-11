@@ -65,6 +65,8 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
+uint64_t nv2a_pb_slow_begin(void);                 /* nv2a_pb_scan.c: RECOMP_TRACE=pb_slow */
+void nv2a_pb_slow_end(const char *what, uint64_t t0);
 
 /* Would writing this surface land on the title's own image?
  *
@@ -6345,14 +6347,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* RECOMP_PRESENT_EARLY (BO-74): hand the finished frame to the host at the
          * stall, then hold for the vblank; otherwise present after it. */
         int early = flip_present_early();
+        uint64_t slow_t0 = nv2a_pb_slow_begin();     /* RECOMP_TRACE=pb_slow */
         if (early)
             flip_present();
         else if (s_backend->on_flip_ready && flip_commit_early())
             s_backend->on_flip_ready();
+        nv2a_pb_slow_end("FLIP_STALL before the hold (the frame's early submit)", slow_t0);
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now -- or, with
          * RECOMP_FLIP_PACING=vblank, the vblank the swap asked for. */
         flip_pacing_stall();
+        slow_t0 = nv2a_pb_slow_begin();
         if (xbox_LatOn())
             xbox_LatRow('V', s_gpu.flips, 0, NULL);
         s_gpu.flip_read = s_gpu.flip_write;
@@ -6502,6 +6507,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 fflush(stderr);
             }
         }
+        nv2a_pb_slow_end("FLIP_STALL after the hold (counters, traces, the present)", slow_t0);
         /* The in-game overlay's pause (kernel_pause.h): the GPU stalls here,
          * after the frame is presented, and the title's fence and pushbuffer
          * waits hold it a frame or two behind. */

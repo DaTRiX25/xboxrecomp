@@ -240,8 +240,8 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
  *
  * Layout as in xemu hw/xbox/xid.c (XIDGamepadOutputReport, xid_handle_data /
  * xid_handle_control). The values are the same 0..65535 XInput uses, so they
- * go straight to xbox_InputSetState, which the SDL/XInput backends already
- * implement (xinput_device.c).
+ * go straight to xbox_InputSetState, where the rumble curve is
+ * (src/input/input_core.c, rumble_curve.h).
  *
  * RECOMP_INPUT_RUMBLE=0 turns it off. RECOMP_TRACE=input_diag prints every
  * report that changes the motors; the first non-zero one of each pad is
@@ -309,14 +309,19 @@ void usb_gamepad_output(int pad, const uint8_t *data, int len)
     rumble_apply(pad, diag);
 }
 
-/* SDL rumble runs for a set time, and the title only sends a report when the
- * motors change, so a held rumble is re-issued from the pad poll. */
+/* From the pad poll. The title only sends a report when the motors change:
+ * its speeds are given again every 150 ms while it holds one (a pad that
+ * appeared since gets them), and every poll is the rumble's clock, which
+ * runs on after the title's zero until the motor has let go. */
 static void rumble_refresh(int pad)
 {
-    if (!(s_rumble[pad].left | s_rumble[pad].right) || !rumble_enabled())
+    if (!rumble_enabled())
         return;
-    if ((unsigned long)GetTickCount() - s_rumble[pad].last_ms >= 150)
+    if ((s_rumble[pad].left | s_rumble[pad].right)
+            && (unsigned long)GetTickCount() - s_rumble[pad].last_ms >= 150)
         rumble_apply(pad, 0);
+    else
+        xbox_InputRumbleTick((DWORD)pad);
 }
 
 /* ---- the input report -------------------------------------------------- */

@@ -56,6 +56,13 @@ struct nvk_core {
 const struct nvk_core *nvk_core_init(const char *const *inst_exts, unsigned n,
                                      VkSurfaceKHR (*make_surface)(VkInstance, void *),
                                      void *ctx, char *err, size_t errn);
+/* A window whose native surface was taken away and given back (an Android
+ * app coming back from the background): the old VkSurfaceKHR is destroyed
+ * and make_surface asked for a new one, which the core then holds. The
+ * caller has destroyed the swapchain first. 0 when no surface could be made
+ * (the core then has none; call again later). */
+int nvk_core_replace_surface(VkSurfaceKHR (*make_surface)(VkInstance, void *), void *ctx);
+
 /* The core if nvk_core_init has succeeded, else NULL. */
 const struct nvk_core *nvk_core_get(void);
 
