@@ -163,8 +163,9 @@ int  xbox_BugReportMake(int screenshot, char *out_path, unsigned n);
  * ("[REPORT] bug_report: done: <path>"): a report without a window, for
  * tests and for a machine reached over ssh. =@<file>: a report each time
  * that file appears instead (it is removed; "shot" in it asks for the
- * frame), so a script picks the moment. Call when the title is about to
- * start. */
+ * frame), so a script picks the moment. "paused" beside "shot" (":shot:paused",
+ * or in the file) pauses the title around the report, as the overlay does.
+ * Call when the title is about to start. */
 void xbox_BugReportArm(void);
 
 #ifdef __cplusplus

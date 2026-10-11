@@ -1573,6 +1573,13 @@ int xbox_BugReport(const xbox_bug_report_opts *o, char *out_path, size_t n)
 
     /* The logs first: system.txt quotes this run's. */
     have_cur = run_log(&cur, log_dir, "run", LOG_TAIL);
+    if (!have_cur && !o->no_current_run) {
+        /* No tee in this process (a Windows build without a console): the
+         * file RECOMP_STDIO_LOG sends the output to, when there is one. */
+        const char *file = recomp_env(RENV_STDIO_LOG);
+        if (file && *file)
+            have_cur = buf_file(&cur, file, LOG_HEAD, LOG_TAIL);
+    }
     if (have_cur)
         xbox_report_text(r, o->no_current_run ? "logs/last-run.txt" : "logs/current.txt",
                          cur.p ? cur.p : "", cur.n);
@@ -1713,7 +1720,7 @@ int xbox_BugReportMake(int screenshot, char *out_path, unsigned n)
 }
 
 static double s_arm_after;
-static int s_arm_shot;
+static const char *s_arm_how = "";
 static const char *s_arm_file;
 
 static void arm_sleep(unsigned ms)
@@ -1726,11 +1733,32 @@ static void arm_sleep(unsigned ms)
 #endif
 }
 
-static void arm_make(int shot)
+#if !defined(XBOX_REPORT_STANDALONE)
+void xbox_HostPause(int on);            /* kernel_pause.h, included below */
+#endif
+
+/* `how` has "shot" for the frame, and "paused" to pause the title around
+ * the report as the settings overlay does (the frame then comes from the
+ * executor's pause hold, not from a flip). */
+static void arm_make(const char *how)
 {
     char path[1200] = "";
+    int paused = strstr(how, "paused") != NULL, ok;
 
-    if (xbox_BugReportMake(shot, path, sizeof path))
+#if !defined(XBOX_REPORT_STANDALONE)
+    if (paused) {
+        xbox_HostPause(1);
+        arm_sleep(300);
+    }
+#else
+    (void)paused;
+#endif
+    ok = xbox_BugReportMake(strstr(how, "shot") != NULL, path, sizeof path);
+#if !defined(XBOX_REPORT_STANDALONE)
+    if (paused)
+        xbox_HostPause(0);
+#endif
+    if (ok)
         fprintf(stderr, LOGP "bug_report: done: %s\n", path);
     else
         fprintf(stderr, LOGP "bug_report: failed: %s\n", path);
@@ -1740,7 +1768,7 @@ static void arm_run(void)
 {
     if (!s_arm_file) {
         arm_sleep((unsigned)(s_arm_after * 1000.0));
-        arm_make(s_arm_shot);
+        arm_make(s_arm_how);
         return;
     }
     /* =@file: a report each time the file appears (a script makes it when
@@ -1749,12 +1777,12 @@ static void arm_run(void)
     for (;;) {
         FILE *f = fopen(s_arm_file, "rb");
         if (f) {
-            char word[16] = "";
+            char word[32] = "";
             size_t n = fread(word, 1, sizeof word - 1, f);
             word[n] = 0;
             fclose(f);
             remove(s_arm_file);
-            arm_make(strstr(word, "shot") != NULL);
+            arm_make(word);
         }
         arm_sleep(100);
     }
@@ -1779,9 +1807,9 @@ void xbox_BugReportArm(void)
         fprintf(stderr, LOGP "bug_report: a report whenever %s appears\n", s_arm_file);
     } else {
         s_arm_after = atof(e);
-        s_arm_shot = strstr(e, ":shot") != NULL;
+        s_arm_how = strchr(e, ':') ? strchr(e, ':') : "";
         fprintf(stderr, LOGP "bug_report: a report in %.1f s%s\n", s_arm_after,
-                s_arm_shot ? ", with the frame" : "");
+                strstr(s_arm_how, "shot") ? ", with the frame" : "");
     }
     {
 #if defined(_WIN32)
