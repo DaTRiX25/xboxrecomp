@@ -14,13 +14,7 @@
 #include "nv2a_backend_common.h"
 
 #define LOGP "[ENHANCE] "
-/* Android: 3. A phone's panel is about 1080 rows, which 3x (1440) already
- * passes; 4x is only heat. */
-#if defined(__ANDROID__)
-#define SCALE_MAX 3
-#else
 #define SCALE_MAX 4
-#endif
 
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
 /* Indexes match XBOX_PACING_SPIN / XBOX_PACING_SLEEP. */
