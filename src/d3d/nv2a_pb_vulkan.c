@@ -208,6 +208,8 @@ typedef struct {
     VkCommandBuffer  *cbs;
     uint32_t          ncbs, used;
     uint64_t          serial;          /* last submit while this frame was current */
+    VkFence           fence;           /* vk_poll=0: signalled by the submit fence_serial */
+    uint64_t          fence_serial;    /* 0: not armed */
     VkDescriptorPool *dps;
     uint32_t          ndps, dp_cur;
 } Frame;
@@ -281,9 +283,51 @@ static void        *s_vf_last_rt;
 
 /* ---- serials and garbage ---------------------------------------------------- */
 
+/* How far the GPU is. With a timeline semaphore of the driver's own that is
+ * one cheap question (vkGetSemaphoreCounterValue), asked wherever it helps.
+ * Mesa's Turnip on Qualcomm's KGSL kernel interface (Android) has no such
+ * semaphore: Mesa emulates it with a list of pending submits and answers the
+ * question by "polling" each with IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID and
+ * timeout 0 (vk_sync_timeline_gc_locked -> kgsl_syncobj_wait ->
+ * wait_timestamp_safe, Mesa 26.2.4), and on the Retroid Pocket 5's 4.19
+ * kernel that call does not return until the GPU has retired the submit:
+ * measured 6 ms a call in a heavy frame at 2x, up to 11.9 ms (BO-85). Every
+ * question was a wait for all the GPU work submitted so far, so the two
+ * frames in flight never overlapped. A submit that signals such a semaphore
+ * asks the same question of the oldest pending one
+ * (vk_sync_timeline_alloc_point_locked), and waited as long. There
+ * (vk_poll=0, the default on Android) the semaphore is not used and the
+ * question is never asked: the last submit of a frame signals
+ * the frame's fence, the fence is waited for when the frame's slot is taken
+ * again (two flips on, long done), and what is known done is what such a
+ * wait has shown. Garbage and occlusion slots are freed that much later;
+ * occlusion counts are read from the query pool as soon as they are there. */
+static int poll_ok(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_VK_POLL);
+#if defined(__ANDROID__)
+        on = e && *e == '1';
+#else
+        on = !(e && *e == '0');
+#endif
+    }
+    return on;
+}
+
+static void serial_known(uint64_t v)
+{
+    if (v > s_done_serial)
+        s_done_serial = v;
+}
+
 static uint64_t serial_done(void)
 {
-    uint64_t v = 0, t0 = s_vf ? now_ns() : 0;
+    uint64_t v = 0, t0;
+    if (!poll_ok())
+        return s_done_serial;
+    t0 = s_vf ? now_ns() : 0;
     if (vkGetSemaphoreCounterValue(s_dev, s_timeline, &v) == VK_SUCCESS && v > s_done_serial)
         s_done_serial = v;
     if (s_vf) {
@@ -300,15 +344,34 @@ static void serial_wait(uint64_t v)
 {
     VkSemaphoreWaitInfo wi;
     uint64_t t0;
+    int ok;
     if (!v || serial_done() >= v)
         return;
     t0 = s_vf ? now_ns() : 0;
+    if (!poll_ok()) {
+        /* No semaphore to wait on (see poll_ok): everything submitted. A
+         * readback or a full ring, not a frame's normal path. */
+        uint64_t last = s_next_serial - 1;
+        nvk_queue_lock();
+        ok = vkQueueWaitIdle(C->queue) == VK_SUCCESS;
+        nvk_queue_unlock();
+        if (ok)
+            serial_known(last);
+        if (s_vf) {
+            s_vf->waits++;
+            s_vf->wait_ns += now_ns() - t0;
+        }
+        return;
+    }
     memset(&wi, 0, sizeof wi);
     wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
     wi.semaphoreCount = 1;
     wi.pSemaphores = &s_timeline;
     wi.pValues = &v;
-    if (vkWaitSemaphores(s_dev, &wi, 5000000000ull) != VK_SUCCESS) {
+    ok = vkWaitSemaphores(s_dev, &wi, 5000000000ull) == VK_SUCCESS;
+    if (ok)
+        serial_known(v);
+    if (!ok) {
         static int said;
         if (said++ < 4)
             fprintf(stderr, LOGP "GPU wait for serial %llu timed out\n", (unsigned long long)v);
@@ -473,6 +536,8 @@ static void rings_reset(void)
 /* End the open pass, submit what is recorded (uploads first) and, with
  * `wait`, block until the GPU is done with it. After a wait every ring is
  * free again. */
+static int s_flush_fence;    /* the next submit signals the frame's fence */
+
 static void flush(int wait, int why)
 {
     VkCommandBuffer cbs[2];
@@ -481,9 +546,13 @@ static void flush(int wait, int why)
     uint64_t serial;
     uint32_t n = 0;
     uint64_t t0 = 0, t1 = 0;
+    VkFence fence = VK_NULL_HANDLE;
     VkResult r;
 
     end_encoder();
+    if (s_flush_fence && (s_cmd || s_up) && s_fr[s_fi].fence && !s_fr[s_fi].fence_serial)
+        fence = s_fr[s_fi].fence;
+    s_flush_fence = 0;
     if (!s_cmd && !s_up) {
         if (wait) {
             serial_wait(s_next_serial - 1);
@@ -517,15 +586,21 @@ static void flush(int wait, int why)
     si.pNext = &ti;
     si.commandBufferCount = n;
     si.pCommandBuffers = cbs;
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &s_timeline;
+    if (poll_ok()) {
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &s_timeline;
+    } else {
+        si.pNext = NULL;
+    }
     if (s_vf)
         t0 = now_ns();
     nvk_queue_lock();
     if (s_vf)
         t1 = now_ns();
-    r = vkQueueSubmit(C->queue, 1, &si, VK_NULL_HANDLE);
+    r = vkQueueSubmit(C->queue, 1, &si, fence);
     nvk_queue_unlock();
+    if (fence && r == VK_SUCCESS)
+        s_fr[s_fi].fence_serial = serial;
     if (s_vf) {
         uint64_t d = now_ns() - t1;
         s_vf->sub[why]++;
@@ -3308,10 +3383,14 @@ static int occ_result(void *ctx, void *qv, int flush_gpu, uint64_t *count)
             flush(0, FL_POLL);
         }
     }
-    done = serial_done();
-    for (i = 0; i < q->n; i++)
-        if (q->serial[i] > done)
-            return 0;
+    /* Submitted. With a cheap poll the counts are read once their submits
+     * are done; without one the query pool itself says which are there. */
+    if (poll_ok()) {
+        done = serial_done();
+        for (i = 0; i < q->n; i++)
+            if (q->serial[i] > done)
+                return 0;
+    }
     for (i = 0; i < q->n; i++) {
         uint64_t v = 0;
         uint64_t t0 = s_vf ? now_ns() : 0;
@@ -3421,6 +3500,24 @@ static void frame_advance(void)
 
     s_fi = (s_fi + 1) % s_frames;
     f = &s_fr[s_fi];
+    if (f->fence_serial) {
+        /* vk_poll=0: the frame's fence, signalled long ago as a rule; the
+         * wait is the question and, when the GPU is behind, the answer. */
+        t0 = now_ns();
+        if (vkWaitForFences(s_dev, 1, &f->fence, VK_TRUE, 5000000000ull) == VK_SUCCESS)
+            serial_known(f->fence_serial);
+        vkResetFences(s_dev, 1, &f->fence);
+        f->fence_serial = 0;
+        t0 = now_ns() - t0;
+        if (t0 > 500000ull) {
+            s_frame_waits++;
+            s_frame_wait_ns += t0;
+        }
+        if (s_vf) {
+            s_vf->waits++;
+            s_vf->wait_ns += t0;
+        }
+    }
     if (f->serial && serial_done() < f->serial) {
         t0 = now_ns();
         serial_wait(f->serial);
@@ -3913,6 +4010,13 @@ static int init(void)
         cp.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         cp.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
         cp.queueFamilyIndex = C->qfam;
+        if (!poll_ok()) {
+            VkFenceCreateInfo fci;
+            memset(&fci, 0, sizeof fci);
+            fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            if (vkCreateFence(s_dev, &fci, NULL, &s_fr[i].fence) != VK_SUCCESS)
+                s_fr[i].fence = VK_NULL_HANDLE;
+        }
         if (vkCreateCommandPool(s_dev, &cp, NULL, &s_fr[i].pool) != VK_SUCCESS) {
             fprintf(stderr, LOGP "command pool failed\n");
             return 0;
@@ -4052,10 +4156,11 @@ static int init(void)
     }
     atexit(at_exit_save);
     fprintf(stderr, LOGP "backend up on %s: %d frames in flight, present %s, write-back %s,"
-            " occlusion %s%s\n", C->name, s_frames,
+            " occlusion %s%s, GPU progress %s\n", C->name, s_frames,
             s_win ? "window slots" : C->surface ? "texture readback" : "headless",
             wb_always() ? "every flip" : "on demand",
-            s_vkq ? "queries" : "fixed", s_qprecise ? " (precise)" : "");
+            s_vkq ? "queries" : "fixed", s_qprecise ? " (precise)" : "",
+            poll_ok() ? "polled (timeline semaphore)" : "from a fence per frame (vk_poll=0)");
     s_failed = 0;
     return 1;
 }
@@ -4219,9 +4324,8 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
         vf_open();
         if (s_vf) {
             /* Is the GPU done with what the frame has submitted so far? */
-            uint64_t last = s_next_serial - 1;
             vt0 = now_ns();
-            s_vf->ready_done = !(s_cmd || s_up) && serial_done() >= last;
+            s_vf->ready_done = s_done_serial >= s_next_serial - 1;
         }
         rt = present_target(surface_offset);
         if (rt) {
@@ -4268,6 +4372,8 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
                                slot->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
                 if (s_vf)
                     vt3 = now_ns();
+                /* The frame's last submit, unless a readback follows. */
+                s_flush_fence = !(rt && wb);
                 flush(0, FL_FLIP);
                 if (s_vf)
                     vt4 = now_ns();
@@ -4295,6 +4401,7 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
         }
         /* Submit the frame and move on: the GPU runs it while the next
          * one is recorded. */
+        s_flush_fence = 1;
         flush(0, FL_FLIP);
         t = prof ? now_ns() : 0;
         {

@@ -244,6 +244,7 @@ extern "C" {
     X(VK_POINT,          DEBUG, "vk_point",        NULL,                       "Vulkan point sampling") \
     X(VK_NO_RTT,         DEBUG, "vk_no_rtt",       NULL,                       "Vulkan decodes render targets from memory (implies vk_writeback=always)") \
     X(VK_WRITEBACK,      DEBUG, "vk_writeback",    NULL,                       "=lazy|always: Vulkan writes guest memory when a dump reads it (default) or at every flip") \
+    X(VK_POLL,           DEBUG, "vk_poll",         NULL,                       "=0|1: Vulkan backend asks the timeline semaphore how far the GPU is (1: default off Android) or never asks and learns it from a fence per frame, waited for when the frame's slot is reused (0: default on Android, where Turnip on KGSL answers the question by waiting for the GPU)") \
     X(VK_OCC,            DEBUG, "vk_occ",          NULL,                       "=sync|fixed: Vulkan occlusion mode") \
     X(VK_PRESENT,        DEBUG, "vk_present",      NULL,                       "=window|readback: Vulkan window present, swapchain from GPU slots (default) or texture readback into the SDL renderer") \
     X(VK_FRAMES,         DEBUG, "vk_frames",       NULL,                       "=1|2: Vulkan frames in flight (default 2)") \
