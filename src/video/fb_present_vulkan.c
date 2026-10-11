@@ -670,6 +670,15 @@ int fbv_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
     if (!s_waiter_run)
         dxgi_vblank_start(win);
 #endif
+#if defined(__ANDROID__)
+    /* No present_wait through Android's loader: the Choreographer's refresh
+     * times instead (android_vsync.c). RECOMP_ANDROID_VSYNC=0: the old
+     * free-running timer, for A/B. */
+    if (!s_waiter_run && !(getenv("RECOMP_ANDROID_VSYNC") && getenv("RECOMP_ANDROID_VSYNC")[0] == '0')) {
+        extern void xbox_AndroidVsyncStart(void);
+        xbox_AndroidVsyncStart();
+    }
+#endif
     fprintf(stderr, LOGP "Vulkan swapchain: %ux%u, %u images, %s, %s%s\n", s_sc_ext.width,
             s_sc_ext.height, s_sc_n, s_sc_fmt == VK_FORMAT_B8G8R8A8_UNORM ? "BGRA8" : "RGBA8",
             s_sc_mode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO (vsync)"
@@ -685,6 +694,12 @@ void fbv_destroy(void)
         return;
 #if defined(_WIN32)
     dxgi_vblank_stop();
+#endif
+#if defined(__ANDROID__)
+    {
+        extern void xbox_AndroidVsyncStop(void);
+        xbox_AndroidVsyncStop();
+    }
 #endif
     if (s_waiter_run) {
         pthread_mutex_lock(&s_id_mu);

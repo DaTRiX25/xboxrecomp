@@ -32,6 +32,9 @@ else()
         if(ANDROID)
             # Vulkan through android_vk.h's pointers (src/d3d/CMakeLists.txt).
             target_compile_options(xbox_video PRIVATE -include ${XR_ANDROID_VK_H})
+            # The display's refresh times from the Choreographer.
+            target_sources(xbox_video PRIVATE android_vsync.c)
+            target_link_libraries(xbox_video PUBLIC android)
         endif()
     endif()
     if(APPLE)
