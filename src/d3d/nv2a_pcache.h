@@ -83,6 +83,50 @@ uint64_t nv2a_fnv64(const void *p, size_t n, uint64_t h);
  * Returns 1 with the path in `out`, 0 when off or not creatable. */
 int nv2a_pcache_dir(const char *dir, const char *app, char *out, size_t n);
 
+/* ---- what the running backend's cache is doing ------------------------------
+ *
+ * One process-wide record the backend with the key list keeps up to date,
+ * for whoever shows it (a settings page, a pre-build's progress line). Read
+ * from any thread: the numbers only grow, a torn read is one count off. */
+enum { NV2A_PC_VS = 0, NV2A_PC_FS = 1, NV2A_PC_PSO = 2 };
+typedef struct nv2a_pcache_stat {
+    int      active;          /* a backend is up and has a key list on disk */
+    int      warming;         /* its pre-warm thread is running */
+    uint32_t listed[3];       /* keys in the list: vertex, fragment, pipeline */
+    uint32_t warmed[3];       /* built by the pre-warm thread */
+    uint32_t ack[3];          /* built by the render thread: the list lacked them */
+    uint32_t ack_max_us;      /* the longest of those */
+    uint64_t ack_ns;          /* and their sum */
+    char     dir[512];        /* the cache directory, "" when off */
+} nv2a_pcache_stat;
+void nv2a_pcache_stat_get(nv2a_pcache_stat *out);
+/* The backend's side. */
+void nv2a_pcache_stat_open(const char *dir, const uint32_t listed[3]);
+void nv2a_pcache_stat_warming(int on);
+void nv2a_pcache_stat_built(int prewarm, int kind, uint64_t ns);
+
+/* Asks the running backend to read its key list again and build what it
+ * does not have yet, on its pre-warm thread: for after another process (a
+ * pre-build) has appended to it. 0 when no backend with a key list is up. */
+int  nv2a_pcache_rescan(void);
+void nv2a_pcache_set_rescan(void (*fn)(void));
+
+/* ---- vertex programs in an executable ---------------------------------------
+ *
+ * A title's vertex shaders are compiled into its executable as the XDK
+ * assembler wrote them: u16 0x2078, u16 n, then n slots of 16 bytes, the
+ * NV2A's microcode as SET_TRANSFORM_PROGRAM uploads it (a shader with
+ * "#pragma screenspace" is uploaded as it is; D3D appends a viewport
+ * epilogue to the others, which then do not match and cost nothing but an
+ * unused entry). Calls fn for each one found in `image`: a slot's first
+ * word is 0, FINAL (bit 0 of the fourth) is set on the last slot and only
+ * there. Returns how many. A pre-build seeds a backend's key list with them
+ * (type 0, the slots: the record both backends write for a vertex program),
+ * so every vertex function is built before the title draws with it. */
+size_t nv2a_pcache_scan_vsh(const void *image, size_t size,
+                            void (*fn)(void *ctx, const uint32_t *slots, uint32_t n),
+                            void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

@@ -117,12 +117,21 @@ static void insert(uint64_t key, uint32_t *words, uint32_t n)
 /* The SPIR-V records: type 0, payload the 64-bit key then the words. */
 static nv2a_pcache *s_file;
 
-static void load(void)
+/* s_lock held. Opens the file (again: `reload` closes it first, to take in
+ * what another process appended) and puts its records in the table; one
+ * already there is kept. */
+static void load(int reload)
 {
     char dir[1024], path[1100], ver[128], msg[256];
     size_t i, n;
 
     s_loaded = 1;
+    if (reload) {
+        if (!s_file)
+            return;
+        nv2a_pcache_close(s_file);
+        s_file = NULL;
+    }
     if (!nvk_cache_dir(dir, sizeof dir)
             || snprintf(path, sizeof path, "%s/vk_spirv.bin", dir) >= (int)sizeof path)
         return;
@@ -145,7 +154,16 @@ static void load(void)
         memcpy(w, (const uint8_t *)d + 8, len - 8);
         insert(key, w, (len - 8) / 4);
     }
-    fprintf(stderr, LOGP "SPIR-V cache %s: %s\n", path, msg);
+    if (!reload)
+        fprintf(stderr, LOGP "SPIR-V cache %s: %s\n", path, msg);
+}
+
+void nvk_glsl_reload(void)
+{
+    pthread_mutex_lock(&s_lock);
+    if (s_loaded)
+        load(1);
+    pthread_mutex_unlock(&s_lock);
 }
 
 static void store(uint64_t key, const uint32_t *w, uint32_t n)
@@ -242,7 +260,7 @@ int nvk_glsl_spirv(enum nvk_stage stage, const char *src, const uint32_t **words
     *compiled = 0;
     pthread_mutex_lock(&s_lock);
     if (!s_loaded)
-        load();
+        load(0);
     if (s_cap && (e = slot(key))->words) {
         *words = e->words;
         *n = e->n;
@@ -254,16 +272,20 @@ int nvk_glsl_spirv(enum nvk_stage stage, const char *src, const uint32_t **words
         glslang_initialize_process();
         s_glslang_up = 1;
     }
+    /* Compiled without the lock (glslang's shader and program objects are
+     * per call), so one thread's compile does not hold up another's lookup:
+     * the ack thread's draw against the pre-warm thread's key list. */
+    pthread_mutex_unlock(&s_lock);
     w = compile(stage == NVK_STAGE_VERTEX ? GLSLANG_STAGE_VERTEX : GLSLANG_STAGE_FRAGMENT,
                 src, &nw, err, errn);
-    if (!w) {
-        pthread_mutex_unlock(&s_lock);
+    if (!w)
         return 0;
-    }
+    pthread_mutex_lock(&s_lock);
     s_compiles++;
     *compiled = 1;
-    store(key, w, nw);
-    insert(key, w, nw);
+    if (!(s_cap && slot(key)->words))   /* else another thread compiled it meanwhile */
+        store(key, w, nw);
+    insert(key, w, nw);                 /* frees w when the key is there */
     if (s_cap && (e = slot(key))->words) {
         *words = e->words;
         *n = e->n;

@@ -352,3 +352,84 @@ int nv2a_pcache_dir(const char *dir, const char *app, char *out, size_t n)
         return 0;
     return make_dirs(out);
 }
+
+/* ---- the running backend's numbers ------------------------------------------- */
+
+static nv2a_pcache_stat s_stat;
+static void (*s_rescan)(void);
+
+void nv2a_pcache_stat_get(nv2a_pcache_stat *out)
+{
+    *out = s_stat;
+}
+
+void nv2a_pcache_stat_open(const char *dir, const uint32_t listed[3])
+{
+    snprintf(s_stat.dir, sizeof s_stat.dir, "%s", dir ? dir : "");
+    memcpy(s_stat.listed, listed, sizeof s_stat.listed);
+    s_stat.active = dir && *dir;
+}
+
+void nv2a_pcache_stat_warming(int on)
+{
+    s_stat.warming = on;
+}
+
+void nv2a_pcache_stat_built(int prewarm, int kind, uint64_t ns)
+{
+    if (kind < 0 || kind > 2)
+        return;
+    if (prewarm) {
+        s_stat.warmed[kind]++;
+    } else {
+        uint64_t us = ns / 1000u;
+        s_stat.ack[kind]++;
+        s_stat.ack_ns += ns;
+        if (us > s_stat.ack_max_us)
+            s_stat.ack_max_us = us > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)us;
+    }
+}
+
+void nv2a_pcache_set_rescan(void (*fn)(void))
+{
+    s_rescan = fn;
+}
+
+int nv2a_pcache_rescan(void)
+{
+    if (!s_rescan || !s_stat.active)
+        return 0;
+    s_rescan();
+    return 1;
+}
+
+/* ---- vertex programs in an executable ------------------------------------------ */
+
+size_t nv2a_pcache_scan_vsh(const void *image, size_t size,
+                            void (*fn)(void *ctx, const uint32_t *slots, uint32_t n),
+                            void *ctx)
+{
+    const unsigned char *b = (const unsigned char *)image;
+    uint32_t slots[136 * 4];
+    size_t i, found = 0;
+
+    for (i = 0; i + 4 + 16 <= size; i++) {
+        uint32_t n, k;
+        if (b[i] != 0x78 || b[i + 1] != 0x20)
+            continue;
+        n = (uint32_t)b[i + 2] | ((uint32_t)b[i + 3] << 8);
+        if (!n || n > 136 || size - i - 4 < (size_t)n * 16u)
+            continue;
+        memcpy(slots, b + i + 4, (size_t)n * 16u);
+        for (k = 0; k < n; k++)
+            if (slots[k * 4] != 0 || ((slots[k * 4 + 3] & 1u) != 0) != (k == n - 1))
+                break;
+        if (k < n)
+            continue;
+        if (fn)
+            fn(ctx, slots, n);
+        found++;
+        i += 3 + (size_t)n * 16u;
+    }
+    return found;
+}

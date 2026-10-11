@@ -1310,6 +1310,7 @@ static void pc_note(int prewarm, int kind, uint64_t t_start, const char *what)
         if (ms > s_cs.rt_max_ms)
             s_cs.rt_max_ms = ms;
     }
+    nv2a_pcache_stat_built(prewarm, kind, ns);
     pthread_mutex_unlock(&s_pc_mu);
     if (s_pc_trace)
         fprintf(stderr, LOGP "pcache: compiled %s %s on the %s thread: %.2f ms at %.3f s\n",
@@ -2109,18 +2110,23 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
 /* ---- pipeline cache on disk, and the pre-warm thread ------------------------ */
 
 static nv2a_pcache *s_pcf;              /* the key list, or NULL (off) */
+static pthread_mutex_t s_pcf_mu = PTHREAD_MUTEX_INITIALIZER;   /* s_pcf itself */
 static uint64_t     s_pc_loaded[3], s_pc_warm[3], s_pc_warm_ns;
-static int          s_pc_warm_done;
+static int          s_pc_warm_done;     /* no pre-warm thread is running (atomic) */
+static int          s_pc_rescan;        /* asked for while one ran (atomic) */
+static char         s_pc_path[1100], s_pc_ver[256];
 
 /* Appends a key the ack thread just built (it is new to this process; the
  * file drops one it already has). */
 static void pc_put(uint32_t type, const void *data, uint32_t len)
 {
+    pthread_mutex_lock(&s_pcf_mu);
     if (s_pcf && nv2a_pcache_put(s_pcf, type, data, len) < 0) {
-        fprintf(stderr, LOGP "pcache: cannot append; the disk cache is off for this run\n");
-        nv2a_pcache_close(s_pcf);
-        s_pcf = NULL;
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "pcache: cannot append; the key list is not written\n");
     }
+    pthread_mutex_unlock(&s_pcf_mu);
 }
 
 /* One record of the file built and cached, as the ack thread would have:
@@ -2224,31 +2230,81 @@ static void pc_warm_one(size_t i, int pass)
 
 /* Builds every key of the file, functions first, on the utility queues:
  * done before the title reaches the draws that need them, the ack thread
- * finds them built. */
+ * finds them built. Goes round again when asked to meanwhile (pc_warm_start:
+ * a pre-build in another process has appended to the file), reading the
+ * file anew each time. */
 static void *pc_prewarm(void *arg)
 {
-    size_t n = nv2a_pcache_count(s_pcf);
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
-    uint64_t t = pc_now();
-    int pass;
     (void)arg;
-    for (pass = 0; pass < 2; pass++)
-        dispatch_apply(n, q, ^(size_t i) {
-            @autoreleasepool {
-                pc_warm_one(i, pass);
-            }
-        });
-    s_pc_warm_ns = pc_now() - t;
-    if (@available(macOS 13.3, *))
-        s_dev.shouldMaximizeConcurrentCompilation = NO;
+    do {
+        uint64_t t = pc_now(), before[3];
+        uint32_t listed[3] = {0, 0, 0};
+        size_t n, i;
+        int pass;
+
+        __atomic_store_n(&s_pc_rescan, 0, __ATOMIC_RELEASE);
+        pthread_mutex_lock(&s_pcf_mu);  /* the ack thread's puts wait for the reopen */
+        if (s_pcf) {
+            char msg[256];
+            nv2a_pcache_close(s_pcf);
+            s_pcf = nv2a_pcache_open(s_pc_path, s_pc_ver, msg, sizeof msg);
+        }
+        pthread_mutex_unlock(&s_pcf_mu);
+        n = nv2a_pcache_count(s_pcf);
+        for (i = 0; i < n; i++) {
+            const void *d;
+            uint32_t type, len;
+            if (nv2a_pcache_get(s_pcf, i, &type, &d, &len) && type <= PC_PSO)
+                listed[type]++;
+        }
+        for (i = 0; i < 3; i++) {
+            s_pc_loaded[i] = listed[i];
+            before[i] = s_pc_warm[i];
+        }
+        nv2a_pcache_stat_open(s_pc_path, listed);
+        /* The compiler service's full width while the pre-warm runs (WWDC23
+         * 10127, "Optimize GPU renderers with Metal"); back to balanced after. */
+        if (@available(macOS 13.3, *)) {
+            if (n && s_dev.maximumConcurrentCompilationTaskCount)
+                s_dev.shouldMaximizeConcurrentCompilation = YES;
+        }
+        for (pass = 0; pass < 2; pass++)
+            dispatch_apply(n, q, ^(size_t k) {
+                @autoreleasepool {
+                    pc_warm_one(k, pass);
+                }
+            });
+        s_pc_warm_ns += pc_now() - t;
+        if (@available(macOS 13.3, *))
+            s_dev.shouldMaximizeConcurrentCompilation = NO;
+        fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines of %u/%u/%u"
+                " on disk in %.0f ms (done at %.2f s)\n",
+                (unsigned long long)(s_pc_warm[PC_VS] - before[PC_VS]),
+                (unsigned long long)(s_pc_warm[PC_FS] - before[PC_FS]),
+                (unsigned long long)(s_pc_warm[PC_PSO] - before[PC_PSO]),
+                listed[0], listed[1], listed[2],
+                (double)(pc_now() - t) / 1e6, (double)(pc_now() - s_t0_ns) / 1e9);
+    } while (__atomic_load_n(&s_pc_rescan, __ATOMIC_ACQUIRE));
+    nv2a_pcache_stat_warming(0);
     __atomic_store_n(&s_pc_warm_done, 1, __ATOMIC_RELEASE);
-    fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines of %llu/%llu/%llu"
-            " on disk in %.0f ms (done at %.2f s)\n",
-            (unsigned long long)s_pc_warm[PC_VS], (unsigned long long)s_pc_warm[PC_FS],
-            (unsigned long long)s_pc_warm[PC_PSO], (unsigned long long)s_pc_loaded[PC_VS],
-            (unsigned long long)s_pc_loaded[PC_FS], (unsigned long long)s_pc_loaded[PC_PSO],
-            (double)s_pc_warm_ns / 1e6, (double)(pc_now() - s_t0_ns) / 1e9);
     return NULL;
+}
+
+/* Starts the pre-warm thread, or has the one running go round again. */
+static void pc_warm_start(void)
+{
+    pthread_t th;
+    __atomic_store_n(&s_pc_rescan, 1, __ATOMIC_RELEASE);
+    if (!__atomic_exchange_n(&s_pc_warm_done, 0, __ATOMIC_ACQ_REL))
+        return;                         /* one is running: it will see the flag */
+    nv2a_pcache_stat_warming(1);
+    if (pthread_create(&th, NULL, pc_prewarm, NULL) == 0) {
+        pthread_detach(th);
+    } else {
+        nv2a_pcache_stat_warming(0);
+        __atomic_store_n(&s_pc_warm_done, 1, __ATOMIC_RELEASE);
+    }
 }
 
 /* With the device up: the tables, the trace, the key list and its
@@ -2257,9 +2313,8 @@ static int pc_start(void)
 {
     const char *tr = recomp_env(RENV_PCACHE_TRACE);
     long max = recomp_env_int(RENV_METAL_PCACHE_MAX, PC_MAX_DEFAULT);
-    char dir[1024], path[1100], ver[256], msg[256];
-    size_t i, n;
-    pthread_t th;
+    char dir[1024], msg[256];
+    size_t i;
 
     s_pc_max = max < 1 ? 1 : max > PC_MAX_LIMIT ? PC_MAX_LIMIT : (int)max;
     s_vs = (VsEntry *)calloc((size_t)s_pc_max, sizeof *s_vs);
@@ -2279,45 +2334,33 @@ static int pc_start(void)
         }
     }
 
+    s_pc_warm_done = 1;
     if (!nv2a_pcache_dir(nv2a_host_opts()->shader_cache, getprogname(), dir, sizeof dir)) {
         fprintf(stderr, LOGP "pcache: no disk cache (render.shader_cache=%s); %d entries"
                 " per table\n", nv2a_host_opts()->shader_cache ? nv2a_host_opts()->shader_cache
                                                                : "(default, unavailable)",
                 s_pc_max);
-        s_pc_warm_done = 1;
         return 1;
     }
-    snprintf(path, sizeof path, "%s/metal_pipelines.bin", dir);
+    snprintf(s_pc_path, sizeof s_pc_path, "%s/metal_pipelines.bin", dir);
     /* What the keys mean: the key-format number (raise it when a key's
      * meaning changes at the same size) and the structures written as they
      * are. Not the build: the file holds keys, the source is generated from
      * them at every start, so a rebuild keeps it (nv2a_pcache.h). */
-    snprintf(ver, sizeof ver, "metal pipelines 1; PsoKey %zu; NV2ACombinerState %zu;"
+    snprintf(s_pc_ver, sizeof s_pc_ver, "metal pipelines 1; PsoKey %zu; NV2ACombinerState %zu;"
              " vsh slots %d", sizeof(PsoKey), sizeof(NV2ACombinerState),
              (int)NV2A_VSH_SLOTS);
-    s_pcf = nv2a_pcache_open(path, ver, msg, sizeof msg);
-    fprintf(stderr, LOGP "pcache: %s: %s; %d entries per table\n", path, msg, s_pc_max);
-    if (!s_pcf) {
-        s_pc_warm_done = 1;
+    s_pcf = nv2a_pcache_open(s_pc_path, s_pc_ver, msg, sizeof msg);
+    fprintf(stderr, LOGP "pcache: %s: %s; %d entries per table\n", s_pc_path, msg, s_pc_max);
+    if (!s_pcf)
         return 1;
+    {
+        uint32_t none[3] = {0, 0, 0};
+        nv2a_pcache_stat_open(s_pc_path, none);
     }
-    n = nv2a_pcache_count(s_pcf);
-    for (i = 0; i < n; i++) {
-        const void *d;
-        uint32_t type, len;
-        if (nv2a_pcache_get(s_pcf, i, &type, &d, &len) && type <= PC_PSO)
-            s_pc_loaded[type]++;
-    }
-    /* The compiler service's full width while the pre-warm runs (WWDC23
-     * 10127, "Optimize GPU renderers with Metal"); back to balanced after. */
-    if (@available(macOS 13.3, *)) {
-        if (n && s_dev.maximumConcurrentCompilationTaskCount)
-            s_dev.shouldMaximizeConcurrentCompilation = YES;
-    }
-    if (n && pthread_create(&th, NULL, pc_prewarm, NULL) == 0)
-        pthread_detach(th);
-    else
-        s_pc_warm_done = 1;
+    nv2a_pcache_set_rescan(pc_warm_start);
+    if (nv2a_pcache_count(s_pcf))
+        pc_warm_start();
     return 1;
 }
 
