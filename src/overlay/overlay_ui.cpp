@@ -118,6 +118,9 @@ static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the s
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
+#if defined(__ANDROID__)
+static const char *const n_vibration[] = { "Auto", "Controller", "This device", "Off", NULL };
+#endif
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
@@ -145,6 +148,9 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speedometer and distances in km/h and metres instead of mph and miles: the game's own metric display, which the US disc keeps for its other languages. A change shows from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
     /* XS_DISPLAY_HUD_FIX */    { "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On: the HUD keeps its 4:3 shape and stays at the screen edges, by the game's own layout values. A change shows from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For a display wider than 16:9, with Aspect at 16:9: the race is drawn for the whole width (more to see at the sides, nothing stretched). Menus, loading screens and videos keep their 16:9 shape in the middle. Window follows the window's or the screen's own shape. A change shows from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
+#if defined(__ANDROID__)
+    /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: the controller when it has motors, else this device's own vibrator.", 1, FMT_PLAIN, n_vibration, 0 },
+#endif
 };
 
 /* R_SPEAKERS: the speaker test, six buttons in a row (action: 0 through
@@ -257,6 +263,9 @@ static int page_rows(int page, Row *r)
         break;
     case P_INPUT:
         SET(XS_INPUT_DEADZONE); SET(XS_INPUT_TRIGGER_DEADZONE); SET(XS_INPUT_RUMBLE);
+#if defined(__ANDROID__)
+        SET(XS_INPUT_VIBRATION);
+#endif
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_POWER:
