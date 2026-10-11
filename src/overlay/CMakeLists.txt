@@ -13,6 +13,7 @@ set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/imgui)
 
 add_library(xbox_overlay STATIC
     xbox_settings.c
+    xbox_settings_report.c
     overlay_ui.cpp
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
@@ -55,7 +56,7 @@ endif()
 if(NOT MSVC)
     # The vendored files are built as they are; the glue is held to the
     # runtime's own warnings.
-    set_source_files_properties(xbox_settings.c overlay_ui.cpp overlay_vulkan.cpp
+    set_source_files_properties(xbox_settings.c xbox_settings_report.c overlay_ui.cpp overlay_vulkan.cpp
         PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
     if(APPLE)
         set_source_files_properties(overlay_metal.mm

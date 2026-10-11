@@ -14,7 +14,8 @@ else()
     find_package(SDL2 REQUIRED)
     # SMAA's shaders and lookup textures (third_party/smaa), for the layer
     # presenters' post passes.
-    target_sources(xbox_video PRIVATE fb_present_sdl.c smaa.c)
+    # host_probe.c: displays, controllers and GPUs for the bug report.
+    target_sources(xbox_video PRIVATE fb_present_sdl.c smaa.c host_probe.c)
     target_include_directories(xbox_video PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/smaa)
     target_link_libraries(xbox_video PUBLIC SDL2::SDL2 xbox_input)
@@ -40,7 +41,7 @@ else()
     if(APPLE)
         # The window's CAMetalLayer present for the Metal backend (manual
         # retain/release, like nv2a_pb_metal.m).
-        target_sources(xbox_video PRIVATE fb_present_metal.m)
+        target_sources(xbox_video PRIVATE fb_present_metal.m host_probe_metal.m)
         target_link_libraries(xbox_video PUBLIC
             "-framework Metal" "-framework QuartzCore" "-framework CoreGraphics"
             "-framework Foundation" "-framework CoreVideo" "-framework AppKit")

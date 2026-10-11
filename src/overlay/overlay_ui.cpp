@@ -20,6 +20,7 @@
 #include "overlay_internal.h"
 #include "xbox_settings.h"
 #include "xbox_shader_build.h"
+#include "xbox_report.h"
 #include "nv2a_pcache.h"
 #include "recomp_patch.h"
 #include "recomp_env.h"
@@ -170,7 +171,13 @@ static const Meta k_meta[XS_COUNT] = {
 extern "C" const char *nvk_core_describe(void);   /* nv2a_vk_core.c */
 #endif
 enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS };
-enum Action { A_RESET_PAGE, A_RESET_ALL, A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER };
+enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
+              A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER };      /* A_SHADERS on: the build's */
+
+/* ── the bug report (xbox_report.h) ────────────────────────────────── */
+
+static char s_rep_info[160] = "Bug report: a zip file on this device; nothing is sent.";
+static char s_rep_done[1400];         /* where the last one went, or why none */
 
 /* ── the shader pre-build (xbox_shader_build.h) ────────────────────── */
 
@@ -321,6 +328,11 @@ static int page_rows(int page, Row *r)
         break;
     default:
         SET(XS_ADVANCED_PERF);
+        if (xbox_BugReportHasMaker()) {
+            INFO(s_rep_info);
+            ACT(A_REPORT, "Create bug report");
+            ACT(A_REPORT_SHOT, "Create bug report with a screenshot");
+        }
         ACT(A_RESET_ALL, "Reset all settings to the defaults");
         break;
     }
@@ -497,6 +509,29 @@ static void activate(const Row &r)
 {
     if (r.kind == R_SPEAKERS) {
         spk_play(r.action);
+        return;
+    }
+    if (r.kind == R_ACTION && (r.action == A_REPORT || r.action == A_REPORT_SHOT)) {
+        /* On this thread, with the title paused behind the overlay: a second
+         * or so (the frame is the executor's, waited for). The path is shown
+         * as the archive writes paths: the home folder as ~. */
+        char path[1200] = "";
+        int ok = xbox_BugReportMake(r.action == A_REPORT_SHOT, path, sizeof path);
+        char *shown = xbox_report_redact(NULL, path, strlen(path), NULL);
+        const char *p = shown ? shown : path;
+        const char *base = p;
+        for (const char *c = p; *c; c++)
+            if (*c == '/' || *c == '\\')
+                base = c + 1;
+        if (ok) {
+            snprintf(s_rep_info, sizeof s_rep_info, "Saved: %.100s (path below)", base);
+            snprintf(s_rep_done, sizeof s_rep_done, "Saved to %s", p);
+        } else {
+            snprintf(s_rep_info, sizeof s_rep_info, "Bug report: not made (reason below)");
+            snprintf(s_rep_done, sizeof s_rep_done, "No report: %s", p);
+        }
+        fprintf(stderr, LOGP "bug report: %s\n", s_rep_done);
+        free(shown);
         return;
     }
     if (r.kind == R_ACTION && r.action >= A_SHADERS) {
@@ -1336,7 +1371,7 @@ static void build_pages(float fs)
         }
     s_reset = 0;
     /* The footer: the selected row's hint (wrapped), a restart note, the keys. */
-    char hint[640] = "";
+    char hint[1800] = "";
     bool hint_locked = false;
     if (rows[sel].kind == R_SETTING) {
         const xs_setting *s = xbox_SettingGet(rows[sel].id);
@@ -1351,6 +1386,13 @@ static void build_pages(float fs)
         }
     } else if (rows[sel].kind == R_SPEAKERS) {
         spk_hint(rows[sel].action, hint, sizeof hint);
+    } else if (rows[sel].kind == R_ACTION
+               && (rows[sel].action == A_REPORT || rows[sel].action == A_REPORT_SHOT)) {
+        snprintf(hint, sizeof hint, "%s%sA zip in the reports folder beside the settings: the logs of"
+                 " this run and the last ones, crash reports, the settings, a system summary%s."
+                 " No saves, no game data; your home folder is written ~. Attach it to an issue.",
+                 s_rep_done, s_rep_done[0] ? ". " : "",
+                 rows[sel].action == A_REPORT_SHOT ? ", the frame behind this menu" : "");
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_SHADERS && s_sb && s_sb->cost) {
         snprintf(hint, sizeof hint, "%s Paused meanwhile; closing the settings stops it"
                  " (it goes on from there next time).", s_sb->cost);

@@ -332,6 +332,16 @@ Wreckless did exactly this and reached its main loop with no renderer set up.
   `GS` lines included, so `stackwalk.py functions.json < report.txt` redoes
   it with real bounds), the last 500 log lines and the settings.
   `RECOMP_DEBUG=crash_test=segv:10` or `=hang:10` makes one on purpose.
+  The same host keeps the output of the run and of the three before it in
+  `<save dir>/logs/` (`run.log`, `run.tail.log`; `prev1..3.*`).
+- A bug report from a player is one zip (`src/kernel/xbox_report.h`): those
+  logs, the crash folders, the settings with their sources, a system summary
+  and the session's frame times, with the home path and the user and host
+  names taken out. A host fills `xbox_bug_report_opts` in a maker function
+  (`xbox_BugReportSetMaker`) and registers its own sections; the settings
+  overlay's Advanced page then has "Create bug report", and
+  `RECOMP_DEBUG=bug_report=<seconds>` (or `=@<file>`) makes one without a
+  window. `tests/bug_report` holds the privacy test.
 - `RECOMP_WATCH=<va>` names the guest code that writes a value (a callback
   table slot, a "ready" flag); `RECOMP_UNIMPL_TRAP=1` stops at the first
   untranslated instruction that is actually reached.

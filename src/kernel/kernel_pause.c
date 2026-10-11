@@ -6,6 +6,9 @@
 #include "xbox_crash.h"       /* g_xbox_flip_count */
 #include "platform/host_time.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 #define PAUSE_LISTENERS 4
 /* The hold wakes this often even without a resume: the watchdog's sign of
  * life, and a bound on a resume that was signalled before the wait began. */
@@ -71,12 +74,111 @@ void xbox_HostPause(int on)
 static volatile uint64_t s_flip_ns[FLIP_RING];
 static volatile uint32_t s_flip_n;       /* written by the executor only */
 
+/* The session's histogram: quarter-millisecond slots up to 200 ms, the last
+ * slot everything longer. Written by the executor only; a reader may be one
+ * flip behind. */
+#define HIST_SLOTS 801
+#define HIST_US    250u
+static volatile uint32_t s_hist[HIST_SLOTS];
+static volatile uint64_t s_hist_n, s_hist_sum_us, s_flips_all;
+static volatile uint32_t s_hist_max_us, s_pauses;
+static volatile uint64_t s_first_ns, s_last_ns, s_prev_ns;
+static volatile uint32_t s_over[5];
+
 static void flip_note(uint64_t ns)
 {
     uint32_t n = s_flip_n;
     s_flip_ns[n % FLIP_RING] = ns;
     s_flip_n = n + 1;
+    if (!ns) {
+        s_prev_ns = 0;          /* a pause: the next flip starts a new run */
+        s_pauses++;
+        return;
+    }
+    s_flips_all++;
+    if (!s_first_ns)
+        s_first_ns = ns;
+    s_last_ns = ns;
+    if (s_prev_ns && ns > s_prev_ns) {
+        static const uint32_t over_us[5] = { 20000, 25000, 34000, 50000, 100000 };
+        uint64_t us64 = (ns - s_prev_ns) / 1000u;
+        uint32_t us = us64 > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)us64;
+        uint32_t slot = us / HIST_US;
+        int i;
+        s_hist[slot < HIST_SLOTS ? slot : HIST_SLOTS - 1]++;
+        s_hist_n++;
+        s_hist_sum_us += us;
+        if (us > s_hist_max_us)
+            s_hist_max_us = us;
+        for (i = 0; i < 5; i++)
+            if (us > over_us[i])
+                s_over[i]++;
+    }
+    s_prev_ns = ns;
 }
+
+/* The frame time below which `q` of the frames lie, from the histogram (a
+ * slot's upper edge; the open last slot gives the maximum). */
+static double hist_quantile(double q)
+{
+    uint64_t want = (uint64_t)(q * (double)s_hist_n), seen = 0;
+    int i;
+    for (i = 0; i < HIST_SLOTS; i++) {
+        seen += s_hist[i];
+        if (seen > want || (seen == s_hist_n && seen))
+            return i == HIST_SLOTS - 1 ? s_hist_max_us / 1000.0
+                                       : (double)(i + 1) * HIST_US / 1000.0;
+    }
+    return 0.0;
+}
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+void xbox_HostFlipStats(xbox_flip_stats *out)
+{
+    static uint64_t ns[FLIP_RING];
+    static uint32_t iv[FLIP_RING];
+    uint32_t late_slot;
+    int i, n, k = 0;
+
+    memset(out, 0, sizeof *out);
+    out->flips = s_flips_all;
+    out->intervals = s_hist_n;
+    out->pauses = s_pauses;
+    if (!s_hist_n)
+        return;
+    out->span_s = (double)(s_last_ns - s_first_ns) / 1e9;
+    out->mean_ms = (double)s_hist_sum_us / (double)s_hist_n / 1000.0;
+    out->p50_ms = hist_quantile(0.50);
+    out->p90_ms = hist_quantile(0.90);
+    out->p95_ms = hist_quantile(0.95);
+    out->p99_ms = hist_quantile(0.99);
+    out->max_ms = s_hist_max_us / 1000.0;
+    late_slot = (uint32_t)(out->p50_ms * 1.5 * 1000.0 / HIST_US);
+    for (i = (int)late_slot; i < HIST_SLOTS; i++)
+        out->late += s_hist[i];
+    for (i = 0; i < 5; i++)
+        out->over[i] = s_over[i];
+    /* The flip ring: the last frames on their own (the scene on screen). */
+    n = xbox_HostFlipTimes(ns, FLIP_RING);
+    for (i = 1; i < n; i++)
+        if (ns[i] && ns[i - 1] && ns[i] > ns[i - 1])
+            iv[k++] = (uint32_t)((ns[i] - ns[i - 1]) / 1000u);
+    if (k) {
+        qsort(iv, (size_t)k, sizeof iv[0], cmp_u32);
+        out->recent = (uint32_t)k;
+        out->recent_p50_ms = iv[k / 2] / 1000.0;
+        out->recent_p95_ms = iv[(int)((k - 1) * 0.95)] / 1000.0;
+        out->recent_max_ms = iv[k - 1] / 1000.0;
+    }
+}
+
+static void (*volatile s_hold_fn)(void);
+void xbox_HostPauseHoldFn(void (*fn)(void)) { s_hold_fn = fn; }
 
 int xbox_HostFlipTimes(uint64_t *ns, int max)
 {
@@ -99,6 +201,15 @@ void xbox_HostPauseHold(void)
     pause_once();
     EnterCriticalSection(&s_lock);
     while (s_paused) {
+        void (*fn)(void) = s_hold_fn;
+        if (fn) {
+            /* Outside the lock: it may take a while (a frame read back). */
+            LeaveCriticalSection(&s_lock);
+            fn();
+            EnterCriticalSection(&s_lock);
+            if (!s_paused)
+                break;
+        }
         SleepConditionVariableCS(&s_cv, &s_lock, PAUSE_TICK_MS);
         g_xbox_flip_count++;
     }

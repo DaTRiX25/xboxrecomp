@@ -197,6 +197,71 @@ static void ring_append(const char *b, size_t n)
     RING_UNLOCK();
 }
 
+/* ── the run log: what the tee saw, kept on disk for the bug report ──
+ *
+ * <save dir>/logs/run.log is the first RUNLOG_HEAD bytes of this run's
+ * output (the start: the device, the display, the settings), run.tail.log
+ * what came after, moved to run.tail.old.log whenever it passes
+ * RUNLOG_TAIL_ROTATE, so a run of any length leaves at most
+ * RUNLOG_HEAD + 2 * RUNLOG_TAIL_ROTATE bytes. Written as the output comes,
+ * so it is there after a crash, a hang or a kill. At start the files of the
+ * last three runs move on to prev1.*, prev2.*, prev3.* (xbox_report.c reads
+ * them by these names). */
+#define RUNLOG_HEAD         (64u * 1024u)
+#define RUNLOG_TAIL_ROTATE  (384u * 1024u)
+#define RUNLOG_PREV         3
+
+static int s_runlog_want = 1;
+static int s_head_fd = -1, s_tail_fd = -1;
+static size_t s_head_left, s_tail_bytes;
+static char s_log_dir[1100];
+
+static void runlog_path(char *out, size_t n, int gen, const char *suffix)
+{
+    if (gen)
+        snprintf(out, n, "%s/prev%d%s", s_log_dir, gen, suffix);
+    else
+        snprintf(out, n, "%s/run%s", s_log_dir, suffix);
+}
+
+/* Under the ring lock. */
+static void runlog_write(const char *b, size_t n)
+{
+    char path[1200], old[1200];
+
+    if (s_head_fd >= 0 && s_head_left) {
+        size_t k = n < s_head_left ? n : s_head_left;
+        write_all(s_head_fd, b, k);
+        s_head_left -= k;
+        b += k;
+        n -= k;
+        if (!s_head_left) {
+            cr_close(s_head_fd);
+            s_head_fd = -1;
+        }
+    }
+    if (!n || s_head_left)
+        return;
+    runlog_path(path, sizeof path, 0, ".tail.log");
+    if (s_tail_fd >= 0 && s_tail_bytes + n > RUNLOG_TAIL_ROTATE) {
+        cr_close(s_tail_fd);
+        s_tail_fd = -1;
+        runlog_path(old, sizeof old, 0, ".tail.old.log");
+        remove(old);
+        rename(path, old);
+    }
+    if (s_tail_fd < 0) {
+        s_tail_fd = cr_open_new(path);
+        s_tail_bytes = 0;
+        if (s_tail_fd < 0) {
+            s_head_left = (size_t)-1;   /* the folder is gone: stop trying */
+            return;
+        }
+    }
+    write_all(s_tail_fd, b, n);
+    s_tail_bytes += n;
+}
+
 typedef struct {
     int rd;                   /* the pipe's read end */
     int out;                  /* where the stream went before (-1: nowhere) */
@@ -245,6 +310,11 @@ static void tee_pump(TeeChan *c)
 #endif
         write_all(c->out, buf, (size_t)n);
         ring_append(buf, (size_t)n);
+        if (s_log_dir[0]) {
+            RING_LOCK();
+            runlog_write(buf, (size_t)n);
+            RING_UNLOCK();
+        }
         c->busy = 0;
     }
 }
@@ -342,6 +412,11 @@ static int tee_redirect(int fd, TeeChan *c)
 
 static void tee_start(void)
 {
+    static int started;
+
+    if (started)
+        return;
+    started = 1;
 #if defined(_WIN32)
     if (_fileno(stderr) < 0 || _get_osfhandle(2) == -1)
         return;     /* a GUI-subsystem run with no stderr: nothing to tee */
@@ -405,6 +480,52 @@ static long s_tz_off;             /* seconds east of UTC, at init */
 
 const char *xbox_crash_root(void) { return s_root; }
 
+void xbox_crash_log_start(void) { tee_start(); }
+void xbox_crash_set_run_log(int on) { s_runlog_want = on; }
+const char *xbox_crash_log_dir(void) { return s_log_dir; }
+
+/* The last runs' files move on one place, then this run's are opened and
+ * given what the tee has seen so far. */
+static void runlog_open(const char *save_dir)
+{
+    static const char *const sfx[] = { ".log", ".tail.log", ".tail.old.log" };
+    char dir[1100], a[1200], b[1200];
+    int g, k;
+
+    if (!s_runlog_want || !s_tee_on)
+        return;
+    snprintf(dir, sizeof dir, "%s/logs", save_dir && *save_dir ? save_dir : ".");
+    mkdir_p(dir);
+    xbox_crash_log_flush(100);
+    RING_LOCK();
+    snprintf(s_log_dir, sizeof s_log_dir, "%s", dir);
+    for (g = RUNLOG_PREV; g >= 1; g--)
+        for (k = 0; k < 3; k++) {
+            runlog_path(b, sizeof b, g, sfx[k]);
+            runlog_path(a, sizeof a, g - 1, sfx[k]);
+            remove(b);
+            rename(a, b);
+        }
+    runlog_path(a, sizeof a, 0, ".log");
+    s_head_fd = cr_open_new(a);
+    if (s_head_fd < 0) {
+        s_log_dir[0] = 0;
+    } else {
+        uint64_t head = s_ring_head;
+        size_t have = head < RING_SIZE ? (size_t)head : RING_SIZE;
+        uint64_t from = head - have;
+        s_head_left = RUNLOG_HEAD;
+        while (have) {
+            size_t at = (size_t)(from % RING_SIZE);
+            size_t n = RING_SIZE - at < have ? RING_SIZE - at : have;
+            runlog_write(s_ring + at, n);
+            from += n;
+            have -= n;
+        }
+    }
+    RING_UNLOCK();
+}
+
 void xbox_crash_init(const char *save_dir)
 {
     static int done;
@@ -432,6 +553,7 @@ void xbox_crash_init(const char *save_dir)
 #endif
 #endif
     tee_start();
+    runlog_open(save_dir);
 }
 
 void xbox_crash_set_settings(const char *text)

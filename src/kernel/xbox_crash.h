@@ -14,6 +14,9 @@
  *                 runtime's table holds
  *   minidump.dmp  Windows only, written by the host
  *
+ * Beside the reports, <save dir>/logs keeps the log of this run and of the
+ * three before it (see xbox_crash_set_run_log).
+ *
  * The log lines come from a tee: xbox_crash_init points fds 1 and 2 at
  * pipes, and a thread copies what arrives to the original destination and
  * into a ring. Nothing that prints has to know.
@@ -41,6 +44,19 @@ extern "C" {
  * early, after any stdio redirect (RECOMP_STDIO_LOG) and before the threads
  * that print start. NULL or "" puts reports under ./crash. */
 void xbox_crash_init(const char *save_dir);
+
+/* The log tee on its own, before the save folder is known: what is printed
+ * from here on is in the ring, and in the run log once xbox_crash_init opens
+ * it. Optional; right after the stdio redirect. */
+void xbox_crash_log_start(void);
+
+/* The run log (<save dir>/logs/run.log and its tail, the last three runs
+ * beside them as prev1..3; the bug report reads them, xbox_report.h). On by
+ * default; 0 before xbox_crash_init for a process that is not a play session
+ * (a shader pre-build's scene), so it does not push the player's runs out. */
+void xbox_crash_set_run_log(int on);
+/* <save dir>/logs, or "" when no run log is kept. */
+const char *xbox_crash_log_dir(void);
 
 /* The host's part of settings.txt (command line, paths, the enhancements
  * file). Copied; call again to replace it. */
