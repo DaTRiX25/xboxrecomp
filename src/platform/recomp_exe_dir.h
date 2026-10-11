@@ -17,6 +17,10 @@ extern "C" {
  * call it first from one thread (startup). */
 const char *recomp_exe_dir(void);
 
+/* The executable's own path, for a host that starts itself again (a shader
+ * pre-build runs the title once per scene). "" when it could not be found. */
+const char *recomp_exe_path(void);
+
 #ifdef __cplusplus
 }
 #endif

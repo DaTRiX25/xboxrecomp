@@ -23,6 +23,8 @@ add_library(xbox_overlay STATIC
 set_property(TARGET xbox_overlay PROPERTY CXX_STANDARD 17)
 target_include_directories(xbox_overlay PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(xbox_overlay PRIVATE ${IMGUI_DIR})
+# nv2a_pcache.h: the shader cache's state, for the "Preparing shaders" line.
+target_include_directories(xbox_overlay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../d3d)
 # Seen by the presenters and the host that call into it.
 target_compile_definitions(xbox_overlay PUBLIC XBOXRECOMP_HAVE_OVERLAY=1)
 target_link_libraries(xbox_overlay PUBLIC SDL2::SDL2 recomp_env xbox_enhance xbox_input xbox_kernel xbox_apu)

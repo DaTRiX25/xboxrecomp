@@ -116,9 +116,6 @@ extern void  xbox_FramebufferWindowPublishTexture(void);
 static int s_layer;                  /* the window takes GPU slot textures */
 static int pc_start(void);           /* the pipeline cache: tables, disk, pre-warm */
 static void pc_log(uint64_t presents);
-#ifndef XBOXRECOMP_GIT_REV
-#define XBOXRECOMP_GIT_REV "unknown"
-#endif
 static void guard_open(void);        /* metal_fb_guard: open the pages before we touch them */
 static int wb_always(void);
 static uint64_t s_window_presents;   /* frames sent to the window (slot or readback) */
@@ -1313,10 +1310,47 @@ static void pc_note(int prewarm, int kind, uint64_t t_start, const char *what)
         if (ms > s_cs.rt_max_ms)
             s_cs.rt_max_ms = ms;
     }
+    nv2a_pcache_stat_built(prewarm, kind, ns);
     pthread_mutex_unlock(&s_pc_mu);
     if (s_pc_trace)
         fprintf(stderr, LOGP "pcache: compiled %s %s on the %s thread: %.2f ms at %.3f s\n",
                 s_pc_kind[kind], what, prewarm ? "pre-warm" : "ack", ms, at);
+}
+
+/* The ack thread missed while the start-up pre-warm is still on the
+ * pipelines of the key list and their functions (the first frames of a
+ * start, which race it): what it needs is most likely on its way, so it
+ * waits for that key instead of compiling the same thing beside it
+ * (PC_WAIT: look again every half millisecond until it is there, the
+ * pipelines' part is done, or the time is up).
+ *
+ * Bounded so that it cannot reach gameplay: only the pre-warm the backend
+ * starts with has this part (a later one, after a pre-build has added to the
+ * list, is never waited for), and all waits together end 3 s after it
+ * started, which is 3 s after the title's first draw. Past that the ack
+ * thread compiles what it needs itself, as without a list. Each wait is
+ * logged. */
+static int      s_pc_warm_done;         /* no pre-warm thread is running (atomic) */
+static int      s_pc_warm_urgent;       /* the first one is on the pipelines' part (atomic) */
+static uint64_t s_pc_wait_until;        /* the ack thread's waits end here */
+static uint64_t s_pc_waits, s_pc_wait_ns;
+#define PC_URGENT() __atomic_load_n(&s_pc_warm_urgent, __ATOMIC_ACQUIRE)
+static int pc_wait_more(void)
+{
+    if (!PC_URGENT() || pc_now() >= __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE))
+        return 0;
+    nv2a_pcache_stat_waiting(1);        /* the window shows a line meanwhile */
+    usleep(500);
+    return 1;
+}
+static void pc_waited(uint64_t t0, const char *what)
+{
+    uint64_t t = pc_now();
+    nv2a_pcache_stat_waiting(0);
+    s_pc_waits++;
+    s_pc_wait_ns += t - t0;
+    fprintf(stderr, LOGP "pcache: the ack thread waited %.1f ms for the pre-warm's %s"
+            " at %.3f s\n", (double)(t - t0) / 1e6, what, (double)(t - s_t0_ns) / 1e9);
 }
 
 /* A pipeline: its two functions (by id) and the blend, colour-mask and
@@ -1464,6 +1498,15 @@ static id<MTLRenderPipelineState> pipeline(uint64_t vs_id, id<MTLFunction> vs,
     pthread_mutex_lock(&s_pc_mu);
     i = pso_find(&pk);
     pthread_mutex_unlock(&s_pc_mu);
+    if (i < 0 && PC_URGENT()) {
+        uint64_t t0 = pc_now();
+        do {
+            pthread_mutex_lock(&s_pc_mu);
+            i = pso_find(&pk);
+            pthread_mutex_unlock(&s_pc_mu);
+        } while (i < 0 && pc_wait_more());
+        pc_waited(t0, "pipeline");
+    }
     if (i < 0) {
         if (!(pso = pso_build(&pk, vs, fs, 0)))
             return nil;
@@ -1928,6 +1971,15 @@ static VsEntry *vs_cache(void)
     pthread_mutex_lock(&s_pc_mu);
     e = vs_find(kid);
     pthread_mutex_unlock(&s_pc_mu);
+    if (!e && PC_URGENT()) {
+        uint64_t t0 = pc_now();
+        do {
+            pthread_mutex_lock(&s_pc_mu);
+            e = vs_find(kid);
+            pthread_mutex_unlock(&s_pc_mu);
+        } while (!e && pc_wait_more());
+        pc_waited(t0, "vertex function");
+    }
     if (!e) {
         fn = vs_build(slots, (int)len, hash, &inputs, 0);
         pthread_mutex_lock(&s_pc_mu);
@@ -2082,6 +2134,15 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     pthread_mutex_lock(&s_pc_mu);
     e = fs_find(kid, &st);
     pthread_mutex_unlock(&s_pc_mu);
+    if (!e && PC_URGENT()) {
+        uint64_t t0 = pc_now();
+        do {
+            pthread_mutex_lock(&s_pc_mu);
+            e = fs_find(kid, &st);
+            pthread_mutex_unlock(&s_pc_mu);
+        } while (!e && pc_wait_more());
+        pc_waited(t0, "fragment function");
+    }
     if (!e) {
         fn = fs_build(&st, kid, 0);
         pthread_mutex_lock(&s_pc_mu);
@@ -2112,23 +2173,42 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
 /* ---- pipeline cache on disk, and the pre-warm thread ------------------------ */
 
 static nv2a_pcache *s_pcf;              /* the key list, or NULL (off) */
+static pthread_mutex_t s_pcf_mu = PTHREAD_MUTEX_INITIALIZER;   /* s_pcf itself */
 static uint64_t     s_pc_loaded[3], s_pc_warm[3], s_pc_warm_ns;
-static int          s_pc_warm_done;
+static int          s_pc_rescan;        /* asked for while one ran (atomic) */
+static char         s_pc_path[1100], s_pc_ver[256];
 
 /* Appends a key the ack thread just built (it is new to this process; the
  * file drops one it already has). */
 static void pc_put(uint32_t type, const void *data, uint32_t len)
 {
+    pthread_mutex_lock(&s_pcf_mu);
     if (s_pcf && nv2a_pcache_put(s_pcf, type, data, len) < 0) {
-        fprintf(stderr, LOGP "pcache: cannot append; the disk cache is off for this run\n");
-        nv2a_pcache_close(s_pcf);
-        s_pcf = NULL;
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "pcache: cannot append; the key list is not written\n");
     }
+    pthread_mutex_unlock(&s_pcf_mu);
+}
+
+/* The function ids the list's pipelines name: built first. */
+static uint64_t *s_pc_need;
+static size_t    s_pc_need_n;
+
+static int pc_needed(uint64_t kid)
+{
+    size_t k;
+    for (k = 0; k < s_pc_need_n; k++)
+        if (s_pc_need[k] == kid)
+            return 1;
+    return 0;
 }
 
 /* One record of the file built and cached, as the ack thread would have:
- * pass 0 builds the functions, pass 1 the pipelines (which need them).
- * Never evicts: a full table leaves the rest to the ack thread. */
+ * pass 0 builds the functions the list's pipelines use, pass 1 the pipelines,
+ * pass 2 the other functions (keys seeded from the title's executable that
+ * nothing drew yet: nobody waits for those). Never evicts: a full table
+ * leaves the rest to the ack thread. */
 static void pc_warm_one(size_t i, int pass)
 {
     const void *data;
@@ -2137,7 +2217,7 @@ static void pc_warm_one(size_t i, int pass)
 
     if (!nv2a_pcache_get(s_pcf, i, &type, &data, &len))
         return;
-    if (pass == 0 && type == PC_VS && len >= 16 && len % 16 == 0
+    if (pass != 1 && type == PC_VS && len >= 16 && len % 16 == 0
             && len <= NV2A_VSH_SLOTS * 16u) {
         uint32_t hash = 2166136261u, k;
         uint16_t inputs = 0;
@@ -2147,6 +2227,8 @@ static void pc_warm_one(size_t i, int pass)
             hash = (hash ^ ((const uint32_t *)data)[k]) * 16777619u;
         if (!(kid = nv2a_fnv64(data, len, NV2A_FNV64_INIT)))
             kid = 1;
+        if (pass == 0 && !pc_needed(kid))
+            return;
         pthread_mutex_lock(&s_pc_mu);
         e = vs_find(kid);
         pthread_mutex_unlock(&s_pc_mu);
@@ -2163,13 +2245,15 @@ static void pc_warm_one(size_t i, int pass)
         }
         pthread_mutex_unlock(&s_pc_mu);
         [fn release];
-    } else if (pass == 0 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
+    } else if (pass != 1 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
         NV2ACombinerState st;
         id<MTLFunction> fn;
         FsEntry *e;
         memcpy(&st, data, sizeof st);
         if (!(kid = nv2a_fnv64(&st, sizeof st, NV2A_FNV64_INIT)))
             kid = 1;
+        if (pass == 0 && !pc_needed(kid))
+            return;
         pthread_mutex_lock(&s_pc_mu);
         e = fs_find(kid, &st);
         pthread_mutex_unlock(&s_pc_mu);
@@ -2227,31 +2311,110 @@ static void pc_warm_one(size_t i, int pass)
 
 /* Builds every key of the file, functions first, on the utility queues:
  * done before the title reaches the draws that need them, the ack thread
- * finds them built. */
+ * finds them built. Goes round again when asked to meanwhile (pc_warm_start:
+ * a pre-build in another process has appended to the file), reading the
+ * file anew each time. */
 static void *pc_prewarm(void *arg)
 {
-    size_t n = nv2a_pcache_count(s_pcf);
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
-    uint64_t t = pc_now();
-    int pass;
     (void)arg;
-    for (pass = 0; pass < 2; pass++)
-        dispatch_apply(n, q, ^(size_t i) {
-            @autoreleasepool {
-                pc_warm_one(i, pass);
+    do {
+        uint64_t t = pc_now(), before[3];
+        uint32_t listed[3] = {0, 0, 0};
+        size_t n, i;
+        int pass;
+
+        __atomic_store_n(&s_pc_rescan, 0, __ATOMIC_RELEASE);
+        pthread_mutex_lock(&s_pcf_mu);  /* the ack thread's puts wait for the reopen */
+        if (s_pcf) {
+            char msg[256];
+            nv2a_pcache_close(s_pcf);
+            s_pcf = nv2a_pcache_open(s_pc_path, s_pc_ver, msg, sizeof msg);
+        }
+        pthread_mutex_unlock(&s_pcf_mu);
+        n = nv2a_pcache_count(s_pcf);
+        for (i = 0; i < n; i++) {
+            const void *d;
+            uint32_t type, len;
+            if (nv2a_pcache_get(s_pcf, i, &type, &d, &len) && type <= PC_PSO)
+                listed[type]++;
+        }
+        for (i = 0; i < 3; i++) {
+            s_pc_loaded[i] = listed[i];
+            before[i] = s_pc_warm[i];
+        }
+        nv2a_pcache_stat_open(s_pc_path, listed);
+        free(s_pc_need);
+        s_pc_need = (uint64_t *)malloc((listed[PC_PSO] ? listed[PC_PSO] : 1) * 2 * sizeof *s_pc_need);
+        s_pc_need_n = 0;
+        for (i = 0; s_pc_need && i < n; i++) {
+            const void *d;
+            uint32_t type, len;
+            if (nv2a_pcache_get(s_pcf, i, &type, &d, &len) && type == PC_PSO
+                    && len == sizeof(PsoKey) && s_pc_need_n + 2 <= (size_t)listed[PC_PSO] * 2) {
+                memcpy(&s_pc_need[s_pc_need_n], d, 16);     /* PsoKey's vs, fs */
+                s_pc_need_n += 2;
             }
-        });
-    s_pc_warm_ns = pc_now() - t;
-    if (@available(macOS 13.3, *))
-        s_dev.shouldMaximizeConcurrentCompilation = NO;
+        }
+        /* The compiler service's full width while the pre-warm runs (WWDC23
+         * 10127, "Optimize GPU renderers with Metal"); back to balanced after. */
+        if (@available(macOS 13.3, *)) {
+            if (n && s_dev.maximumConcurrentCompilationTaskCount)
+                s_dev.shouldMaximizeConcurrentCompilation = YES;
+        }
+        for (pass = 0; pass < 3; pass++) {
+            dispatch_apply(n, q, ^(size_t k) {
+                @autoreleasepool {
+                    pc_warm_one(k, pass);
+                }
+            });
+            if (pass == 1)              /* the pipelines are in: nobody waits now */
+                __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
+        }
+        s_pc_warm_ns += pc_now() - t;
+        if (@available(macOS 13.3, *))
+            s_dev.shouldMaximizeConcurrentCompilation = NO;
+        fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines of %u/%u/%u"
+                " on disk in %.0f ms (done at %.2f s)\n",
+                (unsigned long long)(s_pc_warm[PC_VS] - before[PC_VS]),
+                (unsigned long long)(s_pc_warm[PC_FS] - before[PC_FS]),
+                (unsigned long long)(s_pc_warm[PC_PSO] - before[PC_PSO]),
+                listed[0], listed[1], listed[2],
+                (double)(pc_now() - t) / 1e6, (double)(pc_now() - s_t0_ns) / 1e9);
+    } while (__atomic_load_n(&s_pc_rescan, __ATOMIC_ACQUIRE));
+    __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
+    nv2a_pcache_stat_warming(0);
     __atomic_store_n(&s_pc_warm_done, 1, __ATOMIC_RELEASE);
-    fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines of %llu/%llu/%llu"
-            " on disk in %.0f ms (done at %.2f s)\n",
-            (unsigned long long)s_pc_warm[PC_VS], (unsigned long long)s_pc_warm[PC_FS],
-            (unsigned long long)s_pc_warm[PC_PSO], (unsigned long long)s_pc_loaded[PC_VS],
-            (unsigned long long)s_pc_loaded[PC_FS], (unsigned long long)s_pc_loaded[PC_PSO],
-            (double)s_pc_warm_ns / 1e6, (double)(pc_now() - s_t0_ns) / 1e9);
     return NULL;
+}
+
+/* Starts the pre-warm thread, or has the one running go round again.
+ * `first`: the one the backend starts with, whose pipelines the ack thread
+ * may wait for (pc_wait_more). */
+static void pc_warm_begin(int first)
+{
+    pthread_t th;
+    __atomic_store_n(&s_pc_rescan, 1, __ATOMIC_RELEASE);
+    if (!__atomic_exchange_n(&s_pc_warm_done, 0, __ATOMIC_ACQ_REL))
+        return;                         /* one is running: it will see the flag */
+    nv2a_pcache_stat_warming(1);
+    if (first) {
+        __atomic_store_n(&s_pc_wait_until, pc_now() + 3000000000ull, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_pc_warm_urgent, 1, __ATOMIC_RELEASE);
+    }
+    if (pthread_create(&th, NULL, pc_prewarm, NULL) == 0) {
+        pthread_detach(th);
+    } else {
+        __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
+        nv2a_pcache_stat_warming(0);
+        __atomic_store_n(&s_pc_warm_done, 1, __ATOMIC_RELEASE);
+    }
+}
+
+/* nv2a_pcache_rescan: the list gained keys (a pre-build in another process). */
+static void pc_warm_start(void)
+{
+    pc_warm_begin(0);
 }
 
 /* With the device up: the tables, the trace, the key list and its
@@ -2260,9 +2423,8 @@ static int pc_start(void)
 {
     const char *tr = recomp_env(RENV_PCACHE_TRACE);
     long max = recomp_env_int(RENV_METAL_PCACHE_MAX, PC_MAX_DEFAULT);
-    char dir[1024], path[1100], ver[256], msg[256];
-    size_t i, n;
-    pthread_t th;
+    char dir[1024], msg[256];
+    size_t i;
 
     s_pc_max = max < 1 ? 1 : max > PC_MAX_LIMIT ? PC_MAX_LIMIT : (int)max;
     s_vs = (VsEntry *)calloc((size_t)s_pc_max, sizeof *s_vs);
@@ -2282,43 +2444,34 @@ static int pc_start(void)
         }
     }
 
-    if (!nv2a_pcache_dir(nv2a_host_opts()->shader_cache, getprogname(), dir, sizeof dir)) {
+    s_pc_warm_done = 1;
+    if (!nv2a_pcache_dir(nv2a_host_opts()->shader_cache, nv2a_pcache_app(), dir, sizeof dir)) {
         fprintf(stderr, LOGP "pcache: no disk cache (render.shader_cache=%s); %d entries"
                 " per table\n", nv2a_host_opts()->shader_cache ? nv2a_host_opts()->shader_cache
                                                                : "(default, unavailable)",
                 s_pc_max);
-        s_pc_warm_done = 1;
         return 1;
     }
-    snprintf(path, sizeof path, "%s/metal_pipelines.bin", dir);
-    /* The keys' layout and the build: a file from another build is dropped
-     * (nv2a_pcache_open), as a changed key layout would not read back. */
-    snprintf(ver, sizeof ver, "metal pipelines 1; PsoKey %zu; NV2ACombinerState %zu;"
-             " vsh slots %d; toolkit %s", sizeof(PsoKey), sizeof(NV2ACombinerState),
-             (int)NV2A_VSH_SLOTS, XBOXRECOMP_GIT_REV);
-    s_pcf = nv2a_pcache_open(path, ver, msg, sizeof msg);
-    fprintf(stderr, LOGP "pcache: %s: %s; %d entries per table\n", path, msg, s_pc_max);
-    if (!s_pcf) {
-        s_pc_warm_done = 1;
+    snprintf(s_pc_path, sizeof s_pc_path, "%s/metal_pipelines.bin", dir);
+    /* What the keys mean: the key-format number (raise it when a key's
+     * meaning changes at the same size) and the structures written as they
+     * are. Not the build: the file holds keys, the source is generated from
+     * them at every start, so a rebuild keeps it (nv2a_pcache.h). */
+    snprintf(s_pc_ver, sizeof s_pc_ver, "metal pipelines 1; PsoKey %zu; NV2ACombinerState %zu;"
+             " vsh slots %d", sizeof(PsoKey), sizeof(NV2ACombinerState),
+             (int)NV2A_VSH_SLOTS);
+    s_pcf = nv2a_pcache_open(s_pc_path, s_pc_ver, msg, sizeof msg);
+    fprintf(stderr, LOGP "pcache: %s: %s; %d entries per table\n", s_pc_path, msg, s_pc_max);
+    if (!s_pcf)
         return 1;
+    {
+        uint32_t none[3] = {0, 0, 0};
+        nv2a_pcache_stat_open(s_pc_path, none);
     }
-    n = nv2a_pcache_count(s_pcf);
-    for (i = 0; i < n; i++) {
-        const void *d;
-        uint32_t type, len;
-        if (nv2a_pcache_get(s_pcf, i, &type, &d, &len) && type <= PC_PSO)
-            s_pc_loaded[type]++;
-    }
-    /* The compiler service's full width while the pre-warm runs (WWDC23
-     * 10127, "Optimize GPU renderers with Metal"); back to balanced after. */
-    if (@available(macOS 13.3, *)) {
-        if (n && s_dev.maximumConcurrentCompilationTaskCount)
-            s_dev.shouldMaximizeConcurrentCompilation = YES;
-    }
-    if (n && pthread_create(&th, NULL, pc_prewarm, NULL) == 0)
-        pthread_detach(th);
-    else
-        s_pc_warm_done = 1;
+    nv2a_pcache_set_rescan(pc_warm_start);
+    nv2a_pcache_set_seed(pc_put);
+    if (nv2a_pcache_count(s_pcf))
+        pc_warm_begin(1);
     return 1;
 }
 
@@ -2356,7 +2509,7 @@ static void pc_log(uint64_t presents)
     fprintf(stderr, LOGP "pcache at present #%llu: cached %d vs, %d fs, %d pipelines (max %d);"
             " ack-thread compiles %llu vs + %llu fs + %llu pipelines in %.1f ms (max %.1f,"
             " %llu in the first 10 s); pre-warm %llu + %llu + %llu in %.1f ms (%s);"
-            " evicted %llu + %llu + %llu\n",
+            " evicted %llu + %llu + %llu; start-up waits %llu, %.1f ms\n",
             (unsigned long long)presents, nv, nf, np, s_pc_max,
             (unsigned long long)s_cs.n[0][PC_VS], (unsigned long long)s_cs.n[0][PC_FS],
             (unsigned long long)s_cs.n[0][PC_PSO],
@@ -2367,7 +2520,8 @@ static void pc_log(uint64_t presents)
             (double)(s_cs.ns[1][0] + s_cs.ns[1][1] + s_cs.ns[1][2]) / 1e6,
             __atomic_load_n(&s_pc_warm_done, __ATOMIC_ACQUIRE) ? "done" : "running",
             (unsigned long long)s_cs.evicted[PC_VS], (unsigned long long)s_cs.evicted[PC_FS],
-            (unsigned long long)s_cs.evicted[PC_PSO]);
+            (unsigned long long)s_cs.evicted[PC_PSO],
+            (unsigned long long)s_pc_waits, (double)s_pc_wait_ns / 1e6);
     pthread_mutex_unlock(&s_pc_mu);
 }
 

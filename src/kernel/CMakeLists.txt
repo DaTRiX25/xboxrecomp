@@ -17,6 +17,7 @@ set(KERNEL_SOURCES
     kernel_prof.c
     kernel_pacing.c
     kernel_pause.c
+    xbox_autoplay.c
     kernel_frametime.c
     kernel_xbox.c
     kernel_ob.c

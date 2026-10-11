@@ -58,6 +58,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "nv2a_vk_core.h"
 #include "nv2a_vk_glsl.h"
@@ -71,9 +72,6 @@
 
 ptrdiff_t xbox_GetMemoryOffset(void);
 
-#ifndef XBOXRECOMP_GIT_REV
-#define XBOXRECOMP_GIT_REV "unknown"
-#endif
 
 #define LOGP "[vulkan] "
 
@@ -1091,10 +1089,99 @@ static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
 /* ---- shaders -------------------------------------------------------------------- */
 
 static uint64_t s_compile_errors, s_vs_compiled, s_fs_compiled, s_glsl_compiles;
+#define COUNT(x) __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED)
 
+/* ---- the shader and pipeline tables, and who builds into them --------------------
+ *
+ * s_vs, s_fs and s_pso are filled by two threads: the ack thread, with what
+ * a draw needs and the tables lack, and the pre-warm thread (pc_prewarm),
+ * with the key list from disk, so that a start with a list builds nothing on
+ * the ack thread (as the Metal backend). s_pc_mu guards the tables' slots; an
+ * entry never moves or goes once it is in, so the ack thread keeps its memos
+ * without the lock. Every build is counted by thread and kind
+ * (RECOMP_TRACE=pcache logs each, =<file> adds one CSV line a flip). */
+static pthread_mutex_t s_pc_mu = PTHREAD_MUTEX_INITIALIZER;
+enum { PC_VS = 0, PC_FS = 1, PC_PSO = 2 };
+static const char *const s_pc_kind[3] = { "vs", "fs", "pso" };
+static struct {
+    uint64_t n[2][3], ns[2][3];          /* [ack thread, pre-warm][kind] */
+    uint64_t rt_flip_n, rt_flip_ns;      /* ack thread, since the last flip */
+    uint64_t rt_10s;                     /* ack thread, first 10 s of the process */
+    double   rt_max_ms;
+} s_cs;
+static int      s_pc_trace;              /* RECOMP_TRACE=pcache */
+static FILE    *s_pc_csv;                /* RECOMP_TRACE=pcache=<file> */
+static uint64_t s_t0_ns;                 /* process start, for the trace */
+
+static uint64_t now_ns(void);
+__attribute__((constructor)) static void pc_t0(void)
+{
+    s_t0_ns = now_ns();
+}
+
+/* One build done: counted, and logged under RECOMP_TRACE=pcache. */
+static void pc_note(int prewarm, int kind, uint64_t t_start, const char *what)
+{
+    uint64_t t = now_ns(), ns = t - t_start;
+    double ms = (double)ns / 1e6, at = (double)(t - s_t0_ns) / 1e9;
+    pthread_mutex_lock(&s_pc_mu);
+    s_cs.n[prewarm][kind]++;
+    s_cs.ns[prewarm][kind] += ns;
+    if (!prewarm) {
+        s_cs.rt_flip_n++;
+        s_cs.rt_flip_ns += ns;
+        if (at < 10.0)
+            s_cs.rt_10s++;
+        if (ms > s_cs.rt_max_ms)
+            s_cs.rt_max_ms = ms;
+    }
+    nv2a_pcache_stat_built(prewarm, kind, ns);
+    pthread_mutex_unlock(&s_pc_mu);
+    if (s_pc_trace)
+        fprintf(stderr, LOGP "pcache: compiled %s %s on the %s thread: %.2f ms at %.3f s\n",
+                s_pc_kind[kind], what, prewarm ? "pre-warm" : "ack", ms, at);
+}
+
+/* The ack thread missed while the start-up pre-warm is still on the
+ * pipelines of the key list and their shaders (the first frames of a start,
+ * which race it): what it needs is most likely on its way, so it waits for
+ * that key instead of compiling the same thing beside it (pc_wait_more:
+ * look again every half millisecond until it is there, the pipelines' part
+ * is done, or the time is up).
+ *
+ * Bounded so that it cannot reach gameplay: only the pre-warm the backend
+ * starts with has this part (a later one, after a pre-build has added to the
+ * list, is never waited for), and all waits together end 3 s after it
+ * started, which is 3 s after the title's first draw. Past that the ack
+ * thread compiles what it needs itself, as without a list. Each wait is
+ * logged. */
+static int      s_pc_warming;           /* a pre-warm thread is running (atomic) */
+static int      s_pc_warm_urgent;       /* the first one is on the pipelines' part (atomic) */
+static uint64_t s_pc_wait_until;        /* the ack thread's waits end here */
+static uint64_t s_pc_waits, s_pc_wait_ns;
+#define PC_WARMING() __atomic_load_n(&s_pc_warm_urgent, __ATOMIC_ACQUIRE)
+static int pc_wait_more(void)
+{
+    if (!PC_WARMING() || now_ns() >= __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE))
+        return 0;
+    nv2a_pcache_stat_waiting(1);        /* the window shows a line meanwhile */
+    usleep(500);
+    return 1;
+}
+static void pc_waited(uint64_t t0, const char *what)
+{
+    uint64_t t = now_ns();
+    nv2a_pcache_stat_waiting(0);
+    s_pc_waits++;
+    s_pc_wait_ns += t - t0;
+    fprintf(stderr, LOGP "pcache: the ack thread waited %.1f ms for the pre-warm's %s"
+            " at %.3f s\n", (double)(t - t0) / 1e6, what, (double)(t - s_t0_ns) / 1e9);
+}
+
+/* Any thread. */
 static VkShaderModule module_from_glsl(enum nvk_stage stage, const char *src, const char *what)
 {
-    static char err[8192];
+    char err[2048];
     const uint32_t *w;
     size_t n;
     int compiled;
@@ -1102,19 +1189,19 @@ static VkShaderModule module_from_glsl(enum nvk_stage stage, const char *src, co
     VkShaderModule m = VK_NULL_HANDLE;
 
     if (!nvk_glsl_spirv(stage, src, &w, &n, &compiled, err, sizeof err)) {
-        s_compile_errors++;
-        if (s_compile_errors <= 4)
+        if (COUNT(s_compile_errors) <= 4)
             fprintf(stderr, LOGP "\x1b[1;31m%s: GLSL compile failed: %s\x1b[0m\n%s\n",
                     what, err, src);
         return VK_NULL_HANDLE;
     }
-    s_glsl_compiles += compiled ? 1 : 0;
+    if (compiled)
+        COUNT(s_glsl_compiles);
     memset(&ci, 0, sizeof ci);
     ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     ci.codeSize = n * 4;
     ci.pCode = w;
     if (vkCreateShaderModule(s_dev, &ci, NULL, &m) != VK_SUCCESS) {
-        s_compile_errors++;
+        COUNT(s_compile_errors);
         fprintf(stderr, LOGP "%s: vkCreateShaderModule failed\n", what);
         return VK_NULL_HANDLE;
     }
@@ -1135,13 +1222,69 @@ typedef struct {
 static VsEntry s_vs[VS_MAX];
 
 /* The key list on disk (nv2a_pcache.h, the Metal pipeline cache's format):
- * what was built, as keys, so a start whose driver cache is cold builds it
- * before the title draws with it (pc_prewarm). Types: */
-enum { PC_VS = 0, PC_FS = 1, PC_PSO = 2 };
+ * what was built, as keys (types PC_VS, PC_FS, PC_PSO), so the next start
+ * builds it before the title draws with it (pc_prewarm). */
 #define PC_VS_PASS  1ull      /* ids of the two built-in shaders */
 #define PC_FS_BASIC 2ull
 static nv2a_pcache *s_pcf;
 static void pc_put(uint32_t type, const void *data, uint32_t len);
+
+/* The module for `n` slots of program (up to its FINAL), or VK_NULL_HANDLE;
+ * its inputs in *inputs. Any thread: `parsed` and `glsl` (65536) are the
+ * caller's. */
+static VkShaderModule vs_build(const uint32_t *slots, int n, uint32_t hash, uint16_t *inputs,
+                               NV2AVshProgram *parsed, char *glsl, int prewarm)
+{
+    VkShaderModule m = VK_NULL_HANDLE;
+    uint64_t t = now_ns();
+    char what[32];
+
+    snprintf(what, sizeof what, "program %08X", hash);
+    d3d8_vsh_parse(slots, n, parsed);
+    if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE, glsl, 65536) <= 0) {
+        COUNT(s_compile_errors);
+        fprintf(stderr, LOGP "%s: no GLSL\n", what);
+    } else if ((m = module_from_glsl(NVK_STAGE_VERTEX, glsl, what)) != VK_NULL_HANDLE) {
+        *inputs = parsed->inputs_read;
+        COUNT(s_vs_compiled);
+        pc_note(prewarm, PC_VS, t, what);
+    }
+    return m;
+}
+
+/* s_pc_mu held. */
+static VsEntry *vs_find(uint32_t hash)
+{
+    int i;
+    for (i = 0; i < VS_MAX; i++)
+        if (s_vs[i].used && s_vs[i].hash == hash)
+            return &s_vs[i];
+    return NULL;
+}
+
+/* s_pc_mu held. A free entry taken for `hash`, or NULL when the table is full. */
+static VsEntry *vs_take(uint32_t hash, uint64_t kid, VkShaderModule mod, uint16_t inputs)
+{
+    int i;
+    for (i = 0; i < VS_MAX && s_vs[i].used; i++)
+        ;
+    if (i == VS_MAX)
+        return NULL;
+    s_vs[i].hash = hash;
+    s_vs[i].kid = kid;
+    s_vs[i].mod = mod;
+    s_vs[i].inputs = inputs;
+    s_vs[i].bad = mod ? 0 : 1;
+    s_vs[i].used = 1;
+    return &s_vs[i];
+}
+
+/* The id of a vertex program's key: nv2a_fnv64 of its slots. */
+static uint64_t vs_kid(const void *slots, size_t bytes)
+{
+    uint64_t kid = nv2a_fnv64(slots, bytes, NV2A_FNV64_INIT);
+    return kid <= PC_FS_BASIC ? kid + 3 : kid;
+}
 
 /* As Metal's vs_cache: the program from its start slot, parsed, emitted as
  * GLSL with the screen-space epilogue, keyed by nv2a_vsh_program_hash. */
@@ -1151,51 +1294,46 @@ static VsEntry *vs_cache(void)
     static char glsl[65536];
     static struct { int valid; uint32_t dwords, start; VsEntry *e; } memo;
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
-    uint32_t hash;
-    VsEntry *e = NULL;
-    char what[32];
-    int i;
+    uint32_t hash, len = 0;
+    VsEntry *e;
 
     if (memo.valid && memo.dwords == v->prog_dwords && memo.start == v->start)
         return memo.e;
-    hash = nv2a_vsh_program_hash(v, NULL);
+    hash = nv2a_vsh_program_hash(v, &len);
     if (!hash)
         hash = 1;
-    for (i = 0; i < VS_MAX; i++) {
-        if (s_vs[i].used && s_vs[i].hash == hash) {
-            e = &s_vs[i];
-            break;
-        }
+    pthread_mutex_lock(&s_pc_mu);
+    e = vs_find(hash);
+    pthread_mutex_unlock(&s_pc_mu);
+    if (!e && PC_WARMING()) {
+        uint64_t t0 = now_ns();
+        do {
+            pthread_mutex_lock(&s_pc_mu);
+            e = vs_find(hash);
+            pthread_mutex_unlock(&s_pc_mu);
+        } while (!e && pc_wait_more());
+        pc_waited(t0, "vertex shader");
     }
     if (!e) {
-        for (i = 0; i < VS_MAX && s_vs[i].used; i++)
-            ;
-        if (i == VS_MAX)
-            return NULL;
-        e = &s_vs[i];
-        e->used = 1;
-        e->hash = hash;
-        e->bad = 1;
-        {
-            uint32_t len = 0;
-            (void)nv2a_vsh_program_hash(v, &len);
-            if (!len || len > NV2A_VSH_SLOTS - v->start)
-                len = NV2A_VSH_SLOTS - v->start;
-            e->kid = nv2a_fnv64(&v->prog[v->start][0], (size_t)len * 16u, NV2A_FNV64_INIT);
-            if (e->kid <= PC_FS_BASIC)
-                e->kid += 3;
-            pc_put(PC_VS, &v->prog[v->start][0], len * 16u);
+        const uint32_t *slots = &v->prog[v->start][0];
+        uint16_t inputs = 0;
+        VkShaderModule mod;
+        if (!len || len > NV2A_VSH_SLOTS - v->start)
+            len = NV2A_VSH_SLOTS - v->start;
+        mod = vs_build(slots, (int)len, hash, &inputs, &parsed, glsl, 0);
+        pthread_mutex_lock(&s_pc_mu);
+        if ((e = vs_find(hash)) != NULL) {
+            if (mod)                    /* the pre-warm thread was first */
+                vkDestroyShaderModule(s_dev, mod, NULL);
+            mod = VK_NULL_HANDLE;
+        } else {
+            e = vs_take(hash, vs_kid(slots, (size_t)len * 16u), mod, inputs);
         }
-        d3d8_vsh_parse(&v->prog[v->start][0], NV2A_VSH_SLOTS - (int)v->start, &parsed);
-        snprintf(what, sizeof what, "program %08X", hash);
-        if (d3d8_vsh_generate_glsl(&parsed, D3D8_GLSL_SCREEN_SPACE, glsl, (int)sizeof glsl) <= 0) {
-            s_compile_errors++;
-            fprintf(stderr, LOGP "%s: no GLSL\n", what);
-        } else if ((e->mod = module_from_glsl(NVK_STAGE_VERTEX, glsl, what)) != VK_NULL_HANDLE) {
-            e->inputs = parsed.inputs_read;
-            e->bad = 0;
-            s_vs_compiled++;
-        }
+        pthread_mutex_unlock(&s_pc_mu);
+        if (!e)
+            return NULL;                /* the table is full */
+        if (mod)
+            pc_put(PC_VS, slots, len * 16u);
     }
     memo.valid = 1;
     memo.dwords = v->prog_dwords;
@@ -1212,8 +1350,56 @@ typedef struct {
     NV2ACombinerState st;
     VkShaderModule    mod;
 } FsEntry;
-static FsEntry *s_fs;
+static FsEntry *s_fs;         /* FS_MAX, allocated in init */
 static int      s_fs_n;
+
+/* The module for combiner state `st`, or VK_NULL_HANDLE. Any thread: `glsl`
+ * (65536) is the caller's. */
+static VkShaderModule fs_build(const NV2ACombinerState *st, uint32_t hash, char *glsl,
+                               int prewarm)
+{
+    VkShaderModule m = VK_NULL_HANDLE;
+    uint64_t t = now_ns();
+    char what[32];
+
+    snprintf(what, sizeof what, "combiners %08X", hash);
+    if (d3d8_combiners_generate_glsl(st, glsl, 65536) <= 0) {
+        COUNT(s_compile_errors);
+        fprintf(stderr, LOGP "%s: no GLSL\n", what);
+    } else if ((m = module_from_glsl(NVK_STAGE_FRAGMENT, glsl, what)) != VK_NULL_HANDLE) {
+        COUNT(s_fs_compiled);
+        pc_note(prewarm, PC_FS, t, what);
+    }
+    return m;
+}
+
+/* s_pc_mu held. */
+static FsEntry *fs_find(uint32_t hash, const NV2ACombinerState *st)
+{
+    int n;
+    for (n = 0; n < s_fs_n; n++)
+        if (s_fs[n].hash == hash && !memcmp(&s_fs[n].st, st, sizeof *st))
+            return &s_fs[n];
+    return NULL;
+}
+
+/* s_pc_mu held. The next entry taken for `st`, or NULL when the table is full. */
+static FsEntry *fs_take(uint32_t hash, const NV2ACombinerState *st, VkShaderModule mod)
+{
+    FsEntry *e;
+    if (s_fs_n == FS_MAX)
+        return NULL;
+    e = &s_fs[s_fs_n];
+    e->hash = hash;
+    e->st = *st;
+    e->mod = mod;
+    e->bad = mod ? 0 : 1;
+    e->kid = nv2a_fnv64(st, sizeof *st, NV2A_FNV64_INIT);
+    if (e->kid <= PC_FS_BASIC)
+        e->kid += 3;
+    s_fs_n++;               /* last: fs_find reads up to it */
+    return e;
+}
 
 static uint32_t fnv(const void *p, size_t n)
 {
@@ -1237,8 +1423,7 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     static struct { int valid; uint32_t r[39]; VkShaderModule m; } memo;
     NV2ACombinerState st;
     uint32_t key[39], modes = 0, signs = 0, hash;
-    FsEntry *e = NULL;
-    char what[32];
+    FsEntry *e;
     int n;
 
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
@@ -1281,32 +1466,33 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     st.input_tex[2] = (uint8_t)((v->shader_ctl >> 16) & 0xFu);
     st.input_tex[3] = (uint8_t)((v->shader_ctl >> 20) & 0xFu);
     hash = fnv(&st, sizeof st);
-    if (!s_fs && !(s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs)))
-        return s_fs_basic;
-    for (n = 0; n < s_fs_n; n++)
-        if (s_fs[n].hash == hash && !memcmp(&s_fs[n].st, &st, sizeof st)) {
-            e = &s_fs[n];
-            break;
-        }
+    pthread_mutex_lock(&s_pc_mu);
+    e = fs_find(hash, &st);
+    pthread_mutex_unlock(&s_pc_mu);
+    if (!e && PC_WARMING()) {
+        uint64_t t0 = now_ns();
+        do {
+            pthread_mutex_lock(&s_pc_mu);
+            e = fs_find(hash, &st);
+            pthread_mutex_unlock(&s_pc_mu);
+        } while (!e && pc_wait_more());
+        pc_waited(t0, "fragment shader");
+    }
     if (!e) {
-        if (s_fs_n == FS_MAX)
-            return s_fs_basic;
-        e = &s_fs[s_fs_n++];
-        e->hash = hash;
-        e->st = st;
-        e->bad = 1;
-        e->kid = nv2a_fnv64(&st, sizeof st, NV2A_FNV64_INIT);
-        if (e->kid <= PC_FS_BASIC)
-            e->kid += 3;
-        pc_put(PC_FS, &st, sizeof st);
-        snprintf(what, sizeof what, "combiners %08X", hash);
-        if (d3d8_combiners_generate_glsl(&st, glsl, (int)sizeof glsl) <= 0) {
-            s_compile_errors++;
-            fprintf(stderr, LOGP "%s: no GLSL\n", what);
-        } else if ((e->mod = module_from_glsl(NVK_STAGE_FRAGMENT, glsl, what)) != VK_NULL_HANDLE) {
-            e->bad = 0;
-            s_fs_compiled++;
+        VkShaderModule mod = fs_build(&st, hash, glsl, 0);
+        pthread_mutex_lock(&s_pc_mu);
+        if ((e = fs_find(hash, &st)) != NULL) {
+            if (mod)                    /* the pre-warm thread was first */
+                vkDestroyShaderModule(s_dev, mod, NULL);
+            mod = VK_NULL_HANDLE;
+        } else {
+            e = fs_take(hash, &st, mod);
         }
+        pthread_mutex_unlock(&s_pc_mu);
+        if (!e)
+            return s_fs_basic;          /* the table is full */
+        if (mod)
+            pc_put(PC_FS, &st, sizeof st);
     }
     memcpy(memo.r, key, sizeof key);
     memo.valid = 1;
@@ -1360,8 +1546,10 @@ typedef struct {
 static struct { PsoKey k; VkPipeline p; int used; } *s_pso;
 static uint32_t s_pso_n;
 
-static VkPipeline pipeline_new(const PsoKey *k)
+/* Any thread. */
+static VkPipeline pipeline_new(const PsoKey *k, int prewarm)
 {
+    uint64_t t0 = now_ns();
     VkPipelineShaderStageCreateInfo ss[2];
     VkVertexInputBindingDescription vb;
     VkVertexInputAttributeDescription va[NV2A_VS_MAX_INPUTS];
@@ -1482,9 +1670,29 @@ static VkPipeline pipeline_new(const PsoKey *k)
             fprintf(stderr, LOGP "pipeline failed: %s\n", nvk_result_str(r));
         return VK_NULL_HANDLE;
     }
-    s_pso_created++;
-    s_pso_since_save++;
+    COUNT(s_pso_created);
+    COUNT(s_pso_since_save);
+    {
+        char what[48];
+        snprintf(what, sizeof what, "%016llX/%016llX", (unsigned long long)k->vs,
+                 (unsigned long long)k->fs);
+        pc_note(prewarm, PC_PSO, t0, what);
+    }
     return p;
+}
+
+/* s_pc_mu held. The slot of `k`: its entry when *found, else the free slot
+ * it would take. */
+static uint32_t pso_slot(const PsoKey *k, int *found)
+{
+    uint32_t i = fnv(k, sizeof *k) & (PSO_CAP - 1);
+    for (; s_pso[i].used; i = (i + 1) & (PSO_CAP - 1))
+        if (!memcmp(&s_pso[i].k, k, sizeof *k)) {
+            *found = 1;
+            return i;
+        }
+    *found = 0;
+    return i;
 }
 
 /* A pipeline key on disk: the shaders by id, not by module. */
@@ -1513,8 +1721,10 @@ static uint64_t module_kid(VkShaderModule m)
 static void pso_disk(const PsoKey *k, PsoDisk *d)
 {
     memset(d, 0, sizeof *d);
+    pthread_mutex_lock(&s_pc_mu);
     d->vs = module_kid((VkShaderModule)(uintptr_t)k->vs);
     d->fs = module_kid((VkShaderModule)(uintptr_t)k->fs);
+    pthread_mutex_unlock(&s_pc_mu);
     d->nf4 = k->nf4;
     d->topo = k->topo;
     d->depth = k->depth;
@@ -1528,7 +1738,8 @@ static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
     static uint32_t last = 0xFFFFFFFFu;
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     PsoKey k;
-    uint32_t h, i;
+    uint32_t i;
+    int found, full;
 
     memset(&k, 0, sizeof k);
     k.vs = (uint64_t)(uintptr_t)vs;
@@ -1543,28 +1754,50 @@ static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
     k.blend[3] = k.blend[0] ? (uint32_t)blend_op(g->blend_equation) : 0;
     if (last < PSO_CAP && s_pso[last].used && !memcmp(&s_pso[last].k, &k, sizeof k))
         return s_pso[last].p;
-    h = fnv(&k, sizeof k) & (PSO_CAP - 1);
-    for (i = h; s_pso[i].used; i = (i + 1) & (PSO_CAP - 1))
-        if (!memcmp(&s_pso[i].k, &k, sizeof k)) {
-            last = i;
-            return s_pso[i].p;
-        }
-    if (s_pso_n + 1 >= PSO_CAP * 3 / 4)
-        return VK_NULL_HANDLE;   /* a title with this many wants eviction */
-    s_pso[i].k = k;
-    s_pso[i].p = pipeline_new(&k);
-    if (s_pso[i].p) {
-        PsoDisk dk;
-        pso_disk(&k, &dk);
-        pc_put(PC_PSO, &dk, sizeof dk);
+    pthread_mutex_lock(&s_pc_mu);
+    i = pso_slot(&k, &found);
+    pthread_mutex_unlock(&s_pc_mu);
+    if (!found && PC_WARMING()) {
+        uint64_t t0 = now_ns();
+        do {
+            pthread_mutex_lock(&s_pc_mu);
+            i = pso_slot(&k, &found);
+            pthread_mutex_unlock(&s_pc_mu);
+        } while (!found && pc_wait_more());
+        pc_waited(t0, "pipeline");
     }
-    s_pso[i].used = 1;
-    s_pso_n++;
+    pthread_mutex_lock(&s_pc_mu);
+    full = !found && s_pso_n + 1 >= PSO_CAP * 3 / 4;
+    pthread_mutex_unlock(&s_pc_mu);
+    if (!found) {
+        VkPipeline p;
+        if (full)
+            return VK_NULL_HANDLE;   /* a title with this many wants eviction */
+        p = pipeline_new(&k, 0);
+        pthread_mutex_lock(&s_pc_mu);
+        i = pso_slot(&k, &found);
+        if (!found) {
+            /* A failed one is kept too, so it is not tried at every draw. */
+            s_pso[i].k = k;
+            s_pso[i].p = p;
+            s_pso[i].used = 1;
+            s_pso_n++;
+        }
+        pthread_mutex_unlock(&s_pc_mu);
+        if (found) {                 /* the pre-warm thread was first */
+            if (p)
+                vkDestroyPipeline(s_dev, p, NULL);
+        } else if (p) {
+            PsoDisk dk;
+            pso_disk(&k, &dk);
+            pc_put(PC_PSO, &dk, sizeof dk);
+            if (vk_trace())
+                fprintf(stderr, LOGP "pipeline #%u: blend %u %04X/%04X op %u mask %08X"
+                        " depth %u topo %u inputs %u\n", s_pso_n, k.blend[0], k.blend[1],
+                        k.blend[2], k.blend[3], k.wmask, k.depth, k.topo, k.nf4);
+        }
+    }
     last = i;
-    if (vk_trace() && s_pso[i].p)
-        fprintf(stderr, LOGP "pipeline #%u: blend %u %04X/%04X op %u mask %08X depth %u"
-                " topo %u inputs %u\n", s_pso_n, k.blend[0], k.blend[1], k.blend[2],
-                k.blend[3], k.wmask, k.depth, k.topo, k.nf4);
     return s_pso[i].p;
 }
 
@@ -3114,7 +3347,7 @@ static void at_exit_save(void)
         pcache_save();
 }
 
-static int s_pcache_warm;
+static int s_pc_save;                    /* the pre-warm thread asks for a save (atomic) */
 
 static VkPipelineCache pcache_load(void)
 {
@@ -3152,10 +3385,9 @@ static VkPipelineCache pcache_load(void)
     }
     free(data);
     {
-        /* Warm: the driver kept most of what the file held. */
+        /* What the driver kept of the file (it drops one of another driver). */
         size_t kept = 0;
         vkGetPipelineCacheData(s_dev, pc, &kept, NULL);
-        s_pcache_warm = n > 4096 && kept * 2 >= n;
         fprintf(stderr, LOGP "pipeline cache: %s (%zu bytes, %zu kept by the driver)\n",
                 n ? path : "empty", n, kept);
     }
@@ -3164,114 +3396,323 @@ static VkPipelineCache pcache_load(void)
 
 /* ---- the key list and the pre-warm thread ---------------------------------------- */
 
+static pthread_mutex_t s_pcf_mu = PTHREAD_MUTEX_INITIALIZER;   /* s_pcf itself */
+static int      s_pc_rescan;            /* asked for while one ran */
+static uint64_t s_pc_warm[3], s_pc_warm_ns;
+static char     s_pc_path[1100], s_pc_ver[256];
+
+/* Appends a key the ack thread just built. */
 static void pc_put(uint32_t type, const void *data, uint32_t len)
 {
+    pthread_mutex_lock(&s_pcf_mu);
     if (s_pcf && nv2a_pcache_put(s_pcf, type, data, len) < 0) {
-        fprintf(stderr, LOGP "pcache: cannot append; the key list is off for this run\n");
-        nv2a_pcache_close(s_pcf);
-        s_pcf = NULL;
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "pcache: cannot append; the key list is not written\n");
     }
+    pthread_mutex_unlock(&s_pcf_mu);
 }
 
-/* Builds every key of the file once, into the SPIR-V cache and the
- * VkPipelineCache only: the ack thread's own tables are untouched, and its
- * first use of each then hits both caches. Runs when the driver's cache came
- * up empty (a first start, a driver update); a warm start skips it. */
+/* A module of the tables by its key id, or VK_NULL_HANDLE. s_pc_mu held. */
+static VkShaderModule module_by_kid(uint64_t kid, int fragment)
+{
+    int i;
+    if (!fragment) {
+        if (kid == PC_VS_PASS)
+            return s_vs_pass;
+        for (i = 0; i < VS_MAX; i++)
+            if (s_vs[i].used && !s_vs[i].bad && s_vs[i].kid == kid)
+                return s_vs[i].mod;
+    } else {
+        if (kid == PC_FS_BASIC)
+            return s_fs_basic;
+        for (i = 0; i < s_fs_n; i++)
+            if (!s_fs[i].bad && s_fs[i].kid == kid)
+                return s_fs[i].mod;
+    }
+    return VK_NULL_HANDLE;
+}
+
+/* Builds every key of the list into the ack thread's own tables: first the
+ * shaders the list's pipelines use, then the pipelines, then the other
+ * shaders (keys seeded from the title's executable that nothing drew yet:
+ * nobody waits for those), so the ack thread finds them built: with the SPIR-V cache and the driver's pipeline cache warm this is
+ * a few lookups, and after a driver update or a changed shader generator it
+ * is the compiling the ack thread would otherwise do mid-game. One thread,
+ * below the title's: it shares the machine with a title that is starting. */
 static void *pc_prewarm(void *arg)
 {
     static char glsl[65536];
-    size_t n = nv2a_pcache_count(s_pcf), i;
-    uint64_t *ids = (uint64_t *)calloc(n ? n : 1, sizeof *ids);
-    VkShaderModule *mods = (VkShaderModule *)calloc(n ? n : 1, sizeof *mods);
     NV2AVshProgram *parsed = (NV2AVshProgram *)malloc(sizeof *parsed);
-    uint64_t t0 = now_ns(), nv = 0, nf = 0, np = 0;
-    int pass;
     (void)arg;
-    if (!ids || !mods || !parsed)
-        goto out;
-    for (pass = 0; pass < 2; pass++)
+    do {
+        nv2a_pcache *pc;
+        size_t n, i, nneed;
+        uint64_t t0 = now_ns(), nb[3] = {0, 0, 0}, *need;
+        uint32_t listed[3] = {0, 0, 0};
+        int pass;
+
+        __atomic_store_n(&s_pc_rescan, 0, __ATOMIC_RELEASE);
+        /* The list as it is on disk now (a pre-build may have appended to it
+         * since the last pass). The ack thread's puts wait for the reopen. */
+        pthread_mutex_lock(&s_pcf_mu);
+        if (s_pcf) {
+            char msg[256];
+            nv2a_pcache_close(s_pcf);
+            s_pcf = nv2a_pcache_open(s_pc_path, s_pc_ver, msg, sizeof msg);
+        }
+        pc = s_pcf;
+        pthread_mutex_unlock(&s_pcf_mu);
+        nvk_glsl_reload();
+        n = nv2a_pcache_count(pc);
         for (i = 0; i < n; i++) {
             const void *d;
             uint32_t type, len;
-            if (!nv2a_pcache_get(s_pcf, i, &type, &d, &len))
-                continue;
-            if (pass == 0 && type == PC_VS && len >= 16 && len % 16 == 0
-                    && len <= NV2A_VSH_SLOTS * 16u) {
-                d3d8_vsh_parse((const uint32_t *)d, (int)(len / 16u), parsed);
-                if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE, glsl, sizeof glsl) > 0
-                        && (mods[i] = module_from_glsl(NVK_STAGE_VERTEX, glsl, "pre-warm vs"))) {
-                    ids[i] = nv2a_fnv64(d, len, NV2A_FNV64_INIT);
-                    if (ids[i] <= PC_FS_BASIC)
-                        ids[i] += 3;
-                    nv++;
-                }
-            } else if (pass == 0 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
-                if (d3d8_combiners_generate_glsl((const NV2ACombinerState *)d, glsl, sizeof glsl) > 0
-                        && (mods[i] = module_from_glsl(NVK_STAGE_FRAGMENT, glsl, "pre-warm fs"))) {
-                    ids[i] = nv2a_fnv64(d, len, NV2A_FNV64_INIT);
-                    if (ids[i] <= PC_FS_BASIC)
-                        ids[i] += 3;
-                    nf++;
-                }
-            } else if (pass == 1 && type == PC_PSO && len == sizeof(PsoDisk)) {
-                PsoDisk dk;
-                PsoKey k;
-                size_t j;
-                VkPipeline p;
-                memcpy(&dk, d, sizeof dk);
-                memset(&k, 0, sizeof k);
-                k.vs = dk.vs == PC_VS_PASS ? (uint64_t)(uintptr_t)s_vs_pass : 0;
-                k.fs = dk.fs == PC_FS_BASIC ? (uint64_t)(uintptr_t)s_fs_basic : 0;
-                for (j = 0; j < n && (!k.vs || !k.fs); j++) {
-                    if (!k.vs && ids[j] == dk.vs)
-                        k.vs = (uint64_t)(uintptr_t)mods[j];
-                    if (!k.fs && ids[j] == dk.fs)
-                        k.fs = (uint64_t)(uintptr_t)mods[j];
-                }
-                if (!k.vs || !k.fs)
+            if (nv2a_pcache_get(pc, i, &type, &d, &len) && type <= PC_PSO)
+                listed[type]++;
+        }
+        nv2a_pcache_stat_open(s_pc_path, listed);
+        /* The shader ids the list's pipelines name. */
+        need = (uint64_t *)malloc((listed[PC_PSO] ? listed[PC_PSO] : 1) * 2 * sizeof *need);
+        nneed = 0;
+        for (i = 0; need && i < n; i++) {
+            const void *d;
+            uint32_t type, len;
+            if (nv2a_pcache_get(pc, i, &type, &d, &len) && type == PC_PSO
+                    && len == sizeof(PsoDisk) && nneed + 2 <= (size_t)listed[PC_PSO] * 2) {
+                memcpy(&need[nneed], d, 16);            /* PsoDisk's vs, fs */
+                nneed += 2;
+            }
+        }
+        for (pass = 0; parsed && pass < 3; pass++) {
+            if (pass == 2)              /* the pipelines are in: nobody waits now */
+                __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
+            for (i = 0; i < n; i++) {
+                const void *d;
+                uint32_t type, len;
+                size_t q;
+                if (!nv2a_pcache_get(pc, i, &type, &d, &len))
                     continue;
-                k.nf4 = dk.nf4;
-                k.topo = dk.topo;
-                k.depth = dk.depth;
-                k.wmask = dk.wmask;
-                memcpy(k.blend, dk.blend, sizeof k.blend);
-                if ((p = pipeline_new(&k)) != VK_NULL_HANDLE) {
-                    vkDestroyPipeline(s_dev, p, NULL);
-                    np++;
+                if (pass == 0 && (type == PC_VS || type == PC_FS)) {
+                    uint64_t kid = vs_kid(d, len);      /* the id rule is one for both */
+                    for (q = 0; q < nneed && need[q] != kid; q++)
+                        ;
+                    if (q == nneed)
+                        continue;       /* pass 2 */
+                }
+                if (pass != 1 && type == PC_VS && len >= 16 && len % 16 == 0
+                        && len <= NV2A_VSH_SLOTS * 16u) {
+                    uint32_t hash = 2166136261u, k;
+                    uint16_t inputs = 0;
+                    VkShaderModule mod;
+                    VsEntry *e;
+                    for (k = 0; k < len / 4u; k++)      /* nv2a_vsh_program_hash */
+                        hash = (hash ^ ((const uint32_t *)d)[k]) * 16777619u;
+                    if (!hash)
+                        hash = 1;
+                    pthread_mutex_lock(&s_pc_mu);
+                    e = vs_find(hash);
+                    pthread_mutex_unlock(&s_pc_mu);
+                    if (e || !(mod = vs_build((const uint32_t *)d, (int)(len / 16u), hash,
+                                              &inputs, parsed, glsl, 1)))
+                        continue;
+                    pthread_mutex_lock(&s_pc_mu);
+                    if (vs_find(hash) || !vs_take(hash, vs_kid(d, len), mod, inputs))
+                        e = NULL;       /* the ack thread was first, or the table is full */
+                    else
+                        e = s_vs, nb[PC_VS]++;
+                    pthread_mutex_unlock(&s_pc_mu);
+                    if (!e)
+                        vkDestroyShaderModule(s_dev, mod, NULL);
+                } else if (pass != 1 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
+                    NV2ACombinerState st;
+                    VkShaderModule mod;
+                    uint32_t hash;
+                    FsEntry *e;
+                    memcpy(&st, d, sizeof st);
+                    hash = fnv(&st, sizeof st);
+                    pthread_mutex_lock(&s_pc_mu);
+                    e = fs_find(hash, &st);
+                    pthread_mutex_unlock(&s_pc_mu);
+                    if (e || !(mod = fs_build(&st, hash, glsl, 1)))
+                        continue;
+                    pthread_mutex_lock(&s_pc_mu);
+                    if (fs_find(hash, &st) || !fs_take(hash, &st, mod))
+                        e = NULL;
+                    else
+                        e = s_fs, nb[PC_FS]++;
+                    pthread_mutex_unlock(&s_pc_mu);
+                    if (!e)
+                        vkDestroyShaderModule(s_dev, mod, NULL);
+                } else if (pass == 1 && type == PC_PSO && len == sizeof(PsoDisk)) {
+                    PsoDisk dk;
+                    PsoKey k;
+                    VkPipeline p;
+                    uint32_t at;
+                    int found, full;
+                    memcpy(&dk, d, sizeof dk);
+                    memset(&k, 0, sizeof k);
+                    pthread_mutex_lock(&s_pc_mu);
+                    k.vs = (uint64_t)(uintptr_t)module_by_kid(dk.vs, 0);
+                    k.fs = (uint64_t)(uintptr_t)module_by_kid(dk.fs, 1);
+                    k.nf4 = dk.nf4;
+                    k.topo = dk.topo;
+                    k.depth = dk.depth;
+                    k.wmask = dk.wmask;
+                    memcpy(k.blend, dk.blend, sizeof k.blend);
+                    found = 1;
+                    full = 0;
+                    if (k.vs && k.fs && dk.nf4 <= NV2A_VS_MAX_INPUTS) {
+                        (void)pso_slot(&k, &found);
+                        full = s_pso_n + 1 >= PSO_CAP * 3 / 4;
+                    }
+                    pthread_mutex_unlock(&s_pc_mu);
+                    if (found || full || !(p = pipeline_new(&k, 1)))
+                        continue;
+                    pthread_mutex_lock(&s_pc_mu);
+                    at = pso_slot(&k, &found);
+                    if (!found) {
+                        s_pso[at].k = k;
+                        s_pso[at].p = p;
+                        s_pso[at].used = 1;
+                        s_pso_n++;
+                        nb[PC_PSO]++;
+                    }
+                    pthread_mutex_unlock(&s_pc_mu);
+                    if (found)          /* the ack thread was first */
+                        vkDestroyPipeline(s_dev, p, NULL);
                 }
             }
         }
-    for (i = 0; i < n; i++)
-        if (mods[i])
-            vkDestroyShaderModule(s_dev, mods[i], NULL);
-    fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines in %.0f ms\n",
-            (unsigned long long)nv, (unsigned long long)nf, (unsigned long long)np,
-            (double)(now_ns() - t0) / 1e6);
-out:
-    free(ids);
-    free(mods);
+        free(need);
+        for (i = 0; i < 3; i++)
+            s_pc_warm[i] += nb[i];
+        s_pc_warm_ns += now_ns() - t0;
+        fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines of %u/%u/%u"
+                " on disk in %.0f ms (done at %.2f s)\n",
+                (unsigned long long)nb[PC_VS], (unsigned long long)nb[PC_FS],
+                (unsigned long long)nb[PC_PSO], listed[0], listed[1], listed[2],
+                (double)(now_ns() - t0) / 1e6, (double)(now_ns() - s_t0_ns) / 1e9);
+    } while (__atomic_load_n(&s_pc_rescan, __ATOMIC_ACQUIRE));
     free(parsed);
+    __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
+    nv2a_pcache_stat_warming(0);
+    __atomic_store_n(&s_pc_warming, 0, __ATOMIC_RELEASE);
+    /* What a pre-build made is on disk for the next start. */
+    __atomic_store_n(&s_pc_save, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
-static void pc_start(int driver_cache_warm)
+/* Starts the pre-warm thread, or has the one running go round again.
+ * `first`: the one the backend starts with, whose pipelines the ack thread
+ * may wait for (pc_wait_more). */
+static void pc_warm_begin(int first)
 {
-    char dir[1024], path[1100], ver[256], msg[256];
     pthread_t th;
-
-    if (!nvk_cache_dir(dir, sizeof dir))
+    __atomic_store_n(&s_pc_rescan, 1, __ATOMIC_RELEASE);
+    if (__atomic_exchange_n(&s_pc_warming, 1, __ATOMIC_ACQ_REL))
         return;
-    snprintf(path, sizeof path, "%s/vk_pipelines.bin", dir);
-    snprintf(ver, sizeof ver, "vk pipelines 1; PsoDisk %zu; NV2ACombinerState %zu;"
-             " vsh slots %d; toolkit %s", sizeof(PsoDisk), sizeof(NV2ACombinerState),
-             (int)NV2A_VSH_SLOTS, XBOXRECOMP_GIT_REV);
-    s_pcf = nv2a_pcache_open(path, ver, msg, sizeof msg);
-    fprintf(stderr, LOGP "pcache: %s: %s%s\n", path, msg,
-            s_pcf && nv2a_pcache_count(s_pcf) && driver_cache_warm
-            ? "; the driver's cache is warm: no pre-warm" : "");
-    if (s_pcf && nv2a_pcache_count(s_pcf) && !driver_cache_warm
-            && pthread_create(&th, NULL, pc_prewarm, NULL) == 0)
+    nv2a_pcache_stat_warming(1);
+    if (first) {
+        __atomic_store_n(&s_pc_wait_until, now_ns() + 3000000000ull, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_pc_warm_urgent, 1, __ATOMIC_RELEASE);
+    }
+    if (pthread_create(&th, NULL, pc_prewarm, NULL) == 0) {
         pthread_detach(th);
+    } else {
+        __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
+        nv2a_pcache_stat_warming(0);
+        __atomic_store_n(&s_pc_warming, 0, __ATOMIC_RELEASE);
+    }
+}
+
+/* nv2a_pcache_rescan: the list gained keys (a pre-build in another process). */
+static void pc_warm_start(void)
+{
+    pc_warm_begin(0);
+}
+
+static void pc_start(void)
+{
+    const char *tr = recomp_env(RENV_PCACHE_TRACE);
+    char dir[1024], msg[256];
+
+    if (tr) {
+        s_pc_trace = 1;
+        if (strcmp(tr, "1") != 0) {
+            if ((s_pc_csv = fopen(tr, "w")) != NULL)
+                fprintf(s_pc_csv, "flip,t_ms,interval_ms,ack_compiles,ack_compile_ms\n");
+            else
+                fprintf(stderr, LOGP "pcache: cannot write %s\n", tr);
+        }
+    }
+    if (!nvk_cache_dir(dir, sizeof dir)) {
+        fprintf(stderr, LOGP "pcache: no disk cache (render.shader_cache)\n");
+        return;
+    }
+    snprintf(s_pc_path, sizeof s_pc_path, "%s/vk_pipelines.bin", dir);
+    /* What the keys mean, not the build (nv2a_pcache.h): a rebuild keeps
+     * the list. Raise the number when a key changes meaning at its size. */
+    snprintf(s_pc_ver, sizeof s_pc_ver, "vk pipelines 1; PsoDisk %zu; NV2ACombinerState %zu;"
+             " vsh slots %d", sizeof(PsoDisk), sizeof(NV2ACombinerState),
+             (int)NV2A_VSH_SLOTS);
+    s_pcf = nv2a_pcache_open(s_pc_path, s_pc_ver, msg, sizeof msg);
+    fprintf(stderr, LOGP "pcache: %s: %s\n", s_pc_path, msg);
+    if (!s_pcf)
+        return;
+    {
+        uint32_t none[3] = {0, 0, 0};
+        nv2a_pcache_stat_open(s_pc_path, none);
+    }
+    nv2a_pcache_set_rescan(pc_warm_start);
+    nv2a_pcache_set_seed(pc_put);
+    if (nv2a_pcache_count(s_pcf))
+        pc_warm_begin(1);
+}
+
+/* At every flip: the CSV line. */
+static void pc_flip(uint64_t flip)
+{
+    static uint64_t last;
+    uint64_t t, n, ns;
+    if (!s_pc_csv)
+        return;
+    t = now_ns();
+    pthread_mutex_lock(&s_pc_mu);
+    n = s_cs.rt_flip_n;
+    ns = s_cs.rt_flip_ns;
+    s_cs.rt_flip_n = s_cs.rt_flip_ns = 0;
+    pthread_mutex_unlock(&s_pc_mu);
+    fprintf(s_pc_csv, "%llu,%.3f,%.3f,%llu,%.3f\n", (unsigned long long)flip,
+            (double)(t - s_t0_ns) / 1e6, last ? (double)(t - last) / 1e6 : 0.0,
+            (unsigned long long)n, (double)ns / 1e6);
+    if ((flip % 60) == 0)
+        fflush(s_pc_csv);
+    last = t;
+}
+
+/* The present log's pipeline-cache line (the Metal backend's, field for field). */
+static void pc_log(uint64_t presents)
+{
+    int i, nv = 0;
+    pthread_mutex_lock(&s_pc_mu);
+    for (i = 0; i < VS_MAX; i++)
+        nv += s_vs[i].used;
+    fprintf(stderr, LOGP "pcache at present #%llu: cached %d vs, %d fs, %u pipelines;"
+            " ack-thread compiles %llu vs + %llu fs + %llu pipelines in %.1f ms (max %.1f,"
+            " %llu in the first 10 s); pre-warm %llu + %llu + %llu in %.1f ms (%s);"
+            " start-up waits %llu, %.1f ms\n",
+            (unsigned long long)presents, nv, s_fs_n, s_pso_n,
+            (unsigned long long)s_cs.n[0][PC_VS], (unsigned long long)s_cs.n[0][PC_FS],
+            (unsigned long long)s_cs.n[0][PC_PSO],
+            (double)(s_cs.ns[0][0] + s_cs.ns[0][1] + s_cs.ns[0][2]) / 1e6, s_cs.rt_max_ms,
+            (unsigned long long)s_cs.rt_10s,
+            (unsigned long long)s_cs.n[1][PC_VS], (unsigned long long)s_cs.n[1][PC_FS],
+            (unsigned long long)s_cs.n[1][PC_PSO],
+            (double)(s_cs.ns[1][0] + s_cs.ns[1][1] + s_cs.ns[1][2]) / 1e6,
+            __atomic_load_n(&s_pc_warming, __ATOMIC_ACQUIRE) ? "running" : "done",
+            (unsigned long long)s_pc_waits, (double)s_pc_wait_ns / 1e6);
+    pthread_mutex_unlock(&s_pc_mu);
 }
 
 /* ---- init ---------------------------------------------------------------------- */
@@ -3455,7 +3896,8 @@ static int init(void)
         }
     }
     s_pso = calloc(PSO_CAP, sizeof *s_pso);
-    if (!s_pso)
+    s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs);
+    if (!s_pso || !s_fs)
         return 0;
     s_pcache = pcache_load();
     s_vs_pass = module_from_glsl(NVK_STAGE_VERTEX, s_vs_pass_glsl, "vs_pass");
@@ -3464,7 +3906,7 @@ static int init(void)
         fprintf(stderr, LOGP "base shaders failed\n");
         return 0;
     }
-    pc_start(s_pcache_warm);
+    pc_start();
     if (!solid_texture(&s_black, 0xFF000000u) || !solid_texture(&s_magenta, NV2A_TEX_MAGENTA)) {
         fprintf(stderr, LOGP "base textures failed\n");
         return 0;
@@ -3607,11 +4049,15 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
                 s_pa.waits += s_frame_waits - w0;
             }
         }
-        if (s_pso_since_save && (s_presents % 600) == 599)
+        if ((s_pso_since_save && (s_presents % 600) == 599)
+                || __atomic_exchange_n(&s_pc_save, 0, __ATOMIC_ACQ_REL))
             pcache_save();
     }
     s_presents++;
+    pc_flip(s_presents);
     flip_log(surface_offset, rt);
+    if (s_presents == 1 || (s_presents % 300) == 0)
+        pc_log(s_presents);
     if (s_presents == 1 || (s_presents % 300) == 0) {
         uint64_t sh = 0, sc = 0;
         nvk_glsl_stats(&sh, &sc);

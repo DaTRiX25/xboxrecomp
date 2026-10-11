@@ -143,6 +143,26 @@ static int rewrite(const char *path, const unsigned char *b, size_t len)
     return 1;
 }
 
+/* The header length of file image `b` when it reads as `version`, else 0.
+ * A version of ours followed by "; toolkit <rev>" is ours too: the key lists
+ * up to BO-93 named the toolkit commit, so every rebuild dropped them; the
+ * keys under that suffix are the same. */
+static size_t header_len(const unsigned char *b, size_t size, const char *version)
+{
+    static const char old[] = "; toolkit ";
+    size_t vl = strlen(version), n;
+    if (vl > VERSION_MAX)
+        vl = VERSION_MAX;
+    if (size < 16 || memcmp(b, MAGIC, 8) != 0 || get32(b + 8) != FORMAT)
+        return 0;
+    n = get32(b + 12);
+    if (n > VERSION_MAX || size - 16 < n || n < vl || memcmp(b + 16, version, vl) != 0)
+        return 0;
+    if (n > vl && (n - vl < sizeof old - 1 || memcmp(b + 16 + vl, old, sizeof old - 1) != 0))
+        return 0;
+    return 16 + n;
+}
+
 nv2a_pcache *nv2a_pcache_open(const char *path, const char *version,
                               char *msg, size_t msg_len)
 {
@@ -156,13 +176,14 @@ nv2a_pcache *nv2a_pcache_open(const char *path, const char *version,
     if (!pc)
         return NULL;
     b = slurp(path, &size);
-    if (b && (size < hlen || memcmp(b, hdr, hlen) != 0)) {
+    if (b && !(hlen = header_len(b, size, version))) {
         /* Another format, version or no header at all: start afresh. */
         what = size >= 16 && !memcmp(b, MAGIC, 8) ? "another version, started afresh"
                                                    : "not a cache file, started afresh";
         free(b);
         b = NULL;
         remove(path);
+        hlen = header(hdr, version);
     }
     if (!b) {
         if (!rewrite(path, hdr, hlen)) {
@@ -293,6 +314,21 @@ static int make_dirs(char *p)
         || errno == EEXIST;
 }
 
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+#endif
+
+const char *nv2a_pcache_app(void)
+{
+#if defined(__APPLE__)
+    return getprogname();
+#elif defined(__linux__)
+    return program_invocation_short_name;
+#else
+    return "xboxrecomp";
+#endif
+}
+
 int nv2a_pcache_dir(const char *dir, const char *app, char *out, size_t n)
 {
     const char *home = getenv("HOME");
@@ -330,4 +366,105 @@ int nv2a_pcache_dir(const char *dir, const char *app, char *out, size_t n)
     if (w <= 0 || (size_t)w >= n)
         return 0;
     return make_dirs(out);
+}
+
+/* ---- the running backend's numbers ------------------------------------------- */
+
+static nv2a_pcache_stat s_stat;
+static void (*s_rescan)(void);
+
+void nv2a_pcache_stat_get(nv2a_pcache_stat *out)
+{
+    *out = s_stat;
+}
+
+void nv2a_pcache_stat_open(const char *dir, const uint32_t listed[3])
+{
+    snprintf(s_stat.dir, sizeof s_stat.dir, "%s", dir ? dir : "");
+    memcpy(s_stat.listed, listed, sizeof s_stat.listed);
+    s_stat.active = dir && *dir;
+}
+
+void nv2a_pcache_stat_warming(int on)
+{
+    s_stat.warming = on;
+}
+
+void nv2a_pcache_stat_waiting(int on)
+{
+    s_stat.waiting = on;
+}
+
+void nv2a_pcache_stat_built(int prewarm, int kind, uint64_t ns)
+{
+    if (kind < 0 || kind > 2)
+        return;
+    if (prewarm) {
+        s_stat.warmed[kind]++;
+    } else {
+        uint64_t us = ns / 1000u;
+        s_stat.ack[kind]++;
+        s_stat.ack_ns += ns;
+        if (us > s_stat.ack_max_us)
+            s_stat.ack_max_us = us > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)us;
+    }
+}
+
+static void (*s_seed)(uint32_t, const void *, uint32_t);
+
+void nv2a_pcache_set_seed(void (*fn)(uint32_t type, const void *data, uint32_t len))
+{
+    s_seed = fn;
+}
+
+int nv2a_pcache_seed(uint32_t type, const void *data, uint32_t len)
+{
+    if (!s_seed || !s_stat.active)
+        return 0;
+    s_seed(type, data, len);
+    return 1;
+}
+
+void nv2a_pcache_set_rescan(void (*fn)(void))
+{
+    s_rescan = fn;
+}
+
+int nv2a_pcache_rescan(void)
+{
+    if (!s_rescan || !s_stat.active)
+        return 0;
+    s_rescan();
+    return 1;
+}
+
+/* ---- vertex programs in an executable ------------------------------------------ */
+
+size_t nv2a_pcache_scan_vsh(const void *image, size_t size,
+                            void (*fn)(void *ctx, const uint32_t *slots, uint32_t n),
+                            void *ctx)
+{
+    const unsigned char *b = (const unsigned char *)image;
+    uint32_t slots[136 * 4];
+    size_t i, found = 0;
+
+    for (i = 0; i + 4 + 16 <= size; i++) {
+        uint32_t n, k;
+        if (b[i] != 0x78 || b[i + 1] != 0x20)
+            continue;
+        n = (uint32_t)b[i + 2] | ((uint32_t)b[i + 3] << 8);
+        if (!n || n > 136 || size - i - 4 < (size_t)n * 16u)
+            continue;
+        memcpy(slots, b + i + 4, (size_t)n * 16u);
+        for (k = 0; k < n; k++)
+            if (slots[k * 4] != 0 || ((slots[k * 4 + 3] & 1u) != 0) != (k == n - 1))
+                break;
+        if (k < n)
+            continue;
+        if (fn)
+            fn(ctx, slots, n);
+        found++;
+        i += 3 + (size_t)n * 16u;
+    }
+    return found;
 }

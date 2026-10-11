@@ -111,6 +111,28 @@ Power modes: *stock* is the busy-wait; *performance* sleeps and spins the
 last 8 ms before each frame (steady frame time, about 10 W on the Deck);
 *battery* sleeps throughout (about 8 W, small dips).
 
+## Shader pre-build
+
+A host that can build its shaders ahead of time gives the overlay five calls
+(`xbox_shader_build.h`, `xbox_OverlaySetShaderBuild`): start, cancel, poll
+(state, fraction, text), "offer it at this start?" and "do not ask again".
+The Graphics page then has a status line and an action, *Build shaders now*
+(*Stop building shaders* while one runs, *Build shaders again* after), with
+the host's own sentence on what it costs as the hint.
+
+At the first start the overlay opens by itself on that row, about 1.5 s
+after the window is up, with *Not now* and *Do not ask again* under it, when
+the host's `offer` says so. It never starts a build: the player presses the
+action or leaves. Closing the overlay stops a running build (the title is
+paused while the overlay is open; a build beside a running title would cost
+it frames), and the next one goes on from where it stopped. When a build
+ends the host calls `nv2a_pcache_rescan`, and the backend builds what the
+key list gained on its pre-warm thread.
+
+What a build is (the scenes, the child process, the key list) is the host's
+and the backends': see `nv2a_pcache.h`, `xbox_autoplay.h`, and Burnout 3's
+`docs/shader-prebuild.md` for the one host that has it.
+
 ## Adding a graphics API
 
 A backend is one file: init the official `imgui_impl_*` renderer with the

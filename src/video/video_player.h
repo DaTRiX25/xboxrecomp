@@ -87,6 +87,11 @@ void xbox_HostWindowSetTitle(const char *title);
  * runs on a thread of its own (fb_present_sdl.c). Returns guest_main's exit
  * code. */
 int xbox_HostWindowMain(int (*guest_main)(void));
+
+/* The window's next present read back into `path` (BMP), whatever it shows.
+ * The window's thread only (the overlay's test driver, RECOMP_OVERLAY_TEST);
+ * the Metal and Vulkan presenters. */
+void xbox_HostWindowShot(const char *path);
 #endif
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */
