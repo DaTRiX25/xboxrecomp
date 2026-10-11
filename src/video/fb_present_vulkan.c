@@ -91,6 +91,16 @@ static VkPresentModeKHR s_sc_mode;
 static int              s_sc_shots;      /* TRANSFER_SRC usage: shots possible */
 static int              s_sc_color;      /* COLOR_ATTACHMENT usage: the overlay can draw */
 static int              s_recreate;
+/* VK_SUBOPTIMAL_KHR asks for a new swapchain, except on Android: there it is
+ * returned for as long as the swapchain's transform is not the display's,
+ * which with the identity transform on a sideways-mounted panel (the Retroid
+ * Pocket 5's is 1080x1920) is every frame, and rebuilding it every frame is
+ * what that cost. A size change is caught by the extent check. */
+#if defined(__ANDROID__)
+#define FBV_SUBOPTIMAL_RECREATES 0
+#else
+#define FBV_SUBOPTIMAL_RECREATES 1
+#endif
 static int              s_vsync, s_shots;
 
 static VkCommandPool    s_pool;          /* main thread */
@@ -1486,7 +1496,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
         return 0;     /* timeout: try again at the next wake */
-    if (r == VK_SUBOPTIMAL_KHR)
+    if (r == VK_SUBOPTIMAL_KHR && FBV_SUBOPTIMAL_RECREATES)
         s_recreate = 1;
     vkResetFences(C->dev, 1, &s_fence[s_fi]);
     shot = shot_path && s_sc_shots;
@@ -1677,7 +1687,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         }
         return 0;
     }
-    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR)
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && FBV_SUBOPTIMAL_RECREATES))
         s_recreate = 1;
     if (shot) {
         vkWaitForFences(C->dev, 1, &s_fence[s_fi], VK_TRUE, UINT64_MAX);
