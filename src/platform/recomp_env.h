@@ -277,7 +277,7 @@ extern "C" {
     X(DPC_PROF,          TRACE, "dpc",             NULL,                       "[DPCPROF] time per host-run DPC/ISR routine and its waits, under the 600-vblank line") \
     X(FRAMETIME,         TRACE, "frametime",       NULL,                       "=file: one CSV line per flip: executor hold/busy/draw/present/idle and sampled guest time by section (game, d3d, xdk), spin, host, wait (tools/perf/framestats.py)") \
     X(FRAMETIME_SPIN,    TRACE, "frametime_spin",  NULL,                       "=va[+va...]: lifted functions whose sampled time counts as spin (a guest busy-wait), not as their section") \
-    X(FRAMETIME_US,      TRACE, "frametime_us",    NULL,                       "=us: guest thread sampling period for frametime (500, min 100)") \
+    X(FRAMETIME_US,      TRACE, "frametime_us",    NULL,                       "=us: guest thread sampling period for frametime (500, min 100); 0: no sampling, the executor's columns only") \
     X(FRAMETIME_HOST,    TRACE, "frametime_host",  NULL,                       "=file: with frametime, the host stacks of guest-main's host-code samples in every frame where they reach frametime_host_ms (Mach, Linux)") \
     X(FRAMETIME_HOST_MS, TRACE, "frametime_host_ms", NULL,                     "=ms: the m_host a frame needs for frametime_host to write its stacks (4)") \
     X(LATENCY_TRACE,     TRACE, "latency",         NULL,                       "=file: input-to-photon CSV: pad report changes, guest ISR, swap, vblank release, executor done, GPU done + frame signature, drawable acquire/present/on-glass (tools/perf/latency.py)") \
