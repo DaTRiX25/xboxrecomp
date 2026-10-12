@@ -252,6 +252,16 @@ static void pad_open_index(int i)
     if (!g_open[free_k].c)
         return;
     pad_describe(g_open[free_k].c, d, sizeof d);
+#if defined(__APPLE__) && SDL_VERSION_ATLEAST(2, 24, 0)
+    {
+        /* Which of SDL's macOS drivers has the pad decides how its rumble
+         * ends (sdl_shutdown): HIDAPI has a device path, Apple's
+         * GameController framework (SDL_mfijoystick.m) has none. */
+        const char *pa = SDL_GameControllerPath(g_open[free_k].c);
+        size_t l = strlen(d);
+        snprintf(d + l, sizeof d - l, " [%s]", pa && *pa ? "HIDAPI" : "GameController framework");
+    }
+#endif
     XR_NOTICE( "[INPUT] controller %s opened; it gets a port at its first input\n", d);
 }
 
