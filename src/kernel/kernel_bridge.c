@@ -3395,6 +3395,7 @@ static void kernel_timer_loop_ms(void)
         } else {
             Sleep((DWORD)(wait < 1 ? 1 : wait));
         }
+        xbox_HostWakeTick();
         wait = kernel_vblank_tick();  /* the GPU's frame clock */
         if (wait > 10)
             wait = 10;
@@ -3443,6 +3444,7 @@ static void kernel_timer_loop_ns(void)
         } else {
             xbox_HostSleepNs(wait);
         }
+        xbox_HostWakeTick();              /* a sleep or a stop behind us? */
         raised = kernel_vblank_tick_ns(xbox_GuestNowNs(), &vbl_next);
         busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
         now_ms = kernel_clock_ms();

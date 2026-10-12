@@ -71,6 +71,7 @@
 #endif
 
 uint64_t xbox_HostNowNs(void);
+void xbox_HostWakeListener(const char *what, void (*fn)(uint64_t gap_ns));
 void xbox_PacingPresent(uint64_t when_ns);
 void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
 int xbox_VblankDisplayLockOn(void);
@@ -472,27 +473,87 @@ static void queue_idle(void)
     nvk_queue_unlock();
 }
 
-#if defined(__ANDROID__)
 /* An Android app that leaves the screen (Home, recents, screen off) has its
  * window's surface destroyed, and gets another when it comes back. The
  * VkSurfaceKHR and the swapchain made on the old one are dead then: both are
  * dropped and made again on the window's new surface. Marked from the app's
  * life-cycle events (fbv_android_surface_gone, fb_present_sdl.c) and from
- * any VK_ERROR_SURFACE_LOST_KHR. */
+ * any VK_ERROR_SURFACE_LOST_KHR, on every platform (BO-118: a desktop whose
+ * display went away and came back; until this the lost surface was asked
+ * for an image every frame for the rest of the run). Off Android a surface
+ * that cannot be made yet is tried twice a second, not every frame. */
 static volatile int s_surface_lost;
+/* A gap in the run (host_time.h): the swapchain is made again once. */
+static volatile int s_wake_recreate;
 static VkSurfaceKHR make_surface(VkInstance inst, void *ctx);
 static void destroy_swapchain(void);
 
+#if defined(__ANDROID__)
 void fbv_android_surface_gone(void)
 {
     s_surface_lost = 1;
 }
+#endif
 
-static int android_resurface(SDL_Window *win)
+static void fbv_woke(uint64_t gap_ns)
+{
+    (void)gap_ns;
+    s_wake_recreate = 1;
+}
+
+/* RECOMP_DEBUG=vk_present_fail=at:n[:what] (test hook): from second `at`
+ * after the first present, n acquires in a row do not happen and report
+ * `what` instead. VK_SUCCESS: no failure this time. */
+static VkResult acquire_hook(void)
+{
+    static int parsed, left;
+    static double at = -1.0;
+    static VkResult what = VK_ERROR_OUT_OF_DATE_KHR;
+    static uint64_t t0;
+
+    if (!parsed) {
+        const char *e = recomp_env(RENV_VK_PRESENT_FAIL), *c;
+        parsed = 1;
+        t0 = xbox_HostNowNs();
+        if (e && *e) {
+            at = atof(e);
+            c = strchr(e, ':');
+            left = c ? atoi(c + 1) : 1;
+            c = c ? strchr(c + 1, ':') : NULL;
+            if (c && !strcmp(c + 1, "surface"))
+                what = VK_ERROR_SURFACE_LOST_KHR;
+            else if (c && !strcmp(c + 1, "timeout"))
+                what = VK_TIMEOUT;
+        }
+    }
+    if (at < 0.0 || left <= 0 || (double)(xbox_HostNowNs() - t0) / 1e9 < at)
+        return VK_SUCCESS;
+    left--;
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "test hook: %d acquires fail with %s\n", left + 1,
+                    what == VK_TIMEOUT ? "VK_TIMEOUT"
+                    : what == VK_ERROR_SURFACE_LOST_KHR ? "VK_ERROR_SURFACE_LOST_KHR"
+                    : "VK_ERROR_OUT_OF_DATE_KHR");
+    }
+    return what;
+}
+
+static int resurface(SDL_Window *win)
 {
     static unsigned said;
     if (!C)
         return 0;
+#if !defined(__ANDROID__)
+    {
+        static uint64_t tried_ns;
+        uint64_t now = xbox_HostNowNs();
+        if (tried_ns && now - tried_ns < 500000000ull)
+            return 0;
+        tried_ns = now;
+    }
+#endif
     queue_idle();
     pthread_mutex_lock(&s_sc_mu);
     destroy_swapchain();
@@ -507,7 +568,6 @@ static int android_resurface(SDL_Window *win)
     fprintf(stderr, LOGP "the window's surface was replaced: a new VkSurfaceKHR and swapchain\n");
     return 1;
 }
-#endif
 
 static int make_swapchain(SDL_Window *win)
 {
@@ -523,10 +583,8 @@ static int make_swapchain(SDL_Window *win)
 
     queue_idle();
     r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(C->phys, C->surface, &caps);
-#if defined(__ANDROID__)
     if (r == VK_ERROR_SURFACE_LOST_KHR)
         s_surface_lost = 1;
-#endif
     if (r != VK_SUCCESS)
         return 0;
     pthread_mutex_lock(&s_sc_mu);
@@ -1576,10 +1634,19 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
     if (dw <= 0 || dh <= 0)
         return 0;
-#if defined(__ANDROID__)
-    if (s_surface_lost && !android_resurface(win))
+    {
+        static int listening;
+        if (!listening) {
+            listening = 1;
+            xbox_HostWakeListener("the Vulkan swapchain", fbv_woke);
+        }
+    }
+    if (s_wake_recreate) {
+        s_wake_recreate = 0;
+        s_recreate = 1;
+    }
+    if (s_surface_lost && !resurface(win))
         return 0;
-#endif
     if (!s_sc || s_recreate || FBV_SIZE_CHANGED(dw, dh)) {
         if (!make_swapchain(win))
             return 0;
@@ -1587,7 +1654,9 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     vkWaitForFences(C->dev, 1, &s_fence[s_fi], VK_TRUE, UINT64_MAX);
     {
         uint64_t t_acq0 = xbox_LatOn() ? xbox_HostNowNs() : 0;
-        r = vkAcquireNextImageKHR(C->dev, s_sc, 1000000000ull, s_acq[s_fi], VK_NULL_HANDLE, &idx);
+        r = acquire_hook();
+        if (r == VK_SUCCESS)
+            r = vkAcquireNextImageKHR(C->dev, s_sc, 1000000000ull, s_acq[s_fi], VK_NULL_HANDLE, &idx);
         if (t_acq0 && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) {
             char b[32];
             snprintf(b, sizeof b, "%llu", (unsigned long long)xbox_HostNowNs());
@@ -1598,10 +1667,14 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         s_recreate = 1;
         return 0;
     }
-#if defined(__ANDROID__)
     if (r == VK_ERROR_SURFACE_LOST_KHR)
         s_surface_lost = 1;
-#endif
+    if (r == VK_ERROR_DEVICE_LOST) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "the Vulkan device was lost (VK_ERROR_DEVICE_LOST): nothing"
+                    " more can be shown in this run; the game has to be started again\n");
+    }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
         return 0;     /* timeout: try again at the next wake */
     if (r == VK_SUBOPTIMAL_KHR && FBV_SUBOPTIMAL_RECREATES)
@@ -1799,10 +1872,8 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && FBV_SUBOPTIMAL_RECREATES))
         s_recreate = 1;
-#if defined(__ANDROID__)
     if (pr == VK_ERROR_SURFACE_LOST_KHR)
         s_surface_lost = 1;
-#endif
     if (shot) {
         vkWaitForFences(C->dev, 1, &s_fence[s_fi], VK_TRUE, UINT64_MAX);
         save_shot((const uint8_t *)s_shot_buf.map, s_sc_ext.width, s_sc_ext.height,
