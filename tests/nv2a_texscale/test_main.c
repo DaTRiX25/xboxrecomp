@@ -583,6 +583,23 @@ int main(int argc, char **argv)
         CHECK(nv2a_texscale_has_alpha(t, 4) == 1);
         CHECK(nv2a_texscale_has_alpha(t, 3) == 0);
         CHECK(nv2a_texscale_has_alpha(t, 0) == 0);
+        /* A photograph kept in a format with alpha: stray texels just under
+         * opaque, one in a hundred. Not art. One texel in sixteen is. */
+        {
+            static uint32_t pic[1600];
+            int k;
+            for (k = 0; k < 1600; k++)
+                pic[k] = 0xFF405060u;
+            for (k = 0; k < 16; k++)
+                pic[k * 97] = 0xE3405060u;
+            CHECK(nv2a_texscale_has_alpha(pic, 1600) == 0);
+            for (k = 0; k < 99; k++)
+                pic[k * 16 + 1] = 0x00000000u;
+            CHECK(nv2a_texscale_has_alpha(pic, 1600) == 1);       /* 115 of 1600 */
+            for (k = 16; k < 99; k++)
+                pic[k * 16 + 1] = 0xFF405060u;
+            CHECK(nv2a_texscale_has_alpha(pic, 1600) == 0);       /* 32 of 1600 */
+        }
     }
     /* A texture large enough for the rows to be shared among threads comes
      * out as its parts do alone: the top-left quarter of a 256x256 picture

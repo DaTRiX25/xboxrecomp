@@ -702,9 +702,10 @@ int nv2a_texscale_tex_ok(int size_from_format, uint32_t w, uint32_t h, uint32_t 
 
 int nv2a_texscale_has_alpha(const uint32_t *texels, size_t n)
 {
-    size_t i;
+    /* A sixteenth, rounded up; reached early in art, never in a picture. */
+    size_t i, need = (n + 15) / 16, seen = 0;
     for (i = 0; i < n; i++)
-        if ((texels[i] >> 24) != 0xFFu)
+        if ((texels[i] >> 24) != 0xFFu && ++seen >= need)
             return 1;
     return 0;
 }
