@@ -42,6 +42,7 @@ extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include "recomp_restart.h"
 #include "recomp_save_dir.h"
 #include "xbox_soundtrack.h"    /* the music folder browser's model (xsb_*) */
+#include "xbox_update.h"        /* Check for updates */
 
 #include <math.h>
 #include <stdint.h>
@@ -228,12 +229,13 @@ enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_SHADERS,                                          /* the Graphics page's shader build */
               A_MIXER,                                            /* the Mixer page (overlay_mixer.inc) */
               A_RESTART,                                          /* start the program again (recomp_restart.h) */
+              A_UPDATE_CHECK, A_UPDATE_OPEN,                      /* Check for updates (xbox_update.h) */
               A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_RESTORE, A_SAVE_CANCEL,  /* xbox_OverlaySetSaveIO */
               A_RESTART_PIN, A_QUIT };       /* the two rows at the foot of every page: they ask first */
 
 /* The most rows a page has (the Audio page, with the music folder's lines
  * above its settings; the Advanced page with the save and restart rows). */
-#define OVERLAY_ROWS 32
+#define OVERLAY_ROWS 48
 
 /* ── restart (recomp_restart.h) ────────────────────────────────────── */
 
@@ -276,6 +278,16 @@ static char s_rep_done[1400];         /* where the last one went, or why none */
 /* ── the port's name and version ───────────────────────────────────── */
 
 static char s_about[200];
+
+/* ── Check for updates (xbox_update.h) ─────────────────────────────── */
+
+/* Nothing here runs until the row is pressed: then one thread makes the one
+ * request and writes the answer, the overlay shows it from the next frame. */
+static char s_up_repo[130], s_up_ver[48];
+static std::atomic<int> s_up_state;      /* 0 nothing asked, 1 asking, 2 answered */
+static xbox_update_result s_up_res;      /* written by the thread before s_up_state is 2 */
+static char s_up_open_err[160];          /* the download page would not open */
+static bool s_up_checkable;              /* a repository was registered and this build can ask */
 
 /* ── the music folder (xbox_OverlaySetMusicFolder) ─────────────────── */
 
@@ -492,6 +504,61 @@ static void browser_pick(int i)
 void xbox_OverlaySetAbout(const char *text)
 {
     snprintf(s_about, sizeof s_about, "%s", text ? text : "");
+}
+
+void xbox_OverlaySetUpdateCheck(const char *repo, const char *version)
+{
+    char url[200];
+    s_up_checkable = repo && version && version[0] && xbox_update_api_url(repo, url, sizeof url)
+                     && xbox_update_available();
+    if (s_up_checkable) {
+        snprintf(s_up_repo, sizeof s_up_repo, "%s", repo);
+        snprintf(s_up_ver, sizeof s_up_ver, "%s", version);
+    }
+}
+
+static int update_thread(void *)
+{
+    char url[200], ua[80], err[100] = "", *body = NULL;
+    xbox_update_api_url(s_up_repo, url, sizeof url);
+    snprintf(ua, sizeof ua, "Takedawn/%s", s_up_ver);
+    fprintf(stderr, LOGP "update check: asking GitHub for the latest release of %s\n", s_up_repo);
+    int status = xbox_update_http_get(url, ua, 10000, &body, err, sizeof err);
+    xbox_update_evaluate(status, err, body, s_up_ver, &s_up_res);
+    free(body);
+    fprintf(stderr, LOGP "update check: %s\n", s_up_res.headline);
+    s_up_state.store(2, std::memory_order_release);
+    return 0;
+}
+
+/* Starts the one request; a press while one is out does nothing. */
+static void update_check_start()
+{
+    int expect = 0;
+    if (!s_up_checkable)
+        return;
+    if (!s_up_state.compare_exchange_strong(expect, 1)) {
+        expect = 2;
+        if (!s_up_state.compare_exchange_strong(expect, 1))
+            return;
+    }
+    s_up_open_err[0] = 0;
+    SDL_Thread *t = SDL_CreateThread(update_thread, "update check", NULL);
+    if (!t) {
+        xbox_update_evaluate(0, "could not start the request", NULL, s_up_ver, &s_up_res);
+        s_up_state.store(2, std::memory_order_release);
+        return;
+    }
+    SDL_DetachThread(t);
+}
+
+static void update_open_page()
+{
+    if (s_up_state.load(std::memory_order_acquire) != 2 || s_up_res.kind != XU_NEWER || !s_up_res.url[0])
+        return;
+    fprintf(stderr, LOGP "update check: opening %s\n", s_up_res.url);
+    if (SDL_OpenURL(s_up_res.url) != 0)
+        snprintf(s_up_open_err, sizeof s_up_open_err, "Could not open the page: %.120s", SDL_GetError());
 }
 
 /* ── the shader pre-build (xbox_shader_build.h) ────────────────────── */
@@ -722,6 +789,20 @@ static int page_rows(int page, Row *r)
     default:
         if (s_about[0])
             INFO(s_about);
+        if (s_up_checkable) {
+            int st = s_up_state.load(std::memory_order_acquire);
+            ACT(A_UPDATE_CHECK, st == 1 ? "Checking for updates..." : "Check for updates");
+            if (st == 2) {
+                INFO(s_up_res.headline);
+                /* The way to the download first: the notes can be long. */
+                if (s_up_res.kind == XU_NEWER && s_up_res.url[0])
+                    ACT(A_UPDATE_OPEN, "Open the download page");
+                if (s_up_open_err[0])
+                    INFO(s_up_open_err);
+                for (int k = 0; k < s_up_res.note_count; k++)
+                    INFO(s_up_res.notes[k]);
+            }
+        }
         SET(XS_ADVANCED_PERF);
 #if defined(__APPLE__)
         /* The Metal presenter's (BO-115); the other presenters do not
@@ -1069,6 +1150,14 @@ static void activate(const Row &r)
     }
     if (r.kind == R_ACTION && r.action == A_RESTART) {
         restart_now();
+        return;
+    }
+    if (r.kind == R_ACTION && r.action == A_UPDATE_CHECK) {
+        update_check_start();
+        return;
+    }
+    if (r.kind == R_ACTION && r.action == A_UPDATE_OPEN) {
+        update_open_page();
         return;
     }
     if (r.kind == R_ACTION && r.action >= A_SAVE_EXPORT && r.action <= A_SAVE_CANCEL) {
@@ -2507,6 +2596,12 @@ static void build_pages(float fs)
                          ? " (\"Restart game now\" appears below once it is changed)" : "");
             }
         }
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_UPDATE_CHECK) {
+        snprintf(hint, sizeof hint, "Asks GitHub whether a newer release of %s is out: one anonymous request,"
+                 " made only when you press this row (the game never checks by itself), and the answer"
+                 " is shown here. Nothing is downloaded or installed.", s_up_repo);
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_UPDATE_OPEN) {
+        snprintf(hint, sizeof hint, "Opens %s in your web browser.", s_up_res.url);
     } else if (rows[sel].kind == R_ACTION && rows[sel].action >= A_SAVE_EXPORT
                && rows[sel].action <= A_SAVE_CANCEL) {
         const char *what =

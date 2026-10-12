@@ -177,6 +177,13 @@ void xbox_SettingEnvString(const xs_setting *s, double v, char *out, unsigned n)
  * version (NULL or "": none). Here and not in overlay.h, which needs SDL. */
 void xbox_OverlaySetAbout(const char *text);
 
+/* The "Check for updates" row of the Advanced page (xbox_update.h): the
+ * GitHub repository the port's releases are published in ("owner/name") and
+ * the running version ("0.1.0"). Without this call, or on a build that
+ * cannot make the request (Android), there is no row. The request is made
+ * only when the row is pressed. */
+void xbox_OverlaySetUpdateCheck(const char *repo, const char *version);
+
 /* Ask for the overlay to open, from any thread (a host hook on the title's
  * thread: a menu entry of the game's own). It opens on the main loop's next
  * turn, as the hotkey opens it. 0 when there is no overlay to open (not
