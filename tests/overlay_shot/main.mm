@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 /* Not the headers: their Windows type names clash with Objective-C's BOOL. */
 extern "C" int xbox_InputBlocked(void);
@@ -994,6 +996,75 @@ static int music_note(int i, char *out, unsigned n)
 }
 static const xbox_music_folder_ops k_music_ops = { music_status, music_chosen, music_note };
 
+/* OVERLAY_SHOT_GAME_FONT="<executable>;<size>;<sha256>;<table>,<count>,<tex>,<w>,<h>;<same for the
+ * title font>": the title's fonts, as a port names them (the numbers are the
+ * port's; nothing of a title is in this tool). Waits until they are in use
+ * or refused; OVERLAY_SHOT_GAME_FONT_EXPECT=0 expects a refusal. */
+static void game_font_from_env(void)
+{
+    const char *e = getenv("OVERLAY_SHOT_GAME_FONT");
+    if (!e || !e[0])
+        return;
+    char path[1024], sha[80];
+    unsigned long long size = 0;
+    xbox_overlay_bitmap_font f[2];
+    memset(f, 0, sizeof f);
+    const char *p = strchr(e, ';');
+    if (!p || (size_t)(p - e) >= sizeof path) { CHECK(!"OVERLAY_SHOT_GAME_FONT"); return; }
+    memcpy(path, e, (size_t)(p - e));
+    path[p - e] = 0;
+    if (sscanf(p + 1, "%llu;%64[0-9a-fA-F];%x,%u,%x,%u,%u;%x,%u,%x,%u,%u", &size, sha,
+               &f[0].table_off, &f[0].count, &f[0].tex_off, &f[0].w, &f[0].h,
+               &f[1].table_off, &f[1].count, &f[1].tex_off, &f[1].w, &f[1].h) != 12) {
+        CHECK(!"OVERLAY_SHOT_GAME_FONT");
+        return;
+    }
+    xbox_OverlaySetGameFonts(path, size, sha, &f[0], &f[1]);
+    const char *x = getenv("OVERLAY_SHOT_GAME_FONT_EXPECT");
+    const int want = x && x[0] == '0' ? -1 : 1;
+    const int got = xbox_OverlayGameFontsState(10000);
+    fprintf(stderr, "game font: %d\n", got);
+    CHECK(got == want);
+}
+
+/* The folder browser on folders named in Hungarian, Russian and Greek:
+ * the game's letters where it has them, the fallback's for the rest. */
+static void browser_utf8_shot(const char *pre)
+{
+    char root[1024], d[1200], path[1300];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(root, sizeof root, "%s/overlay_shot_utf8_%d", tmp && tmp[0] ? tmp : "/tmp", (int)getpid());
+    mkdir(root, 0755);
+    static const char *const names[] = { "Zenék – őszi válogatás", "Музыка для гонок", "Ελληνικά τραγούδια",
+                                         "Rock (Ünnepi)" };
+    for (const char *n : names) {
+        snprintf(d, sizeof d, "%s/%s", root, n);
+        mkdir(d, 0755);
+        snprintf(path, sizeof path, "%s/01 – első szám.mp3", d);
+        FILE *f = fopen(path, "wb");
+        if (f) fclose(f);
+    }
+    xsb_open(root);
+    CHECK(xsb_is_open());
+    run(2);
+    CHECK(xbox_OverlayOpen());
+    tap(SDLK_DOWN);                                  /* "Current folder: ..." */
+    run(1);
+    tap(SDLK_RETURN);                                /* into it: the four folders */
+    run(3);
+    {
+        int found = 0;
+        xsb_row r;
+        for (int i = 0; xsb_row_at(i, &r); i++)
+            found += !strcmp(r.label, "Zenék – őszi válogatás") || !strcmp(r.label, "Музыка для гонок");
+        CHECK(found == 2);
+    }
+    snprintf(path, sizeof path, "%sbrowser_utf8.bmp", pre);
+    frame(path);
+    xsb_close();
+    run(1);
+}
+
 int main(int argc, char **argv)
 {
     const char *pre = argc > 1 ? argv[1] : "overlay_";
@@ -1012,6 +1083,7 @@ int main(int argc, char **argv)
     dev = MTLCreateSystemDefaultDevice();
     q = [dev newCommandQueue];
     xbox_OverlaySetWindow(win);
+    game_font_from_env();
     xbox_BugReportSetMaker(fake_report);
     /* A port with a music folder (BO-108): its row is the Audio page's
      * first, and every tour below goes down that page as a port has it. */
@@ -1123,6 +1195,7 @@ int main(int argc, char **argv)
         }
     }
     CHECK(xbox_SettingValue(XS_AUDIO_VOLUME) < 1.0);
+    browser_utf8_shot(pre);
 
     /* B closes: the title is let go. */
     pad(SDL_CONTROLLER_BUTTON_B, true);

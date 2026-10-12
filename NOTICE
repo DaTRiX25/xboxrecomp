@@ -256,6 +256,21 @@ Bitstream Vera licence - DejaVu Sans Mono (overlay font, a subset)
   distributed in binary form with the overlay built in carries that file.
 
 
+SIL Open Font License 1.1 - Roboto Condensed (overlay font, a subset)
+---------------------------------------------------------------------
+
+  https://github.com/google/fonts, ofl/robotocondensed (commit 69d0549)
+
+  src/overlay/overlay_font_ui.h: Roboto Condensed at the Medium weight, cut
+  to Latin, Latin-1, Latin Extended-A and -B, Greek, Cyrillic and some
+  punctuation (third_party/roboto_condensed/make_subset.py), embedded as
+  the settings overlay's text font. Copyright 2011 The Roboto Project
+  Authors. Licensed under the SIL Open Font License 1.1, whose text is
+  third_party/roboto_condensed/OFL.txt; a program distributed in binary form
+  with the overlay built in carries that file. The font may be bundled with
+  software and sold with it; it may not be sold by itself.
+
+
 Reference material (no code taken)
 -----------------------------------
 

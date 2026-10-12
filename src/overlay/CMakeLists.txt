@@ -1,6 +1,7 @@
 # The in-game settings overlay (XBOXRECOMP_OVERLAY, root CMakeLists):
 #   xbox_settings.c        the settings, settings.toml, the precedence (no ImGui)
 #   overlay_ui.cpp    hotkeys, pause, input routing, the pages, the graph
+#   overlay_gamefont.cpp the title's bitmap fonts from the player's executable
 #   overlay_metal.mm  the Metal renderer glue (macOS)
 #   overlay_vulkan.cpp the Vulkan renderer glue
 # Dear ImGui is vendored in third_party/imgui (see VENDORED.txt): the core and
@@ -15,6 +16,7 @@ add_library(xbox_overlay STATIC
     xbox_settings.c
     xbox_settings_report.c
     overlay_ui.cpp
+    overlay_gamefont.cpp
     xbox_update.c
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
@@ -32,6 +34,8 @@ target_compile_definitions(xbox_overlay PUBLIC XBOXRECOMP_HAVE_OVERLAY=1)
 target_link_libraries(xbox_overlay PUBLIC SDL2::SDL2 recomp_env xbox_enhance xbox_input xbox_kernel xbox_apu)
 # The music folder browser's model (xsb_*).
 target_link_libraries(xbox_overlay PUBLIC xbox_soundtrack)
+# The game's fonts: the executable checked by its SHA-256 (xr_sha256.h).
+target_link_libraries(xbox_overlay PRIVATE xbox_install)
 
 if(APPLE)
     target_sources(xbox_overlay PRIVATE
@@ -73,7 +77,7 @@ endif()
 if(NOT MSVC)
     # The vendored files are built as they are; the glue is held to the
     # runtime's own warnings.
-    set_source_files_properties(xbox_settings.c xbox_settings_report.c overlay_ui.cpp overlay_vulkan.cpp xbox_update.c
+    set_source_files_properties(xbox_settings.c xbox_settings_report.c overlay_ui.cpp overlay_gamefont.cpp overlay_vulkan.cpp xbox_update.c
         PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
     if(APPLE)
         set_source_files_properties(overlay_metal.mm

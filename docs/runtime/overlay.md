@@ -202,7 +202,7 @@ before the 8-bit drawable. A texel that is already an exact 8-bit value
 values move by one level at most. The source frame is itself 8-bit, so the
 gain is at the edges of its bands when the frame is scaled to the window.
 Off (default) skips the branch. The Vulkan presenter ends in `vkCmdBlitImage`
-and has no such pass yet; the row is shown on macOS only.
+and has no such pass yet. Not in the menu; settings.toml or RECOMP_GFX_DITHER only.
 
 ## Settings
 
@@ -235,7 +235,7 @@ title's defaults when those change. Keys it does not know are kept.
 | `graphics.aa` (`off`, `fxaa`, `smaa`) | `RECOMP_GFX_AA` | yes |
 | `graphics.sharpen` (0..1) | `RECOMP_GFX_SHARPEN` | yes |
 | `graphics.lod_bias` (`off`, `auto`, `-0.5`, `-1`, `-1.5`) | `RECOMP_GFX_LOD_BIAS` (`0`, `auto` or a number) | yes (a per-draw constant) |
-| `graphics.dither` (bool) | `RECOMP_GFX_DITHER` | yes; Metal only |
+| `graphics.dither` (bool) | `RECOMP_GFX_DITHER` | yes; Metal only. Not in the menu; settings.toml or RECOMP_GFX_DITHER only |
 | `graphics.ui_scale` (`off`, `2x`, `4x`) | `RECOMP_GFX_UI_SCALE` | yes (the texture caches upload a 2D texture again at its next bind) |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |
@@ -405,24 +405,54 @@ process; a second copy is told and does not start. A restart gets it back.
 ## Text and fonts
 
 Every string the overlay draws is UTF-8: its own labels and hints, a port's
-rows, folder names in the music folder browser. Two fonts, both embedded
-(no file is read at run time), merged into one (`overlay_fonts` in
-`overlay_ui.cpp`); Dear ImGui rasterises a glyph when it is first drawn, so
-there is no baked atlas and no list of ranges to keep:
+rows, folder names in the music folder browser. Three faces, each a chain
+Dear ImGui walks for a character (`overlay_fonts`, `gamefont_attach` in
+`overlay_ui.cpp`); a glyph is rasterised when it is first drawn, at the size
+it is drawn at, so there is no baked atlas and no list of ranges to keep:
+
+| face | chain | used for |
+|---|---|---|
+| ui | Roboto Condensed Medium, then DejaVu Sans Mono | hints, the Mixer page, the folder browser, the graph |
+| body | the title's text font (if registered), then ui's chain | the page name, tabs, row labels (capitals, leant), values, the footer keys |
+| title | the title's large font, then its text font, then ui's chain | the one big word, SETTINGS |
 
 | font | covers | licence |
 |---|---|---|
-| ProggyForever, Dear ImGui's own default (in `imgui_draw.cpp`) | Basic Latin, Latin-1 | MIT |
-| DejaVu Sans Mono 2.37, a subset (`overlay_font_ext.h`, 41 KB, 630 characters) | Latin Extended-A and -B (U+0100-024F), Greek (U+0370-03FF), Cyrillic (U+0400-04FF), dashes and quotes (U+2010-2027), U+25A1 | Bitstream Vera licence (MIT kind; the notices go with every copy: `third_party/dejavu/LICENSE.txt`, which a binary release carries) |
+| Roboto Condensed Medium, a subset (`overlay_font_ui.h`, 51 KB, 693 characters) | Basic Latin, Latin-1, Latin Extended-A and -B, Greek, Cyrillic, dashes and quotes, the euro and trade mark signs | SIL OFL 1.1 (`third_party/roboto_condensed/OFL.txt`, which a binary release carries) |
+| DejaVu Sans Mono 2.37, a subset (`overlay_font_ext.h`, 41 KB, 630 characters) | the same scripts again, U+25A1 | Bitstream Vera licence (MIT kind; `third_party/dejavu/LICENSE.txt`, which a binary release carries) |
 
-The first font decides wherever it has the character, so the overlay looks
-as it did; the second is set to its x-height and baseline. The subset is
-made by `third_party/dejavu/make_subset.py` from the release's
-`DejaVuSansMono.ttf` (checked by SHA-256); ProggyForever's own full font has
-no Latin Extended-A either (193 characters), which is why a second font is
-needed at all.
+Roboto is made by `third_party/roboto_condensed/make_subset.py` from
+google/fonts' variable `RobotoCondensed[wght].ttf` (checked by SHA-256),
+pinned to wght 500.
 
-A character neither font has is drawn as a square (U+25A1), not as "?".
+### The title's own fonts
+
+A port can name two bitmap fonts inside its title's executable
+(`xbox_OverlaySetGameFonts`, `xbox_settings.h`): where each DXT5 atlas and
+its glyph table are, the file's size and SHA-256. Burnout 3 names GlobalFont
+and HeadFont of the US retail `default.xbe`. At start a thread reads the
+player's own file, checks it, decodes the two atlases, scales them 4x with
+Super-xBR (`nv2a_texscale`) and keeps the coverage in memory
+(`overlay_gamefont.cpp`; about 90 ms on an M-series Mac); between two frames
+the overlay then adds them in front of its own fonts. A font loader of the
+overlay's own samples the 4x picture at whatever size a glyph is drawn, so
+the letters stay sharp at 4K. Nothing decoded is written anywhere, and
+nothing of the title is in this repository. No file, another file or a
+table that does not read as glyphs: the overlay stays on Roboto everywhere,
+scaled to the game font's capital height so the page keeps its proportions,
+with one line in the log and no message on screen.
+`RECOMP_OVERLAY_GAME_FONT=0` keeps Roboto.
+
+The game's italics are its upright letters leant at draw time; the overlay
+does the same (a shear of 0.2 applied to the drawn vertices, so a fallback
+letter in the same string leans with them): the title, the page name, the
+tabs and the labels are leant, values, hints and the keys upright. The
+game's text font has Latin-1 and little more (no ő ű, no Cyrillic or
+Greek): those letters come from Roboto, scaled to the game font's capital
+height and set on its baseline, so "Zenék – ősz" mixes the two in one line.
+The large font has capitals only.
+
+A character no font has is drawn as a square (U+25A1), not as "?".
 That is the case for CJK, Arabic, Hebrew, Indic scripts and emoji: out of
 scope (a CJK font is megabytes, and right-to-left and combining scripts need
 shaping this renderer does not do). A name in such a script still works: the
