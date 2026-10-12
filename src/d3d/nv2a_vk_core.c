@@ -257,6 +257,18 @@ static int make_device(void)
                 want_pw ? have_pw.presentWait : 0);
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;
+    /* glslang turns GLSL's discard into OpDemoteToHelperInvocation when it
+     * writes SPIR-V 1.6, and a module that declares that capability may
+     * only be created on a device with this feature switched on
+     * (VUID-VkShaderModuleCreateInfo-pCode-08740). Vulkan 1.3 obliges a
+     * driver to have it; it is asked for here, not assumed, and without it
+     * the shaders are written as SPIR-V 1.5, where discard is OpKill
+     * (nv2a_vk_glsl.c). */
+    f13.shaderDemoteToHelperInvocation = have13.shaderDemoteToHelperInvocation;
+    s_core.demote = have13.shaderDemoteToHelperInvocation ? 1 : 0;
+    if (!s_core.demote)
+        fprintf(stderr, "[vulkan] %s has no shaderDemoteToHelperInvocation: fragment shaders"
+                " as SPIR-V 1.5 (discard is OpKill)\n", s_core.name);
     memset(&f12, 0, sizeof f12);
     f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     f12.pNext = &f13;
@@ -398,6 +410,30 @@ const char *nvk_core_describe(void)
                  VK_API_VERSION_MINOR(s_core.props.apiVersion),
                  VK_API_VERSION_PATCH(s_core.props.apiVersion));
     return line;
+}
+
+static void (*s_lost_fn)(const char *why);
+static int s_lost;
+
+void nvk_set_lost_handler(void (*fn)(const char *why))
+{
+    __atomic_store_n(&s_lost_fn, fn, __ATOMIC_RELEASE);
+}
+
+void nvk_device_lost(const char *why)
+{
+    void (*fn)(const char *) = __atomic_load_n(&s_lost_fn, __ATOMIC_ACQUIRE);
+    if (__atomic_exchange_n(&s_lost, 1, __ATOMIC_ACQ_REL))
+        return;
+    fprintf(stderr, "[vulkan] the graphics device is lost (%s): no picture can be drawn in this"
+            " run any more\n", why ? why : "?");
+    fflush(stderr);
+    if (fn) {
+        fn(why);
+    } else {
+        fprintf(stderr, "[vulkan] no window to say it in: ending the run (status 70)\n");
+        exit(70);
+    }
 }
 
 void nvk_queue_lock(void)   { pthread_mutex_lock(&s_queue_lock); }
