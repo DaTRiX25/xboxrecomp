@@ -442,8 +442,8 @@ static int page_rows(int page, Row *r)
          * effects image runs (apu_gp.h); with one they are not dry. */
         if (!apu_gp_wired())
             SET(XS_AUDIO_FX_LEVEL);
-        else
-            SET(XS_AUDIO_LFE_LOWPASS);
+        /* audio.lfe_lowpass has no row: the stock 120 Hz is the console's,
+         * and the Mixer page has its own LFE low-pass for tuning. */
         if (apu_bus_count() > 0)
             ACT(A_MIXER, "Mixer: buses, sends, LFE, limiter, meters");
         if (recomp_patch_enabled(xbox_SettingGet(XS_AUDIO_SPLIT_MUSIC)->key))
