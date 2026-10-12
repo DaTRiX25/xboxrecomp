@@ -103,6 +103,9 @@ typedef enum {
  *   Sony 054C:0CE6 (DualSense) and 054C:0DF2 (DualSense Edge): PLAYSTATION5,
  *     whatever type the host gave (an SDL that predates the type says PS4)
  *   Sony (054C) and Nintendo (057E) pads the host has no type for
+ *   Microsoft (045E) pads the host has no type for, but the original Xbox
+ *     pads (0202 0285 0287 0288 0289), and names with "Xbox 360", "XInput",
+ *     "Xbox One", "Xbox Series" or "Xbox Wireless" in them: XBOX_MODERN
  *   a name with "Steam Deck" in it: STEAM
  *
  * name may be NULL. */

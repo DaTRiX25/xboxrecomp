@@ -59,6 +59,16 @@ xbox_pad_family xbox_PadFamilyFromIds(xbox_pad_family by_type, unsigned vendor,
         return XBOX_PAD_FAMILY_PLAYSTATION5;
     if (by_type != XBOX_PAD_FAMILY_XBOX)
         return by_type;
+    /* An Xbox 360 or later pad the host has no type for (an older SDL, some
+     * receivers and clones): Microsoft's own ids, but not the original
+     * Xbox pads (Duke, S), which keep the original prompts; or a name that
+     * says so. */
+    if (vendor == 0x045Eu && product != 0x0202u && product != 0x0285u &&
+        product != 0x0287u && product != 0x0288u && product != 0x0289u)
+        return XBOX_PAD_FAMILY_XBOX_MODERN;
+    if (ci_has(name, "xbox 360") || ci_has(name, "x-box 360") || ci_has(name, "xinput") ||
+        ci_has(name, "xbox one") || ci_has(name, "xbox series") || ci_has(name, "xbox wireless"))
+        return XBOX_PAD_FAMILY_XBOX_MODERN;
     if (vendor == 0x054Cu)
         return XBOX_PAD_FAMILY_PLAYSTATION;
     if (vendor == 0x057Eu)

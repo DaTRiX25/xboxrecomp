@@ -56,6 +56,12 @@ int main(void)
     CHECK(xbox_PadFamilyFromIds(X, 0x28DE, 0x11FF, "Steam Virtual Gamepad", 0) == XM);
     /* Windows, as SDL reports the common pads there (type first, then ids) */
     CHECK(xbox_PadFamilyFromIds(XM, 0x045E, 0x02FF, "Xbox One Controller", 0) == XM);       /* XInput */
+    CHECK(xbox_PadFamilyFromIds(X, 0x045E, 0x028E, "Xbox 360 Controller", 0) == XM);        /* untyped 360 */
+    CHECK(xbox_PadFamilyFromIds(X, 0x045E, 0x0719, "Xbox 360 Wireless Receiver", 0) == XM);
+    CHECK(xbox_PadFamilyFromIds(X, 0, 0, "XInput Controller #1", 0) == XM);
+    CHECK(xbox_PadFamilyFromIds(X, 0x24C6, 0x5300, "PowerA Mini Pro Ex (Xbox 360)", 0) == XM);
+    CHECK(xbox_PadFamilyFromIds(X, 0x045E, 0x0289, "Original Xbox Controller S", 0) == X);   /* original stays */
+    CHECK(xbox_PadFamilyFromIds(X, 0x045E, 0x0202, "Xbox Duke", 0) == X);
     CHECK(xbox_PadFamilyFromIds(X, 0x054C, 0x05C4, "Wireless Controller", 0) == PS);         /* DualShock 4, untyped */
     CHECK(xbox_PadFamilyFromIds(X, 0x054C, 0x09CC, "Wireless Controller", 0) == PS);         /* DualShock 4 v2 */
     CHECK(xbox_PadFamilyFromIds(X, 0x054C, 0x0CE6, "DualSense Wireless Controller", 0) == P5);
