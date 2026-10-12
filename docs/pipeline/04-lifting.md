@@ -547,6 +547,18 @@ interval 2, two simulation steps a frame); read as 0 the title takes its own
 full-rate path (`graphics.crash_60fps`, `RECOMP_GFX_CRASH_60FPS=1`, off by
 default; the game repository's `docs/crash60.md`).
 
+`"kind": "cmp_u32"` is the same for a 32-bit value, `cmp dword ptr [mem],
+r32|imm` (Burnout 3's music manager compares the player count with 1 and
+stays silent in split screen; read as 1 it plays: `audio.split_music`).
+`"kind": "store_u8"` is for a byte the title stores once and reads later,
+`mov byte ptr [mem], imm8|r8`: the store is followed by
+`MEM8(addr) = (uint8_t)RECOMP_PATCH_U32(key, when, value, MEM8(addr));`, so
+the byte is stored again as the value while the setting says so. Unlike the
+load and compare kinds it writes the guest's memory, as `store_f32` does
+(Burnout 3's two-player stage asks for its half frame rate with one store at
+set-up: `graphics.split_60fps`; the game repository's
+`docs/split-screen.md`).
+
 A float goes by `"kind": "load_f32"` (after `movss xmm, [mem]`, or a 32-bit
 `mov reg, [mem]` that carries a float as bits) or `"store_f32"` (after
 `movss [mem], xmm` / `mov [mem], reg`: the stored float is rewritten, for a
