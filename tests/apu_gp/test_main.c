@@ -152,14 +152,24 @@ static void test_commands(void)
     apu_gp_command(&mem, 2, EQ_A + 7, STATE_OFF + 4 * (EQ_A + 7), 1);
     frame();
     CHECK(fabsf(out[FL][3] + 0.5f) < 1e-6f, "after command 2: %g", out[FL][3]);
-    /* An effect that is not modelled: how far the title opens it. */
-    apu_gp_unmodelled("the test's effect", 0x200, 2, 0x104);
-    ST(0x200) = 0x3B; ST(0x201) = 0xFFFF00;         /* -0x100 */
+    /* An effect that is not modelled: how far the title has it open
+     * while its bin is fed. */
+    apu_gp_unmodelled("the test's effect", 11, 0x200, 2, 0x104);
+    ST(0x200) = 0x3B; ST(0x201) = 0x004000;
     apu_gp_command(&mem, 2, 0x200, STATE_OFF + 4 * 0x200, 2);
-    CHECK(apu_gp_unmodelled_max() == 0x100, "unmodelled effect's level: %X", apu_gp_unmodelled_max());
+    clear();
+    frame();
+    CHECK(apu_gp_unmodelled_max() == 0, "an effect nobody feeds counts as open: %X", apu_gp_unmodelled_max());
+    ST(0x201) = 0xFFFF00;                           /* -0x100 */
+    apu_gp_command(&mem, 2, 0x200, STATE_OFF + 4 * 0x200, 2);
+    bins[11][3] = 0.1f;
+    frame();
+    CHECK(apu_gp_unmodelled_max() == 0x100, "fed at a quiet level: %X", apu_gp_unmodelled_max());
     ST(0x201) = 0x004000;
     apu_gp_command(&mem, 2, 0x1F0, STATE_OFF + 4 * 0x1F0, 0x20);
-    CHECK(apu_gp_unmodelled_max() == 0x4000, "after the title opened it: %X", apu_gp_unmodelled_max());
+    bins[11][3] = 0.1f;
+    frame();
+    CHECK(apu_gp_unmodelled_max() == 0x4000, "fed while the title has it open: %X", apu_gp_unmodelled_max());
     /* Out of range: ignored, no crash. */
     apu_gp_command(&mem, 2, APU_GP_STATE_MAX + 5, STATE_OFF, 10);
     apu_gp_command(&mem, 2, APU_GP_STATE_MAX - 2, STATE_OFF, 100);

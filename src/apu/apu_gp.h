@@ -78,13 +78,13 @@ int  apu_gp_export_range(uint32_t *scratch_off, uint32_t *bytes, int *first_bin)
 void apu_gp_lfe_lowpass(int hz);
 int  apu_gp_lfe_lowpass_hz(void);       /* the setting in force or being faded to */
 
-/* An effect of the image that is not modelled, and the state words that
- * say how far the title has it open: count words from state, harmless up
- * to quiet (as signed 24-bit integers). When the title (command 2) loads a larger
- * value the log says so, once for each new maximum: a sound that is
- * missing can then be traced to it. what must stay valid. */
-void apu_gp_unmodelled(const char *what, uint32_t state, int count, int32_t quiet);
-/* The largest value seen in those words since the wiring. */
+/* An effect of the image that is not modelled: its input bin, and the
+ * state words that say how far the title has it open (count words from
+ * state, harmless up to quiet, as signed 24-bit integers). When the bin is
+ * fed while a word is larger the log says so, once for each new maximum:
+ * a sound that is missing can then be traced to it. what must stay valid. */
+void apu_gp_unmodelled(const char *what, int bin, uint32_t state, int count, int32_t quiet);
+/* The largest value those words had while the bin was fed. */
 int32_t apu_gp_unmodelled_max(void);
 
 /* What a bin reaches (for meters and the host mixer): its speaker, or -1,

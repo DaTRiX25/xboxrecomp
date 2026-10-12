@@ -20,7 +20,7 @@ static struct {
              float x1, x2, y1, y2; } route[APU_GP_BINS];
     struct { int bin; uint32_t st; } drive[4];
     int ndrive;
-    struct { const char *what; uint32_t st; int count; int32_t quiet, max; } un;
+    struct { const char *what; uint32_t st; int bin, count; int32_t quiet, max; } un;
     int exp_first, exp_count;
     uint32_t exp_off;
     /* The LFE low-pass: the one running, and during a change the one it
@@ -82,12 +82,14 @@ void apu_gp_drive(int bin, uint32_t state)
     g.ndrive++;
 }
 
-void apu_gp_unmodelled(const char *what, uint32_t state, int count, int32_t quiet)
+void apu_gp_unmodelled(const char *what, int bin, uint32_t state, int count, int32_t quiet)
 {
     wire();
-    if (count < 0 || state + (uint32_t)count > APU_GP_STATE_MAX)
+    if (bin < 0 || bin >= APU_GP_BINS || count < 0 ||
+        state + (uint32_t)count > APU_GP_STATE_MAX)
         return;
     g.un.what = what;
+    g.un.bin = bin;
     g.un.st = state;
     g.un.count = count;
     g.un.quiet = quiet;
@@ -219,24 +221,6 @@ void apu_gp_command(const apu_gp_mem *m, uint32_t cmd, uint32_t dst,
         count = APU_GP_STATE_MAX - dst;
     for (uint32_t k = 0; k < count; k++)
         g.st[dst + k] = sx24(m->read(m->ctx, src + 4 * k));
-
-    /* The title's own moves only: the first load is the image's defaults,
-     * before the title has set anything. */
-    if (cmd == 2 && g.un.count && dst < g.un.st + (uint32_t)g.un.count && dst + count > g.un.st) {
-        int32_t mx = 0;
-        for (int k = 0; k < g.un.count; k++) {
-            int32_t v = g.st[g.un.st + (uint32_t)k];
-            if (v < 0) v = -v;
-            if (v > mx) mx = v;
-        }
-        if (mx > g.un.max) {
-            g.un.max = mx;
-            if (mx > g.un.quiet)
-                fprintf(stderr, "[APU] GP image: %s is not modelled and the title has it"
-                                " open to 0x%06X (quiet up to 0x%06X)\n",
-                        g.un.what ? g.un.what : "an effect", (unsigned)mx, (unsigned)g.un.quiet);
-        }
-    }
 }
 
 /* ── the distortion ──────────────────────────────────────────────────────
@@ -372,6 +356,30 @@ void apu_gp_frame(const apu_gp_mem *m, float bins[APU_GP_BINS][APU_GP_FRAME],
             if (x > k_max) bins[b][i] = k_max;
             else if (x < -1.0f) bins[b][i] = -1.0f;
         }
+
+    /* An effect that is not modelled, fed while the title has it open. */
+    if (g.un.count) {
+        const float *x = bins[g.un.bin];
+        int fed = 0;
+        for (int i = 0; i < APU_GP_FRAME && !fed; i++)
+            fed = x[i] != 0.0f;
+        if (fed) {
+            int32_t mx = 0;
+            for (int k = 0; k < g.un.count; k++) {
+                int32_t v = g.st[g.un.st + (uint32_t)k];
+                if (v < 0) v = -v;
+                if (v > mx) mx = v;
+            }
+            if (mx > g.un.max) {
+                g.un.max = mx;
+                if (mx > g.un.quiet)
+                    fprintf(stderr, "[APU] GP image: %s is not modelled; the title feeds it"
+                                    " with its level at 0x%06X (quiet up to 0x%06X)\n",
+                            g.un.what ? g.un.what : "an effect", (unsigned)mx,
+                            (unsigned)g.un.quiet);
+            }
+        }
+    }
 
     /* The in-place effects. */
     for (int k = 0; k < g.ndrive; k++) {
