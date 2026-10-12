@@ -538,7 +538,8 @@ static int page_rows(int page, Row *r)
             glass_info();
             INFO(s_glass_info[0]);
             INFO(s_glass_info[1]);
-            INFO(s_glass_info[2]);
+            if (s_glass_info[2][0])    /* empty while there are no on-glass times */
+                INFO(s_glass_info[2]);
         }
 #endif
         if (xbox_BugReportHasMaker()) {
