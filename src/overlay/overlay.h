@@ -67,6 +67,10 @@ void xbox_OverlayShutdown(void);
 #define XBOX_OVERLAY_HOST_ROWS 4
 void xbox_OverlaySetHostRows(int n, const char *(*fn)(int row, int activate));
 
+/* Tests (overlay_shot): the place on the open page of the row whose text
+ * starts with `prefix` (0 is the first), -1 when the page has none. */
+int xbox_OverlayTestRowIndex(const char *prefix);
+
 #ifdef __cplusplus
 }
 #endif
