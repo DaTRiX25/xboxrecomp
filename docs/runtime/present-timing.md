@@ -5,6 +5,11 @@ Code: `src/kernel/present_cadence.{h,c}` (the arithmetic, tested by
 `tests/present_cadence`), `src/video/fb_present_metal.m` (the Metal
 presenter), `src/video/fb_present_vulkan.c` (measurement only).
 
+The default is `legacy`: what the presenters did before. Measured numbers for
+a title are in its own docs (Burnout 3: `docs/present-timing.md`); nothing on
+this page has been verified on a variable-refresh display, a ProMotion panel,
+or a host other than macOS.
+
 ## The problem
 
 A 60 fps title looks smooth only when every frame stays on the screen for the
@@ -124,7 +129,7 @@ swapchain can tell when a frame was shown:
 | Linux / Steam Deck (RADV, gamescope or desktop) | `VK_KHR_present_wait`: the time the wait for a present id returns | measured (when the waiter thread woke after the flip: close to it, but not a scanout stamp) |
 | Windows through Vulkan | `VK_KHR_present_wait` where the driver has it (AMD's 25.x on the RX 9060 XT did not) | measured there, else "not available" |
 | Android (Turnip) | none through the loader's swapchain today; `VK_GOOGLE_display_timing` is the candidate | "not available" |
-| macOS through MoltenVK | `VK_KHR_present_wait` if offered | see the task notes |
+| macOS through MoltenVK | `VK_KHR_present_wait` if offered | not checked |
 
 Can "present when ready" judder happen there? On a fixed-rate display the
 Vulkan build already locks the vblank to the display (`RECOMP_VBLANK_SYNC=
