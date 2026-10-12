@@ -24,6 +24,7 @@ struct MxItem {
     int *i;                     /* MK_BOOL, MK_CHOICE (the value itself) */
     float mn, mx, step;
     bool off_below;             /* MK_DB: under mn is "off" */
+    float on_db;                /* MK_DB: what A sets from "off" */
     const char *const *names;   /* MK_CHOICE */
     const int *vals;
     int nvals;
@@ -234,6 +235,9 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
     const int nbus = apu_bus_count();
     const bool on = apu_bus_enabled() != 0;
 
+    if (on && s_mx_live_b)
+        add(MK_INFO, "YOU HEAR B, the reference preset. Edits here change B and are not saved. F7 / Back+Y: back to A.", NULL);
+
     if (s_mx_view == MX_MAIN) {
         MxItem &en = act(MA_ENABLE, "Mixer", "Off: the game's mix, exactly as without this page. On with the Factory preset it is still the same output, bit for bit; everything below is a change you make.");
         snprintf(en.text, sizeof en.text, "%s", on ? "On" : "Off");
@@ -241,6 +245,7 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
             add(MK_INFO, "Turn the mixer on to hear and edit the buses below.", NULL);
             return n;
         }
+        add(MK_INFO, "The game keeps running while the mixer is open: every change is heard at once.", NULL);
         MxItem &ab = act(MA_AB, "Listening to", "A is your mix, kept in mixer.toml. B is a reference held in memory. F7, or Back + Y on a pad, switches between them at any time, also with this menu closed.");
         snprintf(ab.text, sizeof ab.text, "%s", s_mx_live_b ? "B (reference)" : "A (your mix)");
         MxItem &br = act(MA_BREF, "B is", "Left / right: the preset B holds. Edits made while B is heard change B only and are not saved.");
@@ -249,7 +254,7 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
         snprintf(pr.text, sizeof pr.text, "%s", mx_preset_name(s_mx_preset_idx));
         act(MA_SAVE_COPY, "Save a copy of A as a preset file", "Writes mixer-1.toml (or the next free number) beside mixer.toml. Rename it as you like: mixer-<name>.toml.");
         for (int b = 0; b < nbus; b++) {
-            MxItem &m = add(MK_BUS, apu_bus_name(b), "Left / right: the bus gain, 0.5 dB a step. A: its sends, trims and LFE send. LB mutes, RB solos, Y resets the bus.");
+            MxItem &m = add(MK_BUS, apu_bus_name(b), "Left / right: the bus gain, 0.5 dB a step (hold: faster). A: its route, sends, trims and LFE send. LB mutes, RB solos, Y resets the bus.");
             m.bus = b;
             m.f = &c.bus[b].gain_db;
             m.mn = -60.0f; m.mx = 12.0f; m.step = 0.5f; m.off_below = true;
@@ -292,9 +297,10 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
             static const int order[6] = { 0, 1, 2, 4, 5, 3 };
             for (int k = 0; k < 6; k++)
                 db(sn[order[k]], &p.send_db[order[k]], -60.0f, 12.0f, true,
-                   "0 dB is the sound's own level. Under -60 dB the send is off.");
+                   "0 dB is the sound's own level. A: off / 0 dB. Left / right: 0.5 dB a step, faster when held; under -60 dB the send is off.");
         }
-        db("LFE send (through the crossover)", &p.lfe_send_db, -40.0f, 12.0f, true, "An extra send of the bus to the LFE through the low-pass below, on top of the route. Off by default.");
+        db("LFE send (through the crossover)", &p.lfe_send_db, -40.0f, 12.0f, true, "An extra send of the bus to the LFE through the low-pass below, on top of the route. Off by default; A switches it between off and -10 dB.");
+        it[n - 1].on_db = -10.0f;
         choice("LFE send crossover", &p.lfe_crossover_hz, k_mx_xo, k_mx_hz_v, 6, "The 24 dB/octave low-pass on that send.");
         act(MA_BUS_RESET, "Reset this bus", NULL);
     } else if (s_mx_view == MX_SPEAKERS) {
@@ -327,6 +333,28 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
 
 static bool mx_selectable(const MxItem &m) { return m.kind != MK_INFO; }
 
+/* For tests (overlay_shot): the selection onto the row with this label in
+ * the view that shows; which view shows (-1: the page is closed). */
+extern "C" int xbox_OverlayMixerSelect(const char *label)
+{
+    static MxItem items[40];
+    apu_bus_config c;
+    if (!s_mx_open) return 0;
+    if (s_mx_live_b) c = s_mx_b;
+    else if (s_mx_save_pending) c = s_mx_save_cfg;
+    else apu_bus_get_config(&c);
+    int n = mx_items(c, items, 40);
+    for (int i = 0; i < n; i++)
+        if (mx_selectable(items[i]) && !strcmp(items[i].label, label)) {
+            s_mx_sel[s_mx_view] = i;
+            s_mx_scroll = true;
+            return 1;
+        }
+    return 0;
+}
+
+extern "C" int xbox_OverlayMixerView(void) { return s_mx_open ? s_mx_view : -1; }
+
 /* Left / right on an item; true when the configuration changed. */
 static bool mx_adjust(MxItem &m, int dir, apu_bus_config &c)
 {
@@ -335,8 +363,9 @@ static bool mx_adjust(MxItem &m, int dir, apu_bus_config &c)
     case MK_DB: {
         float v = *m.f;
         if (v <= APU_BUS_OFF_DB) {
+            /* From off: in at -20 dB (audible), not at the bottom. */
             if (dir < 0) return false;
-            v = m.mn;
+            v = m.mn < -20.0f ? -20.0f : m.mn;
         } else {
             v = floorf(v / m.step + 0.5f) * m.step + (float)dir * m.step;
             if (v < m.mn) v = m.off_below ? APU_BUS_OFF_DB : m.mn;
@@ -362,11 +391,12 @@ static bool mx_adjust(MxItem &m, int dir, apu_bus_config &c)
         int k = 0;
         for (int j = 0; j < m.nvals; j++)
             if (m.vals[j] == *m.i) k = j;
-        k = (k + dir + m.nvals) % m.nvals;
+        k = (k + (dir > 0 ? 1 : -1) + m.nvals) % m.nvals;
         *m.i = m.vals[k];
         return true;
     }
     case MK_ACTION:
+        dir = dir > 0 ? 1 : -1;
         if (m.action == MA_BREF) {
             s_mx_b_idx = (s_mx_b_idx + dir + mx_preset_count()) % mx_preset_count();
             mx_b_load();
@@ -388,6 +418,11 @@ static bool mx_activate(MxItem &m, apu_bus_config &c)
 {
     if (m.kind == MK_BOOL)
         return mx_adjust(m, 1, c);
+    if (m.kind == MK_DB && m.off_below) {
+        /* A on a level: off, or back in at its usual level. */
+        *m.f = *m.f <= APU_BUS_OFF_DB ? m.on_db : APU_BUS_OFF_DB;
+        return true;
+    }
     if (m.kind == MK_BUS) {
         s_mx_view = MX_BUS;
         s_mx_bus = m.bus;
@@ -605,14 +640,23 @@ static void build_mixer(float fs, ImDrawList *dl)
         }
         s_mx_scroll = true;
     };
+    /* A held direction speeds up: 2x after six steps, 4x after fourteen,
+     * 8x after thirty. Single presses are always one step. */
+    static int streak[D_COUNT];
+    int mult[D_COUNT];
+    for (int d = 0; d < D_COUNT; d++) {
+        const bool held = s_dpad[d] || s_stick[d] || s_key[d];
+        streak[d] = held ? streak[d] + s_steps[d] : 0;
+        mult[d] = streak[d] > 30 ? 8 : streak[d] > 14 ? 4 : streak[d] > 6 ? 2 : 1;
+    }
     const bool pan_view = s_mx_view == MX_BUS && c.bus[s_mx_bus].route == APU_BUS_ROUTE_PAN;
     if (!pan_view)
         s_mx_grab = false;
     if (s_mx_grab) {
         /* The position follows the D-pad / stick, 0.05 a step. */
         apu_bus_params &p = c.bus[s_mx_bus];
-        const float dx = 0.05f * (float)(s_steps[D_RIGHT] - s_steps[D_LEFT]);
-        const float dy = 0.05f * (float)(s_steps[D_UP] - s_steps[D_DOWN]);
+        const float dx = 0.05f * (float)(s_steps[D_RIGHT] * mult[D_RIGHT] - s_steps[D_LEFT] * mult[D_LEFT]);
+        const float dy = 0.05f * (float)(s_steps[D_UP] * mult[D_UP] - s_steps[D_DOWN] * mult[D_DOWN]);
         if (dx != 0.0f || dy != 0.0f) {
             float x = floorf((p.pan_x + dx) * 20.0f + 0.5f) / 20.0f, y = floorf((p.pan_y + dy) * 20.0f + 0.5f) / 20.0f;
             p.pan_x = x < -1.0f ? -1.0f : x > 1.0f ? 1.0f : x;
@@ -624,8 +668,8 @@ static void build_mixer(float fs, ImDrawList *dl)
     }
     while (s_steps[D_UP]-- > 0) move(-1);
     while (s_steps[D_DOWN]-- > 0) move(1);
-    while (s_steps[D_LEFT]-- > 0) dirty |= mx_adjust(items[sel], -1, c);
-    while (s_steps[D_RIGHT]-- > 0) dirty |= mx_adjust(items[sel], 1, c);
+    while (s_steps[D_LEFT]-- > 0) dirty |= mx_adjust(items[sel], -mult[D_LEFT], c);
+    while (s_steps[D_RIGHT]-- > 0) dirty |= mx_adjust(items[sel], mult[D_RIGHT], c);
     memset(s_steps, 0, sizeof s_steps);
     int view0 = s_mx_view;
     while (s_activate-- > 0 && s_mx_view == view0) dirty |= mx_activate(items[sel], c);

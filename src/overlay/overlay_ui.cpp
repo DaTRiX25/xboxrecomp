@@ -815,6 +815,21 @@ static void clear_nav()
     s_activate = s_back = s_page_delta = s_reset = 0;
 }
 
+/* The title is paused while the overlay is open, except on the Mixer page:
+ * a mix is set by ear, so there the game keeps running and sounding (its
+ * input still held: the car coasts). Called wherever either changes. */
+static void pause_sync()
+{
+    static int applied = -1;
+    int want = s_open && !s_mx_open;
+    if (want != applied) {
+        applied = want;
+        xbox_HostPause(want);
+        if (s_open)
+            fprintf(stderr, LOGP "%s\n", want ? "the title is paused" : "Mixer page: the title runs while it is open");
+    }
+}
+
 static void set_open(bool on)
 {
     if (on == s_open)
@@ -824,7 +839,7 @@ static void set_open(bool on)
     if (on) {
         s_scroll_to_sel = true;
         xbox_InputSetBlocked(1);
-        xbox_HostPause(1);
+        pause_sync();
         fprintf(stderr, LOGP "open: the title is paused, its input is held\n");
     } else {
         /* A build beside a running title would cost it frames: it stops
@@ -839,7 +854,7 @@ static void set_open(bool on)
         }
         mcpx_apu_speaker_test(-1, 0);
         xsb_close();
-        xbox_HostPause(0);
+        pause_sync();
         xbox_InputSetBlocked(0);
         xbox_SettingsFlush();
         s_save_pending = false;
@@ -1167,6 +1182,7 @@ void xbox_OverlayPoll(void)
     /* B or Esc: here and not in the frame, so a window that cannot present
      * (minimised) still closes. */
     mx_poll();
+    pause_sync();
     if (s_back > 0) {
         s_back = 0;
         if (s_open && s_mx_open) {
@@ -1183,6 +1199,7 @@ void xbox_OverlayPoll(void)
         } else if (s_open)
             set_open(false);
     }
+    pause_sync();
 
     /* The fullscreen setting, when it changes. */
     if (s_win) {
