@@ -1880,6 +1880,12 @@ static void scale_prepare_loaded(void)
                 || !nv2a_texscale_tex_ok(nv2a_tex_size_from_format(e->color), e->width,
                                          e->height, e->levels))
             continue;
+        /* Nothing says here whether a 2D draw uses a texture, and the larger
+         * one-level textures with alpha are mostly the world's (car
+         * liveries, tree lines, sky strips, 8 MB each at 4x): those are left
+         * to their own bind, which knows. Fonts and HUD art are within this. */
+        if ((uint64_t)e->width * e->height > 256u * 256u)
+            continue;
         memset(&st, 0, sizeof st);
         st.offset = e->offset;
         st.color = e->color;

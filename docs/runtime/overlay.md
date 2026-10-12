@@ -99,8 +99,9 @@ textures, no hashes):
   target, not a cube map, not a signed (bump) texture;
 - a swizzled or DXT format (a linear one is a video frame or a copy of the
   screen), one mip level, at most 512x512 texels;
-- some texel of it is not opaque (art cut out with alpha). An opaque picture
-  is left alone.
+- at least one texel in sixteen is not opaque (art cut out with alpha). An
+  opaque picture is left alone, and so is a photograph stored with an alpha
+  channel whose stray texels sit just under opaque.
 
 The scaled texture gets the mip levels down to the title's size (2 levels at
 2x, 3 at 4x) and a trilinear sampler over them, so an element drawn smaller
@@ -156,8 +157,10 @@ so a title's shader pre-build run does (it must pass the setting to its
 scenes and call `nv2a_texscale_flush` before it exits). When the setting is
 switched on in the overlay, the backend goes through its texture cache
 while the title is held for the pause (`xbox_HostPauseIdleFn`) and queues
-every loaded texture that passes the texture half of the rule, for the disk
-only; the row's note shows `nv2a_texscale_progress`.
+every loaded texture of at most 256x256 that passes the texture half of the
+rule, for the disk only (it cannot tell which are drawn in 2D, and the larger
+one-level textures with alpha are mostly the world's); the row's note shows
+`nv2a_texscale_progress`.
 
 Off (the default) asks for factor 0: no draw is classified, nothing is
 hashed or queued, no thread is started, and every path is the one it was. A

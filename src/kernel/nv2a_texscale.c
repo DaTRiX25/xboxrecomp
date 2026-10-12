@@ -624,10 +624,34 @@ static void gen_next(void)
         atomic_store_explicit(&s_gen, 1, memory_order_relaxed);
 }
 
+int nv2a_texscale_held(void)
+{
+    const char *e = recomp_env(RENV_UI_SCALE_HOLD);
+    if (e && *e)
+        return *e != '0';
+#if defined(__ANDROID__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static void held_say(unsigned factor)
+{
+    static _Atomic int said;
+    if (factor && !atomic_exchange_explicit(&said, 1, memory_order_relaxed))
+        fprintf(stderr, "[UISCALE] 2D art upscaling (%ux asked for) is held off on this"
+                " platform; RECOMP_DEBUG=ui_scale_hold=0 lifts the hold\n", factor);
+}
+
 void nv2a_texscale_set_factor(unsigned factor)
 {
     if (factor != 2 && factor != 4)
         factor = 0;
+    if (nv2a_texscale_held()) {
+        held_say(factor);
+        factor = 0;
+    }
     if (atomic_exchange_explicit(&s_factor, factor, memory_order_relaxed) != factor)
         gen_next();
 }
@@ -640,6 +664,10 @@ unsigned nv2a_texscale_factor(void)
         const char *e = recomp_env(RENV_GFX_UI_SCALE);
         unsigned expect = UNREAD;
         f = e && e[0] == '2' ? 2u : e && e[0] == '4' ? 4u : 0u;
+        if (nv2a_texscale_held()) {
+            held_say(f);
+            f = 0;
+        }
         /* A set_factor() that came first stays. */
         if (!atomic_compare_exchange_strong_explicit(&s_factor, &expect, f,
                                                      memory_order_relaxed,
@@ -702,9 +730,10 @@ int nv2a_texscale_tex_ok(int size_from_format, uint32_t w, uint32_t h, uint32_t 
 
 int nv2a_texscale_has_alpha(const uint32_t *texels, size_t n)
 {
-    size_t i;
+    /* A sixteenth, rounded up; reached early in art, never in a picture. */
+    size_t i, need = (n + 15) / 16, seen = 0;
     for (i = 0; i < n; i++)
-        if ((texels[i] >> 24) != 0xFFu)
+        if ((texels[i] >> 24) != 0xFFu && ++seen >= need)
             return 1;
     return 0;
 }
