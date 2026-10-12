@@ -322,7 +322,14 @@ What ends a run, and what stops the motors then:
 `xbox_InputShutdown` sets every motor to zero, then the backend's `shutdown`
 writes the stop out (rumble and trigger rumble at zero, 40 ms for SDL's
 HIDAPI rumble queue, which a process that ends at once would take with it
-unwritten) and closes every controller. After it nothing reaches a pad
+unwritten) and closes every controller. A pad that played a rumble in the
+last 600 ms gets SDL's updates for up to 150 ms first: SDL's Xbox One driver
+(a Series pad over Bluetooth on macOS) writes one rumble packet per 50 ms and
+keeps a newer one, the stop included, until its next update, and a pad closed
+with the stop still held back plays its last level on its own (its packet
+loops) until it is switched off. The first end that runs prints one line,
+`[INPUT] rumble stopped on N pads (quit|atexit|exit hook|signal)`, in every
+log. After it nothing reaches a pad
 again: the title's threads run on until the process is gone, and the USB pad
 would otherwise give its held speeds back 150 ms later, to a pad whose SDL
 timer no longer runs. The overlay, the window out of focus, a pad unplugged

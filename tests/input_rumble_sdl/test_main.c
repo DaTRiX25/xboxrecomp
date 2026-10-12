@@ -46,11 +46,39 @@ static int v_ok(void)
     return v.patch >= 50 ? 1 : 0;
 }
 
+/* A pad that behaves as SDL's Xbox One driver does (hid/SDL_hidapi_xboxone.c,
+ * HIDAPI_DriverXboxOne_UpdateRumble): a rumble is written at once only when
+ * the last write is 50 ms old; otherwise it is held back, and the pad is told
+ * at SDL's next update after the 50 ms. The call is taken as done either way. */
+static int g_holdback;
+static int hb_pending;
+static Uint16 hb_low, hb_high;
+static Uint32 hb_written;
+#define HB_BUSY_MS 50
+
 static int SDLCALL v_rumble(void *ud, Uint16 low, Uint16 high)
 {
     (void)ud;
+    if (g_holdback && hb_written && SDL_GetTicks() - hb_written < HB_BUSY_MS) {
+        hb_pending = 1;
+        hb_low = low;
+        hb_high = high;
+        return v_ok();
+    }
+    hb_pending = 0;
+    hb_written = SDL_GetTicks();
     record(low, high, 0);
     return v_ok();
+}
+
+static void SDLCALL v_update(void *ud)
+{
+    (void)ud;
+    if (g_holdback && hb_pending && SDL_GetTicks() - hb_written >= HB_BUSY_MS) {
+        hb_pending = 0;
+        hb_written = SDL_GetTicks();
+        record(hb_low, hb_high, 0);
+    }
 }
 
 static int SDLCALL v_triggers(void *ud, Uint16 left, Uint16 right)
@@ -115,6 +143,7 @@ static int pad_up(void)
     d.name = "rumble test pad";
     d.Rumble = v_rumble;
     d.RumbleTriggers = v_triggers;
+    d.Update = v_update;
     if (SDL_JoystickAttachVirtualEx(&d) < 0) {
         printf("SKIP: no virtual joystick: %s\n", SDL_GetError());
         return 0;
@@ -131,7 +160,7 @@ static int pad_up(void)
     return 1;
 }
 
-enum { END_EXIT, END_SIGTERM, END_KILLED };
+enum { END_EXIT, END_SIGTERM, END_KILLED, END_EXIT_HELD_BACK };
 
 /* A process holding a rumble on the virtual pad, ended the given way. */
 static int child(int how, struct rec *log, int max, int *status)
@@ -147,6 +176,7 @@ static int child(int how, struct rec *log, int max, int *status)
         XBOX_VIBRATION v = { 40000, 30000 };
         close(fd[0]);
         g_pipe = fd[1];
+        g_holdback = how == END_EXIT_HELD_BACK;
         if (!pad_up())
             _exit(77);
         xbox_InputInit();
@@ -154,6 +184,13 @@ static int child(int how, struct rec *log, int max, int *status)
             _exit(78);
         xbox_InputSetState(0, &v);
         poll_for(120);
+        if (how == END_EXIT_HELD_BACK) {
+            /* The level changes, and the process is asked to end at once
+             * (Cmd+Q in a crash): the stop comes inside the pad's 50 ms. */
+            v.wLeftMotorSpeed = 65535;
+            xbox_InputSetState(0, &v);
+            exit(0);
+        }
         if (how == END_EXIT)
             exit(0);
         raise(how == END_SIGTERM ? SIGTERM : SIGKILL);
@@ -184,6 +221,15 @@ int main(void)
     m = last_motor(log, n);
     CHECK(n >= 2 && log[0].low && m && !m->low && !m->high,
           "exit(): the pad was left at %u/%u (%d records)", m ? m->low : 0, m ? m->high : 0, n);
+
+    /* The same, with the pad's own limit of one write per 50 ms: the stop
+     * is held back inside SDL and needs an update to go out. */
+    n = child(END_EXIT_HELD_BACK, log, 256, &status);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "held back: status 0x%x", status);
+    m = last_motor(log, n);
+    CHECK(n >= 3 && m && !m->low && !m->high,
+          "exit() inside the pad's busy time: the pad was left at %u/%u (%d records)",
+          m ? m->low : 0, m ? m->high : 0, n);
 
     n = child(END_SIGTERM, log, 256, &status);
     CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM, "SIGTERM: status 0x%x", status);

@@ -88,6 +88,20 @@ static pthread_mutex_t g_pads_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_pads_closed;
 /* How long the stop is given to reach the devices before the pads close. */
 #define XBOX_RUMBLE_FLUSH_MS 40
+/* A pad that was playing a rumble a moment ago may still have its stop
+ * waiting inside SDL (see sdl_shutdown): the stop is given this long to go
+ * out while SDL is updated. SDL's Xbox One driver sends one rumble packet
+ * per 50 ms on Bluetooth (HIDAPI_DriverXboxOne_UpdateRumble, 10 ms on USB)
+ * and holds a newer one back until its next update; the packet itself gets
+ * the rumble thread and the close another 30 ms. */
+#define XBOX_RUMBLE_SETTLE_MS 150
+/* A rumble that ended longer ago than this has had its stop sent by the
+ * title's own polling: no settling at the end. */
+#define XBOX_RUMBLE_RECENT_MS 600
+static uint64_t sdl_now_ms(void);
+/* When a nonzero level was last given to a pad (0: never). Under
+ * g_pads_lock. */
+static uint64_t g_last_on_ms;
 
 /* Set by the window (src/video/fb_present_sdl.c) when the process main thread
  * runs the SDL event loop. Its SDL_PumpEvents already updates the
@@ -238,6 +252,16 @@ static void pad_open_index(int i)
     if (!g_open[free_k].c)
         return;
     pad_describe(g_open[free_k].c, d, sizeof d);
+#if defined(__APPLE__) && SDL_VERSION_ATLEAST(2, 24, 0)
+    {
+        /* Which of SDL's macOS drivers has the pad decides how its rumble
+         * ends (sdl_shutdown): HIDAPI has a device path, Apple's
+         * GameController framework (SDL_mfijoystick.m) has none. */
+        const char *pa = SDL_GameControllerPath(g_open[free_k].c);
+        size_t l = strlen(d);
+        snprintf(d + l, sizeof d - l, " [%s]", pa && *pa ? "HIDAPI" : "GameController framework");
+    }
+#endif
     XR_NOTICE( "[INPUT] controller %s opened; it gets a port at its first input\n", d);
 }
 
@@ -446,6 +470,8 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
         }
     }
 #endif
+    if (v->wLeftMotorSpeed || v->wRightMotorSpeed)
+        g_last_on_ms = sdl_now_ms();
     SDL_GameControllerRumble(c, v->wLeftMotorSpeed, v->wRightMotorSpeed,
                              (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? XBOX_RUMBLE_EFFECT_MS : 0);
     pthread_mutex_unlock(&g_pads_lock);
@@ -458,12 +484,24 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
  * of their own, and a stop still in that queue when the process ends is
  * never written: the pad then plays the last level for ever. The wait lets
  * the queue drain, and closing a pad waits for its pending rumble as well
- * (HIDAPI_JoystickClose). Nothing opens or reads a pad after this: the
- * title's threads run on until the process is gone. */
+ * (HIDAPI_JoystickClose).
+ *
+ * That is not all of it. SDL's Xbox One driver (a Series pad over Bluetooth
+ * on macOS) sends a rumble packet only when its previous one is 50 ms old
+ * (10 ms on USB); a rumble asked for earlier is kept as "pending" and goes
+ * out from the driver's next update, which is SDL_JoystickUpdate. At the end
+ * of the run nobody updated SDL any more: a stop asked for within 50 ms of
+ * the last level change stayed pending, the pad was closed, and the pad
+ * (its packet says "loop 235 times") played the last level on its own for
+ * minutes. So a pad that played a rumble a moment ago is given SDL's updates
+ * here until the stop is out.
+ *
+ * Nothing opens or reads a pad after this: the title's threads run on until
+ * the process is gone. */
 static void sdl_shutdown(void)
 {
     SDL_GameController *all[PAD_OPEN_MAX + XBOX_MAX_CONTROLLERS];
-    int n = 0;
+    int n = 0, recent = 0;
 
     pthread_mutex_lock(&g_pads_lock);
     g_pads_closed = 1;
@@ -485,7 +523,17 @@ static void sdl_shutdown(void)
             SDL_GameControllerRumble(all[i], 0, 0, 0);
             SDL_GameControllerRumbleTriggers(all[i], 0, 0, 0);
         }
-        SDL_Delay(XBOX_RUMBLE_FLUSH_MS);
+        recent = g_last_on_ms && sdl_now_ms() - g_last_on_ms < XBOX_RUMBLE_RECENT_MS;
+        if (recent) {
+            /* The drivers send what they held back; the zero stays zero
+             * (asking again changes nothing in SDL). */
+            for (int t = 0; t < XBOX_RUMBLE_SETTLE_MS; t += 5) {
+                SDL_GameControllerUpdate();
+                SDL_Delay(5);
+            }
+        } else {
+            SDL_Delay(XBOX_RUMBLE_FLUSH_MS);
+        }
         for (int i = 0; i < n; i++)
             SDL_GameControllerClose(all[i]);
     }
