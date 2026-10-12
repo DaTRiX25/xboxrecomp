@@ -373,6 +373,10 @@ static void sb_texts()
     }
 }
 
+/* The most rows a page has (the Audio page, with the music folder's lines
+ * above its settings). */
+#define OVERLAY_ROWS 28
+
 struct Row {
     RowKind kind;
     xs_id id;                         /* R_SETTING */
@@ -455,6 +459,24 @@ static int page_rows(int page, Row *r)
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_AUDIO:
+        /* The player's own music first: it is what this page is opened for
+         * most (BO-108). Its status line and notes follow it. */
+        if (s_mf) {
+            r[n++] = Row{ R_FOLDER, XS_COUNT, 0, "Custom music folder" };
+            s_mf_status[0] = 0;
+            if (s_mf->status)
+                s_mf->status(s_mf_status, sizeof s_mf_status);
+            if (s_mf_status[0])
+                INFO(s_mf_status);
+            /* More lines of the port's (what a scan left out, by name), as
+             * far as the page has room. */
+            for (int k = 0; k < MUSIC_NOTES && s_mf->note && n < OVERLAY_ROWS - 12; k++) {
+                s_mf_note[k][0] = 0;
+                if (!s_mf->note(k, s_mf_note[k], sizeof s_mf_note[k]) || !s_mf_note[k][0])
+                    break;
+                INFO(s_mf_note[k]);
+            }
+        }
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
         /* The dry effect sends' level: only where no model of the title's
          * effects image runs (apu_gp.h); with one they are not dry. */
@@ -470,22 +492,6 @@ static int page_rows(int page, Row *r)
         SPK(1, "Speaker test, direct");
         if (mcpx_apu_title_channels() != 6)
             INFO("The output is stereo: each speaker is folded to left/right.");
-        if (s_mf) {
-            r[n++] = Row{ R_FOLDER, XS_COUNT, 0, "Custom music folder" };
-            s_mf_status[0] = 0;
-            if (s_mf->status)
-                s_mf->status(s_mf_status, sizeof s_mf_status);
-            if (s_mf_status[0])
-                INFO(s_mf_status);
-            /* More lines of the port's (what a scan left out, by name), as
-             * far as the page has room. */
-            for (int k = 0; k < MUSIC_NOTES && s_mf->note && n < 15; k++) {
-                s_mf_note[k][0] = 0;
-                if (!s_mf->note(k, s_mf_note[k], sizeof s_mf_note[k]) || !s_mf_note[k][0])
-                    break;
-                INFO(s_mf_note[k]);
-            }
-        }
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_INPUT:
@@ -563,7 +569,7 @@ static void test_state(const char *path)
 {
     static const char *const kinds[] = { "setting", "action", "info", "speakers", "folder" };
     static const char *const bkinds[] = { "use", "off", "up", "place", "dir" };
-    Row r[16];
+    Row r[OVERLAY_ROWS];
     int n = page_rows(s_page, r);
     FILE *f = fopen(path, "w");
     if (!f)
@@ -599,9 +605,23 @@ static void test_state(const char *path)
     fclose(f);
 }
 
+/* Tests (overlay_shot): where on the open page the row whose text starts
+ * with `prefix` is, -1 when it has none. */
+int xbox_OverlayTestRowIndex(const char *prefix)
+{
+    Row r[OVERLAY_ROWS];
+    int n = page_rows(s_page, r);
+    for (int i = 0; i < n; i++) {
+        const char *t = r[i].kind == R_SETTING ? k_meta[r[i].id].label : r[i].text;
+        if (t && !strncmp(t, prefix, strlen(prefix)))
+            return i;
+    }
+    return -1;
+}
+
 static void sb_select()
 {
-    Row r[16];
+    Row r[OVERLAY_ROWS];
     int n = page_rows(P_GRAPHICS, r);
     for (int i = 0; i < n; i++)
         if (r[i].kind == R_ACTION && r[i].action == A_SHADERS)
@@ -610,7 +630,7 @@ static void sb_select()
 
 static bool page_has(int page, xs_id id)
 {
-    Row r[16];
+    Row r[OVERLAY_ROWS];
     int n = page_rows(page, r), i;
     for (i = 0; i < n; i++)
         if (r[i].kind == R_SETTING && r[i].id == id)
@@ -2046,7 +2066,7 @@ static void build_pages(float fs)
     }
 
     /* The rows. */
-    Row rows[16];
+    Row rows[OVERLAY_ROWS];
     int n = page_rows(s_page, rows);
     int &sel = s_sel[s_page];
     if (sel < 0 || sel >= n || !selectable(rows[sel])) {
