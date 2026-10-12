@@ -97,6 +97,74 @@ static void make_root(const char *root, const char *mark)
     snprintf(rel, sizeof rel, "%s/settings.toml", root);                          put(rel, "settings");
 }
 
+/* Every entry under `dir` with its size, as one text: a listing to compare. */
+#if !defined(_WIN32)
+#include <dirent.h>
+static void listing(const char *dir, const char *rel, char *out, size_t cap)
+{
+    char path[1400], sub[700];
+    struct dirent *e;
+    DIR *d;
+    snprintf(path, sizeof path, "%s%s%s", dir, *rel ? "/" : "", rel);
+    d = opendir(path);
+    if (!d)
+        return;
+    while ((e = readdir(d)) != NULL) {
+        struct stat st;
+        char full[1700];
+        size_t at = strlen(out);
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+        snprintf(sub, sizeof sub, "%s%s%s", rel, *rel ? "/" : "", e->d_name);
+        snprintf(full, sizeof full, "%s/%s", dir, sub);
+        if (stat(full, &st) != 0)
+            continue;
+        snprintf(out + at, at < cap ? cap - at : 0, "%s %lld %ld\n", sub,
+                 S_ISDIR(st.st_mode) ? -1LL : (long long)st.st_size, (long)st.st_mtime);
+        if (S_ISDIR(st.st_mode))
+            listing(dir, sub, out, cap);
+    }
+    closedir(d);
+}
+
+/* What every start of every player runs: the import step with nothing
+ * asked for. It must change nothing: no file made, moved, rewritten or
+ * removed in a save root as a normal run leaves it, and no folder made
+ * where there is no save root yet. */
+static void test_nothing_staged(void)
+{
+    static char before[16384], after[16384];
+    char text[256] = "x";
+
+    make_root("N", "profile of N");
+    put("N/backup/20260101-000000/UDATA/" ID "/TitleMeta.xbx", "meta");
+    put("N/crash/report.txt", "r");
+    put("N/logs/run.log", "l");
+    before[0] = after[0] = 0;
+    listing(in("N"), "", before, sizeof before);
+    CHECK("a root to compare", strlen(before) > 200);
+    CHECK("nothing staged: 0", recomp_save_import_apply(in("N"), ID, text, sizeof text) == 0 && text[0] == 0);
+    CHECK("asked twice: still 0", recomp_save_import_apply(in("N"), ID, text, sizeof text) == 0);
+    listing(in("N"), "", after, sizeof after);
+    CHECK("the save root is exactly as it was (names, sizes, times)", !strcmp(before, after));
+    CHECK("no note, no result, no aside folder", !there(in("N/save-import.txt"))
+          && !there(in("N/save-import-result.txt")) && !there(in("N/save-before-import")));
+    /* No save root yet (a first start): nothing is made. */
+    CHECK("a root that is not there: 0", recomp_save_import_apply(in("not-there-yet"), ID, text, sizeof text) == 0);
+    CHECK("and it is still not there", !there(in("not-there-yet")));
+    /* The read-only questions the overlay asks make nothing either. */
+    CHECK("no export folder is made by looking", !recomp_save_export_newest(in("no-exports"), ID, text, sizeof text)
+                                                 && !there(in("no-exports")));
+    CHECK("nor by the result or staged questions", !recomp_save_import_result(in("N"), text, sizeof text)
+                                                   && !recomp_save_import_staged(in("N"), text, sizeof text));
+    after[0] = 0;
+    listing(in("N"), "", after, sizeof after);
+    CHECK("still exactly as it was", !strcmp(before, after));
+}
+#else
+static void test_nothing_staged(void) {}
+#endif
+
 int main(int argc, char **argv)
 {
     char out[1024], out2[1024], err[1400], text[2048], newest[1024], staged[1024];
@@ -112,6 +180,8 @@ int main(int argc, char **argv)
     snprintf(A, sizeof A, "%s", in("A"));
     snprintf(B, sizeof B, "%s", in("B"));
     snprintf(home, sizeof home, "%s", in("home/Takedawn-saves"));
+
+    test_nothing_staged();
 
     /* ── export ── */
     CHECK("A has a save", recomp_save_has_data(A, ID));
