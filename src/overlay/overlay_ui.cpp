@@ -19,6 +19,7 @@
 #include "overlay.h"
 #include "overlay_internal.h"
 #include "xbox_settings.h"
+#include "nv2a_texscale.h"
 #include "xbox_shader_build.h"
 #include "xbox_report.h"
 #include "nv2a_pcache.h"
@@ -147,6 +148,7 @@ static const char *const n_scale[]     = { "1x (640x480)", "1.5x (960x720)", "2x
 #endif
 static const char *const n_face[]      = { "Xbox layout", "Nintendo layout", NULL };
 static const char *const n_scheme[]    = { "Xbox layout", "PS2 layout", NULL };
+static const char *const n_ui_scale[]  = { "Off", "2x", "4x", NULL };
 static const char *const n_glyphs[]    = { "Auto (the controller in use)", "Xbox (original)", "Xbox (modern: LB RB LT RT)", "PlayStation", "Nintendo", "Steam (Deck, Steam Controller)", NULL };
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
@@ -202,6 +204,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_AUDIO_LFE_LOWPASS */  { "Subwoofer low-pass (LFE)", "120 Hz is what the console's Dolby Digital encoder did; Off sends the full-range LFE feed.", 1, FMT_PLAIN, n_lfe_lowpass, 0 },
     /* XS_DISPLAY_PRESENT_TIMING */ { "Frame presentation", "When a finished frame is handed to the display. Legacy: as soon as it is ready. Auto: every frame is aimed at one refresh of the display, so each stays on the screen for the same time, and sooner after it was drawn: on a fixed 60/120/240 Hz display the game's clock follows the display; with variable refresh (VRR, ProMotion) frames are presented at even times. The performance overlay shows the result (the on-glass line).", 1, FMT_PLAIN, n_timing, 0 },
     /* XS_ADVANCED_PERF_STEPS */ { "Graph: simulation steps", "The frame-time graph also marks the frames in which the game ran more than one simulation step (it does when its frame rate drops).", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_UI_SCALE */  { "Menu and HUD upscaling", "Redraws the game's 2D art (menu text, HUD, icons, logos) at 2 or 4 times its size with an edge-following scaler (Super-xBR), for a render scale above 1x. Off is the original. The 3D world is not touched. Changes at once. The sharper pictures are made in the background and kept on disk, so new art can show unscaled for a moment the first time; uses more texture memory.", 1, FMT_PLAIN, n_ui_scale, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -409,6 +412,7 @@ static int page_rows(int page, Row *r)
         SET(XS_GRAPHICS_RENDER_SCALE); SET(XS_GRAPHICS_ANISO);
         SET(XS_GRAPHICS_AA); SET(XS_GRAPHICS_SHARPEN);
         SET(XS_GRAPHICS_LOD_BIAS);
+        SET(XS_GRAPHICS_UI_SCALE);
 #if defined(__APPLE__)          /* only the Metal presenter has the pass so far */
         SET(XS_GRAPHICS_DITHER);
 #endif
@@ -2099,6 +2103,18 @@ static void build_pages(float fs)
                          " power (diagnosis: RECOMP_PRESENT_PACING=spin).");
             else
                 snprintf(hint, sizeof hint, "%s", k_meta[rows[sel].id].hint);
+            if (rows[sel].id == XS_GRAPHICS_UI_SCALE) {
+                /* The scaled pictures are made in the background and kept on
+                 * disk: say so while that is going on. */
+                unsigned done = 0, total = 0;
+                nv2a_texscale_progress(&done, &total);
+                if (xbox_SettingValue(XS_GRAPHICS_UI_SCALE) != 0 && done < total) {
+                    char whole[sizeof hint];
+                    snprintf(whole, sizeof whole, "Preparing sharper menus and HUD... %u of %u. %s",
+                             done, total, hint);
+                    snprintf(hint, sizeof hint, "%s", whole);
+                }
+            }
         }
     } else if (rows[sel].kind == R_SPEAKERS) {
         spk_hint(rows[sel].action, hint, sizeof hint);

@@ -59,6 +59,8 @@ static int st_lod_mode = -2, st_dither = -2;
 static float st_lod_val = -2;
 void nv2a_host_set_lod_bias(int m, float v) { st_lod_mode = m; st_lod_val = v; }
 void nv2a_host_set_dither(int on) { st_dither = on; }
+static unsigned st_ui_scale = 99;
+void nv2a_texscale_set_factor(unsigned f) { st_ui_scale = f; }
 #if !defined(_WIN32)
 /* The file writer's one-at-a-time flag (src/platform/win32_compat.c). */
 int32_t InterlockedExchange(volatile int32_t *p, int32_t v)
@@ -317,6 +319,19 @@ int main(void)
     CHECK(recomp_env(RENV_GFX_DITHER) && !strcmp(recomp_env(RENV_GFX_DITHER), "1"));
     xbox_SettingSet(XS_GRAPHICS_DITHER, 0);
     CHECK(st_dither == 0);
+    /* The 2D art's scale: off as shipped; the choice's factor, the
+     * environment's spelling. */
+    CHECK(xbox_SettingValue(XS_GRAPHICS_UI_SCALE) == 0);
+    CHECK(!strcmp(xbox_SettingGet(XS_GRAPHICS_UI_SCALE)->key, "graphics.ui_scale"));
+    xbox_SettingSet(XS_GRAPHICS_UI_SCALE, 1);
+    CHECK(st_ui_scale == 2);
+    CHECK(recomp_env(RENV_GFX_UI_SCALE) && !strcmp(recomp_env(RENV_GFX_UI_SCALE), "2x"));
+    xbox_SettingSet(XS_GRAPHICS_UI_SCALE, 2);
+    CHECK(st_ui_scale == 4);
+    CHECK(recomp_env(RENV_GFX_UI_SCALE) && !strcmp(recomp_env(RENV_GFX_UI_SCALE), "4x"));
+    xbox_SettingSet(XS_GRAPHICS_UI_SCALE, 0);
+    CHECK(st_ui_scale == 0);
+    CHECK(recomp_env(RENV_GFX_UI_SCALE) && !strcmp(recomp_env(RENV_GFX_UI_SCALE), "off"));
     xbox_SettingSet(XS_GRAPHICS_AA, 1);
     xbox_SettingSet(XS_GRAPHICS_SHARPEN, 0.4);
     CHECK(st_aa == 1 && st_sharpen > 0.39f && st_sharpen < 0.41f);
@@ -485,6 +500,21 @@ int main(void)
     }
     xbox_SettingReset(XS_INPUT_GLYPHS);
     CHECK(st_glyphs == 0);
+
+    /* graphics.ui_scale in the file: written by name. */
+    xbox_SettingSet(XS_GRAPHICS_UI_SCALE, 2);
+    xbox_SettingsFlush();
+    {
+        char err[256];
+        recomp_cfg *c = recomp_cfg_load_file(path, err, sizeof err);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(!strcmp(recomp_cfg_string(c, "graphics.ui_scale", ""), "4x"));
+            recomp_cfg_free(c);
+        }
+    }
+    xbox_SettingReset(XS_GRAPHICS_UI_SCALE);
+    CHECK(st_ui_scale == 0);
 
     remove(path);
     fprintf(stderr, "overlay_settings: %d checks, %d failed\n", s_checks, s_fail);

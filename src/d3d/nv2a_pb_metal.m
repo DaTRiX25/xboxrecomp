@@ -85,6 +85,10 @@
 #include "d3d8_msl.h"
 #include "d3d8_swizzle.h"
 #include "nv2a_texrep.h"
+#include "nv2a_texscale.h"
+#include "kernel_pause.h"
+static void scale_prepare_loaded(void);
+static int ui_scale_log(void);
 #include "nv2a_pcache.h"
 #include "latency_trace.h"
 #include "host_time.h"
@@ -683,6 +687,9 @@ static int init(void)
                 wb_always() ? "every flip" : "on demand");
     }
     s_failed = 0;
+    /* graphics.ui_scale switched on in the overlay: the loaded 2D textures
+     * are prepared while the title is held (scale_prepare_loaded). */
+    xbox_HostPauseIdleFn(scale_prepare_loaded);
     return 1;
 }
 
@@ -1601,6 +1608,14 @@ typedef struct {
     uint32_t       gen, used;
     uint64_t       hash;
     uint32_t       rep;           /* nv2a_texrep generation it was uploaded at; 0: not a replaced texture */
+    uint8_t        ui;            /* a 2D draw has bound it (nv2a_texscale.h); stays */
+    uint8_t        scale;         /* the factor it was uploaded at: 0 (as the title's), 2, 4 */
+    uint8_t        salgo;         /* and the scaler */
+    uint8_t        up_scale;      /* the factor the texture on the GPU has (0 where the scaler refused) */
+    uint8_t        use;           /* RECOMP_DEBUG=ui_scale_log: the kinds of draw seen */
+    uint8_t        pend;          /* its scaled picture is being made (nv2a_texscale_get) */
+    uint32_t       pal_len, pgen; /* P8 entries; the flip pend was last asked at */
+    uint64_t       skey;          /* nv2a_texscale_key of the texels uploaded */
     int            live;
     id<MTLTexture> tex;
 } TexEntry;
@@ -1669,7 +1684,108 @@ static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
 
 static uint32_t s_tex_rep;    /* the last tex_upload's nv2a_texrep_apply */
 
-static id<MTLTexture> tex_upload(const Stage *t)
+/* graphics.ui_scale (nv2a_texscale.h): the draw being encoded is a 2D one,
+ * and what tex_bind found for the stage it last bound: the factor its
+ * texture was uploaded at (0: the title's own size). */
+static int      s_draw_2d;
+static unsigned s_bind_scale;
+static uint32_t *s_scaled;
+static size_t    s_scaled_cap;
+
+static unsigned scale_levels(unsigned f)
+{
+    return f == 4 ? 3u : f == 2 ? 2u : 1u;
+}
+
+static uint32_t  s_swap_flip = 0xFFFFFFFFu;   /* the flip of the last swap */
+static int       s_up_pend;    /* the last tex_upload queued the scaled picture */
+static uint64_t  s_up_key;
+
+/* The disk cache of scaled textures: beside the shader cache. Once. */
+static void scale_store_init(void)
+{
+    static int done;
+    char dir[900], sub[1000];
+    if (done)
+        return;
+    done = 1;
+    if (nv2a_pcache_dir(nv2a_host_opts()->shader_cache, nv2a_pcache_app(), dir, sizeof dir)) {
+        snprintf(sub, sizeof sub, "%s/ui_scale", dir);
+        nv2a_texscale_cache_dir(sub);
+    }
+}
+
+static int scaled_room(const Stage *t, unsigned f)
+{
+    size_t n = nv2a_tex_texels(t->width * f, t->height * f, scale_levels(f));
+    if (n > s_scaled_cap) {
+        uint32_t *p = (uint32_t *)realloc(s_scaled, n * 4);
+        if (!p)
+            return 0;
+        s_scaled = p;
+        s_scaled_cap = n;
+    }
+    return 1;
+}
+
+/* s_scaled's level 0 (the texture f times as large) as a texture with the
+ * levels down to the title's size: a 2D element drawn smaller than the
+ * scaled texture is minified through them, not point-skipped. */
+static id<MTLTexture> scaled_texture(const Stage *t, unsigned f)
+{
+    uint32_t w = t->width * f, h = t->height * f, levels = scale_levels(f), l;
+    const uint32_t *src;
+    MTLTextureDescriptor *td;
+    id<MTLTexture> tex;
+
+    nv2a_texscale_mips(s_scaled, w, h, levels);
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                            width:w
+                                                           height:h
+                                                        mipmapped:YES];
+    td.mipmapLevelCount = levels;
+    td.usage = MTLTextureUsageShaderRead;
+    tex = [s_dev newTextureWithDescriptor:td];
+    if (!tex)
+        return nil;
+    for (l = 0, src = s_scaled; l < levels; l++) {
+        uint32_t lw = nv2a_tex_level_dim(w, l), lh = nv2a_tex_level_dim(h, l);
+        [tex replaceRegion:MTLRegionMake2D(0, 0, lw, lh) mipmapLevel:l withBytes:src
+               bytesPerRow:lw * 4];
+        src += (size_t)lw * lh;
+    }
+    return tex;
+}
+
+/* The scaled picture of s_texels, if the store has it ready; else it is
+ * queued (s_up_pend) and the title's own texture is uploaded meanwhile.
+ * Nothing is scaled on this thread. */
+static id<MTLTexture> tex_upload_scaled(const Stage *t, unsigned f, int algo)
+{
+    uint64_t t0 = ui_scale_log() ? xbox_HostNowNs() : 0;
+    int r;
+
+    s_up_pend = 0;
+    if (!nv2a_texscale_has_alpha(s_texels, (size_t)t->width * t->height)
+            || !scaled_room(t, f))
+        return nil;
+    scale_store_init();
+    s_up_key = nv2a_texscale_key(s_texels, t->width, t->height);
+    r = nv2a_texscale_get(s_up_key, s_texels, t->width, t->height, f,
+                          (enum nv2a_texscale_algo)algo, 0, s_scaled);
+    if (ui_scale_log())
+        fprintf(stderr, "[UISCALE] ask %016llx %ux%u x%u: %s, %.3f ms on the render thread,"
+                " flip %llu\n", (unsigned long long)s_up_key, t->width, t->height, f,
+                r == NV2A_TEXSCALE_READY ? "ready" : r == NV2A_TEXSCALE_PENDING ? "queued"
+                                                                               : "not taken",
+                (double)(xbox_HostNowNs() - t0) / 1e6, (unsigned long long)s_presents);
+    if (r == NV2A_TEXSCALE_READY)
+        return scaled_texture(t, f);
+    s_up_pend = r == NV2A_TEXSCALE_PENDING;
+    return nil;
+}
+
+static id<MTLTexture> tex_upload(const Stage *t, unsigned scale, int algo)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
@@ -1699,6 +1815,16 @@ static id<MTLTexture> tex_upload(const Stage *t)
         for (i = 0; i < n; i++)
             s_texels[i] ^= x;
     }
+    s_bind_scale = 0;
+    s_up_pend = 0;
+    if (scale) {
+        tex = tex_upload_scaled(t, scale, algo);
+        if (tex) {
+            s_bind_scale = scale;
+            s_tex_uploads++;
+            return tex;
+        }
+    }
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                             width:t->width
                                                            height:t->height
@@ -1719,13 +1845,113 @@ static id<MTLTexture> tex_upload(const Stage *t)
     return tex;
 }
 
+/* graphics.ui_scale switched on (or changed) in the overlay: while the title
+ * is held for the pause, every loaded texture the rule could scale is decoded
+ * and queued, to be made and written to the disk cache in the background
+ * (nothing is uploaded here; a texture's own bind takes its picture from the
+ * cache later). "Could scale": one level, swizzled or DXT, some transparency;
+ * whether a 2D draw uses it is not known for a texture bound before the
+ * setting was on, so some that never will be are made too. The executor's
+ * thread (xbox_HostPauseIdleFn), which is the thread of every other use of
+ * the cache. */
+static void scale_prepare_loaded(void)
+{
+    static uint32_t done_gen;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    unsigned f = nv2a_texscale_factor(), queued = 0;
+    int algo = (int)nv2a_texscale_algo(), i;
+
+    if (done_gen == nv2a_texscale_generation())
+        return;
+    done_gen = nv2a_texscale_generation();
+    if (!f)
+        return;
+    scale_store_init();
+    if (!nv2a_texscale_cache_path(NULL, 0))
+        return;
+    for (i = 0; i < TEX_CACHE; i++) {
+        TexEntry *e = &s_tc[i];
+        Stage st;
+        const uint32_t *pal = NULL;
+        uint32_t bytes;
+        size_t n;
+
+        if (!e->live || e->sign || e->up_scale == f || e->pend
+                || !nv2a_texscale_tex_ok(nv2a_tex_size_from_format(e->color), e->width,
+                                         e->height, e->levels))
+            continue;
+        memset(&st, 0, sizeof st);
+        st.offset = e->offset;
+        st.color = e->color;
+        st.width = e->width;
+        st.height = e->height;
+        st.pitch = e->pitch;
+        st.palette = e->palette;
+        st.pal_len = e->pal_len;
+        st.levels = e->levels;
+        bytes = nv2a_tex_extent(st.color, st.width, st.height, st.pitch, st.levels);
+        /* Only what is still the texture that was uploaded. */
+        if (!bytes || tex_hash_pal(mem, &st, bytes) != e->hash)
+            continue;
+        n = nv2a_tex_texels(st.width, st.height, st.levels);
+        if (n > s_texels_cap) {
+            uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
+            if (!p)
+                return;
+            s_texels = p;
+            s_texels_cap = n;
+        }
+        if (st.color == NV2A_TEX_P8)
+            pal = (const uint32_t *)(mem + st.palette);
+        nv2a_tex_decode(mem + st.offset, st.color, st.width, st.height, st.pitch, st.levels,
+                        pal, pal ? st.pal_len : 0, s_texels);
+        (void)nv2a_texrep_apply(mem + st.offset, st.color, st.width, st.height, st.pitch,
+                                st.levels, s_texels);
+        if (!nv2a_texscale_has_alpha(s_texels, (size_t)st.width * st.height))
+            continue;
+        if (nv2a_texscale_get(nv2a_texscale_key(s_texels, st.width, st.height), s_texels,
+                              st.width, st.height, f, (enum nv2a_texscale_algo)algo,
+                              NV2A_TEXSCALE_DISK_ONLY, NULL) == NV2A_TEXSCALE_PENDING)
+            queued++;
+    }
+    fprintf(stderr, "[UISCALE] setting changed to %ux: %u loaded textures queued for the"
+            " cache\n", f, queued);
+}
+
+/* RECOMP_DEBUG=ui_scale_log: one line whenever a texture is seen in a kind
+ * of draw it was not seen in before (bit 0: a 2D draw, bit 1: another), with
+ * the hash texrep_dump names its file by. For checking the rule. */
+static int ui_scale_log(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_UI_SCALE_LOG) != NULL;
+    return on;
+}
+
+static void ui_scale_use(TexEntry *e, const Stage *t, const uint8_t *mem)
+{
+    uint8_t bit = s_draw_2d ? 1 : 2;
+    if (e->use & bit)
+        return;
+    e->use |= bit;
+    fprintf(stderr, "[UISCALE] tex %016llx fmt 0x%02x %ux%u levels %u use %u scale %u flip %llu\n",
+            (unsigned long long)nv2a_texrep_hash(mem + t->offset, t->color, t->width,
+                                                 t->height, t->pitch),
+            t->color, t->width, t->height, t->levels, e->use, e->up_scale,
+            (unsigned long long)s_presents);
+}
+
 static id<MTLTexture> tex_bind(const Stage *t)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bytes = 0, i;
     TexEntry *e = NULL, *victim = &s_tc[0];
+    unsigned want;
+    int algo;
 
+    s_bind_scale = 0;
     if (t->valid && (uint64_t)t->width * t->height <= TEX_MAX_TEXELS)
         bytes = nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
     /* The guest bytes are about to be hashed and decoded: a render target
@@ -1776,9 +2002,21 @@ static id<MTLTexture> tex_bind(const Stage *t)
         if (!c->live || (victim->live && c->used < victim->used))
             victim = c;
     }
+    /* graphics.ui_scale: a texture a 2D draw binds is scaled, from then on
+     * and for every draw (off: want is 0 and nothing here differs). */
+    want = nv2a_texscale_factor();
+    algo = (int)nv2a_texscale_algo();
+    if (want && !((s_draw_2d || (e && e->ui)) && !stage_signed(t)
+                  && nv2a_texscale_tex_ok(nv2a_tex_size_from_format(t->color), t->width,
+                                          t->height, t->levels)))
+        want = 0;
     if (e) {
-        /* A replaced texture whose variant changed is uploaded again. */
-        int stale = e->rep && e->rep != nv2a_texrep_generation();
+        /* A replaced texture whose variant changed is uploaded again; so is
+         * one whose scale is not the one wanted now. */
+        int stale = (e->rep && e->rep != nv2a_texrep_generation())
+                 || e->scale != want || (want && e->salgo != algo);
+        if (s_draw_2d)
+            e->ui = 1;
         if (e->gen != g->flips || stale) {
             uint64_t tp = prof_t(), h = tex_hash_pal(mem, t, bytes);
             prof_add(&s_pa.texh, tp);
@@ -1789,7 +2027,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
             if (h != e->hash || stale) {
                 id<MTLTexture> nt;
                 tp = prof_t();
-                nt = tex_upload(t);
+                nt = tex_upload(t, want, algo);
                 prof_add(&s_pa.texup, tp);
                 s_pa.texup_n++;
                 e->hash = h;
@@ -1799,6 +2037,15 @@ static id<MTLTexture> tex_bind(const Stage *t)
                     return s_black;
                 [e->tex release];
                 e->tex = nt;
+                /* The factor wanted, also when the scaler refused: it is
+                 * not asked again until the bytes or the setting change. */
+                e->scale = (uint8_t)want;
+                e->salgo = (uint8_t)algo;
+                e->up_scale = (uint8_t)s_bind_scale;
+                e->pend = (uint8_t)s_up_pend;
+                e->skey = s_up_key;
+                e->pgen = g->flips;
+                e->pal_len = t->pal_len;
             }
         }
     } else {
@@ -1809,12 +2056,21 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->live = 0;
         {
             uint64_t tp = prof_t();
-            nt = tex_upload(t);
+            nt = tex_upload(t, want, algo);
             prof_add(&s_pa.texup, tp);
             s_pa.texup_n++;
         }
         if (!nt)
             return s_black;
+        e->ui = (uint8_t)(s_draw_2d != 0);
+        e->scale = (uint8_t)want;
+        e->salgo = (uint8_t)algo;
+        e->up_scale = (uint8_t)s_bind_scale;
+        e->pend = (uint8_t)s_up_pend;
+        e->skey = s_up_key;
+        e->pgen = g->flips;
+        e->pal_len = t->pal_len;
+        e->use = 0;
         e->offset = t->offset;
         e->color = t->color;
         e->width = t->width;
@@ -1829,7 +2085,42 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->tex = nt;
         e->live = 1;
     }
+    /* Its scaled picture was being made: asked for once a flip, swapped in
+     * when it is there, one texture a flip. A new MTLTexture, so a draw encoded with the unscaled
+     * one keeps it. */
+    if (e->pend && e->pgen != g->flips && s_swap_flip != g->flips) {
+        e->pgen = g->flips;
+        if (!scaled_room(t, e->scale)) {
+            e->pend = 0;
+        } else {
+            uint64_t t0 = ui_scale_log() ? xbox_HostNowNs() : 0;
+            int r = nv2a_texscale_get(e->skey, NULL, t->width, t->height, e->scale,
+                                      (enum nv2a_texscale_algo)e->salgo, 0, s_scaled);
+            if (r == NV2A_TEXSCALE_READY) {
+                id<MTLTexture> nt = scaled_texture(t, e->scale);
+                s_swap_flip = g->flips;   /* one a flip: its upload is the cost */
+                e->pend = 0;
+                if (nt) {
+                    [e->tex release];
+                    e->tex = nt;
+                    e->up_scale = e->scale;
+                    s_tex_uploads++;
+                }
+            } else if (r != NV2A_TEXSCALE_PENDING) {
+                e->pend = 0;         /* refused or lost: stays as the title's */
+            }
+            if (ui_scale_log() && r != NV2A_TEXSCALE_PENDING)
+                fprintf(stderr, "[UISCALE] swap %016llx %ux%u x%u: %s, %.3f ms on the render"
+                        " thread, flip %llu\n", (unsigned long long)e->skey, t->width,
+                        t->height, (unsigned)e->scale,
+                        r == NV2A_TEXSCALE_READY ? "scaled texture in" : "no result",
+                        (double)(xbox_HostNowNs() - t0) / 1e6, (unsigned long long)s_presents);
+        }
+    }
     e->used = ++s_tc_clock;
+    s_bind_scale = e->up_scale;
+    if (ui_scale_log())
+        ui_scale_use(e, t, mem);
     return e->tex;
 }
 
@@ -1853,7 +2144,7 @@ static MTLSamplerAddressMode address_mode(uint32_t m)
 static struct { uint64_t key; id<MTLSamplerState> s; } s_smp[SMP_MAX];
 static int s_smp_n;
 
-static id<MTLSamplerState> sampler(const Stage *t)
+static id<MTLSamplerState> sampler(const Stage *t, unsigned scale)
 {
     static int point = -1;
     MTLSamplerDescriptor *sd;
@@ -1867,13 +2158,19 @@ static id<MTLSamplerState> sampler(const Stage *t)
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
+    /* A scaled 2D texture (one level in the title) has the levels down to
+     * the title's size: blended between, so its look does not step with the
+     * size it is drawn at. */
+    if (scale)
+        mip = 2;
     /* Anisotropy only on a mipmapped sampler with a linear minification
      * filter, as asked (RECOMP_GFX_ANISO). */
-    aniso = (mip && mn) ? nv2a_host_aniso() : 1;
+    aniso = (mip && mn && !scale) ? nv2a_host_aniso() : 1;
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9 | (uint64_t)mip << 10;
     if (mip)
         key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
     key |= (uint64_t)aniso << 33;       /* the level is part of the sampler */
+    key |= (uint64_t)scale << 40;
     for (i = 0; i < s_smp_n; i++)
         if (s_smp[i].key == key)
             return s_smp[i].s;
@@ -1886,8 +2183,8 @@ static id<MTLSamplerState> sampler(const Stage *t)
     sd.sAddressMode = address_mode(u);
     sd.tAddressMode = address_mode(v);
     sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
-    sd.lodMinClamp = mip ? (float)t->lod_min : 0.0f;
-    sd.lodMaxClamp = mip ? (float)t->lod_max : 0.0f;
+    sd.lodMinClamp = scale ? 0.0f : mip ? (float)t->lod_min : 0.0f;
+    sd.lodMaxClamp = scale ? (float)(scale_levels(scale) - 1u) : mip ? (float)t->lod_max : 0.0f;
     st = [s_dev newSamplerStateWithDescriptor:sd];
     [sd release];
     if (!st)
@@ -3026,6 +3323,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
     id<MTLTexture> stex[4];
+    unsigned sscale[4] = { 0, 0, 0, 0 };
 
     if (!init())
         return;
@@ -3166,6 +3464,14 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         /* Textures before the pass: a self copy is a blit between passes. */
         {
             int textured = 0;
+            s_draw_2d = 0;
+            if (nv2a_texscale_factor() || ui_scale_log()) {
+                const struct nv2a_pb_present *pr = nv2a_pb_present_state();
+                struct nv2a_texscale_draw td2 = { d->program, v->depth_enable,
+                                                  v->depth_enable && v->depth_mask,
+                                                  rt->w, rt->h, pr->w, pr->h };
+                s_draw_2d = nv2a_texscale_draw_is_2d(&td2);
+            }
             for (k = 0; k < 4; k++) {
                 const Stage *t = &s_stage[k];
                 RenderTarget *src;
@@ -3186,6 +3492,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     s_rtt_binds++;
                 } else {
                     stex[k] = tex_bind(t);
+                    sscale[k] = s_bind_scale;
                 }
             }
             if (textured)
@@ -3249,7 +3556,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         [s_enc setFragmentBytes:&mpc length:sizeof mpc atIndex:0];
         for (k = 0; k < 4; k++) {
             [s_enc setFragmentTexture:stex[k] atIndex:k];
-            [s_enc setFragmentSamplerState:sampler(&s_stage[k]) atIndex:k];
+            [s_enc setFragmentSamplerState:sampler(&s_stage[k], sscale[k]) atIndex:k];
         }
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
