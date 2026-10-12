@@ -109,6 +109,7 @@ int main(void)
         "[audio]\n"
         "volume = 0.5\n"               /* the environment sets it too */
         "mute = true\n"
+        "custom_music_dir = \"/music/My \\\"Best\\\" Of\"\n"   /* a text setting */
         "[input]\n"
         "deadzone = 3277\n"
         "rumble = 1.8\n"               /* an older slider's value, between two steps */
@@ -121,6 +122,7 @@ int main(void)
     set_env("RECOMP_SETTINGS", path);
     set_env("RECOMP_AUDIO_VOLUME", "0.25");          /* the user's own */
     set_env("RECOMP_AUDIO_MUTE", NULL);
+    set_env("RECOMP_AUDIO_MUSIC_DIR", NULL);
     set_env("RECOMP_PRESENT_OVERSCAN", NULL);
     set_env("RECOMP_PRESENT_PACING", NULL);
     set_env("RECOMP_PRESENT_SPIN_LEAD", NULL);
@@ -133,6 +135,15 @@ int main(void)
 
     xbox_SettingsInit("Test");
     CHECK(!strcmp(xbox_SettingsPath(), path));
+    /* A text setting: into its variable, readable, not "unknown". */
+    CHECK(getenv("RECOMP_AUDIO_MUSIC_DIR")
+          && !strcmp(getenv("RECOMP_AUDIO_MUSIC_DIR"), "/music/My \"Best\" Of"));
+    {
+        int locked = 1;
+        CHECK(!strcmp(xbox_SettingsText("audio.custom_music_dir", &locked), "/music/My \"Best\" Of"));
+        CHECK(!locked);
+        CHECK(!strcmp(xbox_SettingsText("no.such_key", NULL), ""));
+    }
     /* The file reached the environment, the real environment did not move. */
     CHECK(getenv("RECOMP_PRESENT_OVERSCAN") && !strcmp(getenv("RECOMP_PRESENT_OVERSCAN"), "crop"));
     CHECK(getenv("RECOMP_AUDIO_MUTE") && !strcmp(getenv("RECOMP_AUDIO_MUTE"), "1"));
@@ -341,6 +352,13 @@ int main(void)
             }
         }
         CHECK(strstr(text, "mystery.key = 7"));                  /* kept */
+        {
+            /* The text setting: in its section, once, escaped; the strict
+             * reader above took the file, so no table is opened twice. */
+            const char *m = strstr(text, "custom_music_dir = \"/music/My \\\"Best\\\" Of\"");
+            CHECK(m && a && m > a);
+            CHECK(!strstr(text, "audio.custom_music_dir"));
+        }
         CHECK(strstr(text, "mode = \"performance\""));
         CHECK(strstr(text, "deadzone = 6554"));
         CHECK(strstr(text, "overscan = \"off\""));
