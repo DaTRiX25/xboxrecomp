@@ -682,6 +682,67 @@ void xbox_HostPause(int on);
 int  xbox_HostPaused(void);
 void fbv_android_surface_gone(void);
 
+#include <jni.h>
+#include <SDL_system.h>
+/* The warning that no usable Vulkan driver was found, with the way back on
+ * it (BO-121): without the Vulkan window there is no settings overlay, so a
+ * player who chose a driver that cannot run the game could not choose
+ * another from inside it. The port's activity says whether there is a
+ * driver to go back to and does the going (int resetGraphicsDriver(int):
+ * 0 asks, 1 chooses the driver in the app and starts the app again); an
+ * activity without that method gets the plain warning. Returns 1 when the
+ * window with the choice was shown. */
+static int android_offer_driver_reset(const char *msg)
+{
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    jobject act = env ? (jobject)SDL_AndroidGetActivity() : NULL;
+    jclass cls;
+    jmethodID m;
+    int shown = 0;
+
+    if (!act)
+        return 0;
+    cls = (*env)->GetObjectClass(env, act);
+    m = (*env)->GetMethodID(env, cls, "resetGraphicsDriver", "(I)I");
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        m = NULL;
+    }
+    if (m && (*env)->CallIntMethod(env, act, m, (jint)0) == 1) {
+        static const SDL_MessageBoxButtonData b[2] = {
+            { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Reset back to Turnip" },
+            { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Continue on the CPU" },
+        };
+        char text[900];
+        SDL_MessageBoxData d;
+        int hit = 0;
+
+        snprintf(text, sizeof text, "%s\n\nThe settings menu (Select+Start) is not available"
+                 " on this driver either. \"Reset back to Turnip\" chooses the Mesa Turnip"
+                 " driver that comes in the app and starts the game again.", msg);
+        memset(&d, 0, sizeof d);
+        d.flags = SDL_MESSAGEBOX_WARNING;
+        d.title = "Graphics driver";
+        d.message = text;
+        d.numbuttons = 2;
+        d.buttons = b;
+        shown = SDL_ShowMessageBox(&d, &hit) == 0;
+        if (shown && hit == 1) {
+            fprintf(stderr, "[PRESENT] the warning's \"Reset back to Turnip\": the app starts"
+                    " again on the driver in the app\n");
+            (*env)->CallIntMethod(env, act, m, (jint)1);
+            if ((*env)->ExceptionCheck(env))
+                (*env)->ExceptionClear(env);
+            /* The activity ends this process in a moment; nothing more is
+             * started here meanwhile. */
+            SDL_Delay(5000);
+        }
+    }
+    (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, act);
+    return shown;
+}
+
 static int android_lifecycle(void *user, SDL_Event *ev)
 {
     (void)user;
@@ -837,6 +898,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 }
                 fprintf(stderr, "[PRESENT] window up: Vulkan swapchain unavailable (%s);"
                         " SDL renderer, readback present\n", why);
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+                /* Said, not left to be found out: the overlay is drawn by
+                 * the Vulkan (or Metal) presenter and by nothing else. */
+                fprintf(stderr, "[OVERLAY] not available in this start: the window is not"
+                        " presented through Vulkan, and the settings overlay is drawn there"
+                        " only (Back+Start does nothing)\n");
+#endif
 #if defined(__ANDROID__)
                 /* A phone has no terminal to read that on, and what follows
                  * is the CPU rasteriser at a few frames a second: say so on
@@ -849,8 +917,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                              "On an Adreno GPU a Mesa Turnip driver is needed; the "
                              "log in the app's folder says which driver was "
                              "tried.", why);
-                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING,
-                                             "Graphics driver", msg, NULL);
+                    if (!android_offer_driver_reset(msg))
+                        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING,
+                                                 "Graphics driver", msg, NULL);
                 }
 #endif
             }
@@ -878,6 +947,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     SDL_DestroyWindow(win);
                 fprintf(stderr, "[PRESENT] window up: CAMetalLayer unavailable (%s);"
                         " SDL renderer, readback present\n", why);
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+                /* Said, not left to be found out: the overlay is drawn by
+                 * the Vulkan (or Metal) presenter and by nothing else. */
+                fprintf(stderr, "[OVERLAY] not available in this start: the window is not"
+                        " presented through Vulkan, and the settings overlay is drawn there"
+                        " only (Back+Start does nothing)\n");
+#endif
             }
         }
 #endif
