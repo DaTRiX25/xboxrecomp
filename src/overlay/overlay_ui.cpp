@@ -188,6 +188,8 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_GRAPHICS_BLOOM */     { "Bloom", "The game's own soft glow over the picture, strongest while boosting. On is the original look; off skips its three extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "The game's own blur: the streaks towards the edges of the picture at speed and while boosting. On is the original look; off skips its two extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_CRASH_60FPS */ { "60 fps crash cameras", "The game halves its frame rate to 30 in its crash and takedown cameras. On: they run at 60 like the rest of the race, at the same game speed. Off is the original. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_SPLIT_60FPS */ { "60 fps split screen", "The game runs two-player split screen at 30 frames a second. On: it runs at 60, at the same game speed; the scene is drawn twice a frame, so it needs a fast enough device. Off is the original. A change shows from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_AUDIO_SPLIT_MUSIC */  { "Music in split screen", "The game plays no music in two-player split screen. On: EA GAMES TRAX or your custom music plays in two-player Race and Road Rage as in a one-player race. Off is the original. A change shows from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto: -0.5 at 2x, -1.0 at 4x. Off is the original. Changes at once.", 1, FMT_PLAIN, n_lod, 0 },
     /* XS_GRAPHICS_DITHER */    { "Dither", "A faint noise in the final scale to the window that hides the stripes in smooth gradients such as the sky. Metal only for now. Off is the original; text and HUD at the exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_VEHICLE_DETAIL */ { "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Original is the console's distances; Far doubles them, Farthest is four times. Costs GPU time when many vehicles are on screen. Scenery, the track and where traffic appears are not changed. Changes at once.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
@@ -399,6 +401,8 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_MOTION_BLUR);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->key))
             SET(XS_GRAPHICS_CRASH_60FPS);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SPLIT_60FPS)->key))
+            SET(XS_GRAPHICS_SPLIT_60FPS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))
             SET(XS_GRAPHICS_VEHICLE_DETAIL);
 #if defined(__ANDROID__)
@@ -434,6 +438,8 @@ static int page_rows(int page, Row *r)
         SET(XS_AUDIO_FX_LEVEL);
         if (apu_bus_count() > 0)
             ACT(A_MIXER, "Mixer: buses, sends, LFE, limiter, meters");
+        if (recomp_patch_enabled(xbox_SettingGet(XS_AUDIO_SPLIT_MUSIC)->key))
+            SET(XS_AUDIO_SPLIT_MUSIC);
         SPK(0, "Speaker test, game mix");
         SPK(1, "Speaker test, direct");
         if (mcpx_apu_title_channels() != 6)

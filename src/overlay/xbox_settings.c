@@ -109,6 +109,10 @@ static xs_setting s_set[XS_COUNT] = {
     /* The title's crash and takedown cameras at 60 instead of its own 30: the
      * patch is the "1". */
     [XS_GRAPHICS_CRASH_60FPS] = SETTING("graphics.crash_60fps", XS_BOOL, 0, RENV_GFX_CRASH_60FPS, NULL, NULL, 0, 0, 0),
+    /* Split screen at 60 instead of the title's 30, and with the title's
+     * music, which it keeps silent there: the patch is the "1" of each. */
+    [XS_GRAPHICS_SPLIT_60FPS] = SETTING("graphics.split_60fps", XS_BOOL, 0, RENV_GFX_SPLIT_60FPS, NULL, NULL, 0, 0, 0),
+    [XS_AUDIO_SPLIT_MUSIC]  = SETTING("audio.split_music", XS_BOOL, 0, RENV_AUDIO_SPLIT_MUSIC, NULL, NULL, 0, 0, 0),
     /* Both off as shipped: today's picture, bit for bit. */
     [XS_GRAPHICS_LOD_BIAS]  = SETTING("graphics.lod_bias", XS_CHOICE, 0, RENV_GFX_LOD_BIAS, k_lod, k_lod_env, 0, 0, 0),
     [XS_GRAPHICS_DITHER]    = SETTING("graphics.dither", XS_BOOL, 0, RENV_GFX_DITHER, NULL, NULL, 0, 0, 0),
