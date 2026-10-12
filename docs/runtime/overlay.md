@@ -99,9 +99,10 @@ textures, no hashes):
   target, not a cube map, not a signed (bump) texture;
 - a swizzled or DXT format (a linear one is a video frame or a copy of the
   screen), one mip level, at most 512x512 texels;
-- at least one texel in sixteen is not opaque (art cut out with alpha). An
-  opaque picture is left alone, and so is a photograph stored with an alpha
-  channel whose stray texels sit just under opaque.
+- opaque or not: photographs drawn in 2D (the World Tour's, the loading
+  pictures, the static between screens) are scaled with the rest. Only the
+  switch-on pass below, which cannot see how a texture is drawn, keeps to
+  art cut out with alpha (one texel in sixteen not opaque).
 
 The scaled texture gets the mip levels down to the title's size (2 levels at
 2x, 3 at 4x) and a trilinear sampler over them, so an element drawn smaller

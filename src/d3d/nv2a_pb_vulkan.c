@@ -2288,8 +2288,10 @@ static int tex_upload_scaled(const Stage *t, unsigned f, int algo, struct nvk_im
     int r;
 
     s_up_pend = 0;
-    if (!nv2a_texscale_has_alpha(s_texels, (size_t)t->width * t->height)
-            || !scaled_room(t, f))
+    /* Every texture a 2D draw binds, opaque pictures too (the World Tour's
+     * photographs, the loading pictures): the owner wants the whole 2D front
+     * end scaled. Transparency only steers the switch-on pass below. */
+    if (!scaled_room(t, f))
         return 0;
     scale_store_init();
     s_up_key = nv2a_texscale_key(s_texels, t->width, t->height);
@@ -2457,6 +2459,8 @@ static void scale_prepare_loaded(void)
                         pal, pal ? st.pal_len : 0, s_texels);
         (void)nv2a_texrep_apply(mem + st.offset, st.color, st.width, st.height, st.pitch,
                                 st.levels, s_texels);
+        /* Not known to be 2D here: art cut out with alpha is the likely kind;
+         * an opaque picture waits for its own 2D bind. */
         if (!nv2a_texscale_has_alpha(s_texels, (size_t)st.width * st.height))
             continue;
         if (nv2a_texscale_get(nv2a_texscale_key(s_texels, st.width, st.height), s_texels,
