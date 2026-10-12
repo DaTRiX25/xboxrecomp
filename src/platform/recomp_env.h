@@ -296,6 +296,7 @@ extern "C" {
     X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \
     X(WINDOW_SHOT,       DEBUG, "window_shot",     "RECOMP_WINDOW_SHOT",       "=flips: SDL window shots") \
     X(WINDOW_SHOT_PREFIX, DEBUG, "window_shot_prefix", "RECOMP_WINDOW_SHOT_PREFIX", "=prefix: window shot files") \
+    X(AUTOPILOT,         DEBUG, "autopilot",       NULL,                       "=1: the title's own AI drives player 1's car while it races (a game's test driver; Burnout 3: src/game/autopilot.c)") \
     X(BUG_REPORT,        DEBUG, "bug_report",      NULL,                       "=seconds[:shot]: write a bug report archive that long after the start (xbox_report.h), :shot with the last frame; =@file: whenever that file appears; no window needed") \
     X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=prefix: textures, first use") \
     X(TEX_DUMP_EVERY,    DEBUG, "tex_dump_every",  "RECOMP_TEX_DUMP_EVERY",    "=n: tex_dump every nth bind too") \
