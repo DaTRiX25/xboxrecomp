@@ -40,8 +40,9 @@ LGPL-2.1-or-later — extracted from xemu
 
   src/apu/apu_state.h also holds the HRTF filter of xemu's
   hw/xbox/mcpx/apu/vp/hrtf.h ((c) 2025 Matt Borgerson, the same licence), and
-  two pieces that are NOT under this licence: see "BSD-3-Clause" and
-  "GPL-2.0" below.
+  pieces that are NOT under this licence: the ADPCM decoder (see
+  "BSD-3-Clause" below) and the declaration of the DSP core's state (see
+  "GPL-2.0-or-later" below).
 
   The upstream files say "version 2 of the License, or (at your option) any
   later version" of the GNU Lesser General Public License; that wording is
@@ -81,32 +82,48 @@ BSD-3-Clause — ADPCM decoder from ADPCM-XQ (through xemu)
   reproduced with binaries, is LICENSES/ADPCM-XQ-BSD-3-Clause.txt.
 
 
-GPL-2.0 — state variable filter (through xemu)  *** UNRESOLVED ***
------------------------------------------------------------------
+The voice low-pass — this project's own (replaced xemu's GPL-2.0 filter)
+------------------------------------------------------------------------
 
-  src/apu/apu_state.h, the sv_filter struct with setup_svf() and run_svf():
-  taken from xemu's hw/xbox/mcpx/apu/vp/svf.h, whose header reads, in full:
+  src/apu/apu_lowpass.h is xboxrecomp's own file, MIT like the rest.
 
-      Adapted from SWH LADSPA Plugins package, modified for xemu
-      Source:  https://github.com/swh/ladspa/blob/master/svf_1214.xml
-      Author:  Steve Harris, andy@vellocet
-      License: GPLv2
+  Until it was written, src/apu/apu_state.h held the state variable filter of
+  xemu's hw/xbox/mcpx/apu/vp/svf.h (sv_filter, setup_svf(), run_svf()), which
+  that file's header gives as "Adapted from SWH LADSPA Plugins package,
+  modified for xemu ... Author: Steve Harris, andy@vellocet. License: GPLv2".
+  GPL-2.0 code cannot be linked into a program that is distributed with code
+  that cannot be published as source, so it was removed: no line of it is in
+  this repository from this commit on (the history before it still has it).
 
-  It is used: src/apu/apu_vp.c runs every voice that has its filter enabled
-  through run_svf(), so the code is in every program built on the APU.
-  apu_state.h's own header says LGPL; for these lines that is wrong. GPL-2.0
-  code linked into a program puts the whole program under the GPL's terms
-  when it is distributed, which the MIT and LGPL parts allow but which a
-  program that also contains code that cannot be published as source (a
-  recompiled game) cannot meet. This has to be decided by the project's owner
-  before binaries are distributed: replace the filter with an independent
-  implementation (it is about twenty lines: a Chamberlin state variable
-  filter, widely documented), or leave the voice filter out, or accept the
-  GPL for the whole. Until then this notice says what is there.
+  The replacement was not derived from that code. It is the textbook digital
+  state variable filter (Hal Chamberlin, "Musical Applications of
+  Microprocessors"), written from the book's description; the old filter was
+  only ever run, as a compiled black box, to measure what a voice has to
+  sound like: the level of its passband against the resonance setting, and
+  that it answers without a sample of delay. apu_lowpass.h says how the voice
+  processor's two arguments map onto the textbook's f and q, and
+  tests/apu_lowpass checks it over the whole range of the registers.
 
-  xemu's DSP56300 interpreter (hw/xbox/mcpx/dsp, GPL-2.0-or-later, adapted
-  from Hatari) is NOT in this repository: src/apu/apu_dsp.c is a stand-in
-  written against the LGPL apu.c, with no code from it.
+
+GPL-2.0-or-later — the DSP core's state declaration (through xemu)  *** OPEN ***
+--------------------------------------------------------------------------------
+
+  src/apu/apu_state.h, the DSP_*_SIZE / DSP_REG_MAX constants, `struct
+  dsp_core_s` (dsp_core_t) and `struct DSPState`: about seventy lines of
+  declarations, the same as in xemu's hw/xbox/mcpx/apu/dsp/interp/dsp_cpu.h,
+  dsp_cpu_regs.h and dsp/dsp.h. Those three files are not LGPL: their headers
+  read "Copyright (c) 2015 espes ... Adapted from Hatari DSP M56001
+  emulation" and the GNU General Public License, version 2 or later.
+  apu_state.h's own header says LGPL; for these lines that is wrong.
+
+  They are declarations only: a structure layout and six sizes, no function,
+  no table. Nothing but two memsets of one member (apu_core.c) uses them, and
+  the interpreter they belong to (xemu's hw/xbox/mcpx/apu/dsp: dsp.c,
+  dsp_cpu.c, the instruction emulation) is NOT in this repository:
+  src/apu/apu_dsp.c is a stand-in written against the LGPL apu.c, with no
+  code from it. The declarations should still go before a program is
+  distributed (an own, smaller structure does the same job); until then this
+  notice says what is there.
 
 
 Derived algorithms — credited, independently implemented
