@@ -140,6 +140,9 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_ADVANCED_DIAG_LOG]  = SETTING("advanced.diagnostic_log", XS_BOOL, 0, RENV_LOG_DIAG, NULL, NULL, 0, 0, 1),
     /* Off as shipped: the title's own textures, bit for bit. */
     [XS_GRAPHICS_UI_SCALE]  = SETTING("graphics.ui_scale", XS_CHOICE, 0, RENV_GFX_UI_SCALE, k_ui_scale, NULL, 0, 0, 0),
+    /* On as shipped by us: the title's Settings menu lists TAKEDAWN SETTINGS,
+     * which opens this overlay (BO-133). Read when the menu is opened. */
+    [XS_INTERFACE_MENU_ENTRY] = SETTING("interface.menu_entry", XS_BOOL, 0, RENV_MENU_ENTRY, NULL, NULL, 0, 0, 1),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
 #endif

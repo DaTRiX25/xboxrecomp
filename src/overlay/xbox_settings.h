@@ -84,6 +84,7 @@ typedef enum {
     XS_ADVANCED_PERF_STEPS,  /* the graph marks frames of more than one simulation step */
     XS_ADVANCED_DIAG_LOG,    /* diagnostic logging: the print gate (platform/xr_log.h) */
     XS_GRAPHICS_UI_SCALE,    /* the title's 2D art scaled before upload: off, 2x, 4x (nv2a_texscale.h) */
+    XS_INTERFACE_MENU_ENTRY, /* the overlay's entry in the title's own Settings menu, on by default */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
 #endif
@@ -174,6 +175,14 @@ void xbox_SettingEnvString(const xs_setting *s, double v, char *out, unsigned n)
 /* The line at the top of the overlay's Advanced page: the port's name and
  * version (NULL or "": none). Here and not in overlay.h, which needs SDL. */
 void xbox_OverlaySetAbout(const char *text);
+
+/* Ask for the overlay to open, from any thread (a host hook on the title's
+ * thread: a menu entry of the game's own). It opens on the main loop's next
+ * turn, as the hotkey opens it. 0 when there is no overlay to open (not
+ * built, or switched off). */
+int xbox_OverlayRequestOpen(void);
+/* Whether there is an overlay to open (built and not switched off). */
+int xbox_OverlayAvailable(void);
 
 /* The "Custom music folder" row of the overlay's Audio page, for a port
  * whose title plays the user's music (xbox_soundtrack.h); none until this is
