@@ -403,6 +403,8 @@ static void list_places(void)
 #endif
 }
 
+static int s_newest_first;
+
 /* The rows of `dir`; 0 (and nothing changed) when it cannot be read. */
 static int list_folder(const char *dir)
 {
@@ -418,8 +420,9 @@ static int list_folder(const char *dir)
     add_row(XSB_USE, s_use_label, s_dir);
     add_row(XSB_UP, "..", "");
     for (i = 0; i < dirs.n; i++) {
-        join(path, sizeof path, s_dir, dirs.v[i]);
-        add_row(XSB_DIR, dirs.v[i], path);
+        int k = s_newest_first ? dirs.n - 1 - i : i;
+        join(path, sizeof path, s_dir, dirs.v[k]);
+        add_row(XSB_DIR, dirs.v[k], path);
     }
     xst_names_free(&dirs);
     return 1;
@@ -444,7 +447,14 @@ void xsb_open_with(const xsb_options *o)
     snprintf(s_top_label, sizeof s_top_label, "%s", o && o->top_label ? o->top_label : "");
     snprintf(s_top_path, sizeof s_top_path, "%s", o && o->top_path ? o->top_path : "");
     s_mark = o ? o->mark : NULL;
+    s_newest_first = o ? o->newest_first : 0;
     xsb_open_places(o ? o->current : NULL);
+    if (o && o->start_in && *o->start_in && s_open) {
+        LOCK();
+        if (list_folder(o->start_in))
+            s_gen++;
+        UNLOCK();
+    }
 }
 
 void xsb_open(const char *current)

@@ -175,6 +175,8 @@ typedef struct xsb_options {
     const char *use_label, *off_label;
     const char *top_label, *top_path;
     int (*mark)(const char *dir);
+    const char *start_in;                 /* open in this folder, not on the places */
+    int newest_first;                     /* folders in reverse name order (dated ones) */
 } xsb_options;
 void xsb_open_with(const xsb_options *o);
 void xsb_close(void);
