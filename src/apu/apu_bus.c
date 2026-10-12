@@ -127,6 +127,14 @@ int apu_bus_find(const char *s)
 
 /* ── configuration ─────────────────────────────────────────────────── */
 
+static int s_duck_src, s_duck_tgt;
+
+void apu_bus_set_duck_default(int source, int target)
+{
+    s_duck_src = source;
+    s_duck_tgt = target;
+}
+
 void apu_bus_config_neutral(apu_bus_config *c)
 {
     memset(c, 0, sizeof(*c));
@@ -139,7 +147,8 @@ void apu_bus_config_neutral(apu_bus_config *c)
     }
     c->ceiling_db = -0.3f;
     c->limiter_release_ms = 200.0f;
-    c->duck.source = c->duck.target = 0;
+    c->duck.source = s_duck_src;
+    c->duck.target = s_duck_tgt;
     c->duck.threshold_db = -30.0f;
     c->duck.depth_db = 6.0f;
     c->duck.attack_ms = 20.0f;
@@ -290,24 +299,41 @@ static void build_rt(const apu_bus_config *c, struct apu_bus_rt *r)
     }
 }
 
+/* The overlay's thread and the frame thread (a changed file) both set the
+ * configuration: one at a time. The frame thread's reads of the runtime
+ * block take no lock; a block is complete before it is published. */
+static volatile char s_cfg_lock;
+#if defined(_MSC_VER)
+#include <intrin.h>
+static void cfg_lock(void) { while (_InterlockedExchange8(&s_cfg_lock, 1)) {} }
+static void cfg_unlock(void) { _InterlockedExchange8(&s_cfg_lock, 0); }
+#else
+static void cfg_lock(void) { while (__sync_lock_test_and_set(&s_cfg_lock, 1)) {} }
+static void cfg_unlock(void) { __sync_lock_release(&s_cfg_lock); }
+#endif
+
 void apu_bus_set_config(const apu_bus_config *c)
 {
     struct apu_bus_rt *next;
-    if (!s_cfg_set) apu_bus_config_neutral(&s_cfg);
-    s_cfg = *c;
+    apu_bus_config in = *c;
+    cfg_lock();
+    s_cfg = in;
     s_cfg_set = 1;
     next = s_cur == &s_rt[0] ? &s_rt[1] : &s_rt[0];
     build_rt(&s_cfg, next);
     s_cur = next;
+    cfg_unlock();
 }
 
 void apu_bus_get_config(apu_bus_config *c)
 {
+    cfg_lock();
     if (!s_cfg_set) {
         apu_bus_config_neutral(&s_cfg);
         s_cfg_set = 1;
     }
     *c = s_cfg;
+    cfg_unlock();
 }
 
 static void file_open(void);
@@ -596,6 +622,9 @@ size_t apu_bus_config_write(const apu_bus_config *c, char *out, size_t n)
 }
 
 static char s_file[1024], s_file_status[200];
+static volatile unsigned s_file_gen;
+
+unsigned apu_bus_file_gen(void) { return s_file_gen; }
 static long long s_file_mtime = -1;
 
 static long long file_mtime(const char *path)
@@ -664,6 +693,7 @@ static void file_check(int force)
     apu_bus_config_neutral(&c);
     if (apu_bus_load_file(s_file, &c, err, sizeof(err)) == 0) {
         apu_bus_set_config(&c);
+        s_file_gen++;
         snprintf(s_file_status, sizeof(s_file_status), "%s", err);
         fprintf(stderr, "[APU] mixer: %s loaded%s%s\n", s_file, *err ? ", " : "", err);
     } else {

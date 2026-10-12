@@ -76,6 +76,9 @@ typedef struct {
 
 /* The neutral configuration ("Factory"): the mix as without the mixer. */
 void apu_bus_config_neutral(apu_bus_config *c);
+/* The buses the (disabled) duck slot of the neutral configuration names:
+ * what the overlay offers first. */
+void apu_bus_set_duck_default(int source, int target);
 /* 1 when c changes nothing (what the bit-identity holds for). */
 int  apu_bus_config_is_neutral(const apu_bus_config *c);
 
@@ -131,6 +134,8 @@ void apu_bus_set_file(const char *path);
 const char *apu_bus_file(void);
 int  apu_bus_load_file(const char *path, apu_bus_config *c, char *err, size_t nerr);
 int  apu_bus_save_file(const char *path, const apu_bus_config *c);
+/* Counts the times the followed file was read (it changed on disk). */
+unsigned apu_bus_file_gen(void);
 /* Last load's message ("" when fine), for the overlay. */
 const char *apu_bus_file_status(void);
 

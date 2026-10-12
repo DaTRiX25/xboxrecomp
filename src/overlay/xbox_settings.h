@@ -59,6 +59,7 @@ typedef enum {
     XS_AUDIO_MUTE_BG,
     XS_AUDIO_SPEAKERS,
     XS_AUDIO_FX_LEVEL,
+    XS_AUDIO_MIXER,          /* the host mixer (apu_bus.h); its mix is in mixer.toml */
     XS_INPUT_DEADZONE,
     XS_INPUT_TRIGGER_DEADZONE,
     XS_INPUT_RUMBLE,
