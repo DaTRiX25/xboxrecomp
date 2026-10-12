@@ -948,6 +948,12 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * SDL would turn them into SDL_QUIT. Set before the headless return:
      * audio and input start SDL subsystems in headless runs too. */
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+#if defined(__ANDROID__) && defined(SDL_HINT_ANDROID_TRAP_BACK_BUTTON)
+    /* The system Back must not finish the activity (the present loop would
+     * then exit(0) mid-race): it arrives as SDLK_AC_BACK, which the
+     * overlay takes as its toggle (GameActivity.onBackPressed sends it too). */
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+#endif
     if (recomp_env_on(RENV_HEADLESS)) {
 #if defined(__APPLE__)
         /* No window, but the vblank can still follow the main display. */

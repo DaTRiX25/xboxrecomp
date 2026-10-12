@@ -1223,6 +1223,18 @@ int xbox_OverlayEvent(const SDL_Event *ev)
             mx_ab_toggle();             /* the mixer's A/B, menu open or not */
             return 1;
         }
+        /* The Android system Back (the activity delivers it as this key
+         * instead of finishing): closed, it opens the overlay, as F1 does;
+         * open, it goes back like B and Esc. Leaving the game is the system's
+         * app switcher. */
+        if (k == SDLK_AC_BACK) {
+            if (s_open) {
+                s_last_input_pad = true;
+                s_back++;
+            } else
+                hot_toggle();
+            return 1;
+        }
         if (!s_open)
             break;
         s_last_input_pad = false;

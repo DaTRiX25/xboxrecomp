@@ -12,6 +12,7 @@ path).
 | Controller | Back + Start together (on the Steam Deck: View held + Menu, which arrive as Back + Start) |
 | Keyboard | F1 |
 | macOS | Cmd + , |
+| Android | the system Back (button or gesture): it does not end the game, it opens the overlay; inside, it goes back like B. Leave through the app switcher |
 
 Close with B or Esc. `RECOMP_OVERLAY=0` turns it off. For scripted runs:
 `open` starts it open, `toggle=<s>,<s>` opens and closes it at those seconds,
