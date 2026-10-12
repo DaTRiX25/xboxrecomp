@@ -46,6 +46,8 @@ static const char *const k_scale[]    = { "1", "1.5", "2", "3", "4", NULL };
 #endif
 static const char *const k_aniso[]    = { "off", "2x", "4x", "8x", "16x", NULL };
 static const char *const k_aniso_env[] = { "1", "2", "4", "8", "16", NULL };
+static const char *const k_lod[]      = { "off", "auto", "-0.5", "-1", "-1.5", NULL };
+static const char *const k_lod_env[]  = { "0", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
 static const char *const k_units[]    = { "mph", "kmh", NULL };
 static const char *const k_face[]     = { "xbox", "nintendo", NULL };
@@ -97,6 +99,9 @@ static xs_setting s_set[XS_COUNT] = {
     /* The title's own effects, on as shipped: the patch is the "0". */
     [XS_GRAPHICS_BLOOM]     = SETTING("graphics.bloom", XS_BOOL, 0, RENV_GFX_BLOOM, NULL, NULL, 0, 0, 1),
     [XS_GRAPHICS_MOTION_BLUR] = SETTING("graphics.motion_blur", XS_BOOL, 0, RENV_GFX_MOTION_BLUR, NULL, NULL, 0, 0, 1),
+    /* Both off as shipped: today's picture, bit for bit. */
+    [XS_GRAPHICS_LOD_BIAS]  = SETTING("graphics.lod_bias", XS_CHOICE, 0, RENV_GFX_LOD_BIAS, k_lod, k_lod_env, 0, 0, 0),
+    [XS_GRAPHICS_DITHER]    = SETTING("graphics.dither", XS_BOOL, 0, RENV_GFX_DITHER, NULL, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
 #endif
@@ -314,6 +319,16 @@ static void apply(xs_id id)
         nv2a_host_set_aniso(levels[(int)v]);
         break;
     }
+    case XS_GRAPHICS_LOD_BIAS: {
+        static const float bias[] = { 0.0f, 0.0f, -0.5f, -1.0f, -1.5f };
+        int i = (int)v;
+        nv2a_host_set_lod_bias(i == 0 ? NV2A_LOD_OFF : i == 1 ? NV2A_LOD_AUTO : NV2A_LOD_VALUE,
+                               bias[i]);
+        break;
+    }
+    case XS_GRAPHICS_DITHER:
+        nv2a_host_set_dither(v != 0.0);
+        break;
     case XS_GRAPHICS_AA:
         nv2a_host_set_post_aa((int)v);
         break;

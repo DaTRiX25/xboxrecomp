@@ -43,6 +43,14 @@ unsigned xa2_underruns(void) { return 0; }
 uint64_t xa2_samples_played(void) { return dev_head; }
 int  xa2_queued_samples(void) { return (int)(dev_tail - dev_head); }
 void xa2_expect_drain(void)  {}
+/* The speaker layout and the gain, which the device interface has had since
+ * 5.1: a stereo device, as this test was written for. Without them the
+ * linker takes the real backend's object for these four and its other
+ * definitions collide with the ones here. */
+int  xa2_probe_channels(void) { return 2; }
+void xa2_request_channels(int title_channels) { (void)title_channels; }
+int  xa2_channels(void)      { return 2; }
+void xa2_set_gain(float gain) { (void)gain; }
 int  xa2_submit_samples(const int16_t *s, int n)
 {
     got_calls++;

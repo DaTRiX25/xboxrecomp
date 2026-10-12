@@ -119,6 +119,7 @@ static const char *const n_filter[]    = { "Nearest", "Linear", "Integer", NULL 
 static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", NULL };
 static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the sides)", NULL };
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
+static const char *const n_lod[]       = { "Off", "Auto (from the render scale)", "-0.5", "-1.0", "-1.5", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
 #if defined(__ANDROID__)
@@ -162,6 +163,8 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For a display wider than 16:9, with Aspect at 16:9: the race is drawn for the whole width (more to see at the sides, nothing stretched). Menus, loading screens and videos keep their 16:9 shape in the middle. Window follows the window's or the screen's own shape. A change shows from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
     /* XS_GRAPHICS_BLOOM */     { "Bloom", "The game's own soft glow over the picture, strongest while boosting. On is the original look; off skips its three extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "The game's own blur: the streaks towards the edges of the picture at speed and while boosting. On is the original look; off skips its two extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto: -0.5 at 2x, -1.0 at 4x. Off is the original. Changes at once.", 1, FMT_PLAIN, n_lod, 0 },
+    /* XS_GRAPHICS_DITHER */    { "Dither", "A faint noise in the final scale to the window that hides the stripes in smooth gradients such as the sky. Metal only for now. Off is the original; text and HUD at the exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -174,7 +177,17 @@ extern "C" const char *nvk_core_describe(void);   /* nv2a_vk_core.c */
 #endif
 enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS };
 enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
+              A_HOST0, A_HOST1, A_HOST2, A_HOST3,                  /* xbox_OverlaySetHostRows */
               A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER };      /* A_SHADERS on: the build's */
+
+static int s_host_n;
+static const char *(*s_host_fn)(int row, int activate);
+
+void xbox_OverlaySetHostRows(int n, const char *(*fn)(int row, int activate))
+{
+    s_host_fn = fn;
+    s_host_n = fn ? (n > XBOX_OVERLAY_HOST_ROWS ? XBOX_OVERLAY_HOST_ROWS : n) : 0;
+}
 
 /* ── the bug report (xbox_report.h) ────────────────────────────────── */
 
@@ -282,6 +295,10 @@ static int page_rows(int page, Row *r)
     case P_GRAPHICS:
         SET(XS_GRAPHICS_RENDER_SCALE); SET(XS_GRAPHICS_ANISO);
         SET(XS_GRAPHICS_AA); SET(XS_GRAPHICS_SHARPEN);
+        SET(XS_GRAPHICS_LOD_BIAS);
+#if defined(__APPLE__)          /* only the Metal presenter has the pass so far */
+        SET(XS_GRAPHICS_DITHER);
+#endif
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_BLOOM)->key))
             SET(XS_GRAPHICS_BLOOM);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_MOTION_BLUR)->key))
@@ -293,12 +310,16 @@ static int page_rows(int page, Row *r)
             static char drv[420];
             const char *d = nvk_core_describe();
             if (d && *d) {
-                snprintf(drv, sizeof drv, "Graphics driver: %s. To change it, open"
-                         " this app's \"graphics driver\" entry in the app list.", d);
+                snprintf(drv, sizeof drv, "Graphics driver in use: %s", d);
                 INFO(drv);
             }
         }
 #endif
+        for (int i = 0; i < s_host_n; i++) {
+            const char *t = s_host_fn(i, 0);
+            if (t && *t)
+                ACT(A_HOST0 + i, t);
+        }
         if (s_sb) {
             sb_texts();
             INFO(s_sb_info);
@@ -544,6 +565,11 @@ static void activate(const Row &r)
 {
     if (r.kind == R_SPEAKERS) {
         spk_play(r.action);
+        return;
+    }
+    if (r.kind == R_ACTION && r.action >= A_HOST0 && r.action <= A_HOST3) {
+        if (s_host_fn)
+            s_host_fn(r.action - A_HOST0, 1);
         return;
     }
     if (r.kind == R_ACTION && (r.action == A_REPORT || r.action == A_REPORT_SHOT)) {
