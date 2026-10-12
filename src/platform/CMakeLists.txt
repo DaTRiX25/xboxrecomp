@@ -63,5 +63,8 @@ endif()
 # (android_host.h). liblog is the NDK's.
 if(ANDROID)
     target_sources(recomp_env PRIVATE android_host.c)
+    # The print gate (xr_log.h) is force-included before the file's own
+    # _GNU_SOURCE, so the CPU-affinity API needs it from the command line.
+    set_source_files_properties(android_host.c PROPERTIES COMPILE_DEFINITIONS _GNU_SOURCE)
     target_link_libraries(recomp_env PUBLIC log)
 endif()
