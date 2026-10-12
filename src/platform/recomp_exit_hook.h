@@ -19,7 +19,11 @@ typedef void (*recomp_exit_hook_fn)(const char *why);
 /* One hook; a second call replaces the first. Any thread. */
 void recomp_exit_hook_set(recomp_exit_hook_fn fn);
 
-/* Calls the hook, if one is set, with why ("window"). */
+/* One more hook beside it (the pads' motors off, src/input/input_core.c);
+ * up to four, a hook added twice is there once. Any thread. */
+void recomp_exit_hook_add(recomp_exit_hook_fn fn);
+
+/* Calls the hook, if one is set, and the added ones, with why ("window"). */
 void recomp_exit_hook_run(const char *why);
 
 #ifdef __cplusplus

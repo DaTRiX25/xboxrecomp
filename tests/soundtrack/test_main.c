@@ -623,6 +623,80 @@ static void test_utf8_paths(void)
     CHECK("a broken byte", !strcmp(label, "a\xEF\xBF\xBDz"));
 }
 
+/* An mp3 as one was found in a real folder: 64 KiB of zeros, the tail of a
+ * frame cut in two, then the frames; no tag. A decoder plays it; the scan's
+ * probe has to take it too. And what is left out is named, with the reason. */
+static void test_mp3_junk_and_left_out(void)
+{
+    static uint8_t mp3[8192];
+    static int16_t pcm[XST_RATE * 2];
+    FILE *f;
+    size_t n, i, start = 0;
+    uint32_t ms = 0;
+    unsigned rate, ch;
+    const char *why = NULL;
+    xst_library *lib;
+    char from[1400];
+    int k, found_zero = 0, found_text = 0, found_mp3 = 0;
+
+    snprintf(from, sizeof from, "%s/tone_id3v23.mp3", g_data);
+    f = u8_fopen(from, "rb");
+    n = f ? fread(mp3, 1, sizeof mp3, f) : 0;
+    if (f) fclose(f);
+    CHECK("fixture", n > 2000 && !memcmp(mp3, "ID3", 3));
+    if (n > 10)
+        start = 10 + (((size_t)mp3[6] & 0x7F) << 21 | ((size_t)mp3[7] & 0x7F) << 14
+                      | ((size_t)mp3[8] & 0x7F) << 7 | ((size_t)mp3[9] & 0x7F));
+    CHECK("frames after the tag", start < n && mp3[start] == 0xFF);
+
+    mkdir(in_work("junk"), 0755);
+    f = u8_fopen(in_work("junk/1 zeros then frames.mp3"), "wb");
+    for (i = 0; i < 65536; i++) fputc(0, f);
+    for (i = 0; i < 168; i++) fputc((int)(0xE2 + i * 37) & 0xFF, f);     /* no frame header in it */
+    fwrite(mp3 + start, 1, n - start, f);
+    fclose(f);
+    f = u8_fopen(in_work("junk/2 only zeros.mp3"), "wb");
+    for (i = 0; i < 70000; i++) fputc(0, f);
+    fclose(f);
+    f = u8_fopen(in_work("junk/3 text.mp3"), "wb");
+    /* 0xFF 0xFB once, by chance, with no frame after it. */
+    fputs("not music \xFF\xFB\x92\x44 at all, and long enough to hold the frame that is not there", f);
+    for (i = 0; i < 600; i++) fputc('x', f);
+    fclose(f);
+    f = u8_fopen(in_work("junk/4 empty.mp3"), "wb");
+    fclose(f);
+    copy_file(in_work("junk/3 text.mp3"), in_work("junk/5 text.flac"));
+
+    CHECK("zeros, junk, then frames: taken", xst_probe_why(in_work("junk/1 zeros then frames.mp3"), &ms,
+                                                           NULL, 0, &why) && ms > 300 && ms < 900);
+    n = decode_all(in_work("junk/1 zeros then frames.mp3"), pcm, XST_RATE, &rate, &ch);
+    CHECK("and it plays", n > 20000 && tone_share(pcm + 8000, n - 12000, 0, 1000) > 0.99);
+    CHECK("only zeros: not", !xst_probe_why(in_work("junk/2 only zeros.mp3"), &ms, NULL, 0, &why)
+                             && strstr(why, "no MPEG audio"));
+    CHECK("a header by chance: not", !xst_probe_why(in_work("junk/3 text.mp3"), &ms, NULL, 0, &why)
+                                     && strstr(why, "no MPEG audio"));
+    CHECK("empty: not", !xst_probe_why(in_work("junk/4 empty.mp3"), &ms, NULL, 0, &why)
+                        && strstr(why, "empty"));
+    CHECK("no such file", !xst_probe_why(in_work("junk/none.mp3"), &ms, NULL, 0, &why)
+                          && strstr(why, "cannot be opened"));
+    CHECK("not a flac", !xst_probe_why(in_work("junk/5 text.flac"), &ms, NULL, 0, &why)
+                        && strstr(why, "FLAC"));
+
+    lib = xst_scan(in_work("junk"));
+    CHECK("one song, four left out", lib && lib->n_songs == 1 && lib->bad_files == 4
+                                     && lib->n_left_out == 4);
+    for (k = 0; lib && k < lib->n_left_out; k++) {
+        if (strstr(lib->left_out[k].path, "2 only zeros.mp3") && strstr(lib->left_out[k].why, "MPEG"))
+            found_zero = 1;
+        if (strstr(lib->left_out[k].path, "5 text.flac") && strstr(lib->left_out[k].why, "FLAC"))
+            found_text = 1;
+        if (strstr(lib->left_out[k].path, "4 empty.mp3") && strstr(lib->left_out[k].why, "empty"))
+            found_mp3 = 1;
+    }
+    CHECK("each named with its reason", found_zero && found_text && found_mp3);
+    xst_free(lib);
+}
+
 static void test_progress(void)
 {
     xst_progress pr;
@@ -652,6 +726,7 @@ int main(int argc, char **argv)
     test_limits();
     test_browse();
     test_utf8_paths();
+    test_mp3_junk_and_left_out();
     test_progress();
     test_decode();
     printf(failures ? "%d FAILED\n" : "ok\n", failures);

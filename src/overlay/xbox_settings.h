@@ -177,6 +177,9 @@ void xbox_OverlaySetAbout(const char *text);
 typedef struct xbox_music_folder_ops {
     void (*status)(char *out, unsigned n);
     void (*chosen)(const char *dir);
+    /* May be NULL. Further lines under the status, i = 0..3 (files a scan
+     * left out, by name and reason): 1 and the text, or 0 for no more. */
+    int  (*note)(int i, char *out, unsigned n);
 } xbox_music_folder_ops;
 void xbox_OverlaySetMusicFolder(const xbox_music_folder_ops *ops);
 

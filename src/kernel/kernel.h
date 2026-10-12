@@ -538,6 +538,17 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
  * Path Translation (kernel_path.c)
  * ============================================================================ */
 
+/*
+ * The code page of the guest's "ANSI" text: what Rtl*AnsiString*, the
+ * multi-byte conversions and file names mean to the title. Fixed, as it was
+ * on the console (Windows-1252), not the PC's regional one: the host's
+ * CP_ACP differs from machine to machine, and is UTF-8 in a program whose
+ * manifest asks for that (recomp_utf8_args.h), where one guest byte would
+ * no longer be one character. Off Windows the conversion shim reads any
+ * page but UTF-8 as Latin-1, as it always did for CP_ACP.
+ */
+#define XBOX_GUEST_CP 1252u
+
 /* Initialize path translation with base directories */
 void xbox_path_init(const char* game_dir, const char* save_dir);
 

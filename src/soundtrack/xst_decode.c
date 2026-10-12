@@ -241,54 +241,105 @@ static long id3v2_title(FILE *f, char *title, size_t cap)
     return full;
 }
 
-static int mp3_probe(const char *path, uint32_t *ms, char *title, size_t cap)
+/* A layer III frame header at p: its length in bytes (0: not one), and
+ * what a length needs. Free-format frames (bitrate index 0) have no length
+ * in the header and are not looked for. */
+static unsigned mp3_frame(const uint8_t *p, unsigned *kbps, unsigned *rate, unsigned *spf, int *mono,
+                          int *mpeg1)
 {
     static const uint16_t br1[16] = { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 };
     static const uint16_t br2[16] = { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 };
     static const uint32_t sr[3] = { 44100, 48000, 32000 };
+    unsigned ver, layer, bri, sri, pad;
+
+    if (p[0] != 0xFF || (p[1] & 0xE0) != 0xE0)
+        return 0;
+    ver = (p[1] >> 3) & 3;                  /* 3: MPEG1, 2: MPEG2, 0: 2.5 */
+    layer = (p[1] >> 1) & 3;                /* 1: layer III */
+    bri = p[2] >> 4;
+    sri = (p[2] >> 2) & 3;
+    pad = (p[2] >> 1) & 1;
+    if (ver == 1 || layer != 1 || bri == 0 || bri == 15 || sri == 3)
+        return 0;
+    *mpeg1 = ver == 3;
+    *kbps = ver == 3 ? br1[bri] : br2[bri];
+    *rate = sr[sri] >> (ver == 3 ? 0 : ver == 2 ? 1 : 2);
+    *spf = ver == 3 ? 1152 : 576;
+    *mono = (p[3] >> 6) == 3;
+    return (ver == 3 ? 144u : 72u) * *kbps * 1000u / *rate + pad;
+}
+
+/* How far past the tag the first frame is looked for. A decoder
+ * resynchronises through anything; files do start with junk: a block of
+ * zeros a ripper or a download manager left (64 KiB of them in one seen),
+ * the tail of a frame cut in two, a second tag. */
+#define MP3_SEARCH_NEAR  16384
+#define MP3_SEARCH_FAR   (1 << 20)
+
+static int mp3_probe(const char *path, uint32_t *ms, char *title, size_t cap, const char **why)
+{
     FILE *f = open_file(path);
-    uint8_t buf[16384];
+    uint8_t first[MP3_SEARCH_NEAR], *more = NULL, *buf = first;
     long start, end;
     size_t got, i;
-    int ok = 0;
+    int ok = 0, pass;
 
-    if (!f)
+    if (!f) {
+        *why = "cannot be opened";
         return 0;
+    }
     start = id3v2_title(f, title, cap);
     fseek(f, 0, SEEK_END);
     end = ftell(f);
-    if (fseek(f, start, SEEK_SET) != 0) {
+    if (end <= 0) {
         fclose(f);
+        *why = "an empty file";
         return 0;
     }
-    got = fread(buf, 1, sizeof buf, f);
-    for (i = 0; i + 4 < got; i++) {
-        unsigned ver, layer, bri, sri, mono, kbps, rate, spf, off;
-        if (buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0)
-            continue;
-        ver = (buf[i + 1] >> 3) & 3;            /* 3: MPEG1, 2: MPEG2, 0: 2.5 */
-        layer = (buf[i + 1] >> 1) & 3;          /* 1: layer III */
-        bri = buf[i + 2] >> 4;
-        sri = (buf[i + 2] >> 2) & 3;
-        mono = (buf[i + 3] >> 6) == 3;
-        if (ver == 1 || layer != 1 || bri == 0 || bri == 15 || sri == 3)
-            continue;
-        kbps = ver == 3 ? br1[bri] : br2[bri];
-        rate = sr[sri] >> (ver == 3 ? 0 : ver == 2 ? 1 : 2);
-        spf = ver == 3 ? 1152 : 576;
-        ok = 1;
-        *ms = 0;
-        off = (unsigned)i + 4 + (ver == 3 ? (mono ? 17 : 32) : (mono ? 9 : 17));
-        if (off + 12 < got && (!memcmp(buf + off, "Xing", 4) || !memcmp(buf + off, "Info", 4))
-            && (buf[off + 7] & 1)) {
-            uint32_t frames = be32(buf + off + 8);
-            *ms = (uint32_t)((uint64_t)frames * spf * 1000 / rate);
-        } else if (kbps && end > start) {
-            *ms = (uint32_t)((uint64_t)(end - start - (long)i) * 8 / kbps);
+    /* The first 16 KiB is where the first frame nearly always is; only a
+     * file with none there is read further. */
+    for (pass = 0; pass < 2 && !ok; pass++) {
+        size_t want = pass ? MP3_SEARCH_FAR : MP3_SEARCH_NEAR;
+        if (pass) {
+            more = (uint8_t *)malloc(MP3_SEARCH_FAR);
+            if (!more)
+                break;
+            buf = more;
         }
-        break;
+        if (fseek(f, start, SEEK_SET) != 0)
+            break;
+        got = fread(buf, 1, want, f);
+        for (i = 0; i + 4 <= got; i++) {
+            unsigned kbps, rate, spf, len, k2, r2, s2, off;
+            int mono, mpeg1, m2, v2;
+            if (buf[i] != 0xFF)
+                continue;
+            len = mp3_frame(buf + i, &kbps, &rate, &spf, &mono, &mpeg1);
+            if (!len)
+                continue;
+            /* Two bytes of a header turn up by chance in junk: the next
+             * frame must be where this one says, when that is in sight. */
+            if (i + len + 4 <= got && !mp3_frame(buf + i + len, &k2, &r2, &s2, &m2, &v2))
+                continue;
+            ok = 1;
+            *ms = 0;
+            off = (unsigned)i + 4 + (mpeg1 ? (mono ? 17 : 32) : (mono ? 9 : 17));
+            if (off + 12 < got && (!memcmp(buf + off, "Xing", 4) || !memcmp(buf + off, "Info", 4))
+                && (buf[off + 7] & 1)) {
+                uint32_t frames = be32(buf + off + 8);
+                *ms = (uint32_t)((uint64_t)frames * spf * 1000 / rate);
+            } else if (kbps && end > start + (long)i) {
+                *ms = (uint32_t)((uint64_t)(end - start - (long)i) * 8 / kbps);
+            }
+            break;
+        }
+        if (got < want)
+            break;                          /* the whole file was looked at */
     }
+    free(more);
     fclose(f);
+    if (!ok)
+        *why = "no MPEG audio found in its first megabyte";
     return ok;
 }
 
@@ -472,8 +523,18 @@ static stb_vorbis *ogg_open(const char *path)
 
 int xst_probe(const char *path, uint32_t *ms, char *title, size_t title_cap)
 {
-    uint32_t dummy;
+    const char *why;
+    return xst_probe_why(path, ms, title, title_cap, &why);
+}
 
+int xst_probe_why(const char *path, uint32_t *ms, char *title, size_t title_cap, const char **why)
+{
+    uint32_t dummy;
+    const char *unused;
+
+    if (!why)
+        why = &unused;
+    *why = "";
     if (!ms)
         ms = &dummy;
     *ms = 0;
@@ -486,7 +547,7 @@ int xst_probe(const char *path, uint32_t *ms, char *title, size_t title_cap)
 
     switch (kind_of(path)) {
     case K_MP3:
-        return mp3_probe(path, ms, title, title_cap);
+        return mp3_probe(path, ms, title, title_cap, why);
     case K_FLAC: {
         meta_ctx ctx;
         drflac *fl;
@@ -499,8 +560,10 @@ int xst_probe(const char *path, uint32_t *ms, char *title, size_t title_cap)
 #else
         fl = drflac_open_file_with_metadata(path, flac_meta, &ctx, NULL);
 #endif
-        if (!fl)
+        if (!fl) {
+            *why = "not a FLAC file this can read";
             return 0;
+        }
         if (fl->sampleRate)
             *ms = (uint32_t)(fl->totalPCMFrameCount * 1000 / fl->sampleRate);
         drflac_close(fl);
@@ -511,8 +574,10 @@ int xst_probe(const char *path, uint32_t *ms, char *title, size_t title_cap)
         stb_vorbis_info info;
         stb_vorbis_comment c;
         int i;
-        if (!v)
+        if (!v) {
+            *why = "not an Ogg Vorbis file this can read";
             return 0;
+        }
         info = stb_vorbis_get_info(v);
         c = stb_vorbis_get_comment(v);
         for (i = 0; i < c.comment_list_length; i++) {
@@ -532,11 +597,15 @@ int xst_probe(const char *path, uint32_t *ms, char *title, size_t title_cap)
         drwav w;
 #if defined(_WIN32)
         wchar_t wp[1024];
-        if (!wide_path(path, wp, 1024) || !drwav_init_file_w(&w, wp, NULL))
+        if (!wide_path(path, wp, 1024) || !drwav_init_file_w(&w, wp, NULL)) {
+            *why = "not a WAV file this can read";
             return 0;
+        }
 #else
-        if (!drwav_init_file(&w, path, NULL))
+        if (!drwav_init_file(&w, path, NULL)) {
+            *why = "not a WAV file this can read";
             return 0;
+        }
 #endif
         if (w.sampleRate)
             *ms = (uint32_t)(w.totalPCMFrameCount * 1000 / w.sampleRate);
@@ -545,9 +614,14 @@ int xst_probe(const char *path, uint32_t *ms, char *title, size_t title_cap)
     }
 #if defined(__APPLE__)
     case K_SYSTEM:
-        return sys_probe(path, ms, title, title_cap);
+        if (!sys_probe(path, ms, title, title_cap)) {
+            *why = "the system cannot decode it (a protected file?)";
+            return 0;
+        }
+        return 1;
 #endif
     default:
+        *why = "not a kind of file this plays";
         return 0;
     }
 }

@@ -32,7 +32,27 @@ typedef struct xbox_input_backend {
     int   (*keyboard)(XBOX_INPUT_STATE *out);
     /* Monotonic milliseconds. */
     uint64_t (*now_ms)(void);
+    /* The end of the run, after input_core.c has set every motor to zero:
+     * the stop written out to the devices and the pads closed. No call
+     * reaches the backend's pads after it. May be NULL. */
+    void  (*shutdown)(void);
 } xbox_input_backend;
+
+/* A motor is never given a level for longer than this: the host's rumble
+ * effect runs XBOX_RUMBLE_EFFECT_MS, and input_core.c gives a held level
+ * again every XBOX_RUMBLE_REFRESH_MS, well inside it, so what the pad plays
+ * has no gap. If the giving stops (the pad poll hangs, the process is lost
+ * to the host's rumble timer), the effect ends by itself. */
+#define XBOX_RUMBLE_EFFECT_MS   250
+#define XBOX_RUMBLE_REFRESH_MS  100
+
+/* How long a signal waits for the motors' stop before the process ends. */
+#define XBOX_RUMBLE_PANIC_MS    150
+
+/* From a crash or signal handler: every motor off, by a thread woken for it
+ * (POSIX; async-signal-safe, waits at most wait_ms) or at once if the
+ * rumble lock is free (Windows). Best effort: the process is ending. */
+void xbox_InputPanicStop(int wait_ms);
 
 /* Rumble (input_core.c, rumble_curve.h), every backend alike. The strength
  * is the curve's exponent: 1.0 the title's speeds as the console played
