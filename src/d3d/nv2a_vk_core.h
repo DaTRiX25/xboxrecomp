@@ -66,6 +66,9 @@ int nvk_core_replace_surface(VkSurfaceKHR (*make_surface)(VkInstance, void *), v
 
 /* The core if nvk_core_init has succeeded, else NULL. */
 const struct nvk_core *nvk_core_get(void);
+/* 1 when the device is a software renderer (llvmpipe, lavapipe, SwiftShader):
+ * the machine's GPU could not be used. 0 before the device is up. */
+int nvk_core_is_software(void);
 
 /* The device is lost (VK_ERROR_DEVICE_LOST from a submit or a present, or a
  * swapchain that cannot be made any more): said once in the log, and passed

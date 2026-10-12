@@ -352,6 +352,15 @@ const struct nvk_core *nvk_core_init(const char *const *inst_exts, unsigned n,
                     }
                 }
 #endif
+                if (nvk_core_is_software()) {
+#if defined(__linux__) && !defined(__ANDROID__)
+                    const char *hint = "check that your user can use /dev/dri (render group)";
+#else
+                    const char *hint = "check the graphics driver";
+#endif
+                    XR_NOTICE( "[vulkan] WARNING: %s is a software renderer, not a GPU: "
+                            "No GPU access, running on the CPU: %s\n", s_core.name, hint);
+                }
                 XR_NOTICE( "[vulkan] device up: %s (Vulkan %u.%u.%u, driver 0x%X%s),"
                         " queue family %u, depth %s%s\n", s_core.name,
                         VK_API_VERSION_MAJOR(s_core.props.apiVersion),
@@ -392,6 +401,26 @@ int nvk_core_replace_surface(VkSurfaceKHR (*make_surface)(VkInstance, void *), v
         vkDestroySurfaceKHR(s_core.inst, s_core.surface, NULL);
     s_core.surface = make_surface(s_core.inst, ctx);
     return s_core.surface != VK_NULL_HANDLE;
+}
+
+/* Whether the device is a CPU implementation (llvmpipe, lavapipe,
+ * SwiftShader): what the loader offers when the user's graphics device cannot
+ * be opened (on Linux: no access to /dev/dri, the render group). The game
+ * runs, slowly, so this is for a warning and never a stop. */
+int nvk_core_is_software(void)
+{
+    const struct nvk_core *c = nvk_core_get();
+    static const char *const names[] = { "llvmpipe", "lavapipe", "SwiftShader", "softpipe" };
+    unsigned i;
+
+    if (!c)
+        return 0;
+    if (c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
+        return 1;
+    for (i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (strstr(c->name, names[i]))
+            return 1;
+    return 0;
 }
 
 const struct nvk_core *nvk_core_get(void)
