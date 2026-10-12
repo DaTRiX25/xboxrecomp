@@ -32,6 +32,8 @@ void xbox_InputSetTriggerDeadzone(int dz) { st_trigger = dz; }
 void xbox_InputSetRumbleStrength(double g) { st_rumble = g; }
 static int st_face;
 void xbox_InputSetFaceLayoutNintendo(int on) { st_face = on; }
+static int st_scheme = -1;
+void xbox_InputSetControlScheme(int s) { st_scheme = s; }
 static int st_glyphs = -2, st_glyph_refresh;
 void xbox_InputSetGlyphMode(int mode) { st_glyphs = mode; }
 void xbox_InputGlyphsRefresh(void) { st_glyph_refresh++; }
@@ -385,6 +387,15 @@ int main(void)
     CHECK(st_face == 1);
     xbox_SettingReset(XS_INPUT_FACE_LAYOUT);
     CHECK(st_face == 0);
+    /* The driving controls: xbox unless set, and the input layer hears of a
+     * change at once (BO-106). */
+    CHECK(xbox_SettingValue(XS_INPUT_CONTROL_SCHEME) == 0);
+    CHECK(xbox_SettingGet(XS_INPUT_CONTROL_SCHEME)->def == 0);
+    CHECK(!strcmp(xbox_SettingGet(XS_INPUT_CONTROL_SCHEME)->key, "input.control_scheme"));
+    xbox_SettingSet(XS_INPUT_CONTROL_SCHEME, 1);
+    CHECK(st_scheme == 1);
+    xbox_SettingReset(XS_INPUT_CONTROL_SCHEME);
+    CHECK(st_scheme == 0);
     CHECK(st_glyph_refresh >= 2);       /* the Nintendo prompts follow it */
 
     /* The button prompts (input.glyphs): auto by default, a choice reaches

@@ -215,6 +215,27 @@ table below and the code disagree; regenerate it with
 | L | Right stick right |
 <!-- keyboard_map:end -->
 
+## A title's second control scheme
+
+`input.control_scheme` (settings.toml, the overlay's Input page as "Driving
+controls", `RECOMP_INPUT_CONTROL_SCHEME=xbox|ps2`) is a choice the toolkit
+only keeps: `xbox_InputControlScheme()` is 0 for the title's own layout and 1
+for an alternative that the title's host code provides, and the overlay shows
+the row once that code has called `xbox_InputOfferControlScheme(1)`. What the
+alternative is, and when it holds, is the title's business, because only the
+title knows when it is in a menu: it rewrites the pad state its game has just
+read (Burnout 3: `src/game/controls.c` there, the PS2 version's driving
+controls, only while driving). Two things here serve that code:
+
+- `xbox_InputSources(port)`: whether the port's last state came from a
+  controller (`XBOX_INPUT_SRC_PAD`) and whether a keyboard key was held in it
+  (`XBOX_INPUT_SRC_KEYS`), so the keys can keep their documented buttons;
+- `xbox_InputScriptedPads()`: the pads a pad script drives, so a script's
+  `rt` means the same on every machine whatever the player's setting.
+
+The Nintendo face layout (`input.face_layout`) is applied before this, as the
+host pad is read.
+
 ## Connection state and rumble
 
 `xbox_InputGetState` reads a connected port at every call. A port last seen

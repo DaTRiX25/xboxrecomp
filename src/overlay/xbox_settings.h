@@ -63,6 +63,7 @@ typedef enum {
     XS_INPUT_TRIGGER_DEADZONE,
     XS_INPUT_RUMBLE,
     XS_INPUT_FACE_LAYOUT,    /* xbox / nintendo (A-B and X-Y mirrored) */
+    XS_INPUT_CONTROL_SCHEME, /* xbox / ps2: the driving controls, where the title offers them */
     XS_POWER_MODE,
     XS_ADVANCED_PERF,
     XS_GAME_SPEED_UNITS,     /* an opt-in guest patch (recomp_patch.h) */

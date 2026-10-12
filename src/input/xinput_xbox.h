@@ -134,6 +134,14 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 void xbox_InputSetScriptedPads(unsigned mask);
 unsigned xbox_InputScriptedPads(void);
 
+/* What the last xbox_InputGetState of a port was made of: a host controller
+ * that answered, and keyboard keys held at that read (port 0, when the
+ * keyboard is on). For a title's host code that treats a controller's state
+ * differently from the keys' (a control scheme for the pad, BO-106). */
+#define XBOX_INPUT_SRC_PAD  1u
+#define XBOX_INPUT_SRC_KEYS 2u
+unsigned xbox_InputSources(DWORD dwPort);
+
 #ifdef __cplusplus
 }
 #endif
