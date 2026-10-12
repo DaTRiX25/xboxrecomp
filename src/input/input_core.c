@@ -368,7 +368,9 @@ void xbox_InputRumbleTick(DWORD dwPort)
     RUMBLE_UNLOCK();
 }
 
-static void shutdown_atexit(void) { xbox_InputShutdown(); }
+static void input_shutdown(const char *path);
+
+static void shutdown_atexit(void) { input_shutdown("atexit"); }
 
 /* ── the ends atexit does not see ─────────────────────────────────────── */
 
@@ -376,7 +378,11 @@ static void shutdown_atexit(void) { xbox_InputShutdown(); }
 
 /* ExitProcess skips atexit: the windows and the kernel's exits run the exit
  * hooks before it (recomp_exit_hook.h). */
-static void shutdown_exit_hook(const char *why) { (void)why; xbox_InputShutdown(); }
+static void shutdown_exit_hook(const char *why)
+{
+    (void)why;
+    input_shutdown("exit hook");
+}
 
 static void panic_install(void)
 {
@@ -419,7 +425,7 @@ static void *panic_thread(void *arg)
         if (n == 0 || (n < 0 && errno != EINTR))
             return NULL;
     }
-    xbox_InputShutdown();
+    input_shutdown("signal");
     g_panic_done = 1;
     return NULL;
 }
@@ -604,13 +610,20 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     return g_connected[dwPort] ? rc : ERROR_DEVICE_NOT_CONNECTED;
 }
 
-void xbox_InputShutdown(void)
+/* "path" is which end of the run got here first, for the one line the log
+ * keeps of it (a quiet release log shows it: a pad that buzzes on after the
+ * game is gone is then a question of which end ran, and what it did). */
+static void input_shutdown(const char *path)
 {
     if (!g_inited)
         return;
     RUMBLE_LOCK();
     /* Twice is once: atexit, an exit hook and a signal can all get here. */
     if (!g_shutdown) {
+        int pads = 0;
+
+        for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+            pads += g_connected[p] ? 1 : 0;
         rumble_silence();
         g_shutdown = 1;
         for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++) {
@@ -621,8 +634,16 @@ void xbox_InputShutdown(void)
          * before the process (and the host's rumble queue with it) is gone. */
         if (g_be->shutdown)
             g_be->shutdown();
+        XR_NOTICE("[INPUT] rumble stopped on %d pad%s (%s)\n", pads, pads == 1 ? "" : "s", path);
     }
     RUMBLE_UNLOCK();
+}
+
+/* The window layers' own end (SDL_QUIT: Cmd+Q, the close button, the
+ * overlay's Quit game), before the process is on its way out. */
+void xbox_InputShutdown(void)
+{
+    input_shutdown("quit");
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
