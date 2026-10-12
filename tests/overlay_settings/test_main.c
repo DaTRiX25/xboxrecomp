@@ -48,6 +48,8 @@ static float st_fx = -2;
 void mcpx_apu_set_fx_level(float v) { st_fx = v; }
 static int st_mixer = -2;
 void apu_bus_enable(int on) { st_mixer = on; }
+static int st_custom_level = -1;
+void mcpx_apu_set_custom_level(int mode) { st_custom_level = mode; }
 static int st_lfe = -1;
 void mcpx_apu_set_lfe_lowpass(int hz) { st_lfe = hz; }
 static int st_aniso = -2, st_aa = -2;
@@ -162,6 +164,7 @@ int main(void)
     set_env("RECOMP_GFX_CRASH_60FPS", NULL);
     set_env("RECOMP_GFX_SPLIT_60FPS", NULL);
     set_env("RECOMP_AUDIO_SPLIT_MUSIC", NULL);
+    set_env("RECOMP_AUDIO_CUSTOM_LEVEL", NULL);
     set_env("RECOMP_GFX_VEHICLE_DETAIL", NULL);
 
     xbox_SettingsInit("Test");
@@ -300,6 +303,27 @@ int main(void)
         CHECK(!xbox_SettingsNeedRestart());
     }
     CHECK(!xbox_SettingsNeedRestart());              /* live */
+
+    /* The custom music loudness (BO-132): match as shipped, the four
+     * choices in order, the environment's spelling, live. */
+    {
+        static const char *const names[4] = { "off", "quieter", "match", "louder" };
+        const xs_setting *cl = xbox_SettingGet(XS_AUDIO_CUSTOM_LEVEL);
+        CHECK(!strcmp(cl->key, "audio.custom_music_level") && cl->type == XS_CHOICE);
+        CHECK(xbox_SettingValue(XS_AUDIO_CUSTOM_LEVEL) == 2 && !cl->user && cl->def == 2);
+        CHECK(cl->choices[0] && cl->choices[3] && !cl->choices[4]);
+        for (int i = 0; i < 4; i++) {
+            CHECK(!strcmp(cl->choices[i], names[i]));
+            xbox_SettingSet(XS_AUDIO_CUSTOM_LEVEL, i);
+            CHECK(st_custom_level == i);
+            CHECK(xbox_SettingValue(XS_AUDIO_CUSTOM_LEVEL) == i);
+            CHECK(recomp_env(RENV_AUDIO_CUSTOM_LEVEL) && !strcmp(recomp_env(RENV_AUDIO_CUSTOM_LEVEL), names[i]));
+        }
+        CHECK(!xbox_SettingsNeedRestart());          /* live */
+        xbox_SettingSet(XS_AUDIO_CUSTOM_LEVEL, 3);
+        xbox_SettingReset(XS_AUDIO_CUSTOM_LEVEL);
+        CHECK(xbox_SettingValue(XS_AUDIO_CUSTOM_LEVEL) == 2 && !cl->user && st_custom_level == 2);
+    }
 
     /* A live change reaches the runtime, the cached environment and the file. */
     xbox_SettingSet(XS_POWER_MODE, 1);
@@ -524,6 +548,24 @@ int main(void)
     }
     xbox_SettingReset(XS_INPUT_GLYPHS);
     CHECK(st_glyphs == 0);
+
+    /* audio.custom_music_level in the file: written by name when changed,
+     * forgotten at the default, read back from the file at start. */
+    xbox_SettingSet(XS_AUDIO_CUSTOM_LEVEL, 1);
+    xbox_SettingsFlush();
+    {
+        char err[256];
+        recomp_cfg *c = recomp_cfg_load_file(path, err, sizeof err);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(!strcmp(recomp_cfg_string(c, "audio.custom_music_level", ""), "quieter"));
+            recomp_cfg_free(c);
+        }
+    }
+    xbox_SettingReset(XS_AUDIO_CUSTOM_LEVEL);
+    xbox_SettingsFlush();
+    text = read_file(path);
+    CHECK(text && !strstr(text, "custom_music_level"));
 
     /* graphics.ui_scale in the file: written by name. */
     xbox_SettingSet(XS_GRAPHICS_UI_SCALE, 2);

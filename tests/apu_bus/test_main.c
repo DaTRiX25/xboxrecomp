@@ -9,6 +9,8 @@
  *
  * Run with: ctest --test-dir <build> */
 #include "common.h"
+#include "apu_level.h"
+#include <time.h>
 
 static int s_fail;
 #define CHECK(cond, ...) do { if (!(cond)) { s_fail++; fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -95,8 +97,13 @@ static void test_identity(void)
             if (memcmp(oa, ob, sizeof(int16_t) * (six ? 6 : 2) * NUM_SAMPLES_PER_FRAME)) {
                 if (six) bad_51++; else bad_st++;
             }
-            for (int i = 0; i < NUM_SAMPLES_PER_FRAME * (six ? 6 : 2); i++)
-                clipped += oa[i] == 32767 || oa[i] == -32767;
+            {
+                /* What the clamp alone (today's output) cuts: the set must reach it. */
+                int16_t o0[NUM_SAMPLES_PER_FRAME * 6];
+                dsp_out_lim(A, six, o0, 0);
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME * (six ? 6 : 2); i++)
+                    clipped += o0[i] == 32767 || o0[i] == -32767;
+            }
         }
     }
     {
@@ -125,6 +132,349 @@ static void test_identity(void)
     printf("identity: 600 frames x 24 voices, stereo and 5.1: %lu / %lu / %lu frames differ"
            " (mixbins / stereo / 5.1), %lu clamped samples covered\n",
            bad_bins, bad_st, bad_51, clipped);
+}
+
+/* The safety limiter (apu_limit.h) on the real DSP stage: against the
+ * clamp alone, which is today's output. A frame whose clamp-alone output
+ * stays under the ceiling must come out the same bytes; one that does not
+ * must come out at or under it. Each frame starts from the idle limiter,
+ * as every comparison here does. Scaled sets: 1 (clips), 0.08 and 0.04 (never
+ * reaches the ceiling: the whole run must be identical). */
+static void test_limiter_identity(void)
+{
+    static tvoice vv[24];
+    static float A[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    unsigned long frames = 0, quiet = 0, quiet_bad = 0, loud = 0, loud_bad = 0, over_samples = 0;
+
+    for (int pass = 0; pass < 3; pass++) {
+        const float scale = pass == 0 ? 1.0f : pass == 1 ? 0.08f : 0.04f;
+        for (int frame = 0; frame < 300; frame++) {
+            for (int k = 0; k < 24; k++) {
+                make_voice(&vv[k], k + frame + 7 * pass);
+                for (int b = 0; b < 8; b++) vv[k].g[b] *= scale;
+            }
+            memset(A, 0, sizeof(A));
+            for (int k = 0; k < 24; k++) old_mix(A, &vv[k]);
+            for (int six = 0; six < 2; six++) {
+                int16_t on[NUM_SAMPLES_PER_FRAME * 6], off[NUM_SAMPLES_PER_FRAME * 6];
+                const int n = NUM_SAMPLES_PER_FRAME * (six ? 6 : 2);
+                int over = 0;
+                dsp_out_lim(A, six, on, 1);
+                dsp_out_lim(A, six, off, 0);
+                for (int i = 0; i < n; i++)
+                    if (abs(off[i]) > LIM_CEIL16) { over = 1; over_samples++; }
+                frames++;
+                if (!over) {
+                    quiet++;
+                    if (memcmp(on, off, sizeof(int16_t) * (size_t)n)) quiet_bad++;
+                } else {
+                    loud++;
+                    for (int i = 0; i < n; i++)
+                        if (abs(on[i]) > LIM_CEIL16) {
+                            if (getenv("LIMDBG")) fprintf(stderr, "dbg six=%d i=%d ch=%d on=%d off=%d\n", six, i, six ? i % 6 : i % 2, on[i], off[i]);
+                            loud_bad++; break; }
+                }
+            }
+        }
+    }
+    CHECK(quiet > 1000, "the quiet sets never stay under the ceiling (%lu frames)", quiet);
+    CHECK(loud > 100, "the loud set never reaches the ceiling (%lu frames)", loud);
+    CHECK(!quiet_bad, "safety limiter: %lu of %lu frames under the ceiling differ from the clamp alone", quiet_bad, quiet);
+    CHECK(!loud_bad, "safety limiter: %lu of %lu frames over the ceiling come out above it", loud_bad, loud);
+    printf("limiter on the DSP stage: %lu frames (stereo and 5.1); %lu stayed under the ceiling and differ from the"
+           " clamp alone in %lu; %lu went over it (%lu samples) and %lu of those still show a sample above -0.5 dBFS\n",
+           frames, quiet, quiet_bad, loud, over_samples, loud_bad);
+}
+
+/* ── the safety limiter's own behaviour ── */
+
+static void test_limiter(void)
+{
+    static float f[2][APU_LIMIT_FRAME], ref[2][APU_LIMIT_FRAME];
+    const double w = 2.0 * 3.14159265358979 * 1000.0 / 48000.0;
+    float peak = 0.0f;
+    unsigned long moved = 0;
+
+    /* A sine over full scale (1.5 = +3.5 dBFS) for one second comes out at
+     * or under the ceiling, both channels the same gain. */
+    apu_limit_reset();
+    apu_limit_enable(1);
+    for (int blk = 0; blk < 1500; blk++) {
+        for (int i = 0; i < APU_LIMIT_FRAME; i++) {
+            const float x = 1.5f * (float)sin(w * (blk * APU_LIMIT_FRAME + i));
+            f[0][i] = x; f[1][i] = 0.5f * x;
+        }
+        apu_limit(f, 2, APU_LIMIT_FRAME);
+        for (int i = 0; i < APU_LIMIT_FRAME; i++) {
+            if (fabsf(f[0][i]) > peak) peak = fabsf(f[0][i]);
+            if (fabsf(f[1][i]) > 0.5f * 0.94407f) { CHECK(0, "second channel above its share of the ceiling"); break; }
+        }
+    }
+    CHECK(peak <= 0.94407f, "limited peak %.5f is over the ceiling 0.94406", peak);
+    CHECK(peak >= 0.94f, "limited peak %.5f is far under the ceiling: the limiter pulls too hard", peak);
+    printf("limiter: +3.5 dBFS sine in, peak out %.4f (ceiling %.4f = -0.5 dBFS), reduction now %.2f dB\n",
+           peak, 0.94406, apu_limit_reduction_db());
+
+    /* Instant attack: the first sample over the ceiling is itself on it. */
+    apu_limit_reset();
+    memset(f, 0, sizeof(f));
+    f[0][10] = 2.0f; f[1][10] = -1.0f;
+    apu_limit(f, 2, APU_LIMIT_FRAME);
+    CHECK(fabsf(f[0][10]) <= 0.94407f && f[0][10] > 0.94f, "the first sample over is not limited at once: %f", f[0][10]);
+    CHECK(f[1][10] < 0 && fabsf(f[1][10] - (-0.47203f)) < 0.001f, "the channels are not linked: %f", f[1][10]);
+
+    /* Release: a burst, then quiet. The gain recovers by 1 - 1/e of the
+     * way in about 50 ms and is exactly 1 again, the samples untouched. */
+    apu_limit_reset();
+    memset(f, 0, sizeof(f));
+    f[0][0] = 1.5f;                                 /* gain 0.6294 from here */
+    apu_limit(f, 2, APU_LIMIT_FRAME);
+    {
+        const float g0 = powf(10.0f, -apu_limit_reduction_db() / 20.0f);
+        float g50 = 0.0f, g_end = 0.0f;
+        int exact_at = -1;
+        CHECK(fabsf(g0 - 0.6294f) < 0.007f, "gain after the peak %.4f, expected 0.6294 plus 31 samples of release", g0);
+        for (int blk = 1; blk <= 1500 && exact_at < 0; blk++) {
+            for (int i = 0; i < APU_LIMIT_FRAME; i++) { f[0][i] = 0.3f; f[1][i] = -0.3f; }
+            apu_limit(f, 2, APU_LIMIT_FRAME);
+            if (blk * APU_LIMIT_FRAME >= 2400 && g50 == 0.0f)       /* 50 ms later */
+                g50 = powf(10.0f, -apu_limit_reduction_db() / 20.0f);
+            if (apu_limit_reduction_db() == 0.0f) exact_at = blk * APU_LIMIT_FRAME;
+            g_end = f[0][APU_LIMIT_FRAME - 1];
+        }
+        {
+            const float want = 1.0f - (1.0f - g0) * expf(-1.0f);
+            CHECK(fabsf(g50 - want) < 0.01f, "gain 50 ms after the peak %.4f, expected %.4f", g50, want);
+            CHECK(exact_at > 0 && exact_at < 48000, "the gain never came back to exactly 1");
+            CHECK(g_end == 0.3f, "samples touched after the release: %f", g_end);
+            printf("limiter: peak at 1.5 -> gain %.3f; 50 ms later %.3f (1/e point %.3f); exactly 1 again after %d ms\n",
+                   g0, g50, want, exact_at / 48);
+        }
+    }
+
+    /* Under the ceiling: not a bit moves, nothing is counted as engaged. */
+    apu_limit_reset();
+    for (int blk = 0; blk < 1500; blk++) {
+        for (int i = 0; i < APU_LIMIT_FRAME; i++) {
+            const float x = 0.9f * (float)sin(w * (blk * APU_LIMIT_FRAME + i));
+            ref[0][i] = f[0][i] = x; ref[1][i] = f[1][i] = -x;
+        }
+        apu_limit(f, 2, APU_LIMIT_FRAME);
+        if (memcmp(f, ref, sizeof(f))) moved++;
+    }
+    CHECK(!moved && apu_limit_engaged() == 0, "a 0.9 sine (-0.9 dBFS) was touched in %lu blocks", moved);
+    printf("limiter: 1 s of a -0.9 dBFS sine: %lu blocks changed, %lu samples engaged\n", moved, apu_limit_engaged());
+    apu_limit_reset();
+}
+
+/* ── the custom-music leveller ── */
+
+static float noise_amp(float e_db)         /* uniform noise per channel, E = 2 p */
+{
+    return sqrtf(3.0f * 0.5f * powf(10.0f, e_db / 10.0f));
+}
+
+/* seconds of noise at E dB through the leveller; returns the gain at the end */
+static float lv_run(apu_level_state *st, float e_db, float secs, float target, float *at_s, float *gain_at, int n_at)
+{
+    static float blk[32][2];
+    const float a = e_db <= -200.0f ? 0.0f : noise_amp(e_db);
+    const int frames = (int)(secs * 1500.0f);
+    float gl = 1.0f;
+    for (int f = 0; f < frames; f++) {
+        for (int i = 0; i < 32; i++) { blk[i][0] = a * frand(); blk[i][1] = a * frand(); }
+        gl = apu_level_frame(st, blk, 2, target);
+        for (int k = 0; k < n_at; k++)
+            if (f + 1 == (int)(at_s[k] * 1500.0f)) gain_at[k] = st->gain_db;
+    }
+    (void)gl;
+    return st->gain_db;
+}
+
+static int lv_fill(void *ctx, apu_bus_voice *v) { v->stream = 1; v->nstack = *(int *)ctx; return 1; }
+static int lv_class(const apu_bus_voice *v) { return v->nstack == 7; }
+
+static void test_leveller(void)
+{
+    const float T = APU_LEVEL_TARGET_DB;
+    apu_level_state st;
+    float g;
+
+    /* A loud master (-7.5) is pulled down to the target: -8 dB. */
+    apu_level_state_init(&st, -1000.0f);
+    g = lv_run(&st, -7.5f, 20.0f, T, NULL, NULL, 0);
+    CHECK(fabsf(g - (T + 7.5f)) < 0.5f, "loud song: gain %.2f dB, expected %.2f", g, T + 7.5f);
+    printf("leveller: noise at E = -7.5 dB, 20 s: gain %+.2f dB (envelope %.2f dB, target %.1f)\n", g, st.env_db, T);
+
+    /* A quiet one is brought up, never past +6 dB. */
+    apu_level_state_init(&st, -1000.0f);
+    g = lv_run(&st, -30.0f, 20.0f, T, NULL, NULL, 0);
+    CHECK(g <= APU_LEVEL_MAX_DB + 1e-4f && g > APU_LEVEL_MAX_DB - 0.3f, "quiet song: gain %.2f dB, expected +6 at the limit", g);
+    apu_level_state_init(&st, -1000.0f);
+    g = lv_run(&st, -19.0f, 20.0f, T, NULL, NULL, 0);
+    CHECK(fabsf(g - 4.0f) < 0.5f, "song 4 dB under: gain %.2f dB, expected +4", g);
+    printf("leveller: -30 dB-like noise: gain %+.2f dB (limit +6); -19: %+.2f dB (4 dB under the target)\n",
+           lv_run(&(apu_level_state){0}, -30.0f, 1.0f, T, NULL, NULL, 0), g);
+
+    /* A very loud one is limited to -15 dB. */
+    apu_level_state_init(&st, -1000.0f);
+    g = lv_run(&st, 3.0f, 10.0f, T, NULL, NULL, 0);
+    CHECK(g >= APU_LEVEL_MIN_DB - 1e-4f && g < APU_LEVEL_MIN_DB + 0.3f, "very loud song: gain %.2f dB, expected -15", g);
+
+    /* Silence, a very quiet intro and a fade out do not move the gain. */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        float g0 = lv_run(&st, -7.5f, 20.0f, T, NULL, NULL, 0), g1, g2;
+        g1 = lv_run(&st, -200.0f, 15.0f, T, NULL, NULL, 0);     /* digital silence */
+        CHECK(fabsf(g1 - g0) < 0.05f, "silence moved the gain: %.4f -> %.4f", g0, g1);
+        g2 = lv_run(&st, -48.0f, 15.0f, T, NULL, NULL, 0);      /* a very quiet passage */
+        CHECK(fabsf(g2 - g0) < 0.1f, "a quiet passage (-48) moved the gain: %.3f -> %.3f", g0, g2);
+        printf("leveller: gain %+.3f dB; after 15 s of silence %+.3f; after 15 s at -48 dB %+.3f\n", g0, g1, g2);
+    }
+    /* A fade out over 8 s from -7.5 to -60: the gain stays. */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        static float blk[32][2];
+        float g0 = lv_run(&st, -7.5f, 20.0f, T, NULL, NULL, 0), gmax = g0;
+        for (int f = 0; f < 8 * 1500; f++) {
+            const float e = -7.5f - 52.5f * (float)f / (8.0f * 1500.0f);
+            const float a = noise_amp(e);
+            for (int i = 0; i < 32; i++) { blk[i][0] = a * frand(); blk[i][1] = a * frand(); }
+            apu_level_frame(&st, blk, 2, T);
+            if (st.gain_db > gmax) gmax = st.gain_db;
+        }
+        CHECK(gmax - g0 < 0.5f, "a fade out wound the gain up by %.2f dB", gmax - g0);
+        printf("leveller: 8 s fade out (-7.5 to -60): the gain's highest point %+.2f dB over where it was\n", gmax - g0);
+    }
+
+    /* A step from a quiet passage to a loud one is caught. */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        float at[4] = { 0.1f, 0.3f, 0.6f, 1.5f }, ga[4] = { 0 };
+        float g0 = lv_run(&st, -22.0f, 30.0f, T, NULL, NULL, 0);        /* +6.5 -> +6 */
+        float want = T + 7.5f, g10;
+        lv_run(&st, -7.5f, 2.0f, T, at, ga, 4);
+        g10 = lv_run(&st, -7.5f, 8.0f, T, NULL, NULL, 0);
+        CHECK(fabsf(g10 - want) < 1.0f, "step: %.2f dB ten seconds after, settles at %.2f", g10, want);
+        printf("leveller: quiet to loud step (+14.5 dB): gain %+.2f dB before; after 0.1 / 0.3 / 0.6 / 1.5 s: %+.2f / %+.2f / %+.2f / %+.2f (settles at %+.2f, reached %+.2f after 10 s)\n",
+               g0, ga[0], ga[1], ga[2], ga[3], want, g10);
+        /* The gain follows with a 0.3 s time constant: 63 % of the way is a
+         * time constant after the envelope has seen the step. */
+        CHECK(ga[1] < g0 - 0.30f * (g0 - want), "step: %.2f dB at 0.3 s is less than 30%% of the way from %.2f to %.2f", ga[1], g0, want);
+        CHECK(ga[2] < g0 - 0.60f * (g0 - want), "step: %.2f dB at 0.6 s is less than 60%% of the way from %.2f to %.2f", ga[2], g0, want);
+        CHECK(ga[3] < want + 4.0f, "step: still %.2f dB at 1.5 s (settles at %.2f)", ga[3], want);
+    }
+    /* Beat-like level changes inside a song (a break 8 dB down for 1 s)
+     * do not pump: the gain moves under 1 dB. */
+    apu_level_state_init(&st, -1000.0f);
+    {
+        float g0 = lv_run(&st, -7.5f, 20.0f, T, NULL, NULL, 0), lo = g0, hi = g0;
+        for (int rep = 0; rep < 6; rep++) {
+            lv_run(&st, -15.5f, 1.0f, T, NULL, NULL, 0);
+            if (st.gain_db < lo) lo = st.gain_db;
+            if (st.gain_db > hi) hi = st.gain_db;
+            lv_run(&st, -7.5f, 3.0f, T, NULL, NULL, 0);
+            if (st.gain_db < lo) lo = st.gain_db;
+            if (st.gain_db > hi) hi = st.gain_db;
+        }
+        CHECK(hi - lo < 1.5f, "a 1 s break pumped the gain by %.2f dB", hi - lo);
+        printf("leveller: 1 s breaks 8 dB down every 4 s: the gain moved within %.2f dB\n", hi - lo);
+    }
+    /* The offsets of the three levels. */
+    CHECK(apu_level_mode_offset_db(APU_LEVEL_QUIETER) == -4.0f && apu_level_mode_offset_db(APU_LEVEL_MATCH) == 0.0f
+          && apu_level_mode_offset_db(APU_LEVEL_LOUDER) == 4.0f, "mode offsets");
+    apu_level_state_init(&st, -1000.0f);
+    g = lv_run(&st, -7.5f, 20.0f, T - 4.0f, NULL, NULL, 0);
+    CHECK(fabsf(g - (T - 4.0f + 7.5f)) < 0.5f, "quieter: gain %.2f", g);
+
+    /* Voices: only the classifier's voices are touched, off touches none,
+     * and a new song starts at the gain the last one settled on. */
+    {
+        static float a[32][2], b[32][2], keep[32][2];
+        int custom = 7, other = 3;
+        float gain1 = 0, first = 0;
+        const float amp = noise_amp(-7.5f);
+        apu_level_set_classifier(lv_class);
+        apu_level_set_mode(APU_LEVEL_MATCH);
+        for (int i = 0; i < 32; i++) { a[i][0] = amp * frand(); a[i][1] = amp * frand(); }
+        memcpy(keep, a, sizeof(a));
+        for (int f = 0; f < 15 * 1500; f++) {
+            for (int i = 0; i < 32; i++) { b[i][0] = amp * frand(); b[i][1] = amp * frand(); }
+            memcpy(a, b, sizeof(a));
+            apu_level_voice(5, 1, lv_fill, &custom, a, 2);                  /* song 1 */
+            if (f == 15 * 1500 - 1) {
+                double ra = 0, rb = 0;
+                for (int i = 0; i < 32; i++) { ra += a[i][0] * a[i][0]; rb += b[i][0] * b[i][0]; }
+                gain1 = 10.0f * log10f((float)(ra / rb));
+            }
+        }
+        CHECK(fabsf(gain1 - (T + 7.5f)) < 0.7f, "voice path: gain %.2f dB", gain1);
+        memcpy(a, b, sizeof(a));
+        apu_level_voice(5, 2, lv_fill, &custom, a, 2);                      /* song 2 starts */
+        {
+            double ra = 0, rb = 0;
+            for (int i = 0; i < 32; i++) { ra += a[i][0] * a[i][0]; rb += b[i][0] * b[i][0]; }
+            first = 10.0f * log10f((float)(ra / rb));
+        }
+        CHECK(fabsf(first - gain1) < 0.3f, "a new song starts at %.2f dB, the last settled at %.2f", first, gain1);
+        printf("leveller: voice path: song 1 settled at %+.2f dB, song 2 starts at %+.2f dB\n", gain1, first);
+        /* another kind of voice: untouched */
+        memcpy(a, b, sizeof(a));
+        apu_level_voice(6, 1, lv_fill, &other, a, 2);
+        CHECK(!memcmp(a, b, sizeof(a)), "a voice the classifier refuses was touched");
+        /* off: nothing runs */
+        apu_level_set_mode(APU_LEVEL_OFF);
+        CHECK(!apu_level_active(), "off is active");
+        memcpy(a, b, sizeof(a));
+        apu_level_voice(5, 2, lv_fill, &custom, a, 2);
+        CHECK(!memcmp(a, b, sizeof(a)), "off touched a voice");
+        apu_level_set_mode(APU_LEVEL_MATCH);
+        apu_level_set_classifier(NULL);
+        CHECK(!apu_level_active(), "no classifier but active");
+        (void)keep;
+    }
+}
+
+/* What the two stages cost a sample. Printed, and bounded generously (a
+ * Deck core does an order of magnitude less than 1 % on this). */
+static double now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e9 + ts.tv_nsec;
+}
+
+static void test_cost(void)
+{
+    static float f[6][APU_LIMIT_FRAME], blk[32][2];
+    const int frames = 1500 * 20;           /* 20 s of audio */
+    double t0, t_idle, t_hot, t_lv;
+    volatile float sink = 0;
+    apu_level_state st;
+
+    apu_limit_reset();
+    for (int c = 0; c < 6; c++) for (int i = 0; i < 32; i++) f[c][i] = 0.5f * frand();
+    t0 = now_ns();
+    for (int k = 0; k < frames; k++) { apu_limit(f, 6, 32); sink += f[0][0]; }
+    t_idle = (now_ns() - t0) / ((double)frames * 32);
+    for (int c = 0; c < 6; c++) for (int i = 0; i < 32; i++) f[c][i] = 1.6f * frand();
+    t0 = now_ns();
+    for (int k = 0; k < frames; k++) {
+        for (int c = 0; c < 6; c++) for (int i = 0; i < 32; i++) f[c][i] = 1.6f * (float)((i * 7 + c + k) % 11 - 5) / 5.0f;
+        apu_limit(f, 6, 32); sink += f[0][0];
+    }
+    t_hot = (now_ns() - t0) / ((double)frames * 32);
+    apu_level_state_init(&st, -1000.0f);
+    for (int i = 0; i < 32; i++) { blk[i][0] = 0.3f * frand(); blk[i][1] = 0.3f * frand(); }
+    t0 = now_ns();
+    for (int k = 0; k < frames; k++) { apu_level_frame(&st, blk, 2, APU_LEVEL_TARGET_DB); sink += blk[0][0]; }
+    t_lv = (now_ns() - t0) / ((double)frames * 32);
+    (void)sink;
+    printf("cost: safety limiter %.2f ns a sample (6 channels, nothing over the ceiling; the loop is the whole cost),"
+           " %.2f ns while limiting (incl. refilling the block); leveller %.2f ns a sample per custom voice (stereo)."
+           " On a 48 kHz stream: limiter %.3f %%, leveller %.3f %% of a core\n",
+           t_idle, t_hot, t_lv, t_idle * 48000e-7, t_lv * 48000e-7);
+    CHECK(t_idle < 100.0 && t_lv < 200.0, "the stages cost too much a sample: %.1f / %.1f ns", t_idle, t_lv);
 }
 
 static void test_controls(void)
@@ -683,6 +1033,10 @@ int main(void)
     dsp_setup();
     apu_bus_set_names(k_names, 13);
     test_identity();
+    test_limiter_identity();
+    test_limiter();
+    test_leveller();
+    test_cost();
     test_controls();
     test_output();
     test_duck();

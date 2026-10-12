@@ -66,6 +66,7 @@ static const char *const k_vehicle_detail[] = { "original", "far", "farthest", N
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
 static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
 static const char *const k_timing[]   = { "legacy", "auto", NULL };
+static const char *const k_custom_level[] = { "off", "quieter", "match", "louder", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
 #define SETTING(k, t, f, e, c, ev, mn, mx, b) \
@@ -140,6 +141,10 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_ADVANCED_DIAG_LOG]  = SETTING("advanced.diagnostic_log", XS_BOOL, 0, RENV_LOG_DIAG, NULL, NULL, 0, 0, 1),
     /* Off as shipped: the title's own textures, bit for bit. */
     [XS_GRAPHICS_UI_SCALE]  = SETTING("graphics.ui_scale", XS_CHOICE, 0, RENV_GFX_UI_SCALE, k_ui_scale, NULL, 0, 0, 0),
+    /* The custom soundtrack brought to the level of the title's own music
+     * (apu_level.h, BO-132); off is the title's sends as they are, bit for
+     * bit. Match as shipped. Live. */
+    [XS_AUDIO_CUSTOM_LEVEL] = SETTING("audio.custom_music_level", XS_CHOICE, 0, RENV_AUDIO_CUSTOM_LEVEL, k_custom_level, NULL, 0, 0, 2),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
 #endif
@@ -395,6 +400,9 @@ static void apply(xs_id id)
             XR_NOTICE("[LOG] diagnostic logging %s\n", now ? "on" : "off");
         break;
     }
+    case XS_AUDIO_CUSTOM_LEVEL:
+        mcpx_apu_set_custom_level((int)v);
+        break;
     case XS_AUDIO_LFE_LOWPASS:
         mcpx_apu_set_lfe_lowpass(atoi(k_lfe_lowpass[(int)v]));
         break;

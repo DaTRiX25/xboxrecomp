@@ -40,6 +40,7 @@ static void mix_trace_on_off(MCPXAPUState *d, unsigned v, int on);
  * the mixer off; each voice's turn-on count and, with the mixer or the mix
  * study on, the guest return addresses of who turned it on. */
 #include "apu_bus.h"
+#include "apu_level.h"
 #include "apu.h"
 static struct apu_bus_rt *s_bus_rt;
 static int s_bus_audition;              /* this frame: an audition clip loops */
@@ -315,7 +316,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
         if (selected_handle < MCPX_HW_MAX_VOICES) {
             s_von_serial[selected_handle]++;
-            if ((s_mix_on || apu_bus_enabled()) && s_mix_tag_fn)
+            if ((s_mix_on || apu_bus_enabled() || apu_level_active()) && s_mix_tag_fn)
                 s_von_nstack[selected_handle] =
                     (uint8_t)s_mix_tag_fn(s_von_stack[selected_handle], 16);
             else
@@ -2019,6 +2020,15 @@ static void voice_process(MCPXAPUState *d,
         if (mix_rec_on())
             mix_rec_voice(d, v, (const float (*)[2])samples, channels, bin, vol,
                           ea_value, multipass);
+    }
+
+    /* The custom soundtrack's leveller (apu_level.h): the song's samples
+     * scaled before the title's sends and the mixer's buses see them. Not
+     * a thing for any other voice, and not run at all when set to off. */
+    if (apu_level_active() && voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                            NV_PAVS_VOICE_CFG_FMT_DATA_TYPE)) {
+        struct bus_fill_ctx lc = { d, v, bin, 0, 0 };
+        apu_level_voice(v, s_von_serial[v], bus_fill, &lc, samples, channels);
     }
 
     /* Mix into bins */

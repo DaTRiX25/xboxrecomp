@@ -16,6 +16,8 @@ add_library(xbox_apu STATIC
     apu_wav.c
     apu_speakers.c
     apu_bus.c
+    apu_limit.c
+    apu_level.c
     apu_gp.c
     apu_dsp56k.c
     apu_oracle_cap.c

@@ -55,7 +55,7 @@ int main(int argc, char **argv)
     struct { uint8_t tag, channels; uint16_t v; int32_t bin[8]; float g[8]; } h;
     static tvoice vv[512];
     unsigned long frames = 0, voices = 0, bad_game = 0, bad_bins = 0, bad_st = 0, bad_51 = 0;
-    unsigned long sounding = 0;
+    unsigned long sounding = 0, lim_quiet = 0, lim_quiet_bad = 0, lim_loud = 0, lim_loud_bad = 0;
     double peak = 0;
     int nv = 0, c;
     apu_bus_config cfg, busy;
@@ -126,6 +126,27 @@ int main(int argc, char **argv)
                 }
                 for (int i = 0; i < NUM_SAMPLES_PER_FRAME * (six ? 6 : 2); i++)
                     if (abs(oa[i]) > peak) peak = abs(oa[i]);
+                {
+                    /* The safety limiter (apu_limit.h) against the clamp
+                     * alone, which is the output before it existed: a frame
+                     * under the ceiling must be the same bytes, one over it
+                     * must come out at or under. */
+                    int16_t o0[NUM_SAMPLES_PER_FRAME * 6];
+                    const int n = NUM_SAMPLES_PER_FRAME * (six ? 6 : 2);
+                    int over = 0, still = 0;
+                    dsp_out_lim(A, six, o0, 0);
+                    for (int i = 0; i < n; i++)
+                        if (abs(o0[i]) > LIM_CEIL16) over = 1;
+                    if (!over) {
+                        lim_quiet++;
+                        if (memcmp(oa, o0, sizeof(int16_t) * (size_t)n)) lim_quiet_bad++;
+                    } else {
+                        lim_loud++;
+                        for (int i = 0; i < n; i++)
+                            if (abs(oa[i]) > LIM_CEIL16) still = 1;
+                        lim_loud_bad += still;
+                    }
+                }
             }
             frames++;
             nv = 0;
@@ -140,9 +161,11 @@ int main(int argc, char **argv)
     printf("frames where the mixer's mixbins (on, neutral) differ from it:   %lu\n", bad_bins);
     printf("frames where the s16 output differs, mixer off vs on, stereo:    %lu\n", bad_st);
     printf("frames where the s16 output differs, mixer off vs on, 5.1:       %lu\n", bad_51);
+    printf("safety limiter against the clamp alone (stereo and 5.1 frames): %lu under the ceiling, of which differ: %lu;"
+           " %lu over it, of which still above it: %lu\n", lim_quiet, lim_quiet_bad, lim_loud, lim_loud_bad);
     printf("cost a VP frame (32 samples, %.0f voices): the loop alone %.2f us, mixer neutral %.2f us,"
            " mixer with everything on %.2f us; a second of audio is 1500 frames: %.2f%% / %.2f%% / %.2f%% of a core\n",
            (double)voices / frames, t_old / frames, t_neutral / frames, t_busy / frames,
            t_old / frames * 0.15, t_neutral / frames * 0.15, t_busy / frames * 0.15);
-    return frames && !bad_game && !bad_bins && !bad_st && !bad_51 ? 0 : 1;
+    return frames && !bad_game && !bad_bins && !bad_st && !bad_51 && !lim_quiet_bad && !lim_loud_bad ? 0 : 1;
 }

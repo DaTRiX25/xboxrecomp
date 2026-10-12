@@ -141,6 +141,7 @@ static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL 
 static const char *const n_lod[]       = { "Off", "Auto (from the render scale)", "-0.5", "-1.0", "-1.5", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
+static const char *const n_custom_level[] = { "Off", "Quieter", "Match game music", "Louder", NULL };
 static const char *const n_lfe_lowpass[] = { "Off", "80 Hz", "100 Hz", "120 Hz", NULL };
 #if defined(__ANDROID__)
 static const char *const n_vibration[] = { "Auto", "Controller", "This device", "Off", NULL };
@@ -208,6 +209,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_ADVANCED_PERF_STEPS */ { "Graph: simulation steps", "The frame-time graph also marks the frames in which the game ran more than one simulation step (it does when its frame rate drops).", 1, FMT_PLAIN, NULL, 0 },
     /* XS_ADVANCED_DIAG_LOG */  { "Diagnostic logging", "Off: the game writes only errors and a few start-up facts. On: it writes the full diagnostic log, which a bug report then includes (at most about 830 KB a run, the last three runs kept). Switch it on, restart the game so the log has the start too, reproduce the problem, then create the bug report.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_UI_SCALE */  { "Menu and HUD upscaling", "Redraws the game's 2D art (menu text, HUD, icons, logos) at 2 or 4 times its size with an edge-following scaler (Super-xBR), for a render scale above 1x. Off is the original. The 3D world is not touched. Changes at once. The sharper pictures are made in the background and kept on disk, so new art can show unscaled for a moment the first time; uses more texture memory.", 1, FMT_PLAIN, n_ui_scale, 0 },
+    /* XS_AUDIO_CUSTOM_LEVEL */ { "Custom music loudness", "Modern songs are mastered much louder than the game's own music, and the game plays them louder still: the sound distorts. Match game music brings each song to the level of EA GAMES TRAX with a slow gain (it never pumps within a song), Quieter and Louder sit 4 dB under and over that. Off plays your songs as the game sends them. Applies to custom music only.", 1, FMT_PLAIN, n_custom_level, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -669,6 +671,8 @@ static int page_rows(int page, Row *r)
                 INFO(s_mf_note[k]);
             }
         }
+        if (s_mf)
+            SET(XS_AUDIO_CUSTOM_LEVEL);
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
         /* The dry effect sends' level: only where no model of the title's
          * effects image runs (apu_gp.h); with one they are not dry. */

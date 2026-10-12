@@ -11,6 +11,7 @@
  *   apu_speakers_test <scratch.wav>
  */
 #include "apu_speakers.h"
+#include "apu_limit.h"
 #include "apu_wav.h"
 
 #include <math.h>
@@ -148,12 +149,28 @@ static void test_same_conversion(void)
         for (int i = 0; i < N; i++)
             bins[b][i] = (float)(rand() % 2001 - 1000) / 4000.0f;   /* sums clip */
     }
+    /* The clamp alone (the safety limiter, apu_limit.h, off): the
+     * conversion this test is about. */
+    apu_limit_enable(0);
     apu_spk_mix51(&bins[0][0], N, m, NULL, six, N);
     stereo_fold(two);
     for (int i = 0; i < N; i++)
         if (six[i][APU_SPK_FL] != two[i][0] || six[i][APU_SPK_FR] != two[i][1])
             same = 0;
     CHECK("front pair = stereo fold, bit for bit", same);
+    /* With the limiter on, the same clipping sums come out at or under -0.5 dBFS. */
+    apu_limit_enable(1);
+    apu_limit_reset();
+    apu_spk_mix51(&bins[0][0], N, m, NULL, six, N);
+    {
+        int under = 1, hot = 0;
+        for (int i = 0; i < N; i++)
+            for (int c = 0; c < 2; c++) {
+                if (abs(six[i][c]) > 30934) under = 0;
+                if (abs(two[i][c]) == 32767) hot = 1;
+            }
+        CHECK("the limiter keeps the clipping sums under the ceiling", under && hot);
+    }
     for (int i = 0; i < N; i++)
         for (int c = APU_SPK_FC; c < APU_SPK_CHANNELS; c++)
             CHECK("the rest silent", six[i][c] == 0);

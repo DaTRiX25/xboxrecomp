@@ -190,6 +190,9 @@ void apu_wav_write(const int16_t *samples, int count)
         if (s_frames >= s_next_refresh) {
             write_header();
             s_next_refresh = s_frames + APU_WAV_RATE;
+            /* A mark in the log once a second of audio, for a driver that
+             * lays the dump on its own clock (tools/headless/level_report.py). */
+            fprintf(stderr, "[AUDIO-WAV] t=%llu\n", (unsigned long long)(s_frames / APU_WAV_RATE));
         }
     }
     wav_unlock();

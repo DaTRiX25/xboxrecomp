@@ -5,6 +5,7 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_bus.h"
+#include "apu_limit.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -86,7 +87,8 @@ static void dsp_setup(void)
 
 /* One frame of mixbins to s16: out[32][6] (5.1) or out[32][2]. The DSP
  * stage may write into the bins, so it gets a copy. */
-static void dsp_out(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int six, int16_t *out)
+static void dsp_out_lim(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int six, int16_t *out,
+                        int limiter)
 {
     static float copy[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memcpy(copy, mixbins, sizeof(copy));
@@ -94,12 +96,26 @@ static void dsp_out(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int
      * low-pass): every frame starts from the same one, so two sets of bins
      * can be compared by their output. */
     gp_wire();
+    /* The safety limiter (apu_limit.h) has memory too: every frame starts
+     * from its idle state, or off (the clamp alone: today's output). */
+    apu_limit_reset();
+    apu_limit_enable(limiter);
     s_d->monitor.channels = six ? 6 : 2;
     s_d->ep_frame_div = 0;
     mcpx_apu_dsp_frame(s_d, copy);
     if (six) memcpy(out, s_d->monitor.frame_buf6, sizeof(int16_t) * 6 * NUM_SAMPLES_PER_FRAME);
     else     memcpy(out, s_d->monitor.frame_buf, sizeof(int16_t) * 2 * NUM_SAMPLES_PER_FRAME);
+    apu_limit_enable(1);
 }
+
+static void dsp_out(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int six, int16_t *out)
+{
+    dsp_out_lim(mixbins, six, out, 1);
+}
+
+/* The safety limiter's ceiling as a 16-bit value (-0.5 dBFS). */
+#define LIM_CEIL16 30934
+
 
 static const char *const k_names[13] = {
     "Music", "DJ", "Film", "Streams", "Player engine", "Player exhaust", "Other cars",

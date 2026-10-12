@@ -145,6 +145,9 @@ extern "C" {
     X(AUDIO_FX_LEVEL,    CONFIG, "RECOMP_AUDIO_FX_LEVEL",    NULL, "5.1: level of the title's effect-send bins, 0..1 (default 0.25)") \
     X(AUDIO_LFE_LOWPASS, CONFIG, "RECOMP_AUDIO_LFE_LOWPASS", NULL, "low-pass on the LFE (subwoofer) feed of a title whose effects image is modelled: 120 (default: what the console's Dolby Digital encoder did), 100, 80, or off (the full-range feed)") \
     X(AUDIO_MUSIC_DIR,   CONFIG, "RECOMP_AUDIO_MUSIC_DIR",   NULL, "audio.custom_music_dir: a folder of the user's music (mp3, flac, ogg, wav) offered to the title as Xbox custom soundtracks, for a title that plays them (xbox_soundtrack.h); default empty, off") \
+    X(AUDIO_CUSTOM_LEVEL, CONFIG, "RECOMP_AUDIO_CUSTOM_LEVEL", NULL, "audio.custom_music_level: the level of the user's own music (custom soundtracks) against the title's music: off (the title's sends as they are), quieter (-4 dB), match (default: brought to the level of the title's own music), louder (+4 dB); for a title whose port names its custom-soundtrack voices (apu_level.h)") \
+    X(AUDIO_SAFETY_LIMITER, CONFIG, "RECOMP_AUDIO_SAFETY_LIMITER", NULL, "0: the peak limiter in front of the 16-bit clamp (-0.5 dBFS, no look-ahead; apu_limit.h) is off and the clamp alone cuts a mix past full scale, as before it existed (default 1, on; it changes nothing while the mix stays under the ceiling)") \
+    X(AUDIO_LEVEL_LOG,   CONFIG, "RECOMP_AUDIO_LEVEL_LOG",   NULL, "1: the custom-music leveller logs its envelope and gain once a second (default 0)") \
     X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \
     X(AUDIO_BUF_COUNT,   CONFIG, "RECOMP_AUDIO_BUF_COUNT",   NULL, "audio output buffer count") \
     X(CMDLINE,           CONFIG, "RECOMP_CMDLINE",           NULL, "launch-data command line handed to the title") \
