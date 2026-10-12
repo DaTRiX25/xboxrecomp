@@ -937,6 +937,11 @@ int fbv_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pitch
     si.pCommandBuffers = &s_up_cb;
     nvk_queue_lock();
     r = vkQueueSubmit(C->queue, 1, &si, s_up_fence);
+    if (r == VK_SUCCESS) {
+        char what[96];
+        snprintf(what, sizeof what, "window upload %ux%u", w, h);
+        nvk_submit_note(what);
+    }
     nvk_queue_unlock();
     s_up_pending = r == VK_SUCCESS;
     return r == VK_SUCCESS;
@@ -1845,6 +1850,12 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     }
     nvk_queue_lock();
     r = vkQueueSubmit(C->queue, 1, &si, s_fence[s_fi]);
+    if (r == VK_SUCCESS) {
+        char what[96];
+        snprintf(what, sizeof what, "window present flip %u, swapchain %ux%u", flip,
+                 s_sc_ext.width, s_sc_ext.height);
+        nvk_submit_note(what);
+    }
     pr = r == VK_SUCCESS ? vkQueuePresentKHR(C->queue, &pi) : r;
     nvk_queue_unlock();
     if (r == VK_SUCCESS) {

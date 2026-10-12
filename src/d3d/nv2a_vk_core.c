@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "recomp_env.h"
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
@@ -421,6 +422,39 @@ void nvk_set_lost_handler(void (*fn)(const char *why))
     __atomic_store_n(&s_lost_fn, fn, __ATOMIC_RELEASE);
 }
 
+#define SUBMIT_KEEP 64
+static struct { uint64_t n, ns; char what[160]; } s_sub[SUBMIT_KEEP];
+static uint64_t s_sub_n;
+
+uint64_t nvk_submit_note(const char *what)
+{
+    struct timespec ts;
+    uint64_t n = ++s_sub_n;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    s_sub[n % SUBMIT_KEEP].n = n;
+    s_sub[n % SUBMIT_KEEP].ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    snprintf(s_sub[n % SUBMIT_KEEP].what, sizeof s_sub[0].what, "%s", what ? what : "");
+    return n;
+}
+
+/* The kept submits, oldest first, times relative to the last. Under the
+ * queue lock when it can be had at once (a submit that failed is reported
+ * from under it). */
+static void submit_dump(void)
+{
+    int locked = pthread_mutex_trylock(&s_queue_lock) == 0;
+    uint64_t last = s_sub_n, i, first = last > SUBMIT_KEEP ? last - SUBMIT_KEEP + 1 : 1;
+    uint64_t t_last = last ? s_sub[last % SUBMIT_KEEP].ns : 0;
+    fprintf(stderr, "[vulkan] the last %llu of %llu submits (the kernel's 'gpu fault ... ts T'"
+            " is submit #T):\n", (unsigned long long)(last - first + 1),
+            (unsigned long long)last);
+    for (i = first; i <= last; i++)
+        fprintf(stderr, "[vulkan]   #%llu %+.3f ms %s\n", (unsigned long long)s_sub[i % SUBMIT_KEEP].n,
+                -(double)(t_last - s_sub[i % SUBMIT_KEEP].ns) / 1e6, s_sub[i % SUBMIT_KEEP].what);
+    if (locked)
+        pthread_mutex_unlock(&s_queue_lock);
+}
+
 void nvk_device_lost(const char *why)
 {
     void (*fn)(const char *) = __atomic_load_n(&s_lost_fn, __ATOMIC_ACQUIRE);
@@ -428,6 +462,7 @@ void nvk_device_lost(const char *why)
         return;
     fprintf(stderr, "[vulkan] the graphics device is lost (%s): no picture can be drawn in this"
             " run any more\n", why ? why : "?");
+    submit_dump();
     fflush(stderr);
     if (fn) {
         fn(why);

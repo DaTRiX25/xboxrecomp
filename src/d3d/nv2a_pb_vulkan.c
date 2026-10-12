@@ -258,6 +258,13 @@ static uint64_t s_presents, s_clears, s_draws, s_draws_skipped, s_draws_prog,
                 s_tex_changed, s_flushes, s_writebacks, s_submit_errors,
                 s_pso_created, s_pso_since_save, s_frame_waits, s_frame_wait_ns;
 
+/* BO-128: what the command buffers of the next submit hold, for its line in
+ * nvk_submit_note (printed when the device is lost). */
+static struct {
+    uint32_t draws, passes, zpasses, occ, d2, scaled, uploads, swaps, max_idx;
+    uint32_t rt_w, rt_h;
+} s_sn;
+
 static uint64_t now_ns(void)
 {
     struct timespec ts;
@@ -647,7 +654,20 @@ static void flush(int wait, int why)
     if (s_vf)
         t1 = now_ns();
     r = vkQueueSubmit(C->queue, 1, &si, fence);
+    if (r == VK_SUCCESS) {
+        static const char *const why_s[FL_N] = { "flip", "ready", "report", "poll", "ring",
+                                                 "sampler", "readback", "batch" };
+        char what[160];
+        snprintf(what, sizeof what, "backend flip %llu %s%s: %u draws (%u 2D), %u scaled binds, %u passes"
+                 " (%u with depth, last %ux%u), %u occlusion, %u uploads, %u swaps, max %u idx",
+                 (unsigned long long)s_presents, why >= 0 && why < FL_N ? why_s[why] : "?",
+                 fence ? " +fence" : "", s_sn.draws, s_sn.d2, s_sn.scaled, s_sn.passes,
+                 s_sn.zpasses, s_sn.rt_w, s_sn.rt_h, s_sn.occ, s_sn.uploads, s_sn.swaps,
+                 s_sn.max_idx);
+        nvk_submit_note(what);
+    }
     nvk_queue_unlock();
+    memset(&s_sn, 0, sizeof s_sn);
     {
         /* RECOMP_DEBUG=vk_device_lost=<flip>: this submit counts as lost. */
         static long at = -2;
@@ -916,6 +936,10 @@ static void begin_pass(RenderTarget *rt, int clear, const float c[4],
         dt->fresh = 0;
     }
     vkCmdBeginRendering(s_cmd, &ri);
+    s_sn.passes++;
+    s_sn.zpasses += dt != NULL;
+    s_sn.rt_w = rt->hw;
+    s_sn.rt_h = rt->hh;
     if (s_vf) {
         s_vf->passes++;
         s_vf->pass_draws = 0;
@@ -2345,6 +2369,7 @@ static int tex_upload(const Stage *t, unsigned scale, int algo, struct nvk_image
     if (scale && tex_upload_scaled(t, scale, algo, out)) {
         s_bind_scale = scale;
         s_tex_uploads++;
+        s_sn.uploads++;
         return 1;
     }
     t1 = s_pc_trace ? now_ns() : 0;
@@ -2364,6 +2389,7 @@ static int tex_upload(const Stage *t, unsigned scale, int algo, struct nvk_image
         src += (size_t)w * h;
     }
     s_tex_uploads++;
+    s_sn.uploads++;
     if (s_pc_trace) {
         uint64_t t3 = now_ns();
         s_fup.n++;
@@ -2643,6 +2669,7 @@ static VkImageView tex_bind(const Stage *t)
                     e->im = ni;
                     e->up_scale = e->scale;
                     s_tex_uploads++;
+                    s_sn.swaps++;
                 }
             } else if (r != NV2A_TEXSCALE_PENDING) {
                 e->pend = 0;         /* refused or lost: stays as the title's */
@@ -2657,6 +2684,7 @@ static VkImageView tex_bind(const Stage *t)
     }
     e->used = ++s_tc_clock;
     s_bind_scale = e->up_scale;
+    s_sn.scaled += e->up_scale != 0;
     if (ui_scale_log())
         ui_scale_use(e, t, mem);
     return e->im.view;
@@ -3493,6 +3521,10 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     vkCmdBindIndexBuffer(s_cmd, s_ring[RING_IB].buf, ib_off, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(s_cmd, nidx, 1, 0, 0, 0);
     s_draws++;
+    s_sn.draws++;
+    s_sn.d2 += s_draw_2d != 0;
+    if (nidx > s_sn.max_idx)
+        s_sn.max_idx = nidx;
     if (s_vf) {
         s_vf->draws++;
         s_vf->pass_draws++;
@@ -3801,6 +3833,7 @@ static void occ_query_begin(void)
     q->serial[q->n] = s_next_serial;
     q->n++;
     vkCmdBeginQuery(s_cmd, s_vkq, (uint32_t)i, s_qprecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    s_sn.occ++;
     s_occ_slot = i;
 }
 
