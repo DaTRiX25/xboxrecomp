@@ -303,6 +303,12 @@ static volatile LONG s_want_gen;
 static volatile LONG s_scanning;
 static xst_progress  s_progress;
 static void        (*s_done)(int soundtracks, int songs);
+static int         (*s_gate)(void);
+
+void xbox_SoundtrackSetSwapGate(int (*may_swap)(void))
+{
+    s_gate = may_swap;
+}
 
 static DWORD WINAPI scan_thread(LPVOID arg)
 {
@@ -337,10 +343,21 @@ static DWORD WINAPI scan_thread(LPVOID arg)
             xst_free(lib);
             continue;
         }
-        use_library(lib, dir);
-        xbox_SoundtrackInfo(NULL, 0, &n_st, &n_songs);
-        if (done)
-            done(n_st, n_songs);
+        if (s_gate && !s_gate()) {
+            /* The title holds an index into the library in use: not
+             * swapped under it (the port's check, now, not when the folder
+             * was chosen: the title may have chosen a soundtrack since). */
+            xst_free(lib);
+            fprintf(stderr, LOGP "%s: read; the library in use stays (a soundtrack of it is chosen), "
+                    "the folder is used from the next start\n", dir[0] ? dir : "(none)");
+            if (done)
+                done(-1, 0);
+        } else {
+            use_library(lib, dir);
+            xbox_SoundtrackInfo(NULL, 0, &n_st, &n_songs);
+            if (done)
+                done(n_st, n_songs);
+        }
         open_lock();
         last = gen == s_want_gen;
         if (last)

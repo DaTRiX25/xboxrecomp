@@ -224,6 +224,13 @@ const xst_library *xbox_SoundtrackLibrary(void);
  * A change asked for while one runs replaces it. Returns 0 when the thread
  * could not be started. */
 int  xbox_SoundtrackSetFolder(const char *music_dir, void (*done)(int soundtracks, int songs));
+
+/* Optional, the port's: asked on the scan's thread right before a folder it
+ * has read replaces the library in use. 0 keeps the library in use (the
+ * title holds an index into it: a soundtrack of it is chosen) and frees the
+ * new one; `done` is then called with soundtracks = -1 (the folder is used
+ * from the next start). NULL: always replaced. */
+void xbox_SoundtrackSetSwapGate(int (*may_swap)(void));
 /* 1 while a scan runs; the counts so far (each may be NULL). */
 int  xbox_SoundtrackScanning(int *folders, int *files, int *songs);
 /* The folder in use ("" when off) and its counts. */
