@@ -11,8 +11,7 @@
  * Which textures: a rule on how a texture is used, not a list (nothing here
  * knows a title's files). nv2a_texscale_draw_is_2d() says whether a draw is
  * a 2D one, nv2a_texscale_tex_ok() whether a texture may be scaled at all;
- * a backend scales a texture when a 2D draw first binds it, if it has any
- * transparency (nv2a_texscale_has_alpha).
+ * a backend scales every texture a 2D draw binds.
  *
  * The scalers work on premultiplied colour (a transparent texel's colour has
  * no say), read past a texture's edge by repeating the edge texel, and give
@@ -107,13 +106,10 @@ int nv2a_texscale_tex_ok(int size_from_format, uint32_t w, uint32_t h,
                          uint32_t levels);
 
 /* Art cut out with alpha: at least one texel in sixteen of the decoded level
- * 0 is not opaque. A picture that is opaque, or as good as, drawn in 2D is
- * not scaled: an edge scaler has no outline to follow in a photograph, and
- * those are the largest textures of the 2D. "As good as": a photograph
- * stored in a format with an alpha channel has stray texels just under
- * opaque (Burnout 3: one loading picture in three is DXT5 with 1.2% of its
- * texels at alpha 227 to 254), where the 2D art seen has a quarter or more
- * of its texels clear or soft. */
+ * 0 is not opaque. Not part of the rule a 2D draw is judged by (every
+ * texture such a draw binds is scaled, opaque pictures included); the pass
+ * that prepares loaded textures when the setting is switched on, which does
+ * not know how a texture is drawn, takes only these. */
 int nv2a_texscale_has_alpha(const uint32_t *texels, size_t n);
 
 /* ── the store: off the render thread, and on disk ───────────────────── */
