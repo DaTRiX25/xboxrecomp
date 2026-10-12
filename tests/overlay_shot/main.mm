@@ -737,9 +737,16 @@ int main(int argc, char **argv)
         snprintf(path, sizeof path, "%spage%d.bmp", pre, p);
         frame(path);
         if (p == 5) {                                         /* advanced: the bug report */
-            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, true);       /* past the info line */
-            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, false);
-            run(2);
+            /* The two report actions are found from the page's end, not
+             * by a count from its top: the last row is "Reset all
+             * settings", the two above it are the reports, and the
+             * selection wraps. Settings and info lines added above them
+             * (the on-glass lines, BO-115) do not move this. */
+            for (int i = 0; i < 3; i++) {
+                pad(SDL_CONTROLLER_BUTTON_DPAD_UP, true);
+                pad(SDL_CONTROLLER_BUTTON_DPAD_UP, false);
+                run(2);
+            }
             pad(SDL_CONTROLLER_BUTTON_A, true);
             pad(SDL_CONTROLLER_BUTTON_A, false);
             run(2);
