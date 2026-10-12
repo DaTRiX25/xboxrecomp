@@ -131,6 +131,8 @@ int main(void)
     set_env("RECOMP_GFX_BLOOM", NULL);
     set_env("RECOMP_GFX_MOTION_BLUR", NULL);
     set_env("RECOMP_GFX_CRASH_60FPS", NULL);
+    set_env("RECOMP_GFX_SPLIT_60FPS", NULL);
+    set_env("RECOMP_AUDIO_SPLIT_MUSIC", NULL);
     set_env("RECOMP_GFX_VEHICLE_DETAIL", NULL);
 
     xbox_SettingsInit("Test");
@@ -246,6 +248,27 @@ int main(void)
     }
     xbox_SettingSet(XS_GRAPHICS_CRASH_60FPS, 1);
     CHECK(recomp_env(RENV_GFX_CRASH_60FPS) && !strcmp(recomp_env(RENV_GFX_CRASH_60FPS), "1"));
+    /* Split screen at 60 and with music (guest patches on the "1"): both off
+     * as shipped, the variables never "1" untouched, live. */
+    {
+        static const struct { xs_id id; recomp_env_id env; const char *key; } k[] = {
+            { XS_GRAPHICS_SPLIT_60FPS, RENV_GFX_SPLIT_60FPS, "graphics.split_60fps" },
+            { XS_AUDIO_SPLIT_MUSIC, RENV_AUDIO_SPLIT_MUSIC, "audio.split_music" },
+        };
+        for (int i = 0; i < 2; i++) {
+            const char *e = recomp_env(k[i].env);
+            CHECK(!strcmp(xbox_SettingGet(k[i].id)->key, k[i].key));
+            CHECK(xbox_SettingValue(k[i].id) == 0 && !xbox_SettingGet(k[i].id)->user);
+            CHECK(xbox_SettingGet(k[i].id)->def == 0);
+            CHECK(!e || strcmp(e, "1") != 0);
+            xbox_SettingSet(k[i].id, 1);
+            CHECK(recomp_env(k[i].env) && !strcmp(recomp_env(k[i].env), "1"));
+            xbox_SettingReset(k[i].id);
+            CHECK(xbox_SettingValue(k[i].id) == 0 && !xbox_SettingGet(k[i].id)->user);
+            CHECK(recomp_env(k[i].env) && !strcmp(recomp_env(k[i].env), "0"));
+        }
+        CHECK(!xbox_SettingsNeedRestart());
+    }
     CHECK(!xbox_SettingsNeedRestart());              /* live */
 
     /* A live change reaches the runtime, the cached environment and the file. */
