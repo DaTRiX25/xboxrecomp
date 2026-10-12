@@ -81,6 +81,55 @@ gets none. `off` (default) adds exactly 0.0: the picture is the one it was.
 number: `RECOMP_GFX_LOD_BIAS=-0.75`. Metal and Vulkan share the code
 (`nv2a_host_lod_bias`); the Vulkan side has not been run.
 
+## 2D art upscaling (`graphics.ui_scale`, off by default)
+
+PPSSPP's texture scaling for the 2D art only: a texture the title draws its
+HUD, menus and fonts with is scaled 2x or 4x on the CPU, once, when a GPU
+backend uploads it (`src/kernel/nv2a_texscale.[ch]`; hooks in
+`nv2a_pb_metal.m` and `nv2a_pb_vulkan.c` after `nv2a_tex_decode` and
+`nv2a_texrep_apply`, so replaced button prompts are scaled too).
+
+Which textures, by how they are used and what they are (no list of a title's
+textures, no hashes):
+
+- a draw with the depth test off and no depth write, into the frame's own
+  surface (as wide as what the title presents; not a smaller effect target),
+  binds it. From then on the texture is scaled for every draw that uses it;
+- it is decoded by the ordinary 2D path from guest memory: not a render
+  target, not a cube map, not a signed (bump) texture;
+- a swizzled or DXT format (a linear one is a video frame or a copy of the
+  screen), one mip level, at most 512x512 texels;
+- some texel of it is not opaque (art cut out with alpha). An opaque picture
+  is left alone.
+
+The scaled texture gets the mip levels down to the title's size (2 levels at
+2x, 3 at 4x) and a trilinear sampler over them, so an element drawn smaller
+than the scaled texture is minified through them; texture coordinates,
+`tex_scale` and everything else computed from a size keep the guest's size.
+Nothing in the shaders reads a texture's size.
+
+The scaler is Super-xBR (Hyllian, MIT; a C version of the three shader
+passes, notice in `NOTICE`), on premultiplied colour with alpha as a fourth
+channel and part of the edge measure, in the title's own (gamma) colour
+values, as its blending and the GPU's bilinear filter work. It reads past a
+texture's edge by repeating the edge texel (never the opposite edge). Inside
+a sheet nothing knows where one cell ends: a result texel is made of the four
+source texels around it, steered and slightly sharpened by those up to three
+texels away, and held between the four's lowest and highest value (the
+anti-ringing clamp), so a neighbouring cell's colour cannot appear where the
+four nearest do not have it. That is the reach bilinear filtering of the
+title's own texture has (one texel); cells packed with no gap meet as they do
+unscaled. Fully transparent result texels beside visible ones take the
+visible colour. 4x is two 2x
+steps. `RECOMP_DEBUG=ui_scale_algo=bicubic` scales with a Catmull-Rom bicubic
+instead, for comparison. `RECOMP_DEBUG=ui_scale_log` prints one line per
+texture and kind of draw that binds it (with `texrep_dump`'s hash), and the
+time and memory of each scale.
+
+Off (the default) asks for factor 0 and every path is the one it was. A
+change of the setting reaches a texture at its next bind (the cache entry
+remembers the factor it was uploaded at).
+
 `graphics.dither` adds interleaved gradient noise (Jimenez 2014) of just
 under +-0.5 LSB to the Metal presenter's scale to the window, the last step
 before the 8-bit drawable. A texel that is already an exact 8-bit value
@@ -122,6 +171,7 @@ title's defaults when those change. Keys it does not know are kept.
 | `graphics.sharpen` (0..1) | `RECOMP_GFX_SHARPEN` | yes |
 | `graphics.lod_bias` (`off`, `auto`, `-0.5`, `-1`, `-1.5`) | `RECOMP_GFX_LOD_BIAS` (`0`, `auto` or a number) | yes (a per-draw constant) |
 | `graphics.dither` (bool) | `RECOMP_GFX_DITHER` | yes; Metal only |
+| `graphics.ui_scale` (`off`, `2x`, `4x`) | `RECOMP_GFX_UI_SCALE` | yes (the texture caches upload a 2D texture again at its next bind) |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |
 | `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins |

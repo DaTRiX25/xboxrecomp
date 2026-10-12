@@ -179,6 +179,8 @@ void xbox_HostFlipStats(xbox_flip_stats *out)
 
 static void (*volatile s_hold_fn)(void);
 void xbox_HostPauseHoldFn(void (*fn)(void)) { s_hold_fn = fn; }
+static void (*volatile s_idle_fn)(void);
+void xbox_HostPauseIdleFn(void (*fn)(void)) { s_idle_fn = fn; }
 
 int xbox_HostFlipTimes(uint64_t *ns, int max)
 {
@@ -201,11 +203,14 @@ void xbox_HostPauseHold(void)
     pause_once();
     EnterCriticalSection(&s_lock);
     while (s_paused) {
-        void (*fn)(void) = s_hold_fn;
-        if (fn) {
+        void (*fn)(void) = s_hold_fn, (*idle)(void) = s_idle_fn;
+        if (fn || idle) {
             /* Outside the lock: it may take a while (a frame read back). */
             LeaveCriticalSection(&s_lock);
-            fn();
+            if (fn)
+                fn();
+            if (idle)
+                idle();
             EnterCriticalSection(&s_lock);
             if (!s_paused)
                 break;

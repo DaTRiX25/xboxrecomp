@@ -192,7 +192,176 @@ static void scaler(enum nv2a_texscale_algo algo, unsigned f)
     }
 }
 
-int main(void)
+/* The store: a scaled picture comes from a worker thread, and from the disk
+ * cache when it is there. dir: a scratch directory (NULL: no disk tests). */
+static void wait_ready(uint64_t key, uint32_t w, uint32_t h, unsigned f, uint32_t *dst,
+                       int *r)
+{
+    int i;
+    CHECK(nv2a_texscale_flush(20000) == 1);
+    for (i = 0; i < 2000; i++) {
+        *r = nv2a_texscale_get(key, NULL, w, h, f, NV2A_TEXSCALE_SUPERXBR, 0, dst);
+        if (*r != NV2A_TEXSCALE_PENDING)
+            return;
+    }
+}
+
+static void store(const char *dir)
+{
+    static uint32_t src[W * H], other[W * H], ref[W * H * 16], got[W * H * 16];
+    struct nv2a_texscale_store_stats st;
+    char path[1200], found[1000];
+    uint64_t key, key2;
+    unsigned done, total;
+    FILE *f;
+    int r, i;
+
+    block(src, 0x000000u);
+    block(other, 0x000000u);
+    other[5 * W + 6] = 0xFF112233u;
+    key = nv2a_texscale_key(src, W, H);
+    key2 = nv2a_texscale_key(other, W, H);
+    CHECK(key != 0 && key == nv2a_texscale_key(src, W, H) && key != key2);
+    CHECK(key != nv2a_texscale_key(src, H, W));          /* the size is in it */
+    CHECK(nv2a_texscale(src, W, H, 4, NV2A_TEXSCALE_SUPERXBR, ref) == 1);
+
+    /* No disk cache: asked without texels nothing is known; with them a job
+     * is queued (pending, the caller is not held), and the result is the
+     * scaler's, handed over once. */
+    CHECK(nv2a_texscale_cache_path(found, sizeof found) == 0);
+    CHECK(nv2a_texscale_get(key, NULL, W, H, 4, NV2A_TEXSCALE_SUPERXBR, 0, got)
+          == NV2A_TEXSCALE_MISS);
+    CHECK(nv2a_texscale_get(0, src, W, H, 4, NV2A_TEXSCALE_SUPERXBR, 0, got)
+          == NV2A_TEXSCALE_MISS);
+    CHECK(nv2a_texscale_get(key, src, W, H, 3, NV2A_TEXSCALE_SUPERXBR, 0, got)
+          == NV2A_TEXSCALE_MISS);
+    r = nv2a_texscale_get(key, src, W, H, 4, NV2A_TEXSCALE_SUPERXBR, 0, got);
+    CHECK(r == NV2A_TEXSCALE_PENDING);
+    memset(got, 0, sizeof got);
+    wait_ready(key, W, H, 4, got, &r);
+    CHECK(r == NV2A_TEXSCALE_READY);
+    CHECK(!memcmp(got, ref, sizeof ref));
+    CHECK(nv2a_texscale_get(key, NULL, W, H, 4, NV2A_TEXSCALE_SUPERXBR, 0, got)
+          == NV2A_TEXSCALE_MISS);                        /* taken: forgotten */
+    nv2a_texscale_progress(&done, &total);
+    CHECK(done == total && total >= 1);
+    /* Made ahead of use with nowhere to keep it: not queued. */
+    CHECK(nv2a_texscale_get(key, src, W, H, 4, NV2A_TEXSCALE_SUPERXBR,
+                            NV2A_TEXSCALE_DISK_ONLY, NULL) == NV2A_TEXSCALE_MISS);
+    if (!dir) {
+        printf("nv2a_texscale: no scratch directory given, disk cache not tested\n");
+        return;
+    }
+
+    /* With a directory: the first request scales and writes a file, the
+     * next one (the result was taken, so it is asked for again) reads it. */
+    nv2a_texscale_cache_dir(dir);
+    CHECK(nv2a_texscale_cache_path(found, sizeof found) == 1 && !strcmp(found, dir));
+    nv2a_texscale_store_stats(&st);
+    {
+        uint64_t hits0 = st.hits, miss0 = st.misses, wr0 = st.written, bad0 = st.bad;
+        CHECK(nv2a_texscale_get(key, src, W, H, 4, NV2A_TEXSCALE_SUPERXBR, 0, got)
+              == NV2A_TEXSCALE_PENDING);
+        wait_ready(key, W, H, 4, got, &r);
+        CHECK(r == NV2A_TEXSCALE_READY && !memcmp(got, ref, sizeof ref));
+        nv2a_texscale_store_stats(&st);
+        CHECK(st.misses == miss0 + 1 && st.written == wr0 + 1 && st.hits == hits0);
+        snprintf(path, sizeof path, "%s/%016llx_%ux%u_x4_sx%u.tsc", dir,
+                 (unsigned long long)key, (unsigned)W, (unsigned)H,
+                 (unsigned)NV2A_TEXSCALE_VERSION);
+        f = fopen(path, "rb");
+        CHECK(f != NULL);
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            CHECK(ftell(f) == (long)(W * H * 16 * 4 + 48));
+            fclose(f);
+        }
+        memset(got, 0, sizeof got);
+        CHECK(nv2a_texscale_get(key, src, W, H, 4, NV2A_TEXSCALE_SUPERXBR, 0, got)
+              == NV2A_TEXSCALE_PENDING);
+        wait_ready(key, W, H, 4, got, &r);
+        CHECK(r == NV2A_TEXSCALE_READY && !memcmp(got, ref, sizeof ref));
+        nv2a_texscale_store_stats(&st);
+        CHECK(st.hits == hits0 + 1 && st.misses == miss0 + 1 && st.written == wr0 + 1);
+
+        /* A damaged file (one texel changed): found out by its checksum,
+         * removed, scaled again, written again. */
+        f = fopen(path, "r+b");
+        CHECK(f != NULL);
+        if (f) {
+            fseek(f, 48 + 1000, SEEK_SET);
+            fputc(0x5A, f);
+            fclose(f);
+        }
+        memset(got, 0, sizeof got);
+        CHECK(nv2a_texscale_get(key, src, W, H, 4, NV2A_TEXSCALE_SUPERXBR, 0, got)
+              == NV2A_TEXSCALE_PENDING);
+        wait_ready(key, W, H, 4, got, &r);
+        CHECK(r == NV2A_TEXSCALE_READY && !memcmp(got, ref, sizeof ref));
+        nv2a_texscale_store_stats(&st);
+        CHECK(st.bad == bad0 + 1 && st.misses == miss0 + 2 && st.written == wr0 + 2);
+        /* A cut file. */
+        f = fopen(path, "wb");
+        CHECK(f != NULL);
+        if (f) {
+            fwrite(ref, 1, 500, f);
+            fclose(f);
+        }
+        memset(got, 0, sizeof got);
+        CHECK(nv2a_texscale_get(key, src, W, H, 4, NV2A_TEXSCALE_SUPERXBR, 0, got)
+              == NV2A_TEXSCALE_PENDING);
+        wait_ready(key, W, H, 4, got, &r);
+        CHECK(r == NV2A_TEXSCALE_READY && !memcmp(got, ref, sizeof ref));
+        nv2a_texscale_store_stats(&st);
+        CHECK(st.bad == bad0 + 2);
+
+        /* Made ahead of use: on disk, not kept in memory; a bind's request
+         * later finds the file. */
+        CHECK(nv2a_texscale_get(key2, other, W, H, 2, NV2A_TEXSCALE_SUPERXBR,
+                                NV2A_TEXSCALE_DISK_ONLY, NULL) == NV2A_TEXSCALE_PENDING);
+        CHECK(nv2a_texscale_flush(20000) == 1);
+        CHECK(nv2a_texscale_get(key2, NULL, W, H, 2, NV2A_TEXSCALE_SUPERXBR, 0, got)
+              == NV2A_TEXSCALE_MISS);
+        nv2a_texscale_store_stats(&st);
+        hits0 = st.hits;
+        CHECK(nv2a_texscale_get(key2, other, W, H, 2, NV2A_TEXSCALE_SUPERXBR, 0, got)
+              == NV2A_TEXSCALE_PENDING);
+        wait_ready(key2, W, H, 2, got, &r);
+        CHECK(r == NV2A_TEXSCALE_READY);
+        nv2a_texscale_store_stats(&st);
+        CHECK(st.hits == hits0 + 1);
+        CHECK(nv2a_texscale(other, W, H, 2, NV2A_TEXSCALE_SUPERXBR, ref) == 1);
+        CHECK(!memcmp(got, ref, (size_t)W * H * 4 * 4));
+    }
+
+    /* The one-thread mode gives the result at once. */
+    nv2a_texscale_set_sync(1);
+    memset(got, 0, sizeof got);
+    CHECK(nv2a_texscale_get(key2, other, W, H, 2, NV2A_TEXSCALE_SUPERXBR, 0, got)
+          == NV2A_TEXSCALE_READY);
+    CHECK(!memcmp(got, ref, (size_t)W * H * 4 * 4));
+    nv2a_texscale_set_sync(0);
+
+    /* The size bound: more files than it holds, the oldest go. */
+    for (i = 0; i < 12; i++) {
+        other[0] = 0xFF000000u | (uint32_t)(i + 1);
+        CHECK(nv2a_texscale_get(nv2a_texscale_key(other, W, H), other, W, H, 4,
+                                NV2A_TEXSCALE_SUPERXBR, NV2A_TEXSCALE_DISK_ONLY, NULL)
+              == NV2A_TEXSCALE_PENDING);
+    }
+    CHECK(nv2a_texscale_flush(20000) == 1);
+    nv2a_texscale_cache_trim(1u << 30);
+    nv2a_texscale_store_stats(&st);
+    CHECK(st.dir_bytes >= 12u * (W * H * 16 * 4 + 48));
+    nv2a_texscale_cache_trim(6u * (W * H * 16 * 4 + 48));
+    nv2a_texscale_store_stats(&st);
+    CHECK(st.dir_bytes <= 6u * (W * H * 16 * 4 + 48) * 3 / 4 + 48);
+    CHECK(st.dir_bytes > 0);
+    nv2a_texscale_cache_dir(NULL);
+    CHECK(nv2a_texscale_cache_path(found, sizeof found) == 0);
+}
+
+int main(int argc, char **argv)
 {
     static uint32_t src[W * H], dst[W * H * 16];
     unsigned i;
@@ -284,6 +453,43 @@ int main(void)
     CHECK(nv2a_texscale_tex_ok(0, 640, 352, 1) == 0);   /* linear: a video frame */
     CHECK(nv2a_texscale_tex_ok(1, 0, 16, 1) == 0);
 
+    /* Art cut out with alpha, or an opaque picture. */
+    {
+        uint32_t t[4] = { 0xFF000000u, 0xFFFFFFFFu, 0xFF123456u, 0xFFFFFFFFu };
+        CHECK(nv2a_texscale_has_alpha(t, 4) == 0);
+        t[3] = 0xFEFFFFFFu;
+        CHECK(nv2a_texscale_has_alpha(t, 4) == 1);
+        CHECK(nv2a_texscale_has_alpha(t, 3) == 0);
+        CHECK(nv2a_texscale_has_alpha(t, 0) == 0);
+    }
+    /* A texture large enough for the rows to be shared among threads comes
+     * out as its parts do alone: the top-left quarter of a 256x256 picture
+     * scaled whole equals the same texels scaled as a 144x144 cut (the cut's
+     * own edge reaches a few texels in, so compare well inside). */
+    {
+        static uint32_t big[256 * 256], cut[144 * 144], ob[1024 * 1024], oc[576 * 576];
+        uint32_t seed = 99u;
+        int x, y, bad = 0;
+        for (i = 0; i < 256 * 256; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            /* blobs, not noise: 8x8 cells of one colour */
+            if ((i % 256) % 8 == 0)
+                big[i] = seed | ((seed >> 7) & 1u ? 0xFF000000u : 0u);
+            else
+                big[i] = big[i - 1];
+            if ((i / 256) % 8)
+                big[i] = big[i - 256];
+        }
+        for (y = 0; y < 144; y++)
+            memcpy(&cut[y * 144], &big[y * 256], 144 * 4);
+        CHECK(nv2a_texscale(big, 256, 256, 4, NV2A_TEXSCALE_SUPERXBR, ob) == 1);
+        CHECK(nv2a_texscale(cut, 144, 144, 4, NV2A_TEXSCALE_SUPERXBR, oc) == 1);
+        for (y = 0; y < 480; y++)
+            for (x = 0; x < 480; x++)
+                bad += ob[y * 1024 + x] != oc[y * 576 + x];
+        CHECK(bad == 0);
+    }
+
     /* The setting: off unless asked; 2 and 4 only; a change moves the
      * generation on, the same value does not. */
     {
@@ -313,6 +519,8 @@ int main(void)
         nv2a_texscale_stats(&n, &texels, &usec);
         CHECK(n == 1 && texels == 128u * 64u * 16u && usec == 1500);
     }
+
+    store(argc > 1 ? argv[1] : NULL);
 
     printf("nv2a_texscale: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail != 0;

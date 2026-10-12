@@ -86,6 +86,9 @@
 #include "d3d8_swizzle.h"
 #include "nv2a_texrep.h"
 #include "nv2a_texscale.h"
+#include "kernel_pause.h"
+static void scale_prepare_loaded(void);
+static int ui_scale_log(void);
 #include "nv2a_pcache.h"
 #include "latency_trace.h"
 #include "host_time.h"
@@ -684,6 +687,9 @@ static int init(void)
                 wb_always() ? "every flip" : "on demand");
     }
     s_failed = 0;
+    /* graphics.ui_scale switched on in the overlay: the loaded 2D textures
+     * are prepared while the title is held (scale_prepare_loaded). */
+    xbox_HostPauseIdleFn(scale_prepare_loaded);
     return 1;
 }
 
@@ -1607,6 +1613,9 @@ typedef struct {
     uint8_t        salgo;         /* and the scaler */
     uint8_t        up_scale;      /* the factor the texture on the GPU has (0 where the scaler refused) */
     uint8_t        use;           /* RECOMP_DEBUG=ui_scale_log: the kinds of draw seen */
+    uint8_t        pend;          /* its scaled picture is being made (nv2a_texscale_get) */
+    uint32_t       pal_len, pgen; /* P8 entries; the flip pend was last asked at */
+    uint64_t       skey;          /* nv2a_texscale_key of the texels uploaded */
     int            live;
     id<MTLTexture> tex;
 } TexEntry;
@@ -1688,28 +1697,47 @@ static unsigned scale_levels(unsigned f)
     return f == 4 ? 3u : f == 2 ? 2u : 1u;
 }
 
-/* The texture f times as large, with the levels down to the title's size
- * (a 2D element drawn smaller than the scaled texture is minified through
- * them, not point-skipped). nil: no memory, or the scaler refused. */
-static id<MTLTexture> tex_upload_scaled(const Stage *t, unsigned f, int algo)
-{
-    uint32_t w = t->width * f, h = t->height * f, levels = scale_levels(f), l;
-    size_t n = nv2a_tex_texels(w, h, levels);
-    const uint32_t *src;
-    MTLTextureDescriptor *td;
-    id<MTLTexture> tex;
-    uint64_t t0 = xbox_HostNowNs();
+static uint32_t  s_swap_flip = 0xFFFFFFFFu;   /* the flip of the last swap */
+static int       s_up_pend;    /* the last tex_upload queued the scaled picture */
+static uint64_t  s_up_key;
 
+/* The disk cache of scaled textures: beside the shader cache. Once. */
+static void scale_store_init(void)
+{
+    static int done;
+    char dir[900], sub[1000];
+    if (done)
+        return;
+    done = 1;
+    if (nv2a_pcache_dir(nv2a_host_opts()->shader_cache, nv2a_pcache_app(), dir, sizeof dir)) {
+        snprintf(sub, sizeof sub, "%s/ui_scale", dir);
+        nv2a_texscale_cache_dir(sub);
+    }
+}
+
+static int scaled_room(const Stage *t, unsigned f)
+{
+    size_t n = nv2a_tex_texels(t->width * f, t->height * f, scale_levels(f));
     if (n > s_scaled_cap) {
         uint32_t *p = (uint32_t *)realloc(s_scaled, n * 4);
         if (!p)
-            return nil;
+            return 0;
         s_scaled = p;
         s_scaled_cap = n;
     }
-    if (!nv2a_texscale(s_texels, t->width, t->height, f, (enum nv2a_texscale_algo)algo,
-                       s_scaled))
-        return nil;
+    return 1;
+}
+
+/* s_scaled's level 0 (the texture f times as large) as a texture with the
+ * levels down to the title's size: a 2D element drawn smaller than the
+ * scaled texture is minified through them, not point-skipped. */
+static id<MTLTexture> scaled_texture(const Stage *t, unsigned f)
+{
+    uint32_t w = t->width * f, h = t->height * f, levels = scale_levels(f), l;
+    const uint32_t *src;
+    MTLTextureDescriptor *td;
+    id<MTLTexture> tex;
+
     nv2a_texscale_mips(s_scaled, w, h, levels);
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                             width:w
@@ -1726,8 +1754,35 @@ static id<MTLTexture> tex_upload_scaled(const Stage *t, unsigned f, int algo)
                bytesPerRow:lw * 4];
         src += (size_t)lw * lh;
     }
-    nv2a_texscale_note(t->width, t->height, f, (xbox_HostNowNs() - t0) / 1000u);
     return tex;
+}
+
+/* The scaled picture of s_texels, if the store has it ready; else it is
+ * queued (s_up_pend) and the title's own texture is uploaded meanwhile.
+ * Nothing is scaled on this thread. */
+static id<MTLTexture> tex_upload_scaled(const Stage *t, unsigned f, int algo)
+{
+    uint64_t t0 = ui_scale_log() ? xbox_HostNowNs() : 0;
+    int r;
+
+    s_up_pend = 0;
+    if (!nv2a_texscale_has_alpha(s_texels, (size_t)t->width * t->height)
+            || !scaled_room(t, f))
+        return nil;
+    scale_store_init();
+    s_up_key = nv2a_texscale_key(s_texels, t->width, t->height);
+    r = nv2a_texscale_get(s_up_key, s_texels, t->width, t->height, f,
+                          (enum nv2a_texscale_algo)algo, 0, s_scaled);
+    if (ui_scale_log())
+        fprintf(stderr, "[UISCALE] ask %016llx %ux%u x%u: %s, %.3f ms on the render thread,"
+                " flip %llu\n", (unsigned long long)s_up_key, t->width, t->height, f,
+                r == NV2A_TEXSCALE_READY ? "ready" : r == NV2A_TEXSCALE_PENDING ? "queued"
+                                                                               : "not taken",
+                (double)(xbox_HostNowNs() - t0) / 1e6, (unsigned long long)s_presents);
+    if (r == NV2A_TEXSCALE_READY)
+        return scaled_texture(t, f);
+    s_up_pend = r == NV2A_TEXSCALE_PENDING;
+    return nil;
 }
 
 static id<MTLTexture> tex_upload(const Stage *t, unsigned scale, int algo)
@@ -1761,6 +1816,7 @@ static id<MTLTexture> tex_upload(const Stage *t, unsigned scale, int algo)
             s_texels[i] ^= x;
     }
     s_bind_scale = 0;
+    s_up_pend = 0;
     if (scale) {
         tex = tex_upload_scaled(t, scale, algo);
         if (tex) {
@@ -1787,6 +1843,79 @@ static id<MTLTexture> tex_upload(const Stage *t, unsigned scale, int algo)
     }
     s_tex_uploads++;
     return tex;
+}
+
+/* graphics.ui_scale switched on (or changed) in the overlay: while the title
+ * is held for the pause, every loaded texture the rule could scale is decoded
+ * and queued, to be made and written to the disk cache in the background
+ * (nothing is uploaded here; a texture's own bind takes its picture from the
+ * cache later). "Could scale": one level, swizzled or DXT, some transparency;
+ * whether a 2D draw uses it is not known for a texture bound before the
+ * setting was on, so some that never will be are made too. The executor's
+ * thread (xbox_HostPauseIdleFn), which is the thread of every other use of
+ * the cache. */
+static void scale_prepare_loaded(void)
+{
+    static uint32_t done_gen;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    unsigned f = nv2a_texscale_factor(), queued = 0;
+    int algo = (int)nv2a_texscale_algo(), i;
+
+    if (done_gen == nv2a_texscale_generation())
+        return;
+    done_gen = nv2a_texscale_generation();
+    if (!f)
+        return;
+    scale_store_init();
+    if (!nv2a_texscale_cache_path(NULL, 0))
+        return;
+    for (i = 0; i < TEX_CACHE; i++) {
+        TexEntry *e = &s_tc[i];
+        Stage st;
+        const uint32_t *pal = NULL;
+        uint32_t bytes;
+        size_t n;
+
+        if (!e->live || e->sign || e->up_scale == f || e->pend
+                || !nv2a_texscale_tex_ok(nv2a_tex_size_from_format(e->color), e->width,
+                                         e->height, e->levels))
+            continue;
+        memset(&st, 0, sizeof st);
+        st.offset = e->offset;
+        st.color = e->color;
+        st.width = e->width;
+        st.height = e->height;
+        st.pitch = e->pitch;
+        st.palette = e->palette;
+        st.pal_len = e->pal_len;
+        st.levels = e->levels;
+        bytes = nv2a_tex_extent(st.color, st.width, st.height, st.pitch, st.levels);
+        /* Only what is still the texture that was uploaded. */
+        if (!bytes || tex_hash_pal(mem, &st, bytes) != e->hash)
+            continue;
+        n = nv2a_tex_texels(st.width, st.height, st.levels);
+        if (n > s_texels_cap) {
+            uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
+            if (!p)
+                return;
+            s_texels = p;
+            s_texels_cap = n;
+        }
+        if (st.color == NV2A_TEX_P8)
+            pal = (const uint32_t *)(mem + st.palette);
+        nv2a_tex_decode(mem + st.offset, st.color, st.width, st.height, st.pitch, st.levels,
+                        pal, pal ? st.pal_len : 0, s_texels);
+        (void)nv2a_texrep_apply(mem + st.offset, st.color, st.width, st.height, st.pitch,
+                                st.levels, s_texels);
+        if (!nv2a_texscale_has_alpha(s_texels, (size_t)st.width * st.height))
+            continue;
+        if (nv2a_texscale_get(nv2a_texscale_key(s_texels, st.width, st.height), s_texels,
+                              st.width, st.height, f, (enum nv2a_texscale_algo)algo,
+                              NV2A_TEXSCALE_DISK_ONLY, NULL) == NV2A_TEXSCALE_PENDING)
+            queued++;
+    }
+    fprintf(stderr, "[UISCALE] setting changed to %ux: %u loaded textures queued for the"
+            " cache\n", f, queued);
 }
 
 /* RECOMP_DEBUG=ui_scale_log: one line whenever a texture is seen in a kind
@@ -1913,6 +2042,10 @@ static id<MTLTexture> tex_bind(const Stage *t)
                 e->scale = (uint8_t)want;
                 e->salgo = (uint8_t)algo;
                 e->up_scale = (uint8_t)s_bind_scale;
+                e->pend = (uint8_t)s_up_pend;
+                e->skey = s_up_key;
+                e->pgen = g->flips;
+                e->pal_len = t->pal_len;
             }
         }
     } else {
@@ -1933,6 +2066,10 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->scale = (uint8_t)want;
         e->salgo = (uint8_t)algo;
         e->up_scale = (uint8_t)s_bind_scale;
+        e->pend = (uint8_t)s_up_pend;
+        e->skey = s_up_key;
+        e->pgen = g->flips;
+        e->pal_len = t->pal_len;
         e->use = 0;
         e->offset = t->offset;
         e->color = t->color;
@@ -1947,6 +2084,38 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->rep = s_tex_rep;
         e->tex = nt;
         e->live = 1;
+    }
+    /* Its scaled picture was being made: asked for once a flip, swapped in
+     * when it is there, one texture a flip. A new MTLTexture, so a draw encoded with the unscaled
+     * one keeps it. */
+    if (e->pend && e->pgen != g->flips && s_swap_flip != g->flips) {
+        e->pgen = g->flips;
+        if (!scaled_room(t, e->scale)) {
+            e->pend = 0;
+        } else {
+            uint64_t t0 = ui_scale_log() ? xbox_HostNowNs() : 0;
+            int r = nv2a_texscale_get(e->skey, NULL, t->width, t->height, e->scale,
+                                      (enum nv2a_texscale_algo)e->salgo, 0, s_scaled);
+            if (r == NV2A_TEXSCALE_READY) {
+                id<MTLTexture> nt = scaled_texture(t, e->scale);
+                s_swap_flip = g->flips;   /* one a flip: its upload is the cost */
+                e->pend = 0;
+                if (nt) {
+                    [e->tex release];
+                    e->tex = nt;
+                    e->up_scale = e->scale;
+                    s_tex_uploads++;
+                }
+            } else if (r != NV2A_TEXSCALE_PENDING) {
+                e->pend = 0;         /* refused or lost: stays as the title's */
+            }
+            if (ui_scale_log() && r != NV2A_TEXSCALE_PENDING)
+                fprintf(stderr, "[UISCALE] swap %016llx %ux%u x%u: %s, %.3f ms on the render"
+                        " thread, flip %llu\n", (unsigned long long)e->skey, t->width,
+                        t->height, (unsigned)e->scale,
+                        r == NV2A_TEXSCALE_READY ? "scaled texture in" : "no result",
+                        (double)(xbox_HostNowNs() - t0) / 1e6, (unsigned long long)s_presents);
+        }
     }
     e->used = ++s_tc_clock;
     s_bind_scale = e->up_scale;

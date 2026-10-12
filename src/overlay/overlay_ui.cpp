@@ -19,6 +19,7 @@
 #include "overlay.h"
 #include "overlay_internal.h"
 #include "xbox_settings.h"
+#include "nv2a_texscale.h"
 #include "xbox_shader_build.h"
 #include "xbox_report.h"
 #include "nv2a_pcache.h"
@@ -1859,6 +1860,18 @@ static void build_pages(float fs)
                          " power (diagnosis: RECOMP_PRESENT_PACING=spin).");
             else
                 snprintf(hint, sizeof hint, "%s", k_meta[rows[sel].id].hint);
+            if (rows[sel].id == XS_GRAPHICS_UI_SCALE) {
+                /* The scaled pictures are made in the background and kept on
+                 * disk: say so while that is going on. */
+                unsigned done = 0, total = 0;
+                nv2a_texscale_progress(&done, &total);
+                if (xbox_SettingValue(XS_GRAPHICS_UI_SCALE) != 0 && done < total) {
+                    char whole[sizeof hint];
+                    snprintf(whole, sizeof whole, "Preparing sharper menus and HUD... %u of %u. %s",
+                             done, total, hint);
+                    snprintf(hint, sizeof hint, "%s", whole);
+                }
+            }
         }
     } else if (rows[sel].kind == R_SPEAKERS) {
         spk_hint(rows[sel].action, hint, sizeof hint);

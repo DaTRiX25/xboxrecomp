@@ -11,7 +11,8 @@
  * Which textures: a rule on how a texture is used, not a list (nothing here
  * knows a title's files). nv2a_texscale_draw_is_2d() says whether a draw is
  * a 2D one, nv2a_texscale_tex_ok() whether a texture may be scaled at all;
- * a backend scales a texture when a 2D draw first binds it.
+ * a backend scales a texture when a 2D draw first binds it, if it has any
+ * transparency (nv2a_texscale_has_alpha).
  *
  * The scalers work on premultiplied colour (a transparent texel's colour has
  * no say), read past a texture's edge by repeating the edge texel, and give
@@ -47,7 +48,9 @@ enum nv2a_texscale_algo {
  * (h * factor), the same layout. factor 2 or 4. Returns 0 (dst untouched) for
  * another factor, an unknown algorithm, a zero size or no memory. The same
  * input gives the same output on every machine built from the same source
- * with the same compiler; plain float arithmetic, no threads. */
+ * with the same compiler: plain float arithmetic, each texel computed by
+ * itself (a large texture's rows are shared among up to four threads, which
+ * changes no value). */
 int nv2a_texscale(const uint32_t *src, uint32_t w, uint32_t h, unsigned factor,
                   enum nv2a_texscale_algo algo, uint32_t *dst);
 
@@ -91,6 +94,71 @@ int nv2a_texscale_draw_is_2d(const struct nv2a_texscale_draw *d);
  * NV2A_TEXSCALE_MAX_TEXELS. size_from_format: nv2a_tex_size_from_format(). */
 int nv2a_texscale_tex_ok(int size_from_format, uint32_t w, uint32_t h,
                          uint32_t levels);
+
+/* Art cut out with alpha: any texel of the decoded level 0 that is not
+ * opaque. An opaque picture drawn in 2D (a loading screen's photograph, a
+ * film of static) is not scaled: an edge scaler has no outline to follow in
+ * it, and those are the largest textures of the 2D. */
+int nv2a_texscale_has_alpha(const uint32_t *texels, size_t n);
+
+/* ── the store: off the render thread, and on disk ───────────────────── */
+
+/* Part of every cache file's name and header: raise it when a scaler's
+ * output changes, and the files of the old one are no longer read. */
+#define NV2A_TEXSCALE_VERSION 1
+
+/* A texture's key: a hash of its decoded texels (after any replacement) and
+ * its size. Never 0. */
+uint64_t nv2a_texscale_key(const uint32_t *texels, uint32_t w, uint32_t h);
+
+/* The directory of the disk cache (per user, beside the shader cache: what
+ * is in it is made from the user's own disc and stays there). NULL or "":
+ * no disk cache. RECOMP_DEBUG=ui_scale_cache_mb=<n> sets its size bound
+ * (default 256; 0: no disk cache). cache_path: 1 and the directory when one
+ * is in use. */
+void nv2a_texscale_cache_dir(const char *dir);
+int  nv2a_texscale_cache_path(char *out, size_t n);
+
+enum {
+    NV2A_TEXSCALE_MISS    = 0,   /* not known and not queued (no texels given, or no room) */
+    NV2A_TEXSCALE_READY   = 1,   /* dst holds the scaled level 0; the store forgets it */
+    NV2A_TEXSCALE_PENDING = 2,   /* queued, or being made: ask again later */
+    NV2A_TEXSCALE_FAILED  = 3    /* the scaler refused it: do not ask again */
+};
+/* For get(): the result is wanted on disk only (made ahead of use). */
+#define NV2A_TEXSCALE_DISK_ONLY 1u
+
+/* The scaled picture of the texture `key` (w x h, scaled by factor with
+ * algo), without scaling on the caller's thread. A result that is ready is
+ * copied to dst ((w * factor) x (h * factor) texels) and forgotten. Else,
+ * with texels (the decoded level 0, copied here), a job is queued for the
+ * worker thread, which loads the picture from the disk cache or scales it
+ * and writes it there; without texels the call only asks. A backend uploads
+ * the title's own texture meanwhile and asks again at a later bind. */
+int nv2a_texscale_get(uint64_t key, const uint32_t *texels, uint32_t w, uint32_t h,
+                      unsigned factor, enum nv2a_texscale_algo algo, unsigned flags,
+                      uint32_t *dst);
+
+/* Waits until the worker has nothing left to do, timeout_ms at most. 1: it
+ * has nothing left. For a run that fills the cache and then exits. */
+int nv2a_texscale_flush(unsigned timeout_ms);
+
+/* The jobs of the batch in hand (a batch starts when a job comes to an idle
+ * worker): done and queued in all. done == total: nothing is being made. */
+void nv2a_texscale_progress(unsigned *done, unsigned *total);
+
+struct nv2a_texscale_store_stats {
+    uint64_t hits, misses;        /* jobs served from disk / scaled */
+    uint64_t written, bad;        /* files written / found damaged and removed */
+    uint64_t load_usec, scale_usec;
+    uint64_t dir_bytes;           /* the cache directory, as last counted */
+};
+void nv2a_texscale_store_stats(struct nv2a_texscale_store_stats *st);
+
+/* For tests and tools: jobs run on the caller's thread inside get() (1), and
+ * the size bound applied now. */
+void nv2a_texscale_set_sync(int on);
+void nv2a_texscale_cache_trim(uint64_t limit_bytes);
 
 /* Counters for a report and the tests: textures scaled, texels made, and the
  * microseconds spent scaling. note() is for a backend, after it scaled. */

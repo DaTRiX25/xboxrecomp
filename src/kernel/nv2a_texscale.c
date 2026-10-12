@@ -37,6 +37,7 @@
 
 #include <math.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -152,6 +153,67 @@ static void bleed(uint32_t *dst, int w, int h, const uint32_t *src, int sw, int 
         }
     }
 }
+
+/* ── rows on a few threads ───────────────────────────────────────────── */
+
+/* A pass computes each texel from texels no pass is writing, so its rows can
+ * be done in any order and on any thread with the same result. Up to
+ * PAR_THREADS threads for a pass of some size (one of them the caller's);
+ * a toolchain without pthreads, or a thread that does not start, does the
+ * rows on the caller's. */
+typedef void (*row_fn)(void *ctx, int y0, int y1);
+
+#if !defined(_MSC_VER)
+#include <pthread.h>
+#define PAR_THREADS 4
+#define PAR_MIN_TEXELS (64 * 1024)
+
+typedef struct {
+    row_fn fn;
+    void  *ctx;
+    int    y0, y1;
+} ParJob;
+
+static void *par_main(void *arg)
+{
+    ParJob *j = (ParJob *)arg;
+    j->fn(j->ctx, j->y0, j->y1);
+    return NULL;
+}
+
+static void par_rows(row_fn fn, void *ctx, int rows, int width)
+{
+    pthread_t th[PAR_THREADS];
+    ParJob job[PAR_THREADS];
+    int started[PAR_THREADS] = { 0 }, n = PAR_THREADS, i;
+
+    if ((long)rows * width < PAR_MIN_TEXELS || rows < n * 4) {
+        fn(ctx, 0, rows);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        job[i].fn = fn;
+        job[i].ctx = ctx;
+        job[i].y0 = (int)((long)rows * i / n);
+        job[i].y1 = (int)((long)rows * (i + 1) / n);
+    }
+    for (i = 1; i < n; i++)
+        started[i] = pthread_create(&th[i], NULL, par_main, &job[i]) == 0;
+    fn(ctx, job[0].y0, job[0].y1);
+    for (i = 1; i < n; i++) {
+        if (started[i])
+            pthread_join(th[i], NULL);
+        else
+            fn(ctx, job[i].y0, job[i].y1);
+    }
+}
+#else
+static void par_rows(row_fn fn, void *ctx, int rows, int width)
+{
+    (void)width;
+    fn(ctx, 0, rows);
+}
+#endif
 
 /* ── Super-xBR ───────────────────────────────────────────────────────── */
 
@@ -270,10 +332,82 @@ static void xbr_kernel(const XbrPass *k, const float *const s[16], float *out)
  * 2 * XBR_PAD that are cut. */
 #define XBR_PAD 4
 
+typedef struct {
+    const Pic *in;      /* pass 0: the padded source */
+    Pic       *g;       /* the doubled grid */
+    Pic       *out;     /* pass 2's result */
+} XbrCtx;
+
+static void xbr_rows0(void *ctx, int y0, int y1)
+{
+    static const signed char o[16][2] = {
+        { -1, -1 }, { 0, -1 }, { 1, -1 }, { 2, -1 },
+        { -1, 0 },  { 0, 0 },  { 1, 0 },  { 2, 0 },
+        { -1, 1 },  { 0, 1 },  { 1, 1 },  { 2, 1 },
+        { -1, 2 },  { 0, 2 },  { 1, 2 },  { 2, 2 }
+    };
+    const XbrCtx *c = (const XbrCtx *)ctx;
+    const float *s[16];
+    int W = c->g->w, x, y, i;
+
+    for (y = y0; y < y1; y++) {
+        for (x = 0; x < c->in->w; x++) {
+            memcpy(c->g->p + ((size_t)(2 * y) * W + 2 * x) * CH, px(c->in, x, y),
+                   CH * sizeof(float));
+            for (i = 0; i < 16; i++)
+                s[i] = px(c->in, x + o[i][0], y + o[i][1]);
+            xbr_kernel(&k_pass0, s, c->g->p + ((size_t)(2 * y + 1) * W + 2 * x + 1) * CH);
+        }
+    }
+}
+
+static void xbr_rows1(void *ctx, int y0, int y1)
+{
+    const XbrCtx *c = (const XbrCtx *)ctx;
+    const Pic *g = c->g;
+    const float *s[16];
+    int W = g->w, x, y;
+
+    for (y = y0; y < y1; y++) {
+        for (x = (y & 1) ^ 1; x < W; x += 2) {
+            /* g1 along x for an odd column, along y for an odd row. */
+            int ax = x & 1, ay = !ax, bx = ay, by = ax;
+#define AT(a, b) px(g, x + (a) * ax + (b) * bx, y + (a) * ay + (b) * by)
+            s[P0] = AT(-3, 0);  s[P1] = AT(0, -3);  s[P2] = AT(0, 3);   s[P3] = AT(3, 0);
+            s[B_] = AT(-2, -1); s[C_] = AT(-1, -2); s[D_] = AT(-2, 1);  s[E_] = AT(-1, 0);
+            s[F_] = AT(0, -1);  s[G_] = AT(-1, 2);  s[H_] = AT(0, 1);   s[I_] = AT(1, 0);
+            s[F4] = AT(1, -2);  s[I4] = AT(2, -1);  s[H5] = AT(1, 2);   s[I5] = AT(2, 1);
+#undef AT
+            xbr_kernel(&k_pass1, s, g->p + ((size_t)y * W + x) * CH);
+        }
+    }
+}
+
+static void xbr_rows2(void *ctx, int y0, int y1)
+{
+    static const signed char o[16][2] = {
+        { -2, -2 }, { -1, -2 }, { 0, -2 }, { 1, -2 },
+        { -2, -1 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
+        { -2, 0 },  { -1, 0 },  { 0, 0 },  { 1, 0 },
+        { -2, 1 },  { -1, 1 },  { 0, 1 },  { 1, 1 }
+    };
+    const XbrCtx *c = (const XbrCtx *)ctx;
+    const float *s[16];
+    int W = c->g->w, x, y, i;
+
+    for (y = y0; y < y1; y++) {
+        for (x = 0; x < W; x++) {
+            for (i = 0; i < 16; i++)
+                s[i] = px(c->g, x + o[i][0], y + o[i][1]);
+            xbr_kernel(&k_pass2, s, c->out->p + ((size_t)y * W + x) * CH);
+        }
+    }
+}
+
 static int xbr_2x(const Pic *src, Pic *dst)
 {
     Pic in, g, out;
-    const float *s[16];
+    XbrCtx c;
     int w = src->w + 2 * XBR_PAD, h = src->h + 2 * XBR_PAD;
     int W = w * 2, H = h * 2, x, y;
 
@@ -291,50 +425,16 @@ static int xbr_2x(const Pic *src, Pic *dst)
         free(g.p);
         return 0;
     }
-    for (y = 0; y < h; y++) {
-        for (x = 0; x < w; x++) {
-            static const signed char o[16][2] = {
-                { -1, -1 }, { 0, -1 }, { 1, -1 }, { 2, -1 },
-                { -1, 0 },  { 0, 0 },  { 1, 0 },  { 2, 0 },
-                { -1, 1 },  { 0, 1 },  { 1, 1 },  { 2, 1 },
-                { -1, 2 },  { 0, 2 },  { 1, 2 },  { 2, 2 }
-            };
-            int i;
-            memcpy(g.p + ((size_t)(2 * y) * W + 2 * x) * CH, px(&in, x, y),
-                   CH * sizeof(float));
-            for (i = 0; i < 16; i++)
-                s[i] = px(&in, x + o[i][0], y + o[i][1]);
-            xbr_kernel(&k_pass0, s, g.p + ((size_t)(2 * y + 1) * W + 2 * x + 1) * CH);
-        }
-    }
+    c.in = &in;
+    c.g = &g;
+    c.out = &out;
+    /* Pass 0 writes the even-even and odd-odd places from the source alone;
+     * pass 1 reads those and writes the others; pass 2 reads the grid and
+     * writes another picture. */
+    par_rows(xbr_rows0, &c, h, w);
     free(in.p);
-    for (y = 0; y < H; y++) {
-        for (x = (y & 1) ^ 1; x < W; x += 2) {
-            /* g1 along x for an odd column, along y for an odd row. */
-            int ax = x & 1, ay = !ax, bx = ay, by = ax;
-#define AT(a, b) px(&g, x + (a) * ax + (b) * bx, y + (a) * ay + (b) * by)
-            s[P0] = AT(-3, 0);  s[P1] = AT(0, -3);  s[P2] = AT(0, 3);   s[P3] = AT(3, 0);
-            s[B_] = AT(-2, -1); s[C_] = AT(-1, -2); s[D_] = AT(-2, 1);  s[E_] = AT(-1, 0);
-            s[F_] = AT(0, -1);  s[G_] = AT(-1, 2);  s[H_] = AT(0, 1);   s[I_] = AT(1, 0);
-            s[F4] = AT(1, -2);  s[I4] = AT(2, -1);  s[H5] = AT(1, 2);   s[I5] = AT(2, 1);
-#undef AT
-            xbr_kernel(&k_pass1, s, g.p + ((size_t)y * W + x) * CH);
-        }
-    }
-    for (y = 0; y < H; y++) {
-        for (x = 0; x < W; x++) {
-            static const signed char o[16][2] = {
-                { -2, -2 }, { -1, -2 }, { 0, -2 }, { 1, -2 },
-                { -2, -1 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
-                { -2, 0 },  { -1, 0 },  { 0, 0 },  { 1, 0 },
-                { -2, 1 },  { -1, 1 },  { 0, 1 },  { 1, 1 }
-            };
-            int i;
-            for (i = 0; i < 16; i++)
-                s[i] = px(&g, x + o[i][0], y + o[i][1]);
-            xbr_kernel(&k_pass2, s, out.p + ((size_t)y * W + x) * CH);
-        }
-    }
+    par_rows(xbr_rows1, &c, H, W / 2);
+    par_rows(xbr_rows2, &c, H, W);
     free(g.p);
     if (!pic_new(dst, src->w * 2, src->h * 2)) {
         free(out.p);
@@ -576,12 +676,30 @@ int nv2a_texscale_tex_ok(int size_from_format, uint32_t w, uint32_t h, uint32_t 
     return (uint64_t)w * h <= NV2A_TEXSCALE_MAX_TEXELS;
 }
 
+int nv2a_texscale_has_alpha(const uint32_t *texels, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++)
+        if ((texels[i] >> 24) != 0xFFu)
+            return 1;
+    return 0;
+}
+
 void nv2a_texscale_note(uint32_t w, uint32_t h, unsigned factor, uint64_t usec)
 {
     atomic_fetch_add_explicit(&s_textures, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&s_texels, (uint64_t)w * h * factor * factor,
                               memory_order_relaxed);
     atomic_fetch_add_explicit(&s_usec, usec, memory_order_relaxed);
+    if (recomp_env(RENV_UI_SCALE_LOG)) {
+        uint64_t n, texels, total;
+        nv2a_texscale_stats(&n, &texels, &total);
+        fprintf(stderr, "[UISCALE] scaled %ux%u x%u in %.1f ms; so far %llu textures, "
+                "%.1f M texels (%.1f MB with their levels), %.1f ms\n", w, h, factor,
+                (double)usec / 1000.0, (unsigned long long)n, (double)texels / 1e6,
+                (double)texels * 4.0 * (factor == 4 ? 1.3125 : 1.25) / 1048576.0,
+                (double)total / 1000.0);
+    }
 }
 
 void nv2a_texscale_stats(uint64_t *textures, uint64_t *texels, uint64_t *usec)
