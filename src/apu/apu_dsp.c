@@ -64,6 +64,13 @@
  */
 #define APU_DSP_ACK_MAX 8
 #define GP_DOORBELL_OFFSET 0x810u
+/* RECOMP_ORACLE_CAP (apu_oracle_cap.c): plain dumps, off by default. */
+int apu_ocap_on(void);
+void apu_ocap_doorbell(MCPXAPUState *d, uint32_t value);
+void apu_ocap_bins(MCPXAPUState *d, const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+void apu_ocap_out6(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
+                   const int8_t map[NUM_MIXBINS], const float *gain);
+
 static uint32_t s_dsp_ack[APU_DSP_ACK_MAX];
 static int s_dsp_ack_count = -1;
 static int s_dsp_ack_auto;                /* =auto: derive from GPSADDR */
@@ -148,6 +155,8 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
         uint32_t *slot = dsp_ack_auto_slot(d);
         if (slot && *slot) {
             static int shown;
+            if (apu_ocap_on())
+                apu_ocap_doorbell(d, *slot);
             if (shown++ < 3)
                 fprintf(stderr, "[APU] DSP doorbell (auto): command 0x%08X"
                                 " acknowledged\n", *slot);
@@ -405,6 +414,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
+    if (apu_ocap_on())
+        apu_ocap_bins(d, (const float (*)[NUM_SAMPLES_PER_FRAME])mixbins);
+
     if (s_ch_trace < 0)
         s_ch_trace = recomp_env_on(RENV_AUDIO_CHANNELS);
 
@@ -426,6 +438,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         apu_spk_mix51(&mixbins[0][0], NUM_SAMPLES_PER_FRAME, s_spk_map,
                       s_fx_bins ? s_bin_gain : NULL,
                       &d->monitor.frame_buf6[off], NUM_SAMPLES_PER_FRAME);
+        if (apu_ocap_on())
+            apu_ocap_out6((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins, s_spk_map,
+                          s_fx_bins ? s_bin_gain : NULL);
         if (s_ch_trace)
             ch_trace((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins,
                      &d->monitor.frame_buf6[off][0], APU_SPK_CHANNELS);

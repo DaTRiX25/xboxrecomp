@@ -97,6 +97,10 @@ static float clampf(float v, float mn, float mx)
     return v;
 }
 
+/* RECOMP_ORACLE_CAP (apu_oracle_cap.c): plain dumps, off by default. */
+int apu_ocap_on(void);
+void apu_ocap_voice(const void *a, uint32_t an, const void *b, uint32_t bn);
+
 static float attenuate(uint16_t vol)
 {
     vol &= 0xFFF;
@@ -1607,6 +1611,37 @@ static void voice_process(MCPXAPUState *d,
         g *= attenuate(vol[b]) / hr;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
+        }
+    }
+
+    /* RECOMP_ORACLE_CAP (apu_oracle_cap.c): a voice playing 32-bit
+     * containers (DirectSound's buffers over DSP memory): where its buffer
+     * is and the gain it has into each of its bins this frame. */
+    if (apu_ocap_on()) {
+        uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+        if (((fmt & NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE) >> 30) ==
+                NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B32 &&
+            !(fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE)) {
+            uint32_t w[5 + 8];
+            float gain[8];
+            uint32_t ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START,
+                                         NV_PAVS_VOICE_CUR_PSL_START_BA);
+            w[0] = v;
+            w[1] = fmt;
+            w[2] = (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, ba);
+            w[3] = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO);
+            w[4] = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO);
+            for (int b = 0; b < 8; b++) {
+                float hr;
+                if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4))
+                    hr = (float)(1 << d->vp.hrtf_headroom);
+                else
+                    hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
+                w[5 + b] = (uint32_t)bin[b] | ((uint32_t)vol[b] << 8) |
+                           ((uint32_t)(lpf ? 1 : 0) << 24);
+                gain[b] = ea_value * attenuate(vol[b]) / hr;
+            }
+            apu_ocap_voice(w, sizeof(w), gain, sizeof(gain));
         }
     }
 
