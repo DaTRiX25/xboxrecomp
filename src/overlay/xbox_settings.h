@@ -70,6 +70,8 @@ typedef enum {
     XS_DISPLAY_ULTRAWIDE,    /* another: the 3D wider than 16:9 */
     XS_GRAPHICS_BLOOM,       /* another: the title's own bloom, on as shipped */
     XS_GRAPHICS_MOTION_BLUR, /* another: the title's own motion blur, on as shipped */
+    XS_GRAPHICS_LOD_BIAS,    /* extra mip LOD bias: off, auto (from the render scale), or a value */
+    XS_GRAPHICS_DITHER,      /* noise dither in the presenter's scale to the window (Metal) */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
 #endif

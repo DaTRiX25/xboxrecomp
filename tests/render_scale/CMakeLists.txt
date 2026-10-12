@@ -7,10 +7,15 @@ cmake_minimum_required(VERSION 3.20)
 project(render_scale_test C)
 set(CMAKE_C_STANDARD 11)
 add_executable(render_scale_test test_main.c
-    ../../src/kernel/nv2a_backend_common.c)
+    ../../src/kernel/nv2a_backend_common.c
+    ../../src/platform/recomp_env.c)
 target_include_directories(render_scale_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernel
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/platform
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/enhance
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
+target_compile_definitions(render_scale_test PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS)
 if(NOT MSVC)
     target_compile_options(render_scale_test PRIVATE -Wall -Wextra)
 endif()
