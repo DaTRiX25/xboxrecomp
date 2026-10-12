@@ -66,8 +66,14 @@ void nv2a_texscale_mips(uint32_t *texels, uint32_t w, uint32_t h, uint32_t level
 
 /* ── the setting ─────────────────────────────────────────────────────── */
 
-/* 0 (off), 2 or 4; any other value is taken as off. Any thread; a change
- * moves the generation on. */
+/* Held off: the factor is 0 whatever is set. The default on Android (a GPU
+ * hang on Turnip / Adreno 650 with the setting on is not understood yet);
+ * RECOMP_DEBUG=ui_scale_hold=0 lifts it there for a test, =1 holds it
+ * anywhere. The overlay does not show the row while it is held. */
+int nv2a_texscale_held(void);
+
+/* 0 (off), 2 or 4; any other value is taken as off; 0 while held. Any
+ * thread; a change moves the generation on. */
 void     nv2a_texscale_set_factor(unsigned factor);
 unsigned nv2a_texscale_factor(void);
 void     nv2a_texscale_set_algo(enum nv2a_texscale_algo algo);
@@ -100,10 +106,14 @@ int nv2a_texscale_draw_is_2d(const struct nv2a_texscale_draw *d);
 int nv2a_texscale_tex_ok(int size_from_format, uint32_t w, uint32_t h,
                          uint32_t levels);
 
-/* Art cut out with alpha: any texel of the decoded level 0 that is not
- * opaque. An opaque picture drawn in 2D (a loading screen's photograph, a
- * film of static) is not scaled: an edge scaler has no outline to follow in
- * it, and those are the largest textures of the 2D. */
+/* Art cut out with alpha: at least one texel in sixteen of the decoded level
+ * 0 is not opaque. A picture that is opaque, or as good as, drawn in 2D is
+ * not scaled: an edge scaler has no outline to follow in a photograph, and
+ * those are the largest textures of the 2D. "As good as": a photograph
+ * stored in a format with an alpha channel has stray texels just under
+ * opaque (Burnout 3: one loading picture in three is DXT5 with 1.2% of its
+ * texels at alpha 227 to 254), where the 2D art seen has a quarter or more
+ * of its texels clear or soft. */
 int nv2a_texscale_has_alpha(const uint32_t *texels, size_t n);
 
 /* ── the store: off the render thread, and on disk ───────────────────── */

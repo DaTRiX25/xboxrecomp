@@ -18,7 +18,8 @@
  * promises is deleted and the texture is scaled again. NV2A_TEXSCALE_VERSION
  * is in the name and the header: a changed scaler leaves the old files to
  * the size bound, which deletes the files least recently used once the
- * directory passes it.
+ * directory passes it (a file's time is set to now whenever it is read, so
+ * the art seen in every run is the last to go, whenever it was written).
  */
 #include "nv2a_texscale.h"
 #include "recomp_env.h"

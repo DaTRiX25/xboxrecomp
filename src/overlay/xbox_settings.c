@@ -367,6 +367,8 @@ static void apply(xs_id id)
         nv2a_host_set_dither(v != 0.0);
         break;
     case XS_GRAPHICS_UI_SCALE:
+        /* Held off (Android for now): a value stored in the file stays in
+         * the file and does nothing; set_factor says so once. */
         nv2a_texscale_set_factor((int)v == 1 ? 2u : (int)v == 2 ? 4u : 0u);
         break;
     case XS_GRAPHICS_AA:

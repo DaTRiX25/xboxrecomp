@@ -88,6 +88,7 @@
 
 #include <SDL.h>
 #include "recomp_env.h"
+#include "recomp_restart.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -703,6 +704,36 @@ void fbv_android_surface_gone(void);
  * 0 asks, 1 chooses the driver in the app and starts the app again); an
  * activity without that method gets the plain warning. Returns 1 when the
  * window with the choice was shown. */
+/* recomp_restart.h on Android: the activity starts the app again (int
+ * restartGame(): the same path as its driver reset, a page in another
+ * process that starts the game once this process is gone). An activity
+ * without the method: nothing happens, and the log says so. */
+static void android_restart(void)
+{
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    jobject act = env ? (jobject)SDL_AndroidGetActivity() : NULL;
+    jclass cls;
+    jmethodID m;
+
+    if (!act)
+        return;
+    cls = (*env)->GetObjectClass(env, act);
+    m = (*env)->GetMethodID(env, cls, "restartGame", "()I");
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        m = NULL;
+    }
+    if (m) {
+        (*env)->CallIntMethod(env, act, m);
+        if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+    } else {
+        fprintf(stderr, "[RESTART] this app's activity has no restartGame(): not restarted\n");
+    }
+    (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, act);
+}
+
 static int android_offer_driver_reset(const char *msg)
 {
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
@@ -754,6 +785,103 @@ static int android_offer_driver_reset(const char *msg)
     return shown;
 }
 
+#endif /* __ANDROID__ (reopened below) */
+
+/* ── the graphics device is lost (nv2a_vk_core.h: nvk_device_lost) ───────
+ *
+ * A driver that gives up (VK_ERROR_DEVICE_LOST: on the Retroid Pocket 5 the
+ * kernel's "GPU hang detected", BO-128) used to leave the last picture on
+ * the screen with the title and its music running on behind it. Now the
+ * window's loop is told, says so in a box, and ends the run the ordinary
+ * way (the same as closing the window: the title's saves are what they
+ * were at its last save, the settings are written). "Restart" where there
+ * is one: on Android the activity's (restartApp), elsewhere the host's hook
+ * when it has set one (xbox_FramebufferWindowSetRestart). */
+static int s_gfx_lost;                 /* 1: to be said; 2: said */
+static int s_gfx_restart;              /* the player chose Restart */
+static char s_gfx_lost_why[160];
+static void (*s_restart_fn)(void);
+
+void xbox_FramebufferWindowSetRestart(void (*fn)(void))
+{
+    s_restart_fn = fn;
+}
+
+static void gfx_lost_handler(const char *why)
+{
+    snprintf(s_gfx_lost_why, sizeof s_gfx_lost_why, "%s", why ? why : "");
+    __atomic_store_n(&s_gfx_lost, 1, __ATOMIC_RELEASE);
+    {
+        /* The loop may be asleep in its wait for an event. */
+        SDL_Event ev;
+        memset(&ev, 0, sizeof ev);
+        ev.type = s_frame_event;
+        SDL_PushEvent(&ev);
+    }
+}
+
+static int gfx_can_restart(void)
+{
+#if defined(__ANDROID__)
+    return 1;
+#else
+    return s_restart_fn != NULL;
+#endif
+}
+
+static void gfx_restart(void)
+{
+#if defined(__ANDROID__)
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    jobject act = env ? (jobject)SDL_AndroidGetActivity() : NULL;
+    if (act) {
+        jclass cls = (*env)->GetObjectClass(env, act);
+        jmethodID m = (*env)->GetMethodID(env, cls, "restartApp", "()V");
+        if (m)
+            (*env)->CallVoidMethod(env, act, m);
+        if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+        SDL_Delay(1500);        /* the activity ends this process */
+    }
+#else
+    if (s_restart_fn)
+        s_restart_fn();
+#endif
+}
+
+/* The box; returns after the player's answer. The window's thread. */
+static void gfx_lost_say(void)
+{
+    SDL_MessageBoxButtonData b[2];
+    SDL_MessageBoxData d;
+    char text[700];
+    int n = 0, hit = 0;
+
+    snprintf(text, sizeof text, "The graphics driver stopped working (%s), so the game cannot"
+             " draw any more in this run.\n\nThe game is closed now. Your progress up to the"
+             " game's last save is kept.", s_gfx_lost_why);
+    memset(b, 0, sizeof b);
+    if (gfx_can_restart()) {
+        b[n].flags = SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
+        b[n].buttonid = 1;
+        b[n++].text = "Restart";
+    }
+    b[n].flags = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT | (n ? 0 : SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT);
+    b[n].buttonid = 0;
+    b[n++].text = "Quit";
+    memset(&d, 0, sizeof d);
+    d.flags = SDL_MESSAGEBOX_ERROR;
+    d.title = "Graphics driver";
+    d.message = text;
+    d.numbuttons = n;
+    d.buttons = b;
+    fprintf(stderr, "[PRESENT] the graphics device is lost: telling the player and ending the run\n");
+    if (SDL_ShowMessageBox(&d, &hit) == 0 && hit == 1)
+        s_gfx_restart = 1;
+    fprintf(stderr, "[PRESENT] the player chose %s\n", s_gfx_restart ? "Restart" : "Quit");
+}
+
+#if defined(__ANDROID__)
 static int android_lifecycle(void *user, SDL_Event *ev)
 {
     (void)user;
@@ -810,6 +938,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     int filter = eo->present_filter;
     SDL_Rect dst;                /* integer: where the frame goes */
     int dst_ok = 0, out_w = 0, out_h = 0;
+
+#if defined(__ANDROID__)
+    /* A restart is the activity's to do (recomp_restart.h). */
+    recomp_restart_set_hook(android_restart);
+#endif
 
     /* Ctrl-C and SIGTERM keep their default meaning (benches rely on it);
      * SDL would turn them into SDL_QUIT. Set before the headless return:
@@ -916,23 +1049,28 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                         " presented through Vulkan, and the settings overlay is drawn there"
                         " only (Back+Start does nothing)\n");
 #endif
-#if defined(__ANDROID__)
-                /* A phone has no terminal to read that on, and what follows
-                 * is the CPU rasteriser at a few frames a second: say so on
-                 * the screen (RECOMP_ANDROID_NO_GPU_NOTE=1: not). */
-                if (!getenv("RECOMP_ANDROID_NO_GPU_NOTE")) {
+                /* Not everybody has a terminal to read that on, and what
+                 * follows is the CPU rasteriser at a few frames a second:
+                 * say so on the screen (RECOMP_NO_GPU_NOTE=1 or, as before,
+                 * RECOMP_ANDROID_NO_GPU_NOTE=1: not). On Android the box
+                 * also offers the way back to the driver in the app. */
+                if (!getenv("RECOMP_NO_GPU_NOTE") && !getenv("RECOMP_ANDROID_NO_GPU_NOTE")) {
                     char msg[640];
                     snprintf(msg, sizeof msg,
                              "No usable Vulkan 1.3 graphics driver:\n%s\n\n"
                              "The game will draw on the CPU, which is very slow. "
+#if defined(__ANDROID__)
                              "On an Adreno GPU a Mesa Turnip driver is needed; the "
                              "log in the app's folder says which driver was "
                              "tried.", why);
                     if (!android_offer_driver_reset(msg))
+#else
+                             "Update the graphics driver (Vulkan 1.3 is needed); the "
+                             "game's log says which device was tried.", why);
+#endif
                         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING,
                                                  "Graphics driver", msg, NULL);
                 }
-#endif
             }
         }
 #endif
@@ -1050,7 +1188,20 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     t_start = t_stat = now_ns(CLOCK_MONOTONIC);
     cpu_start = cpu_stat = now_ns(CLOCK_THREAD_CPUTIME_ID);
 
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    {
+        /* nv2a_vk_core.h, which this file does not include (Vulkan types). */
+        extern void nvk_set_lost_handler(void (*fn)(const char *why));
+        nvk_set_lost_handler(gfx_lost_handler);
+    }
+#endif
     while (!quit && !guest_done) {
+        if (__atomic_load_n(&s_gfx_lost, __ATOMIC_ACQUIRE) == 1) {
+            __atomic_store_n(&s_gfx_lost, 2, __ATOMIC_RELEASE);
+            gfx_lost_say();
+            quit = 1;           /* the ordinary way out, below */
+            break;
+        }
         SDL_Event ev;
         uint64_t seq;
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
@@ -1398,6 +1549,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_Quit();
     else
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    if (s_gfx_restart)
+        gfx_restart();
     if (quit)
         exit(0);
     return s_guest_rc;

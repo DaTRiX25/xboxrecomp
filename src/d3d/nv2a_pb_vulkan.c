@@ -647,6 +647,18 @@ static void flush(int wait, int why)
         t1 = now_ns();
     r = vkQueueSubmit(C->queue, 1, &si, fence);
     nvk_queue_unlock();
+    {
+        /* RECOMP_DEBUG=vk_device_lost=<flip>: this submit counts as lost. */
+        static long at = -2;
+        if (at == -2) {
+            const char *e = recomp_env(RENV_VK_DEVICE_LOST);
+            at = e && *e ? atol(e) : -1;
+        }
+        if (at >= 0 && (long)s_presents >= at && !s_failed) {
+            fprintf(stderr, LOGP "vk_device_lost=%ld: this submit is treated as lost\n", at);
+            r = VK_ERROR_DEVICE_LOST;
+        }
+    }
     if (fence && r == VK_SUCCESS)
         s_fr[s_fi].fence_serial = serial;
     if (s_vf) {
@@ -664,6 +676,7 @@ static void flush(int wait, int why)
         if (r == VK_ERROR_DEVICE_LOST) {
             fprintf(stderr, LOGP "device lost: drawing stops\n");
             s_failed = 1;
+            nvk_device_lost("vkQueueSubmit: VK_ERROR_DEVICE_LOST");
         }
     }
     s_fr[s_fi].serial = serial;
@@ -2410,6 +2423,12 @@ static void scale_prepare_loaded(void)
         if (!e->live || e->sign || e->up_scale == f || e->pend
                 || !nv2a_texscale_tex_ok(nv2a_tex_size_from_format(e->color), e->width,
                                          e->height, e->levels))
+            continue;
+        /* Nothing says here whether a 2D draw uses a texture, and the larger
+         * one-level textures with alpha are mostly the world's (car
+         * liveries, tree lines, sky strips, 8 MB each at 4x): those are left
+         * to their own bind, which knows. Fonts and HUD art are within this. */
+        if ((uint64_t)e->width * e->height > 256u * 256u)
             continue;
         memset(&st, 0, sizeof st);
         st.offset = e->offset;

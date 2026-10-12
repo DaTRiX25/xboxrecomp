@@ -269,6 +269,7 @@ extern "C" {
     X(VK_POINT,          DEBUG, "vk_point",        NULL,                       "Vulkan point sampling") \
     X(VK_NO_RTT,         DEBUG, "vk_no_rtt",       NULL,                       "Vulkan decodes render targets from memory (implies vk_writeback=always)") \
     X(VK_WRITEBACK,      DEBUG, "vk_writeback",    NULL,                       "=lazy|always: Vulkan writes guest memory when a dump reads it (default) or at every flip") \
+    X(VK_DEVICE_LOST,    DEBUG, "vk_device_lost",  NULL,                       "=<flip>: Vulkan backend treats its first submit after that flip as VK_ERROR_DEVICE_LOST (a test of what the player is told when the driver gives up)") \
     X(VK_POLL,           DEBUG, "vk_poll",         NULL,                       "=0|1: Vulkan backend asks the timeline semaphore how far the GPU is (1: default off Android) or never asks and learns it from a fence per frame, waited for when the frame's slot is reused (0: default on Android, where Turnip on KGSL answers the question by waiting for the GPU)") \
     X(VK_BATCH,          DEBUG, "vk_batch",        NULL,                       "=<draws>: Vulkan backend submits what a frame has recorded when a render pass begins and that many draws (or 2 ms with any draw) have gone since the last submit, so the GPU starts on the frame while the rest is recorded; an occlusion report then waits for the pass to end instead of ending it. 0: one submit when the frame is complete (default; Android: 300)") \
     X(VK_OCC,            DEBUG, "vk_occ",          NULL,                       "=sync|fixed: Vulkan occlusion mode") \
@@ -284,6 +285,7 @@ extern "C" {
     X(FB_DUMP,           DEBUG, "fb_dump",         "RECOMP_FB_DUMP",           "=prefix: frame dumps (CPU/Metal, window)") \
     X(TEXREP_DUMP,       DEBUG, "texrep_dump",     NULL,                       "=dir: every texture a GPU backend (Metal, Vulkan) uploads, once per content, as <hash>_<w>x<h>_f<format>.tga with an index.tsv (the hash is the one nv2a_texrep registers)") \
     X(UI_SCALE_ALGO,     DEBUG, "ui_scale_algo",   NULL,                       "=bicubic: graphics.ui_scale scales with a Catmull-Rom bicubic instead of Super-xBR (for comparison)") \
+    X(UI_SCALE_HOLD,     DEBUG, "ui_scale_hold",   NULL,                       "graphics.ui_scale held off whatever the setting and the environment say: =1 on any platform, =0 lifts the hold where it is the default (Android, until the GPU hang seen on an Adreno 650 with it is understood)") \
     X(UI_SCALE_CACHE_MB, DEBUG, "ui_scale_cache_mb", NULL,                     "=n: size bound of graphics.ui_scale's disk cache of scaled textures, in MB (default 256); 0: no disk cache") \
     X(UI_SCALE_LOG,      DEBUG, "ui_scale_log",    NULL,                       "one line per texture and kind of draw that binds it (use 1: a 2D draw, 2: another, 3: both), with texrep_dump's hash and the factor it is uploaded at: what graphics.ui_scale's rule catches (Metal, Vulkan)") \
     X(FB_DUMP_AT,        DEBUG, "fb_dump_at",      "RECOMP_FB_DUMP_AT",        "=flips: fb_dump at these flips; =@file: the list in that file, read again when it grows") \

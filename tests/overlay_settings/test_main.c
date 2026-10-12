@@ -100,6 +100,29 @@ static char *read_file(const char *path)
     return buf;
 }
 
+/* The settings read once at start, by the table's flag: the only list of
+ * them there is (the overlay's "(restart)" mark, its Restart row and
+ * xbox_SettingsNeedRestart all read the flag). A setting added to the table
+ * with or without the flag has to be put here too, on purpose. */
+static void test_restart_flags(void)
+{
+    int i, flagged = 0;
+
+    for (i = 0; i < XS_COUNT; i++) {
+        const xs_setting *s = xbox_SettingGet((xs_id)i);
+        int want = i == XS_DISPLAY_ASPECT || i == XS_GRAPHICS_RENDER_SCALE || i == XS_AUDIO_SPEAKERS;
+#if defined(__ANDROID__)
+        want = want || i == XS_INPUT_VIBRATION;
+#endif
+        if (!!(s->flags & XS_RESTART) != want) {
+            printf("FAIL restart flag of %s: %d, expected %d\n", s->key, !!(s->flags & XS_RESTART), want);
+            s_fail++;
+        }
+        flagged += !!(s->flags & XS_RESTART);
+    }
+    CHECK(flagged >= 3);
+}
+
 int main(void)
 {
     const char *path = "overlay_settings_test.toml";
@@ -143,6 +166,7 @@ int main(void)
 
     xbox_SettingsInit("Test");
     CHECK(!strcmp(xbox_SettingsPath(), path));
+    test_restart_flags();
     /* A text setting: into its variable, readable, not "unknown". */
     CHECK(getenv("RECOMP_AUDIO_MUSIC_DIR")
           && !strcmp(getenv("RECOMP_AUDIO_MUSIC_DIR"), "/music/My \"Best\" \xC5\x90szi \xC5\xB1r"));
@@ -513,6 +537,12 @@ int main(void)
             recomp_cfg_free(c);
         }
     }
+    /* Where the upscaling is held off (Android for now) this layer does not
+     * decide: the stored value stays in the file as the player set it and is
+     * handed on as it is; the scaler ignores it and says so
+     * (nv2a_texscale_held, tests/nv2a_texscale). So nothing here may rewrite
+     * or drop the key. */
+    CHECK(st_ui_scale == 4 && xbox_SettingValue(XS_GRAPHICS_UI_SCALE) == 2);
     xbox_SettingReset(XS_GRAPHICS_UI_SCALE);
     CHECK(st_ui_scale == 0);
 

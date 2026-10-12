@@ -516,3 +516,397 @@ int recomp_save_backup(const char *dir, int keep, char *out, unsigned out_size)
     }
     return !same;
 }
+
+/* ── export and import (recomp_save_dir.h) ─────────────────────────── */
+
+#define SIO_NOTE     "save-export.txt"
+#define SIO_STAGED   "save-import.txt"
+#define SIO_RESULT   "save-import-result.txt"
+#define SIO_BEFORE   "save-before-import"
+
+static const char *const k_sio_parts[] = { "UDATA", "TDATA" };
+
+static void sio_err(char *err, unsigned n, const char *fmt, const char *a)
+{
+    if (err && n)
+        snprintf(err, n, fmt, a ? a : "");
+}
+
+static void sio_stamp(char *out, size_t n)
+{
+    time_t t = time(NULL);
+    struct tm *lt = localtime(&t);
+    strftime(out, n, "%Y%m%d-%H%M%S", lt);
+}
+
+typedef struct { const char *want; char found[128]; } SioFind;
+
+static int sio_find_entry(const char *dir, const char *name, int dir_entry, void *vctx)
+{
+    SioFind *f = (SioFind *)vctx;
+    size_t i;
+    (void)dir;
+    if (!dir_entry || strlen(name) != strlen(f->want) || strlen(name) >= sizeof f->found)
+        return 1;
+    for (i = 0; name[i]; i++)
+        if (tolower((unsigned char)name[i]) != tolower((unsigned char)f->want[i]))
+            return 1;
+    snprintf(f->found, sizeof f->found, "%s", name);
+    return 1;
+}
+
+/* The folder `name` of `parent`, whatever its case on this disk (the title
+ * names its folder; a copy made on another system keeps that spelling, a
+ * hand-made one may not). 1 with the path in `out`. */
+static int sio_child(const char *parent, const char *name, char *out, size_t n)
+{
+    SioFind f;
+    f.want = name;
+    f.found[0] = 0;
+    snprintf(out, n, "%s/%s", parent, name);
+    if (is_dir(out))
+        return 1;
+    for_each(parent, sio_find_entry, &f);
+    if (!f.found[0])
+        return 0;
+    snprintf(out, n, "%s/%s", parent, f.found);
+    return is_dir(out);
+}
+
+static int sio_count_files(const char *dir);
+
+static int sio_count_entry(const char *dir, const char *name, int dir_entry, void *ctx)
+{
+    char p[RS_PATH];
+    if (dir_entry) {
+        snprintf(p, sizeof p, "%s/%s", dir, name);
+        *(int *)ctx += sio_count_files(p);
+    } else {
+        (*(int *)ctx)++;
+    }
+    return 1;
+}
+
+static int sio_count_files(const char *dir)
+{
+    int n = 0;
+    for_each(dir, sio_count_entry, &n);
+    return n;
+}
+
+/* root/<part>/<title id>, when it is there. */
+static int sio_part(const char *root, int part, const char *title_id, char *out, size_t n)
+{
+    char p[RS_PATH];
+    if (!sio_child(root, k_sio_parts[part], p, sizeof p))
+        return 0;
+    return sio_child(p, title_id, out, n);
+}
+
+int recomp_save_has_data(const char *dir, const char *title_id)
+{
+    char p[RS_PATH];
+    return sio_part(dir, 0, title_id, p, sizeof p) && sio_count_files(p) > 0;
+}
+
+int recomp_save_export_check(const char *folder, const char *title_id, char *err, unsigned err_size)
+{
+    char p[RS_PATH], line[256];
+    FILE *f;
+
+    if (!folder || !*folder || !is_dir(folder)) {
+        sio_err(err, err_size, "%s is not a folder that can be read.", folder);
+        return 0;
+    }
+    snprintf(p, sizeof p, "%s/%s", folder, SIO_NOTE);
+    f = fopen(p, "r");
+    if (f) {
+        /* An export says whose it is. */
+        int other = 0;
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "title ", 6)) {
+                size_t i;
+                line[strcspn(line, "\r\n")] = 0;
+                for (i = 0; line[6 + i] && title_id[i]; i++)
+                    if (tolower((unsigned char)line[6 + i]) != tolower((unsigned char)title_id[i]))
+                        break;
+                other = line[6 + i] || title_id[i];
+            }
+        fclose(f);
+        if (other) {
+            sio_err(err, err_size, "%s holds a save of another game.", folder);
+            return 0;
+        }
+    }
+    if (!sio_part(folder, 0, title_id, p, sizeof p) || sio_count_files(p) == 0) {
+        sio_err(err, err_size, "%s is not a save of this game (no UDATA folder of it inside).", folder);
+        return 0;
+    }
+    return 1;
+}
+
+int recomp_save_export(const char *dir, const char *title_id, const char *dest_root, const char *note,
+                       char *out, unsigned out_size, char *err, unsigned err_size)
+{
+    char stamp[32], dest[RS_PATH], src[RS_PATH], dst[RS_PATH];
+    FILE *f;
+    int k, ok = 1, tries;
+
+    if (out && out_size)
+        out[0] = 0;
+    if (!recomp_save_has_data(dir, title_id)) {
+        sio_err(err, err_size, "There is no save yet: nothing to export.%s", "");
+        return 0;
+    }
+    mkdir_p(dest_root);
+    if (!is_dir(dest_root)) {
+        sio_err(err, err_size, "The folder %s cannot be made.", dest_root);
+        return 0;
+    }
+    sio_stamp(stamp, sizeof stamp);
+    snprintf(dest, sizeof dest, "%s/%s", dest_root, stamp);
+    for (tries = 2; is_dir(dest) && tries < 100; tries++)       /* two in one second */
+        snprintf(dest, sizeof dest, "%s/%s-%d", dest_root, stamp, tries);
+    if (rs_mkdir(dest) != 0 && !is_dir(dest)) {
+        sio_err(err, err_size, "Nothing can be written in %s.", dest_root);
+        return 0;
+    }
+    for (k = 0; k < 2 && ok; k++) {
+        if (!sio_part(dir, k, title_id, src, sizeof src))
+            continue;
+        snprintf(dst, sizeof dst, "%s/%s/%s", dest, k_sio_parts[k], title_id);
+        ok = copy_tree(src, dst, 0);
+    }
+    if (ok) {
+        snprintf(dst, sizeof dst, "%s/%s", dest, SIO_NOTE);
+        f = fopen(dst, "w");
+        if (f) {
+            fprintf(f, "title %s\nmade %s\n%s%s", title_id, stamp, note ? note : "",
+                    note && *note && note[strlen(note) - 1] != '\n' ? "\n" : "");
+            ok = fclose(f) == 0;
+        } else {
+            ok = 0;
+        }
+    }
+    if (!ok || !recomp_save_export_check(dest, title_id, NULL, 0)) {
+        rm_tree(dest);
+        sio_err(err, err_size, "The save could not be copied to %s (is the disk full or read-only?).",
+                dest_root);
+        return 0;
+    }
+    if (out && out_size)
+        snprintf(out, out_size, "%s", dest);
+    return 1;
+}
+
+int recomp_save_export_newest(const char *dest_root, const char *title_id, char *out, unsigned out_size)
+{
+    static char names[256][32];
+    char path[RS_PATH];
+    void *ctx[2];
+    int n = 0, i;
+
+    if (out && out_size)
+        out[0] = 0;
+    if (!is_dir(dest_root))
+        return 0;
+    ctx[0] = names;
+    ctx[1] = &n;
+    for_each(dest_root, collect_entry, ctx);
+    qsort(names, (size_t)n, sizeof names[0], cmp_name);
+    for (i = n - 1; i >= 0; i--) {
+        snprintf(path, sizeof path, "%s/%s", dest_root, names[i]);
+        if (recomp_save_export_check(path, title_id, NULL, 0)) {
+            if (out && out_size)
+                snprintf(out, out_size, "%s", path);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int recomp_save_import_stage(const char *dir, const char *folder, const char *title_id,
+                             char *err, unsigned err_size)
+{
+    char p[RS_PATH];
+    FILE *f;
+
+    if (!recomp_save_export_check(folder, title_id, err, err_size))
+        return 0;
+    mkdir_p(dir);
+    snprintf(p, sizeof p, "%s/%s", dir, SIO_STAGED);
+    f = fopen(p, "w");
+    if (!f || fprintf(f, "%s\n", folder) < 0 || fclose(f) != 0) {
+        sio_err(err, err_size, "The import could not be noted in %s.", dir);
+        return 0;
+    }
+    return 1;
+}
+
+int recomp_save_import_staged(const char *dir, char *folder, unsigned size)
+{
+    char p[RS_PATH], line[RS_PATH] = "";
+    FILE *f;
+
+    snprintf(p, sizeof p, "%s/%s", dir, SIO_STAGED);
+    f = fopen(p, "r");
+    if (!f)
+        return 0;
+    if (!fgets(line, sizeof line, f))
+        line[0] = 0;
+    fclose(f);
+    line[strcspn(line, "\r\n")] = 0;
+    if (folder && size)
+        snprintf(folder, size, "%s", line);
+    return line[0] != 0;
+}
+
+void recomp_save_import_cancel(const char *dir)
+{
+    char p[RS_PATH];
+    snprintf(p, sizeof p, "%s/%s", dir, SIO_STAGED);
+    rs_unlink(p);
+}
+
+static void sio_result(const char *dir, const char *text)
+{
+    char p[RS_PATH];
+    FILE *f;
+    snprintf(p, sizeof p, "%s/%s", dir, SIO_RESULT);
+    f = fopen(p, "w");
+    if (f) {
+        fputs(text, f);
+        fclose(f);
+    }
+}
+
+int recomp_save_import_result(const char *dir, char *text, unsigned size)
+{
+    char p[RS_PATH];
+    FILE *f;
+    size_t n;
+
+    if (!text || !size)
+        return 0;
+    text[0] = 0;
+    snprintf(p, sizeof p, "%s/%s", dir, SIO_RESULT);
+    f = fopen(p, "r");
+    if (!f)
+        return 0;
+    n = fread(text, 1, size - 1, f);
+    fclose(f);
+    text[n] = 0;
+    while (n && (text[n - 1] == '\n' || text[n - 1] == '\r'))
+        text[--n] = 0;
+    return n > 0;
+}
+
+int recomp_save_import_apply(const char *dir, const char *title_id, char *report, unsigned size)
+{
+    char folder[RS_PATH], stamp[32], before[RS_PATH], cur[RS_PATH], src[RS_PATH], dst[RS_PATH];
+    char text[RS_PATH * 3], why[RS_PATH + 128] = "";
+    int k, ok = 1, had[2] = { 0, 0 };
+
+    if (report && size)
+        report[0] = 0;
+    if (!recomp_save_import_staged(dir, folder, sizeof folder)) {
+        /* Nothing asked for: the last import's message was for the start
+         * that did it. */
+        snprintf(cur, sizeof cur, "%s/%s", dir, SIO_RESULT);
+        rs_unlink(cur);
+        return 0;
+    }
+    /* Whatever happens next, it is tried once. */
+    recomp_save_import_cancel(dir);
+    if (!recomp_save_export_check(folder, title_id, why, sizeof why)) {
+        snprintf(text, sizeof text, "The save was not imported: %s The save in use is unchanged.", why);
+        sio_result(dir, text);
+        if (report && size)
+            snprintf(report, size, "%s", text);
+        return -1;
+    }
+
+    /* The save in use, aside first. */
+    sio_stamp(stamp, sizeof stamp);
+    snprintf(before, sizeof before, "%s/%s/%s", dir, SIO_BEFORE, stamp);
+    for (k = 0; k < 2 && ok; k++) {
+        if (!sio_part(dir, k, title_id, cur, sizeof cur))
+            continue;
+        had[k] = 1;
+        snprintf(dst, sizeof dst, "%s/%s/%s", before, k_sio_parts[k], title_id);
+        ok = copy_tree(cur, dst, 0) && sio_count_files(dst) == sio_count_files(cur);
+    }
+    if (!ok) {
+        rm_tree(before);
+        snprintf(text, sizeof text, "The save was not imported: the save in use could not be copied "
+                 "aside first (to %s/%s). It is unchanged.", dir, SIO_BEFORE);
+        sio_result(dir, text);
+        if (report && size)
+            snprintf(report, size, "%s", text);
+        return -1;
+    }
+
+    /* The export in its place. */
+    for (k = 0; k < 2 && ok; k++) {
+        snprintf(cur, sizeof cur, "%s/%s/%s", dir, k_sio_parts[k], title_id);
+        if (had[k]) {
+            char real[RS_PATH];
+            if (sio_part(dir, k, title_id, real, sizeof real))
+                rm_tree(real);
+        }
+        if (!sio_part(folder, k, title_id, src, sizeof src))
+            continue;
+        ok = copy_tree(src, cur, 0) && sio_count_files(cur) == sio_count_files(src);
+    }
+    if (!ok) {
+        /* Back to what it was. */
+        int back = 1;
+        for (k = 0; k < 2; k++) {
+            snprintf(cur, sizeof cur, "%s/%s/%s", dir, k_sio_parts[k], title_id);
+            if (is_dir(cur))
+                rm_tree(cur);
+            if (!had[k])
+                continue;
+            snprintf(src, sizeof src, "%s/%s/%s", before, k_sio_parts[k], title_id);
+            if (!copy_tree(src, cur, 0))
+                back = 0;
+        }
+        snprintf(text, sizeof text, back
+                 ? "The save was not imported: %s could not be copied. The save in use was put back."
+                 : "The save was not imported: %s could not be copied, and the save in use could "
+                   "not be put back either: its copy is in the save-before-import folder.", folder);
+        sio_result(dir, text);
+        if (report && size)
+            snprintf(report, size, "%s", text);
+        return -1;
+    }
+    if (had[0] || had[1])
+        snprintf(text, sizeof text, "Imported the save from %s. The save that was here is in %s.",
+                 folder, before);
+    else
+        snprintf(text, sizeof text, "Imported the save from %s (there was no save here before).", folder);
+    sio_result(dir, text);
+    if (report && size)
+        snprintf(report, size, "%s", text);
+    return 1;
+}
+
+int recomp_home_dir(char *out, unsigned size)
+{
+    const char *h;
+#if defined(__ANDROID__)
+    /* An app has no home folder a file manager shows; its own external
+     * files directory is what it may write without asking. */
+    h = getenv("RECOMP_ANDROID_DIR");
+    if (!h || !*h)
+        h = getenv("XDG_DATA_HOME");
+#elif defined(_WIN32)
+    h = getenv("USERPROFILE");
+#else
+    h = getenv("HOME");
+#endif
+    if (!h || !*h || !out || !size)
+        return 0;
+    snprintf(out, size, "%s", h);
+    return 1;
+}

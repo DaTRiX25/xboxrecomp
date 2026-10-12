@@ -1,9 +1,10 @@
 /* recomp_patch.c - see recomp_patch.h. */
 #include "recomp_patch.h"
 
+#include <stdio.h>
 #include <string.h>
 
-#define PATCH_MAX 8
+#define PATCH_MAX 32
 
 static struct {
     const char *key;
@@ -20,8 +21,10 @@ void recomp_patch_enable(const char *key, recomp_env_id env)
             s_en[i].env = env;
             return;
         }
-    if (s_n == PATCH_MAX)
+    if (s_n == PATCH_MAX) {
+        fprintf(stderr, "[PATCH] switch table full (%d): %s is not registered\n", PATCH_MAX, key);
         return;
+    }
     s_en[s_n].key = key;
     s_en[s_n].env = env;
     s_en[s_n].latched = -1;

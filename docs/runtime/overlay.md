@@ -99,8 +99,9 @@ textures, no hashes):
   target, not a cube map, not a signed (bump) texture;
 - a swizzled or DXT format (a linear one is a video frame or a copy of the
   screen), one mip level, at most 512x512 texels;
-- some texel of it is not opaque (art cut out with alpha). An opaque picture
-  is left alone.
+- at least one texel in sixteen is not opaque (art cut out with alpha). An
+  opaque picture is left alone, and so is a photograph stored with an alpha
+  channel whose stray texels sit just under opaque.
 
 The scaled texture gets the mip levels down to the title's size (2 levels at
 2x, 3 at 4x) and a trilinear sampler over them, so an element drawn smaller
@@ -156,8 +157,10 @@ so a title's shader pre-build run does (it must pass the setting to its
 scenes and call `nv2a_texscale_flush` before it exits). When the setting is
 switched on in the overlay, the backend goes through its texture cache
 while the title is held for the pause (`xbox_HostPauseIdleFn`) and queues
-every loaded texture that passes the texture half of the rule, for the disk
-only; the row's note shows `nv2a_texscale_progress`.
+every loaded texture of at most 256x256 that passes the texture half of the
+rule, for the disk only (it cannot tell which are drawn in 2D, and the larger
+one-level textures with alpha are mostly the world's); the row's note shows
+`nv2a_texscale_progress`.
 
 Off (the default) asks for factor 0: no draw is classified, nothing is
 hashed or queued, no thread is started, and every path is the one it was. A
@@ -211,7 +214,7 @@ title's defaults when those change. Keys it does not know are kept.
 | `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins, where they play dry. Not used (and not shown) for a title whose GP effects image is modelled (`src/apu/apu_gp.h`) |
 | `audio.lfe_lowpass` (`off`, `80`, `100`, `120`; default `120`) | `RECOMP_AUDIO_LFE_LOWPASS` | not on the page (the settings file or the variable only; a change in a running game fades over 21 ms). For a title whose GP effects image is modelled: the low-pass on the LFE (subwoofer) feed, 24 dB an octave. 120 Hz is what the console's Dolby Digital encoder did after the effects stage and is the stock behaviour; off is that stage's own full-range feed. For tuning by ear use the mixer's own `lfe_lowpass_hz`, which comes after this one: with both on the feed passes both |
 | `audio.mixer` (default off) | `RECOMP_AUDIO_MIXER` | yes; the host mixer (`src/apu/apu_bus.h`): buses over the title's voices, on the Audio page's Mixer page. Its mix is not in settings.toml but in `mixer.toml` beside it (`RECOMP_AUDIO_MIXER_FILE`), read again when it changes. Off, and on with the neutral preset, the output is the same as before |
-| `audio.custom_music_dir` (a folder, default empty) | `RECOMP_AUDIO_MUSIC_DIR` | a text setting (`xbox_SettingsText`). Audio page row "Custom music folder" with a folder browser, when the port asked for it (`xbox_OverlaySetMusicFolder`); live if the port can (`soundtrack.md`) |
+| `audio.custom_music_dir` (a folder, default empty) | `RECOMP_AUDIO_MUSIC_DIR` | a text setting (`xbox_SettingsText`). The Audio page's first row, "Custom music folder", with a folder browser (its status line and notes right under it, the page's settings after them), when the port asked for it (`xbox_OverlaySetMusicFolder`); live if the port can (`soundtrack.md`) |
 | `game.speed_units` (`mph`, `kmh`) | `RECOMP_SPEED_UNITS` | live; Display page, only when the title enabled a guest patch for it (`recomp_patch_enable`, lifting: Guest patches) |
 | `display.ultrawide` (`off`, `21:9`, `32:9`, `window`) | `RECOMP_DISPLAY_ULTRAWIDE` | live, from the title's next 3D set-up; Display page, only when the title enabled a guest patch for it |
 | `display.hud_fix` (bool) | `RECOMP_GFX_HUD_FIX` | live, shown whole from the title's next HUD set-up; Display page, only when the title enabled a guest patch for it |
@@ -244,6 +247,74 @@ locks the row. The choice is one table, `k_stock_hidden` in
 `src/overlay/xbox_settings.c` (BO-75; set an entry to 0 to offer Maximum
 again); `xbox_PowerModeAtLoad(host, stored)` is the rule, testable per host
 (`tests/overlay_settings`).
+
+## Restart
+
+Some settings are read once, when the game starts. The table in
+`xbox_settings.c` says which with a flag, `XS_RESTART`, and that flag is the
+only list: the row's "(restart)" mark and note, `xbox_SettingsNeedRestart`
+and the Restart row all read it (the `overlay_settings` test names the
+flagged ones, so adding a setting means deciding). Flagged today:
+`display.aspect` (the dashboard bit the title reads at boot),
+`graphics.render_scale` (render targets are made at start),
+`audio.speakers` (the title picks its mix, and the device is opened, at
+start), on Android `input.vibration`. Everything else is applied while
+running or read each time it is used.
+
+While a flagged setting differs from its value at launch, or a port asked
+with `xbox_OverlayWantRestart(reason)`, every page has a "Restart game now"
+row above its reset row, with the reason in its note; the Advanced page
+always has "Restart game". Nothing restarts unless the row is picked. The
+row closes the overlay (the settings are written), asks `recomp_restart`
+for a restart and closes the window the ordinary way: the program's own
+shutdown runs (motors off, audio closed, logs finished), and its last exit
+handler starts it again with the arguments, directory and environment it
+was first given (`src/platform/recomp_restart.h`): in place on Linux and
+macOS (the same process id, so Steam, a launcher script, an AppImage's
+runtime or a Mac bundle see one program throughout), as a new process on
+Windows, through the activity (`restartGame()`) on Android. A port calls
+`recomp_restart_init(argc, argv)` first thing in `main`; without that there
+is no row.
+
+## Save data: export and import
+
+`xbox_OverlaySetSaveIO({save_dir, title_id, export_dir, note})` puts three
+rows on the Advanced page, above the Restart row (the functions are
+`recomp_save_dir.h`'s; `tests/save_io` covers them on a made tree):
+
+- **Export save to home folder**: copies the title's own save files,
+  `UDATA/<title id>` and `TDATA/<title id>` of the save root, unchanged, to
+  `<export_dir>/<YYYYMMDD-HHMMSS>/`, with a `save-export.txt` naming the
+  title. Nothing else of the save root goes along. The full path is shown.
+  The layout under the save root is the same on every host, so the dated
+  folder can be carried to another machine's folder of the same name.
+- **Import save from home folder (newest: ...)**: the newest export of this
+  title in `export_dir`.
+- **Import save from another folder...**: the folder browser (the music
+  folder's, opened with other words: `xsb_open_with`), starting on "Exported
+  saves", each folder marked when it is a save of this title.
+
+An import never touches the save under the running title (the title holds
+its save in memory and writes it back when it saves). The folder is checked
+(it has `UDATA/<title id>` with files; its `save-export.txt`, if any, names
+this title) and noted in the save root; the rows become "Cancel the import"
+and "Restart now (the save is imported at the start)". At the next start the
+port calls `recomp_save_import_apply` before anything else looks at the save
+root: the save in use is copied to
+`<save root>/save-before-import/<date-time>/` (a folder of its own, which
+the start-up backups' rotation never deletes), then replaced; if the copy
+fails the old save is put back. The result is in the log (`[SAVE] Imported
+the save from ...`) and under the rows for that run.
+
+Messages, not silence: nothing to export yet, no export found, the target
+cannot be written, not a save of this game, a save of another game.
+
+Android: `export_dir` is in the app's own external files folder
+(`/storage/emulated/0/Android/data/<package>/files/...`), the one place an
+app writes without a permission; the row shows the full path. It is reached
+over USB and by some file managers, not by all on Android 11 and later. A
+place every file manager reaches (Download, Documents) needs the storage
+access framework or a zip through MediaStore: not built.
 
 ## Text and fonts
 

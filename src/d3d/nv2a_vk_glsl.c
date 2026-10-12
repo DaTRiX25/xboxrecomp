@@ -16,6 +16,7 @@
 #define _GNU_SOURCE
 #endif
 #include "nv2a_vk_glsl.h"
+#include "nv2a_vk_core.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -47,6 +48,13 @@ typedef struct {
     uint32_t  n;
     uint32_t *words;
 } SpvEntry;
+
+/* The device's demote feature is on (nv2a_vk_core.c), or no device yet. */
+static int spv_demote(void)
+{
+    const struct nvk_core *c = nvk_core_get();
+    return !c || c->demote;
+}
 
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static SpvEntry *s_tab;          /* open addressing, s_cap a power of two */
@@ -124,7 +132,8 @@ static void load(int reload)
     if (!nvk_cache_dir(dir, sizeof dir)
             || snprintf(path, sizeof path, "%s/vk_spirv.bin", dir) >= (int)sizeof path)
         return;
-    snprintf(ver, sizeof ver, "vk spirv 1; glslang %d.%d.%d", GLSLANG_VERSION_MAJOR,
+    snprintf(ver, sizeof ver, "vk spirv %s; glslang %d.%d.%d", spv_demote() ? "1" : "1 (1.5)",
+             GLSLANG_VERSION_MAJOR,
              GLSLANG_VERSION_MINOR, GLSLANG_VERSION_PATCH);
     s_file = nv2a_pcache_open(path, ver, msg, sizeof msg);
     if (!s_file)
@@ -193,7 +202,9 @@ static uint32_t *compile(glslang_stage_t stage, const char *src, uint32_t *nout,
     in.client = GLSLANG_CLIENT_VULKAN;
     in.client_version = GLSLANG_TARGET_VULKAN_1_3;
     in.target_language = GLSLANG_TARGET_SPV;
-    in.target_language_version = GLSLANG_TARGET_SPV_1_6;
+    /* SPIR-V 1.6 where the device has the demote feature on (discard is
+     * OpDemoteToHelperInvocation there); 1.5 where it has not (OpKill). */
+    in.target_language_version = spv_demote() ? GLSLANG_TARGET_SPV_1_6 : GLSLANG_TARGET_SPV_1_5;
     in.code = src;
     in.default_version = 450;
     in.default_profile = GLSLANG_NO_PROFILE;
