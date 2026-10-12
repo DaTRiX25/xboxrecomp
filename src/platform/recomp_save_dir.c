@@ -18,6 +18,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <errno.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -115,38 +116,137 @@ static int for_each(const char *dir, entry_fn fn, void *ctx)
 #endif
 }
 
-static int copy_file(const char *from, const char *to)
+/* The first file a copy could not make, and why: the save history's log
+ * line names it, so a failure on a player's machine says what held it. */
+typedef struct {
+    char     path[RS_PATH];
+    unsigned code;                  /* Windows: GetLastError(); else errno */
+    int      waits;                 /* retries left for the whole copy (Windows) */
+} CopyFail;
+
+#define COPY_WAITS 10               /* x 50 ms: one copy waits half a second at most */
+
+static void copy_failed(CopyFail *fail, const char *path, unsigned code)
+{
+    if (fail && !fail->path[0]) {
+        snprintf(fail->path, sizeof fail->path, "%s", path);
+        fail->code = code;
+    }
+}
+
+#if defined(_WIN32)
+/* A source file is read sharing everything, delete included: the CRT's
+ * fopen shares reading and writing but not deleting, so it could not open a
+ * file a handle with DELETE access has open, and while it had one open
+ * an open asking for that access failed. A file a handle shares nothing of
+ * (another program's, a scanner's, the title's own for a moment) gets a
+ * short retry, bounded for the whole copy (COPY_WAITS): the history copy
+ * runs on the save guard's thread before the save is replaced and before
+ * the quit's two-second wait ends, and giving up loses only this copy. */
+static HANDLE open_source(const char *from, CopyFail *fail)
+{
+    HANDLE h = INVALID_HANDLE_VALUE;
+    DWORD e = 0;
+
+    for (;;) {
+        h = CreateFileA(from, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (h != INVALID_HANDLE_VALUE)
+            return h;
+        e = GetLastError();
+        if ((e != ERROR_SHARING_VIOLATION && e != ERROR_LOCK_VIOLATION && e != ERROR_ACCESS_DENIED)
+            || fail->waits <= 0)
+            break;
+        fail->waits--;
+        Sleep(50);
+    }
+    SetLastError(e);
+    return INVALID_HANDLE_VALUE;
+}
+
+static int copy_file(const char *from, const char *to, CopyFail *fail)
+{
+    HANDLE in = open_source(from, fail), out;
+    char buf[65536];
+    DWORD n, w;
+    int ok = 1;
+
+    if (in == INVALID_HANDLE_VALUE) {
+        copy_failed(fail, from, GetLastError());
+        return 0;
+    }
+    out = CreateFileA(to, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (out == INVALID_HANDLE_VALUE) {
+        copy_failed(fail, to, GetLastError());
+        CloseHandle(in);
+        return 0;
+    }
+    for (;;) {
+        if (!ReadFile(in, buf, sizeof buf, &n, NULL)) {
+            copy_failed(fail, from, GetLastError());
+            ok = 0;
+            break;
+        }
+        if (!n)
+            break;
+        if (!WriteFile(out, buf, n, &w, NULL) || w != n) {
+            copy_failed(fail, to, GetLastError());
+            ok = 0;
+            break;
+        }
+    }
+    CloseHandle(in);
+    if (!CloseHandle(out) && ok) {
+        copy_failed(fail, to, GetLastError());
+        ok = 0;
+    }
+    return ok;
+}
+#else
+static int copy_file(const char *from, const char *to, CopyFail *fail)
 {
     FILE *in = fopen(from, "rb"), *out;
     char buf[65536];
     size_t n;
     int ok = 1;
 
-    if (!in)
+    if (!in) {
+        copy_failed(fail, from, (unsigned)errno);
         return 0;
+    }
     out = fopen(to, "wb");
     if (!out) {
+        copy_failed(fail, to, (unsigned)errno);
         fclose(in);
         return 0;
     }
     while ((n = fread(buf, 1, sizeof buf, in)) > 0)
         if (fwrite(buf, 1, n, out) != n) {
+            copy_failed(fail, to, (unsigned)errno);
             ok = 0;
             break;
         }
-    fclose(in);
-    if (fclose(out) != 0)
+    if (ferror(in)) {
+        copy_failed(fail, from, (unsigned)errno);
         ok = 0;
+    }
+    fclose(in);
+    if (fclose(out) != 0) {
+        copy_failed(fail, to, (unsigned)errno);
+        ok = 0;
+    }
     return ok;
 }
+#endif
 
 typedef struct {
     const char *to;
     int skip_images;
     int ok;
+    CopyFail *fail;
 } CopyCtx;
 
-static int copy_tree(const char *from, const char *to, int skip_images);
+static int copy_tree_f(const char *from, const char *to, int skip_images, CopyFail *fail);
 
 static int copy_entry(const char *dir, const char *name, int dir_entry, void *vctx)
 {
@@ -161,24 +261,34 @@ static int copy_entry(const char *dir, const char *name, int dir_entry, void *vc
     if (!dir_entry && n > 5 && !strcmp(name + n - 5, ".~new"))
         return 1;
     if (dir_entry) {
-        if (!copy_tree(src, dst, c->skip_images))
+        if (!copy_tree_f(src, dst, c->skip_images, c->fail))
             c->ok = 0;
     } else if (!(c->skip_images && n > 4 && !strcmp(name + n - 4, ".img"))) {
-        if (!copy_file(src, dst))
+        if (!copy_file(src, dst, c->fail))
             c->ok = 0;
     }
     return 1;
 }
 
-static int copy_tree(const char *from, const char *to, int skip_images)
+static int copy_tree_f(const char *from, const char *to, int skip_images, CopyFail *fail)
 {
     CopyCtx c;
     c.to = to;
     c.skip_images = skip_images;
     c.ok = 1;
+    c.fail = fail;
     mkdir_p(to);
     for_each(from, copy_entry, &c);
     return c.ok;
+}
+
+static int copy_tree(const char *from, const char *to, int skip_images)
+{
+    CopyFail fail;
+    fail.path[0] = 0;
+    fail.code = 0;
+    fail.waits = COPY_WAITS;
+    return copy_tree_f(from, to, skip_images, &fail);
 }
 
 static int rm_entry(const char *dir, const char *name, int dir_entry, void *ctx);
@@ -696,9 +806,13 @@ int recomp_save_export(const char *dir, const char *title_id, const char *dest_r
                        char *out, unsigned out_size, char *err, unsigned err_size)
 {
     char stamp[32], dest[RS_PATH], src[RS_PATH], dst[RS_PATH];
+    CopyFail fail;
     FILE *f;
     int k, ok = 1, tries;
 
+    fail.path[0] = 0;
+    fail.code = 0;
+    fail.waits = COPY_WAITS;
     if (out && out_size)
         out[0] = 0;
     if (!recomp_save_has_data(dir, title_id)) {
@@ -722,7 +836,7 @@ int recomp_save_export(const char *dir, const char *title_id, const char *dest_r
         if (!sio_part(dir, k, title_id, src, sizeof src))
             continue;
         snprintf(dst, sizeof dst, "%s/%s/%s", dest, k_sio_parts[k], title_id);
-        ok = copy_tree(src, dst, 0);
+        ok = copy_tree_f(src, dst, 0, &fail);
     }
     if (ok) {
         snprintf(dst, sizeof dst, "%s/%s", dest, SIO_NOTE);
@@ -737,8 +851,19 @@ int recomp_save_export(const char *dir, const char *title_id, const char *dest_r
     }
     if (!ok || !recomp_save_export_check(dest, title_id, NULL, 0)) {
         rm_tree(dest);
-        sio_err(err, err_size, "The save could not be copied to %s (is the disk full or read-only?).",
-                dest_root);
+        if (fail.path[0] && err && err_size)
+            /* Which file, and the system's reason: a sharing violation
+             * (Windows error 32) is another program holding it. */
+#if defined(_WIN32)
+            snprintf(err, err_size, "The save could not be copied to %s: %s could not be copied "
+                     "(Windows error %u).", dest_root, fail.path, fail.code);
+#else
+            snprintf(err, err_size, "The save could not be copied to %s: %s could not be copied (%s).",
+                     dest_root, fail.path, strerror((int)fail.code));
+#endif
+        else
+            sio_err(err, err_size, "The save could not be copied to %s (is the disk full or read-only?).",
+                    dest_root);
         return 0;
     }
     if (out && out_size)
@@ -1021,7 +1146,7 @@ int recomp_save_history_prune(const char *dir, time_t now)
 
 int recomp_save_history_take(const char *dir, const char *title_id, char *out, unsigned out_size)
 {
-    char root[RS_PATH], err[RS_PATH + 128];
+    char root[RS_PATH], err[2 * RS_PATH + 160];
     int ok;
 
     snprintf(root, sizeof root, "%s/%s", dir, SH_DIR);

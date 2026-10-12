@@ -24,6 +24,7 @@
 #if !defined(_WIN32)
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #endif
 
 typedef void (*recomp_func_t)(void);
@@ -53,7 +54,11 @@ static void check(int ok, const char *what)
 
 static void on_replace(void) { hooks++; }
 
-static NTSTATUS open_file(const char *path, ACCESS_MASK access, ULONG disposition, HANDLE *out)
+/* share: the title's share mode. A handle kept open while this test looks
+ * at the file from outside shares reading (FILE_SHARE_READ), or Windows
+ * would refuse the look; the guard does not depend on it. */
+static NTSTATUS open_share(const char *path, ACCESS_MASK access, ULONG disposition, ULONG share,
+                           HANDLE *out)
 {
     XBOX_ANSI_STRING name;
     XBOX_OBJECT_ATTRIBUTES oa;
@@ -65,7 +70,12 @@ static NTSTATUS open_file(const char *path, ACCESS_MASK access, ULONG dispositio
     oa.ObjectName = &name;
     oa.Attributes = 0x40;
     *out = NULL;
-    return xbox_NtCreateFile(out, access, &oa, &ios, NULL, 0x80, 0, disposition, 0x60);
+    return xbox_NtCreateFile(out, access, &oa, &ios, NULL, 0x80, share, disposition, 0x60);
+}
+
+static NTSTATUS open_file(const char *path, ACCESS_MASK access, ULONG disposition, HANDLE *out)
+{
+    return open_share(path, access, disposition, 0, out);
 }
 
 /* As the title saves: open, set the size, one write from the start, close. */
@@ -77,7 +87,7 @@ static int save(const char *path, unsigned char fill, int close_it, HANDLE *left
     LARGE_INTEGER at;
     HANDLE h;
 
-    if (open_file(path, 0xC0110000u, XBOX_FILE_OPEN_IF, &h) != 0 || !h)
+    if (open_share(path, 0xC0110000u, XBOX_FILE_OPEN_IF, close_it ? 0 : 1, &h) != 0 || !h)
         return 0;
     eof.EndOfFile.QuadPart = SIZE;
     xbox_NtSetInformationFile(h, &ios, &eof, sizeof eof, XboxFileEndOfFileInformation);
@@ -92,22 +102,64 @@ static int save(const char *path, unsigned char fill, int close_it, HANDLE *left
     return 1;
 }
 
+/* Whether the name is there; not an open, which Windows refuses while a
+ * handle that shares nothing has the file. */
 static int exists(const char *p)
 {
-    FILE *f = fopen(p, "rb");
-    if (f) fclose(f);
-    return f != NULL;
+#if defined(_WIN32)
+    return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES;
+#else
+    struct stat st;
+    return stat(p, &st) == 0;
+#endif
+}
+
+/* The child runs this program again. cmd.exe (system on Windows) drops the
+ * first and last quote of a line that starts with one, so the line is quoted
+ * once more there; without it the child never ran and the steps "passed"
+ * with the old file untouched. The child's exit status is returned. */
+static int run_self(const char *self, const char *args, const char *root)
+{
+    char cmd[1400];
+#if defined(_WIN32)
+    snprintf(cmd, sizeof cmd, "\"\"%s\" %s \"%s\"\"", self, args, root);
+#else
+    snprintf(cmd, sizeof cmd, "\"%s\" %s \"%s\"", self, args, root);
+#endif
+    return system(cmd);
+}
+
+/* The fault hook ends the child with 90 + its step (kernel_saveguard.c). */
+static int child_ended_at(int rc, int step)
+{
+#if defined(_WIN32)
+    return rc == 90 + step;
+#else
+    return rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 90 + step;
+#endif
 }
 
 /* fill when every byte of the file is it and the size is SIZE; -1 otherwise */
 static int content(const char *p)
 {
     static unsigned char buf[SIZE + 16];
-    FILE *f = fopen(p, "rb");
     size_t n, i;
+#if defined(_WIN32)
+    /* Shares deleting too, as the guard's own reads: the title's handle has
+     * DELETE access, which a plain fopen cannot open beside. */
+    DWORD got = 0;
+    HANDLE f = CreateFileA(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return -1;
+    if (!ReadFile(f, buf, sizeof buf, &got, NULL)) got = 0;
+    CloseHandle(f);
+    n = got;
+#else
+    FILE *f = fopen(p, "rb");
     if (!f) return -1;
     n = fread(buf, 1, sizeof buf, f);
     fclose(f);
+#endif
     if (n != SIZE) return -2;
     for (i = 1; i < n; i++)
         if (buf[i] != buf[0]) return -3;
@@ -264,8 +316,11 @@ int main(int argc, char **argv)
     for (step = XBOX_SAVE_FAULT_AFTER_OPEN; step <= XBOX_SAVE_FAULT_AFTER_REPLACE; step++) {
         int want = step == XBOX_SAVE_FAULT_AFTER_REPLACE ? 'C' : 'B';
         int got;
-        snprintf(cmd, sizeof cmd, "\"%s\" fault %d \"%s\"", argv[0], step, root);
-        system(cmd);
+        int rc;
+        snprintf(cmd, sizeof cmd, "fault %d", step);
+        rc = run_self(argv[0], cmd, root);
+        snprintf(what, sizeof what, "ended at step %d: the child ended there (status %d)", step, rc);
+        check(child_ended_at(rc, step), what);
         got = content(g_real);
         snprintf(what, sizeof what, "ended at step %d: the file is the %s save, whole", step,
                  want == 'B' ? "old" : "new");
@@ -280,8 +335,7 @@ int main(int argc, char **argv)
     }
 
     /* The process quits right after the title's close: the save is in. */
-    snprintf(cmd, sizeof cmd, "\"%s\" quit \"%s\"", argv[0], root);
-    system(cmd);
+    check(run_self(argv[0], "quit", root) == 0, "a quit right after a save: the child ran");
     check(content(g_real) == 'D' && !exists(g_shadow), "a quit right after a save waits for it");
 
     /* Deleted on close, through the handle. */

@@ -13,6 +13,9 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <process.h>
+#include <io.h>
+#include <fcntl.h>
+#include <stdint.h>
 #else
 #include <dirent.h>
 #include <fcntl.h>
@@ -170,7 +173,28 @@ static void h_unlink(const xbox_host_char *p)
 static FILE *h_fopen(const xbox_host_char *p, int write)
 {
 #if defined(_WIN32)
-    return _wfopen(p, write ? L"wb" : L"rb");
+    /* A read shares everything, delete included: fopen does not share
+     * deleting, so it cannot open a file a handle with DELETE access has open
+     * (the title's save opens ask for it), and its open would make such an
+     * open of the title fail meanwhile. */
+    if (!write) {
+        HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        int fd;
+        FILE *f;
+        if (h == INVALID_HANDLE_VALUE)
+            return NULL;
+        fd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
+        if (fd < 0) {
+            CloseHandle(h);
+            return NULL;
+        }
+        f = _fdopen(fd, "rb");
+        if (!f)
+            _close(fd);
+        return f;
+    }
+    return _wfopen(p, L"wb");
 #else
     return fopen(p, write ? "wb" : "rb");
 #endif
