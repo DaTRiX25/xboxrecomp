@@ -220,7 +220,9 @@ static long id3v2_title(FILE *f, char *title, size_t cap)
     while (!(h[5] & 0x80)) {                      /* not unsynchronised */
         uint32_t fsize, hdr = ver == 2 ? 6 : 10;
         int is_title;
-        if (pos + hdr > size || tag[pos] == 0)
+        /* Not pos + hdr > size: a corrupt extended-header size makes pos
+         * huge and that sum wraps (audit finding 16). */
+        if (pos > size || hdr > size - pos || tag[pos] == 0)
             break;
         if (ver == 2) {
             fsize = (uint32_t)tag[pos + 3] << 16 | (uint32_t)tag[pos + 4] << 8 | tag[pos + 5];

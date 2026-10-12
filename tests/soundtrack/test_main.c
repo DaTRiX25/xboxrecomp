@@ -13,6 +13,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <unistd.h>      /* symlink */
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #include <direct.h>
@@ -227,7 +230,9 @@ static void test_scan_and_db(void)
     mkdir(in_work("lib"), 0755);
     mkdir(in_work("lib/B album"), 0755);
     mkdir(in_work("lib/a first"), 0755);
-    mkdir(in_work("lib/a first/disc 2"), 0755);
+    mkdir(in_work("lib/a second"), 0755);
+    mkdir(in_work("lib/a first/too deep"), 0755);       /* one level only: not read */
+    mkdir(in_work("elsewhere"), 0755);
     mkdir(in_work("lib/empty"), 0755);
     mkdir(in_work("lib/.hidden"), 0755);
     write_wav(in_work("lib/10 ten.wav"), 44100, 2, 440, 300);
@@ -238,7 +243,15 @@ static void test_scan_and_db(void)
     copy_file(in_work("lib/notes.txt"), in_work("lib/broken.flac"));        /* not a FLAC */
     fixture("tone_id3v23.mp3", "lib/a first/01.mp3");
     fixture("tone.flac", "lib/a first/02.flac");
-    fixture("tone48.ogg", "lib/a first/disc 2/a.ogg");
+    fixture("tone48.ogg", "lib/a second/a.ogg");
+    write_wav(in_work("lib/a first/too deep/deep.wav"), 44100, 1, 440, 200);
+    write_wav(in_work("elsewhere/linked.wav"), 44100, 1, 440, 200);
+#if !defined(_WIN32)
+    /* A folder that is a link is not followed (a link to / would be the
+     * whole disk). */
+    if (symlink(in_work("elsewhere"), in_work("lib/z link")) != 0)
+        CHECK("symlink", 0);
+#endif
     for (i = 1; i <= 14; i++) {                                             /* three groups */
         snprintf(rel, sizeof rel, "lib/B album/%d.wav", i);
         write_wav(in_work(rel), 22050, 1, 440, 100 * (unsigned)i);
@@ -249,13 +262,14 @@ static void test_scan_and_db(void)
     if (!lib)
         return;
     CHECK("four soundtracks", lib->n_st == 4);
-    CHECK("songs", lib->n_songs == 2 + 2 + 1 + 14);
+    CHECK("songs (none from too deep, none through the link)", lib->n_songs == 2 + 2 + 1 + 14);
+    CHECK("the whole folder was read", !lib->budget_hit);
     CHECK("the broken file is counted", lib->bad_files == 1);
     /* The folder itself first, then its folders in natural order, each
      * followed by its own. */
     CHECK("root named after the folder", name_is(lib->st[0].name, "lib"));
     CHECK("then 'a first'", name_is(lib->st[1].name, "a first"));
-    CHECK("then its 'disc 2'", name_is(lib->st[2].name, "disc 2"));
+    CHECK("then 'a second' (a folder in it, not below one)", name_is(lib->st[2].name, "a second"));
     CHECK("then 'B album'", name_is(lib->st[3].name, "B album"));
     CHECK("ids from 1", lib->st[0].id == 1 && lib->st[3].id == 4);
     CHECK("2 before 10", name_is(lib->songs[0].name, "2 two") && name_is(lib->songs[1].name, "10 ten"));
@@ -324,6 +338,34 @@ static void test_limits(void)
         snprintf(rel, sizeof rel, "many/%d.wav", i);
         copy_file(in_work("many/1.wav"), in_work(rel));
     }
+    /* An ID3v2.3 tag whose extended-header size is corrupt (audit finding
+     * 16): the frame walk must stop, not read past the tag. */
+    {
+        unsigned char t[10 + 100];
+        uint32_t ms = 0;
+        char title[64] = "";
+        FILE *f = fopen(in_work("badext.mp3"), "wb");
+        memset(t, 0, sizeof t);
+        memcpy(t, "ID3\x03\x00\x40\x00\x00\x00\x64", 10);   /* v2.3, extended header, 100 bytes */
+        t[10] = 0xFF; t[11] = 0xFF; t[12] = 0xFF; t[13] = 0xF0;     /* its size: near 4 GB */
+        if (f) { fwrite(t, 1, sizeof t, f); fclose(f); }
+        xst_probe(in_work("badext.mp3"), &ms, title, sizeof title);
+        CHECK("a corrupt extended header: no title, no crash", title[0] == 0);
+    }
+
+    /* A folder of more entries than a scan reads (Home, a whole disk):
+     * it stops there, says so, and offers what it read. */
+    mkdir(in_work("huge"), 0755);
+    for (i = 0; i < XST_SCAN_BUDGET + 50; i++) {
+        FILE *f;
+        snprintf(rel, sizeof rel, "huge/note %05d.txt", i);
+        f = fopen(in_work(rel), "wb");
+        if (f) fclose(f);
+    }
+    lib = xst_scan(in_work("huge"));
+    CHECK("a folder past the budget: scanned, stopped, said", lib && lib->budget_hit && lib->n_songs == 0);
+    xst_free(lib);
+
     lib = xst_scan(in_work("many"));
     CHECK("500 songs kept", lib && lib->n_songs == XST_MAX_SONGS && lib->dropped_songs == 3);
     if (lib) {

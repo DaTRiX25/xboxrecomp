@@ -2428,14 +2428,14 @@ static void build_pages(float fs)
             /* The app does not ask for the audio permission yet (the game
              * repository's docs/custom-music.md, "Android"): its own files
              * folder is what it can read, and the browser lists it first. */
-            snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
-                     " own music menu. On Android the app reads its own folder only: copy music"
+            snprintf(hint, sizeof hint, "Your own music (mp3, flac, ogg, wav) for the game's music menu:"
+                     " a folder of songs, or a folder of folders: each one a soundtrack. On Android the app reads its own folder only: copy music"
                      " folders into Android/data/<this app>/files/Music, then press A and choose"
                      " \"This app's Music folder\".");
 #else
-            snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
-                     " own music menu: every folder with music in it becomes a soundtrack there."
-                     " A opens a folder list.");
+            snprintf(hint, sizeof hint, "Your own music (mp3, flac, ogg, wav) for the game's music menu:"
+                     " a folder of songs, or a folder of folders: each one a soundtrack. A opens a"
+                     " folder list.");
 #endif
     } else if (rows[sel].kind == R_ACTION
                && (rows[sel].action == A_REPORT || rows[sel].action == A_REPORT_SHOT)) {

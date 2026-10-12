@@ -45,9 +45,14 @@ cache.
 
 ## The folder
 
-`xst_scan(dir)`: every folder that holds playable files is one soundtrack,
-named after the folder: the chosen folder itself (its loose files), then the
-folders below it in natural order, six levels deep. Songs are in natural
+`xst_scan(dir)`: a folder of songs, or a folder of folders, each one a
+soundtrack named after its folder: the chosen folder itself (its loose
+files), then each folder directly in it, in natural order. Nothing deeper is
+read, and a folder that is a link (a junction on Windows) is not followed. A
+scan reads at most 20 000 folder entries (`XST_SCAN_BUDGET`); past that it
+stops, offers what it read, and says so (`budget_hit`, the log, the overlay's
+row). A port starts it with `xbox_SoundtrackSetFolder` at boot as well,
+never inline: a start cannot wait on a big folder. Songs are in natural
 order of file name ("2" before "10") and named by the title tag (ID3v2,
 Vorbis comment), else the file name without its extension. Entries with a
 leading dot are skipped. Past the limits, folders and songs are left out and
@@ -149,7 +154,8 @@ the mouse. Its model is `xst_browse.c` (`xsb_*`, no drawing, unit-tested):
   window's disc browser, with Music first.
 - a folder: "Use this folder", "..", its folders in natural order (1024 rows
   at most), each with the playable files in and below it, counted by name on
-  the browser's own thread, six levels deep, 20 000 entries a row.
+  the browser's own thread, one level deep as a scan reads (no link
+  followed), 20 000 entries a row.
 - B goes up one folder, from a place's own folder to the places, from the
   places back to the page.
 
