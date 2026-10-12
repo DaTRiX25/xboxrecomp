@@ -139,57 +139,10 @@ typedef struct DSPState {
 } DSPState;
 
 /* ============================================================
- * SVF (State Variable Filter) - from vp/svf.h
+ * Voice low-pass: apu_lowpass.h (this project's own, not from xemu)
  * ============================================================ */
 
-#define flush_to_zero(x) (x)
-#define F_LP 1
-#define F_HP 2
-#define F_BP 3
-#define F_BR 4
-#define F_AP 5
-#define F_R  1
-
-typedef struct {
-    float f;
-    float q;
-    float qnrm;
-    float h;
-    float b;
-    float l;
-    float p;
-    float n;
-    float *op;
-} sv_filter;
-
-static inline void setup_svf(sv_filter *sv, float fc, float q, int t) {
-    sv->f = fc;
-    sv->q = q;
-    sv->qnrm = (float)sqrt(sv->q / 2.0 + 0.01);
-    switch (t) {
-    case F_LP: sv->op = &(sv->l); break;
-    case F_HP: sv->op = &(sv->h); break;
-    case F_BP: sv->op = &(sv->b); break;
-    case F_BR: sv->op = &(sv->n); break;
-    default:   sv->op = &(sv->p); break;
-    }
-}
-
-static inline float run_svf(sv_filter *sv, float in) {
-    float out;
-    in = sv->qnrm * in;
-    for (int i = 0; i < F_R; i++) {
-        sv->b = flush_to_zero(sv->b - sv->b * sv->b * sv->b * 0.001f);
-        sv->h = flush_to_zero(in - sv->l - sv->q * sv->b);
-        sv->b = sv->b + sv->f * sv->h;
-        sv->l = flush_to_zero(sv->l + sv->f * sv->b);
-        sv->n = sv->l + sv->h;
-        sv->p = sv->l - sv->h;
-        out = *(sv->op);
-        in = out;
-    }
-    return out;
-}
+#include "apu_lowpass.h"
 
 /* ============================================================
  * HRTF Filter - from vp/hrtf.h
@@ -385,7 +338,7 @@ typedef struct MCPXAPUVoiceFilter {
      * between them, and whether they have been fetched yet. */
     float rs_last[2], rs_next[2], rs_pos;
     int   rs_have;
-    sv_filter svf[2];
+    ApuLowpass lowpass[2];
     HrtfFilter hrtf;
 } MCPXAPUVoiceFilter;
 
