@@ -369,6 +369,18 @@ static void timing_poll(SDL_Window *win)
     timing_status();
 }
 
+/* RECOMP_DEBUG=glass_measure=0: no on-glass handler in legacy (an A/B of
+ * what the measurement itself costs). */
+static int glass_measure_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_GLASS_MEASURE);
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
 /* RECOMP_TRACE=glass=<file>. */
 static FILE *glass_file(void)
 {
@@ -1113,7 +1125,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         }
         /* When it reached the glass: the pacer's feedback and the graph's
          * trace (a redraw of the same frame only gives its drawable back). */
-        {
+        if (timed || glass_measure_on()) {
             uint64_t vb = vblank_ns, commit_ns = xbox_HostNowNs();
             uint32_t fl2 = flip;
             pc_aim aim2 = aim;

@@ -255,6 +255,7 @@ extern "C" {
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
     X(WINDOW_DISPLAY,    DEBUG, "window_display",  NULL,                       "=n: open the window centred on display n (0 = main)") \
     X(WINDOW_FLOAT,      DEBUG, "window_float",    NULL,                       "1: the window stays above other windows (macOS; a measured run needs it visible: an occluded window reports no on-glass times)") \
+    X(GLASS_MEASURE,     DEBUG, "glass_measure",   NULL,                       "=0: the Metal presenter installs no on-glass handler with display.present_timing = legacy (A/B of the measurement's own cost, BO-125); the graph's on-glass line then says not available") \
     X(EARLY_COMMIT,      DEBUG, "early_commit",    NULL,                       "=0: submit a frame's GPU work after the vblank hold, not at FLIP_STALL (A/B)") \
     X(METAL_FRAMES,      DEBUG, "metal_frames",    NULL,                       "=1: Metal waits for each frame at its flip; default 2 frames in flight") \
     X(METAL_PRESENT,     DEBUG, "metal_present",   NULL,                       "=layer|readback: Metal window present, CAMetalLayer from GPU slots (default) or the old texture readback") \
