@@ -133,8 +133,17 @@ typedef struct {
                                          * that range crosses a page or the end */
     const uint32_t *stack;              /* guest return addresses at turn-on */
     int      nstack;
+    int      gp_return;                 /* a voice playing the GP model's export
+                                         * (apu_gp.h): 1 + the mixbin it plays
+                                         * back; 0 for any other voice */
 } apu_bus_voice;
-/* Returns the bus of a voice, or -1 for the last bus ("Other"). Called on
+/* A classifier's answer for a voice that is only the input of an in-place
+ * GP effect whose output a return voice plays: it is mixed as with the
+ * mixer off (the title's bins and gains; no bus gain, mute, solo or meter),
+ * and the bus of the return voice is where the sound is heard. */
+#define APU_BUS_BYPASS (-2)
+/* Returns the bus of a voice, -1 for the last bus ("Other"), or
+ * APU_BUS_BYPASS. Called on
  * the APU frame thread when a voice starts or its buffer changes. */
 typedef int (*apu_bus_classify_fn)(const apu_bus_voice *v);
 void apu_bus_set_classifier(apu_bus_classify_fn fn);
@@ -212,7 +221,8 @@ void apu_bus_frame_end(struct apu_bus_rt *rt, float (*mixbins)[APU_BUS_FRAME]);
  * then converts as it always did). */
 int  apu_bus_output_active(void);
 void apu_bus_output(float (*feeds)[APU_BUS_FRAME], int nch, int n);
-/* A voice's bus (frame thread): asked again when serial or buffer changed. */
+/* A voice's bus, or APU_BUS_BYPASS (frame thread): asked again when serial
+ * or buffer changed. */
 int  apu_bus_voice_bus(unsigned voice, unsigned serial, uint32_t buffer_pa,
                        int (*fill)(void *ctx, apu_bus_voice *v), void *ctx);
 
