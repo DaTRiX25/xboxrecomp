@@ -14,9 +14,15 @@ endif()
 enable_testing()
 add_test(NAME utf8_args COMMAND utf8_args_test)
 # Windows: the same letters through a real command line. They arrive right
-# only in a program whose code page is UTF-8 (a manifest), which this test
-# program is not: it reports what it got and passes either way when the code
-# page is not UTF-8, and must match when it is.
+# only in a program whose code page is UTF-8, so the test program carries the
+# manifest that says so (utf8.manifest, resource 1 of type 24), as the real
+# programs do; on Windows 10 1903 and later the echo must then match. On an
+# older Windows the manifest is ignored, the program says which code page it
+# has and passes.
 if(WIN32)
+    enable_language(RC)
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/utf8_args.rc
+         "1 24 \"${CMAKE_CURRENT_SOURCE_DIR}/utf8.manifest\"\n")
+    target_sources(utf8_args_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/utf8_args.rc)
     add_test(NAME utf8_args_command_line COMMAND utf8_args_test --echo "Zenék őű музыка")
 endif()
