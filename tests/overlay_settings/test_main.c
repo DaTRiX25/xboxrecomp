@@ -123,6 +123,7 @@ int main(void)
     set_env("RECOMP_PAD_DEADZONE", NULL);
     set_env("RECOMP_GFX_BLOOM", NULL);
     set_env("RECOMP_GFX_MOTION_BLUR", NULL);
+    set_env("RECOMP_GFX_VEHICLE_DETAIL", NULL);
 
     xbox_SettingsInit("Test");
     CHECK(!strcmp(xbox_SettingsPath(), path));
@@ -195,6 +196,21 @@ int main(void)
         /* Untouched, the variable never reads "0": no patch is active. */
         const char *e = recomp_env(RENV_GFX_MOTION_BLUR);
         CHECK(!e || strcmp(e, "0") != 0);
+    }
+    {
+        /* The vehicle detail distance (a guest patch on anything but
+         * "original"): untouched it never reads far or farthest; a choice
+         * reaches the environment at once and goes back. */
+        const char *e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
+        CHECK(xbox_SettingValue(XS_GRAPHICS_VEHICLE_DETAIL) == 0 && !xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->user);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+        xbox_SettingSet(XS_GRAPHICS_VEHICLE_DETAIL, 2);
+        e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
+        CHECK(e && !strcmp(e, "farthest"));
+        CHECK(!xbox_SettingsNeedRestart());          /* live */
+        xbox_SettingReset(XS_GRAPHICS_VEHICLE_DETAIL);
+        e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
+        CHECK(!e || !*e || !strcmp(e, "original"));
     }
     xbox_SettingSet(XS_GRAPHICS_MOTION_BLUR, 0);
     CHECK(recomp_env(RENV_GFX_MOTION_BLUR) && !strcmp(recomp_env(RENV_GFX_MOTION_BLUR), "0"));
