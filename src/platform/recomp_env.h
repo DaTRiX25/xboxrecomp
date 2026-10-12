@@ -102,6 +102,7 @@ extern "C" {
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
     X(INPUT_RUMBLE,      CONFIG, "RECOMP_INPUT_RUMBLE",      NULL, "forward the title's rumble (USB output report) to the host pad; default 1, 0: off") \
     X(INPUT_FACE_LAYOUT, CONFIG, "RECOMP_INPUT_FACE_LAYOUT", NULL, "the host pad's face buttons: xbox (default), nintendo (A and B, X and Y change places: a pad printed the Nintendo way)") \
+    X(INPUT_GLYPHS,      CONFIG, "RECOMP_INPUT_GLYPHS",      NULL, "the button prompts the title draws: auto (default: those of the pad last used; the title's own for a pad nothing is known about), xbox (the title's own, nothing replaced), xbox_modern (LB RB LT RT), playstation, nintendo, steam (the Steam Deck and Valve's controllers)") \
     X(INPUT_RUMBLE_GAIN, CONFIG, "RECOMP_INPUT_RUMBLE_GAIN", NULL, "rumble strength, 0..3: host motor = (speed / peak) ^ (1 / strength), every backend alike; 1.0 (default): the title's speeds as the console played them, 0: off, above 1: the low speeds lifted (full stays full). Under speed 800 a motor is off, and on again from 1200; a falling level lets go over about 90 ms") \
     X(INPUT_RUMBLE_PEAK, CONFIG, "RECOMP_INPUT_RUMBLE_PEAK", NULL, "the title's own full motor speed, 1..65535 (default 65535): the speed that is full on the host motor, for a title whose strongest rumble stays under 65535") \
     X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0)") \
@@ -260,6 +261,7 @@ extern "C" {
     X(USB_NDP,           DEBUG, "usb_ndp",         "RECOMP_USB_NDP",           "=n: root-hub ports, 1..4") \
     X(PAD_PRESS,         DEBUG, "pad_press",       "RECOMP_PAD_PRESS",         "=mask: pulse these buttons (USB pad)") \
     X(FB_DUMP,           DEBUG, "fb_dump",         "RECOMP_FB_DUMP",           "=prefix: frame dumps (CPU/Metal, window)") \
+    X(TEXREP_DUMP,       DEBUG, "texrep_dump",     NULL,                       "=dir: every texture a GPU backend (Metal, Vulkan) uploads, once per content, as <hash>_<w>x<h>_f<format>.tga with an index.tsv (the hash is the one nv2a_texrep registers)") \
     X(FB_DUMP_AT,        DEBUG, "fb_dump_at",      "RECOMP_FB_DUMP_AT",        "=flips: fb_dump at these flips; =@file: the list in that file, read again when it grows") \
     X(FB_DUMP_FLIPS,     DEBUG, "fb_dump_flips",   "RECOMP_FB_DUMP_FLIPS",     "=n: fb_dump every nth flip") \
     X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \

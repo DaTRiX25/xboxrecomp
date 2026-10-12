@@ -72,6 +72,7 @@ const xbox_input_backend xbox_input_host_backend = {
 /* ======================================================================== */
 
 #include <SDL.h>
+#include "pad_glyphs.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
@@ -142,6 +143,61 @@ static void pad_describe(SDL_GameController *c, char *out, size_t n)
     snprintf(out, n, "\"%s\" %04x:%04x player %d", name ? name : "?",
              SDL_GameControllerGetVendor(c), SDL_GameControllerGetProduct(c),
              j ? SDL_JoystickGetPlayerIndex(j) : -1);
+}
+
+/* The pad whose prompts the title should draw (pad_glyphs.h): this one
+ * pressed a button, or is the first one of a headless run. SDL's own type
+ * first, the USB ids for what it has no type for. A Nintendo pad's face
+ * buttons come by their printed letters when SDL's hint says so (its
+ * default). */
+static void pad_active(SDL_GameController *c)
+{
+    static SDL_GameController *last;
+    static int said;
+    xbox_pad_family f = XBOX_PAD_FAMILY_XBOX;
+    const char *sd = getenv("SteamDeck");
+    int labels = 0;
+
+    if (!c)
+        return;
+    switch (SDL_GameControllerGetType(c)) {
+    case SDL_CONTROLLER_TYPE_XBOX360:
+    case SDL_CONTROLLER_TYPE_XBOXONE:
+        f = XBOX_PAD_FAMILY_XBOX_MODERN;
+        break;
+    case SDL_CONTROLLER_TYPE_PS3:
+    case SDL_CONTROLLER_TYPE_PS4:
+    case SDL_CONTROLLER_TYPE_PS5:
+        f = XBOX_PAD_FAMILY_PLAYSTATION;
+        break;
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+#endif
+        f = XBOX_PAD_FAMILY_NINTENDO;
+        labels = SDL_GetHintBoolean(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, SDL_TRUE)
+                     == SDL_TRUE;
+        break;
+    default:
+        break;
+    }
+    f = xbox_PadFamilyFromIds(f, SDL_GameControllerGetVendor(c),
+                              SDL_GameControllerGetProduct(c), SDL_GameControllerName(c),
+                              sd && sd[0] == '1');
+    if (c != last || !said) {
+        static const char *const fam[] = { "unknown (xbox original)", "xbox modern", "playstation", "nintendo", "steam" };
+        char d[160];
+        const char *name = SDL_GameControllerName(c);
+        snprintf(d, sizeof d, "\"%s\" %04x:%04x", name ? name : "?",
+                 SDL_GameControllerGetVendor(c), SDL_GameControllerGetProduct(c));
+        fprintf(stderr, "[INPUT] controller %s in use: family %s (SDL type %d)\n", d, fam[f],
+                (int)SDL_GameControllerGetType(c));
+        last = c;
+        said = 1;
+    }
+    xbox_InputSetActivePad(f, labels);
 }
 
 /* Window thread: open the controller at device index i if it is not open. */
@@ -222,6 +278,9 @@ void xbox_InputPadEvent(const SDL_Event *ev)
         break;
     case SDL_CONTROLLERBUTTONDOWN:
         pad_claim(ev->cbutton.which);
+        for (int k = 0; k < PAD_OPEN_MAX; k++)
+            if (g_open[k].c && g_open[k].id == ev->cbutton.which)
+                pad_active(g_open[k].c);
         break;
     /* A pad in the hand must not go on shaking for a game that is not in
      * front: the motors stop with the window's focus and come back with it
@@ -298,6 +357,7 @@ static void sdl_init(void)
     }
     pthread_mutex_lock(&g_pads_lock);
     open_controllers();
+    pad_active(g_pads[0]);
     pthread_mutex_unlock(&g_pads_lock);
 }
 

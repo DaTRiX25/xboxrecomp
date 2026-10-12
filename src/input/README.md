@@ -8,6 +8,7 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 |------|---------|
 | `xinput_xbox.h` | Public header: types, button constants, function prototypes |
 | `input_map.h`, `input_map.c` | The host → Xbox mapping table, the pure map and deadzone helpers |
+| `pad_glyphs.h`, `pad_glyphs.c` | Which button prompts go with the pad in use (`input.glyphs`): a pad's family from SDL's type and its USB ids, the glyph set from the setting, the family and the face layout. Pure, plus the state a title listens to |
 | `input_core.c` | The public API: connection cache, probe backoff, keyboard merge, shutdown |
 | `input_backend.h` | The seam between `input_core.c` and a host backend (tests swap it) |
 | `xinput_device.c` | Host backends: XInput (Windows, Proton) and SDL2 GameController |

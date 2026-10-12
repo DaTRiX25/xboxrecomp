@@ -128,6 +128,7 @@ static const char *const n_vibration[] = { "Auto", "Controller", "This device", 
 static const char *const n_scale[]     = { "1x (640x480)", "1.5x (960x720)", "2x (1280x960)", "3x", "4x", NULL };
 #endif
 static const char *const n_face[]      = { "Xbox layout", "Nintendo layout", NULL };
+static const char *const n_glyphs[]    = { "Auto (the controller in use)", "Xbox (original)", "Xbox (modern: LB RB LT RT)", "PlayStation", "Nintendo", "Steam (Deck, Steam Controller)", NULL };
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
@@ -162,6 +163,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For a display wider than 16:9, with Aspect at 16:9: the race is drawn for the whole width (more to see at the sides, nothing stretched). Menus, loading screens and videos keep their 16:9 shape in the middle. Window follows the window's or the screen's own shape. A change shows from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
     /* XS_GRAPHICS_BLOOM */     { "Bloom", "The game's own soft glow over the picture, strongest while boosting. On is the original look; off skips its three extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "The game's own blur: the streaks towards the edges of the picture at speed and while boosting. On is the original look; off skips its two extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_INPUT_GLYPHS */       { "Button prompts", "The buttons the game shows in its menus and hints. Auto follows the controller that was last used. Xbox (original) is the game's own picture: white and black buttons, L and R. The game's text and videos still name the Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -313,6 +315,7 @@ static int page_rows(int page, Row *r)
     case P_INPUT:
         SET(XS_INPUT_DEADZONE); SET(XS_INPUT_TRIGGER_DEADZONE); SET(XS_INPUT_RUMBLE);
         SET(XS_INPUT_FACE_LAYOUT);
+        SET(XS_INPUT_GLYPHS);
 #if defined(__ANDROID__)
         SET(XS_INPUT_VIBRATION);
 #endif
