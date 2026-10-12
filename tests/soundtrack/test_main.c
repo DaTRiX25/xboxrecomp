@@ -16,7 +16,23 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <direct.h>
-#define mkdir(p, m) _mkdir(p)
+/* Paths are UTF-8 in this test as in the library: the wide calls. */
+static int u8_mkdir(const char *path)
+{
+    wchar_t w[1024];
+    return MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1024) > 0 ? _wmkdir(w) : -1;
+}
+static FILE *u8_fopen(const char *path, const char *mode)
+{
+    wchar_t w[1024], m[8];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1024) <= 0
+        || MultiByteToWideChar(CP_UTF8, 0, mode, -1, m, 8) <= 0)
+        return NULL;
+    return _wfopen(w, m);
+}
+#define mkdir(p, m) u8_mkdir(p)
+#else
+#define u8_fopen fopen
 #endif
 
 static int failures;
@@ -40,7 +56,7 @@ static void put(FILE *f, uint32_t v, int n) { while (n--) { fputc((int)(v & 0xFF
 /* A 16-bit WAV: a sine of `hz` at half scale, `ms` long. */
 static void write_wav(const char *path, unsigned rate, unsigned ch, double hz, unsigned ms)
 {
-    FILE *f = fopen(path, "wb");
+    FILE *f = u8_fopen(path, "wb");
     uint32_t n = rate * ms / 1000, i;
     unsigned c;
 
@@ -56,7 +72,7 @@ static void write_wav(const char *path, unsigned rate, unsigned ch, double hz, u
 
 static void copy_file(const char *from, const char *to)
 {
-    FILE *a = fopen(from, "rb"), *b = fopen(to, "wb");
+    FILE *a = u8_fopen(from, "rb"), *b = u8_fopen(to, "wb");
     char buf[4096];
     size_t n;
     if (!a || !b) { printf("copy %s -> %s\n", from, to); CHECK("copy_file", 0); }
@@ -533,6 +549,154 @@ static void test_browse(void)
     xsb_set_roots(NULL, NULL);
 }
 
+/* A folder and files with letters outside ASCII and outside Latin-1, as
+ * UTF-8: found by the scan, listed by the browser, opened by every decoder.
+ * (On Windows this is the wide-character road end to end.) */
+static void test_utf8_paths(void)
+{
+    /* "Árvíztűrő tükörfúrógép", "Őszi dal", and a decomposed "ő". */
+    static const char dir[] = "u8/\xC3\x81rv\xC3\xADzt\xC5\xB1r\xC5\x91 t\xC3\xBCk\xC3\xB6rf\xC3\xBAr\xC3\xB3g\xC3\xA9p";
+    static const char sub[] = "\xC5\x90szi dal";
+    char path[512], chosen[1024], where[1024], label[64];
+    static int16_t pcm[XST_RATE];
+    xst_library *lib;
+    xst_stream *st;
+    xsb_row r;
+    uint32_t ms = 0;
+    int sel, i;
+
+    mkdir(in_work("u8"), 0755);
+    mkdir(in_work(dir), 0755);
+    snprintf(path, sizeof path, "%s/%s", dir, sub);
+    mkdir(in_work(path), 0755);
+    snprintf(path, sizeof path, "%s/%s/1 \xC5\xB1r.wav", dir, sub);
+    write_wav(in_work(path), 44100, 2, 1000, 200);
+    snprintf(path, sizeof path, "%s/%s/2 \xC5\x91.mp3", dir, sub);
+    fixture("tone_id3v23.mp3", path);
+    snprintf(path, sizeof path, "%s/%s/3 \xC5\x91.flac", dir, sub);
+    fixture("tone.flac", path);
+    snprintf(path, sizeof path, "%s/%s/4 \xC5\x91.ogg", dir, sub);
+    fixture("tone48.ogg", path);
+
+    lib = xst_scan(in_work(dir));
+    CHECK("scan a folder named in UTF-8", lib && lib->n_st == 1 && lib->n_songs == 4);
+    if (lib) {
+        /* The title's menu name: folded to Latin-1 (O with diaeresis). */
+        CHECK("soundtrack name", lib->st[0].name[0] == 0xD6 && lib->st[0].name[1] == 's');
+        CHECK("wav name and length", lib->songs[0].name[2] == 0xFC && lib->songs[0].ms == 200);
+        CHECK("the path is kept as it is", strstr(lib->songs[0].path, "\xC5\x90szi dal/1 \xC5\xB1r.wav") != NULL);
+        for (i = 0; i < lib->n_songs; i++) {
+            st = xst_stream_open(lib->songs[i].path);
+            CHECK("open a song by its UTF-8 path", st != NULL && xst_stream_read(st, pcm, 1000) == 1000);
+            xst_stream_close(st);
+            CHECK("probe it", xst_probe(lib->songs[i].path, &ms, NULL, 0) && ms >= 190);
+        }
+    }
+    xst_free(lib);
+
+    xsb_set_roots(in_work("u8"), NULL);
+    xsb_open(in_work(dir));
+    CHECK("the current folder's label", xsb_row_at(1, &r) && strstr(r.label, "t\xC5\xB1r\xC5\x91") != NULL);
+    CHECK("into it", xsb_activate(1, chosen, sizeof chosen, &sel) == XSB_MOVED && xsb_rows() == 3);
+    CHECK("its folder", xsb_row_at(2, &r) && !strcmp(r.label, sub));
+    wait_counts();
+    CHECK("its songs", xsb_row_at(2, &r) && r.songs == 4);
+    CHECK("into that", xsb_activate(2, chosen, sizeof chosen, &sel) == XSB_MOVED);
+    CHECK("choose", xsb_activate(0, chosen, sizeof chosen, &sel) == XSB_CHOSEN);
+    xsb_where(where, sizeof where);
+    CHECK("the chosen path is the UTF-8 one", !strcmp(chosen, where)
+                                             && strstr(chosen, "\xC5\x90szi dal") != NULL);
+    lib = xst_scan(chosen);
+    CHECK("and scans", lib && lib->n_songs == 4);
+    xst_free(lib);
+    xsb_close();
+    xsb_set_roots(NULL, NULL);
+
+    /* What a screen is given: a decomposed name composed. */
+    xst_utf8_compose(label, sizeof label, "O\xCC\x8Bszi u\xCC\x8Brhajo\xCC\x81 c\xCC\x8C z\xCC\x87 x\xCC\x81");
+    CHECK("composed", !strcmp(label, "\xC5\x90szi \xC5\xB1rhaj\xC3\xB3 \xC4\x8D \xC5\xBC x\xCC\x81"));
+    xst_utf8_compose(label, sizeof label, "\xD0\x96 \xCE\xA9 \xE6\x97\xA5 abc");
+    CHECK("other scripts untouched", !strcmp(label, "\xD0\x96 \xCE\xA9 \xE6\x97\xA5 abc"));
+    xst_utf8_compose(label, 6, "ab\xC5\x91\xC5\x91\xC5\x91");
+    CHECK("cut on a character", !strcmp(label, "ab\xC5\x91"));
+    xst_utf8_compose(label, sizeof label, "a\xFFz");
+    CHECK("a broken byte", !strcmp(label, "a\xEF\xBF\xBDz"));
+}
+
+/* An mp3 as one was found in a real folder: 64 KiB of zeros, the tail of a
+ * frame cut in two, then the frames; no tag. A decoder plays it; the scan's
+ * probe has to take it too. And what is left out is named, with the reason. */
+static void test_mp3_junk_and_left_out(void)
+{
+    static uint8_t mp3[8192];
+    static int16_t pcm[XST_RATE * 2];
+    FILE *f;
+    size_t n, i, start = 0;
+    uint32_t ms = 0;
+    unsigned rate, ch;
+    const char *why = NULL;
+    xst_library *lib;
+    char from[1400];
+    int k, found_zero = 0, found_text = 0, found_mp3 = 0;
+
+    snprintf(from, sizeof from, "%s/tone_id3v23.mp3", g_data);
+    f = u8_fopen(from, "rb");
+    n = f ? fread(mp3, 1, sizeof mp3, f) : 0;
+    if (f) fclose(f);
+    CHECK("fixture", n > 2000 && !memcmp(mp3, "ID3", 3));
+    if (n > 10)
+        start = 10 + (((size_t)mp3[6] & 0x7F) << 21 | ((size_t)mp3[7] & 0x7F) << 14
+                      | ((size_t)mp3[8] & 0x7F) << 7 | ((size_t)mp3[9] & 0x7F));
+    CHECK("frames after the tag", start < n && mp3[start] == 0xFF);
+
+    mkdir(in_work("junk"), 0755);
+    f = u8_fopen(in_work("junk/1 zeros then frames.mp3"), "wb");
+    for (i = 0; i < 65536; i++) fputc(0, f);
+    for (i = 0; i < 168; i++) fputc((int)(0xE2 + i * 37) & 0xFF, f);     /* no frame header in it */
+    fwrite(mp3 + start, 1, n - start, f);
+    fclose(f);
+    f = u8_fopen(in_work("junk/2 only zeros.mp3"), "wb");
+    for (i = 0; i < 70000; i++) fputc(0, f);
+    fclose(f);
+    f = u8_fopen(in_work("junk/3 text.mp3"), "wb");
+    /* 0xFF 0xFB once, by chance, with no frame after it. */
+    fputs("not music \xFF\xFB\x92\x44 at all, and long enough to hold the frame that is not there", f);
+    for (i = 0; i < 600; i++) fputc('x', f);
+    fclose(f);
+    f = u8_fopen(in_work("junk/4 empty.mp3"), "wb");
+    fclose(f);
+    copy_file(in_work("junk/3 text.mp3"), in_work("junk/5 text.flac"));
+
+    CHECK("zeros, junk, then frames: taken", xst_probe_why(in_work("junk/1 zeros then frames.mp3"), &ms,
+                                                           NULL, 0, &why) && ms > 300 && ms < 900);
+    n = decode_all(in_work("junk/1 zeros then frames.mp3"), pcm, XST_RATE, &rate, &ch);
+    CHECK("and it plays", n > 20000 && tone_share(pcm + 8000, n - 12000, 0, 1000) > 0.99);
+    CHECK("only zeros: not", !xst_probe_why(in_work("junk/2 only zeros.mp3"), &ms, NULL, 0, &why)
+                             && strstr(why, "no MPEG audio"));
+    CHECK("a header by chance: not", !xst_probe_why(in_work("junk/3 text.mp3"), &ms, NULL, 0, &why)
+                                     && strstr(why, "no MPEG audio"));
+    CHECK("empty: not", !xst_probe_why(in_work("junk/4 empty.mp3"), &ms, NULL, 0, &why)
+                        && strstr(why, "empty"));
+    CHECK("no such file", !xst_probe_why(in_work("junk/none.mp3"), &ms, NULL, 0, &why)
+                          && strstr(why, "cannot be opened"));
+    CHECK("not a flac", !xst_probe_why(in_work("junk/5 text.flac"), &ms, NULL, 0, &why)
+                        && strstr(why, "FLAC"));
+
+    lib = xst_scan(in_work("junk"));
+    CHECK("one song, four left out", lib && lib->n_songs == 1 && lib->bad_files == 4
+                                     && lib->n_left_out == 4);
+    for (k = 0; lib && k < lib->n_left_out; k++) {
+        if (strstr(lib->left_out[k].path, "2 only zeros.mp3") && strstr(lib->left_out[k].why, "MPEG"))
+            found_zero = 1;
+        if (strstr(lib->left_out[k].path, "5 text.flac") && strstr(lib->left_out[k].why, "FLAC"))
+            found_text = 1;
+        if (strstr(lib->left_out[k].path, "4 empty.mp3") && strstr(lib->left_out[k].why, "empty"))
+            found_mp3 = 1;
+    }
+    CHECK("each named with its reason", found_zero && found_text && found_mp3);
+    xst_free(lib);
+}
+
 static void test_progress(void)
 {
     xst_progress pr;
@@ -561,6 +725,8 @@ int main(int argc, char **argv)
     test_scan_and_db();
     test_limits();
     test_browse();
+    test_utf8_paths();
+    test_mp3_junk_and_left_out();
     test_progress();
     test_decode();
     printf(failures ? "%d FAILED\n" : "ok\n", failures);

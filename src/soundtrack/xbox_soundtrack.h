@@ -41,6 +41,7 @@ extern "C" {
 #define XST_NAME_UNITS        32          /* UTF-16 units, the NUL included */
 #define XST_BLOCK             512
 #define XST_MAX_DEPTH         6           /* folders below the chosen one */
+#define XST_LEFT_OUT_KEPT     32          /* unreadable files remembered by name */
 
 /* The stream every song is delivered as. */
 #define XST_RATE              44100
@@ -65,8 +66,11 @@ typedef struct xst_library {
     int       n_st;
     xst_song *songs;
     int       n_songs, cap_songs;
-    /* What the limits and unreadable files left out. */
+    /* What the limits and unreadable files left out; of the unreadable
+     * ones the first XST_LEFT_OUT_KEPT by name, with the reason. */
     int       dropped_folders, dropped_songs, bad_files;
+    struct { char *path; const char *why; } left_out[XST_LEFT_OUT_KEPT];
+    int       n_left_out;
 } xst_library;
 
 /* ── xst_library.c ─────────────────────────────────────────────────── */
@@ -101,6 +105,12 @@ int  xst_natural_cmp(const char *a, const char *b);
  * letters are composed, Latin Extended-A is folded to the nearest letter
  * ("ő" to "ö"), anything else above it is '?'. */
 void xst_name_from_utf8(uint16_t out[XST_NAME_UNITS], const char *utf8);
+/* UTF-8 as a screen with a font wants it: a letter followed by a combining
+ * mark (how macOS spells a file name: "o" + U+030B) becomes the one
+ * character there is for it in Latin-1 or Latin Extended-A ("ő"). The rest
+ * is copied; a broken sequence becomes U+FFFD. Never longer than the input;
+ * cut at cap - 1 bytes, on a character. */
+void xst_utf8_compose(char *out, size_t cap, const char *utf8);
 /* 1 when the file name has an extension xst_decode.c plays. */
 int  xst_is_playable_name(const char *name);
 
@@ -109,6 +119,9 @@ int  xst_is_playable_name(const char *name);
 /* A file's length (ms, 0 unknown) and title tag ("" when it has none)
  * without decoding it. 0 when it is not a file this can play. */
 int xst_probe(const char *path, uint32_t *ms, char *title, size_t title_cap);
+/* The same, and for a file that is not: why, in a few words for a log or a
+ * settings screen (a constant string). */
+int xst_probe_why(const char *path, uint32_t *ms, char *title, size_t title_cap, const char **why);
 
 typedef struct xst_stream xst_stream;
 
@@ -194,6 +207,13 @@ int  xbox_SoundtrackSetFolder(const char *music_dir, void (*done)(int soundtrack
 int  xbox_SoundtrackScanning(int *folders, int *files, int *songs);
 /* The folder in use ("" when off) and its counts. */
 void xbox_SoundtrackInfo(char *dir, size_t cap, int *soundtracks, int *songs);
+/* What the folder in use had that is not offered: files that could not be
+ * read, songs past XST_MAX_SONGS in a folder, folders past
+ * XST_MAX_SOUNDTRACKS (each may be NULL). Returns their sum. */
+int  xbox_SoundtrackLeftOut(int *unreadable, int *songs_past_limit, int *folders_past_limit);
+/* Unreadable file i of those remembered (XST_LEFT_OUT_KEPT): its name
+ * without the folder, and why. 0 when there is no such one. */
+int  xbox_SoundtrackLeftOutFile(int i, char *name, size_t cap, const char **why);
 
 /* The port's hook on the title's XOpenSoundtrackSong: `handle` (the guest's
  * 32-bit handle value) is the song `song_id` until it is noted again. */

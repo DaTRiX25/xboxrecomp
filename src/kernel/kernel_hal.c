@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "recomp_exit_hook.h"
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
 #include "recomp_env.h"
@@ -1074,6 +1075,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
     xbox_crash_log_flush(500);
+    recomp_exit_hook_run("kernel");     /* ExitProcess skips atexit: the pads\' motors off */
     ExitProcess(BugCheckCode);
 }
 
@@ -1108,6 +1110,7 @@ VOID __stdcall xbox_KeBugCheckEx(
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
     xbox_crash_log_flush(500);
+    recomp_exit_hook_run("kernel");     /* ExitProcess skips atexit: the pads\' motors off */
     ExitProcess(BugCheckCode);
 }
 
@@ -1154,6 +1157,7 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "HalReturnToFirmware: routine=%u (exiting)", Routine);
     xbox_crash_log_flush(500);
+    recomp_exit_hook_run("kernel");     /* ExitProcess skips atexit: the pads\' motors off */
     ExitProcess(0);
 }
 
@@ -1161,6 +1165,7 @@ VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
     xbox_crash_log_flush(500);
+    recomp_exit_hook_run("kernel");     /* ExitProcess skips atexit: the pads\' motors off */
     ExitProcess(0);
 }
 

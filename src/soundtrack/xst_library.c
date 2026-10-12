@@ -135,6 +135,114 @@ void xst_name_from_utf8(uint16_t out[XST_NAME_UNITS], const char *utf8)
     memset(out + n, 0, (size_t)(XST_NAME_UNITS - n) * sizeof out[0]);
 }
 
+/* ── UTF-8 for a screen ────────────────────────────────────────────── */
+
+/* A base letter and a combining mark as one character, 0 when Unicode has
+ * none in Latin-1 or Latin Extended-A. Each row: the mark, the letters, and
+ * the composed characters in the same order. */
+static uint32_t compose_pair(uint32_t base, uint32_t mark)
+{
+    static const struct { uint16_t mark; const char *from; uint16_t to[20]; } k[] = {
+        { 0x0300, "AEIOUaeiou",   { 0xC0, 0xC8, 0xCC, 0xD2, 0xD9, 0xE0, 0xE8, 0xEC, 0xF2, 0xF9 } },
+        { 0x0301, "AEIOUYaeiouyCcLlNnRr",
+          { 0xC1, 0xC9, 0xCD, 0xD3, 0xDA, 0xDD, 0xE1, 0xE9, 0xED, 0xF3, 0xFA, 0xFD,
+            0x106, 0x107, 0x139, 0x13A, 0x143, 0x144, 0x154, 0x155 } },
+        { 0x0301, "SsZz",         { 0x15A, 0x15B, 0x179, 0x17A } },
+        { 0x0302, "AEIOUaeiouCcGgHhJjSs",
+          { 0xC2, 0xCA, 0xCE, 0xD4, 0xDB, 0xE2, 0xEA, 0xEE, 0xF4, 0xFB,
+            0x108, 0x109, 0x11C, 0x11D, 0x124, 0x125, 0x134, 0x135, 0x15C, 0x15D } },
+        { 0x0302, "WwYy",         { 0x174, 0x175, 0x176, 0x177 } },
+        { 0x0303, "ANOanoIiUu",   { 0xC3, 0xD1, 0xD5, 0xE3, 0xF1, 0xF5, 0x128, 0x129, 0x168, 0x169 } },
+        { 0x0304, "AaEeIiOoUu",   { 0x100, 0x101, 0x112, 0x113, 0x12A, 0x12B, 0x14C, 0x14D, 0x16A, 0x16B } },
+        { 0x0306, "AaEeGgIiOoUu", { 0x102, 0x103, 0x114, 0x115, 0x11E, 0x11F, 0x12C, 0x12D, 0x14E, 0x14F,
+                                    0x16C, 0x16D } },
+        { 0x0307, "CcEeGgIZz",    { 0x10A, 0x10B, 0x116, 0x117, 0x120, 0x121, 0x130, 0x17B, 0x17C } },
+        { 0x0308, "AEIOUaeiouyY", { 0xC4, 0xCB, 0xCF, 0xD6, 0xDC, 0xE4, 0xEB, 0xEF, 0xF6, 0xFC, 0xFF, 0x178 } },
+        { 0x030A, "AaUu",         { 0xC5, 0xE5, 0x16E, 0x16F } },
+        { 0x030B, "OoUu",         { 0x150, 0x151, 0x170, 0x171 } },
+        { 0x030C, "CcDdEeLlNnRrSsTtZz",
+          { 0x10C, 0x10D, 0x10E, 0x10F, 0x11A, 0x11B, 0x13D, 0x13E, 0x147, 0x148, 0x158, 0x159,
+            0x160, 0x161, 0x164, 0x165, 0x17D, 0x17E } },
+        { 0x0327, "CcGgKkLlNnRrSsTt",
+          { 0xC7, 0xE7, 0x122, 0x123, 0x136, 0x137, 0x13B, 0x13C, 0x145, 0x146, 0x156, 0x157,
+            0x15E, 0x15F, 0x162, 0x163 } },
+        { 0x0328, "AaEeIiUu",     { 0x104, 0x105, 0x118, 0x119, 0x12E, 0x12F, 0x172, 0x173 } },
+    };
+    size_t i;
+
+    if (base >= 0x80 || !base)
+        return 0;
+    for (i = 0; i < sizeof k / sizeof k[0]; i++)
+        if (k[i].mark == mark) {
+            const char *at = strchr(k[i].from, (int)base);
+            if (at && (size_t)(at - k[i].from) < sizeof k[i].to / sizeof k[i].to[0])
+                return k[i].to[at - k[i].from];
+        }
+    return 0;
+}
+
+static size_t put_utf8(char *o, size_t n, size_t cap, uint32_t c)
+{
+    if (c < 0x80) {
+        if (n + 1 < cap) o[n++] = (char)c;
+    } else if (c < 0x800) {
+        if (n + 2 < cap) { o[n++] = (char)(0xC0 | (c >> 6)); o[n++] = (char)(0x80 | (c & 0x3F)); }
+    } else if (c < 0x10000) {
+        if (n + 3 < cap) {
+            o[n++] = (char)(0xE0 | (c >> 12));
+            o[n++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            o[n++] = (char)(0x80 | (c & 0x3F));
+        }
+    } else if (n + 4 < cap) {
+        o[n++] = (char)(0xF0 | (c >> 18));
+        o[n++] = (char)(0x80 | ((c >> 12) & 0x3F));
+        o[n++] = (char)(0x80 | ((c >> 6) & 0x3F));
+        o[n++] = (char)(0x80 | (c & 0x3F));
+    }
+    return n;
+}
+
+void xst_utf8_compose(char *out, size_t cap, const char *utf8)
+{
+    const unsigned char *s = (const unsigned char *)(utf8 ? utf8 : "");
+    uint32_t prev = 0;                     /* held back: a mark may follow */
+    size_t n = 0;
+
+    if (!cap)
+        return;
+    while (*s) {
+        uint32_t c = *s++;
+        int more = 0;
+        if (c >= 0xF0)      { c &= 0x07; more = 3; }
+        else if (c >= 0xE0) { c &= 0x0F; more = 2; }
+        else if (c >= 0xC0) { c &= 0x1F; more = 1; }
+        else if (c >= 0x80) { c = 0xFFFD; }
+        while (more-- > 0) {
+            if ((*s & 0xC0) != 0x80) { c = 0xFFFD; break; }
+            c = (c << 6) | (*s++ & 0x3F);
+        }
+        if (c >= 0x0300 && c < 0x0370 && prev) {
+            uint32_t both = compose_pair(prev, c);
+            if (both) {
+                prev = both;
+                continue;
+            }
+        }
+        if (prev) {
+            size_t was = n;
+            n = put_utf8(out, n, cap, prev);
+            if (n == was) {                /* full: cut here */
+                prev = 0;
+                break;
+            }
+        }
+        prev = c;
+    }
+    if (prev)
+        n = put_utf8(out, n, cap, prev);
+    out[n] = 0;
+}
+
 int xst_is_playable_name(const char *name)
 {
     static const char *const ext[] = { ".mp3", ".flac", ".ogg", ".oga", ".wav",
@@ -314,9 +422,21 @@ static void scan_dir(xst_library *lib, const char *dir, int depth, xst_progress 
             }
             snprintf(path, sizeof path, "%s/%s", dir, files.v[i]);
             title[0] = 0;
-            if (!xst_probe(path, &ms, title, sizeof title)) {
-                lib->bad_files++;
-                continue;
+            {
+                const char *why = "";
+                if (!xst_probe_why(path, &ms, title, sizeof title, &why)) {
+                    if (lib->n_left_out < XST_LEFT_OUT_KEPT) {
+                        char *copy = (char *)malloc(strlen(path) + 1);
+                        if (copy) {
+                            strcpy(copy, path);
+                            lib->left_out[lib->n_left_out].path = copy;
+                            lib->left_out[lib->n_left_out].why = why;
+                            lib->n_left_out++;
+                        }
+                    }
+                    lib->bad_files++;
+                    continue;
+                }
             }
             if (!title[0]) {
                 snprintf(stem, sizeof stem, "%s", files.v[i]);
@@ -394,6 +514,8 @@ void xst_free(xst_library *lib)
         return;
     for (i = 0; i < lib->n_songs; i++)
         free(lib->songs[i].path);
+    for (i = 0; i < lib->n_left_out; i++)
+        free(lib->left_out[i].path);
     free(lib->songs);
     free(lib);
 }

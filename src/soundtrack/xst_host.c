@@ -151,12 +151,17 @@ static void log_library(const xst_library *lib, const char *music_dir)
                 lib->st[i].count, lib->st[i].count == 1 ? "" : "s",
                 (unsigned)(lib->st[i].ms / 60000), (unsigned)(lib->st[i].ms / 1000 % 60));
     }
-    if (lib->dropped_folders || lib->dropped_songs || lib->bad_files)
+    if (lib->dropped_folders || lib->dropped_songs)
         fprintf(stderr, LOGP "left out: %d folder%s past the %d soundtracks, %d song%s past "
-                "%d in a folder, %d unreadable file%s\n",
+                "%d in a folder\n",
                 lib->dropped_folders, lib->dropped_folders == 1 ? "" : "s", XST_MAX_SOUNDTRACKS,
-                lib->dropped_songs, lib->dropped_songs == 1 ? "" : "s", XST_MAX_SONGS,
-                lib->bad_files, lib->bad_files == 1 ? "" : "s");
+                lib->dropped_songs, lib->dropped_songs == 1 ? "" : "s", XST_MAX_SONGS);
+    /* Every file that was not taken, by name, with the reason. */
+    for (i = 0; i < lib->n_left_out; i++)
+        fprintf(stderr, LOGP "left out: %s: %s\n", lib->left_out[i].path, lib->left_out[i].why);
+    if (lib->bad_files > lib->n_left_out)
+        fprintf(stderr, LOGP "left out: %d more unreadable file%s\n",
+                lib->bad_files - lib->n_left_out, lib->bad_files - lib->n_left_out == 1 ? "" : "s");
 }
 
 /* `lib` (scanned from `music_dir`) becomes the library in use: its database
@@ -237,6 +242,43 @@ void xbox_SoundtrackInfo(char *dir, size_t cap, int *soundtracks, int *songs)
     if (songs)
         *songs = s_lib ? s_lib->n_songs : 0;
     open_unlock();
+}
+
+int xbox_SoundtrackLeftOut(int *unreadable, int *songs_past_limit, int *folders_past_limit)
+{
+    int a = 0, b = 0, c = 0;
+
+    open_lock();
+    if (s_lib) {
+        a = s_lib->bad_files;
+        b = s_lib->dropped_songs;
+        c = s_lib->dropped_folders;
+    }
+    open_unlock();
+    if (unreadable) *unreadable = a;
+    if (songs_past_limit) *songs_past_limit = b;
+    if (folders_past_limit) *folders_past_limit = c;
+    return a + b + c;
+}
+
+int xbox_SoundtrackLeftOutFile(int i, char *name, size_t cap, const char **why)
+{
+    int ok = 0;
+
+    open_lock();
+    if (s_lib && i >= 0 && i < s_lib->n_left_out) {
+        const char *p = s_lib->left_out[i].path, *leaf = p, *c;
+        for (c = p; *c; c++)
+            if (*c == '/' || *c == '\\')
+                leaf = c + 1;
+        if (name && cap)
+            snprintf(name, cap, "%s", leaf);
+        if (why)
+            *why = s_lib->left_out[i].why;
+        ok = 1;
+    }
+    open_unlock();
+    return ok;
 }
 
 /* ── a change while the title runs ─────────────────────────────────── */
