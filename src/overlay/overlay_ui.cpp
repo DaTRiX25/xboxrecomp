@@ -128,6 +128,7 @@ static const char *const n_vibration[] = { "Auto", "Controller", "This device", 
 static const char *const n_scale[]     = { "1x (640x480)", "1.5x (960x720)", "2x (1280x960)", "3x", "4x", NULL };
 #endif
 static const char *const n_face[]      = { "Xbox layout", "Nintendo layout", NULL };
+static const char *const n_scheme[]    = { "Xbox layout", "PS2 layout", NULL };
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
@@ -155,6 +156,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_INPUT_TRIGGER_DEADZONE */ { "Trigger deadzone", "The part of a trigger's pull that reads as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "1.0 is the original: the game's rumble as the Xbox pad played it. Higher makes the weaker rumbles stronger (the strongest is full at any setting). 0 turns the rumble off.", 0.25, FMT_GAIN, NULL, 0 },
     /* XS_INPUT_FACE_LAYOUT */  { "Face buttons", "Nintendo layout: for a pad printed with A on the right and B below. A and B, X and Y change places, here and in the game.", 1, FMT_PLAIN, n_face, 0 },
+    /* XS_INPUT_CONTROL_SCHEME */ { "Driving controls", "Xbox layout: accelerate and brake on the triggers, boost on A. PS2 layout: the PlayStation 2 version's driving controls: accelerate on the bottom face button, brake on the left one, boost on the right shoulder, look back on the left shoulder (the right stick also accelerates and brakes). Only while driving: menus are not changed. Changes at once.", 1, FMT_PLAIN, n_scheme, 0 },
     /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits all the time (steadiest, hottest). Balanced sleeps and spins only the last 8 ms before each frame (steady 60). Battery saver only sleeps (coolest, an occasional small dip). Watts measured on a Steam Deck.", 1, FMT_PLAIN, n_power, 0 },
     /* XS_ADVANCED_PERF */      { "Performance overlay", "FPS and frame-time graph in the corner. Greetings to the DF team!", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speedometer and distances in km/h and metres instead of mph and miles: the game's own metric display, which the US disc keeps for its other languages. A change shows from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
@@ -313,6 +315,8 @@ static int page_rows(int page, Row *r)
     case P_INPUT:
         SET(XS_INPUT_DEADZONE); SET(XS_INPUT_TRIGGER_DEADZONE); SET(XS_INPUT_RUMBLE);
         SET(XS_INPUT_FACE_LAYOUT);
+        if (xbox_InputControlSchemeOffered())
+            SET(XS_INPUT_CONTROL_SCHEME);
 #if defined(__ANDROID__)
         SET(XS_INPUT_VIBRATION);
 #endif
