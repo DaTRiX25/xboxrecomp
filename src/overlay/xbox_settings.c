@@ -844,8 +844,22 @@ const char *xbox_SettingsText(const char *key, int *locked)
             if (locked)
                 *locked = s_text[i].locked;
             if (s_text[i].locked) {
+#if defined(_WIN32)
+                /* The user's own variable (or an argument put there): the
+                 * narrow copy is in the ANSI code page; the wide one is
+                 * right for any name. */
+                static char utf8[1024];
+                wchar_t wname[64];
+                const wchar_t *w;
+                MultiByteToWideChar(CP_ACP, 0, recomp_env_name(s_text[i].env), -1, wname, 64);
+                w = _wgetenv(wname);
+                if (w && WideCharToMultiByte(CP_UTF8, 0, w, -1, utf8, sizeof utf8, NULL, NULL) > 0)
+                    return utf8;
+                return "";
+#else
                 const char *v = getenv(recomp_env_name(s_text[i].env));
                 return v ? v : "";
+#endif
             }
             return s_text[i].val;
         }
