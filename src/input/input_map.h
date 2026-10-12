@@ -125,6 +125,19 @@ int  xbox_InputFaceLayoutNintendo(void);
 void xbox_InputMirrorFaceXInput(XBOX_HOST_XINPUT_GAMEPAD *pad);
 void xbox_InputMirrorFaceSdl(XBOX_HOST_SDL_GAMEPAD *pad);
 
+/* The driving controls (input.control_scheme, the overlay's Input page):
+ * 0 is the title's own layout, 1 an alternative the title's host code
+ * provides (the layout of another console's version of the game). The
+ * toolkit only keeps the choice: what the alternative is, and when it holds
+ * (while driving, never in a menu), is the title's (it rewrites the pad state
+ * the game has read). A title with an alternative says so with
+ * xbox_InputOfferControlScheme, and the overlay then shows the row. Any
+ * thread. */
+void xbox_InputSetControlScheme(int scheme);
+int  xbox_InputControlScheme(void);
+void xbox_InputOfferControlScheme(int on);
+int  xbox_InputControlSchemeOffered(void);
+
 void xbox_InputMapXInput(const XBOX_HOST_XINPUT_GAMEPAD *in, XBOX_GAMEPAD *out);
 void xbox_InputMapSdl(const XBOX_HOST_SDL_GAMEPAD *in, XBOX_GAMEPAD *out);
 

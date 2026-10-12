@@ -51,6 +51,7 @@ static const char *const k_lod_env[]  = { "0", "auto", "-0.5", "-1", "-1.5", NUL
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
 static const char *const k_units[]    = { "mph", "kmh", NULL };
 static const char *const k_face[]     = { "xbox", "nintendo", NULL };
+static const char *const k_scheme[]   = { "xbox", "ps2", NULL };
 #if defined(__ANDROID__)
 static const char *const k_vibration[] = { "auto", "controller", "device", "off", NULL };
 #endif
@@ -92,6 +93,7 @@ static xs_setting s_set[XS_COUNT] = {
      * more than a pad's. */
     [XS_INPUT_RUMBLE]       = SETTING_STEP("input.rumble", XS_FLOAT, 0, RENV_INPUT_RUMBLE_GAIN, 0, 3, 1, 0.25),
     [XS_INPUT_FACE_LAYOUT]  = SETTING("input.face_layout", XS_CHOICE, 0, RENV_INPUT_FACE_LAYOUT, k_face, NULL, 0, 0, 0),
+    [XS_INPUT_CONTROL_SCHEME] = SETTING("input.control_scheme", XS_CHOICE, 0, RENV_INPUT_CONTROL_SCHEME, k_scheme, NULL, 0, 0, 0),
     [XS_POWER_MODE]         = SETTING("power.mode", XS_CHOICE, XS_VIRTUAL, RENV_COUNT, k_power, NULL, 0, 0, 0),
     [XS_ADVANCED_PERF]      = SETTING("advanced.perf_overlay", XS_BOOL, 0, RENV_OVERLAY_PERF, NULL, NULL, 0, 0, 0),
     [XS_GAME_SPEED_UNITS]   = SETTING("game.speed_units", XS_CHOICE, 0, RENV_SPEED_UNITS, k_units, NULL, 0, 0, 0),
@@ -345,6 +347,9 @@ static void apply(xs_id id)
         break;
     case XS_INPUT_FACE_LAYOUT:
         xbox_InputSetFaceLayoutNintendo(v != 0.0);
+        break;
+    case XS_INPUT_CONTROL_SCHEME:
+        xbox_InputSetControlScheme((int)v);
         break;
     case XS_POWER_MODE: {
         const char *p, *l;
@@ -689,6 +694,7 @@ void xbox_SettingsFinish(void)
     apply_audio();
     xbox_InputSetRumbleStrength(s_set[XS_INPUT_RUMBLE].value);
     xbox_InputSetFaceLayoutNintendo(s_set[XS_INPUT_FACE_LAYOUT].value != 0.0);
+    xbox_InputSetControlScheme((int)s_set[XS_INPUT_CONTROL_SCHEME].value);
 }
 
 /* ── access ────────────────────────────────────────────────────────── */

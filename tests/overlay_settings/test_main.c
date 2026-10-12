@@ -32,6 +32,8 @@ void xbox_InputSetTriggerDeadzone(int dz) { st_trigger = dz; }
 void xbox_InputSetRumbleStrength(double g) { st_rumble = g; }
 static int st_face;
 void xbox_InputSetFaceLayoutNintendo(int on) { st_face = on; }
+static int st_scheme = -1;
+void xbox_InputSetControlScheme(int s) { st_scheme = s; }
 void xbox_PacingSetMode(int m) { st_pacing = m; }
 void xbox_PacingSetSpinLead(uint64_t ns) { st_lead = ns; }
 void nv2a_present_set_overscan(int c) { st_overscan = c; }
@@ -382,6 +384,15 @@ int main(void)
     CHECK(st_face == 1);
     xbox_SettingReset(XS_INPUT_FACE_LAYOUT);
     CHECK(st_face == 0);
+    /* The driving controls: xbox unless set, and the input layer hears of a
+     * change at once (BO-106). */
+    CHECK(xbox_SettingValue(XS_INPUT_CONTROL_SCHEME) == 0);
+    CHECK(xbox_SettingGet(XS_INPUT_CONTROL_SCHEME)->def == 0);
+    CHECK(!strcmp(xbox_SettingGet(XS_INPUT_CONTROL_SCHEME)->key, "input.control_scheme"));
+    xbox_SettingSet(XS_INPUT_CONTROL_SCHEME, 1);
+    CHECK(st_scheme == 1);
+    xbox_SettingReset(XS_INPUT_CONTROL_SCHEME);
+    CHECK(st_scheme == 0);
 
     remove(path);
     fprintf(stderr, "overlay_settings: %d checks, %d failed\n", s_checks, s_fail);

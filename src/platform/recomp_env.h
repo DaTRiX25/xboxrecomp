@@ -101,6 +101,7 @@ extern "C" {
     X(PRESENT_LATENCY,   CONFIG, "RECOMP_PRESENT_LATENCY",   NULL, "D3D11 RECOMP_PRESENT_VSYNC=fifo: SetMaximumFrameLatency, 1-3 (default 1)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
     X(INPUT_RUMBLE,      CONFIG, "RECOMP_INPUT_RUMBLE",      NULL, "forward the title's rumble (USB output report) to the host pad; default 1, 0: off") \
+    X(INPUT_CONTROL_SCHEME, CONFIG, "RECOMP_INPUT_CONTROL_SCHEME", NULL, "the driving controls, for a title that offers a second layout: xbox (default, the title's own), ps2 (the PlayStation 2 version's layout while driving; menus are not changed)") \
     X(INPUT_FACE_LAYOUT, CONFIG, "RECOMP_INPUT_FACE_LAYOUT", NULL, "the host pad's face buttons: xbox (default), nintendo (A and B, X and Y change places: a pad printed the Nintendo way)") \
     X(INPUT_RUMBLE_GAIN, CONFIG, "RECOMP_INPUT_RUMBLE_GAIN", NULL, "rumble strength, 0..3: host motor = (speed / peak) ^ (1 / strength), every backend alike; 1.0 (default): the title's speeds as the console played them, 0: off, above 1: the low speeds lifted (full stays full). Under speed 800 a motor is off, and on again from 1200; a falling level lets go over about 90 ms") \
     X(INPUT_RUMBLE_PEAK, CONFIG, "RECOMP_INPUT_RUMBLE_PEAK", NULL, "the title's own full motor speed, 1..65535 (default 65535): the speed that is full on the host motor, for a title whose strongest rumble stays under 65535") \

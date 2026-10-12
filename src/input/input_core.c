@@ -92,6 +92,14 @@ static volatile int g_combo_guard;
 /* Pads a script drives (src/usb/usb_gamepad.c), for the overlay's note. */
 static volatile unsigned g_scripted;
 
+/* What each port's last read was made of (XBOX_INPUT_SRC_*). */
+static volatile unsigned g_sources[XBOX_MAX_CONTROLLERS];
+
+unsigned xbox_InputSources(DWORD dwPort)
+{
+    return dwPort < XBOX_MAX_CONTROLLERS ? g_sources[dwPort] : 0;
+}
+
 void xbox_InputSetScriptedPads(unsigned mask) { g_scripted = mask; }
 unsigned xbox_InputScriptedPads(void) { return g_scripted; }
 
@@ -295,6 +303,7 @@ void xbox_InputSetBackend(const xbox_input_backend *b)
     memset(g_connected, 0, sizeof g_connected);
     memset(g_last_probe, 0, sizeof g_last_probe);
     memset(g_probed, 0, sizeof g_probed);
+    memset((void *)g_sources, 0, sizeof g_sources);
     RUMBLE_LOCK();
     memset(g_rumble, 0, sizeof g_rumble);
     g_rumble_params = (xbox_rumble_params)XBOX_RUMBLE_PARAMS_DEFAULT;
@@ -307,19 +316,25 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XBOX_INPUT_STATE kb;
     DWORD rc;
+    unsigned src;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
     xbox_InputInit();
 
     rc = due(dwPort) ? probe(dwPort, pState) : ERROR_DEVICE_NOT_CONNECTED;
+    src = rc == ERROR_SUCCESS ? XBOX_INPUT_SRC_PAD : 0;
     /* The title's pad poll is the rumble's clock. */
     xbox_InputRumbleTick(dwPort);
 
     /* The keyboard answers for port 0 with or without a pad there, and is
      * merged on top of one: a real pad keeps working, the keys only add. */
     if (dwPort == 0 && g_be->keyboard && g_be->keyboard(&kb)) {
+        if (any_held(&kb.Gamepad) || kb.Gamepad.sThumbLX || kb.Gamepad.sThumbLY
+                || kb.Gamepad.sThumbRX || kb.Gamepad.sThumbRY)
+            src |= XBOX_INPUT_SRC_KEYS;
         if (rc != ERROR_SUCCESS) {
+            g_sources[dwPort] = src;
             *pState = kb;
             return ERROR_SUCCESS;
         }
@@ -336,6 +351,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
          * number reads as the same state and a key press never happens. */
         pState->dwPacketNumber = kb.dwPacketNumber;
     }
+    g_sources[dwPort] = src;
     if (rc == ERROR_SUCCESS && g_combo_guard
             && (pState->Gamepad.wButtons & XBOX_GAMEPAD_BACK))
         pState->Gamepad.wButtons &= (WORD)~XBOX_GAMEPAD_START;
