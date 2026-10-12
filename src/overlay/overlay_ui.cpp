@@ -135,6 +135,13 @@ static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_vehicle_detail[] = { "Original", "Far (2x)", "Farthest (4x)", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
+/* Off the Steam Deck the watts are somebody else's: the names alone. */
+static const char *const n_power_plain[] = { "Maximum", "Balanced (recommended)", "Battery saver", NULL };
+static bool on_steam_deck()
+{
+    const char *sd = getenv("SteamDeck");
+    return sd && sd[0] == '1';
+}
 
 static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_FULLSCREEN */ { "Fullscreen", "Borderless fullscreen on the desktop.", 1, FMT_PLAIN, NULL, 0 },
@@ -160,7 +167,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "1.0 is the original: the game's rumble as the Xbox pad played it. Higher makes the weaker rumbles stronger (the strongest is full at any setting). 0 turns the rumble off.", 0.25, FMT_GAIN, NULL, 0 },
     /* XS_INPUT_FACE_LAYOUT */  { "Face buttons", "Nintendo layout: for a pad printed with A on the right and B below. A and B, X and Y change places, here and in the game.", 1, FMT_PLAIN, n_face, 0 },
     /* XS_INPUT_CONTROL_SCHEME */ { "Driving controls", "PS2 layout: the PlayStation 2 version's driving controls. Accelerate on the bottom face button, brake on the left one, boost on the right shoulder, look back on the left shoulder. Only while driving: menus are not changed. Changes at once.", 1, FMT_PLAIN, n_scheme, 0 },
-    /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits all the time (steadiest, hottest). Balanced sleeps and spins only the last 8 ms before each frame (steady 60). Battery saver only sleeps (coolest, an occasional small dip). Watts measured on a Steam Deck.", 1, FMT_PLAIN, n_power, 0 },
+    /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits all the time (steadiest, hottest). Balanced sleeps and spins only the last 8 ms before each frame (steady 60). Battery saver only sleeps (coolest, an occasional small dip).", 1, FMT_PLAIN, n_power, 0 },
     /* XS_ADVANCED_PERF */      { "Performance overlay", "FPS and frame-time graph in the corner. Greetings to the DF team!", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speedometer and distances in km/h and metres instead of mph and miles: the game's own metric display, which the US disc keeps for its other languages. A change shows from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
     /* XS_DISPLAY_HUD_FIX */    { "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On: the HUD keeps its 4:3 shape and stays at the screen edges, by the game's own layout values. A change shows from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
@@ -492,7 +499,10 @@ static void value_text(xs_id id, char *out, size_t n)
         snprintf(out, n, "%s", v != 0.0 ? "On" : "Off");
         break;
     case XS_CHOICE:
-        snprintf(out, n, "%s", m.names ? m.names[(int)v] : s->choices[(int)v]);
+        {
+            const char *const *names = m.names == n_power && !on_steam_deck() ? n_power_plain : m.names;
+            snprintf(out, n, "%s", names ? names[(int)v] : s->choices[(int)v]);
+        }
         break;
     default:
         switch (m.fmt) {
