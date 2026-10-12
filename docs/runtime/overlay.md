@@ -413,17 +413,14 @@ Extended-A), since the renderer does not stack combining marks.
 
 ## Shader pre-build
 
-A host that can build its shaders ahead of time gives the overlay five calls
-(`xbox_shader_build.h`, `xbox_OverlaySetShaderBuild`): start, cancel, poll
-(state, fraction, text), "offer it at this start?" and "do not ask again".
-The Graphics page then has a status line and an action, *Build shaders now*
-(*Stop building shaders* while one runs, *Build shaders again* after), with
-the host's own sentence on what it costs as the hint.
-
-At the first start the overlay opens by itself on that row, about 1.5 s
-after the window is up, with *Not now* and *Do not ask again* under it, when
-the host's `offer` says so. It never starts a build: the player presses the
-action or leaves. Closing the overlay stops a running build (the title is
+A host that can build its shaders ahead of time gives the overlay three calls
+(`xbox_shader_build.h`, `xbox_OverlaySetShaderBuild`): start, cancel and poll
+(state, fraction, text). The Graphics page then has a status line and an
+action, *Build shaders now* (*Stop building shaders* while one runs, *Build
+shaders again* after), with the host's own sentence on what it costs as the
+hint. The overlay never opens by itself for it: the offer belongs to the
+host's installer, and a player who skipped it there finds the row here. It
+never starts a build on its own either. Closing the overlay stops a running build (the title is
 paused while the overlay is open; a build beside a running title would cost
 it frames), and the next one goes on from where it stopped. When a build
 ends the host calls `nv2a_pcache_rescan`, and the backend builds what the
