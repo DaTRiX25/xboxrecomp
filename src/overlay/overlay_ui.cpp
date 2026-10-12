@@ -37,6 +37,7 @@ extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include "apu.h"                /* the speaker test */
 #include "apu_bus.h"            /* the Mixer page */
 #include "apu_gp.h"             /* is the title's effects image modelled */
+#include "recomp_restart.h"
 #include "xbox_soundtrack.h"    /* the music folder browser's model (xsb_*) */
 
 #include <math.h>
@@ -216,7 +217,32 @@ enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS, R_FOLDER };
 enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_HOST0, A_HOST1, A_HOST2, A_HOST3,                  /* xbox_OverlaySetHostRows */
               A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER,        /* A_SHADERS on: the build's */
-              A_MIXER };                                          /* the Mixer page (overlay_mixer.inc) */
+              A_MIXER,                                            /* the Mixer page (overlay_mixer.inc) */
+              A_RESTART };                                        /* start the program again (recomp_restart.h) */
+
+/* The most rows a page has. */
+#define OVERLAY_ROWS 28
+
+/* ── restart (recomp_restart.h) ────────────────────────────────────── */
+
+/* Something outside the settings table wants a restart too (a port's own:
+ * a music folder that waits for the next start, a staged save import). */
+static char s_restart_why[200];
+
+void xbox_OverlayWantRestart(const char *reason)
+{
+    snprintf(s_restart_why, sizeof s_restart_why, "%s", reason ? reason : "");
+}
+
+static bool restart_wanted()
+{
+    return xbox_SettingsNeedRestart() || s_restart_why[0];
+}
+
+/* Why: the settings changed that are read at start, by their table flag,
+ * then the port's own reason. */
+static void restart_reason(char *out, size_t n);
+static void restart_now();
 
 static int s_host_n;
 static const char *(*s_host_fn)(int row, int activate);
@@ -389,6 +415,8 @@ static int page_rows(int page, Row *r)
 #define ACT(a, t) r[n++] = Row{ R_ACTION, XS_COUNT, (a), (t) }
 #define INFO(t) r[n++] = Row{ R_INFO, XS_COUNT, 0, (t) }
 #define SPK(a, t) r[n++] = Row{ R_SPEAKERS, XS_COUNT, (a), (t) }
+#define RESTART_ROW() do { if (restart_wanted() && recomp_restart_available()) \
+                               ACT(A_RESTART, "Restart game now"); } while (0)
     switch (page) {
     case P_DISPLAY:
         SET(XS_DISPLAY_FULLSCREEN); SET(XS_DISPLAY_ASPECT); SET(XS_DISPLAY_FILTER);
@@ -403,6 +431,7 @@ static int page_rows(int page, Row *r)
             SET(XS_DISPLAY_HUD_FIX);
         if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_ULTRAWIDE)->key))
             SET(XS_DISPLAY_ULTRAWIDE);
+        RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_GRAPHICS:
@@ -448,6 +477,7 @@ static int page_rows(int page, Row *r)
                 ACT(A_SHADERS_NEVER, "Do not ask again");
             }
         }
+        RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_AUDIO:
@@ -475,13 +505,14 @@ static int page_rows(int page, Row *r)
                 INFO(s_mf_status);
             /* More lines of the port's (what a scan left out, by name), as
              * far as the page has room. */
-            for (int k = 0; k < MUSIC_NOTES && s_mf->note && n < 15; k++) {
+            for (int k = 0; k < MUSIC_NOTES && s_mf->note && n < OVERLAY_ROWS - 2; k++) {
                 s_mf_note[k][0] = 0;
                 if (!s_mf->note(k, s_mf_note[k], sizeof s_mf_note[k]) || !s_mf_note[k][0])
                     break;
                 INFO(s_mf_note[k]);
             }
         }
+        RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_INPUT:
@@ -493,6 +524,7 @@ static int page_rows(int page, Row *r)
 #if defined(__ANDROID__)
         SET(XS_INPUT_VIBRATION);
 #endif
+        RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_POWER:
@@ -518,6 +550,7 @@ static int page_rows(int page, Row *r)
         }
 #endif
         SET(XS_POWER_MODE);
+        RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     default:
@@ -542,6 +575,9 @@ static int page_rows(int page, Row *r)
             ACT(A_REPORT, "Create bug report");
             ACT(A_REPORT_SHOT, "Create bug report with a screenshot");
         }
+        /* Always here; on the other pages only while one is wanted. */
+        if (recomp_restart_available())
+            ACT(A_RESTART, restart_wanted() ? "Restart game now" : "Restart game");
         ACT(A_RESET_ALL, "Reset all settings to the defaults");
         break;
     }
@@ -549,6 +585,7 @@ static int page_rows(int page, Row *r)
 #undef ACT
 #undef INFO
 #undef SPK
+#undef RESTART_ROW
     return n;
 }
 
@@ -558,7 +595,7 @@ static void test_state(const char *path)
 {
     static const char *const kinds[] = { "setting", "action", "info", "speakers", "folder" };
     static const char *const bkinds[] = { "use", "off", "up", "place", "dir" };
-    Row r[16];
+    Row r[OVERLAY_ROWS];
     int n = page_rows(s_page, r);
     FILE *f = fopen(path, "w");
     if (!f)
@@ -596,7 +633,7 @@ static void test_state(const char *path)
 
 static void sb_select()
 {
-    Row r[16];
+    Row r[OVERLAY_ROWS];
     int n = page_rows(P_GRAPHICS, r);
     for (int i = 0; i < n; i++)
         if (r[i].kind == R_ACTION && r[i].action == A_SHADERS)
@@ -605,7 +642,7 @@ static void sb_select()
 
 static bool page_has(int page, xs_id id)
 {
-    Row r[16];
+    Row r[OVERLAY_ROWS];
     int n = page_rows(page, r), i;
     for (i = 0; i < n; i++)
         if (r[i].kind == R_SETTING && r[i].id == id)
@@ -764,6 +801,10 @@ static void activate(const Row &r)
         }
         return;
     }
+    if (r.kind == R_ACTION && r.action == A_RESTART) {
+        restart_now();
+        return;
+    }
     if (r.kind == R_ACTION && r.action >= A_HOST0 && r.action <= A_HOST3) {
         if (s_host_fn)
             s_host_fn(r.action - A_HOST0, 1);
@@ -887,6 +928,46 @@ static void set_open(bool on)
         s_save_pending = false;
         fprintf(stderr, LOGP "closed\n");
     }
+}
+
+/* ── restart ───────────────────────────────────────────────────────── */
+
+static void restart_reason(char *out, size_t n)
+{
+    size_t at = 0;
+    int count = 0;
+
+    out[0] = 0;
+    for (int i = 0; i < XS_COUNT; i++) {
+        const xs_setting *s = xbox_SettingGet((xs_id)i);
+        if (!(s->flags & XS_RESTART) || s->value == s->launch)
+            continue;
+        at += (size_t)snprintf(out + at, at < n ? n - at : 0, "%s%s", count++ ? ", " : "",
+                               k_meta[i].label);
+        if (at >= n)
+            return;
+    }
+    if (count)
+        at += (size_t)snprintf(out + at, at < n ? n - at : 0, " %s read when the game starts.",
+                               count == 1 ? "is" : "are");
+    if (s_restart_why[0] && at < n)
+        snprintf(out + at, n - at, "%s%s", count ? " " : "", s_restart_why);
+}
+
+/* The overlay closes as at any time (the settings are written), then the
+ * window is closed the ordinary way with the restart asked for: the
+ * program's own shutdown runs, and its last step starts it again. */
+static void restart_now()
+{
+    char why[400];
+    SDL_Event q;
+
+    restart_reason(why, sizeof why);
+    set_open(false);
+    recomp_restart_request(why[0] ? why : "the overlay's Restart game");
+    memset(&q, 0, sizeof q);
+    q.type = SDL_QUIT;
+    SDL_PushEvent(&q);
 }
 
 /* ── events ────────────────────────────────────────────────────────── */
@@ -2041,7 +2122,7 @@ static void build_pages(float fs)
     }
 
     /* The rows. */
-    Row rows[16];
+    Row rows[OVERLAY_ROWS];
     int n = page_rows(s_page, rows);
     int &sel = s_sel[s_page];
     if (sel < 0 || sel >= n || !selectable(rows[sel])) {
@@ -2099,7 +2180,19 @@ static void build_pages(float fs)
                          " power (diagnosis: RECOMP_PRESENT_PACING=spin).");
             else
                 snprintf(hint, sizeof hint, "%s", k_meta[rows[sel].id].hint);
+            /* The table's flag: this one is read when the game starts. */
+            if (s->flags & XS_RESTART) {
+                size_t at = strlen(hint);
+                snprintf(hint + at, sizeof hint - at, "%sTakes effect after a restart%s.",
+                         at ? " " : "", recomp_restart_available()
+                         ? " (\"Restart game now\" appears below once it is changed)" : "");
+            }
         }
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_RESTART) {
+        char why[400];
+        restart_reason(why, sizeof why);
+        snprintf(hint, sizeof hint, "%s%sThe game closes and starts again by itself, with the same options."
+                 " What was not saved by the game is lost, as when quitting.", why, why[0] ? " " : "");
     } else if (rows[sel].kind == R_SPEAKERS) {
         spk_hint(rows[sel].action, hint, sizeof hint);
     } else if (rows[sel].kind == R_FOLDER) {
@@ -2201,7 +2294,12 @@ static void build_pages(float fs)
                         hint, nullptr, wrap_w);
         y += hint_h + fs * 0.3f;
         if (xbox_SettingsNeedRestart())
-            dl->AddText(ImVec2(p.x, y), col(T->warn), "Restart the game for the changes marked (restart) to apply.");
+            dl->AddText(ImVec2(p.x, y), col(T->warn),
+                        recomp_restart_available()
+                        ? "The changes marked (restart) apply after a restart: \"Restart game now\" on this page."
+                        : "Restart the game for the changes marked (restart) to apply.");
+        else if (s_restart_why[0])
+            dl->AddText(ImVec2(p.x, y), col(T->warn), "A restart is waiting: \"Restart game now\" on this page.");
         y += fs * 1.3f;
         const char *keys = pad_hints()
             ? "D-pad  select / change      A  toggle      Y  default      B  close"

@@ -189,6 +189,14 @@ typedef struct xbox_music_folder_ops {
 } xbox_music_folder_ops;
 void xbox_OverlaySetMusicFolder(const xbox_music_folder_ops *ops);
 
+/* Restart (recomp_restart.h). The overlay offers "Restart game now" on a
+ * page while one is wanted: a setting flagged XS_RESTART in the table
+ * differs from its value at launch (xbox_SettingsNeedRestart: the table is
+ * the only list), or the port says so here with its reason, a sentence for
+ * the row's note (NULL or "": no longer). The Advanced page always has
+ * "Restart game". Nothing restarts unless the player picks the row. */
+void xbox_OverlayWantRestart(const char *reason);
+
 #ifdef __cplusplus
 }
 #endif

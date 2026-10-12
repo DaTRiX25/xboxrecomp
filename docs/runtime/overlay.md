@@ -161,6 +161,34 @@ locks the row. The choice is one table, `k_stock_hidden` in
 again); `xbox_PowerModeAtLoad(host, stored)` is the rule, testable per host
 (`tests/overlay_settings`).
 
+## Restart
+
+Some settings are read once, when the game starts. The table in
+`xbox_settings.c` says which with a flag, `XS_RESTART`, and that flag is the
+only list: the row's "(restart)" mark and note, `xbox_SettingsNeedRestart`
+and the Restart row all read it (the `overlay_settings` test names the
+flagged ones, so adding a setting means deciding). Flagged today:
+`display.aspect` (the dashboard bit the title reads at boot),
+`graphics.render_scale` (render targets are made at start),
+`audio.speakers` (the title picks its mix, and the device is opened, at
+start), on Android `input.vibration`. Everything else is applied while
+running or read each time it is used.
+
+While a flagged setting differs from its value at launch, or a port asked
+with `xbox_OverlayWantRestart(reason)`, every page has a "Restart game now"
+row above its reset row, with the reason in its note; the Advanced page
+always has "Restart game". Nothing restarts unless the row is picked. The
+row closes the overlay (the settings are written), asks `recomp_restart`
+for a restart and closes the window the ordinary way: the program's own
+shutdown runs (motors off, audio closed, logs finished), and its last exit
+handler starts it again with the arguments, directory and environment it
+was first given (`src/platform/recomp_restart.h`): in place on Linux and
+macOS (the same process id, so Steam, a launcher script, an AppImage's
+runtime or a Mac bundle see one program throughout), as a new process on
+Windows, through the activity (`restartGame()`) on Android. A port calls
+`recomp_restart_init(argc, argv)` first thing in `main`; without that there
+is no row.
+
 ## Text and fonts
 
 Every string the overlay draws is UTF-8: its own labels and hints, a port's
