@@ -56,6 +56,13 @@ void recomp_restart_cancel(void);
 /* A host whose restart is not an exec (Android: the activity). */
 void recomp_restart_set_hook(void (*fn)(void));
 
+/* Tests: what the exec would start (off Windows): the file, its arguments
+ * and environment. In an AppImage the image file (APPIMAGE), named as its
+ * runtime was (ARGV0), without the runtime's variables for the old mount;
+ * otherwise the program itself with the arguments and environment as
+ * given. */
+void recomp_restart_target(const char **exe, char ***argv, char ***envp);
+
 /* Tests: what would be started. Pointers into the module's copies; envp is
  * NULL-terminated "NAME=value" strings. */
 void recomp_restart_snapshot(int *argc, char ***argv, char ***envp, const char **cwd);

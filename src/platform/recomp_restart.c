@@ -75,6 +75,102 @@ static const char *exe_path(void)
 }
 #endif
 
+#if !defined(_WIN32) && !defined(__ANDROID__)
+/* An AppImage (Linux): the program runs from the image's mount
+ * (/tmp/.mount_XXX/usr/bin/...), which the image's runtime keeps only while
+ * the process it started lives on unchanged. After an exec of the program
+ * itself the mount is gone (the first restart works, the files it reads
+ * later and a second restart do not: /proc/self/exe then names a path that
+ * is not there). So a restart starts the image file again, in place: the
+ * runtime mounts it afresh. Its arguments as the runtime got them (ARGV0
+ * for the name), and the environment without what the runtime and AppRun
+ * set for the old mount: APPIMAGE, APPDIR, ARGV0, OWD, and every entry of a
+ * list (LD_LIBRARY_PATH, PATH, XDG_DATA_DIRS, ...) under the old APPDIR;
+ * they set them again. */
+static const char *s_exe;               /* NULL: the program itself */
+static char **s_exec_argv, **s_exec_envp;
+
+static int under(const char *path, const char *dir, size_t n)
+{
+    return n && !strncmp(path, dir, n) && (path[n] == '/' || path[n] == 0);
+}
+
+static char *drop_entries(const char *kv, const char *dir)
+{
+    const char *eq = strchr(kv, '='), *p;
+    size_t n = strlen(dir), keep = 0;
+    char *out;
+
+    if (!eq || !strstr(eq + 1, dir))
+        return dup_str(kv);
+    out = (char *)malloc(strlen(kv) + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, kv, (size_t)(eq - kv) + 1);
+    keep = (size_t)(eq - kv) + 1;
+    for (p = eq + 1; ; ) {
+        const char *end = strchr(p, ':');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char item[4096];
+        if (len < sizeof item) {
+            memcpy(item, p, len);
+            item[len] = 0;
+            if (len && !under(item, dir, n)) {
+                if (keep > (size_t)(eq - kv) + 1)
+                    out[keep++] = ':';
+                memcpy(out + keep, item, len);
+                keep += len;
+            }
+        }
+        if (!end)
+            break;
+        p = end + 1;
+    }
+    out[keep] = 0;
+    if (keep == (size_t)(eq - kv) + 1) {    /* nothing left: the variable goes */
+        free(out);
+        return dup_str("");
+    }
+    return out;
+}
+
+static void plan_appimage(void)
+{
+    const char *img = getenv("APPIMAGE"), *dir = getenv("APPDIR"), *a0 = getenv("ARGV0");
+    int i, n = 0;
+
+    if (!img || !*img || access(img, X_OK) != 0)
+        return;
+    s_exec_argv = (char **)calloc((size_t)s_argc + 1, sizeof *s_exec_argv);
+    while (s_envp[n])
+        n++;
+    s_exec_envp = (char **)calloc((size_t)n + 1, sizeof *s_exec_envp);
+    if (!s_exec_argv || !s_exec_envp)
+        return;
+    s_exec_argv[0] = dup_str(a0 && *a0 ? a0 : img);
+    for (i = 1; i < s_argc; i++)
+        s_exec_argv[i] = s_argv[i];
+    for (i = 0, n = 0; s_envp[i]; i++) {
+        const char *kv = s_envp[i];
+        char *v;
+        if (!strncmp(kv, "APPIMAGE=", 9) || !strncmp(kv, "APPDIR=", 7) || !strncmp(kv, "ARGV0=", 6)
+            || !strncmp(kv, "OWD=", 4))
+            continue;
+        v = dir && *dir ? drop_entries(kv, dir) : dup_str(kv);
+        if (v && *v)
+            s_exec_envp[n++] = v;
+    }
+    s_exe = dup_str(img);
+    {
+        /* A working folder inside the old mount is gone too: the one the
+         * image was started from (OWD), as the runtime gives it. */
+        const char *owd = getenv("OWD");
+        if (dir && *dir && under(s_cwd, dir, strlen(dir)) && owd && *owd)
+            snprintf(s_cwd, sizeof s_cwd, "%s", owd);
+    }
+}
+#endif
+
 /* The last atexit handler to run (the first registered). */
 static void restart_at_exit(void)
 {
@@ -143,7 +239,9 @@ static void restart_at_exit(void)
         }
         if (s_cwd[0] && chdir(s_cwd) != 0)
             fprintf(stderr, "[RESTART] cannot go back to %s\n", s_cwd);
-        execve(exe, s_argv, s_envp);
+        if (s_exe)
+            exe = s_exe;                /* the AppImage itself (plan_appimage) */
+        execve(exe, s_exe ? s_exec_argv : s_argv, s_exe ? s_exec_envp : s_envp);
         fprintf(stderr, "[RESTART] the program could not be started again (%s)\n", exe);
         fflush(stderr);
     }
@@ -207,6 +305,9 @@ void recomp_restart_init(int argc, char **argv)
 #endif
     if (!s_argv || !s_envp)
         return;
+#if !defined(_WIN32) && !defined(__ANDROID__)
+    plan_appimage();
+#endif
     s_ready = 1;
     atexit(restart_at_exit);
 }
@@ -255,6 +356,19 @@ int recomp_restart_requested(void)
 void recomp_restart_cancel(void)
 {
     s_requested = 0;
+}
+
+void recomp_restart_target(const char **exe, char ***argv, char ***envp)
+{
+#if !defined(_WIN32) && !defined(__ANDROID__)
+    if (exe) *exe = s_exe ? s_exe : exe_path();
+    if (argv) *argv = s_exe ? s_exec_argv : s_argv;
+    if (envp) *envp = s_exe ? s_exec_envp : s_envp;
+#else
+    if (exe) *exe = NULL;
+    if (argv) *argv = s_argv;
+    if (envp) *envp = s_envp;
+#endif
 }
 
 void recomp_restart_snapshot(int *argc, char ***argv, char ***envp, const char **cwd)
