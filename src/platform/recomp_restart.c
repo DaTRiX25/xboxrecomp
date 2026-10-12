@@ -29,6 +29,9 @@ static void (*s_hook)(void);
 #if defined(_WIN32)
 static wchar_t *s_wenv;                 /* the environment block as given */
 static wchar_t  s_wcwd[2048];
+#define RESTART_PARENT_W L"RECOMP_RESTART_PARENT"
+static unsigned long s_waited_ms;       /* for the parent of a restart */
+static int s_waited = -1;               /* -1 not a restart, 1 gone, 0 still there */
 #endif
 
 static char *dup_str(const char *s)
@@ -80,14 +83,39 @@ static void restart_at_exit(void)
     fflush(NULL);
 #if defined(_WIN32)
     {
+        /* No handle of this run goes along (as the exec's close-on-exec
+         * elsewhere): an inherited log file kept the new run from moving the
+         * last run's log aside, and nothing of the title's should outlive it.
+         * The new process is told this one's id (RECOMP_RESTART_PARENT,
+         * added to the environment as given and taken out again by
+         * recomp_restart_init) and waits for it to be gone before it looks
+         * at anything: Windows has no exec in place, and this process is
+         * still there, with its files, until the last handler returns. */
         STARTUPINFOW si;
         PROCESS_INFORMATION pi;
         wchar_t *cmd = _wcsdup(GetCommandLineW());
+        wchar_t *env = NULL, var[64];
+        size_t len = 0, vlen;
 
+        swprintf(var, 64, L"%ls=%lu", RESTART_PARENT_W, (unsigned long)GetCurrentProcessId());
+        vlen = wcslen(var) + 1;
+        if (s_wenv) {
+            const wchar_t *p = s_wenv;
+            while (*p)
+                p += wcslen(p) + 1;
+            len = (size_t)(p - s_wenv);
+        }
+        env = (wchar_t *)malloc((len + vlen + 1) * sizeof *env);
+        if (env) {
+            if (len)
+                memcpy(env, s_wenv, len * sizeof *env);
+            memcpy(env + len, var, vlen * sizeof *env);
+            env[len + vlen] = 0;
+        }
         memset(&si, 0, sizeof si);
         si.cb = sizeof si;
-        if (cmd && CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_UNICODE_ENVIRONMENT,
-                                  s_wenv, s_wcwd[0] ? s_wcwd : NULL, &si, &pi)) {
+        if (cmd && env && CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT,
+                                         env, s_wcwd[0] ? s_wcwd : NULL, &si, &pi)) {
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
         } else {
@@ -95,6 +123,7 @@ static void restart_at_exit(void)
                     (unsigned long)GetLastError());
             fflush(stderr);
         }
+        free(env);
         free(cmd);
     }
 #elif !defined(__ANDROID__)
@@ -131,6 +160,26 @@ void recomp_restart_init(int argc, char **argv)
     s_argv = dup_vec(argv, argc);
 #if defined(_WIN32)
     {
+        /* Started by a restart: wait for the process that started this one
+         * to end (it is in its last exit handler), so two runs never hold
+         * the save folder at once; then the variable goes, before the
+         * environment is kept for the next restart. */
+        wchar_t v[32];
+        DWORD got = GetEnvironmentVariableW(RESTART_PARENT_W, v, 32);
+        if (got > 0 && got < 32) {
+            DWORD pid = (DWORD)wcstoul(v, NULL, 10), t0 = GetTickCount();
+            HANDLE h = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
+            s_waited = 1;
+            if (h) {
+                s_waited = WaitForSingleObject(h, 20000) == WAIT_OBJECT_0;
+                CloseHandle(h);
+            }
+            s_waited_ms = GetTickCount() - t0;
+            _wputenv_s(RESTART_PARENT_W, L"");     /* the CRT's copy and the process's */
+            SetEnvironmentVariableW(RESTART_PARENT_W, NULL);
+        }
+    }
+    {
         const wchar_t *env = GetEnvironmentStringsW(), *p = env;
         size_t len;
         if (env) {
@@ -160,6 +209,22 @@ void recomp_restart_init(int argc, char **argv)
         return;
     s_ready = 1;
     atexit(restart_at_exit);
+}
+
+const char *recomp_restart_note(void)
+{
+#if defined(_WIN32)
+    static char note[160];
+    if (s_waited < 0)
+        return "";
+    snprintf(note, sizeof note, s_waited
+             ? "[RESTART] started by a restart: the run before ended %lu ms after this one began\n"
+             : "[RESTART] started by a restart: the run before was still there after %lu ms; going on\n",
+             s_waited_ms);
+    return note;
+#else
+    return "";
+#endif
 }
 
 int recomp_restart_available(void)

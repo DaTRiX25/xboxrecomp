@@ -38,6 +38,10 @@ extern "C" {
 /* First thing in main (after the arguments are final: on Windows after
  * recomp_win_utf8_args). Without it a restart is not available. */
 void recomp_restart_init(int argc, char **argv);
+/* Windows: a run started by a restart waits in recomp_restart_init for
+ * the run that started it to end (never two at once on the save folder);
+ * one line saying so, for the log once it is open ("" otherwise). */
+const char *recomp_restart_note(void);
 int  recomp_restart_available(void);
 
 /* Ask for it: the next ordinary exit (exit(), main returning) starts the
