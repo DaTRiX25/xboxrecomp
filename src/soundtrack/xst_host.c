@@ -156,6 +156,10 @@ static void log_library(const xst_library *lib, const char *music_dir)
                 "%d in a folder\n",
                 lib->dropped_folders, lib->dropped_folders == 1 ? "" : "s", XST_MAX_SOUNDTRACKS,
                 lib->dropped_songs, lib->dropped_songs == 1 ? "" : "s", XST_MAX_SONGS);
+    if (lib->budget_hit)
+        fprintf(stderr, LOGP "the scan stopped after %d folder entries: this is a folder of songs, or a "
+                "folder of folders of songs, not a whole disk; what was read so far is used\n",
+                XST_SCAN_BUDGET);
     /* Every file that was not taken, by name, with the reason. */
     for (i = 0; i < lib->n_left_out; i++)
         fprintf(stderr, LOGP "left out: %s: %s\n", lib->left_out[i].path, lib->left_out[i].why);
@@ -167,13 +171,18 @@ static void log_library(const xst_library *lib, const char *music_dir)
 /* `lib` (scanned from `music_dir`) becomes the library in use: its database
  * on the disk, the redirect on. NULL or an empty one: none in use, the
  * title's paths its own again. Returns the songs now offered. Takes `lib`. */
+static volatile int s_stopped;          /* the last scan stopped at the budget */
+
 static int use_library(xst_library *lib, const char *music_dir)
 {
     xst_library *old;
     uint8_t *db = NULL;
     size_t size;
 
+    s_stopped = lib ? lib->budget_hit : 0;
     if (lib && lib->n_songs == 0) {
+        if (lib->budget_hit)
+            log_library(lib, music_dir);        /* says where it stopped */
         fprintf(stderr, LOGP "%s: no mp3, flac, ogg or wav file found; custom music is off\n",
                 music_dir);
         xst_free(lib);
@@ -259,6 +268,11 @@ int xbox_SoundtrackLeftOut(int *unreadable, int *songs_past_limit, int *folders_
     if (songs_past_limit) *songs_past_limit = b;
     if (folders_past_limit) *folders_past_limit = c;
     return a + b + c;
+}
+
+int xbox_SoundtrackScanStopped(void)
+{
+    return s_stopped;
 }
 
 int xbox_SoundtrackLeftOutFile(int i, char *name, size_t cap, const char **why)

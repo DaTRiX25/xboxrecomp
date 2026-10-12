@@ -299,7 +299,7 @@ static int names_cmp(const void *a, const void *b)
 }
 
 /* The playable files and the folders of `dir`, each sorted. 0: unreadable. */
-int xst_list_dir(const char *dir, xst_names *files, xst_names *dirs)
+static int list_dir(const char *dir, xst_names *files, xst_names *dirs, int no_links, int *budget)
 {
 #if defined(_WIN32)
     wchar_t pat[1024];
@@ -314,12 +314,16 @@ int xst_list_dir(const char *dir, xst_names *files, xst_names *dirs)
         return 0;
     do {
         char name[780];
+        if (budget && (*budget)-- <= 0)
+            break;
         if (!WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof name, NULL, NULL))
             continue;
         if (name[0] == '.' || (fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN))
             continue;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            xst_names_add(dirs, name);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!(no_links && (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)))
+                xst_names_add(dirs, name);
+        }
         else if (files && xst_is_playable_name(name))
             xst_names_add(files, name);
     } while (FindNextFileW(h, &fd));
@@ -332,13 +336,18 @@ int xst_list_dir(const char *dir, xst_names *files, xst_names *dirs)
     while ((e = readdir(d)) != NULL) {
         char path[2048];
         struct stat st;
+        if (budget && (*budget)-- <= 0)
+            break;
         if (e->d_name[0] == '.')
             continue;
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
         if (stat(path, &st) != 0)
             continue;
-        if (S_ISDIR(st.st_mode))
-            xst_names_add(dirs, e->d_name);
+        if (S_ISDIR(st.st_mode)) {
+            struct stat lst;
+            if (!(no_links && lstat(path, &lst) == 0 && S_ISLNK(lst.st_mode)))
+                xst_names_add(dirs, e->d_name);
+        }
         else if (files && S_ISREG(st.st_mode) && xst_is_playable_name(e->d_name))
             xst_names_add(files, e->d_name);
     }
@@ -349,6 +358,16 @@ int xst_list_dir(const char *dir, xst_names *files, xst_names *dirs)
     if (dirs->n)
         qsort(dirs->v, (size_t)dirs->n, sizeof dirs->v[0], names_cmp);
     return 1;
+}
+
+int xst_list_dir(const char *dir, xst_names *files, xst_names *dirs)
+{
+    return list_dir(dir, files, dirs, 0, NULL);
+}
+
+int xst_list_dir_scan(const char *dir, xst_names *files, xst_names *dirs, int *budget)
+{
+    return list_dir(dir, files, dirs, 1, budget);
 }
 
 static const char *leaf_of(const char *path)
@@ -386,90 +405,121 @@ static int add_song(xst_library *lib, const char *path, const char *title, uint3
     return 1;
 }
 
-static void scan_dir(xst_library *lib, const char *dir, int depth, xst_progress *pr)
+/* The playable files of `dir` into soundtrack `st`, then (levels > 0) those
+ * of its folders, each in natural order, flattened into the same one. */
+static void add_songs(xst_library *lib, xst_soundtrack *st, const char *dir, int levels,
+                      xst_progress *pr, int *budget)
 {
     xst_names files = { 0 }, dirs = { 0 };
     char path[2048];
     int i;
 
-    if ((pr && pr->cancel) || !xst_list_dir(dir, &files, &dirs))
+    if ((pr && pr->cancel) || lib->budget_hit || !xst_list_dir_scan(dir, &files, &dirs, budget))
         return;
+    if (*budget < 0)
+        lib->budget_hit = 1;              /* listed in part: what was read is used */
     if (pr)
         pr->folders++;
+    for (i = 0; i < files.n; i++) {
+        char title[256], stem[512];
+        uint32_t ms = 0;
+        char *dot;
+        const char *why = "";
 
-    if (files.n && lib->n_st == XST_MAX_SOUNDTRACKS) {
-        lib->dropped_folders++;
-    } else if (files.n) {
-        xst_soundtrack *st = &lib->st[lib->n_st];
-        char leaf[512];
-
-        memset(st, 0, sizeof *st);
-        st->id = (uint32_t)lib->n_st + 1;
-        st->first = lib->n_songs;
-        for (i = 0; i < files.n; i++) {
-            char title[256], stem[512];
-            uint32_t ms = 0;
-            char *dot;
-
-            if (st->count == XST_MAX_SONGS) {
-                lib->dropped_songs += files.n - i;
+        if (st->count == XST_MAX_SONGS) {
+            lib->dropped_songs += files.n - i;
+            break;
+        }
+        if (pr) {
+            if (pr->cancel)
                 break;
-            }
-            if (pr) {
-                if (pr->cancel)
-                    break;
-                pr->files++;
-            }
-            snprintf(path, sizeof path, "%s/%s", dir, files.v[i]);
-            title[0] = 0;
-            {
-                const char *why = "";
-                if (!xst_probe_why(path, &ms, title, sizeof title, &why)) {
-                    if (lib->n_left_out < XST_LEFT_OUT_KEPT) {
-                        char *copy = (char *)malloc(strlen(path) + 1);
-                        if (copy) {
-                            strcpy(copy, path);
-                            lib->left_out[lib->n_left_out].path = copy;
-                            lib->left_out[lib->n_left_out].why = why;
-                            lib->n_left_out++;
-                        }
-                    }
-                    lib->bad_files++;
-                    continue;
+            pr->files++;
+        }
+        snprintf(path, sizeof path, "%s/%s", dir, files.v[i]);
+        title[0] = 0;
+        if (!xst_probe_why(path, &ms, title, sizeof title, &why)) {
+            if (lib->n_left_out < XST_LEFT_OUT_KEPT) {
+                char *copy = (char *)malloc(strlen(path) + 1);
+                if (copy) {
+                    strcpy(copy, path);
+                    lib->left_out[lib->n_left_out].path = copy;
+                    lib->left_out[lib->n_left_out].why = why;
+                    lib->n_left_out++;
                 }
             }
-            if (!title[0]) {
-                snprintf(stem, sizeof stem, "%s", files.v[i]);
-                dot = strrchr(stem, '.');
-                if (dot)
-                    *dot = 0;
-                snprintf(title, sizeof title, "%s", stem);
-            }
-            if (!add_song(lib, path, title, ms))
-                break;
-            lib->songs[lib->n_songs - 1].id = (st->id << 16) | (uint32_t)st->count;
-            st->count++;
-            if (pr)
-                pr->songs++;
-            st->ms += ms;
+            lib->bad_files++;
+            continue;
         }
-        if (st->count) {
-            const char *l = leaf_of(dir);
-            size_t n = strlen(l);
-            snprintf(leaf, sizeof leaf, "%s", l);
-            while (n < sizeof leaf && n > 0 && (leaf[n - 1] == '/' || leaf[n - 1] == '\\'))
-                leaf[--n] = 0;
-            xst_name_from_utf8(st->name, leaf[0] ? leaf : "Music");
-            lib->n_st++;
+        if (!title[0]) {
+            snprintf(stem, sizeof stem, "%s", files.v[i]);
+            dot = strrchr(stem, '.');
+            if (dot)
+                *dot = 0;
+            snprintf(title, sizeof title, "%s", stem);
         }
+        if (!add_song(lib, path, title, ms))
+            break;
+        lib->songs[lib->n_songs - 1].id = (st->id << 16) | (uint32_t)st->count;
+        st->count++;
+        if (pr)
+            pr->songs++;
+        st->ms += ms;
     }
-
-    if (depth < XST_MAX_DEPTH)
-        for (i = 0; i < dirs.n; i++) {
+    if (levels > 0)
+        for (i = 0; i < dirs.n && !lib->budget_hit; i++) {
             snprintf(path, sizeof path, "%s/%s", dir, dirs.v[i]);
-            scan_dir(lib, path, depth + 1, pr);
+            add_songs(lib, st, path, levels - 1, pr, budget);
         }
     xst_names_free(&files);
+    xst_names_free(&dirs);
+}
+
+/* One soundtrack: the songs of `dir` (and `levels` of folders below it),
+ * named after `dir`. Not kept when it has none. */
+static void add_soundtrack(xst_library *lib, const char *dir, int levels, xst_progress *pr, int *budget)
+{
+    xst_soundtrack *st;
+    char leaf[512];
+    const char *l;
+    size_t n;
+
+    if (lib->n_st == XST_MAX_SOUNDTRACKS) {
+        lib->dropped_folders++;
+        return;
+    }
+    st = &lib->st[lib->n_st];
+    memset(st, 0, sizeof *st);
+    st->id = (uint32_t)lib->n_st + 1;
+    st->first = lib->n_songs;
+    add_songs(lib, st, dir, levels, pr, budget);
+    if (!st->count)
+        return;
+    l = leaf_of(dir);
+    n = strlen(l);
+    snprintf(leaf, sizeof leaf, "%s", l);
+    while (n < sizeof leaf && n > 0 && (leaf[n - 1] == '/' || leaf[n - 1] == '\\'))
+        leaf[--n] = 0;
+    xst_name_from_utf8(st->name, leaf[0] ? leaf : "Music");
+    lib->n_st++;
+}
+
+/* The chosen folder: its own songs one soundtrack, then each folder in it
+ * one more, with what is in it down to XST_MAX_DEPTH below the chosen one. */
+static void scan_dir(xst_library *lib, const char *dir, xst_progress *pr, int *budget)
+{
+    xst_names dirs = { 0 };
+    char path[2048];
+    int i;
+
+    add_soundtrack(lib, dir, 0, pr, budget);
+    if ((pr && pr->cancel) || lib->budget_hit || !xst_list_dir_scan(dir, NULL, &dirs, budget))
+        return;
+    if (*budget < 0)
+        lib->budget_hit = 1;
+    for (i = 0; i < dirs.n && !lib->budget_hit; i++) {
+        snprintf(path, sizeof path, "%s/%s", dir, dirs.v[i]);
+        add_soundtrack(lib, path, XST_MAX_DEPTH - 1, pr, budget);
+    }
     xst_names_free(&dirs);
 }
 
@@ -484,6 +534,7 @@ xst_library *xst_scan_progress(const char *dir, xst_progress *pr)
     xst_names files = { 0 }, dirs = { 0 };
     char root[2048];
     size_t n;
+    int budget = XST_SCAN_BUDGET, probe = 1;
 
     if (!dir || !*dir)
         return NULL;
@@ -491,7 +542,8 @@ xst_library *xst_scan_progress(const char *dir, xst_progress *pr)
     n = strlen(root);
     while (n > 1 && (root[n - 1] == '/' || root[n - 1] == '\\'))
         root[--n] = 0;
-    if (!xst_list_dir(root, &files, &dirs))
+    /* Readable at all (one entry is enough to know). */
+    if (!xst_list_dir_scan(root, &files, &dirs, &probe))
         return NULL;
     xst_names_free(&files);
     xst_names_free(&dirs);
@@ -499,7 +551,7 @@ xst_library *xst_scan_progress(const char *dir, xst_progress *pr)
     lib = (xst_library *)calloc(1, sizeof *lib);
     if (!lib)
         return NULL;
-    scan_dir(lib, root, 0, pr);
+    scan_dir(lib, root, pr, &budget);
     if (pr && pr->cancel) {
         xst_free(lib);
         return NULL;

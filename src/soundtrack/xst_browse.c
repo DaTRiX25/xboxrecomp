@@ -147,7 +147,8 @@ static int count_tree(const char *dir, int depth, int *budget, int gen)
         if (name[0] == '.' || (fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN))
             continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (depth < XST_MAX_DEPTH) {
+            /* As a scan reads: no link to a folder is followed. */
+            if (depth < XST_MAX_DEPTH && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
                 join(path, sizeof path, dir, name);
                 n += count_tree(path, depth + 1, budget, gen);
             }
@@ -190,6 +191,9 @@ static int count_tree(const char *dir, int depth, int *budget, int gen)
                 continue;
             }
             if (!S_ISDIR(st.st_mode))
+                continue;
+            /* As a scan reads: no link to a folder is followed. */
+            if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode))
                 continue;
         }
         if (depth < XST_MAX_DEPTH)

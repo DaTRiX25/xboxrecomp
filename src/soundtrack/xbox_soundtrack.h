@@ -40,7 +40,8 @@ extern "C" {
 #define XST_MAX_GROUPS        84
 #define XST_NAME_UNITS        32          /* UTF-16 units, the NUL included */
 #define XST_BLOCK             512
-#define XST_MAX_DEPTH         6           /* folders below the chosen one */
+#define XST_MAX_DEPTH         3           /* folders below the chosen one: a soundtrack's, and two in it */
+#define XST_SCAN_BUDGET       20000       /* folder entries a scan reads at most */
 #define XST_LEFT_OUT_KEPT     32          /* unreadable files remembered by name */
 
 /* The stream every song is delivered as. */
@@ -71,16 +72,22 @@ typedef struct xst_library {
     int       dropped_folders, dropped_songs, bad_files;
     struct { char *path; const char *why; } left_out[XST_LEFT_OUT_KEPT];
     int       n_left_out;
+    int       budget_hit;                 /* stopped at XST_SCAN_BUDGET entries */
 } xst_library;
 
 /* ── xst_library.c ─────────────────────────────────────────────────── */
 
-/* Scan `dir`: every folder that holds playable files (the folder itself and
- * the folders below it, XST_MAX_DEPTH deep) is one soundtrack, named after
- * the folder, its songs in natural order ("2" before "10") and named by the
- * title tag, or the file name without the extension. Hidden entries (a
- * leading dot) are skipped. NULL when `dir` cannot be read; a folder with no
- * playable file gives a library with n_st == 0. */
+/* Scan `dir`: a folder of songs, or a folder of folders, each one a
+ * soundtrack. The songs in `dir` itself are one soundtrack; each folder
+ * directly in it is one more, with the songs in it and in its folders two
+ * levels further down (albums, discs) flattened into it in natural order:
+ * those folders are not soundtracks of their own. Nothing deeper is read,
+ * and a folder that is a link is not followed. Each is named after its
+ * folder, its songs named by the title tag, or the file name without the
+ * extension. Hidden entries (a leading dot) are skipped. At most
+ * XST_SCAN_BUDGET folder entries are read; past that the scan stops with
+ * what it has (budget_hit). NULL when `dir` cannot be read; a folder with
+ * no playable file gives a library with n_st == 0. */
 xst_library *xst_scan(const char *dir);
 /* The same, watched: the counts grow while it runs (another thread may read
  * them), and setting `cancel` ends it early with NULL. */
@@ -223,6 +230,9 @@ void xbox_SoundtrackInfo(char *dir, size_t cap, int *soundtracks, int *songs);
  * read, songs past XST_MAX_SONGS in a folder, folders past
  * XST_MAX_SOUNDTRACKS (each may be NULL). Returns their sum. */
 int  xbox_SoundtrackLeftOut(int *unreadable, int *songs_past_limit, int *folders_past_limit);
+/* 1 when the folder in use was too big to read whole (XST_SCAN_BUDGET
+ * entries): what was read is offered. */
+int  xbox_SoundtrackScanStopped(void);
 /* Unreadable file i of those remembered (XST_LEFT_OUT_KEPT): its name
  * without the folder, and why. 0 when there is no such one. */
 int  xbox_SoundtrackLeftOutFile(int i, char *name, size_t cap, const char **why);
