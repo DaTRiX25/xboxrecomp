@@ -112,7 +112,10 @@ Power modes: *stock* is the busy-wait; *performance* sleeps and spins the
 last 8 ms before each frame (steady frame time, about 10 W on the Deck);
 *battery* sleeps throughout (about 8 W, small dips).
 
-*stock* (shown as Maximum) is offered on macOS only. On Windows, Android and
+The host's default is Balanced on every platform; the Burnout 3 port's macOS
+default became Balanced too (BO-75, measured: as steady as Stock at about half
+the CPU), with Maximum still offered there and a stored `power.mode = "stock"`
+still honoured. *stock* (shown as Maximum) is offered on macOS only. On Windows, Android and
 Linux / Steam Deck the Power page has Balanced (`performance`) and Battery
 saver; a stored `stock` is read as `performance` at load (the file is not
 rewritten for that; the next save writes the new value). The spin pacing
