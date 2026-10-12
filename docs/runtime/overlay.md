@@ -126,7 +126,35 @@ instead, for comparison. `RECOMP_DEBUG=ui_scale_log` prints one line per
 texture and kind of draw that binds it (with `texrep_dump`'s hash), and the
 time and memory of each scale.
 
-Off (the default) asks for factor 0 and every path is the one it was. A
+Nothing is scaled on the render thread (`nv2a_texscale_store.c`). At upload
+a picked texture goes to the GPU as the title has it, and its decoded texels
+(hashed: `nv2a_texscale_key`) are queued for one worker thread. The worker
+loads the scaled level 0 from the disk cache or scales it (rows on up to four
+threads) and writes it; the backend asks again once a flip at the texture's
+bind and swaps the scaled texture in, one texture a flip (a new texture
+object, so draws already encoded keep the old one).
+
+The disk cache is `<shader cache directory>/ui_scale/`
+(`render.shader_cache`; per user, made from the user's own disc): a file a
+texture, `<key>_<w>x<h>_x<factor>_<scaler><version>.tsc`, a 48-byte header
+(what it is, a checksum of the texels) and the raw scaled level 0. Written
+as `.tmp` and renamed; a file whose header, length or checksum is wrong is
+deleted and the texture scaled again; `NV2A_TEXSCALE_VERSION` in the name
+retires a changed scaler's files. Past 256 MB
+(`RECOMP_DEBUG=ui_scale_cache_mb=<n>`, 0: no disk cache) the least recently
+used files are deleted down to three quarters. No disk cache directory: the
+worker still scales, only nothing is kept.
+
+Filling it ahead of use: any run with the setting on writes what it draws,
+so a title's shader pre-build run does (it must pass the setting to its
+scenes and call `nv2a_texscale_flush` before it exits). When the setting is
+switched on in the overlay, the backend goes through its texture cache
+while the title is held for the pause (`xbox_HostPauseIdleFn`) and queues
+every loaded texture that passes the texture half of the rule, for the disk
+only; the row's note shows `nv2a_texscale_progress`.
+
+Off (the default) asks for factor 0: no draw is classified, nothing is
+hashed or queued, no thread is started, and every path is the one it was. A
 change of the setting reaches a texture at its next bind (the cache entry
 remembers the factor it was uploaded at).
 
