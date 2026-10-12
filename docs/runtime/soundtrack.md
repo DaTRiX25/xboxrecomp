@@ -149,6 +149,25 @@ database is replaced (written beside and renamed over) and `done` is called
 on that thread. What a title has cached of the old list is the port's to
 know (Burnout 3 keeps the soundtrack count: its `soundtrack.c`).
 
+## Paths are UTF-8
+
+A folder or file name is UTF-8 everywhere in this library, the setting
+included, and is handed to the system unchanged on POSIX hosts. On Windows
+every call that takes a path converts to UTF-16 and uses the wide function:
+the scan and the browser (`FindFirstFileW`, `GetFileAttributesW`), the
+probes and decoders (`_wfopen`, dr_libs' `_w` opens, stb_vorbis through a
+`FILE *`), the database (`_wfopen`, `MoveFileExW`). The two places where
+Windows hands over a name in the ANSI code page are converted from the wide
+environment: the home folder for the browser's places (`_wgetenv`), and
+`RECOMP_AUDIO_MUSIC_DIR` when the user set it (`xbox_SettingsText`, which a
+port reads the setting through; `--music-dir` arrives that way too).
+`tests/soundtrack` scans, lists, probes and decodes through a folder named
+"Árvíztűrő tükörfúrógép"; the test and the library cross-compile for Windows
+(llvm-mingw) but have not been run there.
+
+The title's own menu is another matter: names in ST.DB stay folded to
+Latin-1 (above), as far as its font goes.
+
 ## Settings
 
 `audio.custom_music_dir` in settings.toml (a text setting:

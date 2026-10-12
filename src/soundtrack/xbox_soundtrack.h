@@ -101,6 +101,12 @@ int  xst_natural_cmp(const char *a, const char *b);
  * letters are composed, Latin Extended-A is folded to the nearest letter
  * ("ő" to "ö"), anything else above it is '?'. */
 void xst_name_from_utf8(uint16_t out[XST_NAME_UNITS], const char *utf8);
+/* UTF-8 as a screen with a font wants it: a letter followed by a combining
+ * mark (how macOS spells a file name: "o" + U+030B) becomes the one
+ * character there is for it in Latin-1 or Latin Extended-A ("ő"). The rest
+ * is copied; a broken sequence becomes U+FFFD. Never longer than the input;
+ * cut at cap - 1 bytes, on a character. */
+void xst_utf8_compose(char *out, size_t cap, const char *utf8);
 /* 1 when the file name has an extension xst_decode.c plays. */
 int  xst_is_playable_name(const char *name);
 
