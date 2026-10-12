@@ -18,10 +18,7 @@ static int s_checks, s_fail;
 #define GOLD_SX4 0x2c2937aeb7ca42daull
 #define GOLD_BC2 0x282828e050032610ull
 #define GOLD_BC4 0x471009c9b50af0eeull
-#define GOLD_LZ2 0x3aa9b3f4b3e05deaull
-#define GOLD_LZ4 0xac12f7fb7bf4a5a6ull
-#define GOLD_MM2 0x0a978f8a342d53b2ull
-#define GOLD_MM4 0x80dd7dbb3994ab5cull
+
 #define A(c) ((c) >> 24)
 #define R(c) (((c) >> 16) & 0xFFu)
 #define G(c) (((c) >> 8) & 0xFFu)
@@ -202,17 +199,15 @@ static void scaler(enum nv2a_texscale_algo algo, unsigned f)
     }
 }
 
-/* The four filters on one small picture: each gives its own result, and the
+/* The two scalers on one small picture: each gives its own result, and the
  * result's checksum is the recorded one (the same bytes on every machine:
- * the filters use no fused multiply-add and no library function). */
+ * no fused multiply-add and no library function). */
 static void filters(void)
 {
     static const uint64_t want[NV2A_TEXSCALE_ALGOS][2] = {
         /* 2x, 4x */
         { GOLD_SX2, GOLD_SX4 },
         { GOLD_BC2, GOLD_BC4 },
-        { GOLD_LZ2, GOLD_LZ4 },
-        { GOLD_MM2, GOLD_MM4 },
     };
     static uint32_t src[W * H], out[NV2A_TEXSCALE_ALGOS][W * H * 16];
     int x, y, a, b, f;
@@ -249,28 +244,14 @@ static void filters(void)
             for (b = 0; b < a; b++)
                 CHECK(memcmp(out[a], out[b], n * 4) != 0);
         }
-        /* MMPX makes no new colour: every result texel that shows is one of
-         * the source's. */
-        {
-            size_t i, k, bad = 0;
-            for (i = 0; i < n; i++) {
-                if (!(out[NV2A_TEXSCALE_MMPX][i] >> 24))
-                    continue;
-                for (k = 0; k < W * H; k++)
-                    if (src[k] == out[NV2A_TEXSCALE_MMPX][i])
-                        break;
-                bad += k == W * H;
-            }
-            CHECK(bad == 0);
-        }
     }
     /* The names, both ways. */
     CHECK(!strcmp(nv2a_texscale_algo_name(NV2A_TEXSCALE_SUPERXBR), "super-xbr"));
-    CHECK(!strcmp(nv2a_texscale_algo_name(NV2A_TEXSCALE_MMPX), "mmpx"));
+    CHECK(!strcmp(nv2a_texscale_algo_name(NV2A_TEXSCALE_BICUBIC), "bicubic"));
     for (a = 0; a < NV2A_TEXSCALE_ALGOS; a++)
         CHECK(nv2a_texscale_algo_named(nv2a_texscale_algo_name((enum nv2a_texscale_algo)a))
               == (enum nv2a_texscale_algo)a);
-    CHECK(nv2a_texscale_algo_named("xbrz") == NV2A_TEXSCALE_SUPERXBR);
+    CHECK(nv2a_texscale_algo_named("mmpx") == NV2A_TEXSCALE_SUPERXBR);
     CHECK(nv2a_texscale_algo_named(NULL) == NV2A_TEXSCALE_SUPERXBR);
 }
 
@@ -428,12 +409,12 @@ static void store(const char *dir)
         CHECK(!memcmp(got, ref, (size_t)W * H * 4 * 4));
     }
 
-    /* A file a filter: the same texture asked for with each of the four is
-     * made four times (no filter is served another's picture), lies in four
-     * files, and each read back is that filter's own result. */
+    /* A file a scaler: the same texture asked for with each of the two is
+     * made twice (neither is served the other's picture), lies in two
+     * files, and each read back is that scaler's own result. */
     {
         static uint32_t mine[W * H * 16];
-        static const char *const tag[NV2A_TEXSCALE_ALGOS] = { "sx", "bc", "lz", "mm" };
+        static const char *const tag[NV2A_TEXSCALE_ALGOS] = { "sx", "bc" };
         uint64_t miss0, hits0;
         int a;
         nv2a_texscale_store_stats(&st);
@@ -451,7 +432,7 @@ static void store(const char *dir)
             CHECK(!memcmp(got, mine, sizeof mine));
         }
         nv2a_texscale_store_stats(&st);
-        CHECK(st.misses == miss0 + 3);                   /* scaled, not found */
+        CHECK(st.misses == miss0 + 1);                   /* scaled, not found */
         hits0 = st.hits;
         for (a = 0; a < NV2A_TEXSCALE_ALGOS; a++) {
             snprintf(path, sizeof path, "%s/%016llx_%ux%u_x4_%s%u.tsc", dir,
@@ -469,7 +450,7 @@ static void store(const char *dir)
             CHECK(!memcmp(got, mine, sizeof mine));
         }
         nv2a_texscale_store_stats(&st);
-        CHECK(st.hits == hits0 + 4);                     /* all four from their files */
+        CHECK(st.hits == hits0 + 2);                     /* both from their files */
         /* ref back to what the next block compares with */
         CHECK(nv2a_texscale(other, W, H, 2, NV2A_TEXSCALE_SUPERXBR, ref) == 1);
     }
@@ -522,10 +503,6 @@ int main(int argc, char **argv)
     scaler(NV2A_TEXSCALE_SUPERXBR, 4);
     scaler(NV2A_TEXSCALE_BICUBIC, 2);
     scaler(NV2A_TEXSCALE_BICUBIC, 4);
-    scaler(NV2A_TEXSCALE_LANCZOS, 2);
-    scaler(NV2A_TEXSCALE_LANCZOS, 4);
-    scaler(NV2A_TEXSCALE_MMPX, 2);
-    scaler(NV2A_TEXSCALE_MMPX, 4);
     filters();
 
     /* Super-xBR follows an edge: a diagonal step, black over white, comes

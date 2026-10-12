@@ -113,12 +113,7 @@ static int log_on(void)
 
 static const char *algo_tag(uint32_t algo)
 {
-    switch (algo) {
-    case NV2A_TEXSCALE_BICUBIC: return "bc";
-    case NV2A_TEXSCALE_LANCZOS: return "lz";
-    case NV2A_TEXSCALE_MMPX:    return "mm";
-    default:                    return "sx";
-    }
+    return algo == NV2A_TEXSCALE_BICUBIC ? "bc" : "sx";
 }
 
 static void file_path(char *out, size_t n, const char *dir, uint64_t key, uint32_t w,

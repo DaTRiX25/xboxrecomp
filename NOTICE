@@ -193,24 +193,6 @@ src/video/post_shaders.h) and FXAA (NVIDIA's FXAA 3.11 algorithm, written
 here from the paper).
 
 
-MIT - MMPX (2D art scaler, one of graphics.ui_scale_filter's choices)
----------------------------------------------------------------------
-
-  Morgan McGuire and Mara Gagiu, "MMPX Style-Preserving Pixel Art
-  Magnification", Journal of Computer Graphics Techniques, 2021
-  (https://casual-effects.com/research/McGuire2021PixelArt/). The mmpx part
-  of src/kernel/nv2a_texscale.c is a C version of the rules in the MMPX.glc
-  and cppPerf.cpp of the paper's supplement, with fully transparent texels
-  treated as one texel. Their notice:
-
-  Copyright 2020 Morgan McGuire & Mara Gagiu.
-  Provided under the Open Source MIT license https://opensource.org/licenses/MIT
-
-  The permission notice is the MIT one printed in full under Super-xBR
-  below. Nothing was taken from the other scalers in that supplement (hqx
-  and xBR there are LGPL).
-
-
 MIT - Super-xBR (2D art scaler)
 -------------------------------
 

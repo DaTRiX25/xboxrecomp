@@ -83,7 +83,6 @@ typedef enum {
     XS_DISPLAY_PRESENT_TIMING, /* legacy / auto: when frames are presented (present_cadence.h) */
     XS_ADVANCED_PERF_STEPS,  /* the graph marks frames of more than one simulation step */
     XS_GRAPHICS_UI_SCALE,    /* the title's 2D art scaled before upload: off, 2x, 4x (nv2a_texscale.h) */
-    XS_GRAPHICS_UI_SCALE_FILTER, /* with which filter: super-xbr, bicubic, lanczos, mmpx */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
 #endif

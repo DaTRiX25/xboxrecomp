@@ -122,16 +122,11 @@ title's own texture has (one texel); cells packed with no gap meet as they do
 unscaled. Fully transparent result texels beside visible ones take the
 visible colour. 4x is two 2x steps.
 
-`graphics.ui_scale_filter` picks the filter: `super-xbr` (the default),
-`bicubic` (Catmull-Rom) and `lanczos` (Lanczos-3), both written here, on
-premultiplied colour and held between the four nearest texels so they do not
-ring, and `mmpx` (McGuire and Gagiu, MIT, notice in `NOTICE`), which compares
-texels for equality and makes no new colour (fully transparent texels count
-as one texel). The filters use single-precision arithmetic without fused
-multiply-add and no library function, so one source gives the same bytes on
-every machine (`tests/nv2a_texscale` holds a checksum per filter). A cache
-file's name carries the filter, so each has its own pictures and a change of
-filter never shows another's.
+`RECOMP_DEBUG=ui_scale_algo=bicubic` scales with a Catmull-Rom bicubic
+instead, for comparison (its own cache files). The scalers use
+single-precision arithmetic without fused multiply-add and no library
+function, so one source gives the same bytes on every machine
+(`tests/nv2a_texscale` holds a checksum per scaler and factor).
 
 `RECOMP_DEBUG=ui_scale_log` prints one line per
 texture and kind of draw that binds it (with `texrep_dump`'s hash), and the
@@ -211,7 +206,6 @@ title's defaults when those change. Keys it does not know are kept.
 | `graphics.lod_bias` (`off`, `auto`, `-0.5`, `-1`, `-1.5`) | `RECOMP_GFX_LOD_BIAS` (`0`, `auto` or a number) | yes (a per-draw constant) |
 | `graphics.dither` (bool) | `RECOMP_GFX_DITHER` | yes; Metal only |
 | `graphics.ui_scale` (`off`, `2x`, `4x`) | `RECOMP_GFX_UI_SCALE` | yes (the texture caches upload a 2D texture again at its next bind) |
-| `graphics.ui_scale_filter` (`super-xbr`, `bicubic`, `lanczos`, `mmpx`) | `RECOMP_GFX_UI_SCALE_FILTER` | yes, the same way; the row is shown only while `ui_scale` is on |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |
 | `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins, where they play dry. Not used (and not shown) for a title whose GP effects image is modelled (`src/apu/apu_gp.h`) |
