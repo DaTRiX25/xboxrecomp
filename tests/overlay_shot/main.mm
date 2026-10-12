@@ -203,6 +203,33 @@ static int mixer_tour(const char *pre, const char *file)
     apu_bus_get_config(&c);
     CHECK(c.bus[0].send_db[2] <= APU_BUS_OFF_DB);
     snprintf(path, sizeof path, "%smixer_4_bus_sends.bmp", pre); frame(path);
+    /* Route: a place in the room. The position row, moved with the keys;
+     * the width; then back to sends for the checks below. */
+    for (int i = 0; i < 3; i++) { tap(SDLK_UP); run(1); }          /* Route */
+    tap(SDLK_RIGHT); run(2);
+    apu_bus_get_config(&c);
+    CHECK(c.bus[0].route == APU_BUS_ROUTE_PAN && c.bus[0].pan_x == 0.0f && c.bus[0].pan_y == 1.0f);
+    snprintf(path, sizeof path, "%smixer_4b_pan_front.bmp", pre); frame(path);
+    tap(SDLK_DOWN); run(1); tap(SDLK_RETURN); run(1);              /* Position: move */
+    for (int i = 0; i < 6; i++) { tap(SDLK_DOWN); run(1); }        /* 0.3 towards the rear */
+    for (int i = 0; i < 4; i++) { tap(SDLK_LEFT); run(1); }        /* 0.2 to the left */
+    apu_bus_get_config(&c);
+    CHECK(fabsf(c.bus[0].pan_y - 0.7f) < 1e-4f && fabsf(c.bus[0].pan_x + 0.2f) < 1e-4f);
+    snprintf(path, sizeof path, "%smixer_4c_pan_moving.bmp", pre); frame(path);
+    tap(SDLK_ESCAPE); run(2);                                      /* done moving: still on the bus */
+    CHECK(xbox_OverlayOpen());
+    for (int i = 0; i < 3; i++) { tap(SDLK_DOWN); run(1); }        /* Width */
+    for (int i = 0; i < 10; i++) { tap(SDLK_LEFT); run(1); }       /* 1.0 -> 0.5 */
+    apu_bus_get_config(&c);
+    CHECK(fabsf(c.bus[0].pan_width - 0.5f) < 1e-4f);
+    tap(SDLK_DOWN); run(1); tap(SDLK_RIGHT); run(1);               /* divergence 0.05 */
+    apu_bus_get_config(&c);
+    CHECK(fabsf(c.bus[0].pan_divergence - 0.05f) < 1e-4f);
+    snprintf(path, sizeof path, "%smixer_4d_pan_width.bmp", pre); frame(path);
+    for (int i = 0; i < 5; i++) { tap(SDLK_UP); run(1); }          /* Route */
+    tap(SDLK_LEFT); run(2);                                        /* sends again */
+    apu_bus_get_config(&c);
+    CHECK(c.bus[0].route == APU_BUS_ROUTE_SENDS);
     tap(SDLK_ESCAPE); run(3);                                      /* back to the list */
     CHECK(xbox_OverlayOpen());
     /* A/B: B is Factory. */
