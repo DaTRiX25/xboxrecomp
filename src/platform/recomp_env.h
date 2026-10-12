@@ -175,6 +175,7 @@ extern "C" {
     X(APU_TRACE,         TRACE, "apu",             "RECOMP_APU_TRACE",         "APU register and frame trace; [APU-IRQ] line every 5 s") \
     X(AUDIO_HOST,        TRACE, "audio_host",      NULL,                       "host audio playback vs wall clock; [AUDIO-HOST] starve lines (on with apu)") \
     X(AUDIO_CHANNELS,    TRACE, "audio_channels",  NULL,                       "level of every APU mixbin and output channel, once a second: [AUDIO-CH]") \
+    X(MIX_TRACE,         TRACE, "mix",             "RECOMP_MIX_TRACE",         "=file: per-voice mix study (BO-114): who turned each voice on, its bins, volumes, speaker shares and levels, once a second; output peaks before the clamp") \
     X(APU_RING,          TRACE, "apu_ring",        NULL,                       "looping APU buffers refilled by the title: [APU-RING] lead and stale-lap replays") \
     X(MMIO_TRACE,        TRACE, "mmio",            NULL,                       "trapped vs direct device-register accesses by device, register and host PC; [MMIO] block every 10 s") \
     X(USB_TRACE,         TRACE, "usb",             "RECOMP_USB_TRACE",         "OHCI trace") \
