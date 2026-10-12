@@ -235,7 +235,7 @@ static void pad_open_index(int i)
     if (!g_open[free_k].c)
         return;
     pad_describe(g_open[free_k].c, d, sizeof d);
-    fprintf(stderr, "[INPUT] controller %s opened; it gets a port at its first input\n", d);
+    XR_NOTICE( "[INPUT] controller %s opened; it gets a port at its first input\n", d);
 }
 
 /* Window thread: the lowest free port for the controller with this

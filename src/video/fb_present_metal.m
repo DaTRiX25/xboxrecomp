@@ -530,12 +530,12 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             pd.fragmentFunction = [[lib newFunctionWithName:@"fs_fxaa"] autorelease];
             s_pso_fxaa = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
             if (!s_pso_fxaa)
-                fprintf(stderr, "[PRESENT] FXAA pass unavailable: %s\n",
+                XR_ERROR( "[PRESENT] FXAA pass unavailable: %s\n",
                         e ? [[e localizedDescription] UTF8String] : "?");
             pd.fragmentFunction = [[lib newFunctionWithName:@"fs_cas"] autorelease];
             s_pso_cas = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
             if (!s_pso_cas)
-                fprintf(stderr, "[PRESENT] CAS pass unavailable: %s\n",
+                XR_ERROR( "[PRESENT] CAS pass unavailable: %s\n",
                         e ? [[e localizedDescription] UTF8String] : "?");
         }
         [pd release];
@@ -857,13 +857,13 @@ static int smaa_init(void)
     s_smaa_state = -1;
     src = smaa_msl_source();
     if (!src) {
-        fprintf(stderr, "[PRESENT] SMAA unavailable: its shader source did not adapt\n");
+        XR_ERROR( "[PRESENT] SMAA unavailable: its shader source did not adapt\n");
         return 0;
     }
     lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:src] options:nil error:&e];
     free(src);
     if (!lib) {
-        fprintf(stderr, "[PRESENT] SMAA unavailable: %s\n",
+        XR_ERROR( "[PRESENT] SMAA unavailable: %s\n",
                 e ? [[e localizedDescription] UTF8String] : "shader compile failed");
         return 0;
     }
@@ -876,7 +876,7 @@ static int smaa_init(void)
         s_pso_sm[k] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         [pd release];
         if (!s_pso_sm[k]) {
-            fprintf(stderr, "[PRESENT] SMAA unavailable: pipeline %s: %s\n", fn[k],
+            XR_ERROR( "[PRESENT] SMAA unavailable: pipeline %s: %s\n", fn[k],
                     e ? [[e localizedDescription] UTF8String] : "?");
             [lib release];
             return 0;

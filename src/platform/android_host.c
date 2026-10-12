@@ -101,7 +101,8 @@ const char *recomp_android_host_init(const char *tag, const char *logname)
         if (pthread_create(&th, NULL, log_pump, NULL) == 0)
             pthread_detach(th);
     }
-    __android_log_print(ANDROID_LOG_INFO, s_tag, "host directory: %s", dir ? dir : "(none)");
+    if (XR_DIAG_ON())       /* logcat follows the print gate (xr_log.h) */
+        __android_log_print(ANDROID_LOG_INFO, s_tag, "host directory: %s", dir ? dir : "(none)");
     return dir;
 }
 

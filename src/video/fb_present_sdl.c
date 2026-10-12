@@ -498,13 +498,13 @@ static void fit_window(SDL_Window *win)
     {
         SDL_DisplayMode dm;
         if (SDL_GetCurrentDisplayMode(di, &dm) == 0)
-            fprintf(stderr, "[PRESENT] display %d mode %dx%d at %d Hz\n", di, dm.w, dm.h,
+            XR_NOTICE( "[PRESENT] display %d mode %dx%d at %d Hz\n", di, dm.w, dm.h,
                     dm.refresh_rate);
     }
     SDL_GetWindowBordersSize(win, &bt, &bl, &bb, &br);
     SDL_GetWindowSize(win, &w, &h);
     SDL_GetWindowPosition(win, &x, &y);
-    fprintf(stderr, "[PRESENT] window: display %d \"%s\" %dx%d at %d,%d, usable %dx%d at %d,%d,"
+    XR_NOTICE( "[PRESENT] window: display %d \"%s\" %dx%d at %d,%d, usable %dx%d at %d,%d,"
             " %.0f dpi; window %dx%d at %d,%d, borders t%d l%d b%d r%d\n",
             di, SDL_GetDisplayName(di) ? SDL_GetDisplayName(di) : "", db.w, db.h, db.x, db.y,
             ub.w, ub.h, ub.x, ub.y, (double)ddpi, w, h, x, y, bt, bl, bb, br);
@@ -841,7 +841,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     SDL_AddEventWatch(android_lifecycle, NULL);
 #endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) {
-        fprintf(stderr, "[PRESENT] SDL video unavailable (%s); running headless\n",
+        XR_ERROR( "[PRESENT] SDL video unavailable (%s); running headless\n",
                 SDL_GetError());
         return guest_main();
     }
@@ -907,7 +907,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     fbv_destroy();
                     SDL_DestroyWindow(win);
                 }
-                fprintf(stderr, "[PRESENT] window up: Vulkan swapchain unavailable (%s);"
+                XR_ERROR( "[PRESENT] window up: Vulkan swapchain unavailable (%s);"
                         " SDL renderer, readback present\n", why);
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
                 /* Said, not left to be found out: the overlay is drawn by
@@ -956,7 +956,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 fbm_destroy();
                 if (win)
                     SDL_DestroyWindow(win);
-                fprintf(stderr, "[PRESENT] window up: CAMetalLayer unavailable (%s);"
+                XR_ERROR( "[PRESENT] window up: CAMetalLayer unavailable (%s);"
                         " SDL renderer, readback present\n", why);
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
                 /* Said, not left to be found out: the overlay is drawn by
@@ -975,7 +975,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                                            | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0))
                       : NULL;
             if (!ren) {
-                fprintf(stderr, "[PRESENT] SDL window/renderer failed (%s); running headless\n",
+                XR_ERROR( "[PRESENT] SDL window/renderer failed (%s); running headless\n",
                         SDL_GetError());
                 if (win)
                     SDL_DestroyWindow(win);
@@ -993,15 +993,15 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             nv2a_present_note_output((uint32_t)ww, (uint32_t)wh);
     }
     if (s_vk) {
-        fprintf(stderr, "[PRESENT] window up: Vulkan swapchain (zero-copy), vsync %s;"
+        XR_NOTICE( "[PRESENT] window up: Vulkan swapchain (zero-copy), vsync %s;"
                 " guest runs on a pthread\n", vsync ? "on" : "off");
     } else if (s_layer) {
-        fprintf(stderr, "[PRESENT] window up: CAMetalLayer (zero-copy), vsync %s;"
+        XR_NOTICE( "[PRESENT] window up: CAMetalLayer (zero-copy), vsync %s;"
                 " guest runs on a pthread\n", vsync ? "on" : "off");
     } else {
         SDL_RendererInfo ri;
         if (SDL_GetRendererInfo(ren, &ri) == 0)
-            fprintf(stderr, "[PRESENT] window up: SDL %s renderer, vsync %s;"
+            XR_NOTICE( "[PRESENT] window up: SDL %s renderer, vsync %s;"
                     " guest runs on a pthread\n", ri.name, vsync ? "on" : "off");
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
@@ -1014,7 +1014,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
 #endif
     s_guest_done_event = SDL_RegisterEvents(2);
     if (s_guest_done_event == (Uint32)-1) {
-        fprintf(stderr, "[PRESENT] SDL_RegisterEvents failed; running headless\n");
+        XR_ERROR( "[PRESENT] SDL_RegisterEvents failed; running headless\n");
         close_present(ren);
         SDL_DestroyWindow(win);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
@@ -1039,7 +1039,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     xbox_log_thread_role("sdl-main", 0);
     s_running = 1;
     if (!start_guest()) {
-        fprintf(stderr, "[PRESENT] cannot start the guest thread; running headless\n");
+        XR_ERROR( "[PRESENT] cannot start the guest thread; running headless\n");
         s_running = 0;
         xbox_InputSetMainPump(0);
         close_present(ren);

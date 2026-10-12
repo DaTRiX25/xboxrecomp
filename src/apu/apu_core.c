@@ -714,7 +714,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
         d->monitor.channels = g_title_channels;
         xa2_request_channels(g_title_channels);
         apu_wav_set_channels(g_title_channels);
-        fprintf(stderr, "[APU] speakers: %s%s -> the title mixes %s"
+        XR_NOTICE( "[APU] speakers: %s%s -> the title mixes %s"
                         " (dashboard audio 0x%08X)\n",
                 mode == APU_SPK_AUTO ? "auto" : mode == APU_SPK_51 ? "5.1" : "stereo",
                 mode != APU_SPK_AUTO ? "" : probed > 0
@@ -1438,7 +1438,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 {
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
     if (!d) {
-        fprintf(stderr, "[APU] Failed to allocate MCPXAPUState\n");
+        XR_ERROR( "[APU] Failed to allocate MCPXAPUState\n");
         return NULL;
     }
 

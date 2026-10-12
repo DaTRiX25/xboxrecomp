@@ -259,7 +259,7 @@ void xbox_missing_note(const char *guest_path, uint32_t status,
         switch (cls) {
         case CLASS_HIGH:
             InterlockedIncrement(&s_high);
-            fprintf(stderr, "  [FILE] missing %s -> %s\n", s->guest, host);
+            XR_ERROR( "  [FILE] missing %s -> %s\n", s->guest, host);
             break;
         case CLASS_LOW:
             InterlockedIncrement(&s_low);

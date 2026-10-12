@@ -1001,7 +1001,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 }
             }
         } else {
-            fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: start routine 0x%08X not found in dispatch!\n",
+            XR_ERROR( "  [KERNEL] PsCreateSystemThreadEx: start routine 0x%08X not found in dispatch!\n",
                     start_routine);
         }
     }
@@ -8886,7 +8886,7 @@ static void bridge_PsCreateSystemThread(void)
                 }
             }
         } else {
-            fprintf(stderr, "  [KERNEL] PsCreateSystemThread: start routine 0x%08X not found in dispatch!\n",
+            XR_ERROR( "  [KERNEL] PsCreateSystemThread: start routine 0x%08X not found in dispatch!\n",
                     start_routine);
         }
     }

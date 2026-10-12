@@ -164,7 +164,7 @@ static void store(uint64_t key, const uint32_t *w, uint32_t n)
     memcpy(rec, &key, 8);
     memcpy(rec + 8, w, (size_t)n * 4);
     if (nv2a_pcache_put(s_file, 0, rec, len) < 0) {
-        fprintf(stderr, LOGP "SPIR-V cache: cannot append; off for this run\n");
+        XR_ERROR( LOGP "SPIR-V cache: cannot append; off for this run\n");
         nv2a_pcache_close(s_file);
         s_file = NULL;
     }

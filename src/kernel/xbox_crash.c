@@ -701,6 +701,7 @@ static int claim_report(void)
 
 int xbox_crash_begin(const char *kind, const char *headline)
 {
+    g_xr_log_diag = 1;      /* a crash or a hang: everything from here on is said (xr_log.h) */
     char ts[32], path[1200];
     int k;
 

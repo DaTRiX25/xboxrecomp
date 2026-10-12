@@ -338,7 +338,7 @@ const struct nvk_core *nvk_core_init(const char *const *inst_exts, unsigned n,
                     }
                 }
 #endif
-                fprintf(stderr, "[vulkan] device up: %s (Vulkan %u.%u.%u, driver 0x%X%s),"
+                XR_NOTICE( "[vulkan] device up: %s (Vulkan %u.%u.%u, driver 0x%X%s),"
                         " queue family %u, depth %s%s\n", s_core.name,
                         VK_API_VERSION_MAJOR(s_core.props.apiVersion),
                         VK_API_VERSION_MINOR(s_core.props.apiVersion),

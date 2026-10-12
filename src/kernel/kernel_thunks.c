@@ -70,14 +70,15 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...)
     if (g_log_cs_init)
         EnterCriticalSection(&g_log_cs);
 
+    /* Past the level: said, whatever the print gate (the real functions). */
     FILE* out = g_log_file ? g_log_file : stderr;
-    fprintf(out, "[%s] %s [%-6s] ", timestamp, xbox_log_level_str(level), subsystem);
+    (fprintf)(out, "[%s] %s [%-6s] ", timestamp, xbox_log_level_str(level), subsystem);
 
     va_start(args, fmt);
-    vfprintf(out, fmt, args);
+    (vfprintf)(out, fmt, args);
     va_end(args);
 
-    fprintf(out, "\n");
+    (fprintf)(out, "\n");
     fflush(out);
 
     if (g_log_cs_init)
@@ -404,7 +405,11 @@ void xbox_kernel_init(void)
     g_log_cs_init = TRUE;
 
     /* Try to open log file, fall back to stderr */
-    g_log_file = fopen("xbox_kernel.log", "w");
+    /* Not in a quiet run (xr_log.h): no file, and errors only, to stderr. */
+    if (XR_DIAG_ON())
+        g_log_file = fopen("xbox_kernel.log", "w");
+    else
+        g_log_level = XBOX_LOG_ERROR;
 
     /* Set log level from environment variable if present */
     const char* log_env = recomp_env(RENV_LOG_LEVEL);

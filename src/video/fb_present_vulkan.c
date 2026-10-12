@@ -442,7 +442,7 @@ static VkSurfaceKHR make_surface(VkInstance inst, void *ctx)
 {
     VkSurfaceKHR s = VK_NULL_HANDLE;
     if (!SDL_Vulkan_CreateSurface((SDL_Window *)ctx, inst, &s)) {
-        fprintf(stderr, LOGP "SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+        XR_ERROR( LOGP "SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
         return VK_NULL_HANDLE;
     }
     return s;
@@ -1007,7 +1007,7 @@ static VkShaderModule post_module(enum nvk_stage st, const char *src, const char
     VkShaderModule m = VK_NULL_HANDLE;
 
     if (!nvk_glsl_spirv(st, src, &w, &n, &compiled, err, sizeof err)) {
-        fprintf(stderr, LOGP "post pass %s: GLSL compile failed: %s\n", what, err);
+        XR_ERROR( LOGP "post pass %s: GLSL compile failed: %s\n", what, err);
         return VK_NULL_HANDLE;
     }
     memset(&ci, 0, sizeof ci);
@@ -1238,7 +1238,7 @@ static int post_init(void)
     }
     return P.ok;
 fail:
-    fprintf(stderr, LOGP "post passes unavailable (Vulkan objects failed)\n");
+    XR_ERROR( LOGP "post passes unavailable (Vulkan objects failed)\n");
     return 0;
 }
 

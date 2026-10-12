@@ -114,11 +114,11 @@ int xbox_enhance_init(const char *root, const char *title)
     }
 
     nv2a_host_opts_set(&o);
-    fprintf(stderr, LOGP "render.scale=%s%u%s present.filter=%s present.fullscreen=%d"
+    XR_NOTICE( LOGP "render.scale=%s%u%s present.filter=%s present.fullscreen=%d"
             " present.pacing=%s (display.aspect=%s)\n", half ? "1.5 (a backend without it: " : "",
             o.render_scale, half ? ")" : "",
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], aspect);
-    fprintf(stderr, LOGP "display.widescreen=%d display.hdtv=%s (XC_VIDEO=0x%08lX)"
+    XR_NOTICE( LOGP "display.widescreen=%d display.hdtv=%s (XC_VIDEO=0x%08lX)"
             " present.aspect=%s (%s)\n", wide, s_hdtv[hdtv], (unsigned long)xc_video,
             s_aspects[pa], s_aspects[o.present_aspect + 1]);
     if (lead > 0)

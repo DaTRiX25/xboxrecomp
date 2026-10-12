@@ -1761,7 +1761,7 @@ static void arm_make(const char *how)
     if (ok)
         fprintf(stderr, LOGP "bug_report: done: %s\n", path);
     else
-        fprintf(stderr, LOGP "bug_report: failed: %s\n", path);
+        XR_ERROR( LOGP "bug_report: failed: %s\n", path);
 }
 
 static void arm_run(void)

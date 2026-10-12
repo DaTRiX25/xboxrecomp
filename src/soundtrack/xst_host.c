@@ -183,7 +183,7 @@ static int use_library(xst_library *lib, const char *music_dir)
         size = xst_db_size(lib);
         db = (uint8_t *)malloc(size);
         if (!db || xst_db_build(lib, db, size) != size || !write_db(db, size)) {
-            fprintf(stderr, LOGP "cannot write the soundtrack database; custom music is off\n");
+            XR_ERROR( LOGP "cannot write the soundtrack database; custom music is off\n");
             xst_free(lib);
             lib = NULL;
         }
@@ -216,7 +216,7 @@ int xbox_SoundtrackInit(const char *music_dir)
         return s_active ? s_lib->n_songs : 0;
     lib = xst_scan(music_dir);
     if (!lib) {
-        fprintf(stderr, LOGP "%s: cannot read the folder; custom music is off\n", music_dir);
+        XR_ERROR( LOGP "%s: cannot read the folder; custom music is off\n", music_dir);
         return 0;
     }
     return use_library(lib, music_dir);
@@ -310,7 +310,7 @@ static DWORD WINAPI scan_thread(LPVOID arg)
         if (dir[0]) {
             lib = xst_scan_progress(dir, &s_progress);
             if (!lib && !s_progress.cancel)
-                fprintf(stderr, LOGP "%s: cannot read the folder; custom music is off\n", dir);
+                XR_ERROR( LOGP "%s: cannot read the folder; custom music is off\n", dir);
         } else {
             fprintf(stderr, LOGP "custom music is off\n");
         }
@@ -418,7 +418,7 @@ xst_stream *xbox_SoundtrackOpenHandle(uint32_t handle, int *ours)
         *ours = 1;
     s = path[0] ? xst_stream_open(path) : NULL;
     if (!s) {
-        fprintf(stderr, LOGP "cannot play song %08X %s\n", (unsigned)id, path);
+        XR_ERROR( LOGP "cannot play song %08X %s\n", (unsigned)id, path);
         return NULL;
     }
     xst_stream_format(s, &rate, &ch);
