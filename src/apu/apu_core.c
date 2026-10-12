@@ -1558,9 +1558,15 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
  * addr is offset from APU base (0xFE800000)
  * ============================================================ */
 
+/* RECOMP_ORACLE_CAP (apu_oracle_cap.c). */
+int apu_ocap_on(void);
+void apu_ocap_mmio(uint32_t addr, uint32_t val, unsigned size, int is_write);
+
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 {
     if (!d) return 0;
+    if (addr >= 0x30000 && apu_ocap_on())
+        apu_ocap_mmio((uint32_t)addr, 0, size, 0);
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
@@ -1572,6 +1578,8 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
 {
     if (!d) return;
+    if (addr >= 0x2000 && apu_ocap_on())
+        apu_ocap_mmio((uint32_t)addr, (uint32_t)val, size, 1);
     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
 }
 

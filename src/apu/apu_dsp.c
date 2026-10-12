@@ -65,6 +65,12 @@
 #define GP_DOORBELL_OFFSET 0x810u
 /* A command to the title's GP image, as modelled (apu_gp.h; below). */
 static void gp_command(MCPXAPUState *d, const uint32_t *doorbell);
+/* RECOMP_ORACLE_CAP (apu_oracle_cap.c): plain dumps, off by default. */
+int apu_ocap_on(void);
+void apu_ocap_doorbell(MCPXAPUState *d, uint32_t value);
+void apu_ocap_bins(MCPXAPUState *d, const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+void apu_ocap_out6(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
+                   const int8_t map[NUM_MIXBINS], const float *gain);
 
 static uint32_t s_dsp_ack[APU_DSP_ACK_MAX];
 static int s_dsp_ack_count = -1;
@@ -150,6 +156,8 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
         uint32_t *slot = dsp_ack_auto_slot(d);
         if (slot && *slot) {
             static int shown;
+            if (apu_ocap_on())
+                apu_ocap_doorbell(d, *slot);
             if (shown++ < 3)
                 fprintf(stderr, "[APU] DSP doorbell (auto): command 0x%08X"
                                 " acknowledged\n", *slot);
@@ -465,6 +473,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
+    if (apu_ocap_on())
+        apu_ocap_bins(d, (const float (*)[NUM_SAMPLES_PER_FRAME])mixbins);
+
     if (s_ch_trace < 0)
         s_ch_trace = recomp_env_on(RENV_AUDIO_CHANNELS);
 
@@ -472,7 +483,13 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      * stereo folded as the console's analog output is taken to be (ITU-R
      * BS.775: centre and surrounds at -3 dB, no LFE). */
     if (apu_gp_wired() && d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
-        apu_gp_mem m = { gp_mem_read, gp_mem_write, d };
+        /* While a capture for the reference tool is taken
+         * (RECOMP_ORACLE_CAP) the model writes nothing into GP scratch: the
+         * capture is of what the title does, and the tool makes the export
+         * and the delay lines itself. The return voices then play silence
+         * and the reverb has no memory, as in the build the captures were
+         * first made with. */
+        apu_gp_mem m = { gp_mem_read, apu_ocap_on() ? NULL : gp_mem_write, d };
         float acc[APU_SPK_CHANNELS][NUM_SAMPLES_PER_FRAME];
         const int six = d->monitor.channels == APU_SPK_CHANNELS;
         const int nch = six ? APU_SPK_CHANNELS : 2;
@@ -573,6 +590,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             }
             mcpx_apu_mix_trace_out(acc, APU_SPK_CHANNELS, NUM_SAMPLES_PER_FRAME);
         }
+        if (apu_ocap_on())
+            apu_ocap_out6((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins, s_spk_map,
+                          s_fx_bins ? s_bin_gain : NULL);
         if (s_ch_trace)
             ch_trace((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins,
                      &d->monitor.frame_buf6[off][0], APU_SPK_CHANNELS);
