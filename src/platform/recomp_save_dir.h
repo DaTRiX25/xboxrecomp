@@ -15,6 +15,8 @@
 #ifndef RECOMP_SAVE_DIR_H
 #define RECOMP_SAVE_DIR_H
 
+#include <time.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -111,6 +113,33 @@ void recomp_save_import_cancel(const char *dir);
  * log; the same is kept for recomp_save_import_result until the next start. */
 int recomp_save_import_apply(const char *dir, const char *title_id, char *report, unsigned size);
 int recomp_save_import_result(const char *dir, char *text, unsigned size);
+
+/* ── the save history ──────────────────────────────────────────────── */
+
+/*
+ * <save root>/save-history/<YYYYMMDD-HHMMSS>/: the save as it was right
+ * before the game wrote over it, each an export (above), so one is put back
+ * the way an export is (recomp_save_import_stage). The port takes one from
+ * the save guard's hook (kernel_saveguard.h), once for the files one save
+ * writes together. Kept: the RECOMP_SAVE_HISTORY_NEWEST newest, and the
+ * newest of each of the last RECOMP_SAVE_HISTORY_DAYS days and of each of
+ * the last RECOMP_SAVE_HISTORY_WEEKS weeks. Only dated, real folders are
+ * ever removed; anything else in there is left alone.
+ */
+#define RECOMP_SAVE_HISTORY_NEWEST 20
+#define RECOMP_SAVE_HISTORY_DAYS    7
+#define RECOMP_SAVE_HISTORY_WEEKS   4
+
+/* Keep the save as it is now. 1 with the folder in `out`. Prunes after. */
+int recomp_save_history_take(const char *dir, const char *title_id, char *out, unsigned out_size);
+/* Remove what is not kept, as of `now`. How many it removed. */
+int recomp_save_history_prune(const char *dir, time_t now);
+/* Which of `names` (sorted, oldest first) are kept as of `now`: keep[i] 1. */
+void recomp_save_history_keep(const char *const *names, int n, time_t now, int *keep);
+/* The folder (1 when it is there). */
+int recomp_save_history_dir(const char *dir, char *out, unsigned size);
+/* How many saves of this title it holds. */
+int recomp_save_history_count(const char *dir, const char *title_id);
 
 /* The player's home folder: $HOME, %USERPROFILE% on Windows; on Android the
  * app's own external files directory (the one place it may write without a

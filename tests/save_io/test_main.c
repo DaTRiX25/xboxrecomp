@@ -303,6 +303,61 @@ int main(int argc, char **argv)
         char h[1024];
         CHECK("a home folder", recomp_home_dir(h, sizeof h) && h[0]);
     }
+
+    /* The history: what is kept, by made dates. */
+    {
+        static char made[80][32];
+        const char *names[80];
+        int keep[80], n = 0, i, kept = 0;
+        struct tm tm;
+        time_t now, t;
+        memset(&tm, 0, sizeof tm);
+        tm.tm_year = 126; tm.tm_mon = 9; tm.tm_mday = 12; tm.tm_hour = 12; tm.tm_isdst = -1;
+        now = mktime(&tm);
+        n = 0;
+        for (i = 40; i >= 1; i--) {             /* 40 days, oldest first */
+            t = now - (time_t)i * 86400;
+            strftime(made[n++], 32, "%Y%m%d-%H%M%S", localtime(&t));
+        }
+        for (i = 25; i >= 1; i--) {             /* 25 today, a minute apart */
+            t = now - (time_t)i * 60;
+            strftime(made[n++], 32, "%Y%m%d-%H%M%S", localtime(&t));
+        }
+        snprintf(made[n++], 32, "%s", "my notes");
+        for (i = 0; i < n; i++)
+            names[i] = made[i];
+        /* sorted as the module sorts them */
+        for (i = 1; i < n; i++) {
+            int j = i;
+            while (j > 0 && strcmp(names[j - 1], names[j]) > 0) {
+                const char *x = names[j]; names[j] = names[j - 1]; names[j - 1] = x; j--;
+            }
+        }
+        recomp_save_history_keep(names, n, now, keep);
+        for (i = 0; i < n; i++)
+            kept += keep[i];
+        CHECK("history: the 20 newest are kept, a folder not of a date too",
+              keep[n - 2] && keep[n - 21] && !keep[n - 22]
+              && !strcmp(names[n - 1], "my notes") && keep[n - 1]);
+        /* days 1..6 back: one each; weeks 1..3 back: one each */
+        CHECK("history: one a day for a week, one a week for a month, the rest goes",
+              kept == 20 + 1 + 6 + 3);
+    }
+
+    /* The history on disk: a real folder of a dated name is removed, a
+     * link and a folder of another name are not. */
+    make_root("H", "profile of H");
+    {
+        char made[1024];
+        int i;
+        for (i = 0; i < 25; i++)
+            CHECK("history: take 25", recomp_save_history_take(in("H"), ID, made, sizeof made));
+        CHECK("history: 25 taken in a second or so are all of today", recomp_save_history_count(in("H"), ID) >= 20);
+        put("H/save-history/keep-me/note.txt", "mine");
+        recomp_save_history_prune(in("H"), time(NULL) + 40 * 86400);
+        CHECK("history: a folder of another name is left alone", there(in("H/save-history/keep-me/note.txt")));
+        CHECK("history: the save itself is untouched", has(in("H/UDATA/" ID "/57BD267AFF58/Profile 1"), "profile of H"));
+    }
     printf(failures ? "%d FAILED\n" : "ok\n", failures);
     return failures ? 1 : 0;
 }
