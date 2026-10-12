@@ -174,7 +174,17 @@ extern "C" const char *nvk_core_describe(void);   /* nv2a_vk_core.c */
 #endif
 enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS };
 enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
+              A_HOST0, A_HOST1, A_HOST2, A_HOST3,                  /* xbox_OverlaySetHostRows */
               A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER };      /* A_SHADERS on: the build's */
+
+static int s_host_n;
+static const char *(*s_host_fn)(int row, int activate);
+
+void xbox_OverlaySetHostRows(int n, const char *(*fn)(int row, int activate))
+{
+    s_host_fn = fn;
+    s_host_n = fn ? (n > XBOX_OVERLAY_HOST_ROWS ? XBOX_OVERLAY_HOST_ROWS : n) : 0;
+}
 
 /* ── the bug report (xbox_report.h) ────────────────────────────────── */
 
@@ -284,12 +294,16 @@ static int page_rows(int page, Row *r)
             static char drv[420];
             const char *d = nvk_core_describe();
             if (d && *d) {
-                snprintf(drv, sizeof drv, "Graphics driver: %s. To change it, open"
-                         " this app's \"graphics driver\" entry in the app list.", d);
+                snprintf(drv, sizeof drv, "Graphics driver in use: %s", d);
                 INFO(drv);
             }
         }
 #endif
+        for (int i = 0; i < s_host_n; i++) {
+            const char *t = s_host_fn(i, 0);
+            if (t && *t)
+                ACT(A_HOST0 + i, t);
+        }
         if (s_sb) {
             sb_texts();
             INFO(s_sb_info);
@@ -531,6 +545,11 @@ static void activate(const Row &r)
 {
     if (r.kind == R_SPEAKERS) {
         spk_play(r.action);
+        return;
+    }
+    if (r.kind == R_ACTION && r.action >= A_HOST0 && r.action <= A_HOST3) {
+        if (s_host_fn)
+            s_host_fn(r.action - A_HOST0, 1);
         return;
     }
     if (r.kind == R_ACTION && (r.action == A_REPORT || r.action == A_REPORT_SHOT)) {
