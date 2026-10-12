@@ -65,10 +65,10 @@ void nv2a_texscale_mips(uint32_t *texels, uint32_t w, uint32_t h, uint32_t level
 
 /* ── the setting ─────────────────────────────────────────────────────── */
 
-/* Held off: the factor is 0 whatever is set. The default on Android (a GPU
- * hang on Turnip / Adreno 650 with the setting on is not understood yet);
- * RECOMP_DEBUG=ui_scale_hold=0 lifts it there for a test, =1 holds it
- * anywhere. The overlay does not show the row while it is held. */
+/* Held off: the factor is 0 whatever is set. Off by default on every
+ * platform; RECOMP_DEBUG=ui_scale_hold=1 holds it anywhere (a way to rule
+ * the upscaling out when a GPU fault is chased, BO-128). The overlay does not
+ * show the row while it is held. */
 int nv2a_texscale_held(void);
 
 /* 0 (off), 2 or 4; any other value is taken as off; 0 while held. Any

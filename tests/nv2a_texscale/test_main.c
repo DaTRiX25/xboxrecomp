@@ -697,12 +697,7 @@ int main(int argc, char **argv)
         CHECK(nv2a_texscale_factor() == 2);
         nv2a_texscale_set_factor(0);
         recomp_env_set(RENV_UI_SCALE_HOLD, NULL);
-#if defined(__ANDROID__)
-        CHECK(nv2a_texscale_held() == 1);
-        recomp_env_set(RENV_UI_SCALE_HOLD, "0");   /* the rest tests the setting itself */
-#else
         CHECK(nv2a_texscale_held() == 0);
-#endif
     }
 
     /* The setting: off unless asked; 2 and 4 only; a change moves the

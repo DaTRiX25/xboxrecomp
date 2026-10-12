@@ -629,11 +629,7 @@ int nv2a_texscale_held(void)
     const char *e = recomp_env(RENV_UI_SCALE_HOLD);
     if (e && *e)
         return *e != '0';
-#if defined(__ANDROID__)
-    return 1;
-#else
     return 0;
-#endif
 }
 
 static void held_say(unsigned factor)
