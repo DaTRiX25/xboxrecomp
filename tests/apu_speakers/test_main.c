@@ -188,6 +188,7 @@ static void fold1(int16_t fl, int16_t fr, int16_t c, int16_t lfe, int16_t sl,
 
 static void test_downmix(void)
 {
+    apu_limit_enable(0);        /* the fold and its saturation, as before the limiter (apu_limit.h) */
     int16_t l, r;
     double k = sqrt(0.5);
 
@@ -210,6 +211,68 @@ static void test_downmix(void)
     CHECK("full scale saturates high, no wrap", l == 32767 && r == 32767);
     fold1(-32768, -32768, -32768, 0, -32768, -32768, &l, &r);
     CHECK("full scale saturates low, no wrap", l == -32768 && r == -32768);
+}
+
+/* The limiter on the fold of a 5.1 title played on a stereo device: under
+ * the ceiling not a bit moves; over it the fold comes out at or under
+ * -0.5 dBFS (30934) instead of saturating. */
+static void test_downmix_limiter(void)
+{
+    enum { B = 256 };
+    static int16_t in[B][APU_SPK_CHANNELS], on[B][2], off[B][2];
+    unsigned long quiet = 0, quiet_bad = 0, loud = 0, loud_bad = 0;
+    int peak_fold = 0;
+
+    srand(5);
+    for (int pass = 0; pass < 3; pass++) {
+        const int amp = pass == 0 ? 32767 : pass == 1 ? 6000 : 2500;
+        for (int blk = 0; blk < 400; blk++) {
+            int over = 0;
+            for (int i = 0; i < B; i++)
+                for (int c = 0; c < APU_SPK_CHANNELS; c++)
+                    in[i][c] = (int16_t)(rand() % (2 * amp + 1) - amp);
+            apu_limit_reset();
+            apu_limit_enable(0);
+            apu_spk_downmix((const int16_t (*)[APU_SPK_CHANNELS])in, off, B);
+            apu_limit_reset();
+            apu_limit_enable(1);
+            apu_spk_downmix((const int16_t (*)[APU_SPK_CHANNELS])in, on, B);
+            for (int i = 0; i < B; i++)
+                for (int c = 0; c < 2; c++) {
+                    if (abs(off[i][c]) > 30934) over = 1;
+                    if (abs(off[i][c]) > peak_fold) peak_fold = abs(off[i][c]);
+                }
+            if (!over) {
+                quiet++;
+                if (memcmp(on, off, sizeof on)) quiet_bad++;
+            } else {
+                int hot = 0;
+                loud++;
+                for (int i = 0; i < B; i++)
+                    for (int c = 0; c < 2; c++)
+                        if (abs(on[i][c]) > 30934) hot = 1;
+                loud_bad += hot;
+            }
+        }
+    }
+    CHECK("fold limiter: blocks under the ceiling exist", quiet > 100);
+    CHECK("fold limiter: blocks over the ceiling exist", loud > 100);
+    CHECK("fold limiter: under the ceiling, not a bit differs from the saturating fold", quiet_bad == 0);
+    CHECK("fold limiter: over it, never above -0.5 dBFS", loud_bad == 0);
+    /* The measured case: a crash with the fold at +3 dBFS (sum 1.41 x). */
+    apu_limit_reset();
+    apu_limit_enable(1);
+    {
+        int16_t l, r, pk = 0;
+        for (int i = 0; i < 480; i++) {
+            fold1(28000, 28000, 14000, 0, 14000, 14000, &l, &r);   /* 28000 + 0.707 * 28000 = 47800: +3.3 dBFS */
+            if (abs(l) > pk) pk = (int16_t)abs(l);
+        }
+        CHECK("fold limiter: +3.3 dBFS fold held at the ceiling", pk <= 30934 && pk > 30000);
+    }
+    apu_limit_reset();
+    printf("fold limiter: %lu blocks under the ceiling (%lu differ), %lu over (%lu above -0.5 dBFS)\n",
+           quiet, quiet_bad, loud, loud_bad);
 }
 
 static uint32_t le32(const unsigned char *p)
@@ -255,6 +318,7 @@ int main(int argc, char **argv)
     test_title_map();
     test_same_conversion();
     test_downmix();
+    test_downmix_limiter();
     if (argc > 1)
         test_wav6(argv[1]);
     if (failures) {

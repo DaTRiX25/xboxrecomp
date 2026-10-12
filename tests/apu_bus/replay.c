@@ -56,6 +56,8 @@ int main(int argc, char **argv)
     static tvoice vv[512];
     unsigned long frames = 0, voices = 0, bad_game = 0, bad_bins = 0, bad_st = 0, bad_51 = 0;
     unsigned long sounding = 0, lim_quiet = 0, lim_quiet_bad = 0, lim_loud = 0, lim_loud_bad = 0;
+    unsigned long fold_quiet = 0, fold_quiet_bad = 0, fold_loud = 0, fold_loud_bad = 0;
+    int fold_peak = 0;
     double peak = 0;
     int nv = 0, c;
     apu_bus_config cfg, busy;
@@ -137,6 +139,25 @@ int main(int argc, char **argv)
                     dsp_out_lim(A, six, o0, 0);
                     for (int i = 0; i < n; i++)
                         if (abs(o0[i]) > LIM_CEIL16) over = 1;
+                    if (six) {
+                        /* A 5.1 title on a stereo device: today's six feeds
+                         * (the clamp alone) folded (apu_spk_downmix), the
+                         * saturating fold against the limited one. */
+                        int16_t f0[NUM_SAMPLES_PER_FRAME][2], f1[NUM_SAMPLES_PER_FRAME][2];
+                        int fover = 0, fhot = 0;
+                        apu_limit_reset(); apu_limit_enable(0);
+                        apu_spk_downmix((const int16_t (*)[APU_SPK_CHANNELS])o0, f0, NUM_SAMPLES_PER_FRAME);
+                        apu_limit_reset(); apu_limit_enable(1);
+                        apu_spk_downmix((const int16_t (*)[APU_SPK_CHANNELS])o0, f1, NUM_SAMPLES_PER_FRAME);
+                        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                            for (int c = 0; c < 2; c++) {
+                                if (abs(f0[i][c]) > LIM_CEIL16) fover = 1;
+                                if (abs(f0[i][c]) > fold_peak) fold_peak = abs(f0[i][c]);
+                                if (abs(f1[i][c]) > LIM_CEIL16) fhot = 1;
+                            }
+                        if (!fover) { fold_quiet++; if (memcmp(f0, f1, sizeof f0)) fold_quiet_bad++; }
+                        else { fold_loud++; fold_loud_bad += fhot; }
+                    }
                     if (!over) {
                         lim_quiet++;
                         if (memcmp(oa, o0, sizeof(int16_t) * (size_t)n)) lim_quiet_bad++;
@@ -163,9 +184,12 @@ int main(int argc, char **argv)
     printf("frames where the s16 output differs, mixer off vs on, 5.1:       %lu\n", bad_51);
     printf("safety limiter against the clamp alone (stereo and 5.1 frames): %lu under the ceiling, of which differ: %lu;"
            " %lu over it, of which still above it: %lu\n", lim_quiet, lim_quiet_bad, lim_loud, lim_loud_bad);
+    printf("fold of the 5.1 feeds to stereo (a 5.1 title on a stereo device), limiter against saturation: %lu frames under the"
+           " ceiling, of which differ: %lu; %lu over it (fold peak %d of 32767), of which still above it: %lu\n",
+           fold_quiet, fold_quiet_bad, fold_loud, fold_peak, fold_loud_bad);
     printf("cost a VP frame (32 samples, %.0f voices): the loop alone %.2f us, mixer neutral %.2f us,"
            " mixer with everything on %.2f us; a second of audio is 1500 frames: %.2f%% / %.2f%% / %.2f%% of a core\n",
            (double)voices / frames, t_old / frames, t_neutral / frames, t_busy / frames,
            t_old / frames * 0.15, t_neutral / frames * 0.15, t_busy / frames * 0.15);
-    return frames && !bad_game && !bad_bins && !bad_st && !bad_51 && !lim_quiet_bad && !lim_loud_bad ? 0 : 1;
+    return frames && !bad_game && !bad_bins && !bad_st && !bad_51 && !lim_quiet_bad && !lim_loud_bad && !fold_quiet_bad && !fold_loud_bad ? 0 : 1;
 }

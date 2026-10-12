@@ -145,6 +145,7 @@ static void test_limiter_identity(void)
     static tvoice vv[24];
     static float A[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     unsigned long frames = 0, quiet = 0, quiet_bad = 0, loud = 0, loud_bad = 0, over_samples = 0;
+    unsigned long fq = 0, fq_bad = 0, fl = 0, fl_bad = 0;
 
     for (int pass = 0; pass < 3; pass++) {
         const float scale = pass == 0 ? 1.0f : pass == 1 ? 0.08f : 0.04f;
@@ -161,6 +162,23 @@ static void test_limiter_identity(void)
                 int over = 0;
                 dsp_out_lim(A, six, on, 1);
                 dsp_out_lim(A, six, off, 0);
+                if (six) {
+                    /* The 5.1 feeds of today folded for a stereo device: saturating
+                     * fold against the limited one (apu_limit_fold16). */
+                    int16_t f0[NUM_SAMPLES_PER_FRAME][2], f1[NUM_SAMPLES_PER_FRAME][2];
+                    int fover = 0, fhot = 0;
+                    apu_limit_reset(); apu_limit_enable(0);
+                    apu_spk_downmix((const int16_t (*)[6])off, f0, NUM_SAMPLES_PER_FRAME);
+                    apu_limit_reset(); apu_limit_enable(1);
+                    apu_spk_downmix((const int16_t (*)[6])off, f1, NUM_SAMPLES_PER_FRAME);
+                    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                        for (int c = 0; c < 2; c++) {
+                            if (abs(f0[i][c]) > LIM_CEIL16) fover = 1;
+                            if (abs(f1[i][c]) > LIM_CEIL16) fhot = 1;
+                        }
+                    if (!fover) { fq++; if (memcmp(f0, f1, sizeof f0)) fq_bad++; }
+                    else { fl++; fl_bad += fhot; }
+                }
                 for (int i = 0; i < n; i++)
                     if (abs(off[i]) > LIM_CEIL16) { over = 1; over_samples++; }
                 frames++;
@@ -179,6 +197,8 @@ static void test_limiter_identity(void)
     }
     CHECK(quiet > 1000, "the quiet sets never stay under the ceiling (%lu frames)", quiet);
     CHECK(loud > 100, "the loud set never reaches the ceiling (%lu frames)", loud);
+    CHECK(!fq_bad && !fl_bad && fq > 100 && fl > 100, "fold limiter: %lu/%lu quiet differ, %lu/%lu loud above (need both kinds)", fq_bad, fq, fl_bad, fl);
+    printf("limiter on the 5.1 fold (stereo device): %lu frames under the ceiling, %lu differ; %lu over it, %lu above -0.5 dBFS\n", fq, fq_bad, fl, fl_bad);
     CHECK(!quiet_bad, "safety limiter: %lu of %lu frames under the ceiling differ from the clamp alone", quiet_bad, quiet);
     CHECK(!loud_bad, "safety limiter: %lu of %lu frames over the ceiling come out above it", loud_bad, loud);
     printf("limiter on the DSP stage: %lu frames (stereo and 5.1); %lu stayed under the ceiling and differ from the"
@@ -311,9 +331,9 @@ static void test_leveller(void)
     g = lv_run(&st, -30.0f, 20.0f, T, NULL, NULL, 0);
     CHECK(g <= APU_LEVEL_MAX_DB + 1e-4f && g > APU_LEVEL_MAX_DB - 0.3f, "quiet song: gain %.2f dB, expected +6 at the limit", g);
     apu_level_state_init(&st, -1000.0f);
-    g = lv_run(&st, -19.0f, 20.0f, T, NULL, NULL, 0);
+    g = lv_run(&st, T - 4.0f, 20.0f, T, NULL, NULL, 0);
     CHECK(fabsf(g - 4.0f) < 0.5f, "song 4 dB under: gain %.2f dB, expected +4", g);
-    printf("leveller: -30 dB-like noise: gain %+.2f dB (limit +6); -19: %+.2f dB (4 dB under the target)\n",
+    printf("leveller: -30 dB-like noise: gain %+.2f dB (limit +6); 4 dB under the target: %+.2f dB\n",
            lv_run(&(apu_level_state){0}, -30.0f, 1.0f, T, NULL, NULL, 0), g);
 
     /* A very loud one is limited to -15 dB. */
@@ -351,7 +371,7 @@ static void test_leveller(void)
     apu_level_state_init(&st, -1000.0f);
     {
         float at[4] = { 0.1f, 0.3f, 0.6f, 1.5f }, ga[4] = { 0 };
-        float g0 = lv_run(&st, -22.0f, 30.0f, T, NULL, NULL, 0);        /* +6.5 -> +6 */
+        float g0 = lv_run(&st, T - 7.0f, 30.0f, T, NULL, NULL, 0);        /* +7 -> +6 */
         float want = T + 7.5f, g10;
         lv_run(&st, -7.5f, 2.0f, T, at, ga, 4);
         g10 = lv_run(&st, -7.5f, 8.0f, T, NULL, NULL, 0);

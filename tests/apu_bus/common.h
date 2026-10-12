@@ -6,6 +6,7 @@
 #include "apu.h"
 #include "apu_bus.h"
 #include "apu_limit.h"
+#include "apu_speakers.h"
 
 #include <math.h>
 #include <stdio.h>

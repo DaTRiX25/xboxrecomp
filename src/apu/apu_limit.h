@@ -21,6 +21,8 @@
 #ifndef APU_LIMIT_H
 #define APU_LIMIT_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -36,6 +38,14 @@ int  apu_limit_enabled(void);
 void apu_limit_reset(void);
 /* n samples (n <= 32) of nch planar feeds, in place. Frame thread. */
 void apu_limit(float (*feeds)[APU_LIMIT_FRAME], int nch, int n);
+/* The same limiter on the 16-bit stereo fold of a 5.1 title played on a
+ * stereo device (apu_spk_downmix: L = FL + 0.707 C + 0.707 SL), after the
+ * sum and before the saturation: a sample pair as the integers the sum
+ * gives (up to +-2.41 * 32768), the ceiling at 30934. Idle (gain 1, both
+ * under the ceiling) it leaves them as they are, so the saturation that
+ * follows gives what it always gave. Its own state: it is a second stage,
+ * after the six-channel one. */
+void apu_limit_fold16(int32_t *l, int32_t *r);
 /* Gain reduction now, dB >= 0. */
 float apu_limit_reduction_db(void);
 /* Samples this stage has touched (peak over the ceiling, or gain below 1

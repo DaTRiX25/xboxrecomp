@@ -48,12 +48,14 @@ extern "C" {
  * title's EA TRAX streams, seen by the same meter, less the 8 dB the title
  * adds to a custom stream.
  *
- * Until the in-game measurement of EA TRAX against custom music is in, this
- * is the level that undoes the title's +8 dB on a -7.5 LUFS master: -15.5
- * LUFS. The reading is 0.5 dB above LUFS on real songs (four modern
- * masters at -5.2 to -8.6 LUFS read 0.2 to 0.8 dB high, no K weighting), so
- * the constant is -15.0 in its units. One constant. */
-#define APU_LEVEL_TARGET_DB   (-15.0f)
+ * Set from the measurement of EA TRAX in the game (music-only previews of
+ * three songs: -19.7, -23.1, -18.6 LUFS, average -20.1 LUFS): "match" lands
+ * a custom song at about -20 LUFS in the game. Headless runs with four modern
+ * masters (-5.2 to -8.6 LUFS) put a song in the game at this constant minus
+ * 3.6 dB (target -15.0 gave -18.6 LUFS), so the constant is -16.5 in the
+ * leveller's units (its reading is 0.2 to 0.8 dB above LUFS, no K weighting).
+ * One constant. */
+#define APU_LEVEL_TARGET_DB   (-16.5f)
 #define APU_LEVEL_MIN_DB      (-15.0f)
 #define APU_LEVEL_MAX_DB      (6.0f)
 #define APU_LEVEL_FREEZE_DB   (-40.0f)
