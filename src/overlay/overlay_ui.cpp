@@ -1994,7 +1994,7 @@ static const Theme k_theme_game = {
     {0x30, 0x38, 0x40},             /* rule: the thin lines between the regions */
     {0x5a, 0x99, 0xc0}, 0.16f,      /* selected wash: steel blue */
     {0xc4, 0x1c, 0x1c},             /* selected bar: the title crimson */
-    {0x5a, 0x99, 0xc0}, {0x0f, 0x13, 0x19}, {0xd0, 0xe0, 0xf8}, {0x78, 0x90, 0xb0},
+    {0x5a, 0x99, 0xc0}, {0x0f, 0x13, 0x19}, {0x58, 0x98, 0xc0}, {0x78, 0x90, 0xb0},
     {0xa8, 0xd0, 0xf8},             /* text: the list items */
     {0xd0, 0xe0, 0xf8},             /* hi: the selected item and the values */
     {0x48, 0x58, 0x68},             /* dim: disabled (locked) */
@@ -2289,7 +2289,7 @@ static void glass_info()
              s_glass_st.source);
 }
 
-static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
+static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs, float max_w = 0.0f, float max_h = 0.0f)
 {
     uint64_t t[256];
     float iv[255];
@@ -2365,27 +2365,40 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
 
     /* The panel is as wide as its longest line: a fixed width left the stats
      * line running past the backdrop at larger values (a 100+ ms max). */
-    const float pad = fs * 0.6f, lh = fs * 1.15f;
     if (!have_glass)
         l4[0] = 0;
     const int lines = !have_glass ? 2 : l4[0] ? 4 : 3;
-    const float h = fs * 4.1f + lh * lines;
-    float tw = ImGui::CalcTextSize(l1).x;
     const char *const ls[4] = { l1, l2, l3, l4 };
-    for (i = 1; i < lines; i++) {
-        float w2 = ImGui::CalcTextSize(ls[i]).x;
-        if (w2 > tw) tw = w2;
+    ImFont *const pf = ImGui::GetFont();
+    float pad, lh, h, w;
+    /* The box at text size `sz`; with max_w / max_h (the room the page's
+     * header leaves) the text shrinks until the whole box fits. */
+    for (int pass = 0; pass < 2; pass++) {
+        pad = fs * 0.6f;
+        lh = fs * 1.15f;
+        h = fs * 4.1f + lh * lines;
+        float tw = 0.0f;
+        for (i = 0; i < lines; i++) {
+            float w2 = pf->CalcTextSizeA(fs, FLT_MAX, 0.0f, ls[i]).x;
+            if (w2 > tw) tw = w2;
+        }
+        w = tw + 2 * pad > fs * 15.0f ? tw + 2 * pad : fs * 15.0f;
+        float k = 1.0f;
+        if (max_w > 0.0f && w > max_w) k = max_w / w;
+        if (max_h > 0.0f && h * k > max_h) k = max_h / h;
+        if (pass || k >= 1.0f)
+            break;
+        fs *= k * 0.995f;
     }
-    const float w = tw + 2 * pad > fs * 15.0f ? tw + 2 * pad : fs * 15.0f;
     ImVec2 a = origin, b(origin.x + w, origin.y + h);
     dl->AddRectFilled(a, b, solid(T->perf_bg, 200 / 255.0f), fs * 0.5f);
-    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f), solid(T->perf_text), l1);
-    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + lh), solid(T->perf_text2), l2);
+    dl->AddText(pf, fs, ImVec2(a.x + pad, a.y + pad * 0.7f), solid(T->perf_text), l1);
+    dl->AddText(pf, fs, ImVec2(a.x + pad, a.y + pad * 0.7f + lh), solid(T->perf_text2), l2);
     if (have_glass)
-        dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + lh * 2),
+        dl->AddText(pf, fs, ImVec2(a.x + pad, a.y + pad * 0.7f + lh * 2),
                     solid(g.warn_uneven || g.warn_rate ? T->perf_warn : T->perf_text2), l3);
     if (l4[0])
-        dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + lh * 3),
+        dl->AddText(pf, fs, ImVec2(a.x + pad, a.y + pad * 0.7f + lh * 3),
                     solid(g.warn_uneven || g.warn_rate ? T->perf_bad : T->perf_text2), l4);
 
     /* Bars: the last 120 flip intervals against a 50 ms ceiling; the thin
@@ -3179,6 +3192,13 @@ static void draw_header(ImDrawList *dl)
             ImGui::PopID();
             const bool on = i == s_page;
             txt(dl, LY.tab, ImVec2(x, top_for(cy, LY.tab)), on ? col(T->text_hi) : col(T->tab_text), t);
+            if (on) {
+                /* The open page: its name bright, a bar under it in the
+                 * selected row's red (the others are dimmed). */
+                const float bt = fmaxf(2.0f, 0.005f * LY.H), by = y0 + th - bt;
+                dl->AddRectFilled(ImVec2(floorf(x - gap * 0.2f), floorf(by)), ImVec2(floorf(x + w + gap * 0.2f), floorf(by + bt)),
+                                  col(T->sel_bar));
+            }
             x += w + gap;
         }
         Face up(s_f_body);
@@ -3706,13 +3726,34 @@ bool overlay_begin_frame()
 
     if (perf) {
         ImVec2 at(fs * 0.6f, fs * 0.6f);
+        float max_w = 0.0f, max_h = 0.0f;
         if (s_open || s_alpha > 0.0f) {
-            /* Beside the page's title, not over it. */
+            /* In the header's free room: between the big title and the
+             * widest page name with its arrows, above the rule, so it never
+             * covers the title, the page name, the tabs or the rows; the
+             * text shrinks to fit. */
             layout_compute(io.DisplaySize);
-            Face title(s_f_title);
-            at = ImVec2(LY.cx + 0.056f * LY.cw + tw(LY.title, "SETTINGS") * 1.08f + 0.03f * LY.cw, fs * 0.3f);
+            float x0, x1;
+            {
+                Face title(s_f_title);
+                x0 = LY.cx + 0.056f * LY.cw + tw(LY.title, "SETTINGS") * 1.08f + 0.025f * LY.cw;
+            }
+            {
+                Face body(s_f_body, SHEAR);
+                const float sz = LY.head, ar = sz * 0.22f, right = LY.cx + 0.944f * LY.cw;
+                float nw = 0.0f;
+                for (int i = 0; i < P_COUNT; i++) {
+                    const float w = tw(sz, caps(k_page_name[i])) + sz * SHEAR * 0.5f;
+                    if (w > nw) nw = w;
+                }
+                x1 = right - ar * 2.8f - nw - ar * 3.4f - 0.025f * LY.cw;
+            }
+            const float m = 0.012f * LY.H;
+            max_w = x1 - x0;
+            max_h = LY.y_rule - 2.0f * m;
+            at = ImVec2(x0, m);
         }
-        draw_perf(ImGui::GetForegroundDrawList(), at, fs);
+        draw_perf(ImGui::GetForegroundDrawList(), at, fs, max_w, max_h);
     }
     if (note) {
         /* Centred, low on the screen; the dots move so it is seen to live. */
