@@ -38,6 +38,33 @@ static PFN_vkGetInstanceProcAddr s_gipa;
 static char s_driver[256] = "system";
 static int s_failed;
 
+/* BO-128: on Adreno 6xx, Turnip's GMEM rendering with hardware binning
+ * wedges the GPU now and then (a hang every 30 min to a few hours in races on
+ * the Retroid Pocket 5's Adreno 650: RBBM_STATUS 0x00E59005, the vertex
+ * front end and the shader cores busy with no memory traffic, inside a
+ * tile's draws; the family of Mesa issues #5220 and #4923). Without the
+ * binning pass (TU_DEBUG=nobin) the tiles still render in GMEM. Asked before
+ * the driver is opened; a TU_DEBUG the player set (env.txt, even empty) is
+ * left as it is. */
+static void turnip_defaults(void)
+{
+    char model[64] = "";
+    FILE *f;
+    if (getenv("TU_DEBUG"))
+        return;
+    f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r");
+    if (f) {
+        if (!fgets(model, sizeof model, f))
+            model[0] = 0;
+        fclose(f);
+    }
+    model[strcspn(model, "\r\n")] = 0;
+    if (strncmp(model, "Adreno6", 7))
+        return;
+    setenv("TU_DEBUG", "nobin", 0);
+    fprintf(stderr, "[vulkan] %s: TU_DEBUG=nobin (no binning pass; BO-128)\n", model);
+}
+
 static void open_loader(void)
 {
     void *h = NULL;
@@ -48,6 +75,7 @@ static void open_loader(void)
     if (dir && *dir && name && *name && strcmp(name, "system")) {
 #if defined(XBOXRECOMP_HAVE_ADRENOTOOLS)
         char d[1024];
+        turnip_defaults();
         size_t n = strlen(dir);
         /* libadrenotools joins directory and name as they are. */
         snprintf(d, sizeof d, "%s%s", dir, n && dir[n - 1] == '/' ? "" : "/");
