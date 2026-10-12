@@ -48,6 +48,10 @@ static float st_sharpen = -2;
 void nv2a_host_set_post_aa(int a) { st_aa = a; }
 void nv2a_host_set_sharpen(float v) { st_sharpen = v; }
 void nv2a_host_set_aniso(int n) { st_aniso = n; }
+static int st_lod_mode = -2, st_dither = -2;
+static float st_lod_val = -2;
+void nv2a_host_set_lod_bias(int m, float v) { st_lod_mode = m; st_lod_val = v; }
+void nv2a_host_set_dither(int on) { st_dither = on; }
 #if !defined(_WIN32)
 /* The file writer's one-at-a-time flag (src/platform/win32_compat.c). */
 int32_t InterlockedExchange(volatile int32_t *p, int32_t v)
@@ -121,6 +125,7 @@ int main(void)
     set_env("RECOMP_PAD_DEADZONE", NULL);
     set_env("RECOMP_GFX_BLOOM", NULL);
     set_env("RECOMP_GFX_MOTION_BLUR", NULL);
+    set_env("RECOMP_GFX_VEHICLE_DETAIL", NULL);
 
     xbox_SettingsInit("Test");
     CHECK(!strcmp(xbox_SettingsPath(), path));
@@ -194,6 +199,21 @@ int main(void)
         const char *e = recomp_env(RENV_GFX_MOTION_BLUR);
         CHECK(!e || strcmp(e, "0") != 0);
     }
+    {
+        /* The vehicle detail distance (a guest patch on anything but
+         * "original"): untouched it never reads far or farthest; a choice
+         * reaches the environment at once and goes back. */
+        const char *e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
+        CHECK(xbox_SettingValue(XS_GRAPHICS_VEHICLE_DETAIL) == 0 && !xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->user);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+        xbox_SettingSet(XS_GRAPHICS_VEHICLE_DETAIL, 2);
+        e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
+        CHECK(e && !strcmp(e, "farthest"));
+        CHECK(!xbox_SettingsNeedRestart());          /* live */
+        xbox_SettingReset(XS_GRAPHICS_VEHICLE_DETAIL);
+        e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+    }
     xbox_SettingSet(XS_GRAPHICS_MOTION_BLUR, 0);
     CHECK(recomp_env(RENV_GFX_MOTION_BLUR) && !strcmp(recomp_env(RENV_GFX_MOTION_BLUR), "0"));
     CHECK(!xbox_SettingsNeedRestart());              /* live */
@@ -226,6 +246,23 @@ int main(void)
     xbox_SettingSet(XS_GRAPHICS_ANISO, 3);
     CHECK(st_aniso == 8);
     CHECK(recomp_env(RENV_GFX_ANISO) && !strcmp(recomp_env(RENV_GFX_ANISO), "8"));
+    /* LOD bias and dither: off as shipped (today's picture); the choices'
+     * modes and values, the environment's spelling. */
+    CHECK(xbox_SettingValue(XS_GRAPHICS_LOD_BIAS) == 0 && xbox_SettingValue(XS_GRAPHICS_DITHER) == 0);
+    xbox_SettingSet(XS_GRAPHICS_LOD_BIAS, 1);
+    CHECK(st_lod_mode == 1);
+    CHECK(recomp_env(RENV_GFX_LOD_BIAS) && !strcmp(recomp_env(RENV_GFX_LOD_BIAS), "auto"));
+    xbox_SettingSet(XS_GRAPHICS_LOD_BIAS, 3);
+    CHECK(st_lod_mode == 2 && st_lod_val == -1.0f);
+    CHECK(recomp_env(RENV_GFX_LOD_BIAS) && !strcmp(recomp_env(RENV_GFX_LOD_BIAS), "-1"));
+    xbox_SettingSet(XS_GRAPHICS_LOD_BIAS, 0);
+    CHECK(st_lod_mode == 0);
+    CHECK(recomp_env(RENV_GFX_LOD_BIAS) && !strcmp(recomp_env(RENV_GFX_LOD_BIAS), "0"));
+    xbox_SettingSet(XS_GRAPHICS_DITHER, 1);
+    CHECK(st_dither == 1);
+    CHECK(recomp_env(RENV_GFX_DITHER) && !strcmp(recomp_env(RENV_GFX_DITHER), "1"));
+    xbox_SettingSet(XS_GRAPHICS_DITHER, 0);
+    CHECK(st_dither == 0);
     xbox_SettingSet(XS_GRAPHICS_AA, 1);
     xbox_SettingSet(XS_GRAPHICS_SHARPEN, 0.4);
     CHECK(st_aa == 1 && st_sharpen > 0.39f && st_sharpen < 0.41f);

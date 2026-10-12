@@ -69,7 +69,7 @@ uint32_t recomp_patch_u32(const char *key, const char *when, uint32_t value,
 
 /* The names a float patch's expression reads. Set before the guest runs,
  * read from its threads: a slot is written whole before the count moves. */
-#define VAR_MAX 8
+#define VAR_MAX 16
 static struct {
     const char *name;
     double value;

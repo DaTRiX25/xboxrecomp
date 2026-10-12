@@ -168,14 +168,13 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 
 void mcpx_apu_dsp_init(MCPXAPUState *d)
 {
-    /* Allocate minimal DSP state for GP and EP.
-     * We need these to exist so reset doesn't crash,
-     * but they won't actually run DSP programs. */
-    d->gp.dsp = (DSPState *)calloc(1, sizeof(DSPState));
-    d->ep.dsp = (DSPState *)calloc(1, sizeof(DSPState));
+    /* No DSP program runs here; each processor is only marked as set up
+     * (ApuDspStandIn, apu_state.h). */
+    d->gp.dsp = (ApuDspStandIn *)calloc(1, sizeof(ApuDspStandIn));
+    d->ep.dsp = (ApuDspStandIn *)calloc(1, sizeof(ApuDspStandIn));
 
-    if (d->gp.dsp) d->gp.dsp->is_gp = true;
-    if (d->ep.dsp) d->ep.dsp->is_gp = false;
+    if (d->gp.dsp) d->gp.dsp->unit = APU_DSP_UNIT_GLOBAL;
+    if (d->ep.dsp) d->ep.dsp->unit = APU_DSP_UNIT_ENCODE;
 
     d->gp.realtime = false;
     d->ep.realtime = false;

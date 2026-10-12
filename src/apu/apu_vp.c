@@ -71,7 +71,7 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
+    memset(&d->vp.filters[v].lowpass, 0, sizeof(d->vp.filters[v].lowpass));
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
@@ -1573,10 +1573,13 @@ static void voice_process(MCPXAPUState *d,
                 d, v, NV_PAVS_VOICE_TAR_FCA + (ch % channels) * 4,
                 NV_PAVS_VOICE_TAR_FCA_FC1);
             float q_f = clampf(q / (1.0f * 0x8000), 0.079407f, 1.0f);
-            sv_filter *filter = &d->vp.filters[v].svf[ch];
-            setup_svf(filter, fc_f, q_f, F_LP);
+            /* apu_lowpass.h: fc_f is its tuning coefficient and q_f its
+             * damping, as they are. */
+            ApuLowpass *lp = &d->vp.filters[v].lowpass[ch];
+            ApuLowpassCoef lp_coef = apu_lowpass_coef(fc_f, q_f);
+            apu_lowpass_tidy(lp);
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-                samples[i][ch] = run_svf(filter, samples[i][ch]);
+                samples[i][ch] = apu_lowpass_step(lp, &lp_coef, samples[i][ch]);
                 samples[i][ch] = fminf(fmaxf(samples[i][ch], -1.0f), 1.0f);
             }
         }

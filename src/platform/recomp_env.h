@@ -117,6 +117,7 @@ extern "C" {
     X(DISPLAY_ULTRAWIDE, CONFIG, "RECOMP_DISPLAY_ULTRAWIDE", NULL, "a picture wider than 16:9 for the title's 3D, for a title whose build has that behind a patch (--patches, recomp_patch.h): off (default, as shipped), 21:9, 32:9, window (the window's own shape)") \
     X(GFX_BLOOM,         CONFIG, "RECOMP_GFX_BLOOM",         NULL, "0: the title's own bloom (glow) passes are not drawn, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 1, as shipped") \
     X(GFX_MOTION_BLUR,   CONFIG, "RECOMP_GFX_MOTION_BLUR",   NULL, "0: the title's own motion blur is not drawn, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 1, as shipped") \
+    X(GFX_VEHICLE_DETAIL, CONFIG, "RECOMP_GFX_VEHICLE_DETAIL", NULL, "how far from the camera the title's vehicles keep their detailed models, for a title whose build has its level-of-detail distances behind a patch (--patches, recomp_patch.h): original (default, as shipped), far, farthest") \
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
     X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \
     X(OVERLAY_TEST,      CONFIG, "RECOMP_OVERLAY_TEST",      NULL, "=file: a test drives the overlay through it, one line each as appended: key <up|down|left|right|enter|esc|f1|pgup|pgdn|del>, pad <a|b|y|up|down|left|right|lb|rb|back+start> (SDL events pushed into the window's loop), shot <path> (the window as presented, BMP), state <path> (the open page's rows as text)") \
@@ -124,6 +125,8 @@ extern "C" {
     X(GFX_ANISO,         CONFIG, "RECOMP_GFX_ANISO",         NULL, "anisotropic filtering of mipmapped, linearly minified textures: off (default), 2, 4, 8, 16 (Metal, Vulkan; clamped to the device's limit)") \
     X(GFX_AA,            CONFIG, "RECOMP_GFX_AA",            NULL, "post-process anti-aliasing of the frame at the game's resolution, before the scale to the window: off (default), fxaa, smaa (Metal, Vulkan windows)") \
     X(GFX_SHARPEN,       CONFIG, "RECOMP_GFX_SHARPEN",       NULL, "post-process sharpening (AMD FidelityFX CAS) strength, 0..1 (default 0, off) (Metal, Vulkan windows)") \
+    X(GFX_LOD_BIAS,      CONFIG, "RECOMP_GFX_LOD_BIAS",      NULL, "extra mip LOD bias of mipmapped textures, added to the title's own: 0 (default, off), auto (-log2(render scale) / 2: -0.5 at 2x, -1.0 at 4x, so the texture detail keeps up with the supersampled frame), or a number such as -0.5 (Metal, Vulkan)") \
+    X(GFX_DITHER,        CONFIG, "RECOMP_GFX_DITHER",        NULL, "1: noise dither of +-0.5 LSB (interleaved gradient noise) in the Metal presenter's scale to the window, against banding of smooth gradients (default 0, off)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
     X(AUDIO_FX_LEVEL,    CONFIG, "RECOMP_AUDIO_FX_LEVEL",    NULL, "5.1: level of the title's effect-send bins, 0..1 (default 0.25)") \

@@ -1424,14 +1424,7 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
     memset(d->regs, 0, sizeof(d->regs));
     mcpx_apu_vp_reset(d);
 
-    if (d->gp.dsp) {
-        memset((void *)d->gp.dsp->core.pram_opcache, 0,
-               sizeof(d->gp.dsp->core.pram_opcache));
-    }
-    if (d->ep.dsp) {
-        memset((void *)d->ep.dsp->core.pram_opcache, 0,
-               sizeof(d->ep.dsp->core.pram_opcache));
-    }
+    /* Nothing of the GP or EP to reset: no DSP program runs (apu_dsp.c). */
     d->set_irq = false;
 }
 

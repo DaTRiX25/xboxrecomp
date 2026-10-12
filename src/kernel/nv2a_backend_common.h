@@ -1004,6 +1004,21 @@ struct nv2a_host_opts {
 int  nv2a_host_aniso(void);
 void nv2a_host_set_aniso(int level);
 
+/* RECOMP_GFX_LOD_BIAS: an extra mip LOD bias for mipmapped textures, added
+ * to the title's own (the per-draw texture-bias constant both backends hand
+ * the pixel shader), so a supersampled frame (render scale > 1) gets the
+ * sharper mip level its pixel density can show. 0 is today's picture.
+ * Mode 0 off, 1 auto (-log2(render scale) / 2), 2 an explicit value.
+ * nv2a_host_lod_bias() is the bias now, in mip levels (0 when off). */
+enum { NV2A_LOD_OFF = 0, NV2A_LOD_AUTO = 1, NV2A_LOD_VALUE = 2 };
+float nv2a_host_lod_bias(void);
+void  nv2a_host_set_lod_bias(int mode, float value);
+
+/* RECOMP_GFX_DITHER: 1 asks the Metal presenter for a +-0.5 LSB noise dither
+ * in its scale to the window. Read on every present. */
+int   nv2a_host_dither(void);
+void  nv2a_host_set_dither(int on);
+
 /* RECOMP_GFX_AA and RECOMP_GFX_SHARPEN: the window presenters' post passes
  * (src/video/fb_present_metal.m, fb_present_vulkan.c), read on every present
  * so a change while running shows at once. AA: 0 off, 1 FXAA, 2 SMAA.

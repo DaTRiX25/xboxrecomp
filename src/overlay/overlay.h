@@ -58,6 +58,15 @@ void xbox_OverlayFramePresented(void);
 /* The loop is ending: the title is let go, the settings written. */
 void xbox_OverlayShutdown(void);
 
+/* Rows of the host's own on the Graphics page, under the settings: up to
+ * four actions whose text and effect are the port's (Android: which Vulkan
+ * driver the next start loads, a restart). fn(row, 0) gives the row's text
+ * as it now stands (NULL or "": no such row at the moment; the pointer must
+ * stay good until the next call for that row); fn(row, 1) is the row
+ * activated, on the overlay's thread, and returns the text after it. */
+#define XBOX_OVERLAY_HOST_ROWS 4
+void xbox_OverlaySetHostRows(int n, const char *(*fn)(int row, int activate));
+
 #ifdef __cplusplus
 }
 #endif
