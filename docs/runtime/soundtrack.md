@@ -60,6 +60,18 @@ names) are composed, Latin Extended-A is folded to the nearest letter ("ő"
 to "ö", "ř" to "r"), typographic quotes and dashes to the plain ones, and
 other scripts to "?".
 
+A file that is not taken is remembered with the reason (`xst_probe_why`:
+"no MPEG audio found in its first megabyte", "an empty file", "not a FLAC
+file this can read" ...): `xbox_SoundtrackInit` logs each by name, and
+`xbox_SoundtrackLeftOut` / `xbox_SoundtrackLeftOutFile` give them to a
+settings screen (the first 32 by name).
+
+An mp3's first frame is looked for in the 16 KiB after its tag and, when
+there is none there, in the first megabyte: files start with junk a decoder
+plays straight through (one in a real folder: 64 KiB of zeros and the tail
+of a cut frame before the first whole one). A frame header counts when the
+next frame is where it says.
+
 The scan reads headers only: a FLAC's stream info, an Ogg's last page, a
 WAV's header, and for an mp3 the first 64 KiB of its ID3v2 tag and its first
 frame (the Xing/Info frame count, else size over bitrate).
