@@ -524,7 +524,8 @@ static struct {
  * one of two places:
  *
  *   via the map  into the mixbins, every bin the speaker map sends to that
- *                speaker (in stereo: DirectSound's bin for it, 0..5), then
+ *                speaker (in stereo, and for a title with its GP image
+ *                wired, apu_gp.h: DirectSound's bin for it, 0..5), then
  *                the DSP stage's own mix (apu_spk_mix51 or the stereo
  *                fold), the monitor, the device -- the path the title's
  *                sounds take
@@ -572,7 +573,8 @@ static void spk_test_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
     if (g_spk.via_map) {
         int bins[NUM_MIXBINS], nb = 0;
-        if (six) {
+        extern int apu_gp_wired(void);
+        if (six && !apu_gp_wired()) {
             int8_t map[NUM_MIXBINS];
             mcpx_apu_speaker_map_get(map);
             for (int b = 0; b < NUM_MIXBINS; b++)
@@ -1556,9 +1558,15 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
  * addr is offset from APU base (0xFE800000)
  * ============================================================ */
 
+/* RECOMP_ORACLE_CAP (apu_oracle_cap.c). */
+int apu_ocap_on(void);
+void apu_ocap_mmio(uint32_t addr, uint32_t val, unsigned size, int is_write);
+
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 {
     if (!d) return 0;
+    if (addr >= 0x30000 && apu_ocap_on())
+        apu_ocap_mmio((uint32_t)addr, 0, size, 0);
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
@@ -1570,6 +1578,8 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
 {
     if (!d) return;
+    if (addr >= 0x2000 && apu_ocap_on())
+        apu_ocap_mmio((uint32_t)addr, (uint32_t)val, size, 1);
     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
 }
 

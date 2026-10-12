@@ -275,7 +275,7 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
             win_path, buf_size, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
         if (!used || used >= buf_size || used + 1 >= buf_size) return FALSE;
         if (win_path[used - 1] != L'\\') win_path[used++] = L'\\';
-        int count = MultiByteToWideChar(CP_ACP, 0, xbox_path, -1,
+        int count = MultiByteToWideChar(XBOX_GUEST_CP, 0, xbox_path, -1,
             win_path + used, (int)(buf_size - used));
         return count != 0;
     }
@@ -862,7 +862,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             clean_path += 4;
         if (FileName && FileName->Buffer && !dirinfo_mask_is_all(FileName)) {
             WCHAR pattern_wide[MAX_PATH];
-            MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
+            MultiByteToWideChar(XBOX_GUEST_CP, 0, FileName->Buffer, FileName->Length,
                                 pattern_wide, MAX_PATH);
             pattern_wide[FileName->Length] = L'\0';
             swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, pattern_wide);
@@ -901,7 +901,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
     memset(entry, 0, Length);
     char filename_ansi[MAX_PATH];
-    int name_len = WideCharToMultiByte(CP_ACP, 0, ctx->find_data.cFileName, -1,
+    int name_len = WideCharToMultiByte(XBOX_GUEST_CP, 0, ctx->find_data.cFileName, -1,
                                        filename_ansi, MAX_PATH, NULL, NULL);
     if (name_len > 0) name_len--;
 
@@ -944,7 +944,7 @@ NTSTATUS __stdcall xbox_RenameFileByHandle(
         WCHAR *slash = wcsrchr(src, L'\\');
         size_t dir = slash ? (size_t)(slash - src) + 1 : 0;
         memcpy(dst, src, dir * sizeof(WCHAR));
-        if (!MultiByteToWideChar(CP_ACP, 0, name, -1, dst + dir,
+        if (!MultiByteToWideChar(XBOX_GUEST_CP, 0, name, -1, dst + dir,
                                  (int)(MAX_PATH - dir)))
             return STATUS_OBJECT_NAME_INVALID;
     } else if (!translate_obj_path(NewName, dst, MAX_PATH)) {

@@ -15,6 +15,10 @@ add_library(xbox_apu STATIC
     apu_sdl2.c
     apu_wav.c
     apu_speakers.c
+    apu_bus.c
+    apu_gp.c
+    apu_dsp56k.c
+    apu_oracle_cap.c
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

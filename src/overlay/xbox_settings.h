@@ -59,6 +59,7 @@ typedef enum {
     XS_AUDIO_MUTE_BG,
     XS_AUDIO_SPEAKERS,
     XS_AUDIO_FX_LEVEL,
+    XS_AUDIO_MIXER,          /* the host mixer (apu_bus.h); its mix is in mixer.toml */
     XS_INPUT_DEADZONE,
     XS_INPUT_TRIGGER_DEADZONE,
     XS_INPUT_RUMBLE,
@@ -71,10 +72,14 @@ typedef enum {
     XS_DISPLAY_ULTRAWIDE,    /* another: the 3D wider than 16:9 */
     XS_GRAPHICS_BLOOM,       /* another: the title's own bloom, on as shipped */
     XS_GRAPHICS_MOTION_BLUR, /* another: the title's own motion blur, on as shipped */
+    XS_GRAPHICS_CRASH_60FPS, /* another: the title's 30 Hz phases at 60, off as shipped */
+    XS_GRAPHICS_SPLIT_60FPS, /* another: the title's 30 Hz split screen at 60, off as shipped */
+    XS_AUDIO_SPLIT_MUSIC,    /* another: the title's music in split screen, off as shipped */
     XS_GRAPHICS_LOD_BIAS,    /* extra mip LOD bias: off, auto (from the render scale), or a value */
     XS_GRAPHICS_DITHER,      /* noise dither in the presenter's scale to the window (Metal) */
     XS_GRAPHICS_VEHICLE_DETAIL, /* an opt-in guest patch: the title's vehicle LOD distances */
     XS_INPUT_GLYPHS,         /* auto / xbox / xbox_modern / playstation / nintendo / steam (pad_glyphs.h) */
+    XS_AUDIO_LFE_LOWPASS,    /* the LFE feed's low-pass: off / 80 / 100 / 120 Hz (apu_gp.h) */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
 #endif
@@ -127,6 +132,17 @@ void xbox_SettingsFlush(void);
 /* The file in use, or "" (none). */
 const char *xbox_SettingsPath(void);
 
+/* A text setting (audio.custom_music_dir: a folder): what the file holds, or
+ * the environment's when it sets the variable (*locked, may be NULL). ""
+ * when unset or unknown. Set: remembered for the file (an empty value
+ * removes the key); the runtime reads it at the next start. */
+/* Always UTF-8: the file is; on Windows the environment's value is taken
+ * from the wide environment and converted (the narrow one is in the ANSI
+ * code page), so a folder with any letters in its name opens. A reader of
+ * such a setting uses this, not getenv. */
+const char *xbox_SettingsText(const char *key, int *locked);
+void        xbox_SettingsSetText(const char *key, const char *value);
+
 /* The power mode's "stock" (Maximum, the busy-wait) is offered on some hosts
  * only (BO-75: on the Deck and Windows it measured no steadier than Balanced
  * and costs 2.7 W / stutters). Where it is hidden the overlay steps over it
@@ -154,6 +170,22 @@ void xbox_SettingEnvString(const xs_setting *s, double v, char *out, unsigned n)
 /* The line at the top of the overlay's Advanced page: the port's name and
  * version (NULL or "": none). Here and not in overlay.h, which needs SDL. */
 void xbox_OverlaySetAbout(const char *text);
+
+/* The "Custom music folder" row of the overlay's Audio page, for a port
+ * whose title plays the user's music (xbox_soundtrack.h); none until this is
+ * called. The row opens a folder browser inside the overlay (a pad is
+ * enough); the folder picked there is stored as audio.custom_music_dir and
+ * handed to `chosen` ("" for "turn off"), on the overlay's thread. `status`
+ * fills the line under the row: what is in use, a scan's progress, when a
+ * change shows ("" for no line). */
+typedef struct xbox_music_folder_ops {
+    void (*status)(char *out, unsigned n);
+    void (*chosen)(const char *dir);
+    /* May be NULL. Further lines under the status, i = 0..3 (files a scan
+     * left out, by name and reason): 1 and the text, or 0 for no more. */
+    int  (*note)(int i, char *out, unsigned n);
+} xbox_music_folder_ops;
+void xbox_OverlaySetMusicFolder(const xbox_music_folder_ops *ops);
 
 #ifdef __cplusplus
 }

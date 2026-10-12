@@ -111,6 +111,7 @@ extern void xbox_log_thread_role(const char *role, uint32_t routine);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
 extern void xbox_InputInit(void);            /* src/input/input_core.c */
 extern void xbox_InputPadEvent(const SDL_Event *ev); /* src/input/xinput_device.c */
+extern void xbox_InputShutdown(void);                /* src/input/input_core.c */
 extern int  xbox_InputAnyOpen(void);
 
 /* ── Handoff: three slots, one each for writer, reader and the ready frame ── */
@@ -790,7 +791,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     int stats = recomp_env_on(RENV_PRESENT_STATS);
     int scale = recomp_env(RENV_WINDOW_SCALE) ? atoi(recomp_env(RENV_WINDOW_SCALE)) : 2;
     int win_w, win_pos, win_pw, win_ph;
-    int quit = 0, guest_done = 0, dirty = 0, shoot = 0;
+    int quit = 0, guest_done = 0, dirty = 0, shoot = 0, had_pads;
     double quit_after = recomp_env(RENV_WINDOW_QUIT_AFTER)
                       ? atof(recomp_env(RENV_WINDOW_QUIT_AFTER)) : 0.0;
     uint32_t shown_flip = 0;
@@ -1322,13 +1323,21 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     fflush(stdout);
     fflush(stderr);
 
+    /* The pads first, while SDL is whole and on the thread that pumps it:
+     * every motor off, the stop written out, the controllers closed
+     * (input_core.c, xinput_device.c). atexit would do it too, but after
+     * the video subsystem is gone and with the process a moment from its
+     * end; from here on the title's threads cannot start a motor again. */
+    had_pads = xbox_InputAnyOpen();
+    xbox_InputShutdown();
+
     /* The guest is still running when the window closes, and there is no way
      * to stop lifted code mid-flight. exit() ends every thread; atexit
      * handlers (ICALL feedback, profiles) still run.
      *
      * Window and renderer go first, on this thread as AppKit wants. SDL_Quit
-     * is only safe once nothing else uses SDL: the USB thread reads the
-     * game controllers, so with one open SDL stays up and exit() reclaims it. */
+     * is only safe once nothing else uses SDL: a run that had a controller
+     * open keeps SDL up, as before, and exit() reclaims it. */
     if (tex)
         SDL_DestroyTexture(tex);
     close_present(ren);
@@ -1336,7 +1345,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     /* The main pump flag stays set: guest and OHCI threads keep running
      * until exit(), and must not start calling SDL_GameControllerUpdate
      * while SDL is torn down under them. */
-    if (!xbox_InputAnyOpen())
+    if (!had_pads)
         SDL_Quit();
     else
         SDL_QuitSubSystem(SDL_INIT_VIDEO);

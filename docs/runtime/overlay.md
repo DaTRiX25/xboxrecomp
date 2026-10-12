@@ -124,11 +124,17 @@ title's defaults when those change. Keys it does not know are kept.
 | `graphics.dither` (bool) | `RECOMP_GFX_DITHER` | yes; Metal only |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |
-| `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins |
+| `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins, where they play dry. Not used (and not shown) for a title whose GP effects image is modelled (`src/apu/apu_gp.h`) |
+| `audio.lfe_lowpass` (`off`, `80`, `100`, `120`; default `120`) | `RECOMP_AUDIO_LFE_LOWPASS` | not on the page (the settings file or the variable only; a change in a running game fades over 21 ms). For a title whose GP effects image is modelled: the low-pass on the LFE (subwoofer) feed, 24 dB an octave. 120 Hz is what the console's Dolby Digital encoder did after the effects stage and is the stock behaviour; off is that stage's own full-range feed. For tuning by ear use the mixer's own `lfe_lowpass_hz`, which comes after this one: with both on the feed passes both |
+| `audio.mixer` (default off) | `RECOMP_AUDIO_MIXER` | yes; the host mixer (`src/apu/apu_bus.h`): buses over the title's voices, on the Audio page's Mixer page. Its mix is not in settings.toml but in `mixer.toml` beside it (`RECOMP_AUDIO_MIXER_FILE`), read again when it changes. Off, and on with the neutral preset, the output is the same as before |
+| `audio.custom_music_dir` (a folder, default empty) | `RECOMP_AUDIO_MUSIC_DIR` | a text setting (`xbox_SettingsText`). Audio page row "Custom music folder" with a folder browser, when the port asked for it (`xbox_OverlaySetMusicFolder`); live if the port can (`soundtrack.md`) |
 | `game.speed_units` (`mph`, `kmh`) | `RECOMP_SPEED_UNITS` | live; Display page, only when the title enabled a guest patch for it (`recomp_patch_enable`, lifting: Guest patches) |
 | `display.ultrawide` (`off`, `21:9`, `32:9`, `window`) | `RECOMP_DISPLAY_ULTRAWIDE` | live, from the title's next 3D set-up; Display page, only when the title enabled a guest patch for it |
 | `display.hud_fix` (bool) | `RECOMP_GFX_HUD_FIX` | live, shown whole from the title's next HUD set-up; Display page, only when the title enabled a guest patch for it |
 | `graphics.bloom`, `graphics.motion_blur` (bool, default on) | `RECOMP_GFX_BLOOM`, `RECOMP_GFX_MOTION_BLUR` | live, from the next frame; the title's own effects, which a guest patch skips at `0`; Graphics page, only when the title enabled a guest patch for them |
+| `graphics.crash_60fps` (bool, default off) | `RECOMP_GFX_CRASH_60FPS` | live, from the title's next frame; the title's own 30 Hz phases (Burnout 3: crash and takedown cameras) at 60, by a guest patch on the title's own rate choice at `1`; Graphics page, only when the title enabled a guest patch for it; for strong machines: a host that cannot hold 60 runs the game itself slower while it is on (the title steps once a frame), so the row says to leave it off on a Steam Deck and other handhelds |
+| `graphics.split_60fps` (bool, default off) | `RECOMP_GFX_SPLIT_60FPS` | from the title's next two-player stage; the title's 30 Hz split screen at 60, by a guest patch at `1`; Graphics page, only when the title enabled a guest patch for it; for strong machines: a host that cannot hold 60 runs the game itself slower while it is on (the title steps once a frame), so the row says to leave it off on a Steam Deck and other handhelds |
+| `audio.split_music` (bool, default off) | `RECOMP_AUDIO_SPLIT_MUSIC` | live; the title's music in split screen, where it plays none, by a guest patch at `1`; Audio page, only when the title enabled a guest patch for it |
 | `graphics.vehicle_detail` (`original`, `far`, `farthest`) | `RECOMP_GFX_VEHICLE_DETAIL` | live, from the next frame; the distances at which the title swaps its vehicle models for simpler ones, scaled by a guest patch (2x, 4x); Graphics page, only when the title enabled a guest patch for it |
 | `input.deadzone`, `input.trigger_deadzone` | `RECOMP_PAD_DEADZONE`, `RECOMP_PAD_TRIGGER_DEADZONE` | yes |
 | `input.rumble` (strength, 0 to 3 in steps of 0.25; 1 the original, 0 off; motor = (speed / peak) ^ (1 / strength), see src/input/README.md) | `RECOMP_INPUT_RUMBLE_GAIN` | yes |
@@ -152,6 +158,37 @@ locks the row. The choice is one table, `k_stock_hidden` in
 `src/overlay/xbox_settings.c` (BO-75; set an entry to 0 to offer Maximum
 again); `xbox_PowerModeAtLoad(host, stored)` is the rule, testable per host
 (`tests/overlay_settings`).
+
+## Text and fonts
+
+Every string the overlay draws is UTF-8: its own labels and hints, a port's
+rows, folder names in the music folder browser. Two fonts, both embedded
+(no file is read at run time), merged into one (`overlay_fonts` in
+`overlay_ui.cpp`); Dear ImGui rasterises a glyph when it is first drawn, so
+there is no baked atlas and no list of ranges to keep:
+
+| font | covers | licence |
+|---|---|---|
+| ProggyForever, Dear ImGui's own default (in `imgui_draw.cpp`) | Basic Latin, Latin-1 | MIT |
+| DejaVu Sans Mono 2.37, a subset (`overlay_font_ext.h`, 41 KB, 630 characters) | Latin Extended-A and -B (U+0100-024F), Greek (U+0370-03FF), Cyrillic (U+0400-04FF), dashes and quotes (U+2010-2027), U+25A1 | Bitstream Vera licence (MIT kind; the notices go with every copy: `third_party/dejavu/LICENSE.txt`, which a binary release carries) |
+
+The first font decides wherever it has the character, so the overlay looks
+as it did; the second is set to its x-height and baseline. The subset is
+made by `third_party/dejavu/make_subset.py` from the release's
+`DejaVuSansMono.ttf` (checked by SHA-256); ProggyForever's own full font has
+no Latin Extended-A either (193 characters), which is why a second font is
+needed at all.
+
+A character neither font has is drawn as a square (U+25A1), not as "?".
+That is the case for CJK, Arabic, Hebrew, Indic scripts and emoji: out of
+scope (a CJK font is megabytes, and right-to-left and combining scripts need
+shaping this renderer does not do). A name in such a script still works: the
+folder is found, chosen and stored by its real name; only its drawing is
+squares.
+
+Names from a disk may be decomposed (macOS stores "ő" as "o" + U+030B): the
+browser's labels are composed first (`xst_utf8_compose`, Latin-1 and Latin
+Extended-A), since the renderer does not stack combining marks.
 
 ## Shader pre-build
 

@@ -67,14 +67,33 @@ int mcpx_apu_speaker_test_playing(int *via_map);
 void mcpx_apu_set_fx_bins(uint32_t mask);
 void mcpx_apu_set_fx_level(float level);
 
-/* 5.1: bin passes through the biquad EQ the title's GP effects image runs
- * on it, its coefficients read live from GP scratch memory at
- * scratch_offset (b0 b1 b2 a1 a2, s24, halved; apu_dsp.c). Stereo does not
- * use it. Call before mcpx_apu_init_standalone. */
-void mcpx_apu_set_bin_eq(int bin, uint32_t scratch_offset);
+/* A title whose GP effects image has been read wires it with apu_gp.h
+ * (apu_gp_direct, _eq, _drive, _export, before mcpx_apu_init_standalone):
+ * the speaker feeds then come from that model of the image, in 5.1 and in
+ * stereo, and the calls above (speaker map, effect-send level) are not
+ * used. */
+
+/* The low-pass on the LFE feed of such a title (RECOMP_AUDIO_LFE_LOWPASS,
+ * audio.lfe_lowpass: off, 80, 100, 120 Hz; the settings file or the
+ * variable, no overlay row; a change is faded over 21 ms). The
+ * title's wiring sets it until this or the variable does. Any thread. */
+void mcpx_apu_set_lfe_lowpass(int hz);
 
 /* The speaker map in use (mcpx_apu_set_speaker_map, or the default). */
 void mcpx_apu_speaker_map_get(int8_t map[32]);
+
+/* RECOMP_MIX_TRACE (apu_vp.c, the mix study): the host asks this for who is
+ * turning a voice on -- the title's return addresses on the calling guest
+ * thread's stack, innermost first, at most max; returns how many. Not set,
+ * or the trace off: never called. */
+typedef int (*mcpx_apu_voice_tag_fn)(uint32_t *out, int max);
+void mcpx_apu_set_voice_tag_hook(mcpx_apu_voice_tag_fn fn);
+/* The gain a mixbin reaches its speaker with in 5.1 (the effects level and
+ * the title's GP EQ when that is a plain gain; 1 otherwise). Trace only. */
+float mcpx_apu_bin_feed_gain(int bin);
+/* Trace only: the output before the clamp, per channel, from the DSP stage. */
+void mcpx_apu_mix_trace_out(const float *acc, int nch, int n);
+int mcpx_apu_mix_trace_on(void);
 
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */

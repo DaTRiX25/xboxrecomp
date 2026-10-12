@@ -46,6 +46,10 @@ const struct nv2a_host_opts *nv2a_host_opts(void) { return &st_opts; }
 void xa2_set_gain(float g) { st_gain = g; }
 static float st_fx = -2;
 void mcpx_apu_set_fx_level(float v) { st_fx = v; }
+static int st_mixer = -2;
+void apu_bus_enable(int on) { st_mixer = on; }
+static int st_lfe = -1;
+void mcpx_apu_set_lfe_lowpass(int hz) { st_lfe = hz; }
 static int st_aniso = -2, st_aa = -2;
 static float st_sharpen = -2;
 void nv2a_host_set_post_aa(int a) { st_aa = a; }
@@ -109,6 +113,7 @@ int main(void)
         "[audio]\n"
         "volume = 0.5\n"               /* the environment sets it too */
         "mute = true\n"
+        "custom_music_dir = \"/music/My \\\"Best\\\" \xC5\x90szi \xC5\xB1r\"\n"   /* a text setting, UTF-8 */
         "[input]\n"
         "deadzone = 3277\n"
         "rumble = 1.8\n"               /* an older slider's value, between two steps */
@@ -121,6 +126,7 @@ int main(void)
     set_env("RECOMP_SETTINGS", path);
     set_env("RECOMP_AUDIO_VOLUME", "0.25");          /* the user's own */
     set_env("RECOMP_AUDIO_MUTE", NULL);
+    set_env("RECOMP_AUDIO_MUSIC_DIR", NULL);
     set_env("RECOMP_PRESENT_OVERSCAN", NULL);
     set_env("RECOMP_PRESENT_PACING", NULL);
     set_env("RECOMP_PRESENT_SPIN_LEAD", NULL);
@@ -128,10 +134,22 @@ int main(void)
     set_env("RECOMP_PAD_DEADZONE", NULL);
     set_env("RECOMP_GFX_BLOOM", NULL);
     set_env("RECOMP_GFX_MOTION_BLUR", NULL);
+    set_env("RECOMP_GFX_CRASH_60FPS", NULL);
+    set_env("RECOMP_GFX_SPLIT_60FPS", NULL);
+    set_env("RECOMP_AUDIO_SPLIT_MUSIC", NULL);
     set_env("RECOMP_GFX_VEHICLE_DETAIL", NULL);
 
     xbox_SettingsInit("Test");
     CHECK(!strcmp(xbox_SettingsPath(), path));
+    /* A text setting: into its variable, readable, not "unknown". */
+    CHECK(getenv("RECOMP_AUDIO_MUSIC_DIR")
+          && !strcmp(getenv("RECOMP_AUDIO_MUSIC_DIR"), "/music/My \"Best\" \xC5\x90szi \xC5\xB1r"));
+    {
+        int locked = 1;
+        CHECK(!strcmp(xbox_SettingsText("audio.custom_music_dir", &locked), "/music/My \"Best\" \xC5\x90szi \xC5\xB1r"));
+        CHECK(!locked);
+        CHECK(!strcmp(xbox_SettingsText("no.such_key", NULL), ""));
+    }
     /* The file reached the environment, the real environment did not move. */
     CHECK(getenv("RECOMP_PRESENT_OVERSCAN") && !strcmp(getenv("RECOMP_PRESENT_OVERSCAN"), "crop"));
     CHECK(getenv("RECOMP_AUDIO_MUTE") && !strcmp(getenv("RECOMP_AUDIO_MUTE"), "1"));
@@ -223,6 +241,39 @@ int main(void)
     xbox_SettingSet(XS_GRAPHICS_BLOOM, 1);
     CHECK(recomp_env(RENV_GFX_BLOOM) && !strcmp(recomp_env(RENV_GFX_BLOOM), "1"));
     xbox_SettingSet(XS_GRAPHICS_BLOOM, 0);
+    /* The title's 30 Hz phases at 60 (a guest patch on the "1"): off as
+     * shipped, and untouched the variable never reads "1". */
+    CHECK(!strcmp(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->key, "graphics.crash_60fps"));
+    CHECK(xbox_SettingValue(XS_GRAPHICS_CRASH_60FPS) == 0 && !xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->user);
+    CHECK(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->def == 0);
+    {
+        const char *e = recomp_env(RENV_GFX_CRASH_60FPS);
+        CHECK(!e || strcmp(e, "1") != 0);
+    }
+    xbox_SettingSet(XS_GRAPHICS_CRASH_60FPS, 1);
+    CHECK(recomp_env(RENV_GFX_CRASH_60FPS) && !strcmp(recomp_env(RENV_GFX_CRASH_60FPS), "1"));
+    /* Split screen at 60 and with music (guest patches on the "1"): both off
+     * as shipped, the variables never "1" untouched, live. */
+    {
+        static const struct { xs_id id; recomp_env_id env; const char *key; } k[] = {
+            { XS_GRAPHICS_SPLIT_60FPS, RENV_GFX_SPLIT_60FPS, "graphics.split_60fps" },
+            { XS_AUDIO_SPLIT_MUSIC, RENV_AUDIO_SPLIT_MUSIC, "audio.split_music" },
+        };
+        for (int i = 0; i < 2; i++) {
+            const char *e = recomp_env(k[i].env);
+            CHECK(!strcmp(xbox_SettingGet(k[i].id)->key, k[i].key));
+            CHECK(xbox_SettingValue(k[i].id) == 0 && !xbox_SettingGet(k[i].id)->user);
+            CHECK(xbox_SettingGet(k[i].id)->def == 0);
+            CHECK(!e || strcmp(e, "1") != 0);
+            xbox_SettingSet(k[i].id, 1);
+            CHECK(recomp_env(k[i].env) && !strcmp(recomp_env(k[i].env), "1"));
+            xbox_SettingReset(k[i].id);
+            CHECK(xbox_SettingValue(k[i].id) == 0 && !xbox_SettingGet(k[i].id)->user);
+            CHECK(recomp_env(k[i].env) && !strcmp(recomp_env(k[i].env), "0"));
+        }
+        CHECK(!xbox_SettingsNeedRestart());
+    }
+    CHECK(!xbox_SettingsNeedRestart());              /* live */
 
     /* A live change reaches the runtime, the cached environment and the file. */
     xbox_SettingSet(XS_POWER_MODE, 1);
@@ -328,6 +379,13 @@ int main(void)
             }
         }
         CHECK(strstr(text, "mystery.key = 7"));                  /* kept */
+        {
+            /* The text setting: in its section, once, escaped; the strict
+             * reader above took the file, so no table is opened twice. */
+            const char *m = strstr(text, "custom_music_dir = \"/music/My \\\"Best\\\" \xC5\x90szi \xC5\xB1r\"");
+            CHECK(m && a && m > a);
+            CHECK(!strstr(text, "audio.custom_music_dir"));
+        }
         CHECK(strstr(text, "mode = \"performance\""));
         CHECK(strstr(text, "deadzone = 6554"));
         CHECK(strstr(text, "overscan = \"off\""));
@@ -344,6 +402,11 @@ int main(void)
             const char *m = strstr(text, "motion_blur = false");
             CHECK(g && !strstr(g + 1, "[graphics]"));
             CHECK(g && b && m && b > g && m > g);
+            /* And the 60 fps crash cameras' "on", in the same table. */
+            {
+                const char *c = strstr(text, "crash_60fps = true");
+                CHECK(c && c > g);
+            }
         }
     }
 
@@ -354,6 +417,13 @@ int main(void)
     xbox_SettingsFlush();
     text = read_file(path);
     CHECK(text && !strstr(text, "motion_blur") && strstr(text, "bloom = false"));
+    /* Off again: the default, as shipped, and the file forgets it. */
+    xbox_SettingReset(XS_GRAPHICS_CRASH_60FPS);
+    CHECK(xbox_SettingValue(XS_GRAPHICS_CRASH_60FPS) == 0 && !xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->user);
+    CHECK(recomp_env(RENV_GFX_CRASH_60FPS) && !strcmp(recomp_env(RENV_GFX_CRASH_60FPS), "0"));
+    xbox_SettingsFlush();
+    text = read_file(path);
+    CHECK(text && !strstr(text, "crash_60fps"));
 
     /* Reset goes back to the host's default and forgets the setting. */
     xbox_SettingReset(XS_DISPLAY_OVERSCAN);

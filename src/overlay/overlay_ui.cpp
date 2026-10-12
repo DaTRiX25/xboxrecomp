@@ -33,6 +33,9 @@
 #include "input_map.h"
 #include "kernel_pause.h"
 #include "apu.h"                /* the speaker test */
+#include "apu_bus.h"            /* the Mixer page */
+#include "apu_gp.h"             /* is the title's effects image modelled */
+#include "xbox_soundtrack.h"    /* the music folder browser's model (xsb_*) */
 
 #include <math.h>
 #include <stdint.h>
@@ -40,6 +43,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
+
+#include "overlay_font_ext.h"   /* k_overlay_font_ext: the second font's letters */
+/* DejaVu Sans Mono beside ProggyForever. A font's size is its ascent plus
+ * descent, and of that both have the same x-height (0.47), so the scale is
+ * the first font's own (ImGui gives its default 1.015). The baselines differ
+ * by 0.02 of the size (ascents 0.797 and 0.777): at the 13-pixel reference
+ * size the first font is moved down 0.41, this one 0.15. */
+#define OVERLAY_FONT_EXT_SCALE 1.015f
+#define OVERLAY_FONT_EXT_DY    0.15f
 
 #define LOGP "[OVERLAY] "
 
@@ -122,6 +135,7 @@ static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL 
 static const char *const n_lod[]       = { "Off", "Auto (from the render scale)", "-0.5", "-1.0", "-1.5", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
+static const char *const n_lfe_lowpass[] = { "Off", "80 Hz", "100 Hz", "120 Hz", NULL };
 #if defined(__ANDROID__)
 static const char *const n_vibration[] = { "Auto", "Controller", "This device", "Off", NULL };
 #endif
@@ -162,6 +176,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_AUDIO_MUTE_BG */      { "Mute in the background", "No sound while the window is not in front.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_SPEAKERS */     { "Speakers", "Auto plays 5.1 when the system's sound output is set to 5.1 (or more), else stereo. The game picks its mix at start.", 1, FMT_PLAIN, n_speakers, 0 },
     /* XS_AUDIO_FX_LEVEL */     { "Surround effects (reverb) level", "5.1 only: the level of the game's effect sends, which play dry here (no effect DSP runs). Tune by ear.", 0.05, FMT_PERCENT, NULL, 0 },
+    /* XS_AUDIO_MIXER */        { "Mixer", "Buses over the game's sounds: gains, sends, LFE, limiter (the Mixer page below). Off: the game's mix as shipped.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_INPUT_DEADZONE */     { "Stick deadzone", "The part of the stick's travel that reads as centre.", 1638.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_TRIGGER_DEADZONE */ { "Trigger deadzone", "The part of a trigger's pull that reads as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "1.0 is the original: the game's rumble as the Xbox pad played it. Higher makes the weaker rumbles stronger (the strongest is full at any setting). 0 turns the rumble off.", 0.25, FMT_GAIN, NULL, 0 },
@@ -174,10 +189,14 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For a display wider than 16:9, with Aspect at 16:9: the race is drawn for the whole width (more to see at the sides, nothing stretched). Menus, loading screens and videos keep their 16:9 shape in the middle. Window follows the window's or the screen's own shape. A change shows from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
     /* XS_GRAPHICS_BLOOM */     { "Bloom", "The game's own soft glow over the picture, strongest while boosting. On is the original look; off skips its three extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "The game's own blur: the streaks towards the edges of the picture at speed and while boosting. On is the original look; off skips its two extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_CRASH_60FPS */ { "60 fps crash cameras", "The game halves its frame rate to 30 in its crash and takedown cameras. On: they run at 60 like the rest of the race. For strong machines: where 60 fps cannot be held, the game itself runs slower while this is on, not just the picture. Leave it off on a Steam Deck and other handhelds. Off is the original. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_SPLIT_60FPS */ { "60 fps split screen", "The game runs two-player split screen at 30 frames a second. On: it runs at 60, with the scene drawn twice a frame. For strong machines: where 60 fps cannot be held, the game itself runs slower while this is on, not just the picture. Leave it off on a Steam Deck and other handhelds. Off is the original. A change shows from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_AUDIO_SPLIT_MUSIC */  { "Music in split screen", "The game plays no music in two-player split screen. On: EA GAMES TRAX or your custom music plays in two-player Race and Road Rage as in a one-player race. Off is the original. A change shows from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto: -0.5 at 2x, -1.0 at 4x. Off is the original. Changes at once.", 1, FMT_PLAIN, n_lod, 0 },
     /* XS_GRAPHICS_DITHER */    { "Dither", "A faint noise in the final scale to the window that hides the stripes in smooth gradients such as the sky. Metal only for now. Off is the original; text and HUD at the exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_VEHICLE_DETAIL */ { "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Original is the console's distances; Far doubles them, Farthest is four times. Costs GPU time when many vehicles are on screen. Scenery, the track and where traffic appears are not changed. Changes at once.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
     /* XS_INPUT_GLYPHS */       { "Button prompts", "The buttons the game shows in its menus and hints. Auto follows the controller that was last used. Xbox (original) is the game's own picture: white and black buttons, L and R. The game's text and videos still name the Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
+    /* XS_AUDIO_LFE_LOWPASS */  { "Subwoofer low-pass (LFE)", "120 Hz is what the console's Dolby Digital encoder did; Off sends the full-range LFE feed.", 1, FMT_PLAIN, n_lfe_lowpass, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -188,10 +207,11 @@ static const Meta k_meta[XS_COUNT] = {
 #if defined(__ANDROID__)
 extern "C" const char *nvk_core_describe(void);   /* nv2a_vk_core.c */
 #endif
-enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS };
+enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS, R_FOLDER };
 enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_HOST0, A_HOST1, A_HOST2, A_HOST3,                  /* xbox_OverlaySetHostRows */
-              A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER };      /* A_SHADERS on: the build's */
+              A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER,        /* A_SHADERS on: the build's */
+              A_MIXER };                                          /* the Mixer page (overlay_mixer.inc) */
 
 static int s_host_n;
 static const char *(*s_host_fn)(int row, int activate);
@@ -210,6 +230,81 @@ static char s_rep_done[1400];         /* where the last one went, or why none */
 /* ── the port's name and version ───────────────────────────────────── */
 
 static char s_about[200];
+
+/* ── the music folder (xbox_OverlaySetMusicFolder) ─────────────────── */
+
+#define MUSIC_KEY "audio.custom_music_dir"
+static const xbox_music_folder_ops *s_mf;
+static char s_mf_status[200];
+#define MUSIC_NOTES 4
+static char s_mf_note[MUSIC_NOTES][200];
+static int s_fb_sel;                  /* the browser's row */
+static bool s_fb_scroll;
+
+void xbox_OverlaySetMusicFolder(const xbox_music_folder_ops *ops)
+{
+    s_mf = ops;
+}
+
+static const char *path_leaf(const char *p)
+{
+    const char *e = p + strlen(p), *b;
+    while (e > p && (e[-1] == '/' || e[-1] == '\\'))
+        e--;
+    b = e;
+    while (b > p && b[-1] != '/' && b[-1] != '\\')
+        b--;
+    return b;
+}
+
+/* "Off", or the folder's own name. */
+static void music_value(char *out, size_t n)
+{
+    const char *dir = xbox_SettingsText(MUSIC_KEY, NULL);
+    if (!dir[0]) {
+        snprintf(out, n, "Off");
+        return;
+    }
+    const char *b = path_leaf(dir);
+    int len = (int)strcspn(b, "/\\");
+    snprintf(out, n, "%.*s", len > 40 ? 40 : len, b);
+}
+
+static void browser_count(const xsb_row &r, char *out, size_t n)
+{
+    out[0] = 0;
+    if (r.kind == XSB_OFF || r.kind == XSB_UP)
+        return;
+    if (r.songs < 0)
+        snprintf(out, n, "...");
+    else if (r.songs == 0)
+        snprintf(out, n, r.more ? "none found yet" : "no music");
+    else
+        snprintf(out, n, "%d%s song%s", r.songs, r.more ? "+" : "", r.songs == 1 && !r.more ? "" : "s");
+}
+
+static void changed();
+
+/* A browser row is picked. */
+static void browser_pick(int i)
+{
+    char dir[1024] = "";
+    int sel = 0;
+    xsb_result res = xsb_activate(i, dir, sizeof dir, &sel);
+    if (res == XSB_MOVED) {
+        s_fb_sel = sel;
+        s_fb_scroll = true;
+    } else if (res == XSB_CHOSEN || res == XSB_TURNED_OFF) {
+        if (res == XSB_TURNED_OFF)
+            dir[0] = 0;
+        xbox_SettingsSetText(MUSIC_KEY, dir);
+        changed();
+        fprintf(stderr, LOGP "music folder: %s\n", dir[0] ? dir : "off");
+        if (s_mf && s_mf->chosen)
+            s_mf->chosen(dir);
+        xsb_close();
+    }
+}
 
 void xbox_OverlaySetAbout(const char *text)
 {
@@ -307,6 +402,10 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_BLOOM);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_MOTION_BLUR)->key))
             SET(XS_GRAPHICS_MOTION_BLUR);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->key))
+            SET(XS_GRAPHICS_CRASH_60FPS);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SPLIT_60FPS)->key))
+            SET(XS_GRAPHICS_SPLIT_60FPS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))
             SET(XS_GRAPHICS_VEHICLE_DETAIL);
 #if defined(__ANDROID__)
@@ -339,11 +438,36 @@ static int page_rows(int page, Row *r)
         break;
     case P_AUDIO:
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
-        SET(XS_AUDIO_FX_LEVEL);
+        /* The dry effect sends' level: only where no model of the title's
+         * effects image runs (apu_gp.h); with one they are not dry. */
+        if (!apu_gp_wired())
+            SET(XS_AUDIO_FX_LEVEL);
+        /* audio.lfe_lowpass has no row: the stock 120 Hz is the console's,
+         * and the Mixer page has its own LFE low-pass for tuning. */
+        if (apu_bus_count() > 0)
+            ACT(A_MIXER, "Mixer: buses, sends, LFE, limiter, meters");
+        if (recomp_patch_enabled(xbox_SettingGet(XS_AUDIO_SPLIT_MUSIC)->key))
+            SET(XS_AUDIO_SPLIT_MUSIC);
         SPK(0, "Speaker test, game mix");
         SPK(1, "Speaker test, direct");
         if (mcpx_apu_title_channels() != 6)
             INFO("The output is stereo: each speaker is folded to left/right.");
+        if (s_mf) {
+            r[n++] = Row{ R_FOLDER, XS_COUNT, 0, "Custom music folder" };
+            s_mf_status[0] = 0;
+            if (s_mf->status)
+                s_mf->status(s_mf_status, sizeof s_mf_status);
+            if (s_mf_status[0])
+                INFO(s_mf_status);
+            /* More lines of the port's (what a scan left out, by name), as
+             * far as the page has room. */
+            for (int k = 0; k < MUSIC_NOTES && s_mf->note && n < 15; k++) {
+                s_mf_note[k][0] = 0;
+                if (!s_mf->note(k, s_mf_note[k], sizeof s_mf_note[k]) || !s_mf_note[k][0])
+                    break;
+                INFO(s_mf_note[k]);
+            }
+        }
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_INPUT:
@@ -405,7 +529,8 @@ static void value_text(xs_id id, char *out, size_t n);
 
 static void test_state(const char *path)
 {
-    static const char *const kinds[] = { "setting", "action", "info", "speakers" };
+    static const char *const kinds[] = { "setting", "action", "info", "speakers", "folder" };
+    static const char *const bkinds[] = { "use", "off", "up", "place", "dir" };
     Row r[16];
     int n = page_rows(s_page, r);
     FILE *f = fopen(path, "w");
@@ -413,12 +538,28 @@ static void test_state(const char *path)
         return;
     fprintf(f, "open %d\npage %s\noffer %d\npaused %d\n", s_open ? 1 : 0, k_page_name[s_page],
             s_sb_offer ? 1 : 0, xbox_HostPaused());
+    if (xsb_is_open()) {
+        /* The folder browser, over the page: where it is and its rows. */
+        char where[1024], c[48];
+        xsb_row b;
+        xsb_where(where, sizeof where);
+        fprintf(f, "browser %s\n", where[0] ? where : "(places)");
+        for (int i = 0; xsb_row_at(i, &b); i++) {
+            browser_count(b, c, sizeof c);
+            fprintf(f, "%c %s: %s%s%s\n", i == s_fb_sel ? '>' : ' ', bkinds[b.kind], b.label,
+                    c[0] ? " = " : "", c);
+        }
+        fclose(f);
+        return;
+    }
     for (int i = 0; i < n; i++) {
         char v[96] = "";
         const char *label = r[i].text;
         if (r[i].kind == R_SETTING) {
             label = k_meta[r[i].id].label;
             value_text(r[i].id, v, sizeof v);
+        } else if (r[i].kind == R_FOLDER) {
+            music_value(v, sizeof v);
         }
         fprintf(f, "%c %s: %s%s%s\n", s_open && i == s_sel[s_page] ? '>' : ' ', kinds[r[i].kind],
                 label ? label : "", v[0] ? " = " : "", v);
@@ -569,10 +710,31 @@ static void adjust(xs_id id, int dir)
 }
 
 /* Activate: a bool flips, a choice moves on, an action runs. */
+static void mx_open();
+static bool mx_back();
+static void mx_poll();
+static void mx_ab_toggle();
+static bool s_mx_open;                 /* the Mixer page shows (overlay_mixer.inc) */
+
 static void activate(const Row &r)
 {
+    if (r.kind == R_ACTION && r.action == A_MIXER) {
+        mx_open();
+        return;
+    }
     if (r.kind == R_SPEAKERS) {
         spk_play(r.action);
+        return;
+    }
+    if (r.kind == R_FOLDER) {
+        int locked = 0;
+        const char *dir = xbox_SettingsText(MUSIC_KEY, &locked);
+        if (!locked) {
+            xsb_open(dir);
+            /* On the current folder when there is one ("turn off" is above it). */
+            s_fb_sel = dir[0] ? 1 : 0;
+            s_fb_scroll = true;
+        }
         return;
     }
     if (r.kind == R_ACTION && r.action >= A_HOST0 && r.action <= A_HOST3) {
@@ -653,6 +815,21 @@ static void clear_nav()
     s_activate = s_back = s_page_delta = s_reset = 0;
 }
 
+/* The title is paused while the overlay is open, except on the Mixer page:
+ * a mix is set by ear, so there the game keeps running and sounding (its
+ * input still held: the car coasts). Called wherever either changes. */
+static void pause_sync()
+{
+    static int applied = -1;
+    int want = s_open && !s_mx_open;
+    if (want != applied) {
+        applied = want;
+        xbox_HostPause(want);
+        if (s_open)
+            fprintf(stderr, LOGP "%s\n", want ? "the title is paused" : "Mixer page: the title runs while it is open");
+    }
+}
+
 static void set_open(bool on)
 {
     if (on == s_open)
@@ -662,7 +839,7 @@ static void set_open(bool on)
     if (on) {
         s_scroll_to_sel = true;
         xbox_InputSetBlocked(1);
-        xbox_HostPause(1);
+        pause_sync();
         fprintf(stderr, LOGP "open: the title is paused, its input is held\n");
     } else {
         /* A build beside a running title would cost it frames: it stops
@@ -676,7 +853,8 @@ static void set_open(bool on)
             sb_select();
         }
         mcpx_apu_speaker_test(-1, 0);
-        xbox_HostPause(0);
+        xsb_close();
+        pause_sync();
         xbox_InputSetBlocked(0);
         xbox_SettingsFlush();
         s_save_pending = false;
@@ -746,6 +924,10 @@ int xbox_OverlayEvent(const SDL_Event *ev)
             hot_toggle();
             return 1;
         }
+        if (k == SDLK_F7 && apu_bus_enabled()) {
+            mx_ab_toggle();             /* the mixer's A/B, menu open or not */
+            return 1;
+        }
         if (!s_open)
             break;
         s_last_input_pad = false;
@@ -799,6 +981,11 @@ int xbox_OverlayEvent(const SDL_Event *ev)
         }
         if (!(s_back_mask | s_start_mask))
             s_combo_fired = false;
+        /* Back held + Y: the mixer's A/B, menu open or not. */
+        if (down && b == SDL_CONTROLLER_BUTTON_Y && (s_back_mask & bit) && apu_bus_enabled()) {
+            mx_ab_toggle();
+            return 1;
+        }
         if (!s_open)
             break;
         s_last_input_pad = true;
@@ -994,11 +1181,25 @@ void xbox_OverlayPoll(void)
 
     /* B or Esc: here and not in the frame, so a window that cannot present
      * (minimised) still closes. */
+    mx_poll();
+    pause_sync();
     if (s_back > 0) {
         s_back = 0;
-        if (s_open)
+        if (s_open && s_mx_open) {
+            mx_back();
+        } else if (s_open && xsb_is_open()) {
+            /* In the folder browser: one level up, then back to the page. */
+            int sel = 0;
+            if (xsb_back(&sel) == XSB_CLOSED)
+                xsb_close();
+            else {
+                s_fb_sel = sel;
+                s_fb_scroll = true;
+            }
+        } else if (s_open)
             set_open(false);
     }
+    pause_sync();
 
     /* The fullscreen setting, when it changes. */
     if (s_win) {
@@ -1230,6 +1431,35 @@ static void accent_style()
     st.Colors[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
 }
 
+/* The text: Dear ImGui's own vector font (ProggyForever: Basic Latin and
+ * Latin-1), which is what the overlay has always drawn with, and behind it a
+ * subset of DejaVu Sans Mono for the letters that one lacks: Latin
+ * Extended-A and -B, Greek, Cyrillic (overlay_font_ext.h,
+ * third_party/dejavu). So a folder named in Hungarian, Polish, Czech,
+ * Turkish, Greek or Russian reads as it is written. Every string is UTF-8.
+ * A character neither font has (CJK, Arabic, emoji ...) is drawn as a
+ * square, U+25A1, not as "?", which could be part of the name.
+ *
+ * The second font is scaled to the first one's x-height (DejaVu's letters
+ * fill more of the em) and set on the same baseline. */
+static void overlay_fonts()
+{
+    ImGuiIO &io = ImGui::GetIO();
+    ImFont *font = io.Fonts->AddFontDefaultVector();
+    if (!font)
+        return;
+    ImFontConfig cfg;
+    cfg.MergeMode = true;
+    cfg.FontDataOwnedByAtlas = false;
+    cfg.PixelSnapH = true;
+    cfg.ExtraSizeScale = OVERLAY_FONT_EXT_SCALE;
+    cfg.GlyphOffset.y = OVERLAY_FONT_EXT_DY;
+    snprintf(cfg.Name, sizeof cfg.Name, "DejaVuSansMono subset");
+    io.Fonts->AddFontFromMemoryTTF((void *)k_overlay_font_ext, (int)sizeof k_overlay_font_ext,
+                                   13.0f, &cfg);
+    font->FallbackChar = 0x25A1;
+}
+
 bool overlay_core_init(bool vulkan)
 {
     if (s_core_ready)
@@ -1242,6 +1472,7 @@ bool overlay_core_init(bool vulkan)
     /* Navigation is the overlay's own (see the top); ImGui is the renderer
      * and the mouse. */
     io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
+    overlay_fonts();
     theme_pick();
     accent_style();
     bool ok = vulkan ? ImGui_ImplSDL2_InitForVulkan(s_win) : ImGui_ImplSDL2_InitForMetal(s_win);
@@ -1372,6 +1603,19 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(T->action), r.text);
         return;
     }
+    if (r.kind == R_FOLDER) {
+        char v[64], t[80];
+        int locked = 0;
+        xbox_SettingsText(MUSIC_KEY, &locked);
+        music_value(v, sizeof v);
+        snprintf(t, sizeof t, sel && !locked ? "%s  >" : "%s", v);
+        dl->AddText(ImVec2(p.x + fs * 0.8f, ty),
+                    locked ? col(T->text_dim) : col(sel ? T->text_hi : T->text), r.text);
+        float tw = ImGui::CalcTextSize(t).x;
+        dl->AddText(ImVec2(p.x + width - fs * 0.8f - tw, ty),
+                    locked ? col(T->text_dim) : col(T->text_hi), t);
+        return;
+    }
     if (r.kind == R_SPEAKERS) {
         /* Six buttons on the right; the one playing lit, the picked one
          * outlined while the row is selected. A click plays its button. */
@@ -1443,6 +1687,119 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     }
 }
 
+/* The folder browser, in the place of a page's rows: where it is, the rows
+ * (a place or folder with the music found in and below it), the keys. */
+static void build_browser(float fs, ImDrawList *dl)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    int n = xsb_rows();
+
+    collect_steps();
+    if (s_fb_sel >= n) s_fb_sel = n - 1;
+    if (s_fb_sel < 0) s_fb_sel = 0;
+    while (s_steps[D_UP]-- > 0)   { s_fb_sel = (s_fb_sel + n - 1) % (n ? n : 1); s_fb_scroll = true; }
+    while (s_steps[D_DOWN]-- > 0) { s_fb_sel = (s_fb_sel + 1) % (n ? n : 1); s_fb_scroll = true; }
+    memset(s_steps, 0, sizeof s_steps);
+    s_reset = 0;
+    s_page_delta = 0;
+    if (s_activate > 0) {
+        s_activate = 0;
+        browser_pick(s_fb_sel);
+        if (!xsb_is_open()) {
+            /* Chosen: nothing more is drawn this frame, and the header left
+             * the cursor moved with no item after it, which ImGui reports. */
+            ImGui::Dummy(ImVec2(0, 0));
+            return;
+        }
+        n = xsb_rows();
+    }
+
+    /* Where: the folder, cut from the left when it is too long. */
+    char where[1024];
+    xsb_where(where, sizeof where);
+    const float wrap_w = ImGui::GetContentRegionAvail().x;
+    {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        const char *t = where[0] ? where : "Custom music folder: choose where to look";
+        char cut[1100];
+        if (ImGui::CalcTextSize(t).x > wrap_w) {
+            const char *q = t;
+            do {
+                q++;
+                snprintf(cut, sizeof cut, "...%s", q);
+            } while (*q && ImGui::CalcTextSize(cut).x > wrap_w);
+            t = cut;
+        }
+        dl->AddText(ImVec2(p.x, p.y), col(T->text_hi), t);
+        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + fs * 1.6f));
+    }
+
+    const float footer = fs * 0.5f + fs + fs * 2.9f;
+    const float rh = fs * 2.0f;
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImGui::BeginChild("folders", ImVec2(avail.x, avail.y - footer), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoNav);
+    ImDrawList *cdl = ImGui::GetWindowDrawList();
+    const float rw = ImGui::GetContentRegionAvail().x - fs * 0.5f;
+    int picked = -1;
+    xsb_row r;
+    for (int i = 0; xsb_row_at(i, &r); i++) {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        bool sel = i == s_fb_sel;
+        ImGui::PushID(i);
+        ImGui::InvisibleButton("##dir", ImVec2(rw, rh));
+        if (ImGui::IsItemHovered() && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
+            s_fb_sel = i;
+            s_last_input_pad = false;
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+            picked = i;
+        ImGui::PopID();
+        if (!ImGui::IsRectVisible(p, ImVec2(p.x + rw, p.y + rh)) && !(sel && s_fb_scroll))
+            continue;
+        if (sel) {
+            cdl->AddRectFilled(p, ImVec2(p.x + rw, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.35f);
+            cdl->AddRectFilled(p, ImVec2(p.x + fs * 0.22f, p.y + rh), col(T->sel_bar), fs * 0.11f);
+        }
+        const float ty = p.y + (rh - fs) * 0.5f;
+        bool act = r.kind == XSB_USE || r.kind == XSB_OFF;
+        char c[48];
+        browser_count(r, c, sizeof c);
+        float cw = ImGui::CalcTextSize(c).x;
+        cdl->PushClipRect(p, ImVec2(p.x + rw - cw - fs * 1.6f, p.y + rh), true);
+        cdl->AddText(ImVec2(p.x + fs * 0.8f, ty),
+                     act ? col(T->action) : col(sel ? T->text_hi : T->text), r.label);
+        cdl->PopClipRect();
+        if (c[0])
+            cdl->AddText(ImVec2(p.x + rw - fs * 0.8f - cw, ty),
+                         r.songs > 0 ? col(T->text_hi) : col(T->text_dim), c);
+        if (sel && s_fb_scroll) {
+            ImGui::SetScrollHereY(0.5f);
+            s_fb_scroll = false;
+        }
+    }
+    ImGui::EndChild();
+    if (picked >= 0) {
+        s_fb_sel = picked;
+        browser_pick(picked);
+    }
+
+    {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        dl->AddLine(ImVec2(p.x, p.y + fs * 0.2f), ImVec2(p.x + avail.x, p.y + fs * 0.2f), col(T->rule));
+        float y = p.y + fs * 0.5f;
+        dl->AddText(ImVec2(p.x, y), col(T->text_dim),
+                    "Every folder with music in it becomes a soundtrack in the game's own music menu.");
+        y += fs + fs * 0.3f + fs * 1.3f;
+        const char *keys = pad_hints()
+            ? "D-pad  select      A  open / choose      B  back"
+            : "Arrows  select      Enter  open / choose      Esc  back";
+        dl->AddText(ImVec2(p.x, y), col(T->text_dim), keys);
+    }
+}
+
+#include "overlay_mixer.inc"
+
 static void build_pages(float fs)
 {
     ImGuiIO &io = ImGui::GetIO();
@@ -1453,6 +1810,10 @@ static void build_pages(float fs)
     bg->AddRectFilled(ImVec2(0, 0), disp, col(T->scrim, 0.55f));
 
     float pw = fs * 44.0f, ph = fs * 28.0f;
+    if (s_mx_open) {                    /* the Mixer page: a longer list, wider rows */
+        pw = fs * 54.0f;
+        ph = fs * 38.0f;
+    }
     if (pw > disp.x * 0.94f) pw = disp.x * 0.94f;
     if (ph > disp.y * 0.90f) ph = disp.y * 0.90f;
     ImGui::SetNextWindowPos(ImVec2((disp.x - pw) * 0.5f, (disp.y - ph) * 0.5f));
@@ -1479,6 +1840,7 @@ static void build_pages(float fs)
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                 s_page = i;
                 s_scroll_to_sel = true;
+                s_mx_open = false;
             }
             ImGui::PopID();
             bool on = i == s_page;
@@ -1492,6 +1854,19 @@ static void build_pages(float fs)
         float hw = ImGui::CalcTextSize(hint).x;
         dl->AddText(ImVec2(p.x + pw - fs * 2.0f - hw, p.y + (th - fs) * 0.5f), col(T->tab_hint), hint);
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + th + fs * 0.5f));
+    }
+
+    if (xsb_is_open()) {
+        build_browser(fs, dl);
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        return;
+    }
+    if (s_mx_open) {
+        build_mixer(fs, dl);
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        return;
     }
 
     /* The rows. */
@@ -1556,6 +1931,26 @@ static void build_pages(float fs)
         }
     } else if (rows[sel].kind == R_SPEAKERS) {
         spk_hint(rows[sel].action, hint, sizeof hint);
+    } else if (rows[sel].kind == R_FOLDER) {
+        int locked = 0;
+        xbox_SettingsText(MUSIC_KEY, &locked);
+        hint_locked = locked != 0;
+        if (locked)
+            snprintf(hint, sizeof hint, "Set by the environment (RECOMP_AUDIO_MUSIC_DIR or --music-dir);"
+                     " unset it to change it here.");
+        else
+#if defined(__ANDROID__)
+            /* The app does not ask for the audio permission yet (the game
+             * repository's docs/custom-music.md, "Android"), so there is
+             * nothing the player could grant: say that it is not there. */
+            snprintf(hint, sizeof hint, "Your own music in the game's music menu is not available on"
+                     " Android yet: this app cannot read the device's music folders. It works in"
+                     " the Windows, macOS and Linux versions.");
+#else
+            snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
+                     " own music menu: every folder with music in it becomes a soundtrack there."
+                     " A opens a folder list.");
+#endif
     } else if (rows[sel].kind == R_ACTION
                && (rows[sel].action == A_REPORT || rows[sel].action == A_REPORT_SHOT)) {
         snprintf(hint, sizeof hint, "%s%sA zip in the reports folder beside the settings: the logs of"
@@ -1610,7 +2005,7 @@ static void build_pages(float fs)
             } else if (clicked) {
                 sel = i;
             }
-        } else if (clicked && rows[i].kind == R_ACTION) {
+        } else if (clicked && (rows[i].kind == R_ACTION || rows[i].kind == R_FOLDER)) {
             sel = i;
             activate(rows[i]);
         } else if (clicked && rows[i].kind == R_SPEAKERS) {

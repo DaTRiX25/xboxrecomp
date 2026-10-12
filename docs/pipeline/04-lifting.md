@@ -532,6 +532,33 @@ is a `load_u32` of the value its bloom call is gated by). These two settings
 default to on, so the patch is their `"when": "0"`; their rows are on the
 overlay's Graphics page.
 
+`"kind": "cmp_u8"` is for a byte flag the title does not load but compares
+where it lies, `cmp byte ptr [mem], r8|imm8`. The lifter snapshots a
+compare's operands (`_fa`, `_fb`, and their sign-extended twins) and every
+later `jcc`, `setcc` and `cmovcc` reads the snapshot, so the call rewrites
+the left one after the compare:
+`_fa = RECOMP_PATCH_U32(key, when, value, _fa) & 0xFFu; _fas = (int32_t)(int8_t)(_fa);`
+(and `_cf = (int)(_fa < _fb);` in a function that tracks the carry). The
+compare then reads the value where the memory byte was, whatever sits
+between it and the branch, a compare fused with its `jcc` included. No
+latch. Burnout 3 chooses its frame rate this way: a stage's update compares
+its "a crash camera is on" byte and asks for the 30 Hz mode (presentation
+interval 2, two simulation steps a frame); read as 0 the title takes its own
+full-rate path (`graphics.crash_60fps`, `RECOMP_GFX_CRASH_60FPS=1`, off by
+default; the game repository's `docs/crash60.md`).
+
+`"kind": "cmp_u32"` is the same for a 32-bit value, `cmp dword ptr [mem],
+r32|imm` (Burnout 3's music manager compares the player count with 1 and
+stays silent in split screen; read as 1 it plays: `audio.split_music`).
+`"kind": "store_u8"` is for a byte the title stores once and reads later,
+`mov byte ptr [mem], imm8|r8`: the store is followed by
+`MEM8(addr) = (uint8_t)RECOMP_PATCH_U32(key, when, value, MEM8(addr));`, so
+the byte is stored again as the value while the setting says so. Unlike the
+load and compare kinds it writes the guest's memory, as `store_f32` does
+(Burnout 3's two-player stage asks for its half frame rate with one store at
+set-up: `graphics.split_60fps`; the game repository's
+`docs/split-screen.md`).
+
 A float goes by `"kind": "load_f32"` (after `movss xmm, [mem]`, or a 32-bit
 `mov reg, [mem]` that carries a float as bits) or `"store_f32"` (after
 `movss [mem], xmm` / `mov [mem], reg`: the stored float is rewritten, for a

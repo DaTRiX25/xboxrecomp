@@ -119,6 +119,9 @@ add_subdirectory(src/audio)
 # Audio: MCPX APU hardware emulation (voice processor, DSP)
 add_subdirectory(src/apu)
 
+# Audio: the user's music folder as Xbox custom soundtracks (opt-in)
+add_subdirectory(src/soundtrack)
+
 # GPU: NV2A hardware emulation (register handlers, MMIO, push buffer)
 add_subdirectory(src/nv2a)
 
@@ -153,6 +156,7 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_nv2a
     xbox_video
     xbox_install
+    xbox_soundtrack
 )
 if(XBOXRECOMP_ENHANCE)
     target_link_libraries(xboxrecomp INTERFACE xbox_enhance)

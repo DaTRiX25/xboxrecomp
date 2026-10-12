@@ -63,7 +63,7 @@ static uint64_t xi_now_ms(void) { return GetTickCount64(); }
  * idle pad for an empty user index. If a Wine/Proton build does that, the
  * connection probe has to move to XInputGetCapabilities. */
 const xbox_input_backend xbox_input_host_backend = {
-    NULL, xi_get_state, xi_set_state, xbox_InputKeyboardPoll, xi_now_ms
+    NULL, xi_get_state, xi_set_state, xbox_InputKeyboardPoll, xi_now_ms, NULL
 };
 
 /* ======================================================================== */
@@ -82,6 +82,11 @@ const xbox_input_backend xbox_input_host_backend = {
  * pad thread itself). */
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static pthread_mutex_t g_pads_lock = PTHREAD_MUTEX_INITIALIZER;
+/* sdl_shutdown ran: the pads are closed and none is opened again. Under
+ * g_pads_lock. */
+static int g_pads_closed;
+/* How long the stop is given to reach the devices before the pads close. */
+#define XBOX_RUMBLE_FLUSH_MS 40
 
 /* Set by the window (src/video/fb_present_sdl.c) when the process main thread
  * runs the SDL event loop. Its SDL_PumpEvents already updates the
@@ -217,11 +222,18 @@ static void pad_open_index(int i)
     }
     if (free_k < 0)
         return;
-    g_open[free_k].c = SDL_GameControllerOpen(i);
+    /* Under the lock: the end of the run (sdl_shutdown) reads the table
+     * from another thread, and after it nothing is opened. */
+    pthread_mutex_lock(&g_pads_lock);
+    if (!g_pads_closed)
+        g_open[free_k].c = SDL_GameControllerOpen(i);
+    if (g_open[free_k].c) {
+        g_open[free_k].id = id;
+        g_open[free_k].port = -1;
+    }
+    pthread_mutex_unlock(&g_pads_lock);
     if (!g_open[free_k].c)
         return;
-    g_open[free_k].id = id;
-    g_open[free_k].port = -1;
     pad_describe(g_open[free_k].c, d, sizeof d);
     fprintf(stderr, "[INPUT] controller %s opened; it gets a port at its first input\n", d);
 }
@@ -316,6 +328,8 @@ void xbox_InputPadEvent(const SDL_Event *ev)
 static void open_controllers(void)
 {
     int slot = 0;
+    if (g_pads_closed)
+        return;
     for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
         if (!SDL_IsGameController(i))
             continue;
@@ -401,9 +415,14 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
         pthread_mutex_unlock(&g_pads_lock);
         return ERROR_DEVICE_NOT_CONNECTED;
     }
-    /* SDL rumble needs a duration. input_core.c re-issues a held rumble
-     * every 150 ms, so 300 ms bridges one refresh and a lost stop ends
-     * within a third of a second. 0 stops it. */
+    /* SDL rumble needs a duration: XBOX_RUMBLE_EFFECT_MS, which
+     * input_core.c renews every XBOX_RUMBLE_REFRESH_MS while the level is
+     * held (the same level again only moves SDL's expiry on: no write to the
+     * device, no gap). SDL ends an effect that is not renewed, at its next
+     * update, so a pad poll that hangs is silence in a quarter of a second.
+     * That timer is SDL's, in this process: a process killed outright has
+     * nothing left to end the effect, which is why every other end goes
+     * through sdl_shutdown. 0 stops it. */
 #if defined(__ANDROID__)
     /* SDL2's Android joystick driver cannot rumble a pad (2.32.10,
      * src/joystick/android/SDL_sysjoystick.c: ANDROID_JoystickRumble is
@@ -425,9 +444,49 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
     }
 #endif
     SDL_GameControllerRumble(c, v->wLeftMotorSpeed, v->wRightMotorSpeed,
-                             (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 300 : 0);
+                             (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? XBOX_RUMBLE_EFFECT_MS : 0);
     pthread_mutex_unlock(&g_pads_lock);
     return ERROR_SUCCESS;
+}
+
+/* The end of the run (input_core.c, motors already set to zero through
+ * sdl_set_state): every open pad stopped once more by hand, triggers too,
+ * then closed. SDL's HIDAPI drivers write rumble from a queue on a thread
+ * of their own, and a stop still in that queue when the process ends is
+ * never written: the pad then plays the last level for ever. The wait lets
+ * the queue drain, and closing a pad waits for its pending rumble as well
+ * (HIDAPI_JoystickClose). Nothing opens or reads a pad after this: the
+ * title's threads run on until the process is gone. */
+static void sdl_shutdown(void)
+{
+    SDL_GameController *all[PAD_OPEN_MAX + XBOX_MAX_CONTROLLERS];
+    int n = 0;
+
+    pthread_mutex_lock(&g_pads_lock);
+    g_pads_closed = 1;
+    for (int k = 0; k < PAD_OPEN_MAX; k++) {
+        if (g_open[k].c)
+            all[n++] = g_open[k].c;
+        g_open[k].c = NULL;
+    }
+    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++) {
+        int seen = 0;
+        for (int i = 0; i < n; i++)
+            seen |= all[i] == g_pads[p];
+        if (g_pads[p] && !seen)             /* headless: opened by port */
+            all[n++] = g_pads[p];
+        g_pads[p] = NULL;
+    }
+    if (n && SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
+        for (int i = 0; i < n; i++) {
+            SDL_GameControllerRumble(all[i], 0, 0, 0);
+            SDL_GameControllerRumbleTriggers(all[i], 0, 0, 0);
+        }
+        SDL_Delay(XBOX_RUMBLE_FLUSH_MS);
+        for (int i = 0; i < n; i++)
+            SDL_GameControllerClose(all[i]);
+    }
+    pthread_mutex_unlock(&g_pads_lock);
 }
 
 static uint64_t sdl_now_ms(void)
@@ -438,7 +497,8 @@ static uint64_t sdl_now_ms(void)
 }
 
 const xbox_input_backend xbox_input_host_backend = {
-    sdl_init, sdl_get_state, sdl_set_state, xbox_InputKeyboardPoll, sdl_now_ms
+    sdl_init, sdl_get_state, sdl_set_state, xbox_InputKeyboardPoll, sdl_now_ms,
+    sdl_shutdown
 };
 
 #endif /* _WIN32 */

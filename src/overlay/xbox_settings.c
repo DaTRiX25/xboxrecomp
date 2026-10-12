@@ -12,6 +12,7 @@
 #include "nv2a_backend_common.h"
 #include "apu_xaudio2.h"
 #include "apu.h"                /* mcpx_apu_set_fx_level */
+#include "apu_bus.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -60,6 +61,7 @@ static const char *const k_vibration[] = { "auto", "controller", "device", "off"
 static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
 static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
+static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
 #define SETTING(k, t, f, e, c, ev, mn, mx, b) \
@@ -87,6 +89,7 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_AUDIO_MUTE_BG]      = SETTING("audio.mute_background", XS_BOOL, 0, RENV_AUDIO_MUTE_BG, NULL, NULL, 0, 0, 0),
     [XS_AUDIO_SPEAKERS]     = SETTING("audio.speakers", XS_CHOICE, XS_RESTART, RENV_AUDIO_SPEAKERS, k_speakers, NULL, 0, 0, 0),
     [XS_AUDIO_FX_LEVEL]     = SETTING("audio.fx_level", XS_FLOAT, 0, RENV_AUDIO_FX_LEVEL, NULL, NULL, 0, 1, 0.25),
+    [XS_AUDIO_MIXER]        = SETTING("audio.mixer", XS_BOOL, 0, RENV_AUDIO_MIXER, NULL, NULL, 0, 0, 0),
     [XS_INPUT_DEADZONE]     = SETTING("input.deadzone", XS_INT, 0, RENV_PAD_DEADZONE, NULL, NULL, 0, 32767, 0),
     [XS_INPUT_TRIGGER_DEADZONE] = SETTING("input.trigger_deadzone", XS_INT, 0, RENV_PAD_TRIGGER_DEADZONE, NULL, NULL, 0, 254, 0),
     /* 0..3 in quarters: the rumble curve's strength, motor = (speed /
@@ -104,6 +107,13 @@ static xs_setting s_set[XS_COUNT] = {
     /* The title's own effects, on as shipped: the patch is the "0". */
     [XS_GRAPHICS_BLOOM]     = SETTING("graphics.bloom", XS_BOOL, 0, RENV_GFX_BLOOM, NULL, NULL, 0, 0, 1),
     [XS_GRAPHICS_MOTION_BLUR] = SETTING("graphics.motion_blur", XS_BOOL, 0, RENV_GFX_MOTION_BLUR, NULL, NULL, 0, 0, 1),
+    /* The title's crash and takedown cameras at 60 instead of its own 30: the
+     * patch is the "1". */
+    [XS_GRAPHICS_CRASH_60FPS] = SETTING("graphics.crash_60fps", XS_BOOL, 0, RENV_GFX_CRASH_60FPS, NULL, NULL, 0, 0, 0),
+    /* Split screen at 60 instead of the title's 30, and with the title's
+     * music, which it keeps silent there: the patch is the "1" of each. */
+    [XS_GRAPHICS_SPLIT_60FPS] = SETTING("graphics.split_60fps", XS_BOOL, 0, RENV_GFX_SPLIT_60FPS, NULL, NULL, 0, 0, 0),
+    [XS_AUDIO_SPLIT_MUSIC]  = SETTING("audio.split_music", XS_BOOL, 0, RENV_AUDIO_SPLIT_MUSIC, NULL, NULL, 0, 0, 0),
     /* Both off as shipped: today's picture, bit for bit. */
     [XS_GRAPHICS_LOD_BIAS]  = SETTING("graphics.lod_bias", XS_CHOICE, 0, RENV_GFX_LOD_BIAS, k_lod, k_lod_env, 0, 0, 0),
     [XS_GRAPHICS_DITHER]    = SETTING("graphics.dither", XS_BOOL, 0, RENV_GFX_DITHER, NULL, NULL, 0, 0, 0),
@@ -112,6 +122,10 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_GRAPHICS_VEHICLE_DETAIL] = SETTING("graphics.vehicle_detail", XS_CHOICE, 0, RENV_GFX_VEHICLE_DETAIL, k_vehicle_detail, NULL, 0, 0, 0),
     /* The title's button prompts for the pad in use (pad_glyphs.h). */
     [XS_INPUT_GLYPHS]       = SETTING("input.glyphs", XS_CHOICE, 0, RENV_INPUT_GLYPHS, k_glyphs, NULL, 0, 0, 0),
+    /* The LFE feed's low-pass where the title's effects image is modelled
+     * (apu_gp.h): 120 Hz is what the console's AC-3 encoder did after the
+     * GP stage; off is the GP stage's own full-range feed. Live. */
+    [XS_AUDIO_LFE_LOWPASS]  = SETTING("audio.lfe_lowpass", XS_CHOICE, 0, RENV_AUDIO_LFE_LOWPASS, k_lfe_lowpass, NULL, 0, 0, 3),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
 #endif
@@ -130,6 +144,19 @@ static int s_background;
 #define KEEP_MAX 64
 static struct { char key[64]; char val[192]; } s_keep[KEEP_MAX];
 static int s_n_keep;
+
+/* Text settings: a key whose value is a string (a folder), not one of the
+ * stepped settings above. Read from the file into its variable like them,
+ * written back as it is; a change shows after a restart. */
+static struct {
+    const char *key;
+    recomp_env_id env;
+    char val[1024];
+    int user, locked;
+} s_text[] = {
+    { "audio.custom_music_dir", RENV_AUDIO_MUSIC_DIR, "", 0, 0 },
+};
+#define TEXT_COUNT ((int)(sizeof s_text / sizeof s_text[0]))
 
 /* ── value <-> text ────────────────────────────────────────────────── */
 
@@ -340,6 +367,12 @@ static void apply(xs_id id)
     case XS_AUDIO_FX_LEVEL:
         mcpx_apu_set_fx_level((float)v);
         break;
+    case XS_AUDIO_MIXER:
+        apu_bus_enable(v != 0.0);
+        break;
+    case XS_AUDIO_LFE_LOWPASS:
+        mcpx_apu_set_lfe_lowpass(atoi(k_lfe_lowpass[(int)v]));
+        break;
     case XS_INPUT_DEADZONE:
         xbox_InputSetDeadzone((int)v);
         break;
@@ -423,6 +456,38 @@ static int section_written_before(int i)
     return 0;
 }
 
+/* The text settings of section `sec`, under its header (in_section), or,
+ * with sec NULL, those whose section no stepped setting opened, each under a
+ * header of its own: a key and its [table] are written once (TOML). */
+static void write_texts(FILE *f, const char *sec, int in_section)
+{
+    int t, i;
+
+    for (t = 0; t < TEXT_COUNT; t++) {
+        char ts[32], sj[32];
+        const char *name;
+        int opened = 0;
+
+        if (!s_text[t].user || !s_text[t].val[0])
+            continue;
+        name = section_of(s_text[t].key, ts, sizeof ts);
+        for (i = 0; i < XS_COUNT; i++) {
+            if (!s_set[i].user)
+                continue;
+            section_of(s_set[i].key, sj, sizeof sj);
+            if (!strcmp(ts, sj))
+                opened = 1;
+        }
+        if (in_section ? strcmp(ts, sec) != 0 : opened)
+            continue;
+        if (!in_section)
+            fprintf(f, "\n[%s]\n", ts);
+        fprintf(f, "%s = ", name);
+        quote(f, s_text[t].val);
+        fputc('\n', f);
+    }
+}
+
 void xbox_SettingsFlush(void)
 {
     char tmp[sizeof s_path + 8], sec[32];
@@ -473,7 +538,9 @@ void xbox_SettingsFlush(void)
             write_value(f, s, s->locked ? s->filev : s->value);
             fputc('\n', f);
         }
+        write_texts(f, sec, 1);
     }
+    write_texts(f, NULL, 0);
     if (fclose(f) != 0) {
         fprintf(stderr, LOGP "cannot write %s\n", tmp);
         InterlockedExchange(&writing, 0);
@@ -576,6 +643,21 @@ static void load_file(void)
             if (!strcmp(key, s_set[i].key))
                 break;
         if (i == XS_COUNT) {
+            int t;
+            for (t = 0; t < TEXT_COUNT; t++)
+                if (!strcmp(key, s_text[t].key))
+                    break;
+            if (t < TEXT_COUNT) {
+                if (recomp_cfg_type_of(c, key) == RCFG_STRING) {
+                    snprintf(s_text[t].val, sizeof s_text[t].val, "%s",
+                             recomp_cfg_string(c, key, ""));
+                    s_text[t].user = 1;
+                } else {
+                    fprintf(stderr, LOGP "%s:%d: %s should be a string; ignored\n", s_path,
+                            recomp_cfg_line(c, key), key);
+                }
+                continue;
+            }
             fprintf(stderr, LOGP "%s:%d: unknown key %s (kept)\n", s_path,
                     recomp_cfg_line(c, key), key);
             keep_unknown(c, key);
@@ -606,6 +688,8 @@ void xbox_SettingsInit(const char *title)
         if (s->env != RENV_COUNT)
             s->locked = env_real(s->env);
     }
+    for (i = 0; i < TEXT_COUNT; i++)
+        s_text[i].locked = env_real(s_text[i].env);
     s_power_locked_pacing = env_real(RENV_PRESENT_PACING);
     s_power_locked_lead = env_real(RENV_PRESENT_SPIN_LEAD);
     s_set[XS_POWER_MODE].locked = s_power_locked_pacing || s_power_locked_lead;
@@ -642,6 +726,9 @@ void xbox_SettingsInit(const char *title)
         xbox_SettingEnvString(s, s->value, buf, sizeof buf);
         sx_setenv_keep(recomp_env_name(s->env), buf);
     }
+    for (i = 0; i < TEXT_COUNT; i++)
+        if (s_text[i].user && s_text[i].val[0] && !s_text[i].locked)
+            sx_setenv_keep(recomp_env_name(s_text[i].env), s_text[i].val);
     /* recomp_save_dir read the table before these were set. */
     recomp_env_reload();
     fprintf(stderr, LOGP "%s\n", s_path);
@@ -764,6 +851,52 @@ int xbox_SettingsNeedRestart(void)
         if ((s_set[i].flags & XS_RESTART) && s_set[i].value != s_set[i].launch)
             return 1;
     return 0;
+}
+
+const char *xbox_SettingsText(const char *key, int *locked)
+{
+    int i;
+    for (i = 0; i < TEXT_COUNT; i++)
+        if (!strcmp(key, s_text[i].key)) {
+            if (locked)
+                *locked = s_text[i].locked;
+            if (s_text[i].locked) {
+#if defined(_WIN32)
+                /* The user's own variable (or an argument put there): the
+                 * narrow copy is in the ANSI code page; the wide one is
+                 * right for any name. */
+                static char utf8[1024];
+                wchar_t wname[64];
+                const wchar_t *w;
+                MultiByteToWideChar(CP_ACP, 0, recomp_env_name(s_text[i].env), -1, wname, 64);
+                w = _wgetenv(wname);
+                if (w && WideCharToMultiByte(CP_UTF8, 0, w, -1, utf8, sizeof utf8, NULL, NULL) > 0)
+                    return utf8;
+                return "";
+#else
+                const char *v = getenv(recomp_env_name(s_text[i].env));
+                return v ? v : "";
+#endif
+            }
+            return s_text[i].val;
+        }
+    if (locked)
+        *locked = 0;
+    return "";
+}
+
+void xbox_SettingsSetText(const char *key, const char *value)
+{
+    int i;
+    for (i = 0; i < TEXT_COUNT; i++)
+        if (!strcmp(key, s_text[i].key)) {
+            if (s_text[i].locked || !strcmp(s_text[i].val, value ? value : ""))
+                return;
+            snprintf(s_text[i].val, sizeof s_text[i].val, "%s", value ? value : "");
+            s_text[i].user = 1;
+            s_dirty = 1;
+            return;
+        }
 }
 
 const char *xbox_SettingsPath(void)
