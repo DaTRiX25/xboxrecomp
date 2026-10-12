@@ -104,6 +104,9 @@ static xs_setting s_set[XS_COUNT] = {
     /* The title's own effects, on as shipped: the patch is the "0". */
     [XS_GRAPHICS_BLOOM]     = SETTING("graphics.bloom", XS_BOOL, 0, RENV_GFX_BLOOM, NULL, NULL, 0, 0, 1),
     [XS_GRAPHICS_MOTION_BLUR] = SETTING("graphics.motion_blur", XS_BOOL, 0, RENV_GFX_MOTION_BLUR, NULL, NULL, 0, 0, 1),
+    /* The title's crash and takedown cameras at 60 instead of its own 30: the
+     * patch is the "1". */
+    [XS_GRAPHICS_CRASH_60FPS] = SETTING("graphics.crash_60fps", XS_BOOL, 0, RENV_GFX_CRASH_60FPS, NULL, NULL, 0, 0, 0),
     /* Both off as shipped: today's picture, bit for bit. */
     [XS_GRAPHICS_LOD_BIAS]  = SETTING("graphics.lod_bias", XS_CHOICE, 0, RENV_GFX_LOD_BIAS, k_lod, k_lod_env, 0, 0, 0),
     [XS_GRAPHICS_DITHER]    = SETTING("graphics.dither", XS_BOOL, 0, RENV_GFX_DITHER, NULL, NULL, 0, 0, 0),

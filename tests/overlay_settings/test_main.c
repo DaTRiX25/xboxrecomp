@@ -128,6 +128,7 @@ int main(void)
     set_env("RECOMP_PAD_DEADZONE", NULL);
     set_env("RECOMP_GFX_BLOOM", NULL);
     set_env("RECOMP_GFX_MOTION_BLUR", NULL);
+    set_env("RECOMP_GFX_CRASH_60FPS", NULL);
     set_env("RECOMP_GFX_VEHICLE_DETAIL", NULL);
 
     xbox_SettingsInit("Test");
@@ -223,6 +224,18 @@ int main(void)
     xbox_SettingSet(XS_GRAPHICS_BLOOM, 1);
     CHECK(recomp_env(RENV_GFX_BLOOM) && !strcmp(recomp_env(RENV_GFX_BLOOM), "1"));
     xbox_SettingSet(XS_GRAPHICS_BLOOM, 0);
+    /* The title's 30 Hz phases at 60 (a guest patch on the "1"): off as
+     * shipped, and untouched the variable never reads "1". */
+    CHECK(!strcmp(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->key, "graphics.crash_60fps"));
+    CHECK(xbox_SettingValue(XS_GRAPHICS_CRASH_60FPS) == 0 && !xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->user);
+    CHECK(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->def == 0);
+    {
+        const char *e = recomp_env(RENV_GFX_CRASH_60FPS);
+        CHECK(!e || strcmp(e, "1") != 0);
+    }
+    xbox_SettingSet(XS_GRAPHICS_CRASH_60FPS, 1);
+    CHECK(recomp_env(RENV_GFX_CRASH_60FPS) && !strcmp(recomp_env(RENV_GFX_CRASH_60FPS), "1"));
+    CHECK(!xbox_SettingsNeedRestart());              /* live */
 
     /* A live change reaches the runtime, the cached environment and the file. */
     xbox_SettingSet(XS_POWER_MODE, 1);
@@ -344,6 +357,11 @@ int main(void)
             const char *m = strstr(text, "motion_blur = false");
             CHECK(g && !strstr(g + 1, "[graphics]"));
             CHECK(g && b && m && b > g && m > g);
+            /* And the 60 fps crash cameras' "on", in the same table. */
+            {
+                const char *c = strstr(text, "crash_60fps = true");
+                CHECK(c && c > g);
+            }
         }
     }
 
@@ -354,6 +372,13 @@ int main(void)
     xbox_SettingsFlush();
     text = read_file(path);
     CHECK(text && !strstr(text, "motion_blur") && strstr(text, "bloom = false"));
+    /* Off again: the default, as shipped, and the file forgets it. */
+    xbox_SettingReset(XS_GRAPHICS_CRASH_60FPS);
+    CHECK(xbox_SettingValue(XS_GRAPHICS_CRASH_60FPS) == 0 && !xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->user);
+    CHECK(recomp_env(RENV_GFX_CRASH_60FPS) && !strcmp(recomp_env(RENV_GFX_CRASH_60FPS), "0"));
+    xbox_SettingsFlush();
+    text = read_file(path);
+    CHECK(text && !strstr(text, "crash_60fps"));
 
     /* Reset goes back to the host's default and forgets the setting. */
     xbox_SettingReset(XS_DISPLAY_OVERSCAN);

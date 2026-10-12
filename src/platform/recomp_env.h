@@ -118,6 +118,7 @@ extern "C" {
     X(DISPLAY_ULTRAWIDE, CONFIG, "RECOMP_DISPLAY_ULTRAWIDE", NULL, "a picture wider than 16:9 for the title's 3D, for a title whose build has that behind a patch (--patches, recomp_patch.h): off (default, as shipped), 21:9, 32:9, window (the window's own shape)") \
     X(GFX_BLOOM,         CONFIG, "RECOMP_GFX_BLOOM",         NULL, "0: the title's own bloom (glow) passes are not drawn, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 1, as shipped") \
     X(GFX_MOTION_BLUR,   CONFIG, "RECOMP_GFX_MOTION_BLUR",   NULL, "0: the title's own motion blur is not drawn, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 1, as shipped") \
+    X(GFX_CRASH_60FPS,   CONFIG, "RECOMP_GFX_CRASH_60FPS",   NULL, "1: the title's 30 Hz phases (crash and takedown cameras) run at 60, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
     X(GFX_VEHICLE_DETAIL, CONFIG, "RECOMP_GFX_VEHICLE_DETAIL", NULL, "how far from the camera the title's vehicles keep their detailed models, for a title whose build has its level-of-detail distances behind a patch (--patches, recomp_patch.h): original (default, as shipped), far, farthest") \
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
     X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \

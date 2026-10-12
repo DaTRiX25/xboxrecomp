@@ -4038,6 +4038,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
             if flag_insn.mnemonic in ("cmp", "test") and len(flag_insn.operands) >= 2:
                 stmts.extend(lifter._snapshot_flags(
                     flag_insn, last_flag_ops, last_flag_setter))
+            # --patches: a patch on the compare (cmp_u8 rewrites the
+            # snapshot the fused jcc reads; a mark) goes between the two.
+            if lifter.patches is not None:
+                stmts.extend(lifter.patches.after(
+                    flag_insn, needs_cf=lifter.needs_cf))
             stmts.append(stmt)
             i += consumed
             continue
@@ -4195,7 +4200,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                                  " /* ZF in: a zero count keeps it */")
         stmts.extend(results)
         if lifter.patches is not None:
-            stmts.extend(lifter.patches.after(curr))
+            stmts.extend(lifter.patches.after(
+                curr, needs_cf=lifter.needs_cf))
 
         # Track flag-setting instructions
         if (curr.mnemonic in _BARE_STRING_COMPARES

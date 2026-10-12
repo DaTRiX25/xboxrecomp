@@ -167,6 +167,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For a display wider than 16:9, with Aspect at 16:9: the race is drawn for the whole width (more to see at the sides, nothing stretched). Menus, loading screens and videos keep their 16:9 shape in the middle. Window follows the window's or the screen's own shape. A change shows from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
     /* XS_GRAPHICS_BLOOM */     { "Bloom", "The game's own soft glow over the picture, strongest while boosting. On is the original look; off skips its three extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "The game's own blur: the streaks towards the edges of the picture at speed and while boosting. On is the original look; off skips its two extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_CRASH_60FPS */ { "60 fps crash cameras", "The game halves its frame rate to 30 in its crash and takedown cameras. On: they run at 60 like the rest of the race, at the same game speed. Off is the original. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto: -0.5 at 2x, -1.0 at 4x. Off is the original. Changes at once.", 1, FMT_PLAIN, n_lod, 0 },
     /* XS_GRAPHICS_DITHER */    { "Dither", "A faint noise in the final scale to the window that hides the stripes in smooth gradients such as the sky. Metal only for now. Off is the original; text and HUD at the exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_VEHICLE_DETAIL */ { "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Original is the console's distances; Far doubles them, Farthest is four times. Costs GPU time when many vehicles are on screen. Scenery, the track and where traffic appears are not changed. Changes at once.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
@@ -300,6 +301,8 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_BLOOM);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_MOTION_BLUR)->key))
             SET(XS_GRAPHICS_MOTION_BLUR);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->key))
+            SET(XS_GRAPHICS_CRASH_60FPS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))
             SET(XS_GRAPHICS_VEHICLE_DETAIL);
 #if defined(__ANDROID__)
