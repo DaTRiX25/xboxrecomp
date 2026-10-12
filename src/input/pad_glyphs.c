@@ -45,8 +45,12 @@ xbox_pad_family xbox_PadFamilyFromIds(xbox_pad_family by_type, unsigned vendor,
             return XBOX_PAD_FAMILY_STEAM;
         if (steam_deck)             /* Steam Input's virtual pad, on a Deck */
             return XBOX_PAD_FAMILY_STEAM;
-        /* The virtual pad elsewhere: any pad at all, wrapped by Steam. */
-        return by_type == XBOX_PAD_FAMILY_XBOX_MODERN ? by_type : XBOX_PAD_FAMILY_XBOX;
+        /* The virtual pad elsewhere: any pad at all, wrapped by Steam and
+         * handed on as an Xbox 360 pad (LB RB LT RT, no white or black), so
+         * its prompts are the modern Xbox ones whether or not the host typed
+         * it (Windows shows it through XInput; a host that types it nothing
+         * used to get the original pad's prompts). */
+        return XBOX_PAD_FAMILY_XBOX_MODERN;
     }
     if (ci_has(name, "steam deck"))
         return XBOX_PAD_FAMILY_STEAM;

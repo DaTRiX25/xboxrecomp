@@ -77,7 +77,8 @@ typedef enum {
  *     this one, whatever it is, so it says nothing about the pad in the
  *     hands. STEAM only when steam_deck says the machine is a Steam Deck (the
  *     SteamDeck=1 Steam sets there: its own controls are what is most likely
- *     held); elsewhere what by_type says, an Xbox 360 pad as a rule
+ *     held); elsewhere XBOX_MODERN: Steam hands every wrapped pad on as an
+ *     Xbox 360 pad
  *   Sony (054C) and Nintendo (057E) pads the host has no type for
  *   a name with "Steam Deck" in it: STEAM
  *
