@@ -228,7 +228,6 @@ enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_HOST0, A_HOST1, A_HOST2, A_HOST3,                  /* xbox_OverlaySetHostRows */
               A_SHADERS,                                          /* the Graphics page's shader build */
               A_MIXER,                                            /* the Mixer page (overlay_mixer.inc) */
-              A_RESTART,                                          /* start the program again (recomp_restart.h) */
               A_UPDATE_CHECK, A_UPDATE_OPEN,                      /* Check for updates (xbox_update.h) */
               A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_RESTORE, A_SAVE_CANCEL,  /* xbox_OverlaySetSaveIO */
               A_RESTART_PIN, A_QUIT };       /* the two rows at the foot of every page: they ask first */
@@ -254,6 +253,19 @@ static char s_restart_save[200];
 static bool restart_wanted()
 {
     return xbox_SettingsNeedRestart() || s_restart_why[0] || s_restart_save[0];
+}
+
+/* How many changes wait for a restart: the settings changed that are read at
+ * start, the port's own reason, a staged save import. */
+static int restart_count()
+{
+    int n = 0;
+    for (int i = 0; i < XS_COUNT; i++) {
+        const xs_setting *s = xbox_SettingGet((xs_id)i);
+        if ((s->flags & XS_RESTART) && s->value != s->launch)
+            n++;
+    }
+    return n + (s_restart_why[0] ? 1 : 0) + (s_restart_save[0] ? 1 : 0);
 }
 
 /* Why: the settings changed that are read at start, by their table flag,
@@ -646,8 +658,6 @@ static int page_rows(int page, Row *r)
 #define ACT(a, t) r[n++] = Row{ R_ACTION, XS_COUNT, (a), (t) }
 #define INFO(t) r[n++] = Row{ R_INFO, XS_COUNT, 0, (t) }
 #define SPK(a, t) r[n++] = Row{ R_SPEAKERS, XS_COUNT, (a), (t) }
-#define RESTART_ROW() do { if (restart_wanted() && recomp_restart_available()) \
-                               ACT(A_RESTART, "Restart game now"); } while (0)
     switch (page) {
     case P_DISPLAY:
         SET(XS_DISPLAY_FULLSCREEN); SET(XS_DISPLAY_ASPECT); SET(XS_DISPLAY_FILTER);
@@ -662,7 +672,6 @@ static int page_rows(int page, Row *r)
             SET(XS_DISPLAY_HUD_FIX);
         if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_ULTRAWIDE)->key))
             SET(XS_DISPLAY_ULTRAWIDE);
-        RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_GRAPHICS:
@@ -706,7 +715,6 @@ static int page_rows(int page, Row *r)
             INFO(s_sb_info);
             ACT(A_SHADERS, s_sb_label);
         }
-        RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_AUDIO:
@@ -745,7 +753,6 @@ static int page_rows(int page, Row *r)
         SPK(1, "Speaker test, direct");
         if (mcpx_apu_title_channels() != 6)
             INFO("The output is stereo: each speaker is folded to left/right.");
-        RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_INPUT:
@@ -757,7 +764,6 @@ static int page_rows(int page, Row *r)
 #if defined(__ANDROID__)
         SET(XS_INPUT_VIBRATION);
 #endif
-        RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_POWER:
@@ -783,7 +789,6 @@ static int page_rows(int page, Row *r)
         }
 #endif
         SET(XS_POWER_MODE);
-        RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     default:
@@ -863,15 +868,20 @@ static int page_rows(int page, Row *r)
         break;
     }
     /* The foot of every page, kept in view below the page's own rows (the
-     * last two rows; see pin_count). Each asks once more before it acts. */
-    if (recomp_restart_available())
-        ACT(A_RESTART_PIN, staged ? "Restart now (the save is imported at the start)" : "Restart game");
+     * last rows; see pin_count): Quit game always, and Restart only while a
+     * restart is pending (the one place for it: there is no Restart row in
+     * the pages). Each asks once more before it acts. */
+    if (recomp_restart_available() && (restart_wanted() || staged)) {
+        static char label[96];
+        const int k = restart_count() + (staged && !s_restart_save[0] ? 1 : 0);
+        snprintf(label, sizeof label, "Restart now to apply %d change%s", k, k == 1 ? "" : "s");
+        ACT(A_RESTART_PIN, label);
+    }
     ACT(A_QUIT, "Quit game");
 #undef SET
 #undef ACT
 #undef INFO
 #undef SPK
-#undef RESTART_ROW
     return n;
 }
 
@@ -1146,10 +1156,6 @@ static void activate(const Row &r)
             s_fb_sel = dir[0] ? 1 : 0;
             s_fb_scroll = true;
         }
-        return;
-    }
-    if (r.kind == R_ACTION && r.action == A_RESTART) {
-        restart_now();
         return;
     }
     if (r.kind == R_ACTION && r.action == A_UPDATE_CHECK) {
@@ -1841,6 +1847,11 @@ struct Theme {
     Rgb notice_bg, notice_text;     /* the red scripted-input banner */
     Rgb toast_bg, toast_text;       /* the "Preparing shaders" line */
     Rgb perf_bg, perf_text, perf_text2, perf_good, perf_warn, perf_bad, perf_line;
+    Rgb title;          /* the page title (the game's red) */
+    Rgb hint;           /* hints, the footer, secondary lines */
+    Rgb arrow;          /* the value arrows and the cursor */
+    Rgb bar;            /* the footer bar */
+    Rgb attn;           /* attention: restart pending, a locked row's reason (the game's yellow) */
 };
 
 static const Theme k_theme_game = {
@@ -1848,22 +1859,27 @@ static const Theme k_theme_game = {
     {0x00, 0x00, 0x00},             /* scrim: black */
     {0x16, 0x1d, 0x26},             /* panel: the menu body navy */
     {0x5a, 0x99, 0xc0}, 1.0f,       /* edge: the steel-blue rule */
-    {0x3f, 0x4d, 0x5d},             /* rule: the grid line */
-    {0x5a, 0x99, 0xc0}, 0.24f,      /* selected wash: steel blue */
+    {0x30, 0x38, 0x40},             /* rule: the thin lines between the regions */
+    {0x5a, 0x99, 0xc0}, 0.16f,      /* selected wash: steel blue */
     {0xc4, 0x1c, 0x1c},             /* selected bar: the title crimson */
-    {0x5a, 0x99, 0xc0}, {0x0f, 0x13, 0x19}, {0xac, 0xd4, 0xfc}, {0x82, 0x96, 0xab},
-    {0xac, 0xd4, 0xfc},             /* text: the menu entries */
-    {0xff, 0xff, 0xff},             /* hi: the lit entry */
-    {0x82, 0x96, 0xab},             /* dim: derived, a desaturated step of the entries */
-    {0x5a, 0x99, 0xc0},             /* info: the footer blue */
-    {0xd4, 0xe4, 0xfc},             /* action */
+    {0x5a, 0x99, 0xc0}, {0x0f, 0x13, 0x19}, {0xd0, 0xe0, 0xf8}, {0x82, 0x96, 0xab},
+    {0xa8, 0xd0, 0xf8},             /* text: the list items */
+    {0xd0, 0xe0, 0xf8},             /* hi: the selected item and the values */
+    {0x48, 0x58, 0x68},             /* dim: disabled (locked) */
+    {0x58, 0x98, 0xc0},             /* info: the hint blue */
+    {0xa8, 0xd0, 0xf8},             /* action */
     {0x2f, 0x39, 0x42}, {0x3f, 0x4d, 0x5d}, {0x5a, 0x99, 0xc0}, {0x4a, 0x5a, 0x6a},
     {0xd4, 0xe4, 0xfc}, {0x0f, 0x13, 0x19},
-    {0xff, 0x8a, 0x80},             /* warn: the title red, lifted to read as text */
+    {0xf8, 0xc0, 0x20},             /* warn: attention yellow */
     {0x94, 0x0c, 0x14}, {0xff, 0xff, 0xff},     /* notice: the title red band */
     {0x11, 0x15, 0x1a}, {0xd4, 0xe4, 0xfc},     /* toast: the header/footer plate */
     {0x0f, 0x13, 0x19}, {0xe6, 0xf0, 0xff}, {0xac, 0xd4, 0xfc},
     {0x5c, 0xb0, 0x1a}, {0xe8, 0xc8, 0x46}, {0xe8, 0x48, 0x40}, {0xd4, 0xe4, 0xfc},
+    {0xc0, 0x18, 0x18},             /* title */
+    {0x58, 0x98, 0xc0},             /* hint */
+    {0x88, 0xc0, 0xe0},             /* arrow */
+    {0x10, 0x10, 0x18},             /* bar */
+    {0xf8, 0xc0, 0x20},             /* attn */
 };
 
 static const Theme k_theme_classic = {
@@ -1887,6 +1903,7 @@ static const Theme k_theme_classic = {
     {18, 18, 20}, {235, 235, 240},
     {8, 8, 10}, {255, 255, 255}, {190, 190, 195},
     {90, 210, 120}, {235, 200, 70}, {235, 90, 80}, {255, 255, 255},
+    {255, 140, 30}, {130, 130, 136}, {190, 190, 198}, {12, 12, 14}, {240, 190, 70},
 };
 
 static const Theme *T = &k_theme_game;
@@ -2210,6 +2227,145 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
 
 static bool pad_hints() { return s_last_input_pad; }
 
+/* ── the sizes ─────────────────────────────────────────────────────── */
+
+/* The game's own proportions, measured on its menu frame (640x464): the
+ * labels' caps are 3.7% of the screen's height, a row's pitch 6.25%, a hint
+ * 2.6%, the footer's text 2.8%, the header's 4.7%; the labels start at 14%
+ * of the width, the values are right-aligned in a column from 56% to 94%.
+ * So every size here is a fraction of the window, with no upper cap (a 4K
+ * window gets 4K text) and a floor for a tiny one. The overlay uses the
+ * whole screen: it pauses the game anyway. A touch device (Android;
+ * RECOMP_OVERLAY_TOUCH=1 to try it elsewhere) keeps a row at least 7 mm
+ * high at the display's own density.
+ *
+ * The content is at most 1.8 H wide and centred (an ultrawide window keeps
+ * the proportions); the rules and the footer bar span the window. */
+struct Lay {
+    float W, H;
+    float cw, cx;                         /* the content's width and left edge */
+    float label, hint, foot, head, tab;   /* text sizes */
+    float pitch;                          /* a row */
+    float x_label, x_val0, x_val1;        /* the columns (screen x) */
+    float y_rule, y_rows, y_foot;         /* the regions (screen y) */
+    float body_x0, body_x1;               /* where a row's wash begins and ends */
+};
+static Lay LY;
+
+static float display_dpi()
+{
+    const char *e = getenv("RECOMP_OVERLAY_DPI");
+    float d = 0.0f;
+    if (e && atof(e) > 0.0)
+        return (float)atof(e);
+    if (s_win) {
+        int di = SDL_GetWindowDisplayIndex(s_win);
+        if (di >= 0 && SDL_GetDisplayDPI(di, &d, NULL, NULL) == 0 && d > 0.0f)
+            return d;
+    }
+    return 0.0f;
+}
+
+static bool touch_sizing()
+{
+#if defined(__ANDROID__)
+    return true;
+#else
+    const char *e = getenv("RECOMP_OVERLAY_TOUCH");
+    return e && e[0] == '1';
+#endif
+}
+
+static void layout_compute(ImVec2 disp)
+{
+    const float W = disp.x, H = disp.y;
+    /* The text follows the height; a window narrower than 1.3 : 1 follows
+     * its width instead (the text would not fit a column). */
+    const float ref = H < W / 1.3f ? H : W / 1.3f;
+    LY.W = W;
+    LY.H = H;
+    LY.cw = W < H * 1.8f ? W : H * 1.8f;
+    LY.cx = (W - LY.cw) * 0.5f;
+    LY.label = fmaxf(0.037f * ref, 13.0f);
+    LY.hint = fmaxf(0.026f * ref, 10.0f);
+    LY.foot = fmaxf(0.028f * ref, 11.0f);
+    LY.head = fmaxf(0.047f * ref, 18.0f);
+    LY.tab = fmaxf(0.030f * ref, 11.0f);
+    LY.pitch = fmaxf(0.0625f * ref, LY.label * 1.5f);
+    if (touch_sizing()) {
+        float dpi = display_dpi();
+        if (dpi <= 0.0f)
+            dpi = 160.0f;
+        const float mm7 = 7.0f * dpi / 25.4f;
+        if (LY.pitch < mm7)
+            LY.pitch = mm7;
+    }
+    LY.x_label = LY.cx + 0.14f * LY.cw;
+    LY.x_val0 = LY.cx + 0.56f * LY.cw;
+    LY.x_val1 = LY.cx + 0.94f * LY.cw;
+    LY.y_rule = 0.19f * H;
+    LY.y_rows = 0.265f * H;
+    LY.y_foot = 0.87f * H;
+    LY.body_x0 = LY.cx + 0.09f * LY.cw;
+    LY.body_x1 = LY.cx + 0.97f * LY.cw;
+}
+
+/* ── text and shapes at an explicit size ───────────────────────────── */
+
+static float tw(float size, const char *t)
+{
+    return ImGui::GetFont()->CalcTextSizeA(size, FLT_MAX, 0.0f, t).x;
+}
+
+static void txt(ImDrawList *dl, float size, ImVec2 p, ImU32 c, const char *t)
+{
+    dl->AddText(ImGui::GetFont(), size, p, c, t);
+}
+
+/* A text that has to fit `w`: a smaller size for it (down to 72%), and cut
+ * at `w` when that is not enough. `right`: p.x is the right edge. Returns
+ * the width it took. */
+static float txt_fit(ImDrawList *dl, float size, ImVec2 p, ImU32 c, const char *t, float w, bool right = false)
+{
+    float x = tw(size, t), s = size;
+    if (x > w && x > 0.0f) {
+        s = size * (w / x);
+        if (s < size * 0.72f)
+            s = size * 0.72f;
+        x = tw(s, t);
+    }
+    const float x0 = right ? p.x - (x < w ? x : w) : p.x;
+    const float y = p.y + (size - s) * 0.5f;
+    dl->PushClipRect(ImVec2(x0, p.y - size * 0.2f), ImVec2(x0 + w, p.y + size * 1.4f), true);
+    txt(dl, s, ImVec2(x0, y), c, t);
+    dl->PopClipRect();
+    return x < w ? x : w;
+}
+
+/* A solid triangle pointing left (dir -1) or right (1), `r` high from the
+ * centre. */
+static void arrow_tri(ImDrawList *dl, float cx, float cy, float r, int dir, ImU32 c)
+{
+    dl->AddTriangleFilled(ImVec2(cx + dir * r * 0.7f, cy), ImVec2(cx - dir * r * 0.6f, cy - r),
+                          ImVec2(cx - dir * r * 0.6f, cy + r), c);
+}
+
+/* A small tag after a label: RESTART in attention yellow where the value
+ * has changed since the game started (a restart applies it), in the
+ * disabled grey where the setting is only read at start. Returns its width. */
+static float restart_tag(ImDrawList *dl, float x, float cy, float label, bool changed)
+{
+    const float s = label * 0.5f, padx = s * 0.45f, pady = s * 0.22f;
+    const float w = tw(s, "RESTART");
+    const ImU32 c = changed ? col(T->attn) : col(T->text_dim);
+    dl->AddRect(ImVec2(x, cy - s * 0.5f - pady), ImVec2(x + w + padx * 2.0f, cy + s * 0.5f + pady), c,
+                s * 0.25f, 0, fmaxf(1.0f, s * 0.08f));
+    txt(dl, s, ImVec2(x + padx, cy - s * 0.5f), c, "RESTART");
+    return w + padx * 2.0f;
+}
+
+/* One row. `fs` is the label's size, `rh` the pitch; the columns are the
+ * layout's. */
 static void draw_row(const Row &r, int idx, bool sel, float width, float rh, float fs, ImDrawList *dl,
                      bool *clicked, int *click_dir, bool *hovered, double *drag_t)
 {
@@ -2221,60 +2377,66 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     *hovered = ImGui::IsItemHovered();
     *clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     ImVec2 mp = ImGui::GetIO().MousePos;
-    *click_dir = mp.x > p.x + width * 0.78f ? 1 : -1;
+    *click_dir = mp.x > (LY.x_val0 + LY.x_val1) * 0.5f ? 1 : -1;
     ImGui::PopID();
 
-    if (sel)
-        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.35f);
-    if (sel)
-        dl->AddRectFilled(p, ImVec2(p.x + fs * 0.22f, p.y + rh), col(T->sel_bar), fs * 0.11f);
+    const float cy = p.y + rh * 0.5f;
+    const float ty = cy - fs * 0.5f;
+    const float ar = fs * 0.36f;                  /* the arrows' half height */
+    const float lx = LY.x_label, label_w = LY.x_val0 - lx - ar * 4.0f;
+    const float vr = LY.x_val1;                   /* where a value's text ends; the arrows are outside the column */
+    const float arl = LY.x_val0 - ar * 1.6f, arr = LY.x_val1 + ar * 1.6f;
 
-    const float ty = p.y + (rh - fs) * 0.5f;
     if (r.kind == R_INFO) {
-        dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(T->text_info), r.text);
+        txt_fit(dl, LY.hint, ImVec2(lx, cy - LY.hint * 0.5f), col(T->hint), r.text, LY.x_val1 - lx);
         return;
     }
+    if (sel) {
+        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.2f);
+        arrow_tri(dl, lx - fs * 0.9f, cy, ar, 1, col(T->arrow));
+    }
     if (r.kind == R_ACTION) {
-        dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(T->action), r.text);
+        const bool pin = r.action == A_RESTART_PIN;
+        txt_fit(dl, fs, ImVec2(lx, ty), pin ? col(T->attn) : sel ? col(T->text_hi) : col(T->action), r.text,
+                pin ? LY.x_val1 - lx : label_w);
         if (s_confirm && r.action == s_confirm) {
             /* Restart / Quit, asked once more: the question in the row's note. */
             const char *q = confirm_text(r.action);
-            float tw = ImGui::CalcTextSize(q).x;
-            dl->AddText(ImVec2(p.x + width - fs * 0.8f - tw, ty), col(T->warn), q);
+            txt_fit(dl, fs, ImVec2(LY.x_val1, ty), col(T->attn), q, LY.x_val1 - LY.x_val0, true);
         }
         return;
     }
     if (r.kind == R_FOLDER) {
-        char v[64], t[80];
+        char v[64];
         int locked = 0;
         xbox_SettingsText(MUSIC_KEY, &locked);
         music_value(v, sizeof v);
-        snprintf(t, sizeof t, sel && !locked ? "%s  >" : "%s", v);
-        dl->AddText(ImVec2(p.x + fs * 0.8f, ty),
-                    locked ? col(T->text_dim) : col(sel ? T->text_hi : T->text), r.text);
-        float tw = ImGui::CalcTextSize(t).x;
-        dl->AddText(ImVec2(p.x + width - fs * 0.8f - tw, ty),
-                    locked ? col(T->text_dim) : col(T->text_hi), t);
+        const ImU32 lc = locked ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text);
+        txt_fit(dl, fs, ImVec2(lx, ty), lc, r.text, label_w);
+        txt_fit(dl, fs, ImVec2(vr, ty), locked ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text), v,
+                vr - LY.x_val0, true);
+        if (sel && !locked)
+            arrow_tri(dl, arr, cy, ar, 1, col(T->arrow));
         return;
     }
     if (r.kind == R_SPEAKERS) {
-        /* Six buttons on the right; the one playing lit, the picked one
-         * outlined while the row is selected. A click plays its button. */
+        /* Six buttons in the value column; the one playing lit, the picked
+         * one outlined while the row is selected. A click plays its button. */
         int via = 0, playing = mcpx_apu_speaker_test_playing(&via);
-        const float bw = fs * 3.0f, gap = fs * 0.35f, bh = fs * 1.4f;
-        float bx = p.x + width - fs * 0.8f - 6 * bw - 5 * gap;
-        const float by = p.y + (rh - bh) * 0.5f;
-        dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(sel ? T->text_hi : T->text), r.text);
+        const float gap = fs * 0.3f, bw = (LY.x_val1 - LY.x_val0 - 5.0f * gap) / 6.0f, bh = fs * 1.35f;
+        float bx = LY.x_val0;
+        const float by = cy - bh * 0.5f;
+        txt_fit(dl, fs, ImVec2(lx, ty), sel ? col(T->text_hi) : col(T->text), r.text, label_w);
         for (int k = 0; k < 6; k++, bx += bw + gap) {
             bool lit = playing == k && (via != 0) == (r.action == 0);
             ImVec2 a(bx, by), b(bx + bw, by + bh);
             dl->AddRectFilled(a, b, lit ? col(T->fill) : col(T->track), bh * 0.3f);
             if (sel && s_spk_sel[r.action] == k)
-                dl->AddRect(a, b, col(T->text_hi), bh * 0.3f, 0, fs * 0.12f);
-            float tw = ImGui::CalcTextSize(k_spk_short[k]).x;
-            dl->AddText(ImVec2(bx + (bw - tw) * 0.5f, ty), lit ? col(T->on_accent) : col(T->text),
-                        k_spk_short[k]);
-            if (*clicked && mp.x >= a.x && mp.x < b.x) {
+                dl->AddRect(a, b, col(T->text_hi), bh * 0.3f, 0, fs * 0.1f);
+            float w = tw(fs * 0.8f, k_spk_short[k]);
+            txt(dl, fs * 0.8f, ImVec2(bx + (bw - w) * 0.5f, cy - fs * 0.4f), lit ? col(T->on_accent) : col(T->text),
+                k_spk_short[k]);
+            if (*clicked && mp.x >= a.x && mp.x < b.x + gap) {
                 s_spk_sel[r.action] = k;
                 *click_dir = 0;
             }
@@ -2284,49 +2446,132 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
 
     const xs_setting *s = xbox_SettingGet(r.id);
     const Meta &m = k_meta[r.id];
-    char v[96], lab[96];
-    bool dim = s->locked;
+    char v[96];
+    const bool dim = s->locked;
+    const ImU32 vc = dim ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text);
     value_text(r.id, v, sizeof v);
-    if (s->flags & XS_RESTART)
-        snprintf(lab, sizeof lab, "%s  (restart)", m.label);
-    else
-        snprintf(lab, sizeof lab, "%s", m.label);
-    dl->AddText(ImVec2(p.x + fs * 0.8f, ty), dim ? col(T->text_dim) : col(sel ? T->text_hi : T->text), lab);
+    {
+        /* The label, and after it the tag for a setting read at start. */
+        float tag_w = 0.0f;
+        if (s->flags & XS_RESTART)
+            tag_w = tw(fs * 0.5f, "RESTART") + fs * 0.5f * 0.9f + fs * 0.4f;
+        const float w = txt_fit(dl, fs, ImVec2(lx, ty), dim ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text),
+                                m.label, label_w - tag_w);
+        if (s->flags & XS_RESTART)
+            restart_tag(dl, lx + w + fs * 0.4f, cy, fs, s->value != s->launch);
+    }
 
-    const float vx1 = p.x + width - fs * 0.8f;
     if (s->type == XS_INT || s->type == XS_FLOAT) {
-        /* A bar and the number. */
-        const float tw = ImGui::CalcTextSize(v).x;
-        const float bw = fs * 9.0f, bh = fs * 0.5f;
-        const float bx1 = vx1 - fs * 4.4f, bx0 = bx1 - bw, by = p.y + (rh - bh) * 0.5f;
+        /* A bar of blocks and the number, between the arrows. */
+        const float nw = tw(fs, "100%") + fs * 0.2f;
+        const float bx0 = LY.x_val0, bx1 = vr - nw - fs * 0.5f, bh = fs * 0.62f, by = cy - bh * 0.5f;
+        const float bw = bx1 - bx0;
         double t = (s->value - s->min) / (s->max - s->min);
         t = t < 0 ? 0 : t > 1 ? 1 : t;
-        dl->AddRectFilled(ImVec2(bx0, by), ImVec2(bx1, by + bh), col(T->track), bh * 0.5f);
-        dl->AddRectFilled(ImVec2(bx0, by), ImVec2(bx0 + bw * (float)t, by + bh),
-                          dim ? col(T->fill_dim) : col(T->fill), bh * 0.5f);
-        dl->AddText(ImVec2(vx1 - tw, ty), dim ? col(T->text_dim) : col(T->text_hi), v);
+        const int blocks = 20, on = (int)floor(t * blocks + 0.5);
+        const float seg = bw / blocks;
+        for (int k = 0; k < blocks; k++)
+            dl->AddRectFilled(ImVec2(bx0 + seg * k, by), ImVec2(bx0 + seg * (k + 1) - seg * 0.22f, by + bh),
+                              k < on ? (dim ? col(T->fill_dim) : col(T->fill)) : col(T->track));
+        txt(dl, fs, ImVec2(vr - tw(fs, v), ty), vc, v);
         if (drag_t && ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::IsItemActive()) {
             double f = (ImGui::GetIO().MousePos.x - bx0) / bw;
             *drag_t = f < 0 ? 0 : f > 1 ? 1 : f;
         }
-    } else if (s->type == XS_CHOICE) {
-        char t[128];
-        snprintf(t, sizeof t, sel && !dim ? "<  %s  >" : "%s", v);
-        float tw = ImGui::CalcTextSize(t).x;
-        dl->AddText(ImVec2(vx1 - tw, ty), dim ? col(T->text_dim) : col(T->text_hi), t);
     } else {
-        const float pw = fs * 3.0f, ph = fs * 1.4f;
-        const float px = vx1 - pw, py = p.y + (rh - ph) * 0.5f;
-        bool on = s->value != 0.0;
-        dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-                          on && !dim ? col(T->fill) : col(T->track_off), ph * 0.5f);
-        float kx = on ? px + pw - ph * 0.5f : px + ph * 0.5f;
-        dl->AddCircleFilled(ImVec2(kx, py + ph * 0.5f), ph * 0.38f, col(T->knob));
-        const char *txt = on ? "On" : "Off";
-        float tw = ImGui::CalcTextSize(txt).x;
-        dl->AddText(ImVec2(px - tw - fs * 0.6f, ty), dim ? col(T->text_dim) : col(T->text_hi), txt);
+        /* A choice or a switch: its value, right-aligned (On / Off for a switch). */
+        txt_fit(dl, fs, ImVec2(vr, ty), vc, v, vr - LY.x_val0, true);
+    }
+    if (sel && !dim) {
+        arrow_tri(dl, arl, cy, ar, -1, col(T->arrow));
+        arrow_tri(dl, arr, cy, ar, 1, col(T->arrow));
     }
 }
+
+/* The footer bar: a band under the page with the keys, in the hint blue
+ * (the attention yellow while the page asks for something). */
+static const char *s_foot_keys;
+static bool s_foot_attn;
+
+static void foot_set(const char *keys, bool attn = false)
+{
+    s_foot_keys = keys;
+    s_foot_attn = attn;
+}
+
+static void draw_footer(ImDrawList *dl)
+{
+    dl->AddRectFilled(ImVec2(0, LY.y_foot), ImVec2(LY.W, LY.H), col(T->bar, 0.97f));
+    dl->AddLine(ImVec2(0, LY.y_foot), ImVec2(LY.W, LY.y_foot), col(T->rule));
+    if (!s_foot_keys)
+        return;
+    const float h = LY.H - LY.y_foot;
+    txt_fit(dl, LY.foot, ImVec2(LY.cx + 0.06f * LY.cw, LY.y_foot + (h - LY.foot) * 0.5f),
+            s_foot_attn ? col(T->attn) : col(T->hint), s_foot_keys, 0.88f * LY.cw);
+}
+
+/* The header: SETTINGS in the title red, the page's name with its arrows on
+ * the right, a rule, and the pages as a row of names. */
+static void draw_header(ImDrawList *dl)
+{
+    const float cy = 0.105f * LY.H;
+    txt(dl, LY.head, ImVec2(LY.cx + 0.06f * LY.cw, cy - LY.head * 0.5f), col(T->title), "SETTINGS");
+    {
+        /* The page: < NAME >, a click on an arrow turns the page. */
+        const char *name = k_page_name[s_page];
+        const float ar = LY.head * 0.3f, nw = tw(LY.head, name), right = LY.cx + 0.94f * LY.cw;
+        const float xn = right - ar * 2.6f - nw;
+        txt(dl, LY.head, ImVec2(xn, cy - LY.head * 0.5f), col(T->text_hi), name);
+        arrow_tri(dl, xn - ar * 1.6f, cy, ar, -1, col(T->arrow));
+        arrow_tri(dl, right - ar * 0.6f, cy, ar, 1, col(T->arrow));
+        for (int k = 0; k < 2; k++) {
+            const float x0 = k ? right - ar * 2.4f : xn - ar * 3.4f, x1 = k ? right + ar : xn - ar * 0.2f;
+            ImGui::SetCursorScreenPos(ImVec2(x0, cy - LY.head * 0.6f));
+            ImGui::PushID(k + 100);
+            ImGui::InvisibleButton("##pg", ImVec2(x1 - x0, LY.head * 1.2f));
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                s_page = (s_page + (k ? 1 : -1) + P_COUNT) % P_COUNT;
+                s_scroll_to_sel = true;
+                s_mx_open = false;
+                s_confirm = 0;
+            }
+            ImGui::PopID();
+        }
+    }
+    dl->AddLine(ImVec2(0, LY.y_rule), ImVec2(LY.W, LY.y_rule), col(T->rule));
+
+    /* The pages: names in a row under the rule. */
+    {
+        const float th = LY.y_rows - LY.y_rule - 0.004f * LY.H, y0 = LY.y_rule + 0.002f * LY.H;
+        const float gap = LY.tab * 1.2f;
+        float x = LY.cx + 0.095f * LY.cw;
+        for (int i = 0; i < P_COUNT; i++) {
+            const float w = tw(LY.tab, k_page_name[i]);
+            ImGui::SetCursorScreenPos(ImVec2(x - gap * 0.5f, y0));
+            ImGui::PushID(i);
+            ImGui::InvisibleButton("##tab", ImVec2(w + gap, th));
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                s_page = i;
+                s_scroll_to_sel = true;
+                s_mx_open = false;
+                s_confirm = 0;
+            }
+            ImGui::PopID();
+            const bool on = i == s_page;
+            const float ty = y0 + (th - LY.tab) * 0.5f;
+            txt(dl, LY.tab, ImVec2(x, ty), on ? col(T->text_hi) : col(T->tab_text), k_page_name[i]);
+            if (on)
+                dl->AddLine(ImVec2(x, ty + LY.tab * 1.2f), ImVec2(x + w, ty + LY.tab * 1.2f), col(T->arrow),
+                            fmaxf(2.0f, LY.tab * 0.08f));
+            x += w + gap;
+        }
+        const char *hint = pad_hints() ? "LB / RB" : "PgUp / PgDn";
+        const float hw = tw(LY.hint, hint);
+        txt(dl, LY.hint, ImVec2(LY.cx + 0.94f * LY.cw - hw, y0 + (th - LY.hint) * 0.5f), col(T->hint), hint);
+    }
+}
+
+/* ── the pages ─ (rows) */
 
 /* The folder browser, in the place of a page's rows: where it is, the rows
  * (a place or folder with the music found in and below it), the keys. */
@@ -2377,8 +2622,12 @@ static void build_browser(float fs, ImDrawList *dl)
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + fs * 1.6f));
     }
 
-    const float footer = fs * 0.5f + fs + fs * 2.9f;
-    const float rh = fs * 2.0f;
+    const char *note = s_fb_purpose == FB_SAVE
+        ? "An exported save is a dated folder with UDATA inside. It is imported at the next start."
+        : "Every folder with music in it becomes a soundtrack in the game's own music menu.";
+    const float note_h = ImGui::GetFont()->CalcTextSizeA(LY.hint, FLT_MAX, wrap_w, note).y;
+    const float footer = 0.012f * LY.H + note_h + 0.008f * LY.H;
+    const float rh = LY.pitch;
     ImVec2 avail = ImGui::GetContentRegionAvail();
     ImGui::BeginChild("folders", ImVec2(avail.x, avail.y - footer), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoNav);
@@ -2401,8 +2650,8 @@ static void build_browser(float fs, ImDrawList *dl)
         if (!ImGui::IsRectVisible(p, ImVec2(p.x + rw, p.y + rh)) && !(sel && s_fb_scroll))
             continue;
         if (sel) {
-            cdl->AddRectFilled(p, ImVec2(p.x + rw, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.35f);
-            cdl->AddRectFilled(p, ImVec2(p.x + fs * 0.22f, p.y + rh), col(T->sel_bar), fs * 0.11f);
+            cdl->AddRectFilled(p, ImVec2(p.x + rw, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.2f);
+            arrow_tri(cdl, p.x + fs * 0.35f, p.y + rh * 0.5f, fs * 0.36f, 1, col(T->arrow));
         }
         const float ty = p.y + (rh - fs) * 0.5f;
         bool act = r.kind == XSB_USE || r.kind == XSB_OFF;
@@ -2429,89 +2678,66 @@ static void build_browser(float fs, ImDrawList *dl)
 
     {
         ImVec2 p = ImGui::GetCursorScreenPos();
-        dl->AddLine(ImVec2(p.x, p.y + fs * 0.2f), ImVec2(p.x + avail.x, p.y + fs * 0.2f), col(T->rule));
-        float y = p.y + fs * 0.5f;
-        dl->AddText(ImVec2(p.x, y), col(T->text_dim),
-                    s_fb_purpose == FB_SAVE
-                    ? "An exported save is a dated folder with UDATA inside. It is imported at the next start."
-                    : "Every folder with music in it becomes a soundtrack in the game's own music menu.");
-        y += fs + fs * 0.3f + fs * 1.3f;
-        const char *keys = pad_hints()
+        dl->AddLine(ImVec2(p.x - 0.05f * LY.cw, p.y + 0.004f * LY.H), ImVec2(p.x + avail.x + 0.03f * LY.cw, p.y + 0.004f * LY.H),
+                    col(T->rule));
+        dl->PushClipRect(ImVec2(p.x, p.y), ImVec2(p.x + avail.x, p.y + footer), true);
+        dl->AddText(ImGui::GetFont(), LY.hint, ImVec2(p.x, p.y + 0.012f * LY.H), col(T->hint), note, nullptr, wrap_w);
+        dl->PopClipRect();
+        foot_set(pad_hints()
             ? "D-pad  select      A  open / choose      B  back"
-            : "Arrows  select      Enter  open / choose      Esc  back";
-        dl->AddText(ImVec2(p.x, y), col(T->text_dim), keys);
+            : "Arrows  select      Enter  open / choose      Esc  back");
     }
 }
 
 #include "overlay_mixer.inc"
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
-static void build_pages(float fs)
+static void build_pages_inner()
 {
     ImGuiIO &io = ImGui::GetIO();
     ImDrawList *bg = ImGui::GetBackgroundDrawList();
     const ImVec2 disp = io.DisplaySize;
 
+    layout_compute(disp);
     /* Dim the game. */
-    bg->AddRectFilled(ImVec2(0, 0), disp, col(T->scrim, 0.55f));
+    bg->AddRectFilled(ImVec2(0, 0), disp, col(T->scrim, 0.78f));
 
-    float pw = fs * 44.0f, ph = fs * 28.0f;
-    if (s_mx_open) {                    /* the Mixer page: a longer list, wider rows */
-        pw = fs * 54.0f;
-        ph = fs * 38.0f;
-    }
-    if (pw > disp.x * 0.94f) pw = disp.x * 0.94f;
-    if (ph > disp.y * 0.90f) ph = disp.y * 0.90f;
-    ImGui::SetNextWindowPos(ImVec2((disp.x - pw) * 0.5f, (disp.y - ph) * 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(pw, ph));
-    ImGui::SetNextWindowBgAlpha(0.96f);
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(disp);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, s_alpha);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(fs, fs * 0.8f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, fmaxf(8.0f, 0.011f * LY.H));
     ImGui::Begin("Settings", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
                  | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings
-                 | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav);
+                 | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground);
     ImDrawList *dl = ImGui::GetWindowDrawList();
+    const float fs = LY.label;
+    foot_set(NULL);
 
-    /* Header: the pages. */
-    {
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        float x = p.x;
-        const float th = fs * 1.8f;
-        for (int i = 0; i < P_COUNT; i++) {
-            float tw = ImGui::CalcTextSize(k_page_name[i]).x + fs * 1.4f;
-            ImGui::SetCursorScreenPos(ImVec2(x, p.y));
-            ImGui::PushID(i);
-            ImGui::InvisibleButton("##tab", ImVec2(tw, th));
-            if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-                s_page = i;
-                s_scroll_to_sel = true;
-                s_mx_open = false;
-            }
-            ImGui::PopID();
-            bool on = i == s_page;
-            if (on)
-                dl->AddRectFilled(ImVec2(x, p.y), ImVec2(x + tw, p.y + th), col(T->tab_on), fs * 0.35f);
-            dl->AddText(ImVec2(x + fs * 0.7f, p.y + (th - fs) * 0.5f),
-                        on ? col(T->tab_on_text) : col(T->tab_text), k_page_name[i]);
-            x += tw + fs * 0.25f;
-        }
-        const char *hint = pad_hints() ? "LB / RB" : "PgUp / PgDn";
-        float hw = ImGui::CalcTextSize(hint).x;
-        dl->AddText(ImVec2(p.x + pw - fs * 2.0f - hw, p.y + (th - fs) * 0.5f), col(T->tab_hint), hint);
-        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + th + fs * 0.5f));
-    }
+    draw_header(dl);
 
-    if (xsb_is_open()) {
-        build_browser(fs, dl);
+    if (xsb_is_open() || s_mx_open) {
+        /* The folder browser and the Mixer page: in a body under the header,
+         * their own rows and notes as they were; the keys go to the footer. */
+        ImGui::SetCursorScreenPos(ImVec2(LY.body_x0, LY.y_rows));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.05f * LY.cw, 0));
+        ImGui::BeginChild("body", ImVec2(LY.body_x1 - LY.body_x0, LY.y_foot - LY.y_rows - 0.008f * LY.H),
+                          ImGuiChildFlags_AlwaysUseWindowPadding,
+                          ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
+        ImDrawList *bdl = ImGui::GetWindowDrawList();
+        if (xsb_is_open())
+            build_browser(fs, bdl);
+        else
+            build_mixer(fs, bdl);
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        draw_footer(dl);
         ImGui::End();
-        ImGui::PopStyleVar(2);
-        return;
-    }
-    if (s_mx_open) {
-        build_mixer(fs, dl);
-        ImGui::End();
-        ImGui::PopStyleVar(2);
+        ImGui::PopStyleVar(6);
         return;
     }
 
@@ -2591,9 +2817,7 @@ static void build_pages(float fs)
             /* The table's flag: this one is read when the game starts. */
             if (s->flags & XS_RESTART) {
                 size_t at = strlen(hint);
-                snprintf(hint + at, sizeof hint - at, "%sTakes effect after a restart%s.",
-                         at ? " " : "", recomp_restart_available()
-                         ? " (\"Restart game now\" appears below once it is changed)" : "");
+                snprintf(hint + at, sizeof hint - at, "%sTakes effect after a restart.", at ? " " : "");
             }
         }
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_UPDATE_CHECK) {
@@ -2625,8 +2849,7 @@ static void build_pages(float fs)
         recomp_save_history_dir(s_sio_dir, hist, sizeof hist);
         snprintf(hint, sizeof hint, "%s%s%s %s. %s", s_sio_msg, s_sio_msg[0] ? "  |  " : "", what,
                  rows[sel].action == A_SAVE_RESTORE ? hist : s_sio_dest, then);
-    } else if (rows[sel].kind == R_ACTION
-               && (rows[sel].action == A_RESTART || rows[sel].action == A_RESTART_PIN)) {
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_RESTART_PIN) {
         char why[400];
         restart_reason(why, sizeof why);
         snprintf(hint, sizeof hint, "%s%s%s%sThe game closes and starts again by itself, with the same options."
@@ -2672,23 +2895,40 @@ static void build_pages(float fs)
         snprintf(hint, sizeof hint, "%s Paused meanwhile; closing the settings stops it"
                  " (it goes on from there next time).", s_sb->cost);
     }
-    const float wrap_w = ImGui::GetContentRegionAvail().x;
-    const float hint_h = hint[0] ? ImGui::CalcTextSize(hint, nullptr, false, wrap_w).y : fs;
-    const float rh = fs * 2.0f;
-    const int pins = pin_count(rows, n);   /* Restart game, Quit game: below the scrolling rows */
-    const float footer = fs * 0.5f + hint_h + fs * 2.9f + (pins ? pins * rh + fs * 0.4f : 0.0f);
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    ImGui::BeginChild("rows", ImVec2(avail.x, avail.y - footer), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoNav);
+    /* The foot of the page, bottom up: the footer bar, the selected row's
+     * hint, the pinned rows (Quit game, and Restart while one is pending),
+     * and the scrolling rows in what is left above. */
+    const int pins = pin_count(rows, n);
+    const bool note_only = !recomp_restart_available() && (restart_wanted() || xbox_SettingsNeedRestart());
+    const float pitch = LY.pitch, gap = 0.009f * LY.H;
+    const float hx = LY.cx + 0.06f * LY.cw, hw = 0.88f * LY.cw;
+    const float pins_h = pins * pitch + (note_only ? pitch * 0.75f : 0.0f) + (pins || note_only ? gap : 0.0f);
+    float hs = LY.hint, hint_h = 0.0f;
+    for (int k = 0; hint[0] && k < 10; k++) {
+        /* A long hint shrinks (to 62%) before it takes the rows' room. */
+        hint_h = ImGui::GetFont()->CalcTextSizeA(hs, FLT_MAX, hw, hint).y;
+        const float rows_h = LY.y_foot - gap - hint_h - gap - pins_h - LY.y_rows;
+        if ((hint_h <= 0.13f * LY.H && rows_h >= pitch * 3.0f) || hs <= LY.hint * 0.62f)
+            break;
+        hs *= 0.92f;
+    }
+    const float y_hint = LY.y_foot - gap - hint_h;
+    const float y_pins = y_hint - gap - pins_h;
+    float rows_h = y_pins - LY.y_rows;
+    if (rows_h < pitch * 1.5f)
+        rows_h = pitch * 1.5f;
+
+    ImGui::SetCursorScreenPos(ImVec2(LY.body_x0, LY.y_rows));
+    ImGui::BeginChild("rows", ImVec2(LY.body_x1 - LY.body_x0, rows_h), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground);
     ImDrawList *cdl = ImGui::GetWindowDrawList();
-    const float rw = ImGui::GetContentRegionAvail().x - fs * 0.5f;
+    const float rw = ImGui::GetContentRegionAvail().x;
     auto rows_run = [&](int from, int to, ImDrawList *rdl) {
     for (int i = from; i < to; i++) {
         bool clicked, hov;
         int cdir;
         double drag = -1;
-        ImVec2 y0 = ImGui::GetCursorScreenPos();
-        draw_row(rows[i], i, i == sel, rw, rh, fs, rdl, &clicked, &cdir, &hov, &drag);
+        draw_row(rows[i], i, i == sel, rw, pitch, fs, rdl, &clicked, &cdir, &hov, &drag);
         if (hov && selectable(rows[i]) && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
             sel = i;
             s_last_input_pad = false;
@@ -2725,44 +2965,43 @@ static void build_pages(float fs)
             ImGui::SetScrollHereY(0.5f);
             s_scroll_to_sel = false;
         }
-        (void)y0;
     }
     };
     rows_run(0, n - pins, cdl);
     ImGui::EndChild();
-    if (pins) {
+    if (pins || note_only) {
         /* The foot of the page, always in view. */
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        dl->AddLine(ImVec2(p.x, p.y + fs * 0.1f), ImVec2(p.x + avail.x, p.y + fs * 0.1f), col(T->rule));
-        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + fs * 0.2f));
-        ImGui::PushID("foot");
-        rows_run(n - pins, n, dl);
-        ImGui::PopID();
+        dl->AddLine(ImVec2(LY.body_x0, y_pins), ImVec2(LY.body_x1, y_pins), col(T->rule));
+        float y = y_pins + gap * 0.5f;
+        if (note_only) {
+            /* No restart on this platform (or a build without it): the
+             * changes wait for the game to be started again. */
+            const int k = restart_count();
+            char t[96];
+            snprintf(t, sizeof t, "Restart the game to apply %d change%s", k > 0 ? k : 1, k > 1 ? "s" : "");
+            txt_fit(dl, fs, ImVec2(LY.x_label, y + (pitch * 0.75f - fs) * 0.5f), col(T->attn), t,
+                    LY.x_val1 - LY.x_label);
+            y += pitch * 0.75f;
+        }
+        if (pins) {
+            ImGui::SetCursorScreenPos(ImVec2(LY.body_x0, y));
+            ImGui::PushID("foot");
+            rows_run(n - pins, n, dl);
+            ImGui::PopID();
+        }
     }
-
-    {
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        dl->AddLine(ImVec2(p.x, p.y + fs * 0.2f), ImVec2(p.x + avail.x, p.y + fs * 0.2f), col(T->rule));
-        float y = p.y + fs * 0.5f;
-        if (hint[0])
-            dl->AddText(ImGui::GetFont(), fs, ImVec2(p.x, y), hint_locked ? col(T->warn) : col(T->text_dim),
-                        hint, nullptr, wrap_w);
-        y += hint_h + fs * 0.3f;
-        if (xbox_SettingsNeedRestart())
-            dl->AddText(ImVec2(p.x, y), col(T->warn),
-                        recomp_restart_available()
-                        ? "The changes marked (restart) apply after a restart: \"Restart game now\" on this page."
-                        : "Restart the game for the changes marked (restart) to apply.");
-        else if (s_restart_why[0] || s_restart_save[0])
-            dl->AddText(ImVec2(p.x, y), col(T->warn), "A restart is waiting: the Restart row on this page does it.");
-        y += fs * 1.3f;
-        const char *keys = pad_hints()
-            ? "D-pad  select / change      A  toggle      Y  default      B  close"
-            : "Arrows  select / change      Enter  toggle      Del  default      Esc  close";
-        dl->AddText(ImVec2(p.x, y), col(T->text_dim), keys);
+    if (hint[0]) {
+        dl->PushClipRect(ImVec2(hx, y_hint), ImVec2(hx + hw, LY.y_foot), true);
+        dl->AddText(ImGui::GetFont(), hs, ImVec2(hx, y_hint), hint_locked ? col(T->attn) : col(T->hint),
+                    hint, nullptr, hw);
+        dl->PopClipRect();
     }
+    foot_set(pad_hints()
+        ? "D-pad  select / change      A  toggle      Y  default      B  close"
+        : "Arrows  select / change      Enter  toggle      Del  default      Esc  close");
+    draw_footer(dl);
     ImGui::End();
-    ImGui::PopStyleVar(2);
+    ImGui::PopStyleVar(6);
 
     /* A page change shows from the next frame. */
     if (s_page_delta) {
@@ -2771,6 +3010,16 @@ static void build_pages(float fs)
         s_confirm = 0;
         s_scroll_to_sel = true;
     }
+}
+
+/* The whole page at the label's size (what the browser and the Mixer page
+ * draw without naming one). */
+static void build_pages(float)
+{
+    layout_compute(ImGui::GetIO().DisplaySize);
+    ImGui::PushFont(nullptr, LY.label);
+    build_pages_inner();
+    ImGui::PopFont();
 }
 
 bool overlay_begin_frame()
@@ -2799,7 +3048,13 @@ bool overlay_begin_frame()
     const float fs = ImGui::GetFontSize();
 
     if (perf) {
-        draw_perf(ImGui::GetForegroundDrawList(), ImVec2(fs * 0.6f, fs * 0.6f), fs);
+        ImVec2 at(fs * 0.6f, fs * 0.6f);
+        if (s_open || s_alpha > 0.0f) {
+            /* Beside the page's title, not over it. */
+            layout_compute(io.DisplaySize);
+            at = ImVec2(LY.cx + 0.06f * LY.cw + tw(LY.head, "SETTINGS") + 0.03f * LY.cw, fs * 0.3f);
+        }
+        draw_perf(ImGui::GetForegroundDrawList(), at, fs);
     }
     if (note) {
         /* Centred, low on the screen; the dots move so it is seen to live. */

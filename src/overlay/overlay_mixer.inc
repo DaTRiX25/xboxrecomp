@@ -592,9 +592,9 @@ static bool mx_pan_diagram(ImDrawList *dl, ImVec2 at, float w, float h, float fs
     static const struct { float x, y; const char *name; } spk[5] = {
         { -1, 1, "FL" }, { 1, 1, "FR" }, { 0, 1, "C" }, { -1, -1, "SL" }, { 1, -1, "SR" },
     };
-    const float pad = fs * 2.6f;
+    const float pad = fs * 2.4f;
     float side = (w < h ? w : h) - 2.0f * pad;
-    if (side < fs * 6.0f)
+    if (side < fs * 3.0f)
         return false;
     const ImVec2 o(at.x + (w - side) * 0.5f, at.y + (h - side) * 0.5f);
     auto pt = [&](float x, float y) { return ImVec2(o.x + (x + 1.0f) * 0.5f * side, o.y + (1.0f - y) * 0.5f * side); };
@@ -621,9 +621,9 @@ static bool mx_pan_diagram(ImDrawList *dl, ImVec2 at, float w, float h, float fs
     /* The listener, facing the front wall. */
     {
         const ImVec2 c = pt(0, 0);
-        dl->AddCircle(c, fs * 0.45f, col(T->text_dim), 16, 1.5f);
+        dl->AddCircle(c, fs * 0.45f, col(T->hint), 16, 1.5f);
         dl->AddTriangleFilled(ImVec2(c.x, c.y - fs * 0.85f), ImVec2(c.x - fs * 0.3f, c.y - fs * 0.45f),
-                              ImVec2(c.x + fs * 0.3f, c.y - fs * 0.45f), col(T->text_dim));
+                              ImVec2(c.x + fs * 0.3f, c.y - fs * 0.45f), col(T->hint));
     }
     /* What each speaker gets: a mono sound's gains (the two ends' powers
      * averaged); for a stereo sound the left end's and the right end's
@@ -641,20 +641,20 @@ static bool mx_pan_diagram(ImDrawList *dl, ImVec2 at, float w, float h, float fs
             const float lvl = db < -30.0f ? 0.0f : (db + 30.0f) / 30.0f;
             char t[24];
             dl->AddCircleFilled(c, fs * (0.35f + 0.55f * lvl), lvl > 0 ? col(T->fill, 0.35f + 0.65f * lvl) : col(T->track_off));
-            dl->AddCircle(c, fs * 0.9f, col(T->text_dim), 20, 1.0f);
+            dl->AddCircle(c, fs * 0.9f, col(T->hint), 20, 1.0f);
             if (db > -60.0f) snprintf(t, sizeof t, "%s %.1f", spk[k].name, (double)db);
             else snprintf(t, sizeof t, "%s  -", spk[k].name);
-            const float tw = ImGui::CalcTextSize(t).x;
-            dl->AddText(ImVec2(c.x - tw * 0.5f, spk[k].y > 0 ? c.y - fs * 2.2f : c.y + fs * 1.1f),
-                        lvl > 0 ? col(T->text_hi) : col(T->text_dim), t);
+            const float tw_ = tw(fs, t);
+            txt(dl, fs, ImVec2(c.x - tw_ * 0.5f, spk[k].y > 0 ? c.y - fs * 2.2f : c.y + fs * 1.1f),
+                lvl > 0 ? col(T->text_hi) : col(T->hint), t);
         }
         /* The sound: its two ends when it has a width, and the position. */
         if (p.pan_width > 0.0f) {
             dl->AddLine(pt(xl, p.pan_y), pt(xr, p.pan_y), col(T->sel_bar), 2.0f);
             dl->AddCircleFilled(pt(xl, p.pan_y), fs * 0.3f, col(T->sel_bar));
             dl->AddCircleFilled(pt(xr, p.pan_y), fs * 0.3f, col(T->sel_bar));
-            dl->AddText(ImVec2(pt(xl, p.pan_y).x - fs * 0.25f, pt(xl, p.pan_y).y - fs * 1.5f), col(T->text_dim), "L");
-            dl->AddText(ImVec2(pt(xr, p.pan_y).x - fs * 0.25f, pt(xr, p.pan_y).y - fs * 1.5f), col(T->text_dim), "R");
+            txt(dl, fs, ImVec2(pt(xl, p.pan_y).x - fs * 0.25f, pt(xl, p.pan_y).y - fs * 1.5f), col(T->hint), "L");
+            txt(dl, fs, ImVec2(pt(xr, p.pan_y).x - fs * 0.25f, pt(xr, p.pan_y).y - fs * 1.5f), col(T->hint), "R");
         }
         dl->AddCircleFilled(pt(p.pan_x, p.pan_y), fs * 0.45f, s_mx_grab ? col(T->warn) : col(T->text_hi));
         dl->AddCircle(pt(p.pan_x, p.pan_y), fs * 0.7f, s_mx_grab ? col(T->warn) : col(T->sel_bar), 20, 2.0f);
@@ -774,17 +774,18 @@ static void build_mixer(float fs, ImDrawList *dl)
                 : s_mx_live_b ? "listening to B" : "listening to A";
             float w = ImGui::CalcTextSize(l).x;
             dl->AddText(ImVec2(p.x + ImGui::GetContentRegionAvail().x - w - fs * 0.5f, p.y),
-                        s_mx_live_b ? col(T->warn) : col(T->text_dim), l);
+                        s_mx_live_b ? col(T->warn) : col(T->hint), l);
         }
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + fs * 1.6f));
     }
 
     const char *hint = items[sel].hint ? items[sel].hint : "";
     const float wrap_w = ImGui::GetContentRegionAvail().x;
-    const float hint_h = hint[0] ? ImGui::CalcTextSize(hint, nullptr, false, wrap_w).y : fs;
-    const float meters_h = apu_bus_enabled() ? fs * 3.4f : 0.0f;
-    const float footer = fs * 0.5f + meters_h + hint_h + fs * 2.9f;
-    const float rh = fs * 1.75f;
+    const float hs = LY.hint;           /* the footer's text size */
+    const float hint_h = ImGui::GetFont()->CalcTextSizeA(hs, FLT_MAX, wrap_w, hint[0] ? hint : "A").y;
+    const float meters_h = apu_bus_enabled() ? hs * 3.4f : 0.0f;
+    const float footer = hs * 0.5f + meters_h + hint_h + hs * 0.8f;
+    const float rh = LY.pitch * 0.82f;       /* a denser list: the Mixer has more rows */
     ImVec2 avail = ImGui::GetContentRegionAvail();
     const ImVec2 list_pos = ImGui::GetCursorScreenPos();
     const float list_h = avail.y - footer;
@@ -813,8 +814,8 @@ static void build_mixer(float fs, ImDrawList *dl)
         if (!ImGui::IsRectVisible(p, ImVec2(p.x + rw, p.y + rh)) && !(isel && s_mx_scroll))
             continue;
         if (isel) {
-            cdl->AddRectFilled(p, ImVec2(p.x + rw, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.35f);
-            cdl->AddRectFilled(p, ImVec2(p.x + fs * 0.22f, p.y + rh), col(T->sel_bar), fs * 0.11f);
+            cdl->AddRectFilled(p, ImVec2(p.x + rw, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.2f);
+            arrow_tri(cdl, p.x + fs * 0.35f, p.y + rh * 0.5f, fs * 0.36f, 1, col(T->arrow));
         }
         const float ty = p.y + (rh - fs) * 0.5f;
         char v[96];
@@ -829,16 +830,21 @@ static void build_mixer(float fs, ImDrawList *dl)
             float x = p.x + rw * 0.36f;
             if (bp.mute) { cdl->AddText(ImVec2(x, ty), col(T->warn), "M"); }
             if (bp.solo) { cdl->AddText(ImVec2(x + fs * 1.1f, ty), col(T->perf_good), "S"); }
-            if (bp.route == APU_BUS_ROUTE_SENDS) cdl->AddText(ImVec2(x + fs * 2.2f, ty), col(T->text_dim), "sends");
+            if (bp.route == APU_BUS_ROUTE_SENDS) cdl->AddText(ImVec2(x + fs * 2.2f, ty), col(T->hint), "sends");
             else if (bp.lfe_send_db > APU_BUS_OFF_DB || bp.trim_db[0] != 0 || bp.trim_db[1] != 0
                      || bp.trim_db[2] != 0 || bp.trim_db[3] != 0)
-                cdl->AddText(ImVec2(x + fs * 2.2f, ty), col(T->text_dim), "trims");
+                cdl->AddText(ImVec2(x + fs * 2.2f, ty), col(T->hint), "trims");
             mx_meter(cdl, ImVec2(p.x + rw * 0.50f, p.y + rh * 0.36f), rw * 0.27f, rh * 0.28f,
                      mt.bus_rms_db[m.bus], -200.0f, false);
         }
-        if (v[0])
-            cdl->AddText(ImVec2(p.x + rw - fs * 0.8f - vw, ty),
-                         m.kind == MK_INFO ? col(T->text_info) : col(T->text_hi), v);
+        if (v[0]) {
+            /* The value takes what the label leaves; smaller, then cut. */
+            float room = rw - fs * 1.6f - tw(fs, m.label) - fs * 0.6f;
+            if (m.kind == MK_BUS)
+                room = vw;
+            txt_fit(cdl, fs, ImVec2(p.x + rw - fs * 0.8f, ty), m.kind == MK_INFO ? col(T->text_info) : col(T->text_hi),
+                    v, room > fs * 2.0f ? room : fs * 2.0f, true);
+        }
         if (isel && s_mx_scroll) {
             ImGui::SetScrollHereY(0.5f);
             s_mx_scroll = false;
@@ -849,7 +855,9 @@ static void build_mixer(float fs, ImDrawList *dl)
         /* Beside the list; the footer goes on from where the list ended. */
         apu_bus_params &p = c.bus[s_mx_bus];
         const ImVec2 after = ImGui::GetCursorScreenPos();
-        if (mx_pan_diagram(dl, ImVec2(list_pos.x + list_w + fs, list_pos.y), avail.x - list_w - fs, list_h, fs, p))
+        /* The diagram's parts at the hint's size: it has the room that is left. */
+        if (mx_pan_diagram(dl, ImVec2(list_pos.x + list_w + fs, list_pos.y), avail.x - list_w - fs, list_h,
+                           LY.hint, p))
             mx_changed(c);
         ImGui::SetCursorScreenPos(after);
         ImGui::Dummy(ImVec2(0, 0));
@@ -865,8 +873,9 @@ static void build_mixer(float fs, ImDrawList *dl)
 
     {
         ImVec2 p = ImGui::GetCursorScreenPos();
-        dl->AddLine(ImVec2(p.x, p.y + fs * 0.2f), ImVec2(p.x + avail.x, p.y + fs * 0.2f), col(T->rule));
-        float y = p.y + fs * 0.5f;
+        dl->AddLine(ImVec2(p.x - 0.05f * LY.cw, p.y + hs * 0.2f), ImVec2(p.x + avail.x + 0.03f * LY.cw, p.y + hs * 0.2f),
+                    col(T->rule));
+        float y = p.y + hs * 0.5f;
         if (meters_h > 0) {
             /* The speaker feeds after the output stage: RMS bar, peak hold
              * tick, and a red block when samples went past full scale. */
@@ -876,40 +885,38 @@ static void build_mixer(float fs, ImDrawList *dl)
             const float colw = avail.x / 3.0f;
             unsigned overs = 0;
             for (int s = 0; s < nch; s++) {
-                float x = p.x + colw * (float)(s % 3), yy = y + fs * 1.1f * (float)(s / 3);
+                float x = p.x + colw * (float)(s % 3), yy = y + hs * 1.1f * (float)(s / 3);
                 char lab[40];
-                dl->AddText(ImVec2(x, yy), col(T->text_dim), nch == 6 ? sp6[s] : sp2[s]);
-                mx_meter(dl, ImVec2(x + fs * 2.4f, yy + fs * 0.25f), colw - fs * 9.0f, fs * 0.5f,
+                txt(dl, hs, ImVec2(x, yy), col(T->hint), nch == 6 ? sp6[s] : sp2[s]);
+                mx_meter(dl, ImVec2(x + hs * 2.4f, yy + hs * 0.25f), colw - hs * 9.0f, hs * 0.5f,
                          mt.spk_rms_db[s], mt.spk_peak_db[s], mt.spk_over[s] != 0);
                 if (mt.spk_peak_db[s] > -99.0f) snprintf(lab, sizeof lab, "%+.1f", (double)mt.spk_peak_db[s]);
                 else snprintf(lab, sizeof lab, "-inf");
-                dl->AddText(ImVec2(x + colw - fs * 5.2f, yy), mt.spk_peak_db[s] > 0.0f ? col(T->perf_bad) : col(T->text_dim), lab);
+                txt(dl, hs, ImVec2(x + colw - hs * 5.2f, yy), mt.spk_peak_db[s] > 0.0f ? col(T->perf_bad) : col(T->hint), lab);
                 overs += mt.spk_over[s];
             }
             char st[200];
             snprintf(st, sizeof st, "RMS, peak hold (dBFS)     over full scale: %u samples     limiter %.1f dB     duck %.1f dB",
                      overs, (double)(mt.limiter_db > 0.05f ? -mt.limiter_db : 0.0f),
                      (double)(mt.duck_db > 0.05f ? -mt.duck_db : 0.0f));
-            dl->AddText(ImVec2(p.x, y + fs * 2.3f), overs ? col(T->warn) : col(T->text_dim), st);
+            txt_fit(dl, hs, ImVec2(p.x, y + hs * 2.3f), overs ? col(T->warn) : col(T->hint), st, avail.x);
             y += meters_h;
         }
         const char *fst = apu_bus_file_status();
         const char *line = s_mx_note[0] ? s_mx_note : fst[0] ? fst : hint;
         if (line[0])
-            dl->AddText(ImGui::GetFont(), fs, ImVec2(p.x, y), (s_mx_note[0] || fst[0]) && line != hint ? col(T->warn) : col(T->text_dim),
+            dl->AddText(ImGui::GetFont(), hs, ImVec2(p.x, y), (s_mx_note[0] || fst[0]) && line != hint ? col(T->warn) : col(T->hint),
                         line, nullptr, wrap_w);
-        y += hint_h + fs * 0.3f + fs * 1.3f;
         if (s_mx_grab) {
-            dl->AddText(ImVec2(p.x, y), col(T->warn), pad_hints()
+            foot_set(pad_hints()
                 ? "D-pad / stick  move the sound in the room      A or B  done"
-                : "Arrows  move the sound in the room      Enter or Esc  done");
+                : "Arrows  move the sound in the room      Enter or Esc  done", true);
             return;
         }
-        const char *keys = pad_hints()
+        foot_set(pad_hints()
             ? (s_mx_view == MX_MAIN ? "D-pad  select / change   A  open   LB  mute   RB  solo   Y  reset   B  back   Back+Y  A/B"
                                     : "D-pad  select / change    A  toggle    Y  default    B  back    Back+Y  A/B")
             : (s_mx_view == MX_MAIN ? "Arrows  select / change   Enter  open   PgUp  mute   PgDn  solo   Del  reset   Esc  back   F7  A/B"
-                                    : "Arrows  select / change    Enter  toggle    Del  default    Esc  back    F7  A/B");
-        dl->AddText(ImVec2(p.x, y), col(T->text_dim), keys);
+                                    : "Arrows  select / change    Enter  toggle    Del  default    Esc  back    F7  A/B"));
     }
 }
