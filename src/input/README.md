@@ -284,6 +284,28 @@ Nothing is sent, the refresh included, while the settings overlay is open
 (`xbox_InputSetBackground`, from the window's focus events): a zero goes out
 first, and what the title last asked for plays again after.
 
+### Overlay hotkey (Back+Start)
+
+With the overlay on (`xbox_InputSetComboGuard`), each pad's Back reaches the
+title a moment late, so that Back+Start can open the settings without the
+title seeing either button. This is SpeedBreaker's behaviour: a tap arrives
+when you let go, a hold after a quarter of a second. Per port, on the pad's
+buttons before the keyboard is merged (the keyboard is not touched); several
+pads are independent. In `xbox_InputGetState`:
+
+| Pad | The title sees |
+|---|---|
+| Back down | nothing of Back, and Start is hidden while it is down |
+| Start comes with Back down | neither; nothing of the pair until both are let go |
+| Back let go alone | Back pressed for `XBOX_INPUT_BACK_TAP_MS` (50 ms), at least `XBOX_INPUT_BACK_TAP_POLLS` (2) reads, then released |
+| Back down `XBOX_INPUT_BACK_DELAY_MS` (250 ms), no Start | a held Back from then on; Start still hidden |
+| Start first, Back after | Start at once (no grace: it would delay every pause); the overlay opens |
+
+Where this changes the buttons without the pad having, the packet number
+moves on too, since the title records edges by it. While the overlay is open
+(or its port is latched) a Back press is swallowed whole. The same combo closes
+the overlay; View+Menu on a Steam Deck arrive as Back+Start.
+
 ### A pad is never left shaking
 
 What ends a run, and what stops the motors then:

@@ -75,9 +75,21 @@ void xbox_InputSetBackground(int on);
  * that closed the overlay is not also the title's. Any thread. */
 void xbox_InputSetBlocked(int on);
 
-/* The overlay's hotkey is Back+Start: with the guard on, a title never sees
- * Start while Back is held, so pressing Back first (View, then Menu on a
- * Steam Deck) does not also pause the game. Start first still reaches it. */
+/* The overlay's hotkey is Back+Start of one pad (View+Menu on a Steam Deck),
+ * so with the guard on a pad's Back reaches the title a moment late, as in
+ * SpeedBreaker. Per port, the pad part only (the keyboard is not touched):
+ *   - Back goes down: neither it nor Start reaches the title.
+ *   - Start comes while Back is down: the overlay opens; the title never
+ *     sees either, and nothing of the pair until both are let go.
+ *   - Back is let go without Start: the title gets a Back press then, kept
+ *     for XBOX_INPUT_BACK_TAP_MS and at least XBOX_INPUT_BACK_TAP_POLLS reads.
+ *   - Back stays down XBOX_INPUT_BACK_DELAY_MS without Start: from then on
+ *     it is passed as a normal held Back (Start stays hidden while it is).
+ *   - Start first is not delayed: it reaches the title at once, and Back
+ *     coming after it opens the overlay all the same. */
+#define XBOX_INPUT_BACK_DELAY_MS 250
+#define XBOX_INPUT_BACK_TAP_MS   50
+#define XBOX_INPUT_BACK_TAP_POLLS 2
 void xbox_InputSetComboGuard(int on);
 int  xbox_InputBlocked(void);
 
