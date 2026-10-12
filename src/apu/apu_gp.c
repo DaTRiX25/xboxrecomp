@@ -116,7 +116,7 @@ int32_t apu_gp_unmodelled_max(void) { return g.un.max; }
 void apu_gp_program(uint32_t code_scratch_off, uint32_t code_words)
 {
     wire();
-    if (code_words == 0 || code_words > APU_GP_CODE_MAX)
+    if (code_words > APU_GP_CODE_MAX)
         return;
     g.prog.off = code_scratch_off;
     g.prog.words = code_words;

@@ -85,7 +85,7 @@ void apu_gp_drive(int bin, uint32_t state);
  * n at X:0x80 + n), loaded by the title's commands like every other
  * effect's. Its last word must be the NOP the image ends every effect
  * with. If it meets something the interpreter does not have, the log says
- * so once and the program is left out. */
+ * so once and the program is left out. code_words 0: no program. */
 void apu_gp_program(uint32_t code_scratch_off, uint32_t code_words);
 /* DSP instructions run for it so far. */
 unsigned long apu_gp_program_steps(void);
