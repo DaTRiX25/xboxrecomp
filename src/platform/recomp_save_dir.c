@@ -683,6 +683,45 @@ int recomp_save_backup(const char *dir, int keep, char *out, unsigned out_size)
 
 static const char *const k_sio_parts[] = { "UDATA", "TDATA" };
 
+int recomp_save_sandbox_begin(const char *root, const char *sandbox)
+{
+    char from[RS_PATH], to[RS_PATH];
+    int ok = 1;
+    unsigned i;
+
+    rm_tree(sandbox);
+    mkdir_p(sandbox);
+    for (i = 0; i < 2; i++) {
+        snprintf(from, sizeof from, "%s/%s", root, k_sio_parts[i]);
+        snprintf(to, sizeof to, "%s/%s", sandbox, k_sio_parts[i]);
+        if (is_dir(from) && !copy_tree(from, to, 1))
+            ok = 0;
+        else if (!is_dir(from))
+            mkdir_p(to);
+    }
+    return ok;
+}
+
+int recomp_save_sandbox_commit(const char *sandbox, const char *root)
+{
+    char from[RS_PATH], to[RS_PATH];
+    int ok = 1;
+    unsigned i;
+
+    for (i = 0; i < 2; i++) {
+        snprintf(from, sizeof from, "%s/%s", sandbox, k_sio_parts[i]);
+        snprintf(to, sizeof to, "%s/%s", root, k_sio_parts[i]);
+        if (is_dir(from) && !copy_tree(from, to, 1))
+            ok = 0;
+    }
+    return ok;
+}
+
+void recomp_save_sandbox_discard(const char *sandbox)
+{
+    rm_tree(sandbox);
+}
+
 static void sio_err(char *err, unsigned n, const char *fmt, const char *a)
 {
     if (err && n)
