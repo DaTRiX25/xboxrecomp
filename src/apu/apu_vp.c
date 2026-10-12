@@ -42,6 +42,7 @@ static void mix_trace_on_off(MCPXAPUState *d, unsigned v, int on);
 #include "apu_bus.h"
 #include "apu.h"
 static struct apu_bus_rt *s_bus_rt;
+static int s_bus_audition;              /* this frame: an audition clip loops */
 static unsigned s_von_serial[MCPX_HW_MAX_VOICES];
 static uint32_t s_von_stack[MCPX_HW_MAX_VOICES][16];
 static uint8_t s_von_nstack[MCPX_HW_MAX_VOICES];
@@ -2042,7 +2043,10 @@ static void voice_process(MCPXAPUState *d,
             fc.pa = (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, fc.ba);
         }
         bus = apu_bus_voice_bus(v, s_von_serial[v], fc.pa, bus_fill, &fc);
-        if (bus == APU_BUS_BYPASS) {
+        if (s_bus_audition) {
+            /* An audition clip loops (apu_bus.h): the live voices run on,
+             * unheard, and the clip's are mixed in their place. */
+        } else if (bus == APU_BUS_BYPASS) {
             /* The input of an in-place GP effect: as with the mixer off. */
             for (int b = 0; b < 8; b++)
                 for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
@@ -2176,8 +2180,10 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         static int have_map;
         if (!have_map) { mcpx_apu_speaker_map_get(map); have_map = 1; }
         s_bus_rt = apu_bus_frame_begin(d->monitor.channels, map);
+        s_bus_audition = s_bus_rt && apu_bus_audition_playing();
     } else {
         s_bus_rt = NULL;
+        s_bus_audition = 0;
     }
 
     for (int list = 0; list < 3; list++) {
@@ -2215,8 +2221,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         }
     }
 
-    if (s_bus_rt)
+    if (s_bus_rt) {
+        if (s_bus_audition)
+            apu_bus_audition_mix(s_bus_rt, mixbins);
         apu_bus_frame_end(s_bus_rt, mixbins);
+    }
     if (s_mix_on > 0 && s_rec_state > 0)
         mix_rec_frame((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins);
 

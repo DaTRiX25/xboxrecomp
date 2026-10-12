@@ -15,7 +15,7 @@
 enum { MX_MAIN, MX_BUS, MX_SPEAKERS, MX_DUCK, MX_VIEWS };
 enum { MK_DB, MK_MS, MK_BOOL, MK_CHOICE, MK_ACTION, MK_INFO, MK_BUS, MK_UNIT };
 enum { MA_ENABLE, MA_PRESET, MA_AB, MA_BREF, MA_SAVE_COPY, MA_SPEAKERS, MA_DUCK,
-       MA_RESET_OVERS, MA_BUS_RESET, MA_PAN_MOVE };
+       MA_RESET_OVERS, MA_BUS_RESET, MA_PAN_MOVE, MA_AUD, MA_AUD_SAVE };
 
 struct MxItem {
     int kind;
@@ -45,6 +45,7 @@ static uint32_t s_mx_save_at;
 static apu_bus_config s_mx_save_cfg;
 static unsigned s_mx_gen;
 static char s_mx_note[240];
+static int s_mx_aud_keep;              /* the Audition recording row: seconds */
 static bool s_mx_grab;                 /* the pan position follows the D-pad / stick */
 
 /* The presets on offer: the built-in ones, then mixer-*.toml beside the
@@ -198,6 +199,16 @@ static const char *const k_mx_lim[] = { "Off (hard clamp, as shipped)", "Soft cl
 static const int k_mx_lim_v[] = { APU_BUS_LIM_OFF, APU_BUS_LIM_SOFT, APU_BUS_LIM_PEAK };
 static const char *const k_mx_hz[] = { "Off", "60 Hz", "80 Hz", "100 Hz", "120 Hz", "150 Hz" };
 static const int k_mx_hz_v[] = { 0, 60, 80, 100, 120, 150 };
+static const char *const k_mx_keep[] = { "Off", "The last 30 s", "The last 60 s" };
+static const int k_mx_keep_v[] = { 0, 30, 60 };
+
+static void mx_aud_path(char *out, size_t n)
+{
+    char dir[1024];
+    mx_dir(dir, sizeof dir);
+    snprintf(out, n, "%s/mixer-audition.clip", dir);
+}
+
 static const char *const k_mx_xo[] = { "Full range", "60 Hz", "80 Hz", "100 Hz", "120 Hz", "150 Hz" };
 
 static char s_mx_busnames[APU_BUS_MAX][40];
@@ -253,6 +264,23 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
         MxItem &pr = act(MA_PRESET, "Load a preset into A", "Left / right to choose, A to load it over your mix (mixer.toml is rewritten). Files named mixer-<name>.toml beside it are listed too.");
         snprintf(pr.text, sizeof pr.text, "%s", mx_preset_name(s_mx_preset_idx));
         act(MA_SAVE_COPY, "Save a copy of A as a preset file", "Writes mixer-1.toml (or the next free number) beside mixer.toml. Rename it as you like: mixer-<name>.toml.");
+        /* Audition: a recorded stretch of the game's sound, looped through
+         * the mixer in place of the live sound. */
+        s_mx_aud_keep = apu_bus_audition_kept_seconds();
+        choice("Audition recording", &s_mx_aud_keep, k_mx_keep, k_mx_keep_v, 3, "Keeps the last 30 or 60 seconds of the game's sound in memory while you play (about 3 MB a second kept; your own recording, on this machine only), to loop it below. Off: nothing is recorded and no memory is held.");
+        {
+            apu_bus_audition_info ai;
+            apu_bus_audition_get(&ai);
+            const int st = apu_bus_audition_state();
+            MxItem &au = act(MA_AUD, "Audition", "A: loop what was recorded, through the mixer, in place of the live sound (the game runs on, unheard): every change is then heard on the same material. A again: back to the live sound. Right: the saved clip instead. The loop point is cross-faded over 2 s.");
+            if (st == APU_BUS_AUD_OFF)
+                snprintf(au.text, sizeof au.text, s_mx_aud_keep ? "Off (live sound), %.0f s recorded" : "Off (live sound)", (double)ai.kept_s);
+            else
+                snprintf(au.text, sizeof au.text, "%s  %.1f / %.1f s", st == APU_BUS_AUD_FILE ? "Looping the saved clip" : "Looping the recording",
+                         (double)ai.position_s, (double)ai.length_s);
+            if (st != APU_BUS_AUD_OFF)
+                act(MA_AUD_SAVE, "Save this clip", "Writes the looping clip to mixer-audition.clip beside mixer.toml, so it can be looped again after a restart. It is your own recording of the game and stays on this machine.");
+        }
         for (int b = 0; b < nbus; b++) {
             MxItem &m = add(MK_BUS, apu_bus_name(b), "Left / right: the bus gain, 0.5 dB a step (hold: faster). A: its route, sends, trims and LFE send. LB mutes, RB solos, Y resets the bus.");
             m.bus = b;
@@ -406,6 +434,15 @@ static bool mx_adjust(MxItem &m, int dir, apu_bus_config &c)
             }
         } else if (m.action == MA_PRESET) {
             s_mx_preset_idx = (s_mx_preset_idx + dir + mx_preset_count()) % mx_preset_count();
+        } else if (m.action == MA_AUD) {
+            char path[1200];
+            mx_aud_path(path, sizeof path);
+            if (dir > 0) {
+                if (apu_bus_audition_loop_file(path) != 0)
+                    snprintf(s_mx_note, sizeof s_mx_note, "No saved clip (mixer-audition.clip) to loop.");
+            } else {
+                apu_bus_audition_stop();
+            }
         }
         return false;
     default:
@@ -474,6 +511,23 @@ static bool mx_activate(MxItem &m, apu_bus_config &c)
         return false;
     }
     case MA_PAN_MOVE: s_mx_grab = !s_mx_grab; return false;
+    case MA_AUD:
+        if (apu_bus_audition_state() != APU_BUS_AUD_OFF)
+            apu_bus_audition_stop();
+        else if (apu_bus_audition_loop_last() != 0)
+            snprintf(s_mx_note, sizeof s_mx_note, apu_bus_audition_kept_seconds()
+                     ? "Not enough recorded yet: play for at least five seconds, then loop."
+                     : "Nothing is recorded: set Audition recording to 30 or 60 s, play a while, then loop.");
+        return false;
+    case MA_AUD_SAVE: {
+        char path[1200];
+        mx_aud_path(path, sizeof path);
+        if (apu_bus_audition_save(path) == 0)
+            snprintf(s_mx_note, sizeof s_mx_note, "Saved the clip as mixer-audition.clip beside mixer.toml.");
+        else
+            snprintf(s_mx_note, sizeof s_mx_note, "Could not write %s.", path);
+        return false;
+    }
     case MA_SPEAKERS: s_mx_view = MX_SPEAKERS; s_mx_scroll = true; return false;
     case MA_DUCK:     s_mx_view = MX_DUCK; s_mx_scroll = true; return false;
     case MA_RESET_OVERS: apu_bus_reset_overs(); return false;
@@ -694,6 +748,10 @@ static void build_mixer(float fs, ImDrawList *dl)
     }
     s_page_delta = 0;
     s_reset = 0;
+    if (s_mx_view == MX_MAIN && view0 == MX_MAIN && s_mx_aud_keep != apu_bus_audition_kept_seconds()) {
+        apu_bus_audition_keep(s_mx_aud_keep);   /* the Audition recording row */
+        dirty = false;
+    }
     if (dirty)
         mx_changed(c);
     if (s_mx_view != view0) {
@@ -711,7 +769,9 @@ static void build_mixer(float fs, ImDrawList *dl)
         else snprintf(t, sizeof t, "Mixer");
         dl->AddText(ImVec2(p.x, p.y), col(T->text_hi), t);
         if (apu_bus_enabled()) {
-            const char *l = s_mx_live_b ? "listening to B" : "listening to A";
+            const char *l = apu_bus_audition_state() != APU_BUS_AUD_OFF
+                ? (s_mx_live_b ? "AUDITION LOOP, B" : "AUDITION LOOP, A")
+                : s_mx_live_b ? "listening to B" : "listening to A";
             float w = ImGui::CalcTextSize(l).x;
             dl->AddText(ImVec2(p.x + ImGui::GetContentRegionAvail().x - w - fs * 0.5f, p.y),
                         s_mx_live_b ? col(T->warn) : col(T->text_dim), l);
