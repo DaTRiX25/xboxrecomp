@@ -53,6 +53,15 @@ typedef struct {
     uint32_t (*read)(void *ctx, uint32_t off);
     void (*write)(void *ctx, uint32_t off, const uint32_t *words, int n);
     void *ctx;
+    /* The guest's view of the GP's X memory, a dword an X word from X:0,
+     * or NULL. DirectSound does not only load effect states through
+     * commands: it reads them back from here (an I3DL2 listener change
+     * starts by reading the reverb's delay table, which the reverb's own
+     * code completed) and writes some words here directly. The model
+     * keeps its state words and this window the same: a word the guest
+     * changed is taken over before a command or a frame, a word the model
+     * changed is written out after it. */
+    uint32_t *xwin;
 } apu_gp_mem;
 
 /* ── wiring: the title's port, before the APU starts ── */

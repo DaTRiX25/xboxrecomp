@@ -317,11 +317,22 @@ static void gp_follow_lfe(void)
         apu_gp_lfe_lowpass(want);
 }
 
+/* The guest's view of the GP's X memory (apu_gp_mem.xwin): the APU's
+ * register window from 0x30000, plain RAM in this runtime, a dword an X
+ * word. NULL before the memory layout is up. */
+extern void *xbox_McpxWindow(void);
+
+static uint32_t *gp_xwin(void)
+{
+    uint8_t *w = (uint8_t *)xbox_McpxWindow();
+    return w ? (uint32_t *)(w + 0x30000) : NULL;
+}
+
 /* A command about to be acknowledged: its block is the five dwords before
  * the doorbell (GP scratch 0x800..0x80C). */
 static void gp_command(MCPXAPUState *d, const uint32_t *doorbell)
 {
-    apu_gp_mem m = { gp_mem_read, gp_mem_write, d };
+    apu_gp_mem m = { gp_mem_read, gp_mem_write, d, gp_xwin() };
     if (apu_gp_wired())
         apu_gp_command(&m, doorbell[0], doorbell[-4], doorbell[-2], doorbell[-1]);
 }
@@ -489,7 +500,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
          * and the delay lines itself. The return voices then play silence
          * and the reverb has no memory, as in the build the captures were
          * first made with. */
-        apu_gp_mem m = { gp_mem_read, apu_ocap_on() ? NULL : gp_mem_write, d };
+        apu_gp_mem m = { gp_mem_read, apu_ocap_on() ? NULL : gp_mem_write, d, gp_xwin() };
         float acc[APU_SPK_CHANNELS][NUM_SAMPLES_PER_FRAME];
         const int six = d->monitor.channels == APU_SPK_CHANNELS;
         const int nch = six ? APU_SPK_CHANNELS : 2;

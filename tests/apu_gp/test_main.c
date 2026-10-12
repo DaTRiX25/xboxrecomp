@@ -132,6 +132,46 @@ static void test_routing(void)
     CHECK(fabsf(out[FL][N - 1] - 0.5f) < 1e-4f, "one-pole send settles at the input: %g", out[FL][N - 1]);
 }
 
+/* The guest's X window: DirectSound reads effect states back from the
+ * DSP's memory and writes some words there directly. */
+static void test_xwindow(void)
+{
+    static uint32_t win[0x80 + 0x400 + 8];
+    apu_gp_mem m = { rd, wr, NULL, win };
+
+    wire(0);
+    memset(win, 0, sizeof win);
+    drive_params(0x7FFFFF, 0x1FFFFF, 0x0147AE, 0x7FFFFF, 0x3FFFFF, 0x1FFFFF, 0x7FFFFF);
+    apu_gp_command(&m, 3, 0, STATE_OFF, 0x400);
+    CHECK(win[0x80 + EQ_A + 7] == 0x7FFFFF && win[0x80 + EQ_B + 7] == 0x800000 && win[0x80 + DRV + 9] == 0x0147AE,
+          "a loaded state is not in the guest's X window (%06X %06X)", win[0x80 + EQ_A + 7], win[0x80 + EQ_B + 7]);
+    CHECK(win[0x7F] == 0 && win[0x80 + 0x400] == 0, "the window was written outside the state area");
+    /* The guest writes a word there, no command: the model has it. */
+    win[0x80 + EQ_A + 7] = 0x800000;
+    clear();
+    for (int i = 0; i < N; i++) { bins[19][i] = 0.5f; bins[17][i] = 0.01f * (float)(i % 5 - 2); }
+    apu_gp_frame(&m, bins, out);
+    CHECK(fabsf(out[FL][3] + 0.5f) < 1e-6f, "a word the guest wrote into the window did not reach the model: %g", out[FL][3]);
+    /* The model's own running state appears in the window. */
+    CHECK(win[0x80 + DRV + 17] != 0 || win[0x80 + DRV + 18] != 0 || win[0x80 + DRV + 0] != 0,
+          "the distortion's filter state is not in the window");
+    /* ... but a word the model did not change is not rewritten over the guest's. */
+    win[0x80 + EQ_L + 7] = 0x200000;
+    clear();
+    for (int i = 0; i < N; i++) bins[24][i] = 0.5f;
+    apu_gp_frame(&m, bins, out);
+    CHECK(win[0x80 + EQ_L + 7] == 0x200000, "the guest's word was overwritten");
+    /* With no way to write guest memory (a capture) frames leave the window alone. */
+    {
+        apu_gp_mem ro = { rd, NULL, NULL, win };
+        uint32_t before = win[0x80 + DRV + 18];
+        clear();
+        for (int i = 0; i < N; i++) bins[17][i] = 0.02f * (float)(i % 7 - 3);
+        apu_gp_frame(&ro, bins, out);
+        CHECK(win[0x80 + DRV + 18] == before, "a frame wrote the window while a capture was taken");
+    }
+}
+
 static void test_commands(void)
 {
     wire(0);
@@ -412,6 +452,7 @@ int main(void)
     CHECK(apu_gp_bin_speaker(0) == -1 && !apu_gp_export_range(NULL, NULL, NULL), "unwired answers");
     test_routing();
     test_commands();
+    test_xwindow();
     test_export();
     test_drive();
     test_lfe();

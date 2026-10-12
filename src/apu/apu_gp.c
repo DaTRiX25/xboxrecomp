@@ -33,6 +33,10 @@ static struct {
      * GP scratch, copied when the image's state is first loaded. */
     struct { uint32_t off, words; int have, dead; uint32_t code[APU_GP_CODE_MAX]; } prog;
     const apu_gp_mem *mem;              /* of the frame or command running */
+    /* The state words as the guest's X window last had them (xwin_in /
+     * xwin_out), and how many there are (the title's first load). */
+    int32_t xsh[APU_GP_STATE_MAX];
+    uint32_t nstate;
     /* The GP's X memory. The effects' state words (signed 24-bit, loaded
      * from GP scratch by the title's commands) are X:0x80 and up; the
      * mixbins the programs read are at X:0x1400, the speaker sums they add
@@ -243,6 +247,31 @@ static int32_t sx24(uint32_t v)
     return (int32_t)(v << 8) >> 8;
 }
 
+/* The guest's X window and the model's state words (apu_gp_mem.xwin). */
+static void xwin_in(const apu_gp_mem *m)
+{
+    if (!m || !m->xwin)
+        return;
+    for (uint32_t i = 0; i < g.nstate; i++) {
+        int32_t v = sx24(m->xwin[0x80 + i]);
+        if (v != g.xsh[i]) {
+            ST[i] = v;
+            g.xsh[i] = v;
+        }
+    }
+}
+
+static void xwin_out(const apu_gp_mem *m)
+{
+    if (!m || !m->xwin)
+        return;
+    for (uint32_t i = 0; i < g.nstate; i++)
+        if (ST[i] != g.xsh[i]) {
+            m->xwin[0x80 + i] = (uint32_t)ST[i] & 0xFFFFFFu;
+            g.xsh[i] = ST[i];
+        }
+}
+
 void apu_gp_command(const apu_gp_mem *m, uint32_t cmd, uint32_t dst,
                     uint32_t src, uint32_t count)
 {
@@ -266,8 +295,12 @@ void apu_gp_command(const apu_gp_mem *m, uint32_t cmd, uint32_t dst,
         return;
     if (count > APU_GP_STATE_MAX - dst)
         count = APU_GP_STATE_MAX - dst;
+    xwin_in(m);
     for (uint32_t k = 0; k < count; k++)
         ST[dst + k] = sx24(m->read(m->ctx, src + 4 * k));
+    if (dst + count > g.nstate)
+        g.nstate = dst + count;
+    xwin_out(m);
 }
 
 /* ── the distortion ──────────────────────────────────────────────────────
@@ -395,6 +428,7 @@ void apu_gp_frame(const apu_gp_mem *m, float bins[APU_GP_BINS][APU_GP_FRAME],
     static const float k_max = 8388607.0f / 8388608.0f;
 
     memset(out, 0, sizeof(float) * APU_GP_SPEAKERS * APU_GP_FRAME);
+    xwin_in(m);
 
     /* The GP's words are 24 bits: a bin past full scale arrives limited. */
     for (int b = 0; b < APU_GP_BINS; b++)
@@ -528,6 +562,11 @@ void apu_gp_frame(const apu_gp_mem *m, float bins[APU_GP_BINS][APU_GP_FRAME],
              * would survive either; the send is dropped. */
         }
     }
+
+    /* Without a way to write GP scratch (a capture is being taken) the
+     * model leaves the guest's memory alone during frames. */
+    if (m && m->write)
+        xwin_out(m);
 
     if (g.lfe_fade) {
         float a[APU_GP_FRAME], b[APU_GP_FRAME];
