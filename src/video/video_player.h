@@ -88,6 +88,12 @@ void xbox_HostWindowSetTitle(const char *title);
  * code. */
 int xbox_HostWindowMain(int (*guest_main)(void));
 
+/* When the graphics device is lost the window says so in a box and ends the
+ * run; with a restart to offer the box has "Restart" as well. The program's
+ * own restart (recomp_restart.h) is offered when it is available; a host
+ * with another way sets it here. */
+void xbox_FramebufferWindowSetRestart(void (*fn)(void));
+
 /* The window's next present read back into `path` (BMP), whatever it shows.
  * The window's thread only (the overlay's test driver, RECOMP_OVERLAY_TEST);
  * the Metal and Vulkan presenters. */

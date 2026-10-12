@@ -223,7 +223,7 @@ enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER,        /* A_SHADERS on: the build's */
               A_MIXER,                                            /* the Mixer page (overlay_mixer.inc) */
               A_RESTART,                                          /* start the program again (recomp_restart.h) */
-              A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_CANCEL,  /* xbox_OverlaySetSaveIO */
+              A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_RESTORE, A_SAVE_CANCEL,  /* xbox_OverlaySetSaveIO */
               A_RESTART_PIN, A_QUIT };       /* the two rows at the foot of every page: they ask first */
 
 /* The most rows a page has (the Audio page, with the music folder's lines
@@ -310,6 +310,8 @@ static void music_value(char *out, size_t n)
     int len = (int)strcspn(b, "/\\");
     snprintf(out, n, "%.*s", len > 40 ? 40 : len, b);
 }
+
+static uint32_t now_ms();
 
 /* ── save data (xbox_OverlaySetSaveIO, recomp_save_dir.h) ─────────── */
 
@@ -405,6 +407,25 @@ static void sio_action(int action)
         s_fb_purpose = FB_SAVE;
         xsb_open_with(&o);
         s_fb_sel = 0;
+        s_fb_scroll = true;
+        break;
+    }
+    case A_SAVE_RESTORE: {
+        /* The save history (recomp_save_dir.h): each an export, put back the
+         * same way, newest first. */
+        static char hist[1024];
+        xsb_options o;
+        recomp_save_history_dir(s_sio_dir, hist, sizeof hist);
+        memset(&o, 0, sizeof o);
+        o.use_label = "Restore the save in this folder";
+        o.top_label = "Earlier saves";
+        o.top_path = hist;
+        o.start_in = hist;
+        o.newest_first = 1;
+        o.mark = sio_mark;
+        s_fb_purpose = FB_SAVE;
+        xsb_open_with(&o);
+        s_fb_sel = xsb_rows() > 2 ? 2 : 0;        /* on the newest */
         s_fb_scroll = true;
         break;
     }
@@ -722,6 +743,18 @@ static int page_rows(int page, Row *r)
                     snprintf(imp, sizeof imp, "Import save from home folder (none found there)");
                 ACT(A_SAVE_IMPORT, imp);
                 ACT(A_SAVE_BROWSE, "Import save from another folder...");
+                /* Counted now and then, not at every frame. */
+                static int kept = -1;
+                static uint32_t kept_at;
+                static char rest[96];
+                if (kept < 0 || (int32_t)(now_ms() - kept_at) > 2000) {
+                    kept = recomp_save_history_count(s_sio_dir, s_sio_id);
+                    kept_at = now_ms();
+                }
+                if (kept > 0) {
+                    snprintf(rest, sizeof rest, "Restore an earlier save (%d kept)...", kept);
+                    ACT(A_SAVE_RESTORE, rest);
+                }
             }
             if (s_sio_info[0])
                 INFO(s_sio_info);
@@ -2468,6 +2501,9 @@ static void build_pages(float fs)
             ? "Takes the newest exported save in"
             : rows[sel].action == A_SAVE_BROWSE
             ? "Pick the dated folder of an exported save, on a drive or card too; the usual place is"
+            : rows[sel].action == A_SAVE_RESTORE
+            ? "The save as it was before each time the game saved, newest first (the newest 20, one a"
+              " day for a week, one a week for a month). They are kept in"
             : "Forgets the import that is waiting; the exported folder stays in";
         const char *then =
             rows[sel].action == A_SAVE_EXPORT
@@ -2475,8 +2511,10 @@ static void build_pages(float fs)
             : rows[sel].action == A_SAVE_CANCEL ? ""
             : "It replaces the save at the next start, after the save in use is copied aside;"
               " nothing changes under the running game.";
+        char hist[1024];
+        recomp_save_history_dir(s_sio_dir, hist, sizeof hist);
         snprintf(hint, sizeof hint, "%s%s%s %s. %s", s_sio_msg, s_sio_msg[0] ? "  |  " : "", what,
-                 s_sio_dest, then);
+                 rows[sel].action == A_SAVE_RESTORE ? hist : s_sio_dest, then);
     } else if (rows[sel].kind == R_ACTION
                && (rows[sel].action == A_RESTART || rows[sel].action == A_RESTART_PIN)) {
         char why[400];

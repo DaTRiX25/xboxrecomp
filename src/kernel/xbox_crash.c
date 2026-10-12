@@ -375,8 +375,9 @@ static void tee_atexit(void) { xbox_crash_log_flush(500); }
 void __sanitizer_set_death_callback(void (*callback)(void));
 #endif
 
-/* Point fd at a new pipe whose old destination becomes c->out. */
-static int tee_redirect(int fd, TeeChan *c)
+/* Point fd (the stream's own descriptor; std = 1 stdout, 2 stderr) at a
+ * new pipe whose old destination becomes c->out. */
+static int tee_redirect(int fd, int std, TeeChan *c)
 {
 #if defined(_WIN32)
     int p[2];
@@ -389,7 +390,7 @@ static int tee_redirect(int fd, TeeChan *c)
     }
     _close(p[1]);
     c->rd = p[0];
-    SetStdHandle(fd == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE,
+    SetStdHandle(std == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE,
                  (HANDLE)_get_osfhandle(fd));
     return 1;
 #else
@@ -418,8 +419,18 @@ static void tee_start(void)
         return;
     started = 1;
 #if defined(_WIN32)
-    if (_fileno(stderr) < 0 || _get_osfhandle(2) == -1)
-        return;     /* a GUI-subsystem run with no stderr: nothing to tee */
+    /* A window program started with no console and no redirection (from
+     * Explorer, or by a restart, which passes no handles on) has no stderr:
+     * the run log would stay empty. The streams go to NUL, and the tee has
+     * a descriptor to put its pipe on. */
+    if (_fileno(stderr) < 0 || _get_osfhandle(_fileno(stderr)) == -1) {
+        if (!freopen("NUL", "w", stderr))
+            return;
+    }
+    if (_fileno(stdout) < 0 || _get_osfhandle(_fileno(stdout)) == -1)
+        freopen("NUL", "w", stdout);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     InitializeCriticalSection(&s_ring_lock);
 #endif
     fflush(stdout);
@@ -433,17 +444,18 @@ static void tee_start(void)
         same = fstat(1, &a) == 0 && fstat(2, &b) == 0
             && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 #endif
-        if (!tee_redirect(2, &s_tee[0]))
+        int efd = fileno(stderr), ofd = fileno(stdout);
+        if (!tee_redirect(efd, 2, &s_tee[0]))
             return;
         s_err_fd = s_tee[0].out;
         s_ntee = 1;
         if (same) {
 #if defined(_WIN32)
-            _dup2(2, 1);
+            _dup2(efd, ofd);
 #else
-            dup2(2, 1);
+            dup2(efd, ofd);
 #endif
-        } else if (tee_redirect(1, &s_tee[1])) {
+        } else if (ofd >= 0 && tee_redirect(ofd, 1, &s_tee[1])) {
             s_ntee = 2;
         }
     }

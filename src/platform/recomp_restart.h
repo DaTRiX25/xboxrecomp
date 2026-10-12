@@ -38,6 +38,10 @@ extern "C" {
 /* First thing in main (after the arguments are final: on Windows after
  * recomp_win_utf8_args). Without it a restart is not available. */
 void recomp_restart_init(int argc, char **argv);
+/* Windows: a run started by a restart waits in recomp_restart_init for
+ * the run that started it to end (never two at once on the save folder);
+ * one line saying so, for the log once it is open ("" otherwise). */
+const char *recomp_restart_note(void);
 int  recomp_restart_available(void);
 
 /* Ask for it: the next ordinary exit (exit(), main returning) starts the
@@ -59,6 +63,13 @@ void recomp_restart_set_hook(void (*fn)(void));
  * the task does not stay behind in the recents or come back on its own. */
 void recomp_quit_set_hook(void (*fn)(void));
 void recomp_quit_request(const char *why);
+
+/* Tests: what the exec would start (off Windows): the file, its arguments
+ * and environment. In an AppImage the image file (APPIMAGE), named as its
+ * runtime was (ARGV0), without the runtime's variables for the old mount;
+ * otherwise the program itself with the arguments and environment as
+ * given. */
+void recomp_restart_target(const char **exe, char ***argv, char ***envp);
 
 /* Tests: what would be started. Pointers into the module's copies; envp is
  * NULL-terminated "NAME=value" strings. */

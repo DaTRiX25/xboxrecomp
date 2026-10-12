@@ -155,6 +155,10 @@ static int copy_entry(const char *dir, const char *name, int dir_entry, void *vc
 
     snprintf(src, sizeof src, "%s/%s", dir, name);
     snprintf(dst, sizeof dst, "%s/%s", c->to, name);
+    /* A save file on its way to the disk (kernel_saveguard.h) is not a
+     * save: the file beside it is. */
+    if (!dir_entry && n > 5 && !strcmp(name + n - 5, ".~new"))
+        return 1;
     if (dir_entry) {
         if (!copy_tree(src, dst, c->skip_images))
             c->ok = 0;
@@ -184,16 +188,38 @@ static void rm_tree(const char *path)
     rs_rmdir(path);
 }
 
+static int rm_link_dir(const char *p);
+
 static int rm_entry(const char *dir, const char *name, int dir_entry, void *ctx)
 {
     char p[RS_PATH];
     (void)ctx;
     snprintf(p, sizeof p, "%s/%s", dir, name);
-    if (dir_entry)
+    /* A link to a folder is removed, never what it points to. */
+    if (dir_entry && !rm_link_dir(p))
         rm_tree(p);
-    else
+    else if (!dir_entry)
         rs_unlink(p);
     return 1;
+}
+
+/* 1 when `p` was a link (a symbolic link, a junction) and the link alone is
+ * gone now. */
+static int rm_link_dir(const char *p)
+{
+#if defined(_WIN32)
+    DWORD a = GetFileAttributesA(p);
+    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_REPARSE_POINT))
+        return 0;
+    RemoveDirectoryA(p);            /* the junction, not its target */
+    return 1;
+#else
+    struct stat st;
+    if (lstat(p, &st) != 0 || !S_ISLNK(st.st_mode))
+        return 0;
+    unlink(p);
+    return 1;
+#endif
 }
 
 /* ── same contents ─────────────────────────────────────────────────── */
@@ -437,6 +463,23 @@ int recomp_save_dir_migrate(const char *legacy, const char *dir)
     return 1;
 }
 
+/* A name the program gave a dated folder: YYYYMMDD-HHMMSS, maybe "-N". */
+static int stamped_name(const char *name)
+{
+    int i;
+    for (i = 0; i < 15; i++)
+        if (i == 8 ? name[i] != '-' : !isdigit((unsigned char)name[i]))
+            return 0;
+    if (!name[15])
+        return 1;
+    if (name[15] != '-' || !name[16])
+        return 0;
+    for (i = 16; name[i]; i++)
+        if (!isdigit((unsigned char)name[i]) || i > 19)
+            return 0;
+    return 1;
+}
+
 static int collect_entry(const char *dir, const char *name, int dir_entry, void *vctx)
 {
     char (*names)[32] = (char (*)[32])((void **)vctx)[0];
@@ -512,7 +555,10 @@ int recomp_save_backup(const char *dir, int keep, char *out, unsigned out_size)
     }
     for (i = 0; keep > 0 && i < n - keep; i++) {
         snprintf(path, sizeof path, "%s/%s", root, names[i]);
-        rm_tree(path);
+        /* Only what this made: a dated, real folder (never a link, nor a
+         * folder the player put there under another name). */
+        if (stamped_name(names[i]) && is_real_dir(path))
+            rm_tree(path);
     }
     return !same;
 }
@@ -889,6 +935,127 @@ int recomp_save_import_apply(const char *dir, const char *title_id, char *report
     if (report && size)
         snprintf(report, size, "%s", text);
     return 1;
+}
+
+/* ── the save history (recomp_save_dir.h) ──────────────────────────── */
+
+#define SH_DIR "save-history"
+
+static time_t stamp_time(const char *name)
+{
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    if (!stamped_name(name))
+        return (time_t)-1;
+    if (sscanf(name, "%4d%2d%2d-%2d%2d%2d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+               &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6)
+        return (time_t)-1;
+    tm.tm_year -= 1900;
+    tm.tm_mon -= 1;
+    tm.tm_isdst = -1;
+    return mktime(&tm);
+}
+
+void recomp_save_history_keep(const char *const *names, int n, time_t now, int *keep)
+{
+    int i, b, rank = 0;
+    time_t day_seen[RECOMP_SAVE_HISTORY_DAYS], week_seen[RECOMP_SAVE_HISTORY_WEEKS];
+
+    for (i = 0; i < n; i++)
+        keep[i] = 0;
+    for (b = 0; b < RECOMP_SAVE_HISTORY_DAYS; b++)
+        day_seen[b] = 0;
+    for (b = 0; b < RECOMP_SAVE_HISTORY_WEEKS; b++)
+        week_seen[b] = 0;
+    /* Newest first: the newest of each day and each week is the one kept. */
+    for (i = n - 1; i >= 0; i--) {
+        time_t t = stamp_time(names[i]);
+        long age;
+        if (t == (time_t)-1) {
+            keep[i] = 1;                /* not one of ours: never touched */
+            continue;
+        }
+        if (rank++ < RECOMP_SAVE_HISTORY_NEWEST)
+            keep[i] = 1;
+        age = t <= now ? (long)((now - t) / 86400) : 0;
+        if (age < RECOMP_SAVE_HISTORY_DAYS && !day_seen[age]) {
+            day_seen[age] = 1;
+            keep[i] = 1;
+        }
+        if (age / 7 < RECOMP_SAVE_HISTORY_WEEKS && !week_seen[age / 7]) {
+            week_seen[age / 7] = 1;
+            keep[i] = 1;
+        }
+    }
+}
+
+int recomp_save_history_prune(const char *dir, time_t now)
+{
+    static char names[256][32];
+    const char *list[256];
+    int keep[256];
+    char root[RS_PATH], path[RS_PATH];
+    void *ctx[2];
+    int n = 0, i, gone = 0;
+
+    snprintf(root, sizeof root, "%s/%s", dir, SH_DIR);
+    if (!is_real_dir(root))
+        return 0;
+    ctx[0] = names;
+    ctx[1] = &n;
+    for_each(root, collect_entry, ctx);
+    qsort(names, (size_t)n, sizeof names[0], cmp_name);
+    for (i = 0; i < n; i++)
+        list[i] = names[i];
+    recomp_save_history_keep(list, n, now, keep);
+    for (i = 0; i < n; i++) {
+        snprintf(path, sizeof path, "%s/%s", root, names[i]);
+        if (!keep[i] && stamped_name(names[i]) && is_real_dir(path)) {
+            rm_tree(path);
+            gone++;
+        }
+    }
+    return gone;
+}
+
+int recomp_save_history_take(const char *dir, const char *title_id, char *out, unsigned out_size)
+{
+    char root[RS_PATH], err[RS_PATH + 128];
+    int ok;
+
+    snprintf(root, sizeof root, "%s/%s", dir, SH_DIR);
+    ok = recomp_save_export(dir, title_id, root, "kept before the game saved over it", out, out_size,
+                            err, sizeof err);
+    if (!ok && recomp_save_has_data(dir, title_id))
+        fprintf(stderr, "[SAVE] the save could not be kept in the history: %s\n", err);
+    recomp_save_history_prune(dir, time(NULL));
+    return ok;
+}
+
+int recomp_save_history_dir(const char *dir, char *out, unsigned size)
+{
+    snprintf(out, size, "%s/%s", dir, SH_DIR);
+    return is_dir(out);
+}
+
+int recomp_save_history_count(const char *dir, const char *title_id)
+{
+    static char names[256][32];
+    char root[RS_PATH], path[RS_PATH];
+    void *ctx[2];
+    int n = 0, i, c = 0;
+
+    snprintf(root, sizeof root, "%s/%s", dir, SH_DIR);
+    if (!is_dir(root))
+        return 0;
+    ctx[0] = names;
+    ctx[1] = &n;
+    for_each(root, collect_entry, ctx);
+    for (i = 0; i < n; i++) {
+        snprintf(path, sizeof path, "%s/%s", root, names[i]);
+        c += recomp_save_export_check(path, title_id, NULL, 0);
+    }
+    return c;
 }
 
 int recomp_home_dir(char *out, unsigned size)

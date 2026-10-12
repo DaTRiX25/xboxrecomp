@@ -855,7 +855,8 @@ static int gfx_can_restart(void)
 #if defined(__ANDROID__)
     return 1;
 #else
-    return s_restart_fn != NULL;
+    /* The host's hook, or the program's own restart (recomp_restart.h). */
+    return s_restart_fn != NULL || recomp_restart_available();
 #endif
 }
 
@@ -876,6 +877,8 @@ static void gfx_restart(void)
 #else
     if (s_restart_fn)
         s_restart_fn();
+    else
+        recomp_restart_request("The graphics driver stopped working.");
 #endif
 }
 

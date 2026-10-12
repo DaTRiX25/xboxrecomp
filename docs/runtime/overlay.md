@@ -334,6 +334,42 @@ over USB and by some file managers, not by all on Android 11 and later. A
 place every file manager reaches (Download, Documents) needs the storage
 access framework or a zip through MediaStore: not built.
 
+## Save history: restore an earlier save
+
+With the save guard on (`kernel_saveguard.h`, below) and a port that takes
+a copy from its hook (`recomp_save_history_take`), the save root keeps
+`save-history/<YYYYMMDD-HHMMSS>/`: the save as it was right before the game
+wrote over it, each folder an export. Kept: the 20 newest, the newest of
+each of the last 7 days and of each of the last 4 weeks; only dated, real
+folders are removed (never a link, never a folder of another name).
+
+**Restore an earlier save (N kept)...** (on the Advanced page with the
+other save rows, when there is at least one) opens the folder browser in
+`save-history`, newest first, the cursor on the newest. The folder chosen
+is staged exactly like an import: "Restart now (the save is imported at the
+start)", the save in use copied to `save-before-import/` first.
+
+## Saves are replaced whole (kernel_saveguard.h)
+
+A port turns it on with `xbox_SaveGuardEnable("<title id>")` after
+`xbox_path_init`. Then a file under `UDATA/<id>` or `TDATA/<id>` opened for
+writing is a new file beside it (`<name>.~new`, a copy of the old one to
+start with); at its last close a thread of the guard's own flushes it
+(`F_FULLFSYNC` on macOS, `fsync`, `FlushFileBuffers`) and renames it over
+the old name (`rename`, `MoveFileExW` with replace and write-through). The
+title's close returns at once; a later open of the same file waits until
+the rename is done. Same bytes as before: the new file is dropped and
+nothing is renamed. Listings never show a `.~new`; one left by a process
+that ended mid-save is removed at the next enable (the old file beside it
+is the save). Every way out (`exit`, and the exit hooks of the windows that
+end with `ExitProcess`) waits up to two seconds for a save on its way.
+`tests/kernel_saveguard` ends a process at each step of a save and checks
+the file is the old save or the new one, whole.
+
+One running copy per save root: `recomp_instance_lock(save_root, wait_ms)`
+(`recomp_instance.h`) holds `instance.lock` there for the life of the
+process; a second copy is told and does not start. A restart gets it back.
+
 ## Text and fonts
 
 Every string the overlay draws is UTF-8: its own labels and hints, a port's

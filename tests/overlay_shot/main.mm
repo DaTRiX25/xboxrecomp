@@ -811,6 +811,41 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     xbox_OverlayPoll();
     CHECK(!xsb_is_open() && xbox_OverlayOpen());
 
+    /* The save history (BO-129): the restore row, and the browser opened
+     * in the history, newest first. */
+    CHECK(!xbox_OverlayTestHasRow("Restore an earlier save"));
+    {
+        char made[3][1024];
+        for (int k = 0; k < 3; k++)
+            CHECK(recomp_save_history_take(save, "4541005b", made[k], sizeof made[k]));
+        SDL_Delay(2100);                                        /* the count is read every 2 s */
+        run(3);
+        CHECK(xbox_OverlayTestHasRow("Restore an earlier save (3 kept)..."));
+        CHECK(xbox_OverlayTestSelectRow("Restore an earlier save"));
+        run(3);
+        snprintf(path, sizeof path, "%ssave_restore_row.bmp", pre);
+        frame(path);
+        press_a();
+        run(15);                                                /* the marks arrive */
+        CHECK(xsb_is_open());
+        {
+            xsb_row r;
+            const char *newest = strrchr(made[2], '/') + 1;
+            CHECK(xsb_row_at(0, &r) && r.kind == XSB_USE && !strcmp(r.label, "Restore the save in this folder"));
+            CHECK(xsb_row_at(2, &r) && r.kind == XSB_DIR && !strcmp(r.label, newest) && r.songs == 1);
+        }
+        snprintf(path, sizeof path, "%ssave_restore_list.bmp", pre);
+        frame(path);
+        press_a();                                              /* the cursor is on the newest: into it */
+        press(SDL_CONTROLLER_BUTTON_DPAD_UP); press(SDL_CONTROLLER_BUTTON_DPAD_UP);
+        press_a();                                              /* "Restore the save in this folder" */
+        CHECK(!xsb_is_open() && recomp_save_import_staged(save, path, sizeof path)
+              && !strcmp(path, made[2]));
+        CHECK(xbox_OverlayTestHasRow("Restart now (the save is imported at the start)"));
+        CHECK(xbox_OverlayTestSelectRow("Cancel the import"));
+        press_a();
+    }
+
     /* A setting the table flags: the Restart row comes and goes with it. */
     for (int p = 0; p < 12 && !xbox_OverlayTestHasRow("Aspect ratio"); p++)
         press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);

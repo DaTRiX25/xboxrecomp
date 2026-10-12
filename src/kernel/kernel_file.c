@@ -18,6 +18,7 @@
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #endif
 #include "kernel.h"
+#include "kernel_saveguard.h"
 #include <stddef.h>     /* offsetof */
 #include <string.h>
 #include <stdio.h>
@@ -89,6 +90,23 @@ uint32_t xbox_LastFileError(void)
  * does not, so on POSIX that mask skipped every name without a dot (a save
  * folder's, for one). Burnout 3 passes "*", NULL and a name; this is for a
  * title that passes "*.*". */
+/* What xbox_saveguard_open is told about an open (kernel_saveguard.h): 1
+ * when it can change the file's bytes (write access, or an open that
+ * empties or replaces it). An open-if without write access only makes an
+ * empty file that is not there: in place, as before. */
+static int guard_mode(ACCESS_MASK access, ULONG disposition)
+{
+    if (access & (XBOX_GENERIC_WRITE | XBOX_GENERIC_ALL | XBOX_FILE_WRITE_DATA | XBOX_FILE_APPEND_DATA))
+        return 1;
+    switch (disposition) {
+        case XBOX_FILE_SUPERSEDE:
+        case XBOX_FILE_CREATE:
+        case XBOX_FILE_OVERWRITE:
+        case XBOX_FILE_OVERWRITE_IF: return 1;
+        default:                     return 0;
+    }
+}
+
 static int dirinfo_mask_is_all(const XBOX_ANSI_STRING *mask)
 {
     return mask->Length == 3 && !memcmp(mask->Buffer, "*.*", 3);
@@ -290,6 +308,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 {
     WCHAR win_path[MAX_PATH];
     HANDLE h;
+    void *guard;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
     (void)AllocationSize;
 
@@ -324,6 +343,10 @@ NTSTATUS __stdcall xbox_NtCreateFile(
                      "using its containing directory instead");
         }
     }
+
+    /* A save file opened for writing is a new file beside it (kernel_saveguard.h). */
+    guard = xbox_saveguard_open(win_path, MAX_PATH, guard_mode(DesiredAccess, CreateDisposition),
+                                (CreateOptions & XBOX_FILE_DIRECTORY_FILE) != 0);
 
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
@@ -362,6 +385,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
+        xbox_saveguard_opened(guard, NULL, 0);
         /* Kept for the caller's trace. An NTSTATUS says "it did not open";
          * only the Win32 error distinguishes a title probing for a file that
          * is genuinely absent from one it cannot open because this runtime
@@ -387,6 +411,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = h;
+    xbox_saveguard_opened(guard, h, 1);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -460,6 +485,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     }
 
     if (result) {
+        xbox_saveguard_wrote(FileHandle, bytes_written);
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = bytes_written;
         if (Event) SetEvent(Event);
@@ -481,6 +507,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         overwrite_settle(Handle);
         dir_context_release(Handle);
+        xbox_saveguard_close(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -493,6 +520,7 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %S", win_path);
+    xbox_saveguard_settle(win_path);
     if (DeleteFileW(win_path))    return STATUS_SUCCESS;
     if (RemoveDirectoryW(win_path)) return STATUS_SUCCESS;
     return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -618,6 +646,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             }
             if (cur.QuadPart <= info->EndOfFile.QuadPart)
                 SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
+            xbox_saveguard_wrote(FileHandle, 0);
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -651,6 +680,8 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             FILE_DISPOSITION_INFO fdi;
             fdi.DeleteFile = info->DeleteFile;
+            if (info->DeleteFile)
+                xbox_saveguard_deleted(FileHandle);
             if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi)))
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
                          "SetFileDispositionInfo failed: err=%u", GetLastError());
@@ -739,6 +770,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
         return STATUS_INVALID_PARAMETER;
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
+    xbox_saveguard_settle(win_path);
 
     if (!GetFileAttributesExW(win_path, GetFileExInfoStandard, &fad)) {
         DWORD err = GetLastError();
@@ -869,6 +901,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         } else {
             swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
         }
+        xbox_saveguard_settle(search_path);
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
             ctx->find_handle = NULL;
@@ -888,7 +921,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 
     /* FATX enumeration never exposes the host's dot directories. */
     while (!wcscmp(ctx->find_data.cFileName, L".") ||
-           !wcscmp(ctx->find_data.cFileName, L"..")) {
+           !wcscmp(ctx->find_data.cFileName, L"..") ||
+           xbox_saveguard_hidden_name(ctx->find_data.cFileName)) {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
@@ -1147,6 +1181,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             }
         }
     }
+    /* A save file opened for writing is a new file beside it (kernel_saveguard.h). */
+    void *guard = xbox_saveguard_open(host_path, MAX_PATH, guard_mode(DesiredAccess, CreateDisposition),
+                                      (CreateOptions & XBOX_FILE_DIRECTORY_FILE) != 0);
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             mkdir(host_path, 0755);   /* EEXIST is fine */
@@ -1170,6 +1207,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (fd < 0) {
         int e = errno;
         NTSTATUS st = errno_to_status(e);
+        xbox_saveguard_opened(guard, NULL, 0);
         /* ENOENT covers a missing file and a missing directory alike. The
          * console and the Win32 backend (ERROR_PATH_NOT_FOUND) tell them
          * apart, and a title may branch on which, so POSIX does too. */
@@ -1191,6 +1229,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
+    xbox_saveguard_opened(guard, *FileHandle, 1);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -1263,6 +1302,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
         return STATUS_UNSUCCESSFUL;
     }
 
+    xbox_saveguard_wrote(FileHandle, (unsigned)n);
     IoStatusBlock->Status = STATUS_SUCCESS;
     IoStatusBlock->Information = (ULONG_PTR)n;
     if (Event) SetEvent(Event);
@@ -1277,6 +1317,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         overwrite_settle(w32_handle_fd(Handle));
         dir_context_release(Handle);
+        xbox_saveguard_close(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1290,6 +1331,7 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
+    xbox_saveguard_settle(host_path);
     if (unlink(host_path) == 0) return STATUS_SUCCESS;
     if (rmdir(host_path)  == 0) return STATUS_SUCCESS;
     return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -1395,6 +1437,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             overwrite_take(fd);
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
+            xbox_saveguard_wrote(FileHandle, 0);
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -1429,6 +1472,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             if (info->DeleteFile) {
                 const char* p = w32_handle_path(FileHandle);
                 if (p) unlink(p);
+                xbox_saveguard_deleted(FileHandle);
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
@@ -1583,6 +1627,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     const char* xbox_path = get_xbox_path(ObjectAttributes);
     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
+    xbox_saveguard_settle(host_path);
     if (stat(host_path, &st) != 0)
         return STATUS_OBJECT_NAME_NOT_FOUND;
 
@@ -1677,6 +1722,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         if (ctx->dir) { closedir(ctx->dir); ctx->dir = NULL; }
         const char* dpath = w32_handle_path(FileHandle);
         if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
+        xbox_saveguard_settle(dpath);
         ctx->dir = opendir(dpath);
         if (!ctx->dir) {
             LeaveCriticalSection(&s_dir_cs);
@@ -1708,7 +1754,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")
+            || xbox_saveguard_hidden_name(de->d_name))
             continue;
         if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
             break;
