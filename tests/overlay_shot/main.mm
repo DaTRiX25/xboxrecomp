@@ -10,9 +10,11 @@
 #include "overlay.h"
 #include "overlay_metal.h"
 #include "xbox_settings.h"
+#include "apu_bus.h"
 
 #import <Metal/Metal.h>
 #include <SDL.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,6 +118,134 @@ static void run(int n)
     }
 }
 
+/* OVERLAY_SHOT_MIXER=<preset file>: the Mixer page (BO-114) instead of the
+ * tour of the pages: thirteen buses as a title registers them, a little
+ * signal for the meters, and the page driven with keys. */
+static void frame(const char *save);
+static void run(int n);
+
+static void mixer_signal(void)
+{
+    static const int8_t map[32] = { 0, 1, 2, 3, 4, 5, 0, 1, 4, 5, 0, 1, 0, 1, 4, 5, 2, 0, 1,
+                                    0, 1, 4, 5, 2, 3, 0, -1, 1, 0, 1, 0, 1 };
+    static float bins[32][32], feeds[6][32], smp[32][2];
+    static const int bin[8] = { 0, 1, 4, 5, 2, 3, 6, 7 };
+    static unsigned t;
+    for (int f = 0; f < 400; f++) {
+        struct apu_bus_rt *rt = apu_bus_frame_begin(6, map);
+        if (!rt) return;
+        memset(bins, 0, sizeof bins);
+        for (int bus = 0; bus < 12; bus++) {
+            float g[8] = { 0.05f * (float)(bus + 1), 0.04f * (float)(bus + 1), 0.02f, 0.02f, 0, 0.01f, 0, 0 };
+            for (int i = 0; i < 32; i++)
+                smp[i][0] = smp[i][1] = sinf((float)(t + (unsigned)i) * 0.05f * (float)(bus + 1));
+            apu_bus_mix_voice(rt, bus, bins, (const float (*)[2])smp, 1, bin, g);
+        }
+        apu_bus_frame_end(rt, bins);
+        for (int c = 0; c < 6; c++)
+            memcpy(feeds[c], bins[c], sizeof feeds[c]);
+        apu_bus_output(feeds, 6, 32);
+        t += 32;
+    }
+}
+
+static int mixer_tour(const char *pre, const char *file)
+{
+    static const char *const names[13] = {
+        "Music", "DJ", "Film", "Streams", "Player engine", "Player exhaust", "Other cars",
+        "Traffic", "Tyres/road/wind", "Impacts/crash", "Boost", "UI/HUD", "Other" };
+    char path[512];
+    apu_bus_config c;
+
+    remove(file);
+    apu_bus_set_names(names, 13);
+    apu_bus_add_preset("Factory", "The game's own mix.", "");
+    apu_bus_add_preset("Music front", "Music on the front pair only.",
+                       "[bus.music]\nroute = \"sends\"\nsend_fl_db = 0\nsend_fr_db = 0\n");
+    apu_bus_set_file(file);
+
+    tap(SDLK_F1);
+    run(12);
+    tap(SDLK_PAGEDOWN); run(2); tap(SDLK_PAGEDOWN); run(3);       /* Audio */
+    for (int i = 0; i < 5; i++) { tap(SDLK_DOWN); run(1); }        /* the Mixer row */
+    snprintf(path, sizeof path, "%smixer_0_audio.bmp", pre); frame(path);
+    tap(SDLK_RETURN); run(3);
+    CHECK(!apu_bus_enabled());
+    snprintf(path, sizeof path, "%smixer_1_off.bmp", pre); frame(path);
+    tap(SDLK_RETURN); run(3);                                      /* Mixer: On */
+    CHECK(apu_bus_enabled() && xbox_SettingValue(XS_AUDIO_MIXER) != 0);
+    mixer_signal();
+    for (int i = 0; i < 5; i++) { tap(SDLK_DOWN); run(1); }        /* Music */
+    for (int i = 0; i < 4; i++) { tap(SDLK_RIGHT); run(1); }       /* +2 dB */
+    apu_bus_get_config(&c);
+    CHECK(c.bus[0].gain_db == 2.0f);
+    tap(SDLK_DOWN); run(1); tap(SDLK_PAGEUP); run(1);              /* DJ: mute */
+    tap(SDLK_DOWN); run(1); tap(SDLK_PAGEDOWN); run(1);            /* Film: solo */
+    apu_bus_get_config(&c);
+    CHECK(c.bus[1].mute && c.bus[2].solo);
+    tap(SDLK_PAGEDOWN); run(1); tap(SDLK_UP); run(1); tap(SDLK_PAGEUP); run(1);
+    apu_bus_get_config(&c);
+    CHECK(!c.bus[1].mute && !c.bus[2].solo);
+    mixer_signal();
+    snprintf(path, sizeof path, "%smixer_2_main.bmp", pre); frame(path);
+    tap(SDLK_UP); run(1);                                          /* Music */
+    tap(SDLK_RETURN); run(3);                                      /* its page */
+    for (int i = 0; i < 3; i++) { tap(SDLK_DOWN); run(1); }        /* Route */
+    snprintf(path, sizeof path, "%smixer_3_bus_title.bmp", pre); frame(path);
+    tap(SDLK_RIGHT); run(2);
+    apu_bus_get_config(&c);
+    CHECK(c.bus[0].route == APU_BUS_ROUTE_SENDS);
+    for (int i = 0; i < 3; i++) { tap(SDLK_DOWN); run(1); }        /* send to centre: off -> -60 -> up */
+    tap(SDLK_RIGHT); run(1);
+    apu_bus_get_config(&c);
+    CHECK(c.bus[0].send_db[2] == -60.0f);
+    tap(SDLK_LEFT); run(1);
+    apu_bus_get_config(&c);
+    CHECK(c.bus[0].send_db[2] <= APU_BUS_OFF_DB);
+    snprintf(path, sizeof path, "%smixer_4_bus_sends.bmp", pre); frame(path);
+    tap(SDLK_ESCAPE); run(3);                                      /* back to the list */
+    CHECK(xbox_OverlayOpen());
+    /* A/B: B is Factory. */
+    tap(SDLK_F7); run(2);
+    apu_bus_get_config(&c);
+    CHECK(apu_bus_config_is_neutral(&c));
+    snprintf(path, sizeof path, "%smixer_5_b.bmp", pre); frame(path);
+    tap(SDLK_F7); run(2);
+    apu_bus_get_config(&c);
+    CHECK(c.bus[0].gain_db == 2.0f && c.bus[0].route == APU_BUS_ROUTE_SENDS);
+    /* The file follows, a moment after the last change. */
+    SDL_Delay(500); run(3);
+    {
+        apu_bus_config f;
+        char err[160];
+        apu_bus_config_neutral(&f);
+        CHECK(apu_bus_load_file(file, &f, err, sizeof err) == 0);
+        CHECK(f.bus[0].gain_db == 2.0f && f.bus[0].route == APU_BUS_ROUTE_SENDS);
+    }
+    /* Master rows, the speakers and the duck views. */
+    for (int i = 0; i < 13; i++) { tap(SDLK_DOWN); run(1); }       /* Limiter */
+    tap(SDLK_RIGHT); tap(SDLK_RIGHT); run(2);
+    apu_bus_get_config(&c);
+    CHECK(c.limiter == APU_BUS_LIM_PEAK);
+    snprintf(path, sizeof path, "%smixer_6_master.bmp", pre); frame(path);
+    for (int i = 0; i < 4; i++) { tap(SDLK_DOWN); run(1); }        /* Speakers */
+    tap(SDLK_RETURN); run(3);
+    snprintf(path, sizeof path, "%smixer_7_speakers.bmp", pre); frame(path);
+    tap(SDLK_ESCAPE); run(2);
+    tap(SDLK_DOWN); run(1); tap(SDLK_RETURN); run(3);              /* Ducking */
+    tap(SDLK_RETURN); run(2);
+    apu_bus_get_config(&c);
+    CHECK(c.duck.enabled);
+    snprintf(path, sizeof path, "%smixer_8_duck.bmp", pre); frame(path);
+    tap(SDLK_ESCAPE); run(2);
+    tap(SDLK_ESCAPE); run(2);                                      /* the Audio page */
+    CHECK(xbox_OverlayOpen());
+    tap(SDLK_ESCAPE); run(12);
+    CHECK(!xbox_OverlayOpen());
+    fprintf(stderr, s_fail ? "overlay_shot mixer: %d failed\n" : "overlay_shot mixer: ok\n", s_fail);
+    return s_fail ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *pre = argc > 1 ? argv[1] : "overlay_";
@@ -135,6 +265,8 @@ int main(int argc, char **argv)
     q = [dev newCommandQueue];
     xbox_OverlaySetWindow(win);
     xbox_BugReportSetMaker(fake_report);
+    if (getenv("OVERLAY_SHOT_MIXER"))
+        return mixer_tour(pre, getenv("OVERLAY_SHOT_MIXER"));
 
     /* Flips for the graph: mostly 60 Hz, a few long ones. */
     for (int i = 0; i < 150; i++) {
