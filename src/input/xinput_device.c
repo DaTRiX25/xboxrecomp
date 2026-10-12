@@ -173,8 +173,10 @@ static void pad_active(SDL_GameController *c)
         break;
     case SDL_CONTROLLER_TYPE_PS3:
     case SDL_CONTROLLER_TYPE_PS4:
-    case SDL_CONTROLLER_TYPE_PS5:
         f = XBOX_PAD_FAMILY_PLAYSTATION;
+        break;
+    case SDL_CONTROLLER_TYPE_PS5:
+        f = XBOX_PAD_FAMILY_PLAYSTATION5;
         break;
     case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
 #if SDL_VERSION_ATLEAST(2, 24, 0)
@@ -193,7 +195,7 @@ static void pad_active(SDL_GameController *c)
                               SDL_GameControllerGetProduct(c), SDL_GameControllerName(c),
                               sd && sd[0] == '1');
     if (c != last || !said) {
-        static const char *const fam[] = { "unknown (xbox original)", "xbox modern", "playstation", "nintendo", "steam" };
+        static const char *const fam[] = { "unknown (xbox original)", "xbox modern", "playstation", "nintendo", "steam", "playstation 5 (DualSense)" };
         char d[160];
         const char *name = SDL_GameControllerName(c);
         snprintf(d, sizeof d, "\"%s\" %04x:%04x", name ? name : "?",

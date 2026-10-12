@@ -11,11 +11,12 @@
 #include <string.h>
 
 static const char *const k_mode[XBOX_GLYPHS_MODE_COUNT] = {
-    "auto", "xbox", "xbox_modern", "playstation", "nintendo", "steam"
+    "auto", "xbox", "xbox_modern", "playstation", "playstation5", "nintendo", "steam", "positional"
 };
 static const char *const k_set[XBOX_GLYPH_SET_COUNT] = {
     "xbox (the title's own)", "playstation", "nintendo (by position)",
-    "nintendo (by letter)", "steam", "xbox modern (LB RB LT RT)"
+    "nintendo (by letter)", "steam", "xbox modern (LB RB LT RT)",
+    "positional", "positional (read by letter)", "playstation 5 (DualSense)"
 };
 
 static int ci_has(const char *s, const char *sub)
@@ -54,6 +55,8 @@ xbox_pad_family xbox_PadFamilyFromIds(xbox_pad_family by_type, unsigned vendor,
     }
     if (ci_has(name, "steam deck"))
         return XBOX_PAD_FAMILY_STEAM;
+    if (vendor == 0x054Cu && (product == 0x0CE6u || product == 0x0DF2u))
+        return XBOX_PAD_FAMILY_PLAYSTATION5;
     if (by_type != XBOX_PAD_FAMILY_XBOX)
         return by_type;
     if (vendor == 0x054Cu)
@@ -77,8 +80,12 @@ xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family
         return XBOX_GLYPH_SET_XBOX_MODERN;
     case XBOX_GLYPHS_PLAYSTATION:
         return XBOX_GLYPH_SET_PLAYSTATION;
+    case XBOX_GLYPHS_PLAYSTATION5:
+        return XBOX_GLYPH_SET_PLAYSTATION5;
     case XBOX_GLYPHS_STEAM:
         return XBOX_GLYPH_SET_STEAM;
+    case XBOX_GLYPHS_POSITIONAL:
+        return by_letter ? XBOX_GLYPH_SET_POSITIONAL_SWAPPED : XBOX_GLYPH_SET_POSITIONAL;
     case XBOX_GLYPHS_NINTENDO:
         return by_letter ? XBOX_GLYPH_SET_NINTENDO_LABEL : XBOX_GLYPH_SET_NINTENDO_POSITION;
     default:
@@ -87,13 +94,17 @@ xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family
     switch (family) {
     case XBOX_PAD_FAMILY_PLAYSTATION:
         return XBOX_GLYPH_SET_PLAYSTATION;
+    case XBOX_PAD_FAMILY_PLAYSTATION5:
+        return XBOX_GLYPH_SET_PLAYSTATION5;
     case XBOX_PAD_FAMILY_STEAM:
         return XBOX_GLYPH_SET_STEAM;
     case XBOX_PAD_FAMILY_NINTENDO:
         return by_letter ? XBOX_GLYPH_SET_NINTENDO_LABEL : XBOX_GLYPH_SET_NINTENDO_POSITION;
     case XBOX_PAD_FAMILY_XBOX_MODERN:
         return face_nintendo ? XBOX_GLYPH_SET_NINTENDO_LABEL : XBOX_GLYPH_SET_XBOX_MODERN;
-    default:
+    case XBOX_PAD_FAMILY_XBOX:      /* a pad of no known family */
+        return by_letter ? XBOX_GLYPH_SET_POSITIONAL_SWAPPED : XBOX_GLYPH_SET_POSITIONAL;
+    default:                        /* no pad yet */
         return face_nintendo ? XBOX_GLYPH_SET_NINTENDO_LABEL : XBOX_GLYPH_SET_XBOX;
     }
 }
@@ -119,7 +130,7 @@ int xbox_GlyphModeFromName(const char *s)
 /* ── state ───────────────────────────────────────────────────────────── */
 
 static _Atomic int s_mode = -1;                 /* -1: the environment */
-static _Atomic int s_family = XBOX_PAD_FAMILY_XBOX;
+static _Atomic int s_family = XBOX_PAD_FAMILY_NONE;
 static _Atomic int s_label_mapped;
 static _Atomic int s_set = XBOX_GLYPH_SET_XBOX;
 static void (*_Atomic s_listener)(int);

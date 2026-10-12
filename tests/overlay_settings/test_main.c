@@ -548,6 +548,20 @@ int main(void)
     }
     xbox_SettingReset(XS_INPUT_GLYPHS);
     CHECK(st_glyphs == 0);
+    xbox_SettingSet(XS_INPUT_GLYPHS, 7);                /* positional, the last choice */
+    CHECK(st_glyphs == 7);
+    xbox_SettingsFlush();
+    {
+        char err[256];
+        recomp_cfg *c = recomp_cfg_load_file(path, err, sizeof err);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(!strcmp(recomp_cfg_string(c, "input.glyphs", ""), "positional"));
+            recomp_cfg_free(c);
+        }
+    }
+    xbox_SettingReset(XS_INPUT_GLYPHS);
+    CHECK(st_glyphs == 0);
 
     /* audio.custom_music_level in the file: written by name when changed,
      * forgotten at the default, read back from the file at start. */
