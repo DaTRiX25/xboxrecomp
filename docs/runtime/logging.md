@@ -32,8 +32,9 @@ A crash, a hang report or a fault turns it on for the rest of the run.
 stderr to `<save dir>/logs/run.log` (first 64 KB) and `run.tail.log`
 (384 KB, rotated once), at most about 830 KB a run, the last three runs kept
 as `prev1..3`; Android also logcat and `<files>/takedawn.log`. In a quiet run
-only errors and notices reach them, and `xbox_kernel.log` (the kernel's
-`xbox_log`) is not written. The bug report says whether logging was on and
+only errors and notices reach them, and the kernel's own `xbox_log` writes
+nothing (no `xbox_kernel.log`; its ERROR level is the HLE's bookkeeping, such
+as unresolved ordinal slots, nothing a player can act on). The bug report says whether logging was on and
 how to get a full log.
 
 **Testing a release build with today's log** (launchers on test machines):

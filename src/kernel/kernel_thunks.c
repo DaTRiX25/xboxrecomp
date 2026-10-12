@@ -406,15 +406,18 @@ void xbox_kernel_init(void)
     g_log_cs_init = TRUE;
 
     /* Try to open log file, fall back to stderr */
-    /* Not in a quiet run (xr_log.h): no file, and errors only, to stderr. */
+    /* Not in a quiet run (xr_log.h): no file and no line. Its ERROR level
+     * is the HLE's own bookkeeping (an unresolved ordinal slot, a stub
+     * called), nothing a player can act on; what is fatal says so with
+     * XR_ERROR. */
     if (XR_DIAG_ON())
         g_log_file = fopen("xbox_kernel.log", "w");
     else
-        g_log_level = XBOX_LOG_ERROR;
+        g_log_level = XBOX_LOG_ERROR - 1;
 
     /* Set log level from environment variable if present */
     const char* log_env = recomp_env(RENV_LOG_LEVEL);
-    if (log_env) {
+    if (log_env && XR_DIAG_ON()) {
         g_log_level = atoi(log_env);
         if (g_log_level < XBOX_LOG_ERROR) g_log_level = XBOX_LOG_ERROR;
         if (g_log_level > XBOX_LOG_TRACE) g_log_level = XBOX_LOG_TRACE;
