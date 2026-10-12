@@ -47,7 +47,17 @@ int main(void)
     /* Steam Input's virtual pad is any pad at all: Steam's only on a Deck. */
     CHECK(xbox_PadFamilyFromIds(X, 0x28DE, 0x11FF, "Steam Virtual Gamepad", 1) == DK);
     CHECK(xbox_PadFamilyFromIds(XM, 0x28DE, 0x11FF, "Steam Virtual Gamepad", 1) == DK);
-    CHECK(xbox_PadFamilyFromIds(X, 0x28DE, 0x11FF, "Steam Virtual Gamepad", 0) == X);
+    CHECK(xbox_PadFamilyFromIds(X, 0x28DE, 0x11FF, "Steam Virtual Gamepad", 0) == XM);
+    /* Windows, as SDL reports the common pads there (type first, then ids) */
+    CHECK(xbox_PadFamilyFromIds(XM, 0x045E, 0x02FF, "Xbox One Controller", 0) == XM);       /* XInput */
+    CHECK(xbox_PadFamilyFromIds(X, 0x054C, 0x05C4, "Wireless Controller", 0) == PS);         /* DualShock 4, untyped */
+    CHECK(xbox_PadFamilyFromIds(X, 0x054C, 0x09CC, "Wireless Controller", 0) == PS);         /* DualShock 4 v2 */
+    CHECK(xbox_PadFamilyFromIds(X, 0x054C, 0x0CE6, "DualSense Wireless Controller", 0) == PS);
+    CHECK(xbox_PadFamilyFromIds(X, 0x054C, 0x0DF2, "DualSense Edge", 0) == PS);
+    CHECK(xbox_PadFamilyFromIds(X, 0x057E, 0x2009, "Pro Controller", 0) == NI);
+    CHECK(xbox_PadFamilyFromIds(XM, 0x28DE, 0x11FF, "Xbox 360 Controller", 0) == XM);        /* Steam Input, XInput */
+    CHECK(xbox_PadFamilyFromIds(PS, 0x28DE, 0x11FF, "Steam Virtual Gamepad", 0) == XM);
+    CHECK(xbox_PadFamilyFromIds(X, 0x28DE, 0x1304, "Steam Controller", 0) == DK);
     CHECK(xbox_PadFamilyFromIds(XM, 0x28DE, 0x11FF, "Steam Virtual Gamepad", 0) == XM);
     /* SteamDeck=1 alone does not make a wired Xbox pad Valve's (no Steam Input). */
     CHECK(xbox_PadFamilyFromIds(XM, 0x045E, 0x028E, "Xbox 360 Controller", 1) == XM);
