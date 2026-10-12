@@ -291,6 +291,7 @@ extern "C" {
     X(PAD_PRESS,         DEBUG, "pad_press",       "RECOMP_PAD_PRESS",         "=mask: pulse these buttons (USB pad)") \
     X(FB_DUMP,           DEBUG, "fb_dump",         "RECOMP_FB_DUMP",           "=prefix: frame dumps (CPU/Metal, window)") \
     X(TEXREP_DUMP,       DEBUG, "texrep_dump",     NULL,                       "=dir: every texture a GPU backend (Metal, Vulkan) uploads, once per content, as <hash>_<w>x<h>_f<format>.tga with an index.tsv (the hash is the one nv2a_texrep registers)") \
+    X(CHEATS,            DEBUG, "cheats",          NULL,                       "shows the Advanced page's cheat rows (xbox_OverlaySetCheats), a tester's tool: while one is on the title's saves go to a copy of the save") \
     X(UI_SCALE_ALGO,     DEBUG, "ui_scale_algo",   NULL,                       "=bicubic: graphics.ui_scale scales with a Catmull-Rom bicubic instead of Super-xBR (for comparison)") \
     X(UI_SCALE_HOLD,     DEBUG, "ui_scale_hold",   NULL,                       "graphics.ui_scale held off whatever the setting and the environment say: =1 on any platform, =0 lifts the hold where it is the default (Android, until the GPU hang seen on an Adreno 650 with it is understood)") \
     X(UI_SCALE_CACHE_MB, DEBUG, "ui_scale_cache_mb", NULL,                     "=n: size bound of graphics.ui_scale's disk cache of scaled textures, in MB (default 256); 0: no disk cache") \

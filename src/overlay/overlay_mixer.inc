@@ -250,14 +250,14 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
         add(MK_INFO, "YOU HEAR B, the reference preset. Edits here change B and are not saved. F7 / Back+Y: back to A.", NULL);
 
     if (s_mx_view == MX_MAIN) {
-        MxItem &en = act(MA_ENABLE, "Mixer", "Off: the game's mix, exactly as without this page. On with the Factory preset it is still the same output, bit for bit; everything below is a change you make.");
+        MxItem &en = act(MA_ENABLE, "Mixer", "Off plays the game's mix untouched. With the Factory preset on, the output is still identical bit for bit; everything below is a change you make.");
         snprintf(en.text, sizeof en.text, "%s", on ? "On" : "Off");
         if (!on) {
             add(MK_INFO, "Turn the mixer on to hear and edit the buses below.", NULL);
             return n;
         }
-        add(MK_INFO, "The game keeps running while the mixer is open: every change is heard at once.", NULL);
-        MxItem &ab = act(MA_AB, "Listening to", "A is your mix, kept in mixer.toml. B is a reference held in memory. F7, or Back + Y on a pad, switches between them at any time, also with this menu closed.");
+        add(MK_INFO, "The game keeps running while the mixer is open, so you hear changes as you make them.", NULL);
+        MxItem &ab = act(MA_AB, "Listening to", "A is your mix, kept in mixer.toml. B is a reference held in memory. F7, or Back + Y on a pad, switches between them at any time, even with this menu closed.");
         snprintf(ab.text, sizeof ab.text, "%s", s_mx_live_b ? "B (reference)" : "A (your mix)");
         MxItem &br = act(MA_BREF, "B is", "Left / right: the preset B holds. Edits made while B is heard change B only and are not saved.");
         snprintf(br.text, sizeof br.text, "%s", mx_preset_name(s_mx_b_idx));
@@ -267,19 +267,19 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
         /* Audition: a recorded stretch of the game's sound, looped through
          * the mixer in place of the live sound. */
         s_mx_aud_keep = apu_bus_audition_kept_seconds();
-        choice("Audition recording", &s_mx_aud_keep, k_mx_keep, k_mx_keep_v, 3, "Keeps the last 30 or 60 seconds of the game's sound in memory while you play (about 3 MB a second kept; your own recording, on this machine only), to loop it below. Off: nothing is recorded and no memory is held.");
+        choice("Audition recording", &s_mx_aud_keep, k_mx_keep, k_mx_keep_v, 3, "Keeps the last 30 or 60 seconds of the game's sound in memory while you play (about 3 MB per second), so you can loop it below. Off records nothing and holds no memory.");
         {
             apu_bus_audition_info ai;
             apu_bus_audition_get(&ai);
             const int st = apu_bus_audition_state();
-            MxItem &au = act(MA_AUD, "Audition", "A: loop what was recorded, through the mixer, in place of the live sound (the game runs on, unheard): every change is then heard on the same material. A again: back to the live sound. Right: the saved clip instead. The loop point is cross-faded over 2 s.");
+            MxItem &au = act(MA_AUD, "Audition", "A loops the recording through the mixer in place of the live sound (the game keeps running, unheard), so every change is heard on the same material. A again returns to the live sound. Right selects the saved clip instead. The loop point is cross-faded over 2 s.");
             if (st == APU_BUS_AUD_OFF)
                 snprintf(au.text, sizeof au.text, s_mx_aud_keep ? "Off (live sound), %.0f s recorded" : "Off (live sound)", (double)ai.kept_s);
             else
                 snprintf(au.text, sizeof au.text, "%s  %.1f / %.1f s", st == APU_BUS_AUD_FILE ? "Looping the saved clip" : "Looping the recording",
                          (double)ai.position_s, (double)ai.length_s);
             if (st != APU_BUS_AUD_OFF)
-                act(MA_AUD_SAVE, "Save this clip", "Writes the looping clip to mixer-audition.clip beside mixer.toml, so it can be looped again after a restart. It is your own recording of the game and stays on this machine.");
+                act(MA_AUD_SAVE, "Save this clip", "Saves the looping clip to mixer-audition.clip beside mixer.toml, so you can loop it again after a restart.");
         }
         for (int b = 0; b < nbus; b++) {
             MxItem &m = add(MK_BUS, apu_bus_name(b), "Left / right: the bus gain, 0.5 dB a step (hold: faster). A: its route, sends, trims and LFE send. LB mutes, RB solos, Y resets the bus.");
@@ -517,7 +517,7 @@ static bool mx_activate(MxItem &m, apu_bus_config &c)
         else if (apu_bus_audition_loop_last() != 0)
             snprintf(s_mx_note, sizeof s_mx_note, apu_bus_audition_kept_seconds()
                      ? "Not enough recorded yet: play for at least five seconds, then loop."
-                     : "Nothing is recorded: set Audition recording to 30 or 60 s, play a while, then loop.");
+                     : "No recording yet: set Audition recording to 30 or 60 s, play a while, then loop.");
         return false;
     case MA_AUD_SAVE: {
         char path[1200];

@@ -13,6 +13,7 @@
 #include "apu_bus.h"
 #include "nv2a_texrep.h"
 #include "pad_glyphs.h"
+#include "recomp_env.h"
 
 #import <Metal/Metal.h>
 #include <SDL.h>
@@ -1279,6 +1280,10 @@ int main(int argc, char **argv)
             pad(SDL_CONTROLLER_BUTTON_A, false);
             run(2);
             CHECK(s_reports == 2 && s_report_shot == 1);
+            /* The cheat rows are a tester's: none until RECOMP_DEBUG=cheats. */
+            CHECK(!xbox_OverlayTestHasRow("Unlock everything") && !xbox_OverlayTestHasRow("Cheats"));
+            recomp_env_set(RENV_CHEATS, "1");
+            run(2);
             /* The cheats: label and state as a setting's row; A once shows
              * the warning and asks again. */
             CHECK(xbox_OverlayTestSelectRow("Unlock everything"));
