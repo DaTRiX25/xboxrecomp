@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #if defined(_WIN32)
 #include <direct.h>
+#include <windows.h>
+#include <process.h>
 #define mkdir(p, m) _mkdir(p)
 #else
 #include <unistd.h>
@@ -163,6 +165,58 @@ static void test_nothing_staged(void)
 }
 #else
 static void test_nothing_staged(void) {}
+#endif
+
+#if defined(_WIN32)
+/* Windows: the history copy beside the title's own handles. The title's save
+ * opens ask for DELETE access (0xC0110000) and pass its share mode to
+ * CreateFile (kernel_file.c); a reader that does not share deleting (the
+ * CRT's fopen) cannot open such a file. */
+static HANDLE hold(const char *rel, DWORD access, DWORD share)
+{
+    return CreateFileA(in(rel), access, share, NULL, OPEN_EXISTING, 0, NULL);
+}
+
+static unsigned __stdcall let_go(void *h)
+{
+    Sleep(150);
+    CloseHandle((HANDLE)h);
+    return 0;
+}
+
+static void test_history_beside_open_files(void)
+{
+    char made[1024], err[3000];
+    HANDLE h;
+
+    make_root("W", "profile of W");
+    /* As the title holds a save it writes: DELETE access, reading shared. */
+    h = hold("W/UDATA/" ID "/57BD267AFF58/SaveMeta.xbx", GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ);
+    CHECK("win: the title's handle opens", h != INVALID_HANDLE_VALUE);
+    CHECK("win: history beside a handle with DELETE access",
+          recomp_save_history_take(in("W"), ID, made, sizeof made)
+          && has(join(made, "UDATA/" ID "/57BD267AFF58/SaveMeta.xbx"), "savemeta"));
+    CloseHandle(h);
+
+    /* A handle that shares nothing, let go of in 150 ms: the bounded retry. */
+    h = hold("W/UDATA/" ID "/57BD267AFF58/Profile 1", GENERIC_READ, 0);
+    CHECK("win: a handle sharing nothing opens", h != INVALID_HANDLE_VALUE);
+    CloseHandle((HANDLE)_beginthreadex(NULL, 0, let_go, h, 0, NULL));
+    CHECK("win: history waits briefly for a file held a moment",
+          recomp_save_history_take(in("W"), ID, made, sizeof made)
+          && has(join(made, "UDATA/" ID "/57BD267AFF58/Profile 1"), "profile of W"));
+
+    /* Held throughout: no copy, the reason named, the save untouched. */
+    h = hold("W/UDATA/" ID "/57BD267AFF58/Profile 1", GENERIC_READ, 0);
+    err[0] = 0;
+    CHECK("win: a file held throughout: no copy",
+          !recomp_save_export(in("W"), ID, in("W/save-history"), NULL, made, sizeof made, err, sizeof err));
+    printf("  (%s)\n", err);
+    CHECK("win: the reason names the file and Windows error 32",
+          strstr(err, "Profile 1") && strstr(err, "Windows error 32"));
+    CloseHandle(h);
+    CHECK("win: the save itself is untouched", has(in("W/UDATA/" ID "/57BD267AFF58/Profile 1"), "profile of W"));
+}
 #endif
 
 int main(int argc, char **argv)
@@ -358,6 +412,9 @@ int main(int argc, char **argv)
         CHECK("history: a folder of another name is left alone", there(in("H/save-history/keep-me/note.txt")));
         CHECK("history: the save itself is untouched", has(in("H/UDATA/" ID "/57BD267AFF58/Profile 1"), "profile of H"));
     }
+#if defined(_WIN32)
+    test_history_beside_open_files();
+#endif
     printf(failures ? "%d FAILED\n" : "ok\n", failures);
     return failures ? 1 : 0;
 }
