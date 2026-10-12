@@ -498,7 +498,7 @@ int apu_bus_voice_bus(unsigned voice, unsigned serial, uint32_t pa,
         memset(&v, 0, sizeof(v));
         if (fill(ctx, &v)) {
             bus = s_classify(&v);
-            if (bus < 0 || bus >= s_nbus) bus = other;
+            if (bus != APU_BUS_BYPASS && (bus < 0 || bus >= s_nbus)) bus = other;
         }
     }
     s_vbus[voice].gen = gen;

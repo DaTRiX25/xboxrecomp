@@ -16,6 +16,7 @@ add_library(xbox_apu STATIC
     apu_wav.c
     apu_speakers.c
     apu_bus.c
+    apu_gp.c
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

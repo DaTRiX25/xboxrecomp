@@ -1745,6 +1745,11 @@ static void mix_trace_report(MCPXAPUState *d)
     fflush(s_mix_f);
 }
 
+/* A voice buffer in the GP model's export block (apu_dsp.c): 1 + its
+ * mixbin, else 0. */
+int mcpx_apu_gp_export_buffer(MCPXAPUState *d, uint32_t pa);
+int apu_gp_wired(void);
+
 /* What the mixer's classifier is told about voice v (apu_bus.h). */
 struct bus_fill_ctx { MCPXAPUState *d; unsigned v; const int *bin; uint32_t pa, ba; };
 
@@ -1775,12 +1780,32 @@ static int bus_fill(void *ctx_, apu_bus_voice *o)
     }
     o->stack = s_von_stack[c->v];
     o->nstack = s_von_nstack[c->v];
+    o->gp_return = !o->stream && c->pa ? mcpx_apu_gp_export_buffer(d, c->pa) : 0;
     return 1;
 }
 
 /* ============================================================
  * Voice processing (main per-voice function)
  * ============================================================ */
+
+/* A looping buffer voice at the frame rate whose buffer lies in the GP
+ * model's export block (apu_dsp.c): a title's return voice. */
+
+static bool voice_plays_gp_export(MCPXAPUState *d, uint16_t v, float rate)
+{
+    uint32_t fmt, ba;
+
+    if (!apu_gp_wired() || rate != 1.0f)
+        return false;
+    fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+    if ((fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) || !(fmt & NV_PAVS_VOICE_CFG_FMT_LOOP) ||
+        ((fmt & NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE) >> 30) !=
+            NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B32)
+        return false;
+    ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START, NV_PAVS_VOICE_CUR_PSL_START_BA);
+    return mcpx_apu_gp_export_buffer(
+        d, (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, ba)) != 0;
+}
 
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
@@ -1846,6 +1871,32 @@ static void voice_process(MCPXAPUState *d,
                                         NV_PAVS_VOICE_CFG_FMT_CLEAR_MIX) != 0;
         if (clear_mix) {
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
+        }
+    } else if (voice_plays_gp_export(d, v, rate)) {
+        /* A voice whose buffer is the block the GP model exports each
+         * frame (apu_gp.h), at the frame rate: the block as it is, one
+         * frame after the bins it was made from, since the voices are
+         * mixed before the GP stage runs. Not through the interpolator
+         * below: that keeps one source sample in hand, so the first sample
+         * of every frame would come from the block before. */
+        MCPXAPUVoiceFilter *f = &d->vp.filters[v];
+        if (f->rs_have) {
+            /* Back over what the interpolator had fetched and not played. */
+            uint32_t len = 1 + voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT,
+                                              NV_PAVS_VOICE_PAR_NEXT_EBO);
+            uint32_t cbo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                                          NV_PAVS_VOICE_PAR_OFFSET_CBO);
+            uint32_t held = f->rs_pos >= 1.0f ? 1 : 2;
+            voice_set_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                           NV_PAVS_VOICE_PAR_OFFSET_CBO, (cbo + len - held % len) % len);
+            f->rs_have = 0;
+        }
+        for (int sample_count = 0, tries = 0;
+             sample_count < NUM_SAMPLES_PER_FRAME && tries < 4; tries++) {
+            int count = voice_get_samples(d, v, &samples[sample_count],
+                                          NUM_SAMPLES_PER_FRAME - sample_count);
+            if (count < 0) break;
+            sample_count += count;
         }
     } else {
         int empty = 0;
@@ -1991,6 +2042,12 @@ static void voice_process(MCPXAPUState *d,
             fc.pa = (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, fc.ba);
         }
         bus = apu_bus_voice_bus(v, s_von_serial[v], fc.pa, bus_fill, &fc);
+        if (bus == APU_BUS_BYPASS) {
+            /* The input of an in-place GP effect: as with the mixer off. */
+            for (int b = 0; b < 8; b++)
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                    mixbins[bin[b]][i] += gs[b] * samples[i][(unsigned)b % channels];
+        } else
         apu_bus_mix_voice(s_bus_rt, bus, mixbins, (const float (*)[2])samples,
                           channels, bin, gs);
     } else
