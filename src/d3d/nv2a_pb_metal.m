@@ -490,11 +490,13 @@ static void ensure_cmd(void)
 /* RECOMP_TRACE=metal_frame: the flip's passes in order, one line a flip:
  *   [metal] frame 1234: 5 passes 2 copies | 0x03A52000 640x480 C 212 | ...
  * a pass is a target's offset and guest size, C (cleared) or L (loaded), its
- * draws and, after '>', the host size of the target (render scale applied); "copy WxH" a self copy (the target copied to a texture so that
+ * draws and, after '>', the host size of the target (render scale applied) and
+ * "i<n>", the indices those draws sent (what a level-of-detail change moves
+ * when the draws stay the same); "copy WxH" a self copy (the target copied to a texture so that
  * a draw into it can sample it). What a title's post effect costs in passes
  * and full-screen copies is read off two such lines. */
 #define MF_MAX 64
-static struct { uint32_t off, w, h, hw, hh, draws; char kind; } s_mf[MF_MAX];
+static struct { uint32_t off, w, h, hw, hh, draws, idx; char kind; } s_mf[MF_MAX];
 static int s_mf_n, s_mf_over, s_mf_on = -1;
 
 static void mf_add(char kind, const RenderTarget *rt)
@@ -513,6 +515,7 @@ static void mf_add(char kind, const RenderTarget *rt)
     s_mf[s_mf_n].hw = rt->hw;
     s_mf[s_mf_n].hh = rt->hh;
     s_mf[s_mf_n].draws = 0;
+    s_mf[s_mf_n].idx = 0;
     s_mf[s_mf_n++].kind = kind;
 }
 
@@ -531,9 +534,9 @@ static void mf_flip(void)
             n += snprintf(line + n, sizeof line - (size_t)n, " | copy %ux%u",
                           s_mf[i].w, s_mf[i].h);
         else
-            n += snprintf(line + n, sizeof line - (size_t)n, " | 0x%08X %ux%u %c %u >%ux%u",
+            n += snprintf(line + n, sizeof line - (size_t)n, " | 0x%08X %ux%u %c %u >%ux%u i%u",
                           s_mf[i].off, s_mf[i].w, s_mf[i].h, s_mf[i].kind, s_mf[i].draws,
-                          s_mf[i].hw, s_mf[i].hh);
+                          s_mf[i].hw, s_mf[i].hh, s_mf[i].idx);
     }
     fprintf(stderr, LOGP "%s\n", line);
     s_mf_n = s_mf_over = 0;
@@ -3240,8 +3243,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         s_draws++;
         rt->gen = ++s_rt_seq;
-        if (s_mf_on > 0 && s_mf_n && s_mf[s_mf_n - 1].kind != 'X')
+        if (s_mf_on > 0 && s_mf_n && s_mf[s_mf_n - 1].kind != 'X') {
             s_mf[s_mf_n - 1].draws++;
+            s_mf[s_mf_n - 1].idx += (uint32_t)nidx;
+        }
     }
 }
 

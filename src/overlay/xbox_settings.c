@@ -55,6 +55,7 @@ static const char *const k_face[]     = { "xbox", "nintendo", NULL };
 static const char *const k_vibration[] = { "auto", "controller", "device", "off", NULL };
 #endif
 static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
+static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
@@ -102,6 +103,9 @@ static xs_setting s_set[XS_COUNT] = {
     /* Both off as shipped: today's picture, bit for bit. */
     [XS_GRAPHICS_LOD_BIAS]  = SETTING("graphics.lod_bias", XS_CHOICE, 0, RENV_GFX_LOD_BIAS, k_lod, k_lod_env, 0, 0, 0),
     [XS_GRAPHICS_DITHER]    = SETTING("graphics.dither", XS_BOOL, 0, RENV_GFX_DITHER, NULL, NULL, 0, 0, 0),
+    /* The title's vehicle level-of-detail distances: the patch is anything
+     * but "original". */
+    [XS_GRAPHICS_VEHICLE_DETAIL] = SETTING("graphics.vehicle_detail", XS_CHOICE, 0, RENV_GFX_VEHICLE_DETAIL, k_vehicle_detail, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
 #endif
