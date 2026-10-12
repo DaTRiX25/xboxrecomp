@@ -141,6 +141,9 @@ void apu_bus_config_neutral(apu_bus_config *c)
     for (int b = 0; b < APU_BUS_MAX; b++) {
         c->bus[b].lfe_send_db = APU_BUS_OFF_DB;
         c->bus[b].lfe_crossover_hz = 80;
+        c->bus[b].pan_y = 1.0f;             /* front centre, full width */
+        c->bus[b].pan_width = 1.0f;
+        c->bus[b].field_width = 1.0f;
         for (int s = 0; s < APU_BUS_SPEAKERS; s++)
             c->bus[b].send_db[s] = APU_BUS_OFF_DB;
         c->bus[b].send_db[0] = c->bus[b].send_db[1] = 0.0f;
@@ -161,6 +164,7 @@ static int bus_is_neutral(const apu_bus_params *p)
         return 0;
     for (int t = 0; t < APU_BUS_TRIMS; t++)
         if (p->trim_db[t] != 0.0f) return 0;
+    if (p->field_width != 1.0f || p->field_divergence != 0.0f) return 0;
     return p->lfe_send_db <= APU_BUS_OFF_DB;
 }
 
@@ -171,6 +175,90 @@ int apu_bus_config_is_neutral(const apu_bus_config *c)
     for (int s = 0; s < APU_BUS_SPEAKERS; s++)
         if (c->speaker_trim_db[s] != 0.0f || c->speaker_delay_ms[s] != 0.0f) return 0;
     return !c->lfe_lowpass_hz && !c->mains_highpass_hz && !c->limiter && !c->duck.enabled;
+}
+
+/* ── the pan law (apu_bus.h) ───────────────────────────────────────── */
+
+static float clampf1(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void apu_bus_pan_gains(float x, float y, float divergence, float out[5])
+{
+    /* The ring, clockwise from the centre speaker, by its angle in the room
+     * (the square's corners at 45 and 135 degrees). The share of an arc is
+     * the same whether the arc is measured in the room or between the ITU
+     * angles the corners stand for, so only the room's are needed. */
+    static const struct { int spk; float room; } ring[6] = {
+        { 2, 0.0f }, { 1, 45.0f }, { 4, 135.0f }, { 3, 225.0f }, { 0, 315.0f }, { 2, 360.0f },
+    };
+    double pw[5] = { 0, 0, 0, 0, 0 };
+    float r, ang;
+    x = clampf1(x, -1.0f, 1.0f);
+    y = clampf1(y, -1.0f, 1.0f);
+    divergence = clampf1(divergence, 0.0f, 1.0f);
+    r = fabsf(x) > fabsf(y) ? fabsf(x) : fabsf(y);
+    ang = r > 0.0f ? atan2f(x, y) * (float)(180.0 / M_PI) : 0.0f;
+    if (ang < 0.0f) ang += 360.0f;
+    for (int k = 0; k < 5; k++) {
+        if (ang >= ring[k].room && ang <= ring[k + 1].room) {
+            const float t = (ang - ring[k].room) / (ring[k + 1].room - ring[k].room);
+            const double a = (double)t * (M_PI / 2.0);
+            pw[ring[k].spk] += cos(a) * cos(a);
+            pw[ring[k + 1].spk] += sin(a) * sin(a);
+            break;
+        }
+    }
+    for (int k = 0; k < 5; k++)
+        pw[k] = (1.0 - r) / 5.0 + r * pw[k];
+    {
+        const double moved = divergence * pw[2];
+        pw[2] -= moved;
+        pw[0] += moved / 2.0;
+        pw[1] += moved / 2.0;
+    }
+    for (int k = 0; k < 5; k++)
+        out[k] = (float)sqrt(pw[k] > 0.0 ? pw[k] : 0.0);
+}
+
+void apu_bus_pan_gains_stereo(float x, float out[2])
+{
+    const double a = ((double)clampf1(x, -1.0f, 1.0f) + 1.0) * (M_PI / 4.0);
+    out[0] = (float)cos(a);
+    out[1] = (float)sin(a);
+}
+
+void apu_bus_field_width(float w, float *left, float *right)
+{
+    const float l = fabsf(*left), r = fabsf(*right);
+    const float m = l + r, p = l * l + r * r;
+    float s = (l - r) * clampf1(w, 0.0f, 2.0f), nl, nr, np;
+    if (p <= 0.0f) return;
+    if (s > m) s = m;
+    if (s < -m) s = -m;
+    nl = 0.5f * (m + s);
+    nr = 0.5f * (m - s);
+    np = nl * nl + nr * nr;
+    if (np > 0.0f) {
+        const float k = sqrtf(p / np);
+        *left = nl * k;
+        *right = nr * k;
+    }
+}
+
+void apu_bus_field_divergence(float d, float *fl, float *fr, float *c)
+{
+    const float pl = *fl * *fl, pr = *fr * *fr, pc = *c * *c;
+    d = clampf1(d, -1.0f, 1.0f);
+    if (d > 0.0f) {
+        const float moved = d * pc;
+        *c = sqrtf(pc - moved);
+        *fl = sqrtf(pl + 0.5f * moved);
+        *fr = sqrtf(pr + 0.5f * moved);
+    } else if (d < 0.0f) {
+        const float common = (pl < pr ? pl : pr) * -d;
+        *fl = sqrtf(pl - common);
+        *fr = sqrtf(pr - common);
+        *c = sqrtf(pc + 2.0f * common);
+    }
 }
 
 /* ── the runtime block ─────────────────────────────────────────────── */
@@ -184,8 +272,14 @@ struct apu_bus_rt {
     float eff[APU_BUS_MAX];             /* this frame: gain with mute, solo, duck */
     /* from the configuration: */
     float lin[APU_BUS_MAX];             /* gain with mute and solo */
-    uint8_t route[APU_BUS_MAX];
-    uint8_t plain[APU_BUS_MAX];         /* route title, trims 0 dB, no LFE send */
+    uint8_t route[APU_BUS_MAX];         /* APU_BUS_ROUTE_* */
+    uint8_t plain[APU_BUS_MAX];         /* route title, trims 0 dB, no shaping, no LFE send */
+    uint8_t shaped[APU_BUS_MAX];        /* route title with field width or divergence */
+    float field_w[APU_BUS_MAX], field_d[APU_BUS_MAX];
+    /* Route pan: the gains of the left channel, the right channel and a
+     * mono voice; 5.1 as FL FR C SL SR, stereo as L R. */
+    float pan6[APU_BUS_MAX][3][5], pan2[APU_BUS_MAX][3][2];
+    int8_t spk[APU_BUS_BINS];           /* this frame: the speaker of each bin, -1 none */
     float trim[APU_BUS_MAX][APU_BUS_TRIMS + 1];
     float send[APU_BUS_MAX][APU_BUS_SPEAKERS];
     float lfe_send[APU_BUS_MAX];
@@ -246,7 +340,28 @@ static void build_rt(const apu_bus_config *c, struct apu_bus_rt *r)
         const apu_bus_params *p = &c->bus[b];
         int silent = p->mute || (any_solo && !p->solo);
         r->lin[b] = silent ? 0.0f : p->gain_db == 0.0f ? 1.0f : db_lin(p->gain_db);
-        r->route[b] = (uint8_t)(p->route == APU_BUS_ROUTE_SENDS);
+        r->route[b] = (uint8_t)(p->route == APU_BUS_ROUTE_SENDS ? APU_BUS_ROUTE_SENDS
+                              : p->route == APU_BUS_ROUTE_PAN ? APU_BUS_ROUTE_PAN : APU_BUS_ROUTE_TITLE);
+        r->field_w[b] = clampf1(p->field_width, 0.0f, 2.0f);
+        r->field_d[b] = clampf1(p->field_divergence, -1.0f, 1.0f);
+        r->shaped[b] = r->route[b] == APU_BUS_ROUTE_TITLE
+                    && (r->field_w[b] != 1.0f || r->field_d[b] != 0.0f);
+        if (r->route[b] == APU_BUS_ROUTE_PAN) {
+            /* The two channels a width apart around the position; a mono
+             * voice is at both places with half its power each. */
+            const float w = clampf1(p->pan_width, 0.0f, 1.0f);
+            const float xl = clampf1(p->pan_x - w, -1.0f, 1.0f), xr = clampf1(p->pan_x + w, -1.0f, 1.0f);
+            apu_bus_pan_gains(xl, p->pan_y, p->pan_divergence, r->pan6[b][0]);
+            apu_bus_pan_gains(xr, p->pan_y, p->pan_divergence, r->pan6[b][1]);
+            apu_bus_pan_gains_stereo(xl, r->pan2[b][0]);
+            apu_bus_pan_gains_stereo(xr, r->pan2[b][1]);
+            for (int k = 0; k < 5; k++)
+                r->pan6[b][2][k] = sqrtf(0.5f * (r->pan6[b][0][k] * r->pan6[b][0][k]
+                                               + r->pan6[b][1][k] * r->pan6[b][1][k]));
+            for (int k = 0; k < 2; k++)
+                r->pan2[b][2][k] = sqrtf(0.5f * (r->pan2[b][0][k] * r->pan2[b][0][k]
+                                               + r->pan2[b][1][k] * r->pan2[b][1][k]));
+        }
         for (int t = 0; t < APU_BUS_TRIMS; t++)
             r->trim[b][t] = p->trim_db[t] == 0.0f ? 1.0f : db_lin(p->trim_db[t]);
         r->trim[b][APU_BUS_TRIMS] = 1.0f;
@@ -258,7 +373,7 @@ static void build_rt(const apu_bus_config *c, struct apu_bus_rt *r)
             butter4(r->lfe_xover[b], 0, r->lfe_coef[b]);
         if (r->lfe_send[b] > 0.0f)
             r->any_lfe_send = 1;
-        r->plain[b] = !r->route[b] && r->lfe_send[b] == 0.0f;
+        r->plain[b] = !r->route[b] && !r->shaped[b] && r->lfe_send[b] == 0.0f;
         for (int t = 0; t < APU_BUS_TRIMS; t++)
             if (r->trim[b][t] != 1.0f) r->plain[b] = 0;
     }
@@ -524,10 +639,17 @@ int apu_bus_config_parse(const char *text, apu_bus_config *out, char *err, size_
             else if (!strcmp(key, "mute")) b->mute = num != 0 && kind != 1, done = 1;
             else if (!strcmp(key, "solo")) b->solo = num != 0 && kind != 1, done = 1;
             else if (!strcmp(key, "route")) {
-                b->route = str && !strcmp(str, "sends") ? APU_BUS_ROUTE_SENDS : APU_BUS_ROUTE_TITLE;
+                b->route = str && !strcmp(str, "sends") ? APU_BUS_ROUTE_SENDS
+                         : str && !strcmp(str, "pan") ? APU_BUS_ROUTE_PAN : APU_BUS_ROUTE_TITLE;
                 done = 1;
             } else if (!strcmp(key, "lfe_send_db")) b->lfe_send_db = (float)num, done = 1;
             else if (!strcmp(key, "lfe_crossover_hz")) b->lfe_crossover_hz = num <= 0 ? 0 : (int)num, done = 1;
+            else if (!strcmp(key, "pan_x")) b->pan_x = clampf1((float)num, -1.0f, 1.0f), done = 1;
+            else if (!strcmp(key, "pan_y")) b->pan_y = clampf1((float)num, -1.0f, 1.0f), done = 1;
+            else if (!strcmp(key, "pan_width")) b->pan_width = clampf1((float)num, 0.0f, 1.0f), done = 1;
+            else if (!strcmp(key, "pan_divergence")) b->pan_divergence = clampf1((float)num, 0.0f, 1.0f), done = 1;
+            else if (!strcmp(key, "field_width")) b->field_width = clampf1((float)num, 0.0f, 2.0f), done = 1;
+            else if (!strcmp(key, "field_divergence")) b->field_divergence = clampf1((float)num, -1.0f, 1.0f), done = 1;
             for (int t = 0; !done && t < APU_BUS_TRIMS; t++)
                 if (!strcmp(key, k_trim[t])) b->trim_db[t] = (float)num, done = 1;
             if (!done && !strncmp(key, "send_", 5)) {
@@ -606,15 +728,19 @@ size_t apu_bus_config_write(const apu_bus_config *c, char *out, size_t n)
         at = put(out, n, at, "\n[bus.%s]                # %s\n", key, apu_bus_name(b));
         at = put(out, n, at, "gain_db = %.1f\nmute = %s\nsolo = %s\n", (double)p->gain_db,
                  p->mute ? "true" : "false", p->solo ? "true" : "false");
-        at = put(out, n, at, "route = \"%s\"            # title: the game's own panning, with the four trims; sends: the six sends instead\n",
-                 p->route == APU_BUS_ROUTE_SENDS ? "sends" : "title");
+        at = put(out, n, at, "route = \"%s\"            # title: the game's own panning (trims, field_*); sends: the six sends; pan: a place in the room (pan_*)\n",
+                 p->route == APU_BUS_ROUTE_SENDS ? "sends" : p->route == APU_BUS_ROUTE_PAN ? "pan" : "title");
         for (int t = 0; t < APU_BUS_TRIMS; t++)
             at = put(out, n, at, "%s = %.1f\n", k_trim[t], (double)p->trim_db[t]);
+        at = put(out, n, at, "field_width = %.2f\nfield_divergence = %.2f\n",
+                 (double)p->field_width, (double)p->field_divergence);
         for (int s = 0; s < APU_BUS_SPEAKERS; s++) {
             char k2[24];
             snprintf(k2, sizeof(k2), "send_%s_db", k_spk_lc[s]);
             at = put_db(out, n, at, k2, p->send_db[s]);
         }
+        at = put(out, n, at, "pan_x = %.2f\npan_y = %.2f\npan_width = %.2f\npan_divergence = %.2f\n",
+                 (double)p->pan_x, (double)p->pan_y, (double)p->pan_width, (double)p->pan_divergence);
         at = put_db(out, n, at, "lfe_send_db", p->lfe_send_db);
         at = put(out, n, at, "lfe_crossover_hz = %d\n", p->lfe_crossover_hz);
     }
@@ -792,6 +918,9 @@ struct apu_bus_rt *apu_bus_frame_begin(int channels, const int8_t spk_map[APU_BU
     r->channels = channels == APU_BUS_SPEAKERS ? APU_BUS_SPEAKERS : 2;
     for (int b = 0; b < APU_BUS_BINS; b++) {
         int sp = r->channels == APU_BUS_SPEAKERS && spk_map ? spk_map[b] : 0;
+        /* For the field shaping: the speaker a bin feeds; on a stereo
+         * output only the left/right pair itself. */
+        r->spk[b] = (int8_t)(r->channels == APU_BUS_SPEAKERS ? sp : b < 2 ? b : -1);
         r->cls[b] = sp < 0 ? APU_BUS_TRIMS
                   : sp <= 1 ? APU_BUS_TRIM_FRONT
                   : sp == 2 ? APU_BUS_TRIM_CENTRE
@@ -825,7 +954,78 @@ void apu_bus_mix_voice(struct apu_bus_rt *r, int bus,
     for (int b = 0; b < 8; b++)
         if (g[b] > ref) ref = g[b];
 
-    if (!r->route[bus]) {
+    if (r->route[bus] == APU_BUS_ROUTE_TITLE && r->shaped[bus]) {
+        /* The title's own panning, reshaped: the width of its FL/FR and
+         * SL/SR pairs around the centre line, and its centre send against
+         * a phantom centre, each keeping the voice's power. The sends stay
+         * on the bins (and polarities) the title chose. */
+        const float *trim = r->trim[bus];
+        float gg[8];
+        int slot[APU_BUS_SPEAKERS] = { -1, -1, -1, -1, -1, -1 };
+        for (int b = 0; b < 8; b++) {
+            const int sp = r->spk[bin[b]];
+            gg[b] = g[b];
+            if (sp >= 0 && sp < APU_BUS_SPEAKERS && slot[sp] < 0)
+                slot[sp] = b;       /* the first send to a speaker: a later one is an effect send */
+        }
+        if (r->field_w[bus] != 1.0f) {
+            if (slot[0] >= 0 && slot[1] >= 0)
+                apu_bus_field_width(r->field_w[bus], &gg[slot[0]], &gg[slot[1]]);
+            if (slot[4] >= 0 && slot[5] >= 0)
+                apu_bus_field_width(r->field_w[bus], &gg[slot[4]], &gg[slot[5]]);
+        }
+        if (r->field_d[bus] != 0.0f && slot[0] >= 0 && slot[1] >= 0 && slot[2] >= 0)
+            apu_bus_field_divergence(r->field_d[bus], &gg[slot[0]], &gg[slot[1]], &gg[slot[2]]);
+        for (int b = 0; b < 8; b++) {
+            const float t = eff * trim[r->cls[bin[b]]] * gg[b];
+            for (int i = 0; i < APU_BUS_FRAME; i++)
+                mixbins[bin[b]][i] += t * samples[i][(unsigned)b % channels];
+            level += (double)t * t * ss[(unsigned)b % channels];
+        }
+    } else if (r->route[bus] == APU_BUS_ROUTE_PAN) {
+        /* A place in the room at the voice's own level (its loudest send):
+         * each channel through its own constant-power gains. */
+        const float base = ref * eff;
+        if (r->channels == APU_BUS_SPEAKERS) {
+            static const uint8_t pbin[5] = { 0, 1, 2, 4, 5 };   /* FL FR C SL SR */
+            if (channels > 1) {
+                const float *gl = r->pan6[bus][0], *gr = r->pan6[bus][1];
+                for (int k = 0; k < 5; k++) {
+                    const float a = base * gl[k], c = base * gr[k];
+                    if (a == 0.0f && c == 0.0f) continue;
+                    for (int i = 0; i < APU_BUS_FRAME; i++)
+                        mixbins[pbin[k]][i] += a * samples[i][0] + c * samples[i][1];
+                    level += (double)a * a * ss[0] + (double)c * c * ss[1];
+                }
+            } else {
+                const float *gm = r->pan6[bus][2];
+                for (int k = 0; k < 5; k++) {
+                    const float a = base * gm[k];
+                    if (a == 0.0f) continue;
+                    for (int i = 0; i < APU_BUS_FRAME; i++)
+                        mixbins[pbin[k]][i] += a * samples[i][0];
+                    level += (double)a * a * ss[0];
+                }
+            }
+        } else {
+            const float (*p2)[2] = r->pan2[bus];
+            if (channels > 1) {
+                for (int k = 0; k < 2; k++) {
+                    const float a = base * p2[0][k], c = base * p2[1][k];
+                    for (int i = 0; i < APU_BUS_FRAME; i++)
+                        mixbins[k][i] += a * samples[i][0] + c * samples[i][1];
+                    level += (double)a * a * ss[0] + (double)c * c * ss[1];
+                }
+            } else {
+                for (int k = 0; k < 2; k++) {
+                    const float a = base * p2[2][k];
+                    for (int i = 0; i < APU_BUS_FRAME; i++)
+                        mixbins[k][i] += a * samples[i][0];
+                    level += (double)a * a * ss[0];
+                }
+            }
+        }
+    } else if (!r->route[bus]) {
         /* The title's own bins and volumes. With eff 1 and the trims at
          * 0 dB this is the loop of apu_vp.c, operation for operation. */
         const float *trim = r->trim[bus];

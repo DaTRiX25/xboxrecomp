@@ -13,9 +13,9 @@
  */
 
 enum { MX_MAIN, MX_BUS, MX_SPEAKERS, MX_DUCK, MX_VIEWS };
-enum { MK_DB, MK_MS, MK_BOOL, MK_CHOICE, MK_ACTION, MK_INFO, MK_BUS };
+enum { MK_DB, MK_MS, MK_BOOL, MK_CHOICE, MK_ACTION, MK_INFO, MK_BUS, MK_UNIT };
 enum { MA_ENABLE, MA_PRESET, MA_AB, MA_BREF, MA_SAVE_COPY, MA_SPEAKERS, MA_DUCK,
-       MA_RESET_OVERS, MA_BUS_RESET };
+       MA_RESET_OVERS, MA_BUS_RESET, MA_PAN_MOVE };
 
 struct MxItem {
     int kind;
@@ -44,6 +44,7 @@ static uint32_t s_mx_save_at;
 static apu_bus_config s_mx_save_cfg;
 static unsigned s_mx_gen;
 static char s_mx_note[240];
+static bool s_mx_grab;                 /* the pan position follows the D-pad / stick */
 
 /* The presets on offer: the built-in ones, then mixer-*.toml beside the
  * followed file. */
@@ -176,7 +177,11 @@ static void mx_open()
 
 /* B / Esc: a view up, then out. Returns false when the page closed. */
 static bool mx_back()
-{
+{    if (s_mx_grab) {
+        s_mx_grab = false;
+        return true;
+    }
+
     if (s_mx_view != MX_MAIN) {
         s_mx_view = MX_MAIN;
         s_mx_scroll = true;
@@ -186,8 +191,8 @@ static bool mx_back()
     return false;
 }
 
-static const char *const k_mx_route[] = { "The game's panning", "Sends" };
-static const int k_mx_route_v[] = { APU_BUS_ROUTE_TITLE, APU_BUS_ROUTE_SENDS };
+static const char *const k_mx_route[] = { "The game's panning", "Sends", "A place in the room (pan)" };
+static const int k_mx_route_v[] = { APU_BUS_ROUTE_TITLE, APU_BUS_ROUTE_SENDS, APU_BUS_ROUTE_PAN };
 static const char *const k_mx_lim[] = { "Off (hard clamp, as shipped)", "Soft clip", "Peak limiter (+1.33 ms)" };
 static const int k_mx_lim_v[] = { APU_BUS_LIM_OFF, APU_BUS_LIM_SOFT, APU_BUS_LIM_PEAK };
 static const char *const k_mx_hz[] = { "Off", "60 Hz", "80 Hz", "100 Hz", "120 Hz", "150 Hz" };
@@ -212,6 +217,10 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
     auto db = [&](const char *label, float *f, float mn, float mx, bool off, const char *hint) {
         MxItem &m = add(MK_DB, label, hint);
         m.f = f; m.mn = mn; m.mx = mx; m.step = 0.5f; m.off_below = off;
+    };
+    auto unit = [&](const char *label, float *f, float mn, float mx, const char *hint) {
+        MxItem &m = add(MK_UNIT, label, hint);
+        m.f = f; m.mn = mn; m.mx = mx; m.step = 0.05f;
     };
     auto choice = [&](const char *label, int *i, const char *const *names, const int *vals, int nv, const char *hint) {
         MxItem &m = add(MK_CHOICE, label, hint);
@@ -262,8 +271,17 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
         db("Gain", &p.gain_db, -60.0f, 12.0f, true, "The whole bus.");
         { MxItem &m = add(MK_BOOL, "Mute", NULL); m.i = &p.mute; }
         { MxItem &m = add(MK_BOOL, "Solo", "Only the soloed buses sound."); m.i = &p.solo; }
-        choice("Route", &p.route, k_mx_route, k_mx_route_v, 2, "The game's panning: its own speaker sends, with a trim per speaker group. Sends: six sends of your own at the sound's level (its loudest send in the game's mix); the left channel of a stereo sound feeds the left speakers, the right the right ones, their sum the centre and the LFE.");
-        if (p.route == APU_BUS_ROUTE_TITLE) {
+        choice("Route", &p.route, k_mx_route, k_mx_route_v, 3, "The game's panning: its own speaker sends, with trims and field shaping (for sounds the game positions). Sends: six sends of your own at the sound's level. A place in the room: the sound panned to a position in the 5.1 plane, constant power (for music, the player's engine and exhaust, speech, UI).");
+        if (p.route == APU_BUS_ROUTE_PAN) {
+            MxItem &mv = act(MA_PAN_MOVE, "Position", "A / Enter, then the D-pad or stick moves the sound in the room; A or B when done. Or drag in the diagram with the mouse. The room's corners are the speakers (FL, FR, SL, SR), C is the middle of the front wall, the listener sits in the middle.");
+            snprintf(mv.text, sizeof mv.text, "%s", s_mx_grab ? "moving..." : "move");
+            unit("Position X (left - right)", &p.pan_x, -1.0f, 1.0f, "-1 is the left wall, +1 the right one.");
+            unit("Position Y (rear - front)", &p.pan_y, -1.0f, 1.0f, "-1 is the rear wall, +1 the front one, 0 the listener's row: there all five speakers share the sound.");
+            unit("Width", &p.pan_width, 0.0f, 1.0f, "A stereo sound's left and right channels sit this far to the left and right of the position (1 at the front: left on FL, right on FR). A mono sound is put at both places with half its power each, which spreads it to the neighbouring speakers.");
+            unit("Centre divergence", &p.pan_divergence, 0.0f, 1.0f, "0: what falls on the centre speaker stays there. 1: it is played by FL and FR instead, at -3 dB each (a phantom centre).");
+        } else if (p.route == APU_BUS_ROUTE_TITLE) {
+            unit("Field width", &p.field_width, 0.0f, 2.0f, "The game's left/right spread of each sound, front pair and surround pair alike: 1 as the game pans, 0 everything on the centre line, 2 wider. A sound's power stays the same.");
+            unit("Centre divergence", &p.field_divergence, -1.0f, 1.0f, "Above 0: that share of what the game sends to the centre speaker goes to FL and FR instead. Below 0: that share of what FL and FR have in common goes to the centre. 0 as the game pans.");
             db("Front trim", &p.trim_db[APU_BUS_TRIM_FRONT], -60.0f, 12.0f, true, "Front left and right, relative to the game's own panning.");
             db("Centre trim", &p.trim_db[APU_BUS_TRIM_CENTRE], -60.0f, 12.0f, true, "The centre, relative to the game's own panning.");
             db("Rear trim", &p.trim_db[APU_BUS_TRIM_REAR], -60.0f, 12.0f, true, "The surrounds, relative to the game's own panning.");
@@ -328,6 +346,7 @@ static bool mx_adjust(MxItem &m, int dir, apu_bus_config &c)
         *m.f = v;
         return true;
     }
+    case MK_UNIT:
     case MK_MS: {
         float v = floorf(*m.f / m.step + 0.5f) * m.step + (float)dir * m.step;
         if (v < m.mn) v = m.mn;
@@ -419,6 +438,7 @@ static bool mx_activate(MxItem &m, apu_bus_config &c)
         mx_scan_user();
         return false;
     }
+    case MA_PAN_MOVE: s_mx_grab = !s_mx_grab; return false;
     case MA_SPEAKERS: s_mx_view = MX_SPEAKERS; s_mx_scroll = true; return false;
     case MA_DUCK:     s_mx_view = MX_DUCK; s_mx_scroll = true; return false;
     case MA_RESET_OVERS: apu_bus_reset_overs(); return false;
@@ -441,6 +461,7 @@ static void mx_value(const MxItem &m, char *out, size_t n)
         else snprintf(out, n, "%+.1f dB", (double)*m.f);
         break;
     case MK_MS: snprintf(out, n, "%.1f ms", (double)*m.f); break;
+    case MK_UNIT: snprintf(out, n, "%+.2f", (double)*m.f); break;
     case MK_BOOL: snprintf(out, n, "%s", *m.i ? "On" : "Off"); break;
     case MK_CHOICE: {
         const char *t = "";
@@ -471,6 +492,85 @@ static void mx_meter(ImDrawList *dl, ImVec2 p, float w, float h, float db, float
     }
     if (over)
         dl->AddRectFilled(ImVec2(p.x + w + h * 0.3f, p.y), ImVec2(p.x + w + h * 1.3f, p.y + h), col(T->perf_bad), h * 0.3f);
+}
+
+/* The room from above, for a bus in pan mode: the five speakers on its
+ * edge (their dots grow with what each gets, in dB under it), the listener
+ * in the middle, the sound's position; with a width, its two ends. Dragging
+ * in it moves the position. True when the mouse changed it. */
+static bool mx_pan_diagram(ImDrawList *dl, ImVec2 at, float w, float h, float fs, apu_bus_params &p)
+{
+    static const struct { float x, y; const char *name; } spk[5] = {
+        { -1, 1, "FL" }, { 1, 1, "FR" }, { 0, 1, "C" }, { -1, -1, "SL" }, { 1, -1, "SR" },
+    };
+    const float pad = fs * 2.6f;
+    float side = (w < h ? w : h) - 2.0f * pad;
+    if (side < fs * 6.0f)
+        return false;
+    const ImVec2 o(at.x + (w - side) * 0.5f, at.y + (h - side) * 0.5f);
+    auto pt = [&](float x, float y) { return ImVec2(o.x + (x + 1.0f) * 0.5f * side, o.y + (1.0f - y) * 0.5f * side); };
+    bool changed_ = false;
+
+    ImGui::SetCursorScreenPos(ImVec2(o.x - fs * 0.5f, o.y - fs * 0.5f));
+    ImGui::InvisibleButton("##room", ImVec2(side + fs, side + fs));
+    if (ImGui::IsItemActive()) {
+        const ImVec2 m = ImGui::GetIO().MousePos;
+        float x = (m.x - o.x) / side * 2.0f - 1.0f, y = 1.0f - (m.y - o.y) / side * 2.0f;
+        x = floorf((x < -1 ? -1 : x > 1 ? 1 : x) * 20.0f + 0.5f) / 20.0f;
+        y = floorf((y < -1 ? -1 : y > 1 ? 1 : y) * 20.0f + 0.5f) / 20.0f;
+        if (x != p.pan_x || y != p.pan_y) {
+            p.pan_x = x;
+            p.pan_y = y;
+            changed_ = true;
+        }
+        s_last_input_pad = false;
+    }
+
+    dl->AddRect(o, ImVec2(o.x + side, o.y + side), col(T->rule), fs * 0.3f);
+    dl->AddLine(pt(-1, 0), pt(1, 0), col(T->rule, 0.5f));
+    dl->AddLine(pt(0, -1), pt(0, 1), col(T->rule, 0.5f));
+    /* The listener, facing the front wall. */
+    {
+        const ImVec2 c = pt(0, 0);
+        dl->AddCircle(c, fs * 0.45f, col(T->text_dim), 16, 1.5f);
+        dl->AddTriangleFilled(ImVec2(c.x, c.y - fs * 0.85f), ImVec2(c.x - fs * 0.3f, c.y - fs * 0.45f),
+                              ImVec2(c.x + fs * 0.3f, c.y - fs * 0.45f), col(T->text_dim));
+    }
+    /* What each speaker gets: a mono sound's gains (the two ends' powers
+     * averaged); for a stereo sound the left end's and the right end's
+     * are the same picture, mirrored about the position. */
+    {
+        float gl[5], gr[5];
+        const float xl = p.pan_x - p.pan_width < -1 ? -1 : p.pan_x - p.pan_width;
+        const float xr = p.pan_x + p.pan_width > 1 ? 1 : p.pan_x + p.pan_width;
+        apu_bus_pan_gains(xl, p.pan_y, p.pan_divergence, gl);
+        apu_bus_pan_gains(xr, p.pan_y, p.pan_divergence, gr);
+        for (int k = 0; k < 5; k++) {
+            const float pw = 0.5f * (gl[k] * gl[k] + gr[k] * gr[k]);
+            const float db = pw > 1e-6f ? 10.0f * log10f(pw) : -99.0f;
+            const ImVec2 c = pt(spk[k].x, spk[k].y);
+            const float lvl = db < -30.0f ? 0.0f : (db + 30.0f) / 30.0f;
+            char t[24];
+            dl->AddCircleFilled(c, fs * (0.35f + 0.55f * lvl), lvl > 0 ? col(T->fill, 0.35f + 0.65f * lvl) : col(T->track_off));
+            dl->AddCircle(c, fs * 0.9f, col(T->text_dim), 20, 1.0f);
+            if (db > -60.0f) snprintf(t, sizeof t, "%s %.1f", spk[k].name, (double)db);
+            else snprintf(t, sizeof t, "%s  -", spk[k].name);
+            const float tw = ImGui::CalcTextSize(t).x;
+            dl->AddText(ImVec2(c.x - tw * 0.5f, spk[k].y > 0 ? c.y - fs * 2.2f : c.y + fs * 1.1f),
+                        lvl > 0 ? col(T->text_hi) : col(T->text_dim), t);
+        }
+        /* The sound: its two ends when it has a width, and the position. */
+        if (p.pan_width > 0.0f) {
+            dl->AddLine(pt(xl, p.pan_y), pt(xr, p.pan_y), col(T->sel_bar), 2.0f);
+            dl->AddCircleFilled(pt(xl, p.pan_y), fs * 0.3f, col(T->sel_bar));
+            dl->AddCircleFilled(pt(xr, p.pan_y), fs * 0.3f, col(T->sel_bar));
+            dl->AddText(ImVec2(pt(xl, p.pan_y).x - fs * 0.25f, pt(xl, p.pan_y).y - fs * 1.5f), col(T->text_dim), "L");
+            dl->AddText(ImVec2(pt(xr, p.pan_y).x - fs * 0.25f, pt(xr, p.pan_y).y - fs * 1.5f), col(T->text_dim), "R");
+        }
+        dl->AddCircleFilled(pt(p.pan_x, p.pan_y), fs * 0.45f, s_mx_grab ? col(T->warn) : col(T->text_hi));
+        dl->AddCircle(pt(p.pan_x, p.pan_y), fs * 0.7f, s_mx_grab ? col(T->warn) : col(T->sel_bar), 20, 2.0f);
+    }
+    return changed_;
 }
 
 static void build_mixer(float fs, ImDrawList *dl)
@@ -505,6 +605,23 @@ static void build_mixer(float fs, ImDrawList *dl)
         }
         s_mx_scroll = true;
     };
+    const bool pan_view = s_mx_view == MX_BUS && c.bus[s_mx_bus].route == APU_BUS_ROUTE_PAN;
+    if (!pan_view)
+        s_mx_grab = false;
+    if (s_mx_grab) {
+        /* The position follows the D-pad / stick, 0.05 a step. */
+        apu_bus_params &p = c.bus[s_mx_bus];
+        const float dx = 0.05f * (float)(s_steps[D_RIGHT] - s_steps[D_LEFT]);
+        const float dy = 0.05f * (float)(s_steps[D_UP] - s_steps[D_DOWN]);
+        if (dx != 0.0f || dy != 0.0f) {
+            float x = floorf((p.pan_x + dx) * 20.0f + 0.5f) / 20.0f, y = floorf((p.pan_y + dy) * 20.0f + 0.5f) / 20.0f;
+            p.pan_x = x < -1.0f ? -1.0f : x > 1.0f ? 1.0f : x;
+            p.pan_y = y < -1.0f ? -1.0f : y > 1.0f ? 1.0f : y;
+            dirty = true;
+        }
+        memset(s_steps, 0, sizeof s_steps);
+        if (s_activate > 0) { s_mx_grab = false; s_activate = 0; }
+    }
     while (s_steps[D_UP]-- > 0) move(-1);
     while (s_steps[D_DOWN]-- > 0) move(1);
     while (s_steps[D_LEFT]-- > 0) dirty |= mx_adjust(items[sel], -1, c);
@@ -523,7 +640,7 @@ static void build_mixer(float fs, ImDrawList *dl)
             p = nz.bus[items[sel].bus];
             dirty = true;
         }
-    } else if (s_mx_view == view0 && s_reset > 0 && (items[sel].kind == MK_DB || items[sel].kind == MK_MS)) {
+    } else if (s_mx_view == view0 && s_reset > 0 && (items[sel].kind == MK_DB || items[sel].kind == MK_MS || items[sel].kind == MK_UNIT)) {
         /* Y / Del: the neutral value of the row. */
         apu_bus_config nz;
         apu_bus_config_neutral(&nz);
@@ -565,7 +682,10 @@ static void build_mixer(float fs, ImDrawList *dl)
     const float footer = fs * 0.5f + meters_h + hint_h + fs * 2.9f;
     const float rh = fs * 1.75f;
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    ImGui::BeginChild("mixer", ImVec2(avail.x, avail.y - footer), ImGuiChildFlags_None, ImGuiWindowFlags_NoNav);
+    const ImVec2 list_pos = ImGui::GetCursorScreenPos();
+    const float list_h = avail.y - footer;
+    const float list_w = pan_view ? avail.x * 0.56f : avail.x;
+    ImGui::BeginChild("mixer", ImVec2(list_w, list_h), ImGuiChildFlags_None, ImGuiWindowFlags_NoNav);
     ImDrawList *cdl = ImGui::GetWindowDrawList();
     const float rw = ImGui::GetContentRegionAvail().x - fs * 0.5f;
     int clicked = -1, cdir = 0;
@@ -621,6 +741,15 @@ static void build_mixer(float fs, ImDrawList *dl)
         }
     }
     ImGui::EndChild();
+    if (pan_view) {
+        /* Beside the list; the footer goes on from where the list ended. */
+        apu_bus_params &p = c.bus[s_mx_bus];
+        const ImVec2 after = ImGui::GetCursorScreenPos();
+        if (mx_pan_diagram(dl, ImVec2(list_pos.x + list_w + fs, list_pos.y), avail.x - list_w - fs, list_h, fs, p))
+            mx_changed(c);
+        ImGui::SetCursorScreenPos(after);
+        ImGui::Dummy(ImVec2(0, 0));
+    }
     if (clicked >= 0) {
         sel = clicked;
         bool ch = cdir && items[clicked].kind != MK_BOOL && !(items[clicked].kind == MK_ACTION
@@ -666,6 +795,12 @@ static void build_mixer(float fs, ImDrawList *dl)
             dl->AddText(ImGui::GetFont(), fs, ImVec2(p.x, y), (s_mx_note[0] || fst[0]) && line != hint ? col(T->warn) : col(T->text_dim),
                         line, nullptr, wrap_w);
         y += hint_h + fs * 0.3f + fs * 1.3f;
+        if (s_mx_grab) {
+            dl->AddText(ImVec2(p.x, y), col(T->warn), pad_hints()
+                ? "D-pad / stick  move the sound in the room      A or B  done"
+                : "Arrows  move the sound in the room      Enter or Esc  done");
+            return;
+        }
         const char *keys = pad_hints()
             ? (s_mx_view == MX_MAIN ? "D-pad  select / change   A  open   LB  mute   RB  solo   Y  reset   B  back   Back+Y  A/B"
                                     : "D-pad  select / change    A  toggle    Y  default    B  back    Back+Y  A/B")

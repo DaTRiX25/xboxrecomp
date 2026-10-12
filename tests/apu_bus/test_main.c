@@ -393,6 +393,9 @@ static void test_preset(void)
     a.bus[9].lfe_send_db = -6.0f;
     a.bus[9].lfe_crossover_hz = 100;
     a.bus[5].mute = 1;
+    a.bus[4].route = APU_BUS_ROUTE_PAN;
+    a.bus[4].pan_x = -0.25f; a.bus[4].pan_y = 0.5f; a.bus[4].pan_width = 0.75f; a.bus[4].pan_divergence = 0.5f;
+    a.bus[7].field_width = 1.5f; a.bus[7].field_divergence = -0.25f;
     a.speaker_trim_db[2] = -1.5f;
     a.speaker_delay_ms[5] = 3.5f;
     a.limiter = APU_BUS_LIM_PEAK;
@@ -410,6 +413,8 @@ static void test_preset(void)
     CHECK(b.bus[0].send_db[4] <= APU_BUS_OFF_DB && b.bus[0].send_db[5] == -12.5f, "sends did not read back");
     CHECK(b.duck.source == 9 && b.duck.target == 0 && b.duck.enabled, "the duck slot did not read back");
     CHECK(!apu_bus_config_is_neutral(&b), "a changed preset reads as neutral");
+    CHECK(b.bus[4].route == APU_BUS_ROUTE_PAN && b.bus[4].pan_x == -0.25f && b.bus[4].pan_width == 0.75f
+          && b.bus[7].field_width == 1.5f && b.bus[7].field_divergence == -0.25f, "pan and field keys did not read back");
 
     /* By hand: comments, an unknown key (reported, not fatal), a bad line. */
     apu_bus_config_neutral(&b);
@@ -427,6 +432,205 @@ static void test_preset(void)
           apu_bus_find("nothing") < 0, "bus keys");
 }
 
+/* The pan law, route "pan" and the field shaping. */
+static void test_pan(void)
+{
+    static float out[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    apu_bus_config cfg;
+    tvoice v;
+    float g[5], g2[2];
+    double worst = 0.0;
+
+    /* The law: the squares sum to 1 everywhere, for any divergence. */
+    for (int ix = -10; ix <= 10; ix++)
+        for (int iy = -10; iy <= 10; iy++)
+            for (int id = 0; id <= 4; id++) {
+                double p = 0;
+                apu_bus_pan_gains(ix / 10.0f, iy / 10.0f, id / 4.0f, g);
+                for (int k = 0; k < 5; k++) p += (double)g[k] * g[k];
+                if (fabs(db(sqrt(p))) > worst) worst = fabs(db(sqrt(p)));
+            }
+    CHECK(worst < 0.001, "pan law: the power is off by %.4f dB somewhere on the grid", worst);
+    /* The places that have a name. Order: FL FR C SL SR. */
+    apu_bus_pan_gains(0, 1, 0, g);
+    CHECK(fabsf(g[2] - 1) < 1e-5f && g[0] < 1e-5f && g[1] < 1e-5f && g[3] < 1e-5f, "front centre is not the centre speaker");
+    apu_bus_pan_gains(-1, 1, 0, g);
+    CHECK(fabsf(g[0] - 1) < 1e-5f && g[2] < 1e-4f && g[3] < 1e-4f, "front left corner is not FL");
+    apu_bus_pan_gains(1, -1, 0, g);
+    CHECK(fabsf(g[4] - 1) < 1e-5f && g[1] < 1e-4f && g[3] < 1e-4f, "rear right corner is not SR");
+    apu_bus_pan_gains(0, -1, 0, g);
+    CHECK(fabsf(g[3] - 0.70711f) < 1e-4f && fabsf(g[4] - 0.70711f) < 1e-4f && g[2] < 1e-5f, "rear centre is not SL + SR at -3 dB");
+    apu_bus_pan_gains(1, 0, 0, g);
+    CHECK(fabsf(g[1] - 0.70711f) < 1e-4f && fabsf(g[4] - 0.70711f) < 1e-4f, "the right wall's middle is not FR + SR at -3 dB");
+    apu_bus_pan_gains(0, 0, 0, g);
+    for (int k = 0; k < 5; k++) CHECK(fabsf(g[k] - 0.44721f) < 1e-4f, "the middle of the room is not all five at -7 dB");
+    apu_bus_pan_gains(0, 1, 1, g);
+    CHECK(g[2] < 1e-5f && fabsf(g[0] - 0.70711f) < 1e-4f && fabsf(g[1] - 0.70711f) < 1e-4f, "divergence 1 is not a phantom centre");
+    apu_bus_pan_gains(0, 1, 0.5f, g);
+    CHECK(fabsf(g[2] - 0.70711f) < 1e-4f && fabsf(g[0] - 0.5f) < 1e-4f, "divergence 0.5 does not halve the centre's power");
+    apu_bus_pan_gains(0.5f, 1, 0, g);
+    CHECK(g[2] > 0.3f && g[1] > 0.3f && g[0] < 1e-5f && g[4] < 1e-5f, "between C and FR other speakers play");
+    for (int ix = -10; ix <= 10; ix++) {
+        apu_bus_pan_gains_stereo(ix / 10.0f, g2);
+        CHECK(fabs(db(sqrt((double)g2[0] * g2[0] + (double)g2[1] * g2[1]))) < 0.001, "stereo pan law power at %d", ix);
+    }
+    apu_bus_pan_gains_stereo(-1, g2);
+    CHECK(fabsf(g2[0] - 1) < 1e-6f && fabsf(g2[1]) < 1e-6f, "stereo pan: hard left");
+
+    /* Through the mixer. A stereo voice whose channels are orthogonal (a
+     * sine and a cosine, whole periods in a frame), so powers add; its
+     * loudest send is 0.5. */
+    memset(&v, 0, sizeof(v));
+    v.channels = 2;
+    memcpy(v.bin, k_bins[0], sizeof(v.bin));
+    v.g[0] = 0.5f; v.g[1] = 0.5f; v.g[2] = 0.3f; v.g[3] = 0.3f; v.g[5] = 0.1f;
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        v.samples[i][0] = (float)sin(2.0 * M_PI * 2.0 * i / 32.0);
+        v.samples[i][1] = (float)cos(2.0 * M_PI * 2.0 * i / 32.0);
+    }
+    for (int mono = 0; mono < 2; mono++) {
+        double want = 0.5 * sqrt(mono ? 0.5 : 1.0), worst_p = 0;      /* rms of both channels, or of one */
+        tvoice t = v;
+        if (mono) {
+            t.channels = 1;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) t.samples[i][1] = t.samples[i][0];
+        }
+        for (int six = 0; six < 2; six++)
+            for (int ix = -4; ix <= 4; ix++)
+                for (int iy = -4; iy <= 4; iy++)
+                    for (int iw = 0; iw <= 4; iw++) {
+                        double p = 0, d;
+                        apu_bus_config_neutral(&cfg);
+                        cfg.bus[0].route = APU_BUS_ROUTE_PAN;
+                        cfg.bus[0].pan_x = ix / 4.0f;
+                        cfg.bus[0].pan_y = iy / 4.0f;
+                        cfg.bus[0].pan_width = iw / 4.0f;
+                        cfg.bus[0].pan_divergence = (float)((ix + iy + 8) % 3) / 2.0f;
+                        memset(out, 0, sizeof(out));
+                        run_one(&cfg, six ? 6 : 2, 0, &t, out);
+                        for (int b = 0; b < NUM_MIXBINS; b++) p += bin_rms(out[b]) * bin_rms(out[b]);
+                        d = fabs(db(sqrt(p) / want));
+                        if (d > worst_p) worst_p = d;
+                        if (six) CHECK(bin_rms(out[3]) == 0.0, "route pan feeds the LFE");
+                    }
+        CHECK(worst_p < 0.1, "route pan (%s source): total power off by %.3f dB somewhere", mono ? "mono" : "stereo", worst_p);
+    }
+    /* Front centre, full width: the left channel is FL and nothing else,
+     * the right FR: the stereo picture as it is. Width 0: both in C. */
+    apu_bus_config_neutral(&cfg);
+    cfg.bus[0].route = APU_BUS_ROUTE_PAN;
+    memset(out, 0, sizeof(out));
+    run_one(&cfg, 6, 0, &v, out);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        CHECK(fabsf(out[0][i] - 0.5f * v.samples[i][0]) < 1e-6f, "pan, width 1: FL is not the left channel");
+        CHECK(fabsf(out[1][i] - 0.5f * v.samples[i][1]) < 1e-6f, "pan, width 1: FR is not the right channel");
+    }
+    CHECK(bin_rms(out[2]) < 1e-6 && bin_rms(out[4]) < 1e-6, "pan, width 1 at the front: centre or rears play");
+    cfg.bus[0].pan_width = 0.0f;
+    memset(out, 0, sizeof(out));
+    run_one(&cfg, 6, 0, &v, out);
+    CHECK(bin_rms(out[0]) < 1e-6 && fabs(db(bin_rms(out[2]) / 0.5)) < 0.01, "pan, width 0: not the two channels in the centre");
+    /* Stereo output, x 0, width 1: left to L, right to R, as shipped; and
+     * its mono sum is the source's mono sum (nothing cancels or doubles). */
+    cfg.bus[0].pan_width = 1.0f;
+    cfg.bus[0].pan_y = -0.5f;                           /* ignored on a stereo output */
+    memset(out, 0, sizeof(out));
+    run_one(&cfg, 2, 0, &v, out);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        CHECK(fabsf(out[0][i] - 0.5f * v.samples[i][0]) < 1e-6f, "stereo output: L is not the left channel");
+        CHECK(fabsf(out[0][i] + out[1][i] - 0.5f * (v.samples[i][0] + v.samples[i][1])) < 1e-6f,
+              "stereo output: the mono sum is not the source's");
+    }
+    /* A mono voice with width: on the neighbours too, in phase. */
+    {
+        tvoice t = v;
+        t.channels = 1;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) t.samples[i][1] = t.samples[i][0];
+        apu_bus_config_neutral(&cfg);
+        cfg.bus[4].route = APU_BUS_ROUTE_PAN;
+        cfg.bus[4].pan_width = 0.5f;
+        memset(out, 0, sizeof(out));
+        run_one(&cfg, 6, 4, &t, out);
+        CHECK(bin_rms(out[0]) > 0.05 && bin_rms(out[1]) > 0.05 && bin_rms(out[2]) > 0.05,
+              "a mono voice with width 0.5 at the front does not use FL, C and FR");
+        CHECK(fabs(bin_rms(out[0]) - bin_rms(out[1])) < 1e-6, "its FL and FR differ");
+    }
+
+    /* Field shaping: the pair's width and the centre's divergence, power
+     * kept, over a grid of pans. */
+    {
+        double worst_w = 0, worst_d = 0;
+        for (int il = 0; il <= 8; il++)
+            for (int ir = 0; ir <= 8; ir++)
+                for (int iw = 0; iw <= 8; iw++) {
+                    float l = il / 8.0f, r = ir / 8.0f, c = (float)((il + ir) % 5) / 4.0f;
+                    float l2 = l, r2 = r, c2 = c;
+                    const double p0 = (double)l * l + (double)r * r;
+                    if (p0 == 0) continue;
+                    apu_bus_field_width(iw / 4.0f, &l2, &r2);
+                    if (fabs(db(sqrt(((double)l2 * l2 + (double)r2 * r2) / p0))) > worst_w)
+                        worst_w = fabs(db(sqrt(((double)l2 * l2 + (double)r2 * r2) / p0)));
+                    CHECK(l2 >= 0 && r2 >= 0, "field width made a negative gain");
+                    if (iw == 4) CHECK(fabsf(l2 - l) < 1e-6f && fabsf(r2 - r) < 1e-6f, "field width 1 changes the pair");
+                    if (iw == 0) CHECK(fabsf(l2 - r2) < 1e-6f, "field width 0 is not the centre line");
+                    if (iw > 4 && l > r) CHECK(l2 >= l - 1e-6f && r2 <= r + 1e-6f, "field width > 1 does not widen");
+                    l2 = l; r2 = r;
+                    apu_bus_field_divergence((iw - 4) / 4.0f, &l2, &r2, &c2);
+                    {
+                        const double p1 = p0 + (double)c * c, p2 = (double)l2 * l2 + (double)r2 * r2 + (double)c2 * c2;
+                        if (fabs(db(sqrt(p2 / p1))) > worst_d) worst_d = fabs(db(sqrt(p2 / p1)));
+                    }
+                    if (iw == 8) CHECK(c2 < 1e-6f, "field divergence 1 leaves a centre send");
+                    if (iw == 0) CHECK(l2 < 1e-3f || r2 < 1e-3f, "field divergence -1 leaves a common part in FL and FR");
+                }
+        CHECK(worst_w < 0.01 && worst_d < 0.01, "field shaping: power off by %.4f / %.4f dB", worst_w, worst_d);
+    }
+    /* Through the mixer: a positioned voice, mostly front left. */
+    memset(&v, 0, sizeof(v));
+    v.channels = 1;
+    memcpy(v.bin, k_bins[2], sizeof(v.bin));            /* FL FR C LFE SL SR, reverb */
+    v.g[0] = 0.5f; v.g[1] = 0.1f; v.g[2] = 0.2f; v.g[3] = 0.05f; v.g[4] = 0.3f; v.g[5] = 0.1f;
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        v.samples[i][0] = v.samples[i][1] = sinf((float)i * 0.7f);
+    {
+        static float ref[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+        double p_ref = 0, p = 0;
+        memset(ref, 0, sizeof(ref));
+        old_mix(ref, &v);
+        for (int b = 0; b < NUM_MIXBINS; b++) p_ref += bin_rms(ref[b]) * bin_rms(ref[b]);
+        apu_bus_config_neutral(&cfg);
+        cfg.bus[9].field_width = 0.0f;
+        memset(out, 0, sizeof(out));
+        run_one(&cfg, 6, 9, &v, out);
+        for (int b = 0; b < NUM_MIXBINS; b++) p += bin_rms(out[b]) * bin_rms(out[b]);
+        CHECK(fabs(bin_rms(out[19]) - bin_rms(out[20])) < 1e-6 && fabs(bin_rms(out[14]) - bin_rms(out[15])) < 1e-6,
+              "field width 0: the pairs are not centred");
+        CHECK(!memcmp(out[16], ref[16], sizeof(ref[0])) && !memcmp(out[24], ref[24], sizeof(ref[0])),
+              "field width touched the centre or the LFE");
+        CHECK(fabs(db(sqrt(p / p_ref))) < 0.01, "field width 0 changed the voice's power by %.3f dB", db(sqrt(p / p_ref)));
+        apu_bus_config_neutral(&cfg);
+        cfg.bus[9].field_divergence = 1.0f;
+        memset(out, 0, sizeof(out));
+        p = 0;
+        run_one(&cfg, 6, 9, &v, out);
+        for (int b = 0; b < NUM_MIXBINS; b++) p += bin_rms(out[b]) * bin_rms(out[b]);
+        CHECK(bin_rms(out[16]) < 1e-6 && bin_rms(out[19]) > bin_rms(ref[19]), "field divergence 1: the centre send is not in FL/FR");
+        CHECK(fabs(db(sqrt(p / p_ref))) < 0.01, "field divergence changed the voice's power by %.3f dB", db(sqrt(p / p_ref)));
+        /* Neutral values are not on the path at all: the same bytes as
+         * the loop, whatever the pan settings of the unused route say. */
+        apu_bus_config_neutral(&cfg);
+        cfg.bus[9].pan_x = -0.7f; cfg.bus[9].pan_y = 0.2f; cfg.bus[9].pan_width = 0.3f; cfg.bus[9].pan_divergence = 1.0f;
+        CHECK(apu_bus_config_is_neutral(&cfg), "pan settings of a bus on the title's route make it non-neutral");
+        memset(out, 0, sizeof(out));
+        run_one(&cfg, 6, 9, &v, out);
+        CHECK(!memcmp(out, ref, sizeof(ref)), "a neutral bus with pan settings is not the loop's sum");
+        cfg.bus[9].field_width = 1.01f;
+        CHECK(!apu_bus_config_is_neutral(&cfg), "a field width of 1.01 reads as neutral");
+    }
+    apu_bus_config_neutral(&cfg);
+    apu_bus_set_config(&cfg);
+}
+
 int main(void)
 {
     dsp_setup();
@@ -436,6 +640,7 @@ int main(void)
     test_output();
     test_duck();
     test_preset();
+    test_pan();
     /* And once more after everything else ran: neutral is still today. */
     test_identity();
     if (s_fail) { fprintf(stderr, "%d check(s) failed\n", s_fail); return 1; }
