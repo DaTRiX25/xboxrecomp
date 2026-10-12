@@ -284,6 +284,29 @@ Nothing is sent, the refresh included, while the settings overlay is open
 (`xbox_InputSetBackground`, from the window's focus events): a zero goes out
 first, and what the title last asked for plays again after.
 
+### A pad is never left shaking
+
+What ends a run, and what stops the motors then:
+
+| End | Stop |
+|---|---|
+| the window closed, Cmd+Q, the overlay's quit | the window's thread calls `xbox_InputShutdown` before SDL is taken down |
+| `exit()`, a return from `main`, the title's own quit | `atexit` (POSIX); the exit hooks before `ExitProcess` (Windows, `recomp_exit_hook.h`) |
+| SIGTERM, SIGINT, SIGHUP | a handler wakes a thread that calls `xbox_InputShutdown`, waits up to 150 ms, and the signal then ends the process as before (only where the signal had its default action) |
+| a crash | the host's crash handler calls `xbox_InputPanicStop` (signal-safe: the same thread does the work) |
+| the pad poll hangs, the process alive | the host's rumble effect runs `XBOX_RUMBLE_EFFECT_MS` (250 ms) and is renewed every `XBOX_RUMBLE_REFRESH_MS` (100 ms) only by the poll: SDL ends it at its next update |
+| SIGKILL, power | nothing here can run. SDL's rumble time is kept by SDL in this process, not by the pad: what the pad does with its last report is the pad's own, and not measured here |
+
+`xbox_InputShutdown` sets every motor to zero, then the backend's `shutdown`
+writes the stop out (rumble and trigger rumble at zero, 40 ms for SDL's
+HIDAPI rumble queue, which a process that ends at once would take with it
+unwritten) and closes every controller. After it nothing reaches a pad
+again: the title's threads run on until the process is gone, and the USB pad
+would otherwise give its held speeds back 150 ms later, to a pad whose SDL
+timer no longer runs. The overlay, the window out of focus, a pad unplugged
+(SDL stops a pad it closes) each stop the motors as before; a pad plugged in
+again gets the held level at the next refresh.
+
 `RECOMP_TRACE=input_diag` prints each change handed to the host, with the
 title's speeds beside it; it runs without a pad too (`(no pad)`).
 

@@ -6106,7 +6106,7 @@ static void bridge_RtlAnsiStringToUnicodeString(void)
         }
     }
 
-    result = MultiByteToWideChar(CP_ACP, 0,
+    result = MultiByteToWideChar(XBOX_GUEST_CP, 0,
         (const char*)XBOX_TO_NATIVE(s_buf_va), (int)s_len,
         (WCHAR*)XBOX_TO_NATIVE(d_buf_va), (int)(unicode_bytes / sizeof(WCHAR)));
     if (result > 0) {
@@ -6162,7 +6162,7 @@ static void bridge_RtlUnicodeStringToAnsiString(void)
         }
     }
 
-    result = WideCharToMultiByte(CP_ACP, 0,
+    result = WideCharToMultiByte(XBOX_GUEST_CP, 0,
         (const WCHAR*)XBOX_TO_NATIVE(s_buf_va), (int)(s_len / sizeof(WCHAR)),
         (char*)XBOX_TO_NATIVE(d_buf_va), (int)ansi_bytes, NULL, NULL);
     if (result > 0) {
@@ -6786,7 +6786,7 @@ static void bridge_RtlMultiByteToUnicodeN(void)
 
     if (!uni_va && max_bytes) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
     chars = (int)(max_bytes / sizeof(WCHAR));
-    result = MultiByteToWideChar(CP_ACP, 0,
+    result = MultiByteToWideChar(XBOX_GUEST_CP, 0,
         (const char *)XBOX_TO_NATIVE(mb_va), (int)mb_bytes,
         uni_va ? (WCHAR *)XBOX_TO_NATIVE(uni_va) : NULL, chars);
     if (bytes_va)
@@ -6803,7 +6803,7 @@ static void bridge_RtlMultiByteToUnicodeSize(void)
     uint32_t mb_bytes = STACK_ARG(2);
     int result;
 
-    result = MultiByteToWideChar(CP_ACP, 0,
+    result = MultiByteToWideChar(XBOX_GUEST_CP, 0,
         (const char *)XBOX_TO_NATIVE(mb_va), (int)mb_bytes, NULL, 0);
     if (bytes_va)
         BRIDGE_MEM32(bytes_va) = result > 0 ? (uint32_t)(result * sizeof(WCHAR)) : 0;
@@ -6822,7 +6822,7 @@ static void bridge_RtlUnicodeToMultiByteN(void)
     int result;
 
     if (!mb_va && max_bytes) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-    result = WideCharToMultiByte(CP_ACP, 0,
+    result = WideCharToMultiByte(XBOX_GUEST_CP, 0,
         (const WCHAR *)XBOX_TO_NATIVE(uni_va), (int)(uni_bytes / sizeof(WCHAR)),
         mb_va ? (char *)XBOX_TO_NATIVE(mb_va) : NULL, (int)max_bytes,
         NULL, NULL);
@@ -6840,7 +6840,7 @@ static void bridge_RtlUnicodeToMultiByteSize(void)
     uint32_t uni_bytes = STACK_ARG(2);
     int result;
 
-    result = WideCharToMultiByte(CP_ACP, 0,
+    result = WideCharToMultiByte(XBOX_GUEST_CP, 0,
         (const WCHAR *)XBOX_TO_NATIVE(uni_va), (int)(uni_bytes / sizeof(WCHAR)),
         NULL, 0, NULL, NULL);
     if (bytes_va)
@@ -6876,7 +6876,7 @@ static void bridge_RtlUpcaseUnicodeToMultiByteN(void)
             tmp[wc] = 0;
         }
     }
-    result = WideCharToMultiByte(CP_ACP, 0,
+    result = WideCharToMultiByte(XBOX_GUEST_CP, 0,
         tmp, (int)wc,
         mb_va ? (char *)XBOX_TO_NATIVE(mb_va) : NULL, (int)max_bytes,
         NULL, NULL);
