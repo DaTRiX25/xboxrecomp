@@ -675,6 +675,9 @@ static void test_return_voices(void)
     apu_bus_reclassify();
 }
 
+#include <unistd.h>
+#include "audition.inc"
+
 int main(void)
 {
     dsp_setup();
@@ -686,7 +689,9 @@ int main(void)
     test_preset();
     test_pan();
     test_return_voices();
-    /* And once more after everything else ran: neutral is still today. */
+    test_audition();
+    /* And once more after everything else ran, now with the audition
+     * recording on: neutral is still today. */
     test_identity();
     if (s_fail) { fprintf(stderr, "%d check(s) failed\n", s_fail); return 1; }
     puts("PASS: the neutral mixer is bit-identical; controls, output stage, ducking and presets as specified.");

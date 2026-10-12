@@ -46,12 +46,22 @@ extern "C" {
 #define APU_GP_FRAME    32
 #define APU_GP_SPEAKERS 6               /* FL FR C LFE SL SR (apu_speakers.h) */
 #define APU_GP_STATE_MAX 4096           /* words of effect state */
+#define APU_GP_CODE_MAX 2048            /* words of a program run as it is */
 
 /* GP scratch memory, by byte offset: a dword read, and n dwords written. */
 typedef struct {
     uint32_t (*read)(void *ctx, uint32_t off);
     void (*write)(void *ctx, uint32_t off, const uint32_t *words, int n);
     void *ctx;
+    /* The guest's view of the GP's X memory, a dword an X word from X:0,
+     * or NULL. DirectSound does not only load effect states through
+     * commands: it reads them back from here (an I3DL2 listener change
+     * starts by reading the reverb's delay table, which the reverb's own
+     * code completed) and writes some words here directly. The model
+     * keeps its state words and this window the same: a word the guest
+     * changed is taken over before a command or a frame, a word the model
+     * changed is written out after it. */
+    uint32_t *xwin;
 } apu_gp_mem;
 
 /* ── wiring: the title's port, before the APU starts ── */
@@ -65,6 +75,21 @@ void apu_gp_eq(int bin, int speaker, uint32_t state);
 /* The image's distortion, in place on bin. state as above (parameters at
  * +7..+11, +13, +15; its filter at +0, +17, +18). */
 void apu_gp_drive(int bin, uint32_t state);
+/* An effect of the image run as the title's own code (apu_dsp56k.h): its
+ * code_words words at GP scratch code_scratch_off, taken when the title
+ * loads the image's state. For an effect too large to restate by hand (a
+ * reverb with its delay lines in GP scratch): it runs once a frame after
+ * the in-place effects above, reads the mixbins where the GP has them
+ * (X:0x1400 + 0x20 * bin), adds to the speaker sums (X:0xC00 + 0x20 *
+ * speaker) and finds its state words where the image put them (state word
+ * n at X:0x80 + n), loaded by the title's commands like every other
+ * effect's. Its last word must be the NOP the image ends every effect
+ * with. If it meets something the interpreter does not have, the log says
+ * so once and the program is left out. code_words 0: no program. */
+void apu_gp_program(uint32_t code_scratch_off, uint32_t code_words);
+/* DSP instructions run for it so far. */
+unsigned long apu_gp_program_steps(void);
+
 /* Each frame bins first .. first + count - 1 are written, after the
  * in-place effects, to GP scratch at scratch_off: 32 dwords a bin, a
  * signed 24-bit sample in each. */

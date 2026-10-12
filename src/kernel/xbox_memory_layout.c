@@ -105,6 +105,10 @@ static void *g_nv2a_memory = NULL;
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
 static void *g_mcpx_memory = NULL;
 
+/* RECOMP_ORACLE_CAP (apu_oracle_cap.c): the MCPX window, to dump the DSP
+ * memory the title writes (plain RAM here). NULL before the layout is up. */
+void *xbox_McpxWindow(void) { return g_mcpx_memory; }
+
 /* Flash ROM. The console's 256 KB flash is mirrored through the top of the
  * address space, and the MCPX span above stops one page short of it -- so a
  * title that touches it faulted on an address that is perfectly ordinary on

@@ -42,6 +42,7 @@ static void mix_trace_on_off(MCPXAPUState *d, unsigned v, int on);
 #include "apu_bus.h"
 #include "apu.h"
 static struct apu_bus_rt *s_bus_rt;
+static int s_bus_audition;              /* this frame: an audition clip loops */
 static unsigned s_von_serial[MCPX_HW_MAX_VOICES];
 static uint32_t s_von_stack[MCPX_HW_MAX_VOICES][16];
 static uint8_t s_von_nstack[MCPX_HW_MAX_VOICES];
@@ -111,6 +112,10 @@ static float clampf(float v, float mn, float mx)
     if (v > mx) return mx;
     return v;
 }
+
+/* RECOMP_ORACLE_CAP (apu_oracle_cap.c): plain dumps, off by default. */
+int apu_ocap_on(void);
+void apu_ocap_voice(const void *a, uint32_t an, const void *b, uint32_t bn);
 
 static float attenuate(uint16_t vol)
 {
@@ -2042,7 +2047,10 @@ static void voice_process(MCPXAPUState *d,
             fc.pa = (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, fc.ba);
         }
         bus = apu_bus_voice_bus(v, s_von_serial[v], fc.pa, bus_fill, &fc);
-        if (bus == APU_BUS_BYPASS) {
+        if (s_bus_audition) {
+            /* An audition clip loops (apu_bus.h): the live voices run on,
+             * unheard, and the clip's are mixed in their place. */
+        } else if (bus == APU_BUS_BYPASS) {
             /* The input of an in-place GP effect: as with the mixer off. */
             for (int b = 0; b < 8; b++)
                 for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
@@ -2062,6 +2070,37 @@ static void voice_process(MCPXAPUState *d,
         g *= attenuate(vol[b]) / hr;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
+        }
+    }
+
+    /* RECOMP_ORACLE_CAP (apu_oracle_cap.c): a voice playing 32-bit
+     * containers (DirectSound's buffers over DSP memory): where its buffer
+     * is and the gain it has into each of its bins this frame. */
+    if (apu_ocap_on()) {
+        uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+        if (((fmt & NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE) >> 30) ==
+                NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B32 &&
+            !(fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE)) {
+            uint32_t w[5 + 8];
+            float gain[8];
+            uint32_t ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START,
+                                         NV_PAVS_VOICE_CUR_PSL_START_BA);
+            w[0] = v;
+            w[1] = fmt;
+            w[2] = (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, ba);
+            w[3] = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO);
+            w[4] = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO);
+            for (int b = 0; b < 8; b++) {
+                float hr;
+                if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4))
+                    hr = (float)(1 << d->vp.hrtf_headroom);
+                else
+                    hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
+                w[5 + b] = (uint32_t)bin[b] | ((uint32_t)vol[b] << 8) |
+                           ((uint32_t)(lpf ? 1 : 0) << 24);
+                gain[b] = ea_value * attenuate(vol[b]) / hr;
+            }
+            apu_ocap_voice(w, sizeof(w), gain, sizeof(gain));
         }
     }
 
@@ -2176,8 +2215,10 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         static int have_map;
         if (!have_map) { mcpx_apu_speaker_map_get(map); have_map = 1; }
         s_bus_rt = apu_bus_frame_begin(d->monitor.channels, map);
+        s_bus_audition = s_bus_rt && apu_bus_audition_playing();
     } else {
         s_bus_rt = NULL;
+        s_bus_audition = 0;
     }
 
     for (int list = 0; list < 3; list++) {
@@ -2215,8 +2256,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         }
     }
 
-    if (s_bus_rt)
+    if (s_bus_rt) {
+        if (s_bus_audition)
+            apu_bus_audition_mix(s_bus_rt, mixbins);
         apu_bus_frame_end(s_bus_rt, mixbins);
+    }
     if (s_mix_on > 0 && s_rec_state > 0)
         mix_rec_frame((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins);
 
