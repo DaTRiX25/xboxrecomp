@@ -254,7 +254,8 @@ static int mixer_e2e(const char *file)
     run(12);
     CHECK(xbox_OverlayOpen() && xbox_HostPaused() && xbox_InputBlocked());
     ptap(P_RB, 2); run(3);
-    ptap(P_DOWN, 5);
+    CHECK(xbox_OverlayTestRowIndex("Custom music folder") == 0);
+    ptap(P_DOWN, 6);                      /* past the music folder's row, then as before */
     ptap(P_A); run(3);
     CHECK(xbox_OverlayMixerView() == 0);
     CHECK(!xbox_HostPaused() && xbox_InputBlocked());               /* live: runs, input still ours */
@@ -554,7 +555,7 @@ static int mixer_tour(const char *pre, const char *file)
     tap(SDLK_F1);
     run(12);
     tap(SDLK_PAGEDOWN); run(2); tap(SDLK_PAGEDOWN); run(3);       /* Audio */
-    for (int i = 0; i < 5; i++) { tap(SDLK_DOWN); run(1); }        /* the Mixer row */
+    for (int i = 0; i < 6; i++) { tap(SDLK_DOWN); run(1); }        /* the Mixer row, under the music folder's */
     snprintf(path, sizeof path, "%smixer_0_audio.bmp", pre); frame(path);
     tap(SDLK_RETURN); run(3);
     CHECK(!apu_bus_enabled());
@@ -828,6 +829,19 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     return s_fail ? 1 : 0;
 }
 
+/* The music folder row's port side, stood in for: a status line and two
+ * notes, nothing chosen. */
+static void music_status(char *out, unsigned n) { snprintf(out, n, "2 soundtracks, 34 songs: in the game's music menu."); }
+static void music_chosen(const char *dir) { (void)dir; }
+static int music_note(int i, char *out, unsigned n)
+{
+    if (i > 0)
+        return 0;
+    snprintf(out, n, "  one.mp3: no MPEG audio found in its first megabyte");
+    return 1;
+}
+static const xbox_music_folder_ops k_music_ops = { music_status, music_chosen, music_note };
+
 int main(int argc, char **argv)
 {
     const char *pre = argc > 1 ? argv[1] : "overlay_";
@@ -847,6 +861,9 @@ int main(int argc, char **argv)
     q = [dev newCommandQueue];
     xbox_OverlaySetWindow(win);
     xbox_BugReportSetMaker(fake_report);
+    /* A port with a music folder (BO-108): its row is the Audio page's
+     * first, and every tour below goes down that page as a port has it. */
+    xbox_OverlaySetMusicFolder(&k_music_ops);
     if (getenv("OVERLAY_SHOT_MIXER_E2E"))
         return mixer_e2e(getenv("OVERLAY_SHOT_MIXER_E2E"));
     if (getenv("OVERLAY_SHOT_MIXER"))
@@ -887,6 +904,20 @@ int main(int argc, char **argv)
         pad(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, false);
         run(3);
         if (p == 2) {                                         /* audio */
+            /* The music folder's row is the first, its lines under it, the
+             * settings after them in the order they always had. */
+            CHECK(xbox_OverlayTestRowIndex("Custom music folder") == 0);
+            CHECK(xbox_OverlayTestRowIndex("2 soundtracks") == 1);
+            CHECK(xbox_OverlayTestRowIndex("  one.mp3") == 2);
+            CHECK(xbox_OverlayTestRowIndex("Master volume") == 3);
+            CHECK(xbox_OverlayTestRowIndex("Mute") == 4);
+            CHECK(xbox_OverlayTestRowIndex("Speakers") > xbox_OverlayTestRowIndex("Mute in the background"));
+            CHECK(xbox_OverlayTestRowIndex("Reset this page") > xbox_OverlayTestRowIndex("Speaker test, direct"));
+            snprintf(path, sizeof path, "%saudio_top.bmp", pre);
+            frame(path);
+            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, true);       /* off the music row, onto the volume */
+            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, false);
+            run(2);
             pad(SDL_CONTROLLER_BUTTON_DPAD_LEFT, true);
             pad(SDL_CONTROLLER_BUTTON_DPAD_LEFT, false);
             run(2);

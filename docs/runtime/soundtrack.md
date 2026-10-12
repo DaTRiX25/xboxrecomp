@@ -137,7 +137,8 @@ unchanged.
 ## Choosing the folder in the overlay
 
 `xbox_OverlaySetMusicFolder(&ops)` (xbox_settings.h) puts a "Custom music
-folder" row on the overlay's Audio page. The row opens a folder browser
+folder" row at the top of the overlay's Audio page, above the volume and
+the rest. The row opens a folder browser
 drawn in the place of the page's rows; D-pad or arrows, A or Enter, B or Esc,
 the mouse. Its model is `xst_browse.c` (`xsb_*`, no drawing, unit-tested):
 

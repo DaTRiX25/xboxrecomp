@@ -225,7 +225,8 @@ enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_RESTART,                                          /* start the program again (recomp_restart.h) */
               A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_CANCEL };  /* xbox_OverlaySetSaveIO */
 
-/* The most rows a page has. */
+/* The most rows a page has (the Audio page, with the music folder's lines
+ * above its settings; the Advanced page with the save and restart rows). */
 #define OVERLAY_ROWS 28
 
 /* ── restart (recomp_restart.h) ────────────────────────────────────── */
@@ -606,6 +607,24 @@ static int page_rows(int page, Row *r)
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_AUDIO:
+        /* The player's own music first: it is what this page is opened for
+         * most (BO-108). Its status line and notes follow it. */
+        if (s_mf) {
+            r[n++] = Row{ R_FOLDER, XS_COUNT, 0, "Custom music folder" };
+            s_mf_status[0] = 0;
+            if (s_mf->status)
+                s_mf->status(s_mf_status, sizeof s_mf_status);
+            if (s_mf_status[0])
+                INFO(s_mf_status);
+            /* More lines of the port's (what a scan left out, by name), as
+             * far as the page has room. */
+            for (int k = 0; k < MUSIC_NOTES && s_mf->note && n < OVERLAY_ROWS - 12; k++) {
+                s_mf_note[k][0] = 0;
+                if (!s_mf->note(k, s_mf_note[k], sizeof s_mf_note[k]) || !s_mf_note[k][0])
+                    break;
+                INFO(s_mf_note[k]);
+            }
+        }
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
         /* The dry effect sends' level: only where no model of the title's
          * effects image runs (apu_gp.h); with one they are not dry. */
@@ -621,22 +640,6 @@ static int page_rows(int page, Row *r)
         SPK(1, "Speaker test, direct");
         if (mcpx_apu_title_channels() != 6)
             INFO("The output is stereo: each speaker is folded to left/right.");
-        if (s_mf) {
-            r[n++] = Row{ R_FOLDER, XS_COUNT, 0, "Custom music folder" };
-            s_mf_status[0] = 0;
-            if (s_mf->status)
-                s_mf->status(s_mf_status, sizeof s_mf_status);
-            if (s_mf_status[0])
-                INFO(s_mf_status);
-            /* More lines of the port's (what a scan left out, by name), as
-             * far as the page has room. */
-            for (int k = 0; k < MUSIC_NOTES && s_mf->note && n < OVERLAY_ROWS - 2; k++) {
-                s_mf_note[k][0] = 0;
-                if (!s_mf->note(k, s_mf_note[k], sizeof s_mf_note[k]) || !s_mf_note[k][0])
-                    break;
-                INFO(s_mf_note[k]);
-            }
-        }
         RESTART_ROW();
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
@@ -778,9 +781,9 @@ static void test_state(const char *path)
     fclose(f);
 }
 
-/* Tests (overlay_shot): the open page's row whose text starts with
- * `prefix`: whether there is one, and the cursor put on it. */
-static int row_starting(const char *prefix)
+/* Tests (overlay_shot): where on the open page the row whose text starts
+ * with `prefix` is, -1 when it has none. */
+int xbox_OverlayTestRowIndex(const char *prefix)
 {
     Row r[OVERLAY_ROWS];
     int n = page_rows(s_page, r);
@@ -794,12 +797,12 @@ static int row_starting(const char *prefix)
 
 int xbox_OverlayTestHasRow(const char *prefix)
 {
-    return row_starting(prefix) >= 0;
+    return xbox_OverlayTestRowIndex(prefix) >= 0;
 }
 
 int xbox_OverlayTestSelectRow(const char *prefix)
 {
-    int i = row_starting(prefix);
+    int i = xbox_OverlayTestRowIndex(prefix);
     if (i < 0)
         return 0;
     s_sel[s_page] = i;
