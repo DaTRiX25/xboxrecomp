@@ -67,6 +67,10 @@ void xbox_HostFlipStats(xbox_flip_stats *out);
  * outside the lock: work that must run on the executor's thread while the
  * title is stopped (a frame capture for the bug report). One; NULL: none. */
 void xbox_HostPauseHoldFn(void (*fn)(void));
+/* A second such call, for the GPU backend (work on its own tables while the
+ * title is stopped: graphics.ui_scale prepares the loaded 2D textures when
+ * the setting is switched on in the overlay). One; NULL: none. */
+void xbox_HostPauseIdleFn(void (*fn)(void));
 
 /* fn(paused) is called, after the flag changes, on every xbox_HostPause that
  * changes it. At most 4; call before the guest starts. */

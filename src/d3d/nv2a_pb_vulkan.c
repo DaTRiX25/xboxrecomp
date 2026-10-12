@@ -67,6 +67,10 @@
 #include "d3d8_glsl.h"
 #include "d3d8_swizzle.h"
 #include "nv2a_texrep.h"
+#include "nv2a_texscale.h"
+#include "kernel_pause.h"
+static void scale_prepare_loaded(void);
+static int ui_scale_log(void);
 #include "nv2a_pcache.h"
 #include "recomp_env.h"
 #include <pthread.h>
@@ -2115,6 +2119,14 @@ typedef struct {
     uint32_t         gen, used;
     uint64_t         hash;
     uint32_t         rep;           /* nv2a_texrep generation it was uploaded at; 0: not a replaced texture */
+    uint8_t          ui;            /* a 2D draw has bound it (nv2a_texscale.h); stays */
+    uint8_t          scale;         /* the factor wanted when it was uploaded: 0, 2, 4 */
+    uint8_t          salgo;         /* and the scaler */
+    uint8_t          up_scale;      /* the factor the image has (0 where the scaler refused) */
+    uint8_t          use;           /* RECOMP_DEBUG=ui_scale_log: the kinds of draw seen */
+    uint8_t          pend;          /* its scaled picture is being made (nv2a_texscale_get) */
+    uint32_t         pal_len, pgen; /* P8 entries; the flip pend was last asked at */
+    uint64_t         skey;          /* nv2a_texscale_key of the texels uploaded */
     int              live;
     struct nvk_image im;
 } TexEntry;
@@ -2186,7 +2198,103 @@ static struct { uint32_t n; uint64_t texels, decode, image, copy; } s_fup;
  * recorded with, as Metal's new MTLTexture per change. */
 static uint32_t s_tex_rep;    /* the last tex_upload's nv2a_texrep_apply */
 
-static int tex_upload(const Stage *t, struct nvk_image *out)
+/* graphics.ui_scale (nv2a_texscale.h), as Metal: the draw being recorded is
+ * a 2D one, and the factor the texture tex_bind last returned has. */
+static int       s_draw_2d;
+static unsigned  s_bind_scale;
+static uint32_t *s_scaled;
+static size_t    s_scaled_cap;
+
+static unsigned scale_levels(unsigned f)
+{
+    return f == 4 ? 3u : f == 2 ? 2u : 1u;
+}
+
+static uint32_t  s_swap_flip = 0xFFFFFFFFu;   /* the flip of the last swap */
+static int       s_up_pend;    /* the last tex_upload queued the scaled picture */
+static uint64_t  s_up_key;
+
+/* The disk cache of scaled textures: beside the shader cache. Once. */
+static void scale_store_init(void)
+{
+    static int done;
+    char dir[900], sub[1000];
+    if (done)
+        return;
+    done = 1;
+    if (nvk_cache_dir(dir, sizeof dir)) {
+        snprintf(sub, sizeof sub, "%s/ui_scale", dir);
+        nv2a_texscale_cache_dir(sub);
+    }
+}
+
+static int scaled_room(const Stage *t, unsigned f)
+{
+    size_t n = nv2a_tex_texels(t->width * f, t->height * f, scale_levels(f));
+    if (n > s_scaled_cap) {
+        uint32_t *p = (uint32_t *)realloc(s_scaled, n * 4);
+        if (!p)
+            return 0;
+        s_scaled = p;
+        s_scaled_cap = n;
+    }
+    return 1;
+}
+
+/* s_scaled's level 0 (the texture f times as large) as an image with the
+ * levels down to the title's size (as Metal). 0: no image (out untouched). */
+static int scaled_image(const Stage *t, unsigned f, struct nvk_image *out)
+{
+    uint32_t w = t->width * f, h = t->height * f, levels = scale_levels(f), l;
+    const uint32_t *src;
+
+    nv2a_texscale_mips(s_scaled, w, h, levels);
+    if (!nvk_image_new(out, RT_FORMAT, w, h, levels,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT))
+        return 0;
+    for (l = 0, src = s_scaled; l < levels; l++) {
+        uint32_t lw = nv2a_tex_level_dim(w, l), lh = nv2a_tex_level_dim(h, l);
+        if (!upload_level(out, l, lw, lh, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          l + 1 == levels)) {
+            garbage_push(out, VK_NULL_HANDLE, NULL);
+            memset(out, 0, sizeof *out);
+            return 0;
+        }
+        src += (size_t)lw * lh;
+    }
+    return 1;
+}
+
+/* The scaled picture of s_texels, if the store has it ready; else it is
+ * queued (s_up_pend) and the title's own texture is uploaded meanwhile.
+ * Nothing is scaled on this thread. */
+static int tex_upload_scaled(const Stage *t, unsigned f, int algo, struct nvk_image *out)
+{
+    uint64_t t0 = ui_scale_log() ? now_ns() : 0;
+    int r;
+
+    s_up_pend = 0;
+    if (!nv2a_texscale_has_alpha(s_texels, (size_t)t->width * t->height)
+            || !scaled_room(t, f))
+        return 0;
+    scale_store_init();
+    s_up_key = nv2a_texscale_key(s_texels, t->width, t->height);
+    r = nv2a_texscale_get(s_up_key, s_texels, t->width, t->height, f,
+                          (enum nv2a_texscale_algo)algo, 0, s_scaled);
+    if (ui_scale_log())
+        fprintf(stderr, "[UISCALE] ask %016llx %ux%u x%u: %s, %.3f ms on the render thread,"
+                " flip %llu\n", (unsigned long long)s_up_key, t->width, t->height, f,
+                r == NV2A_TEXSCALE_READY ? "ready" : r == NV2A_TEXSCALE_PENDING ? "queued"
+                                                                               : "not taken",
+                (double)(now_ns() - t0) / 1e6, (unsigned long long)s_presents);
+    if (r == NV2A_TEXSCALE_READY)
+        return scaled_image(t, f, out);
+    s_up_pend = r == NV2A_TEXSCALE_PENDING;
+    return 0;
+}
+
+static int tex_upload(const Stage *t, unsigned scale, int algo, struct nvk_image *out)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
@@ -2215,6 +2323,13 @@ static int tex_upload(const Stage *t, struct nvk_image *out)
         size_t i;
         for (i = 0; i < n; i++)
             s_texels[i] ^= x;
+    }
+    s_bind_scale = 0;
+    s_up_pend = 0;
+    if (scale && tex_upload_scaled(t, scale, algo, out)) {
+        s_bind_scale = scale;
+        s_tex_uploads++;
+        return 1;
     }
     t1 = s_pc_trace ? now_ns() : 0;
     if (!nvk_image_new(out, RT_FORMAT, t->width, t->height, t->levels,
@@ -2261,12 +2376,111 @@ static void tex_upload_log(void)
 
 static void rt_sync(RenderTarget *rt, uint32_t pitch);
 
+/* graphics.ui_scale switched on (or changed) in the overlay: while the title
+ * is held for the pause, every loaded texture the rule could scale is decoded
+ * and queued, to be made and written to the disk cache in the background
+ * (nothing is uploaded here; a texture's own bind takes its picture from the
+ * cache later). "Could scale": one level, swizzled or DXT, some transparency;
+ * whether a 2D draw uses it is not known for a texture bound before the
+ * setting was on, so some that never will be are made too. The executor's
+ * thread (xbox_HostPauseIdleFn), which is the thread of every other use of
+ * the cache. */
+static void scale_prepare_loaded(void)
+{
+    static uint32_t done_gen;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    unsigned f = nv2a_texscale_factor(), queued = 0;
+    int algo = (int)nv2a_texscale_algo(), i;
+
+    if (done_gen == nv2a_texscale_generation())
+        return;
+    done_gen = nv2a_texscale_generation();
+    if (!f)
+        return;
+    scale_store_init();
+    if (!nv2a_texscale_cache_path(NULL, 0))
+        return;
+    for (i = 0; i < TEX_CACHE; i++) {
+        TexEntry *e = &s_tc[i];
+        Stage st;
+        const uint32_t *pal = NULL;
+        uint32_t bytes;
+        size_t n;
+
+        if (!e->live || e->sign || e->up_scale == f || e->pend
+                || !nv2a_texscale_tex_ok(nv2a_tex_size_from_format(e->color), e->width,
+                                         e->height, e->levels))
+            continue;
+        memset(&st, 0, sizeof st);
+        st.offset = e->offset;
+        st.color = e->color;
+        st.width = e->width;
+        st.height = e->height;
+        st.pitch = e->pitch;
+        st.palette = e->palette;
+        st.pal_len = e->pal_len;
+        st.levels = e->levels;
+        bytes = nv2a_tex_extent(st.color, st.width, st.height, st.pitch, st.levels);
+        /* Only what is still the texture that was uploaded. */
+        if (!bytes || tex_hash_pal(mem, &st, bytes) != e->hash)
+            continue;
+        n = nv2a_tex_texels(st.width, st.height, st.levels);
+        if (n > s_texels_cap) {
+            uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
+            if (!p)
+                return;
+            s_texels = p;
+            s_texels_cap = n;
+        }
+        if (st.color == NV2A_TEX_P8)
+            pal = (const uint32_t *)(mem + st.palette);
+        nv2a_tex_decode(mem + st.offset, st.color, st.width, st.height, st.pitch, st.levels,
+                        pal, pal ? st.pal_len : 0, s_texels);
+        (void)nv2a_texrep_apply(mem + st.offset, st.color, st.width, st.height, st.pitch,
+                                st.levels, s_texels);
+        if (!nv2a_texscale_has_alpha(s_texels, (size_t)st.width * st.height))
+            continue;
+        if (nv2a_texscale_get(nv2a_texscale_key(s_texels, st.width, st.height), s_texels,
+                              st.width, st.height, f, (enum nv2a_texscale_algo)algo,
+                              NV2A_TEXSCALE_DISK_ONLY, NULL) == NV2A_TEXSCALE_PENDING)
+            queued++;
+    }
+    fprintf(stderr, "[UISCALE] setting changed to %ux: %u loaded textures queued for the"
+            " cache\n", f, queued);
+}
+
+/* RECOMP_DEBUG=ui_scale_log, as Metal. */
+static int ui_scale_log(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_UI_SCALE_LOG) != NULL;
+    return on;
+}
+
+static void ui_scale_use(TexEntry *e, const Stage *t, const uint8_t *mem)
+{
+    uint8_t bit = s_draw_2d ? 1 : 2;
+    if (e->use & bit)
+        return;
+    e->use |= bit;
+    fprintf(stderr, "[UISCALE] tex %016llx fmt 0x%02x %ux%u levels %u use %u scale %u flip %llu\n",
+            (unsigned long long)nv2a_texrep_hash(mem + t->offset, t->color, t->width,
+                                                 t->height, t->pitch),
+            t->color, t->width, t->height, t->levels, e->use, e->up_scale,
+            (unsigned long long)s_presents);
+}
+
 static VkImageView tex_bind(const Stage *t)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bytes = 0, i;
     TexEntry *e = NULL, *victim = &s_tc[0];
+    unsigned want;
+    int algo;
+
+    s_bind_scale = 0;
 
     if (t->valid && (uint64_t)t->width * t->height <= TEX_MAX_TEXELS)
         bytes = nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
@@ -2316,9 +2530,21 @@ static VkImageView tex_bind(const Stage *t)
         if (!c->live || (victim->live && c->used < victim->used))
             victim = c;
     }
+    /* graphics.ui_scale: a texture a 2D draw binds is scaled, from then on
+     * and for every draw (off: want is 0 and nothing here differs). */
+    want = nv2a_texscale_factor();
+    algo = (int)nv2a_texscale_algo();
+    if (want && !((s_draw_2d || (e && e->ui)) && !stage_signed(t)
+                  && nv2a_texscale_tex_ok(nv2a_tex_size_from_format(t->color), t->width,
+                                          t->height, t->levels)))
+        want = 0;
     if (e) {
-        /* A replaced texture whose variant changed is uploaded again. */
-        int stale = e->rep && e->rep != nv2a_texrep_generation();
+        /* A replaced texture whose variant changed is uploaded again; so is
+         * one whose scale is not the one wanted now. */
+        int stale = (e->rep && e->rep != nv2a_texrep_generation())
+                 || e->scale != want || (want && e->salgo != algo);
+        if (s_draw_2d)
+            e->ui = 1;
         if (e->gen != g->flips || stale) {
             uint64_t h = tex_hash_pal(mem, t, bytes);
             s_tex_rehash++;
@@ -2327,11 +2553,18 @@ static VkImageView tex_bind(const Stage *t)
                 struct nvk_image ni;
                 e->hash = h;
                 s_tex_changed++;
-                if (!tex_upload(t, &ni))
+                if (!tex_upload(t, want, algo, &ni))
                     return s_black.view;
                 garbage_push(&e->im, VK_NULL_HANDLE, NULL);
                 e->rep = s_tex_rep;
                 e->im = ni;
+                e->scale = (uint8_t)want;
+                e->salgo = (uint8_t)algo;
+                e->up_scale = (uint8_t)s_bind_scale;
+                e->pend = (uint8_t)s_up_pend;
+                e->skey = s_up_key;
+                e->pgen = g->flips;
+                e->pal_len = t->pal_len;
             }
         }
     } else {
@@ -2341,8 +2574,17 @@ static VkImageView tex_bind(const Stage *t)
             garbage_push(&e->im, VK_NULL_HANDLE, NULL);
         memset(&e->im, 0, sizeof e->im);
         e->live = 0;
-        if (!tex_upload(t, &ni))
+        if (!tex_upload(t, want, algo, &ni))
             return s_black.view;
+        e->ui = (uint8_t)(s_draw_2d != 0);
+        e->scale = (uint8_t)want;
+        e->salgo = (uint8_t)algo;
+        e->up_scale = (uint8_t)s_bind_scale;
+        e->pend = (uint8_t)s_up_pend;
+        e->skey = s_up_key;
+        e->pgen = g->flips;
+        e->pal_len = t->pal_len;
+        e->use = 0;
         e->offset = t->offset;
         e->color = t->color;
         e->width = t->width;
@@ -2357,7 +2599,42 @@ static VkImageView tex_bind(const Stage *t)
         e->im = ni;
         e->live = 1;
     }
+    /* Its scaled picture was being made: asked for once a flip, swapped in
+     * when it is there (as Metal). The old image goes when the frames that
+     * may use it are done. */
+    if (e->pend && e->pgen != g->flips && s_swap_flip != g->flips) {
+        e->pgen = g->flips;
+        if (!scaled_room(t, e->scale)) {
+            e->pend = 0;
+        } else {
+            uint64_t t0 = ui_scale_log() ? now_ns() : 0;
+            int r = nv2a_texscale_get(e->skey, NULL, t->width, t->height, e->scale,
+                                      (enum nv2a_texscale_algo)e->salgo, 0, s_scaled);
+            if (r == NV2A_TEXSCALE_READY) {
+                struct nvk_image ni;
+                s_swap_flip = g->flips;   /* one a flip: its upload is the cost */
+                e->pend = 0;
+                if (scaled_image(t, e->scale, &ni)) {
+                    garbage_push(&e->im, VK_NULL_HANDLE, NULL);
+                    e->im = ni;
+                    e->up_scale = e->scale;
+                    s_tex_uploads++;
+                }
+            } else if (r != NV2A_TEXSCALE_PENDING) {
+                e->pend = 0;         /* refused or lost: stays as the title's */
+            }
+            if (ui_scale_log() && r != NV2A_TEXSCALE_PENDING)
+                fprintf(stderr, "[UISCALE] swap %016llx %ux%u x%u: %s, %.3f ms on the render"
+                        " thread, flip %llu\n", (unsigned long long)e->skey, t->width,
+                        t->height, (unsigned)e->scale,
+                        r == NV2A_TEXSCALE_READY ? "scaled texture in" : "no result",
+                        (double)(now_ns() - t0) / 1e6, (unsigned long long)s_presents);
+        }
+    }
     e->used = ++s_tc_clock;
+    s_bind_scale = e->up_scale;
+    if (ui_scale_log())
+        ui_scale_use(e, t, mem);
     return e->im.view;
 }
 
@@ -2375,7 +2652,7 @@ static VkSamplerAddressMode address_mode(uint32_t m)
 static struct { uint64_t key; VkSampler s; } s_smp[SMP_MAX];
 static int s_smp_n;
 
-static VkSampler sampler(const Stage *t)
+static VkSampler sampler(const Stage *t, unsigned scale)
 {
     static int point = -1;
     VkSamplerCreateInfo sc;
@@ -2389,11 +2666,15 @@ static VkSampler sampler(const Stage *t)
     mn = !point && nv2a_tex_filter_linear(t->filter, 0);
     mg = !point && nv2a_tex_filter_linear(t->filter, 1);
     mip = t->levels > 1 ? nv2a_tex_filter_mip(t->filter) : 0;
+    /* A scaled 2D texture has the levels down to the title's size, blended
+     * between (as Metal). */
+    if (scale)
+        mip = 2;
     /* Anisotropy only on a mipmapped sampler with a linear minification
      * filter, as asked (RECOMP_GFX_ANISO), within the device's limit. */
     {
         const struct nvk_core *core = nvk_core_get();
-        aniso = (mip && mn && core && core->max_aniso > 1.0f) ? nv2a_host_aniso() : 1;
+        aniso = (mip && mn && !scale && core && core->max_aniso > 1.0f) ? nv2a_host_aniso() : 1;
         if (aniso > 1 && (float)aniso > core->max_aniso)
             aniso = (int)core->max_aniso;
     }
@@ -2401,6 +2682,7 @@ static VkSampler sampler(const Stage *t)
     if (mip)
         key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
     key |= (uint64_t)aniso << 33;       /* the level is part of the sampler */
+    key |= (uint64_t)scale << 40;
     for (i = 0; i < s_smp_n; i++)
         if (s_smp[i].key == key)
             return s_smp[i].s;
@@ -2414,10 +2696,10 @@ static VkSampler sampler(const Stage *t)
     sc.addressModeU = address_mode(u);
     sc.addressModeV = address_mode(v);
     sc.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sc.minLod = mip ? (float)t->lod_min : 0.0f;
+    sc.minLod = scale ? 0.0f : mip ? (float)t->lod_min : 0.0f;
     /* Not mipmapped: level 0, with the min/mag choice kept (the Vulkan
      * spec's maxLod 0.25 for Metal's MipFilterNotMipmapped). */
-    sc.maxLod = mip ? (float)t->lod_max : 0.25f;
+    sc.maxLod = scale ? (float)(scale_levels(scale) - 1u) : mip ? (float)t->lod_max : 0.25f;
     if (vkCreateSampler(s_dev, &sc, NULL, &st) != VK_SUCCESS)
         return s_smp_n ? s_smp[0].s : VK_NULL_HANDLE;
     if (s_smp_n < SMP_MAX) {
@@ -3001,11 +3283,19 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
      * one. */
     {
         int textured = 0;
+        s_draw_2d = 0;
+        if (nv2a_texscale_factor() || ui_scale_log()) {
+            const struct nv2a_pb_present *pr = nv2a_pb_present_state();
+            struct nv2a_texscale_draw td2 = { d->program, v->depth_enable,
+                                              v->depth_enable && v->depth_mask,
+                                              rt->w, rt->h, pr->w, pr->h };
+            s_draw_2d = nv2a_texscale_draw_is_2d(&td2);
+        }
         for (k = 0; k < 4; k++) {
             const Stage *t = &s_stage[k];
             uint32_t sw, sh;
             sview[k] = s_black.view;
-            ssmp[k] = sampler(t);
+            ssmp[k] = sampler(t, 0);
             if (!t->mode || t->mode == 4)
                 continue;
             textured = 1;
@@ -3020,6 +3310,8 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                 s_rtt_binds++;
             } else {
                 sview[k] = tex_bind(t);
+                if (s_bind_scale)
+                    ssmp[k] = sampler(t, s_bind_scale);
             }
         }
         if (textured)
@@ -4372,6 +4664,9 @@ static int init(void)
             s_vkq ? "queries" : "fixed", s_qprecise ? " (precise)" : "",
             poll_ok() ? "polled (timeline semaphore)" : "from a fence per frame (vk_poll=0)");
     s_failed = 0;
+    /* graphics.ui_scale switched on in the overlay: the loaded 2D textures
+     * are prepared while the title is held (scale_prepare_loaded). */
+    xbox_HostPauseIdleFn(scale_prepare_loaded);
     return 1;
 }
 

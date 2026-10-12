@@ -10,6 +10,7 @@
 #include "pad_glyphs.h"
 #include "kernel_pacing.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_texscale.h"
 #include "apu_xaudio2.h"
 #include "apu.h"                /* mcpx_apu_set_fx_level */
 #include "apu_bus.h"
@@ -48,6 +49,7 @@ static const char *const k_scale[]    = { "1", "1.5", "2", "3", "4", NULL };
 #endif
 static const char *const k_aniso[]    = { "off", "2x", "4x", "8x", "16x", NULL };
 static const char *const k_aniso_env[] = { "1", "2", "4", "8", "16", NULL };
+static const char *const k_ui_scale[] = { "off", "2x", "4x", NULL };
 static const char *const k_lod[]      = { "off", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_lod_env[]  = { "0", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
@@ -132,6 +134,8 @@ static xs_setting s_set[XS_COUNT] = {
      * while running (the presenter looks twice a second). */
     [XS_DISPLAY_PRESENT_TIMING] = SETTING("display.present_timing", XS_CHOICE, 0, RENV_PRESENT_TIMING, k_timing, NULL, 0, 0, 0),
     [XS_ADVANCED_PERF_STEPS] = SETTING("advanced.perf_steps", XS_BOOL, 0, RENV_OVERLAY_PERF_STEPS, NULL, NULL, 0, 0, 0),
+    /* Off as shipped: the title's own textures, bit for bit. */
+    [XS_GRAPHICS_UI_SCALE]  = SETTING("graphics.ui_scale", XS_CHOICE, 0, RENV_GFX_UI_SCALE, k_ui_scale, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
 #endif
@@ -358,6 +362,9 @@ static void apply(xs_id id)
     }
     case XS_GRAPHICS_DITHER:
         nv2a_host_set_dither(v != 0.0);
+        break;
+    case XS_GRAPHICS_UI_SCALE:
+        nv2a_texscale_set_factor((int)v == 1 ? 2u : (int)v == 2 ? 4u : 0u);
         break;
     case XS_GRAPHICS_AA:
         nv2a_host_set_post_aa((int)v);

@@ -36,6 +36,8 @@ set(KERNEL_SOURCES
     nv2a_pb_exec.c
     nv2a_backend_common.c
     nv2a_texrep.c
+    nv2a_texscale.c
+    nv2a_texscale_store.c
     nv2a_vsh_cpu.c
     nv2a_combiner.c
 )
@@ -90,6 +92,12 @@ if(MSVC)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+endif()
+
+# graphics.ui_scale's filters give the same bytes on every machine (the disk
+# cache's files and the test's checksums): no fused multiply-add there.
+if(NOT MSVC)
+    set_source_files_properties(nv2a_texscale.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 endif()
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)
