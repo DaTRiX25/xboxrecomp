@@ -12,9 +12,10 @@
  * jitter is on the glass.
  *
  * Everything here is arithmetic on host nanoseconds with no clock, lock or
- * platform call of its own (tests/present_cadence drives it). The presenters
- * feed it: fb_present_metal.m (CAMetalLayer, presentedTime), and
- * fb_present_vulkan.c for the measurement only.
+ * platform call of its own (tests/present_cadence drives it). The Metal
+ * presenter feeds it (fb_present_metal.m: CAMetalLayer, presentedTime); the
+ * other presenters are as they were, and the overlay says "not available"
+ * for them.
  *
  * Strategies (pc_pick), with display.present_timing = auto:
  *

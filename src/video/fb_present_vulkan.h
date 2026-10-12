@@ -28,9 +28,5 @@ int   fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
  * the last displayed vblank (0 when unknown). */
 void  fbv_timing_report(const char *when);
 int   fbv_display_vblank(uint64_t *t_ns, uint64_t *period_ns);
-/* The emulated vblank of the game frame the next fbv_present shows for the
- * first time (0: a redraw): for the on-glass measurement only
- * (present_cadence.h); nothing about the present changes. */
-void  fbv_frame_vblank(uint64_t vblank_ns);
 
 #endif

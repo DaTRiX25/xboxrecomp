@@ -3,7 +3,7 @@
 `display.present_timing` (`RECOMP_PRESENT_TIMING`): `legacy` or `auto`.
 Code: `src/kernel/present_cadence.{h,c}` (the arithmetic, tested by
 `tests/present_cadence`), `src/video/fb_present_metal.m` (the Metal
-presenter), `src/video/fb_present_vulkan.c` (measurement only).
+presenter).
 
 The default is `legacy`: what the presenters did before. Measured numbers for
 a title are in its own docs (Burnout 3: `docs/present-timing.md`); nothing on
@@ -120,16 +120,13 @@ The log says so (`[PRESENT] window: not visible ...`), and
 
 ## Other backends
 
-Presentation on Vulkan is unchanged. The on-glass trace is recorded where the
-swapchain can tell when a frame was shown:
-
-| Host | Source | State |
-|---|---|---|
-| macOS, Metal | `presentedTime` | measured |
-| Linux / Steam Deck (RADV, gamescope or desktop) | `VK_KHR_present_wait`: the time the wait for a present id returns | measured (when the waiter thread woke after the flip: close to it, but not a scanout stamp) |
-| Windows through Vulkan | `VK_KHR_present_wait` where the driver has it (AMD's 25.x on the RX 9060 XT did not) | measured there, else "not available" |
-| Android (Turnip) | none through the loader's swapchain today; `VK_GOOGLE_display_timing` is the candidate | "not available" |
-| macOS through MoltenVK | `VK_KHR_present_wait` if offered | not checked |
+Only the Metal presenter is changed. On Vulkan (Linux / Steam Deck, Windows,
+Android, MoltenVK) presentation is as it was and the overlay's on-glass line
+says "not available". A measurement from `VK_KHR_present_wait` (the time the
+wait for a present id returns) is written but has run nowhere yet; it is kept
+on the branch `bo3/glass-vulkan` until it has been built and run on those
+hosts. Android's loader swapchain has no present wait: `VK_GOOGLE_display_timing`
+is the candidate there.
 
 Can "present when ready" judder happen there? On a fixed-rate display the
 Vulkan build already locks the vblank to the display (`RECOMP_VBLANK_SYNC=
@@ -142,8 +139,9 @@ an adaptive-sync display) the display follows the present, so present-time
 jitter is on the glass exactly as on the Mac, and the lock's input (the
 present-wait times) then follows the title's own presents instead of a grid.
 The Deck's own panel is fixed-rate, so the tuned Deck path is not affected.
-Proposed follow-up: the same pacer on Vulkan, with the present call itself
-made at the vblank plus a lead on a variable display (FIFO shows it at once
-there), `VK_EXT_present_timing` for a target time and a real on-glass stamp
-where the driver has it, `VK_GOOGLE_display_timing` on Android, and the
+This is reasoning from the code, not a measurement. Proposed follow-up: the
+same pacer on Vulkan, with the present call itself made at the vblank plus a
+lead on a variable display (FIFO shows it at once there),
+`VK_EXT_present_timing` for a target time and a real on-glass stamp where the
+driver has it, `VK_GOOGLE_display_timing` on Android, and the
 variable-refresh state from the swapchain or the compositor.

@@ -52,9 +52,10 @@
  * RECOMP_PRESENT_TIMING=legacy|auto (display.present_timing): when a frame is
  * handed to the display, on the CAMetalLayer path (fb_present_metal.m and
  * src/kernel/present_cadence.h, BO-115). Each frame carries its emulated
- * vblank from the publish to its first present; both layer presenters record
- * when frames reach the glass for the overlay's graph (the Vulkan one where
- * the swapchain can tell), and RECOMP_TRACE=glass=<file> writes them out.
+ * vblank from the publish to its first present; the Metal presenter records
+ * when frames reach the glass for the overlay's graph, and
+ * RECOMP_TRACE=glass=<file> writes them out. The Vulkan presenter is as it
+ * was: its graph says "not available".
  *
  * RECOMP_WINDOW_SHOT=<flip>[,<flip>...]: read back what the renderer drew for
  * the frame of that walker flip count (the number RECOMP_FB_DUMP_FLIPS and
@@ -1055,6 +1056,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
         if (seq != shown_seq)
             s_last_pickup_ns = now_ns(CLOCK_MONOTONIC);
+        (void)new_frame;               /* read by the Metal present only */
         if (seq != shown_seq && s_layer) {
             /* Layer mode: the slot is already a GPU texture. */
             new_frame = 1;
@@ -1108,7 +1110,6 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 snprintf(path, sizeof path, "%s", s_shot_req);
             else if (shoot)
                 shot_path(path, sizeof path, shown_flip);
-            fbv_frame_vblank(shown_seq && new_frame ? f->vbl_ns : 0);
             if (fbv_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
                             filter, shoot ? path : NULL, shown_flip)) {
                 new_frame = 0;
