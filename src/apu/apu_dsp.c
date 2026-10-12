@@ -330,11 +330,45 @@ static uint32_t *gp_xwin(void)
 
 /* A command about to be acknowledged: its block is the five dwords before
  * the doorbell (GP scratch 0x800..0x80C). */
+/* The doorbell whose command the model has already taken (at the start of
+ * a frame, below), so the acknowledgement does not load it again. */
+static const uint32_t *s_gp_taken;
+
 static void gp_command(MCPXAPUState *d, const uint32_t *doorbell)
 {
     apu_gp_mem m = { gp_mem_read, gp_mem_write, d, gp_xwin() };
+    if (s_gp_taken == doorbell) {
+        s_gp_taken = NULL;
+        return;
+    }
     if (apu_gp_wired())
         apu_gp_command(&m, doorbell[0], doorbell[-4], doorbell[-2], doorbell[-1]);
+}
+
+/* A command posted since the last acknowledgement poll: the GP program
+ * looks at its doorbell when its frame starts, so a command the title
+ * wrote just before this frame takes effect in it, not in the next. The
+ * acknowledgement itself stays with the poll. */
+static void gp_command_at_frame(MCPXAPUState *d)
+{
+    if (s_dsp_ack_count < 0 || !d->ram_ptr || s_gp_taken)
+        return;
+    if (s_dsp_ack_auto) {
+        const uint32_t *slot = dsp_ack_auto_slot(d);
+        if (slot && *slot) {
+            gp_command(d, slot);
+            s_gp_taken = slot;
+        }
+        return;
+    }
+    for (int i = 0; i < s_dsp_ack_count; i++) {
+        const uint32_t *slot = (const uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
+        if (*slot) {
+            gp_command(d, slot);
+            s_gp_taken = slot;
+            return;
+        }
+    }
 }
 
 /* pa, a voice buffer's physical address, in the block the GP model exports
@@ -506,6 +540,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         const int nch = six ? APU_SPK_CHANNELS : 2;
 
         gp_follow_lfe();
+        gp_command_at_frame(d);
         apu_gp_frame(&m, mixbins, acc);
         if (!six) {
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {

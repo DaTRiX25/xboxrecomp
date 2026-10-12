@@ -66,6 +66,7 @@ static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL
 static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
 static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
+static const char *const k_timing[]   = { "legacy", "auto", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
 #define SETTING(k, t, f, e, c, ev, mn, mx, b) \
@@ -130,6 +131,11 @@ static xs_setting s_set[XS_COUNT] = {
      * (apu_gp.h): 120 Hz is what the console's AC-3 encoder did after the
      * GP stage; off is the GP stage's own full-range feed. Live. */
     [XS_AUDIO_LFE_LOWPASS]  = SETTING("audio.lfe_lowpass", XS_CHOICE, 0, RENV_AUDIO_LFE_LOWPASS, k_lfe_lowpass, NULL, 0, 0, 3),
+    /* When frames are presented (present_cadence.h, BO-115): legacy is
+     * "when ready", as before; auto aims each frame at one refresh. Taken
+     * while running (the presenter looks twice a second). */
+    [XS_DISPLAY_PRESENT_TIMING] = SETTING("display.present_timing", XS_CHOICE, 0, RENV_PRESENT_TIMING, k_timing, NULL, 0, 0, 0),
+    [XS_ADVANCED_PERF_STEPS] = SETTING("advanced.perf_steps", XS_BOOL, 0, RENV_OVERLAY_PERF_STEPS, NULL, NULL, 0, 0, 0),
     /* Off as shipped: the title's own textures, bit for bit. */
     [XS_GRAPHICS_UI_SCALE]  = SETTING("graphics.ui_scale", XS_CHOICE, 0, RENV_GFX_UI_SCALE, k_ui_scale, NULL, 0, 0, 0),
     [XS_GRAPHICS_UI_SCALE_FILTER] = SETTING("graphics.ui_scale_filter", XS_CHOICE, 0, RENV_GFX_UI_SCALE_FILTER, k_ui_scale_filter, NULL, 0, 0, 0),

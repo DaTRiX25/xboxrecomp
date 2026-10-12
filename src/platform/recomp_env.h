@@ -98,6 +98,10 @@ extern "C" {
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt") \
     X(VBLANK_SYNC,       CONFIG, "RECOMP_VBLANK_SYNC",       NULL, "=display: the emulated vblank follows the display's refresh (reported by the present path) when within 5% of 60 Hz; default: its own 60.000 Hz timer") \
     X(PRESENT_DRAWABLES, CONFIG, "RECOMP_PRESENT_DRAWABLES", NULL, "Metal: CAMetalLayer maximumDrawableCount, 2 or 3 (default 2)") \
+    X(PRESENT_TIMING,    CONFIG, "RECOMP_PRESENT_TIMING",    NULL, "display.present_timing: legacy (present when ready; default) or auto (BO-115: each frame aimed at one refresh; the vblank locked to a fixed-rate display, timed presents under variable refresh); lock, timed force one (Metal)") \
+    X(PRESENT_PHASE,     CONFIG, "RECOMP_PRESENT_PHASE",     NULL, "present timing, a locked display: ms the emulated vblank sits before a display refresh (default 5)") \
+    X(PRESENT_LEAD,      CONFIG, "RECOMP_PRESENT_LEAD",      NULL, "present timing, a variable-refresh display: ms from the emulated vblank to the frame's present time (default 12)") \
+    X(PRESENT_DEPTH,     CONFIG, "RECOMP_PRESENT_DEPTH",     NULL, "present timing, a locked display: refreshes from the vblank's refresh to the frame's, 0-3 (default 1; raised by itself when frames slip)") \
     X(PRESENT_LATENCY,   CONFIG, "RECOMP_PRESENT_LATENCY",   NULL, "D3D11 RECOMP_PRESENT_VSYNC=fifo: SetMaximumFrameLatency, 1-3 (default 1)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
     X(INPUT_RUMBLE,      CONFIG, "RECOMP_INPUT_RUMBLE",      NULL, "forward the title's rumble (USB output report) to the host pad; default 1, 0: off") \
@@ -124,6 +128,7 @@ extern "C" {
     X(GFX_VEHICLE_DETAIL, CONFIG, "RECOMP_GFX_VEHICLE_DETAIL", NULL, "how far from the camera the title's vehicles keep their detailed models, for a title whose build has its level-of-detail distances behind a patch (--patches, recomp_patch.h): original (default, as shipped), far, farthest") \
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
     X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \
+    X(OVERLAY_PERF_STEPS, CONFIG, "RECOMP_OVERLAY_PERF_STEPS", NULL, "1: the frame-time graph also marks frames in which the title ran more than one simulation step (default off)") \
     X(OVERLAY_TEST,      CONFIG, "RECOMP_OVERLAY_TEST",      NULL, "=file: a test drives the overlay through it, one line each as appended: key <up|down|left|right|enter|esc|f1|pgup|pgdn|del>, pad <a|b|y|up|down|left|right|lb|rb|back+start> (SDL events pushed into the window's loop), shot <path> (the window as presented, BMP), state <path> (the open page's rows as text)") \
     X(SETTINGS_FILE,     CONFIG, "RECOMP_SETTINGS",          NULL, "the overlay's settings file: a path, or none (default: <save dir>/settings.toml)") \
     X(GFX_ANISO,         CONFIG, "RECOMP_GFX_ANISO",         NULL, "anisotropic filtering of mipmapped, linearly minified textures: off (default), 2, 4, 8, 16 (Metal, Vulkan; clamped to the device's limit)") \
@@ -250,6 +255,7 @@ extern "C" {
     X(METAL_POINT,       DEBUG, "metal_point",     "RECOMP_METAL_POINT",       "Metal point sampling") \
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
     X(WINDOW_DISPLAY,    DEBUG, "window_display",  NULL,                       "=n: open the window centred on display n (0 = main)") \
+    X(WINDOW_FLOAT,      DEBUG, "window_float",    NULL,                       "1: the window stays above other windows (macOS; a measured run needs it visible: an occluded window reports no on-glass times)") \
     X(EARLY_COMMIT,      DEBUG, "early_commit",    NULL,                       "=0: submit a frame's GPU work after the vblank hold, not at FLIP_STALL (A/B)") \
     X(METAL_FRAMES,      DEBUG, "metal_frames",    NULL,                       "=1: Metal waits for each frame at its flip; default 2 frames in flight") \
     X(METAL_PRESENT,     DEBUG, "metal_present",   NULL,                       "=layer|readback: Metal window present, CAMetalLayer from GPU slots (default) or the old texture readback") \
@@ -313,6 +319,7 @@ extern "C" {
     X(FRAMETIME_HOST_MS, TRACE, "frametime_host_ms", NULL,                     "=ms: the m_host a frame needs for frametime_host to write its stacks (4)") \
     X(LATENCY_TRACE,     TRACE, "latency",         NULL,                       "=file: input-to-photon CSV: pad report changes, guest ISR, swap, vblank release, executor done, GPU done + frame signature, drawable acquire/present/on-glass (tools/perf/latency.py)") \
     X(PB_SLOW,           TRACE, "pb_slow",         NULL,                       "=ms: a [PB] line for every pushbuffer method the executor spends that long in (default 5): which command a frame stood in; two clock reads a method header") \
+    X(GLASS_TRACE,       TRACE, "glass",           NULL,                       "=file: one CSV line per presented frame: flip, emulated vblank, present target, commit, on-glass time, interval in ms and refreshes, steps (tools/perf/glass.py)") \
     X(PACING_TRACE,      TRACE, "pacing",          NULL,                       "[PACING] flip intervals, vblank gaps, CPU and spin-wait sites every 600 flips; =all also every flip") \
     X(VBLANK_CLOCK,      DEBUG, "vblank_clock",    NULL,                       "=ms: the old millisecond vblank schedule and timer loop (A/B)") \
     X(MISSING,           TRACE, "missing",         NULL,                       "missing game files, one line each and an exit summary; default on, =0 off, =all also absent directories, other trees, probes, every FAILED repeat and NtOpenFile/IoCreateFile successes") \

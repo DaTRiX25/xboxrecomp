@@ -84,6 +84,16 @@ void xbox_VblankSignal(void);
  * raises. */
 void xbox_PacingSetSpinLead(uint64_t ns);
 void xbox_VblankNextDue(uint64_t ns);
+/* The grid time of the last vblank raised, and of vblank number `count`
+ * (one already raised, or one still to come); 0 before the first. */
+uint64_t xbox_VblankLastDue(void);
+uint64_t xbox_VblankEdgeNs(uint32_t count);
+/* The emulated vblank of the frame the executor hands to the host: set
+ * before the backend's on_flip, read by the window's presenter when the
+ * frame is published (the same thread), so a present can be aimed at a
+ * time on the vblank's grid (present_cadence.h). */
+void     xbox_PacingFrameVblank(uint64_t ns);
+uint64_t xbox_PacingFrameVblankNs(void);
 uint32_t xbox_VblankCount(void);
 
 /* Per-site counters, for the trace and the tests. */
@@ -108,6 +118,9 @@ void xbox_PacingFlip(uint32_t flip, uint32_t batches);
  * vblank timer's grid follows the display's (xbox_VblankSchedule). */
 void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
 int  xbox_VblankDisplayLockOn(void);
+/* A presenter turns the lock on or off itself (display.present_timing =
+ * auto); a RECOMP_VBLANK_SYNC that is set keeps its meaning. */
+void xbox_VblankDisplayLockAuto(int on);
 /* A host present reached the swap chain (when_ns 0: now) or the display. */
 void xbox_PacingPresent(uint64_t when_ns);
 /* A vblank raised at now_ns (the timer thread), for the gap range. */

@@ -49,6 +49,14 @@
  * RECOMP_PRESENT_STATS=1 prints a [PRESENT] line every 5 s (one is always
  * printed at exit); RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
  *
+ * RECOMP_PRESENT_TIMING=legacy|auto (display.present_timing): when a frame is
+ * handed to the display, on the CAMetalLayer path (fb_present_metal.m and
+ * src/kernel/present_cadence.h, BO-115). Each frame carries its emulated
+ * vblank from the publish to its first present; the Metal presenter records
+ * when frames reach the glass for the overlay's graph, and
+ * RECOMP_TRACE=glass=<file> writes them out. The Vulkan presenter is as it
+ * was: its graph says "not available".
+ *
  * RECOMP_WINDOW_SHOT=<flip>[,<flip>...]: read back what the renderer drew for
  * the frame of that walker flip count (the number RECOMP_FB_DUMP_FLIPS and
  * RECOMP_FLIP_LOG print), at the window's pixel size, with
@@ -106,6 +114,7 @@
 #include "overlay.h"          /* src/overlay: the settings overlay */
 #endif
 
+extern uint64_t xbox_PacingFrameVblankNs(void);   /* src/kernel/kernel_pacing.c */
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
@@ -121,6 +130,7 @@ struct fb_slot {
     size_t   cap;
     uint32_t w, h, bpp;
     uint32_t flip;                 /* the walker's flip count at this frame */
+    uint64_t vbl_ns;               /* its emulated vblank (kernel_pacing.h) */
 };
 
 static struct fb_slot  s_slot[3];
@@ -245,6 +255,7 @@ static void publish(uint32_t w, uint32_t h, uint32_t bpp, uint64_t t0)
     s->h = h;
     s->bpp = bpp;
     s->flip = nv2a_pb_gpu_state()->flips;
+    s->vbl_ns = xbox_PacingFrameVblankNs();
     pthread_mutex_lock(&s_lock);
     {
         int t = s_ready;
@@ -682,6 +693,67 @@ void xbox_HostPause(int on);
 int  xbox_HostPaused(void);
 void fbv_android_surface_gone(void);
 
+#include <jni.h>
+#include <SDL_system.h>
+/* The warning that no usable Vulkan driver was found, with the way back on
+ * it (BO-121): without the Vulkan window there is no settings overlay, so a
+ * player who chose a driver that cannot run the game could not choose
+ * another from inside it. The port's activity says whether there is a
+ * driver to go back to and does the going (int resetGraphicsDriver(int):
+ * 0 asks, 1 chooses the driver in the app and starts the app again); an
+ * activity without that method gets the plain warning. Returns 1 when the
+ * window with the choice was shown. */
+static int android_offer_driver_reset(const char *msg)
+{
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    jobject act = env ? (jobject)SDL_AndroidGetActivity() : NULL;
+    jclass cls;
+    jmethodID m;
+    int shown = 0;
+
+    if (!act)
+        return 0;
+    cls = (*env)->GetObjectClass(env, act);
+    m = (*env)->GetMethodID(env, cls, "resetGraphicsDriver", "(I)I");
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        m = NULL;
+    }
+    if (m && (*env)->CallIntMethod(env, act, m, (jint)0) == 1) {
+        static const SDL_MessageBoxButtonData b[2] = {
+            { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Reset back to Turnip" },
+            { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Continue on the CPU" },
+        };
+        char text[900];
+        SDL_MessageBoxData d;
+        int hit = 0;
+
+        snprintf(text, sizeof text, "%s\n\nThe settings menu (Select+Start) is not available"
+                 " on this driver either. \"Reset back to Turnip\" chooses the Mesa Turnip"
+                 " driver that comes in the app and starts the game again.", msg);
+        memset(&d, 0, sizeof d);
+        d.flags = SDL_MESSAGEBOX_WARNING;
+        d.title = "Graphics driver";
+        d.message = text;
+        d.numbuttons = 2;
+        d.buttons = b;
+        shown = SDL_ShowMessageBox(&d, &hit) == 0;
+        if (shown && hit == 1) {
+            fprintf(stderr, "[PRESENT] the warning's \"Reset back to Turnip\": the app starts"
+                    " again on the driver in the app\n");
+            (*env)->CallIntMethod(env, act, m, (jint)1);
+            if ((*env)->ExceptionCheck(env))
+                (*env)->ExceptionClear(env);
+            /* The activity ends this process in a moment; nothing more is
+             * started here meanwhile. */
+            SDL_Delay(5000);
+        }
+    }
+    (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, act);
+    return shown;
+}
+
 static int android_lifecycle(void *user, SDL_Event *ev)
 {
     (void)user;
@@ -730,7 +802,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     int stats = recomp_env_on(RENV_PRESENT_STATS);
     int scale = recomp_env(RENV_WINDOW_SCALE) ? atoi(recomp_env(RENV_WINDOW_SCALE)) : 2;
     int win_w, win_pos, win_pw, win_ph;
-    int quit = 0, guest_done = 0, dirty = 0, shoot = 0, had_pads;
+    int quit = 0, guest_done = 0, dirty = 0, shoot = 0, had_pads, new_frame = 0, retry_soon = 0;
     double quit_after = recomp_env(RENV_WINDOW_QUIT_AFTER)
                       ? atof(recomp_env(RENV_WINDOW_QUIT_AFTER)) : 0.0;
     uint32_t shown_flip = 0;
@@ -837,6 +909,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 }
                 fprintf(stderr, "[PRESENT] window up: Vulkan swapchain unavailable (%s);"
                         " SDL renderer, readback present\n", why);
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+                /* Said, not left to be found out: the overlay is drawn by
+                 * the Vulkan (or Metal) presenter and by nothing else. */
+                fprintf(stderr, "[OVERLAY] not available in this start: the window is not"
+                        " presented through Vulkan, and the settings overlay is drawn there"
+                        " only (Back+Start does nothing)\n");
+#endif
 #if defined(__ANDROID__)
                 /* A phone has no terminal to read that on, and what follows
                  * is the CPU rasteriser at a few frames a second: say so on
@@ -849,8 +928,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                              "On an Adreno GPU a Mesa Turnip driver is needed; the "
                              "log in the app's folder says which driver was "
                              "tried.", why);
-                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING,
-                                             "Graphics driver", msg, NULL);
+                    if (!android_offer_driver_reset(msg))
+                        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING,
+                                                 "Graphics driver", msg, NULL);
                 }
 #endif
             }
@@ -878,6 +958,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     SDL_DestroyWindow(win);
                 fprintf(stderr, "[PRESENT] window up: CAMetalLayer unavailable (%s);"
                         " SDL renderer, readback present\n", why);
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+                /* Said, not left to be found out: the overlay is drawn by
+                 * the Vulkan (or Metal) presenter and by nothing else. */
+                fprintf(stderr, "[OVERLAY] not available in this start: the window is not"
+                        " presented through Vulkan, and the settings overlay is drawn there"
+                        " only (Back+Start does nothing)\n");
+#endif
             }
         }
 #endif
@@ -976,7 +1063,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
          * (inside the wait) also updates the game controllers, which
          * xinput_device.c then only reads. */
         if (SDL_WaitEventTimeout(&ev, s_overlay_open ? (vsync ? 1 : 8)
-                                      : s_overlay_note ? 16 : 100)) {
+                                      : retry_soon ? 4 : s_overlay_note ? 16 : 100)) {
             do {
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
                 if (s_layer)
@@ -1045,8 +1132,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         }
         if (seq != shown_seq)
             s_last_pickup_ns = now_ns(CLOCK_MONOTONIC);
+        (void)new_frame;               /* read by the Metal present only */
         if (seq != shown_seq && s_layer) {
             /* Layer mode: the slot is already a GPU texture. */
+            new_frame = 1;
             dropped_base += seq - shown_seq - 1;
             shown_flip = s_slot[s_front].flip;
             /* A shot still pending (no drawable yet) is taken of this frame,
@@ -1099,6 +1188,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 shot_path(path, sizeof path, shown_flip);
             if (fbv_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
                             filter, shoot ? path : NULL, shown_flip)) {
+                new_frame = 0;
                 dirty = 0;
                 shoot = 0;
                 s_shot_req[0] = 0;
@@ -1110,6 +1200,29 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
         }
 #endif
+        {
+            /* Said once per change: a hidden window presents nothing, and a
+             * measured run that shows no on-glass times should say why. */
+            static Uint32 last = 0xFFFFFFFFu;
+            Uint32 fl = SDL_GetWindowFlags(win)
+                        & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_INPUT_FOCUS);
+#if defined(__APPLE__)
+            if (s_layer && !s_vk && !fbm_visible(win))
+                fl |= 0x80000000u;      /* covered by other windows, or on another Space */
+#endif
+            if (fl != last) {
+                if (last != 0xFFFFFFFFu
+                        || (fl & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | 0x80000000u)))
+                    fprintf(stderr, "[PRESENT] window:%s%s%s%s\n",
+                            fl & SDL_WINDOW_MINIMIZED ? " minimised" : "",
+                            fl & SDL_WINDOW_HIDDEN ? " hidden" : "",
+                            fl & 0x80000000u ? " not visible (covered, or on another Space)"
+                                             : " visible",
+                            fl & SDL_WINDOW_INPUT_FOCUS ? ", has the keyboard"
+                                                        : ", without the keyboard");
+                last = fl;
+            }
+        }
 #if defined(__APPLE__)
         /* Not while minimised or hidden: nextDrawable then blocks for up to
          * its 1 s timeout, and the event pump and pad poll with it. */
@@ -1123,9 +1236,21 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 snprintf(path, sizeof path, "%s", s_shot_req);
             else if (shoot)
                 shot_path(path, sizeof path, shown_flip);
-            if (fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
-                            filter, shoot ? path : NULL, shown_flip)
+            /* A frame's own vblank goes with its first present only: a
+             * redraw (the overlay, an expose) shows it again. */
+            uint64_t vbl = shown_seq && new_frame ? f->vbl_ns : 0;
+            int rc = fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
+                                 filter, shoot ? path : NULL, shown_flip, vbl);
+            retry_soon = 0;
+            if (rc == 2) {
+                /* Skipped (present timing: no drawable without a wait). The
+                 * next frame replaces it; should none come (the title
+                 * stopped on this picture), it is shown as a redraw. */
+                new_frame = 0;
+                retry_soon = 1;
+            } else if (rc
                     && ((s_last_present_ns = now_ns(CLOCK_MONOTONIC) - t0), 1)) {
+                new_frame = 0;
                 dirty = 0;
                 shoot = 0;
                 s_shot_req[0] = 0;

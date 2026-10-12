@@ -56,10 +56,10 @@
 #include "host_time.h"
 #include <mach/mach_time.h>
 
-/* src/kernel/kernel_pacing.c */
-void xbox_PacingPresent(uint64_t when_ns);
-void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
-int  xbox_VblankDisplayLockOn(void);
+#include "kernel/kernel_pacing.h"
+#include "kernel/present_cadence.h"
+#include <os/lock.h>
+#include <stdatomic.h>
 
 #if __has_feature(objc_arc)
 #error "fb_present_metal.m is manual retain/release: build it without -fobjc-arc"
@@ -164,6 +164,272 @@ void fbm_vblank_link(SDL_Window *win)
             " (CVDisplayLink, RECOMP_VBLANK_SYNC=display)\n", (unsigned)id);
 }
 #pragma clang diagnostic pop
+
+/* ---- present timing (present_cadence.h, BO-115) ----------------------------
+ *
+ * display.present_timing = legacy: the layer has two drawables, a frame is
+ * presented as soon as it is picked up (presentDrawable:), and nextDrawable
+ * waits when both drawables are in use. Measured in a window on a 120 Hz
+ * display that wait is a whole frame once it starts (a drawable is free
+ * again only when the next one replaces it on the glass), and the frame is
+ * on the glass about three frames after its vblank.
+ *
+ * auto: three drawables and never a wait: a frame is presented only while at
+ * most one earlier present has not reached the glass yet, else it is skipped
+ * (counted; the title's timing is not touched either way). Each frame is
+ * aimed with presentDrawable:atTime: by the pacer: on a fixed-rate display
+ * at one refresh of the display's grid, which the on-glass times define and
+ * the emulated vblank is locked to; on a variable-refresh display at the
+ * frame's vblank plus a fixed lead, the vblank on its own 60.000 Hz timer.
+ * The display is looked at again twice a second (the window moved, the mode
+ * changed, the setting changed).
+ *
+ * Every drawable's presentedTime is recorded in both modes: the overlay's
+ * graph and RECOMP_TRACE=glass show what reached the glass. */
+static pc_pacer        s_pacer;
+static pc_display      s_disp;
+static int             s_strategy = -1;         /* PC_*; -1 before the first look */
+static os_unfair_lock  s_pc_lock = OS_UNFAIR_LOCK_INIT;
+static atomic_int      s_inflight;              /* presents not on the glass yet */
+static atomic_uint     s_skips;
+static unsigned        s_poll;
+static char            s_disp_name[48];
+static int             s_disp_fullscreen;
+static uint64_t        s_last_commit_ns;        /* main thread */
+static unsigned        s_no_drawable;
+static FILE           *s_glass_f;
+static int             s_glass_tried;
+
+static double env_ms(recomp_env_id id, double def, double lo, double hi)
+{
+    const char *e = recomp_env(id);
+    double v = e && *e ? atof(e) : def;
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+/* A time on xbox_HostNowNs's clock as presentDrawable:atTime: wants it:
+ * seconds of mach_absolute_time. */
+static CFTimeInterval host_ns_to_mach_s(uint64_t host_ns)
+{
+    uint64_t host = xbox_HostNowNs(), mnow = mach_ticks_ns(mach_absolute_time());
+    return host_ns >= host ? (double)(mnow + (host_ns - host)) / 1e9
+                           : (double)(mnow - (host - host_ns)) / 1e9;
+}
+
+/* The display the window is on: its rate, and whether it is variable. */
+static void display_probe(SDL_Window *win, pc_display *d, char *name, size_t namen, int *fs)
+{
+    NSScreen *scr = nil;
+    NSNumber *num;
+    CGDirectDisplayID id;
+    CGDisplayModeRef m;
+    double mode_hz = 0, mn = 0, mx = 0, fps = 0;
+    SDL_SysWMinfo wm;
+
+    memset(d, 0, sizeof *d);
+    SDL_VERSION(&wm.version);
+    if (win && SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_COCOA)
+        scr = [wm.info.cocoa.window screen];
+    if (!scr)
+        scr = [NSScreen mainScreen];
+    num = scr ? [[scr deviceDescription] objectForKey:@"NSScreenNumber"] : nil;
+    id = num ? (CGDirectDisplayID)[num unsignedIntValue] : CGMainDisplayID();
+    m = CGDisplayCopyDisplayMode(id);
+    if (m) {
+        mode_hz = CGDisplayModeGetRefreshRate(m);
+        CGDisplayModeRelease(m);
+    }
+    if (scr) {
+        if (@available(macOS 12.0, *)) {
+            mn = scr.minimumRefreshInterval;
+            mx = scr.maximumRefreshInterval;
+            fps = (double)scr.maximumFramesPerSecond;
+        }
+    }
+    d->builtin = CGDisplayIsBuiltin(id) ? 1 : 0;
+    d->refresh_hz = mn > 0 ? 1.0 / mn : mode_hz > 0 ? mode_hz : fps;
+    d->min_hz = mx > 0 ? 1.0 / mx : d->refresh_hz;
+    /* A variable display states a range of refresh intervals (an external
+     * adaptive-sync display with the option on, a ProMotion panel). */
+    d->vrr = mn > 0 && mx > mn * 1.02;
+    if (name && namen) {
+        const char *n = NULL;
+        if (scr) {
+            if (@available(macOS 10.15, *))
+                n = [[scr localizedName] UTF8String];
+        }
+        snprintf(name, namen, "%s", n ? n : "display");
+    }
+    if (fs)
+        *fs = win && (SDL_GetWindowFlags(win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
+}
+
+/* 1 while some part of the window can be seen (not covered by other
+ * windows, not on another Space): only then does a drawable reach the glass
+ * and report when. */
+int fbm_visible(SDL_Window *win)
+{
+    SDL_SysWMinfo wm;
+    SDL_VERSION(&wm.version);
+    if (win && SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_COCOA)
+        return ([wm.info.cocoa.window occlusionState] & NSWindowOcclusionStateVisible) != 0;
+    return 1;
+}
+
+static void timing_status(void)
+{
+    pc_status st;
+    memset(&st, 0, sizeof st);
+    os_unfair_lock_lock(&s_pc_lock);
+    st.display = s_disp;
+    st.strategy = s_strategy;
+    st.depth = s_pacer.depth;
+    st.phase_ms = s_pacer.phase_ns / 1e6;
+    st.lead_ms = s_pacer.lead_ns / 1e6;
+    st.slips = s_pacer.slips_all;
+    st.lates = s_pacer.lates_all;
+    os_unfair_lock_unlock(&s_pc_lock);
+    st.measured = 1;
+    st.skips = atomic_load(&s_skips);
+    snprintf(st.source, sizeof st.source, "Metal presentedTime");
+    xbox_PresentCadenceStatus(&st);
+}
+
+/* Twice a second, on the main thread: the display, the setting, the
+ * strategy; what follows from a change. */
+static void timing_poll(SDL_Window *win)
+{
+    pc_display d;
+    char name[sizeof s_disp_name];
+    int fs = 0, strategy, changed;
+
+    if (s_strategy >= 0 && s_poll++ % 30)
+        return;
+    display_probe(win, &d, name, sizeof name, &fs);
+    strategy = pc_pick(&d, pc_setting(recomp_env(RENV_PRESENT_TIMING)));
+    changed = strategy != s_strategy || d.vrr != s_disp.vrr
+              || (int)(d.refresh_hz * 100) != (int)(s_disp.refresh_hz * 100)
+              || strcmp(name, s_disp_name) || fs != s_disp_fullscreen;
+    if (!changed) {
+        timing_status();
+        return;
+    }
+    os_unfair_lock_lock(&s_pc_lock);
+    s_disp = d;
+    s_strategy = strategy;
+    pc_pacer_init(&s_pacer, strategy, &d,
+                  (uint64_t)(env_ms(RENV_PRESENT_PHASE, 5.0, 0.0, 15.0) * 1e6),
+                  (uint64_t)(env_ms(RENV_PRESENT_LEAD, 12.0, 0.0, 33.0) * 1e6),
+                  (int)env_ms(RENV_PRESENT_DEPTH, 1.0, 0.0, PC_DEPTH_MAX));
+    os_unfair_lock_unlock(&s_pc_lock);
+    snprintf(s_disp_name, sizeof s_disp_name, "%s", name);
+    s_disp_fullscreen = fs;
+    {
+        const char *e = recomp_env(RENV_PRESENT_DRAWABLES);
+        int n = strategy != PC_LEGACY ? 3 : (e && atoi(e) == 3) ? 3 : 2;
+        if ((int)s_layer.maximumDrawableCount != n)
+            s_layer.maximumDrawableCount = n;
+    }
+    /* The vblank follows the display only where there is a grid to follow;
+     * the on-glass times are its clock then, not a CVDisplayLink. */
+    if (strategy == PC_LOCK && s_link) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        CVDisplayLinkStop(s_link);
+        CVDisplayLinkRelease(s_link);
+#pragma clang diagnostic pop
+        s_link = NULL;
+    }
+    if (strategy != PC_LEGACY || !s_link)
+        xbox_VblankDisplayLockAuto(strategy == PC_LOCK);
+    fprintf(stderr, "[PRESENT] timing: %s on \"%s\" (%s%.2f Hz%s, %s): ",
+            pc_strategy_name(strategy), s_disp_name, d.builtin ? "built-in, " : "",
+            d.refresh_hz, d.vrr ? ", variable refresh" : ", fixed",
+            fs ? "fullscreen" : "windowed");
+    if (d.vrr)
+        fprintf(stderr, "down to %.1f Hz; ", d.min_hz);
+    switch (strategy) {
+    case PC_LOCK:
+        fprintf(stderr, "the vblank %.1f ms before a display refresh, each frame"
+                " shown %d refresh(es) after it, 3 drawables\n",
+                s_pacer.phase_ns / 1e6, s_pacer.depth);
+        break;
+    case PC_TIMED:
+    case PC_TIMED_ODD:
+        fprintf(stderr, "the vblank on its own 60 Hz timer, each frame presented"
+                " %.1f ms after it, 3 drawables%s\n", s_pacer.lead_ns / 1e6,
+                strategy == PC_TIMED_ODD ? "; this rate is not a multiple of 60:"
+                " frames cannot all be shown for the same time" : "");
+        break;
+    default:
+        fprintf(stderr, "present when ready, %d drawables\n",
+                (int)s_layer.maximumDrawableCount);
+        break;
+    }
+    timing_status();
+}
+
+/* RECOMP_TRACE=glass=<file>. */
+static FILE *glass_file(void)
+{
+    if (!s_glass_tried) {
+        const char *path = recomp_env(RENV_GLASS_TRACE);
+        s_glass_tried = 1;
+        if (path && *path && strcmp(path, "1")) {
+            s_glass_f = fopen(path, "w");
+            if (s_glass_f)
+                fprintf(s_glass_f, "flip,vblank_ns,commit_ns,at_ns,target_ns,glass_ns,late,skipped,"
+                        "steps,strategy,depth,refresh_hz,vrr\n");
+            else
+                fprintf(stderr, "[PRESENT] RECOMP_TRACE=glass: cannot write %s\n", path);
+        }
+    }
+    return s_glass_f;
+}
+
+/* One presented (or skipped) game frame: the ring, the pacer, the vblank's
+ * lock, the trace. Any thread. */
+static void glass_note(uint32_t flip, uint64_t vblank_ns, uint64_t commit_ns,
+                       const pc_aim *aim, uint64_t glass_ns, int skipped)
+{
+    pc_sample smp;
+    uint64_t report = 0, period = 0;
+    int strategy, depth, raised = 0;
+    double hz;
+    int vrr;
+    FILE *f;
+
+    memset(&smp, 0, sizeof smp);
+    smp.flip = flip;
+    smp.vblank_ns = vblank_ns;
+    smp.glass_ns = glass_ns;
+    smp.skipped = skipped ? 1 : 0;
+    smp.steps = (uint8_t)xbox_PresentCadenceStepsOf(flip);
+    xbox_PresentCadenceNote(&smp);
+    os_unfair_lock_lock(&s_pc_lock);
+    if (!skipped && glass_ns) {
+        raised = pc_pacer_glass(&s_pacer, aim, glass_ns);
+        report = pc_pacer_lock_report(&s_pacer, glass_ns);
+        period = s_pacer.period_ns;
+    }
+    strategy = s_strategy;
+    depth = s_pacer.depth;
+    hz = s_disp.refresh_hz;
+    vrr = s_disp.vrr;
+    os_unfair_lock_unlock(&s_pc_lock);
+    if (report)
+        xbox_VblankDisplayRefresh(report, period);
+    if (raised)
+        fprintf(stderr, "[PRESENT] timing: frames reached the glass late; now %s\n",
+                strategy == PC_LOCK ? "one refresh more between a frame's vblank and its refresh"
+                                    : "2 ms more between a frame's vblank and its present");
+    if ((f = glass_file()) != NULL)
+        fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,%d,%d,%u,%d,%d,%.3f,%d\n", flip,
+                (unsigned long long)vblank_ns, (unsigned long long)commit_ns,
+                (unsigned long long)aim->at_ns, (unsigned long long)aim->target_ns,
+                (unsigned long long)glass_ns, aim->late, skipped, smp.steps, strategy, depth,
+                hz, vrr);
+}
 
 static const char s_blit_msl[] =
     "#include <metal_stdlib>\n"
@@ -304,6 +570,12 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         SDL_Metal_GetDrawableSize(win, &w, &h);
         if (w > 0 && h > 0)
             s_layer.drawableSize = CGSizeMake(w, h);
+        if (recomp_env_on(RENV_WINDOW_FLOAT)) {
+            SDL_SysWMinfo wm;
+            SDL_VERSION(&wm.version);
+            if (SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_COCOA)
+                [wm.info.cocoa.window setLevel:NSFloatingWindowLevel];
+        }
         if (xbox_VblankDisplayLockOn())
             fbm_vblank_link(win);
         {
@@ -706,7 +978,7 @@ static id<MTLTexture> post_chain(id<MTLCommandBuffer> *cbp, id<MTLTexture> src)
 /* Slot k (fw x fh) into the window. 0 when no drawable came (timeout, display
  * asleep, window hidden): the caller keeps the frame and tries again. */
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
-                const char *shot_path, uint32_t flip)
+                const char *shot_path, uint32_t flip, uint64_t vblank_ns)
 {
     int ok = 0;
 
@@ -727,9 +999,41 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         if (dw > 0 && dh > 0 && ((int)cur.width != dw || (int)cur.height != dh))
             s_layer.drawableSize = CGSizeMake(dw, dh);
         uint64_t t_acq0 = xbox_LatOn() ? xbox_HostNowNs() : 0;
+        pc_aim aim;
+        int timed;
+
+        memset(&aim, 0, sizeof aim);
+        timing_poll(win);
+        timed = s_strategy != PC_LEGACY;
+        /* Never wait for a drawable: with two presents still on their way
+         * to the glass the third drawable is the one on it. A new game
+         * frame is skipped then (and said so); a redraw is tried again. */
+        if (timed && !shot_path && atomic_load(&s_inflight) >= 2) {
+            /* Presents the system has said nothing about for a tenth of a
+             * second (the window went behind another, the display slept)
+             * are not on their way any more. */
+            if (xbox_HostNowNs() - s_last_commit_ns > 100000000ull) {
+                atomic_store(&s_inflight, 0);
+                goto take;
+            }
+            if (!vblank_ns)
+                return 0;
+            atomic_fetch_add(&s_skips, 1);
+            glass_note(flip, vblank_ns, xbox_HostNowNs(), &aim, 0, 1);
+            return 2;
+        }
+    take:
         d = [s_layer nextDrawable];
-        if (!d)
+        if (!d) {
+            if (!s_no_drawable++)
+                fprintf(stderr, "[PRESENT] no drawable (the window is hidden, behind"
+                        " another, or the display sleeps): presents wait\n");
             return 0;
+        }
+        if (s_no_drawable) {
+            fprintf(stderr, "[PRESENT] drawables again after %u tries\n", s_no_drawable);
+            s_no_drawable = 0;
+        }
         if (t_acq0) {
             char b[32];
             snprintf(b, sizeof b, "%llu", (unsigned long long)xbox_HostNowNs());
@@ -797,7 +1101,37 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 if (t > 0)
                     xbox_PacingPresent(mach_to_host_ns((uint64_t)(t * 1e9)));
             }];
-        [cb presentDrawable:d];
+        /* Aimed here, with the pass encoded: what is left before the
+         * commit is the same few microseconds every frame. */
+        if (timed && vblank_ns) {
+            uint64_t now = xbox_HostNowNs();
+            os_unfair_lock_lock(&s_pc_lock);
+            pc_pacer_aim(&s_pacer, vblank_ns, now, &aim);
+            os_unfair_lock_unlock(&s_pc_lock);
+            if (aim.at_ns > now + 100000000ull)   /* never park a frame */
+                aim.at_ns = 0;
+        }
+        /* When it reached the glass: the pacer's feedback and the graph's
+         * trace (a redraw of the same frame only gives its drawable back). */
+        {
+            uint64_t vb = vblank_ns, commit_ns = xbox_HostNowNs();
+            uint32_t fl2 = flip;
+            pc_aim aim2 = aim;
+            atomic_fetch_add(&s_inflight, 1);
+            s_last_commit_ns = commit_ns;
+            [d addPresentedHandler:^(id<MTLDrawable> dr) {
+                CFTimeInterval t = dr.presentedTime;   /* 0: never shown */
+                if (atomic_fetch_sub(&s_inflight, 1) <= 0)
+                    atomic_store(&s_inflight, 0);       /* reset while it was out */
+                if (vb)
+                    glass_note(fl2, vb, commit_ns, &aim2,
+                               t > 0 ? mach_to_host_ns((uint64_t)(t * 1e9)) : 0, 0);
+            }];
+        }
+        if (aim.at_ns)
+            [cb presentDrawable:d atTime:host_ns_to_mach_s(aim.at_ns)];
+        else
+            [cb presentDrawable:d];
         if (t_acq0) {
             /* presentedTime: host seconds (mach_absolute_time) when the
              * drawable reached the glass, 0 when it never did. */

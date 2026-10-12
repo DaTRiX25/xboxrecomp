@@ -5891,11 +5891,16 @@ done:
 /* Present the frame just finished: present_pick says which surface that is,
  * for every backend. Before anything qualifies (no draw or clear yet), the
  * old answer: the last surface drawn, else the current one. */
-static void flip_present(void)
+static void flip_present(int early)
 {
     present_pick();
     if (s_backend->on_flip) {
         uint64_t t0 = rt_now();
+        /* The frame's own vblank, for a presenter that aims its present
+         * (present_cadence.h): the one just raised, or with
+         * RECOMP_PRESENT_EARLY the one the swap still waits for. */
+        xbox_PacingFrameVblank(early && s_swap_pending ? xbox_VblankEdgeNs(s_swap_target)
+                                                       : xbox_VblankLastDue());
         if (s_present.offset)
             s_backend->on_flip(s_present.offset, s_present.pitch);
         else
@@ -6387,7 +6392,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         int early = flip_present_early();
         uint64_t slow_t0 = nv2a_pb_slow_begin();     /* RECOMP_TRACE=pb_slow */
         if (early)
-            flip_present();
+            flip_present(1);
         else if (s_backend->on_flip_ready && flip_commit_early())
             s_backend->on_flip_ready();
         nv2a_pb_slow_end("FLIP_STALL before the hold (the frame's early submit)", slow_t0);
@@ -6419,7 +6424,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             prev = b;
         }
         if (!early)
-            flip_present();
+            flip_present(0);
         /* The window title's FPS and draws: one call per flip, with the
          * draws of the frame just finished. */
         {
