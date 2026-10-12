@@ -836,6 +836,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 }
                 fprintf(stderr, "[PRESENT] window up: Vulkan swapchain unavailable (%s);"
                         " SDL renderer, readback present\n", why);
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+                /* Said, not left to be found out: the overlay is drawn by
+                 * the Vulkan (or Metal) presenter and by nothing else. */
+                fprintf(stderr, "[OVERLAY] not available in this start: the window is not"
+                        " presented through Vulkan, and the settings overlay is drawn there"
+                        " only (Back+Start does nothing)\n");
+#endif
 #if defined(__ANDROID__)
                 /* A phone has no terminal to read that on, and what follows
                  * is the CPU rasteriser at a few frames a second: say so on
@@ -877,6 +884,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     SDL_DestroyWindow(win);
                 fprintf(stderr, "[PRESENT] window up: CAMetalLayer unavailable (%s);"
                         " SDL renderer, readback present\n", why);
+#if defined(XBOXRECOMP_HAVE_OVERLAY)
+                /* Said, not left to be found out: the overlay is drawn by
+                 * the Vulkan (or Metal) presenter and by nothing else. */
+                fprintf(stderr, "[OVERLAY] not available in this start: the window is not"
+                        " presented through Vulkan, and the settings overlay is drawn there"
+                        " only (Back+Start does nothing)\n");
+#endif
             }
         }
 #endif
