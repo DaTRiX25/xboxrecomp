@@ -54,4 +54,10 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard
 if(XR_SDL_HOST)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard_sdl
                      ${CMAKE_CURRENT_BINARY_DIR}/input_keyboard_sdl)
+    if(NOT WIN32 AND NOT ANDROID)
+        # The SDL pad backend's rumble against a virtual controller: no gap
+        # while held, an end by itself, stopped at every exit.
+        add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_rumble_sdl
+                         ${CMAKE_CURRENT_BINARY_DIR}/input_rumble_sdl)
+    endif()
 endif()

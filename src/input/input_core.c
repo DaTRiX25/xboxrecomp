@@ -22,17 +22,23 @@
 #include "rumble_curve.h"
 #include "recomp_env.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #if defined(_WIN32)
 #include <windows.h>
+#include "recomp_exit_hook.h"
 static SRWLOCK g_rumble_lock = SRWLOCK_INIT;
-#define RUMBLE_LOCK()   AcquireSRWLockExclusive(&g_rumble_lock)
-#define RUMBLE_UNLOCK() ReleaseSRWLockExclusive(&g_rumble_lock)
+#define RUMBLE_LOCK()    AcquireSRWLockExclusive(&g_rumble_lock)
+#define RUMBLE_TRYLOCK() TryAcquireSRWLockExclusive(&g_rumble_lock)
+#define RUMBLE_UNLOCK()  ReleaseSRWLockExclusive(&g_rumble_lock)
 #else
 #include <pthread.h>
+#include <signal.h>
+#include <time.h>
+#include <unistd.h>
 static pthread_mutex_t g_rumble_lock = PTHREAD_MUTEX_INITIALIZER;
 #define RUMBLE_LOCK()   pthread_mutex_lock(&g_rumble_lock)
 #define RUMBLE_UNLOCK() pthread_mutex_unlock(&g_rumble_lock)
@@ -46,9 +52,10 @@ static int      g_probed[XBOX_MAX_CONTROLLERS];   /* ever probed */
 
 /* ── rumble ───────────────────────────────────────────────────────────── */
 
-/* A held rumble is given to the host again this often: SDL's rumble runs for
- * a set time (xinput_device.c), and a lost report ends with it. */
-#define RUMBLE_REFRESH_MS 150
+/* A held rumble is given to the host again this often
+ * (XBOX_RUMBLE_REFRESH_MS, input_backend.h): the host's effect runs for
+ * XBOX_RUMBLE_EFFECT_MS only, so a rumble nobody renews ends by itself. */
+#define RUMBLE_REFRESH_MS XBOX_RUMBLE_REFRESH_MS
 /* A falling level is given to the host no more often than this (a pad's
  * output report is a write to the device); a rise and the stop go at once. */
 #define RUMBLE_SEND_MS 16
@@ -65,6 +72,11 @@ static struct rumble_port {
 static xbox_rumble_params g_rumble_params = XBOX_RUMBLE_PARAMS_DEFAULT;
 static int g_rumble_params_read;
 static int g_background;        /* the window is not in front */
+/* xbox_InputShutdown ran: the motors are off for good. The title's threads
+ * run on until the process is gone (exit() does not stop them, and the USB
+ * pad gives a held rumble again every 150 ms): nothing of theirs may start a
+ * motor after the stop. */
+static int g_shutdown;
 
 /* The in-game overlay: while open the title reads neutral state; after it
  * closes, a port reads neutral until it was seen with nothing held. */
@@ -157,7 +169,7 @@ void xbox_InputSetRumbleGate(unsigned off, unsigned on)
     RUMBLE_UNLOCK();
 }
 
-static int rumble_muted(void) { return g_blocked || g_background; }
+static int rumble_muted(void) { return g_blocked || g_background || g_shutdown; }
 
 static WORD rumble_word(double level)
 {
@@ -260,6 +272,111 @@ void xbox_InputRumbleTick(DWORD dwPort)
 
 static void shutdown_atexit(void) { xbox_InputShutdown(); }
 
+/* ── the ends atexit does not see ─────────────────────────────────────── */
+
+#if defined(_WIN32)
+
+/* ExitProcess skips atexit: the windows and the kernel's exits run the exit
+ * hooks before it (recomp_exit_hook.h). */
+static void shutdown_exit_hook(const char *why) { (void)why; xbox_InputShutdown(); }
+
+static void panic_install(void)
+{
+    recomp_exit_hook_add(shutdown_exit_hook);
+}
+
+/* A crash filter's stop: at once if the lock is free (the crashed thread
+ * may hold it), else nothing. */
+void xbox_InputPanicStop(int wait_ms)
+{
+    static const XBOX_VIBRATION off = { 0, 0 };
+
+    (void)wait_ms;
+    if (!g_inited || !RUMBLE_TRYLOCK())
+        return;
+    g_shutdown = 1;
+    for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+        g_be->set_state(p, &off);
+    RUMBLE_UNLOCK();
+}
+
+#else
+
+/* A signal handler cannot stop a motor (the host's pad calls take locks and
+ * allocate), so a thread that waits on a pipe does it: the handler writes a
+ * byte and gives the thread a moment. SIGTERM, SIGINT and SIGHUP end the
+ * process as they did, after that moment. */
+static int g_panic_pipe[2] = { -1, -1 };
+static volatile sig_atomic_t g_panic_done;
+
+static void *panic_thread(void *arg)
+{
+    char b;
+
+    (void)arg;
+    for (;;) {
+        ssize_t n = read(g_panic_pipe[0], &b, 1);
+        if (n == 1)
+            break;
+        if (n == 0 || (n < 0 && errno != EINTR))
+            return NULL;
+    }
+    xbox_InputShutdown();
+    g_panic_done = 1;
+    return NULL;
+}
+
+/* Async-signal-safe. */
+void xbox_InputPanicStop(int wait_ms)
+{
+    struct timespec ts = { 0, 2000000 };
+    int saved = errno;
+
+    if (g_panic_pipe[1] >= 0 && write(g_panic_pipe[1], "x", 1) == 1)
+        for (int i = 0; i < wait_ms / 2 && !g_panic_done; i++)
+            nanosleep(&ts, NULL);
+    errno = saved;
+}
+
+static void panic_signal(int sig)
+{
+    xbox_InputPanicStop(XBOX_RUMBLE_PANIC_MS);
+    /* SA_RESETHAND: the default again, and the signal ends the process when
+     * this returns, as the shell or the script that sent it expects. */
+    raise(sig);
+}
+
+static void panic_install(void)
+{
+    static const int sigs[] = { SIGTERM, SIGINT, SIGHUP };
+    pthread_t th;
+
+    if (g_panic_pipe[1] >= 0 || pipe(g_panic_pipe) != 0)
+        return;
+    if (pthread_create(&th, NULL, panic_thread, NULL) != 0) {
+        close(g_panic_pipe[0]);
+        close(g_panic_pipe[1]);
+        g_panic_pipe[0] = g_panic_pipe[1] = -1;
+        return;
+    }
+    pthread_detach(th);
+    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        struct sigaction old, sa;
+        /* Only where nothing else has a say: a host's own handler, or an
+         * ignored signal, stays. */
+        if (sigaction(sigs[i], NULL, &old) != 0 || (old.sa_flags & SA_SIGINFO)
+                || old.sa_handler != SIG_DFL)
+            continue;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = panic_signal;
+        sa.sa_flags = SA_RESETHAND;
+        sigemptyset(&sa.sa_mask);
+        sigaction(sigs[i], &sa, NULL);
+    }
+}
+
+#endif
+
 static DWORD probe(DWORD port, XBOX_INPUT_STATE *st)
 {
     DWORD rc = g_be->get_state(port, st);
@@ -288,11 +405,14 @@ void xbox_InputInit(void)
         g_be->init();
     for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++)
         probe(p, &st);
-    /* A crash or an exit while the title has the motors on must not leave a
-     * pad buzzing. */
+    /* An exit, a signal or a crash while the title has the motors on must
+     * not leave a pad buzzing: atexit for exit() and a return from main, the
+     * exit hooks where ExitProcess skips atexit, a thread the signal
+     * handlers wake (and a crash handler, xbox_InputPanicStop). */
     if (!atexit_done && g_be == &xbox_input_host_backend) {
         atexit_done = 1;
         atexit(shutdown_atexit);
+        panic_install();
     }
 }
 
@@ -309,6 +429,7 @@ void xbox_InputSetBackend(const xbox_input_backend *b)
     g_rumble_params = (xbox_rumble_params)XBOX_RUMBLE_PARAMS_DEFAULT;
     g_rumble_params_read = 0;
     g_background = 0;
+    g_shutdown = 0;
     RUMBLE_UNLOCK();
 }
 
@@ -388,10 +509,18 @@ void xbox_InputShutdown(void)
     if (!g_inited)
         return;
     RUMBLE_LOCK();
-    rumble_silence();
-    for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++) {
-        memset(g_rumble[p].target, 0, sizeof g_rumble[p].target);
-        memset(g_rumble[p].m, 0, sizeof g_rumble[p].m);
+    /* Twice is once: atexit, an exit hook and a signal can all get here. */
+    if (!g_shutdown) {
+        rumble_silence();
+        g_shutdown = 1;
+        for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++) {
+            memset(g_rumble[p].target, 0, sizeof g_rumble[p].target);
+            memset(g_rumble[p].m, 0, sizeof g_rumble[p].m);
+        }
+        /* The backend's own end: the stop written out and the pads let go,
+         * before the process (and the host's rumble queue with it) is gone. */
+        if (g_be->shutdown)
+            g_be->shutdown();
     }
     RUMBLE_UNLOCK();
 }

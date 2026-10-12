@@ -9,10 +9,17 @@
 #include "input_map.h"
 #include "input_backend.h"
 #include "recomp_env.h"
+#include "recomp_exit_hook.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 static int g_fail, g_checks;
 
@@ -300,11 +307,35 @@ static DWORD f_get(DWORD p, XBOX_INPUT_STATE *s)
     s->Gamepad.wButtons = (f_hold_start ? XBOX_GAMEPAD_START : 0) | (f_hold_back ? XBOX_GAMEPAD_BACK : 0);
     return ERROR_SUCCESS;
 }
+/* Every call that reaches the pad, in order: a motor write (port, levels,
+ * when) or the backend's shutdown. test_quit reads it back; a child process
+ * of that test writes each record down a pipe as well (f_pipe). */
+struct f_rec { int shutdown; DWORD port; WORD l, r; uint64_t ms; };
+static struct f_rec f_log[4096];
+static int f_n_log, f_shutdown_calls, f_pipe = -1;
+static uint64_t f_clock(void);
+static void f_record(int shutdown, DWORD p, const XBOX_VIBRATION *v)
+{
+    struct f_rec rec = { shutdown, p, v ? v->wLeftMotorSpeed : 0, v ? v->wRightMotorSpeed : 0,
+                         f_clock() };
+    if (f_n_log < (int)(sizeof f_log / sizeof f_log[0]))
+        f_log[f_n_log++] = rec;
+#ifndef _WIN32
+    if (f_pipe >= 0)
+        (void)!write(f_pipe, &rec, sizeof rec);
+#endif
+}
 static DWORD f_set(DWORD p, const XBOX_VIBRATION *v)
 {
     f_set_calls[p]++;
     f_last_vib[p] = *v;
+    f_record(0, p, v);
     return ERROR_SUCCESS;
+}
+static void f_shutdown(void)
+{
+    f_shutdown_calls++;
+    f_record(1, 0, NULL);
 }
 static int f_kb(XBOX_INPUT_STATE *s)
 {
@@ -314,12 +345,15 @@ static int f_kb(XBOX_INPUT_STATE *s)
     s->dwPacketNumber = 77;
     return 1;
 }
-static uint64_t f_clock(void) { return f_now; }
+static uint64_t (*f_clock_fn)(void);
+static uint64_t f_clock(void) { return f_clock_fn ? f_clock_fn() : f_now; }
 
-static const xbox_input_backend k_fake = { f_init, f_get, f_set, f_kb, f_clock };
+static const xbox_input_backend k_fake = { f_init, f_get, f_set, f_kb, f_clock, f_shutdown };
 
-/* input_core.c's default; never called here. */
-const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f_clock };
+/* input_core.c's default: the same fake pad. Only test_quit's child
+ * processes run on it, for the ends input_core.c guards the host backend
+ * against (atexit, the signals, a crash handler's stop). */
+const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f_clock, f_shutdown };
 
 static void test_cache(void)
 {
@@ -557,7 +591,8 @@ static void test_rumble(void)
         f_now += 1;
         xbox_InputRumbleTick(0);
     }
-    CHECK(f_set_calls[0] - sets == 4, "%d refreshes in 600 ms", f_set_calls[0] - sets);
+    CHECK(f_set_calls[0] - sets == 600 / XBOX_RUMBLE_REFRESH_MS, "%d refreshes in 600 ms",
+          f_set_calls[0] - sets);
 
     /* The window out of focus: a zero, then nothing, the refresh included;
      * back in front, what the title last asked for plays again. */
@@ -621,6 +656,315 @@ static void test_rumble(void)
     set_env("RECOMP_INPUT_RUMBLE_GAIN", NULL);
     set_env("RECOMP_INPUT_RUMBLE_PEAK", NULL);
     xbox_InputSetBackend(NULL);
+}
+
+/* ── the end of a run ────────────────────────────────────────────────────
+ *
+ * A pad must never be left shaking. Every way out that can still run code
+ * ends in a motor write of zero and then the backend's shutdown, with no
+ * motor write after it; and a way out that runs nothing leaves a level the
+ * host plays for XBOX_RUMBLE_EFFECT_MS at most. */
+
+/* What the pad plays, from the log: a level given at t holds until the next
+ * write or t + XBOX_RUMBLE_EFFECT_MS, whichever is first (the host's rumble
+ * effect; xinput_device.c gives SDL that duration). The longest stretch of
+ * silence between from and to, while the level asked for was not zero. */
+static uint64_t quit_longest_gap(int first, uint64_t from, uint64_t to)
+{
+    uint64_t gap = 0, covered = from;
+
+    for (int i = first; i < f_n_log; i++) {
+        const struct f_rec *r = &f_log[i];
+        if (r->shutdown || r->port != 0)
+            continue;
+        if (r->ms > covered && r->ms - covered > gap)
+            gap = r->ms - covered;
+        covered = (r->l | r->r) ? r->ms + XBOX_RUMBLE_EFFECT_MS : r->ms;
+    }
+    if (to > covered && to - covered > gap)
+        gap = to - covered;
+    return gap;
+}
+
+/* The log ends: ... a zero to every port that had a level, the shutdown,
+ * and nothing after. */
+static int quit_ended_stopped(const struct f_rec *log, int n)
+{
+    WORD on[XBOX_MAX_CONTROLLERS] = { 0 };
+    int i, shut = -1;
+
+    for (i = 0; i < n; i++) {
+        if (log[i].shutdown) {
+            if (shut < 0)
+                shut = i;
+            continue;
+        }
+        if (shut >= 0)
+            return 0;                   /* a motor write after the shutdown */
+        on[log[i].port] = log[i].l | log[i].r;
+    }
+    if (shut < 0)
+        return 0;
+    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (on[i])
+            return 0;                   /* a port left with a level */
+    return 1;
+}
+
+static void quit_begin(void)
+{
+    f_now += 5000;
+    rumble_begin("1.5", "52054");
+    f_n_log = 0;
+    f_shutdown_calls = 0;
+}
+
+#ifndef _WIN32
+static uint64_t f_real_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void quit_crash_handler(int sig)
+{
+    (void)sig;
+    xbox_InputPanicStop(500);           /* what a host's crash handler calls */
+    _exit(9);
+}
+
+enum { QUIT_EXIT, QUIT_RETURN_FROM_MAIN, QUIT_SIGTERM, QUIT_SIGINT, QUIT_SIGHUP,
+       QUIT_CRASH, QUIT_KILLED };
+
+/* A process on the host backend (the fake pad), rumbling, ended the given
+ * way; what its pad was sent comes back down a pipe. */
+static int quit_child(int how, struct f_rec *log, int max, int *status)
+{
+    int fd[2], n = 0;
+    pid_t pid;
+
+    if (pipe(fd) != 0)
+        return -1;
+    fflush(stdout);
+    pid = fork();
+    if (pid == 0) {
+        XBOX_VIBRATION v = { 52054, 20000 };
+        XBOX_INPUT_STATE st;
+        close(fd[0]);
+        f_pipe = fd[1];
+        f_n_log = 0;
+        memset(f_plugged, 0, sizeof f_plugged);
+        f_plugged[0] = f_plugged[1] = 1;
+        xbox_InputSetBackend(NULL);     /* the host backend: the guards go in */
+        xbox_InputInit();
+        xbox_InputSetState(0, &v);
+        xbox_InputSetState(1, &v);
+        f_now += 20;
+        xbox_InputGetState(0, &st);
+        switch (how) {
+        case QUIT_EXIT:    exit(0);
+        case QUIT_SIGTERM: raise(SIGTERM); break;
+        case QUIT_SIGINT:  raise(SIGINT); break;
+        case QUIT_SIGHUP:  raise(SIGHUP); break;
+        case QUIT_CRASH:
+            signal(SIGSEGV, quit_crash_handler);
+            raise(SIGSEGV);
+            break;
+        case QUIT_KILLED:  raise(SIGKILL); break;
+        default: break;
+        }
+        if (how == QUIT_RETURN_FROM_MAIN)
+            exit(0);                    /* what returning from main does */
+        _exit(99);                      /* a signal that did not end it */
+    }
+    close(fd[1]);
+    while (n < max && read(fd[0], &log[n], sizeof log[n]) == (ssize_t)sizeof log[n])
+        n++;
+    close(fd[0]);
+    waitpid(pid, status, 0);
+    return n;
+}
+#endif
+
+static void test_quit(void)
+{
+    XBOX_VIBRATION v = { 52054, 0 };
+    XBOX_INPUT_STATE st;
+    int sets, first;
+    uint64_t t0;
+
+    /* 1. Shutdown in the middle of a rumble (a window closed, the title's
+     * own quit: both reach xbox_InputShutdown). */
+    quit_begin();
+    xbox_InputSetState(0, &v);
+    CHECK(f_last_vib[0].wLeftMotorSpeed == 65535, "quit: no rumble to stop");
+    xbox_InputShutdown();
+    CHECK(quit_ended_stopped(f_log, f_n_log) && f_shutdown_calls == 1,
+          "quit: not stopped (%d records, %d shutdowns)", f_n_log, f_shutdown_calls);
+    /* The title's threads run on until the process is gone: the USB pad
+     * gives its held speeds again every 150 ms, the poll ticks. None of it
+     * may reach the pad. */
+    sets = f_n_log;
+    for (int i = 0; i < 2000; i++) {
+        f_now += 1;
+        if (i % 150 == 0)
+            xbox_InputSetState(0, &v);
+        xbox_InputRumbleTick(0);
+        xbox_InputGetState(0, &st);
+    }
+    v.wLeftMotorSpeed = 30000; v.wRightMotorSpeed = 30000;
+    xbox_InputSetState(0, &v);
+    xbox_InputSetBlocked(1); xbox_InputSetBlocked(0);
+    xbox_InputSetBackground(1); xbox_InputSetBackground(0);
+    f_hold_start = 0;                           /* (the block's latch, let go) */
+    xbox_InputGetState(0, &st);
+    f_hold_start = 1;
+    f_now += 300;
+    xbox_InputRumbleTick(0);
+    CHECK(f_n_log == sets, "quit: %d calls reached the pad after the shutdown", f_n_log - sets);
+    /* atexit after the window's own call, a signal after that: once. */
+    xbox_InputShutdown();
+    xbox_InputShutdown();
+    CHECK(f_shutdown_calls == 1 && f_n_log == sets, "quit: shut down %d times", f_shutdown_calls);
+
+    /* 2. The same from every state the motors can be silent or falling in. */
+    v.wLeftMotorSpeed = 52054; v.wRightMotorSpeed = 0;
+    quit_begin();                               /* the overlay open */
+    xbox_InputSetState(0, &v);
+    xbox_InputSetBlocked(1);
+    xbox_InputShutdown();
+    CHECK(quit_ended_stopped(f_log, f_n_log), "quit in the overlay: not stopped");
+    xbox_InputSetBlocked(0);
+    f_now += 200;
+    xbox_InputRumbleTick(0);
+    CHECK(quit_ended_stopped(f_log, f_n_log), "quit in the overlay: rumble after closing it");
+    f_hold_start = 0;                           /* (the block's latch, let go) */
+    xbox_InputGetState(0, &st);
+    f_hold_start = 1;
+    quit_begin();                               /* the window not in front */
+    xbox_InputSetState(0, &v);
+    xbox_InputSetBackground(1);
+    xbox_InputShutdown();
+    xbox_InputSetBackground(0);
+    f_now += 200;
+    xbox_InputRumbleTick(0);
+    CHECK(quit_ended_stopped(f_log, f_n_log), "quit in the background: not stopped");
+    quit_begin();                               /* the release, after the title's zero */
+    xbox_InputSetState(0, &v);
+    v.wLeftMotorSpeed = 0;
+    xbox_InputSetState(0, &v);
+    f_now += 30;
+    xbox_InputRumbleTick(0);
+    CHECK(f_last_vib[0].wLeftMotorSpeed != 0, "quit in the release: already silent");
+    xbox_InputShutdown();
+    CHECK(quit_ended_stopped(f_log, f_n_log), "quit in the release: not stopped");
+    quit_begin();                               /* nothing playing: still let go */
+    xbox_InputShutdown();
+    CHECK(quit_ended_stopped(f_log, f_n_log) && f_shutdown_calls == 1, "quit at rest");
+
+    /* 3. No way out at all (the process killed outright, a pad poll that
+     * hangs): what the pad was last given has an end. A held level is given
+     * again before the host's effect runs out, whatever the poll's rate, so
+     * the pad plays without a gap; and once the giving stops the last
+     * effect is over XBOX_RUMBLE_EFFECT_MS later, which is the limit. */
+    CHECK(XBOX_RUMBLE_EFFECT_MS <= 250, "the effect's limit grew: %d ms", XBOX_RUMBLE_EFFECT_MS);
+    CHECK(XBOX_RUMBLE_REFRESH_MS * 2 <= XBOX_RUMBLE_EFFECT_MS, "no margin between refresh and effect");
+    {
+        static const int poll_ms[] = { 1, 4, 16, 33, 50 };
+        for (unsigned k = 0; k < sizeof poll_ms / sizeof poll_ms[0]; k++) {
+            uint64_t gap, last = 0;
+            int writes = 0;
+            v.wLeftMotorSpeed = 40000; v.wRightMotorSpeed = 0;
+            quit_begin();
+            first = f_n_log;
+            t0 = f_now;
+            xbox_InputSetState(0, &v);
+            for (int t = 0; t < 3000; t += poll_ms[k]) {
+                f_now += (uint64_t)poll_ms[k];
+                xbox_InputRumbleTick(0);
+            }
+            gap = quit_longest_gap(first, t0, f_now);
+            CHECK(gap == 0, "poll %d ms: the pad was silent for %llu ms of a held rumble",
+                  poll_ms[k], (unsigned long long)gap);
+            /* The held level never changes: nothing that could pulse. */
+            for (int i = first; i < f_n_log; i++) {
+                CHECK(f_log[i].l == f_log[first].l && f_log[i].r == 0,
+                      "poll %d ms: the held level moved (%u)", poll_ms[k], f_log[i].l);
+                last = f_log[i].ms;
+                writes++;
+            }
+            CHECK(writes >= 3000 / (XBOX_RUMBLE_REFRESH_MS + poll_ms[k]),
+                  "poll %d ms: %d writes in 3 s", poll_ms[k], writes);
+            /* The process dies here: no tick, no shutdown. */
+            CHECK(f_now - last < XBOX_RUMBLE_REFRESH_MS + (uint64_t)poll_ms[k],
+                  "poll %d ms: last write %llu ms old", poll_ms[k], (unsigned long long)(f_now - last));
+        }
+    }
+    /* The curve is BO-98's, untouched by the re-arming: the decision's
+     * levels, and a release that still falls through them. */
+    quit_begin();
+    v.wLeftMotorSpeed = 18349; v.wRightMotorSpeed = 5734;
+    xbox_InputSetState(0, &v);
+    CHECK(NEAR(f_last_vib[0].wLeftMotorSpeed, 0.50) && NEAR(f_last_vib[0].wRightMotorSpeed, 0.23),
+          "curve: %.3f/%.3f", FRAC(f_last_vib[0].wLeftMotorSpeed), FRAC(f_last_vib[0].wRightMotorSpeed));
+    xbox_InputSetBackend(NULL);
+
+#ifndef _WIN32
+    /* 4. A real process on the host backend, ended each way while its pads
+     * rumble. Whatever can still run code ends stopped; the signals still
+     * end the process as signals. */
+    {
+        static const struct { int how; const char *name; int sig; } way[] = {
+            { QUIT_EXIT, "exit()", 0 },
+            { QUIT_RETURN_FROM_MAIN, "return from main", 0 },
+            { QUIT_SIGTERM, "SIGTERM", SIGTERM },
+            { QUIT_SIGINT, "SIGINT", SIGINT },
+            { QUIT_SIGHUP, "SIGHUP", SIGHUP },
+            { QUIT_CRASH, "a crash handler", 0 },
+        };
+        static struct f_rec log[64];
+        int status, n;
+
+        f_clock_fn = f_real_ms;                 /* the children wait in real time */
+        for (unsigned k = 0; k < sizeof way / sizeof way[0]; k++) {
+            n = quit_child(way[k].how, log, 64, &status);
+            CHECK(n >= 3 && (log[0].l | log[0].r), "%s: the child did not rumble (%d records)",
+                  way[k].name, n);
+            CHECK(quit_ended_stopped(log, n), "%s: the pads were left on (%d records)", way[k].name, n);
+            if (way[k].sig)
+                CHECK(WIFSIGNALED(status) && WTERMSIG(status) == way[k].sig,
+                      "%s: ended with status 0x%x, not by the signal", way[k].name, status);
+            else
+                CHECK(WIFEXITED(status) && WEXITSTATUS(status) != 99, "%s: status 0x%x",
+                      way[k].name, status);
+        }
+        /* SIGKILL: nothing runs. The pad's last word is a level, and what
+         * ends it is the effect's own time. */
+        n = quit_child(QUIT_KILLED, log, 64, &status);
+        CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "SIGKILL: status 0x%x", status);
+        CHECK(n >= 2 && !quit_ended_stopped(log, n) && (log[n - 1].l | log[n - 1].r),
+              "SIGKILL: a stop was sent?");
+        f_clock_fn = NULL;
+    }
+#endif
+}
+
+/* The exit hooks (recomp_exit_hook.h): where ExitProcess skips atexit, the
+ * windows and the kernel's exits run them, and the pads' stop is one. */
+static int f_hook_a, f_hook_b;
+static void f_hook_fn_a(const char *why) { (void)why; f_hook_a++; }
+static void f_hook_fn_b(const char *why) { (void)why; f_hook_b++; }
+static void test_exit_hooks(void)
+{
+    recomp_exit_hook_set(f_hook_fn_a);
+    recomp_exit_hook_add(f_hook_fn_b);
+    recomp_exit_hook_add(f_hook_fn_b);          /* twice is once */
+    recomp_exit_hook_run("test");
+    CHECK(f_hook_a == 1 && f_hook_b == 1, "exit hooks ran %d and %d times", f_hook_a, f_hook_b);
+    recomp_exit_hook_set(NULL);
+    recomp_exit_hook_run("test");
+    CHECK(f_hook_a == 1 && f_hook_b == 2, "added hook lost with the first");
 }
 
 /* The overlay's combo guard: Start is hidden while Back is held. */
@@ -752,6 +1096,8 @@ int main(int argc, char **argv)
     test_cache();
     test_block();
     test_rumble();
+    test_quit();
+    test_exit_hooks();
     test_combo_guard();
     test_trigger_deadzone();
     test_face_layout();
