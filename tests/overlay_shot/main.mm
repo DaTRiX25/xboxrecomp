@@ -255,7 +255,7 @@ static int mixer_e2e(const char *file)
     CHECK(xbox_OverlayOpen() && xbox_HostPaused() && xbox_InputBlocked());
     ptap(P_RB, 2); run(3);
     CHECK(xbox_OverlayTestRowIndex("Custom music folder") == 0);
-    ptap(P_DOWN, 6);                      /* past the music folder's row, then as before */
+    CHECK(xbox_OverlayTestSelectRow("Mixer")); run(2);   /* past the music folder's rows and the loudness */
     ptap(P_A); run(3);
     CHECK(xbox_OverlayMixerView() == 0);
     CHECK(!xbox_HostPaused() && xbox_InputBlocked());               /* live: runs, input still ours */
@@ -555,7 +555,7 @@ static int mixer_tour(const char *pre, const char *file)
     tap(SDLK_F1);
     run(12);
     tap(SDLK_PAGEDOWN); run(2); tap(SDLK_PAGEDOWN); run(3);       /* Audio */
-    for (int i = 0; i < 6; i++) { tap(SDLK_DOWN); run(1); }        /* the Mixer row, under the music folder's */
+    CHECK(xbox_OverlayTestSelectRow("Mixer")); run(1);            /* the Mixer row, under the music folder's */
     snprintf(path, sizeof path, "%smixer_0_audio.bmp", pre); frame(path);
     tap(SDLK_RETURN); run(3);
     CHECK(!apu_bus_enabled());
@@ -720,11 +720,10 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     CHECK(xbox_OverlayTestHasRow("Export save to home folder"));
     CHECK(xbox_OverlayTestHasRow("Import save from home folder (none found"));
     CHECK(xbox_OverlayTestHasRow("Import save from another folder"));
-    CHECK(xbox_OverlayTestHasRow("Restart game") && !xbox_OverlayTestHasRow("Restart game now"));
-    /* Restart game and Quit game are the last two rows of the page, and the
-     * Advanced page has no Restart row of its own above its reset row. */
-    CHECK(xbox_OverlayTestRowIndex("Restart game") > xbox_OverlayTestRowIndex("Reset all settings"));
-    CHECK(xbox_OverlayTestRowIndex("Quit game") == xbox_OverlayTestRowIndex("Restart game") + 1);
+    /* Nothing waits for a restart: Quit game is the page's last row and there
+     * is no Restart row at all (none of its own in the page either). */
+    CHECK(!xbox_OverlayTestHasRow("Restart"));
+    CHECK(xbox_OverlayTestRowIndex("Quit game") > xbox_OverlayTestRowIndex("Reset all settings"));
     CHECK(!xbox_OverlayTestHasRow("Cancel the import"));
 
     /* Import with nothing exported: a message, nothing staged. */
@@ -749,7 +748,7 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     press_a();
     CHECK(recomp_save_import_staged(save, path, sizeof path) && !strcmp(path, found));
     CHECK(xbox_OverlayTestHasRow("Cancel the import"));
-    CHECK(xbox_OverlayTestHasRow("Restart now (the save is imported at the start)"));
+    CHECK(xbox_OverlayTestHasRow("Restart now to apply 1 change"));
     CHECK(xbox_OverlayTestHasRow("Import waiting for the next start"));
     CHECK(!xbox_OverlayTestHasRow("Import save from another folder"));
     CHECK(xbox_OverlayTestSelectRow("Restart now"));
@@ -758,7 +757,7 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     frame(path);
     /* And on another page too, while it waits. */
     press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
-    CHECK(xbox_OverlayTestHasRow("Restart game now"));
+    CHECK(xbox_OverlayTestHasRow("Restart now to apply 1 change"));
     press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
 
     /* Cancel. */
@@ -841,37 +840,52 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
         press_a();                                              /* "Restore the save in this folder" */
         CHECK(!xsb_is_open() && recomp_save_import_staged(save, path, sizeof path)
               && !strcmp(path, made[2]));
-        CHECK(xbox_OverlayTestHasRow("Restart now (the save is imported at the start)"));
+        CHECK(xbox_OverlayTestHasRow("Restart now to apply 1 change"));
         CHECK(xbox_OverlayTestSelectRow("Cancel the import"));
         press_a();
     }
 
-    /* A setting the table flags: the Restart row comes and goes with it. */
+    /* A setting the table flags: the one Restart row (at the foot of the
+     * page, over Quit game) comes and goes with it, and no page has a Restart
+     * row of its own. */
     for (int p = 0; p < 12 && !xbox_OverlayTestHasRow("Aspect ratio"); p++)
         press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
     CHECK(xbox_OverlayTestHasRow("Aspect ratio"));
-    CHECK(!xbox_OverlayTestHasRow("Restart game now"));
+    CHECK(!xbox_OverlayTestHasRow("Restart"));
     xbox_SettingSet(XS_DISPLAY_ASPECT, 1);
     run(2);
-    CHECK(xbox_SettingsNeedRestart() && xbox_OverlayTestHasRow("Restart game now"));
-    CHECK(xbox_OverlayTestSelectRow("Restart game now"));
+    CHECK(xbox_SettingsNeedRestart() && xbox_OverlayTestHasRow("Restart now to apply 1 change"));
+    CHECK(!xbox_OverlayTestHasRow("Restart game"));
+    xbox_SettingSet(XS_GRAPHICS_RENDER_SCALE, 2);
+    run(2);
+    CHECK(xbox_OverlayTestHasRow("Restart now to apply 2 changes"));
+    CHECK(xbox_OverlayTestSelectRow("Restart now"));
     run(3);
     snprintf(path, sizeof path, "%srestart_row.bmp", pre);
     frame(path);
+    xbox_SettingSet(XS_GRAPHICS_RENDER_SCALE, 1);
     xbox_SettingSet(XS_DISPLAY_ASPECT, 0);
     run(2);
-    CHECK(!xbox_OverlayTestHasRow("Restart game now"));
+    CHECK(!xbox_OverlayTestHasRow("Restart now"));
     CHECK(!recomp_restart_requested());
 
-    /* Restart game and Quit game: on every page, each asks once more. */
+    /* Restart now and Quit game: on every page while a change waits, each
+     * asks once more; with nothing waiting only Quit game is there. */
     for (int p = 0; p < 6; p++) {
-        CHECK(xbox_OverlayTestHasRow("Restart game") && xbox_OverlayTestHasRow("Quit game"));
-        CHECK(xbox_OverlayTestRowIndex("Quit game") == xbox_OverlayTestRowIndex("Restart game") + 1);
-        CHECK(xbox_OverlayTestRowIndex("Restart game") > xbox_OverlayTestRowIndex("Reset "));
+        CHECK(!xbox_OverlayTestHasRow("Restart") && xbox_OverlayTestHasRow("Quit game"));
+        CHECK(xbox_OverlayTestRowIndex("Quit game") > xbox_OverlayTestRowIndex("Reset "));
+        press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+    }
+    xbox_SettingSet(XS_DISPLAY_ASPECT, 1);
+    run(2);
+    for (int p = 0; p < 6; p++) {
+        CHECK(xbox_OverlayTestHasRow("Restart now to apply 1 change") && xbox_OverlayTestHasRow("Quit game"));
+        CHECK(xbox_OverlayTestRowIndex("Quit game") == xbox_OverlayTestRowIndex("Restart now") + 1);
+        CHECK(xbox_OverlayTestRowIndex("Restart now") > xbox_OverlayTestRowIndex("Reset "));
         press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
     }
     press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);                  /* the Advanced page */
-    CHECK(xbox_OverlayTestSelectRow("Restart game"));
+    CHECK(xbox_OverlayTestSelectRow("Restart now"));
     run(3);
     snprintf(path, sizeof path, "%squitrow.bmp", pre);
     frame(path);
@@ -892,6 +906,7 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     CHECK(!xbox_OverlayOpen() && recomp_restart_requested() && SDL_HasEvent(SDL_QUIT));
     recomp_restart_cancel();                                    /* or this tool would start again */
     SDL_FlushEvent(SDL_QUIT);
+    xbox_SettingSet(XS_DISPLAY_ASPECT, 0);
 
     tap(SDLK_F1);
     CHECK(xbox_OverlayOpen());
@@ -1010,6 +1025,8 @@ int main(int argc, char **argv)
     if (getenv("OVERLAY_SHOT_SAVEIO"))
         return saveio_tour(pre, getenv("OVERLAY_SHOT_SAVEIO"), argc, argv);
 
+    recomp_restart_init(argc, argv);     /* the host can restart: the pending-restart row shows */
+
     /* Flips for the graph: mostly 60 Hz, a few long ones. */
     for (int i = 0; i < 150; i++) {
         xbox_HostPauseHold();
@@ -1048,14 +1065,14 @@ int main(int argc, char **argv)
             CHECK(xbox_OverlayTestRowIndex("Custom music folder") == 0);
             CHECK(xbox_OverlayTestRowIndex("2 soundtracks") == 1);
             CHECK(xbox_OverlayTestRowIndex("  one.mp3") == 2);
-            CHECK(xbox_OverlayTestRowIndex("Master volume") == 3);
-            CHECK(xbox_OverlayTestRowIndex("Mute") == 4);
+            CHECK(xbox_OverlayTestRowIndex("Custom music loudness") == 3);
+            CHECK(xbox_OverlayTestRowIndex("Master volume") == 4);
+            CHECK(xbox_OverlayTestRowIndex("Mute") == 5);
             CHECK(xbox_OverlayTestRowIndex("Speakers") > xbox_OverlayTestRowIndex("Mute in the background"));
             CHECK(xbox_OverlayTestRowIndex("Reset this page") > xbox_OverlayTestRowIndex("Speaker test, direct"));
             snprintf(path, sizeof path, "%saudio_top.bmp", pre);
             frame(path);
-            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, true);       /* off the music row, onto the volume */
-            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, false);
+            CHECK(xbox_OverlayTestSelectRow("Master volume"));
             run(2);
             pad(SDL_CONTROLLER_BUTTON_DPAD_LEFT, true);
             pad(SDL_CONTROLLER_BUTTON_DPAD_LEFT, false);
@@ -1075,6 +1092,14 @@ int main(int argc, char **argv)
             CHECK(xbox_SettingValue(XS_AUDIO_SPEAKERS) != 2);   /* 5.1 cannot be picked */
         }
         CHECK(xbox_OverlayTestHasRow("Quit game"));           /* the foot of every page */
+        if (p == 1) {                                         /* graphics: a second change waits */
+            xbox_SettingSet(XS_GRAPHICS_RENDER_SCALE, 2);
+            run(2);
+            CHECK(xbox_OverlayTestHasRow("Restart now to apply 2 changes"));
+        } else {
+            CHECK(xbox_OverlayTestHasRow("Restart now to apply "));
+            CHECK(!xbox_OverlayTestHasRow("Restart game"));
+        }
         snprintf(path, sizeof path, "%spage%d.bmp", pre, p);
         frame(path);
         if (p == 5) {                                         /* advanced: the bug report */

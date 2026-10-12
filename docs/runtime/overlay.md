@@ -20,6 +20,25 @@ Close with B or Esc. `RECOMP_OVERLAY=0` turns it off. For scripted runs:
 `RECOMP_WINDOW_SHOT` pending while it is open is taken of the overlay over
 the last frame.
 
+## Look and sizes
+
+The overlay uses the whole window (it pauses the game anyway), over the
+frame dimmed to 22%. Every size is a fraction of the window, the game's own
+proportions measured on its 640x464 menu frame: label 3.7% of the height,
+row pitch 6.25%, hint 2.6%, footer text 2.8%, header 4.7%; labels start at
+14% of the width, values are right-aligned in a column from 56% to 94%, with
+the arrows outside it; no upper cap, a floor of 13 px for a tiny window. The
+content is at most 1.8 H wide and centred. A touch device (Android;
+`RECOMP_OVERLAY_TOUCH=1` elsewhere, `RECOMP_OVERLAY_DPI` to force the
+density) keeps a row at least 7 mm high. A text that does not fit its column
+shrinks to 72% and is then cut. The selected row shows the value between
+arrows; a switch is an On / Off value, a slider a bar of blocks. The palette
+is the game's menu colours (title red, selected, list items, disabled,
+hint, arrows, rule, footer bar, attention yellow: `k_theme_game`). The font
+is still the monospace one. The Mixer page and the folder browser use the
+same sizes and colours in a body under the header, their layout as before
+(the Mixer's rows a little denser).
+
 ## What it does to the title
 
 * **Input.** While it is open `xbox_InputGetState` (src/input/input_core.c)
@@ -263,7 +282,7 @@ again); `xbox_PowerModeAtLoad(host, stored)` is the rule, testable per host
 
 Some settings are read once, when the game starts. The table in
 `xbox_settings.c` says which with a flag, `XS_RESTART`, and that flag is the
-only list: the row's "(restart)" mark and note, `xbox_SettingsNeedRestart`
+only list: the row's RESTART tag and note, `xbox_SettingsNeedRestart`
 and the Restart row all read it (the `overlay_settings` test names the
 flagged ones, so adding a setting means deciding). Flagged today:
 `display.aspect` (the dashboard bit the title reads at boot),
@@ -273,9 +292,13 @@ start), on Android `input.vibration`. Everything else is applied while
 running or read each time it is used.
 
 While a flagged setting differs from its value at launch, or a port asked
-with `xbox_OverlayWantRestart(reason)`, every page has a "Restart game now"
-row above its reset row, with the reason in its note. Nothing restarts
-unless a row is picked. The row closes the overlay (the settings are written), asks `recomp_restart`
+with `xbox_OverlayWantRestart(reason)`, or a save import waits, the foot of
+every page shows one row, "Restart now to apply N changes" (N counts those
+three), in attention yellow, over Quit game; its note has the reasons. A
+changed setting's row carries a yellow RESTART tag beside its label; a
+setting only read at start carries the same tag in grey. No page has a
+Restart row of its own. Nothing restarts unless that row is picked. The row
+closes the overlay (the settings are written), asks `recomp_restart`
 for a restart and closes the window the ordinary way: the program's own
 shutdown runs (motors off, audio closed, logs finished), and its last exit
 handler starts it again with the arguments, directory and environment it
@@ -284,18 +307,17 @@ macOS (the same process id, so Steam, a launcher script, an AppImage's
 runtime or a Mac bundle see one program throughout), as a new process on
 Windows, through the activity (`restartGame()`) on Android. A port calls
 `recomp_restart_init(argc, argv)` first thing in `main`; without that there
-is no row.
+is no row, and the foot shows the yellow line "Restart the game to apply N
+changes" instead (nothing to press).
 
-### Restart game and Quit game (the foot of every page)
+### Restart now and Quit game (the foot of every page)
 
-Every page ends with two rows that stay in view below the page's own rows
-(the rows scroll above them): "Restart game" (the Advanced page's only
-Restart row; with a save import waiting it reads "Restart now (the save is
-imported at the start)") and "Quit game". Both ask first: A (Enter, a click)
-on the row shows "Press A again to restart / quit, B to cancel" in the row
-and its note; the same row again does it. B or Esc, another row or another
-page takes it back. Without `recomp_restart_init` the Restart row is not
-offered; Quit always is.
+Every page ends with rows that stay in view below the page's own rows (the
+rows scroll above them): "Restart now to apply N changes" (only while a
+restart is pending) and "Quit game" (always). Both ask first: A (Enter, a
+click) on the row shows "Press A again to restart / quit, B to cancel" in the
+row and its note; the same row again does it. B or Esc, another row or
+another page takes it back.
 
 Quit game closes the overlay (settings written) and posts SDL_QUIT, the same
 event as the window's close button, so the presenter's ordinary way out
@@ -326,7 +348,7 @@ An import never touches the save under the running title (the title holds
 its save in memory and writes it back when it saves). The folder is checked
 (it has `UDATA/<title id>` with files; its `save-export.txt`, if any, names
 this title) and noted in the save root; the rows become "Cancel the import"
-and "Restart now (the save is imported at the start)". At the next start the
+and the foot's "Restart now to apply 1 change". At the next start the
 port calls `recomp_save_import_apply` before anything else looks at the save
 root: the save in use is copied to
 `<save root>/save-before-import/<date-time>/` (a folder of its own, which
