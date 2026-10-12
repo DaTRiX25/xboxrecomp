@@ -336,6 +336,8 @@ const char *(*xbox_PathRedirectHook)(const char *xbox_path);
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
 static WCHAR s_user_dir[MAX_PATH];   /* UDATA/TDATA root: s_save_dir or RECOMP_SAVE_DIR */
+static WCHAR s_user_alt[MAX_PATH];   /* xbox_PathSetUserRoot: in its place while set */
+static char  s_user_utf8[MAX_PATH * 3];
 static BOOL  s_initialized = FALSE;
 
 #define XBOX_DISK_IMAGE_NAME   L"Partition0.img"
@@ -534,7 +536,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         skip = match_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
-            base_dir  = s_rules[i].to_save == 2 ? s_user_dir
+            base_dir  = s_rules[i].to_save == 2 ? (s_user_alt[0] ? s_user_alt : s_user_dir)
                       : s_rules[i].to_save     ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_win;
             goto translate;
@@ -587,6 +589,25 @@ translate:
 }
 
 /* ======================================================================== */
+void xbox_PathSetUserRoot(const char *utf8)
+{
+    if (!utf8 || !utf8[0]) {
+        s_user_alt[0] = 0;
+        return;
+    }
+    if (!MultiByteToWideChar(CP_UTF8, 0, utf8, -1, s_user_alt, MAX_PATH))
+        s_user_alt[0] = 0;
+    for (WCHAR *p = s_user_alt; *p; p++)
+        if (*p == L'/') *p = L'\\';
+}
+
+const char *xbox_PathUserRoot(void)
+{
+    if (!WideCharToMultiByte(CP_UTF8, 0, s_user_dir, -1, s_user_utf8, (int)sizeof s_user_utf8, NULL, NULL))
+        s_user_utf8[0] = 0;
+    return s_user_utf8;
+}
+
 #else /* !_WIN32  -- POSIX / Linux */
 /* ======================================================================== */
 
@@ -600,6 +621,7 @@ translate:
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
 static char s_user_dir[MAX_PATH];   /* UDATA/TDATA root: s_save_dir or RECOMP_SAVE_DIR */
+static char s_user_alt[MAX_PATH];   /* xbox_PathSetUserRoot: in its place while set */
 static BOOL s_initialized = FALSE;
 
 /* Strip a single trailing '/' (but never the root '/'). */
@@ -814,7 +836,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         skip = match_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
-            base_dir  = s_rules[i].to_save == 2 ? s_user_dir
+            base_dir  = s_rules[i].to_save == 2 ? (s_user_alt[0] ? s_user_alt : s_user_dir)
                       : s_rules[i].to_save     ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_posix;
             goto translate;
@@ -872,6 +894,19 @@ translate:
         }
         return TRUE;
     }
+}
+
+void xbox_PathSetUserRoot(const char *utf8)
+{
+    if (!utf8 || !utf8[0])
+        s_user_alt[0] = 0;
+    else
+        snprintf(s_user_alt, sizeof s_user_alt, "%s", utf8);
+}
+
+const char *xbox_PathUserRoot(void)
+{
+    return s_user_dir;
 }
 
 #endif /* _WIN32 */

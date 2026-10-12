@@ -230,11 +230,13 @@ enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_MIXER,                                            /* the Mixer page (overlay_mixer.inc) */
               A_UPDATE_CHECK, A_UPDATE_OPEN,                      /* Check for updates (xbox_update.h) */
               A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_RESTORE, A_SAVE_CANCEL,  /* xbox_OverlaySetSaveIO */
+              A_CHEAT0, A_CHEAT1, A_CHEAT2, A_CHEAT3,              /* xbox_OverlaySetCheats */
+              A_CHEAT_KEEP, A_CHEAT_DISCARD,
               A_RESTART_PIN, A_QUIT };       /* the two rows at the foot of every page: they ask first */
 
 /* The most rows a page has (the Audio page, with the music folder's lines
  * above its settings; the Advanced page with the save and restart rows). */
-#define OVERLAY_ROWS 48
+#define OVERLAY_ROWS 56
 
 /* ── restart (recomp_restart.h) ────────────────────────────────────── */
 
@@ -280,6 +282,106 @@ void xbox_OverlaySetHostRows(int n, const char *(*fn)(int row, int activate))
 {
     s_host_fn = fn;
     s_host_n = fn ? (n > XBOX_OVERLAY_HOST_ROWS ? XBOX_OVERLAY_HOST_ROWS : n) : 0;
+}
+
+/* ── cheats (xbox_OverlaySetCheats) ────────────────────────────────── */
+
+/* A cheat session: from the first cheat switched on, the title's saves go
+ * to a copy of its UDATA and TDATA (recomp_save_sandbox_begin,
+ * xbox_PathSetUserRoot), so nothing it saves meanwhile reaches the player's
+ * save. When the last cheat goes off the player decides: keep (the copy goes
+ * over the save, saving is back to normal) or throw away (the save stays as
+ * it was; the title still holds that progress in memory, so its saves keep
+ * going to the copy until the game is started again). Quitting with a
+ * session open throws it away; the copy left behind is removed at the next
+ * start. */
+extern "C" const char *xbox_PathUserRoot(void);           /* kernel/kernel.h */
+extern "C" void xbox_PathSetUserRoot(const char *utf8);
+enum { CS_NONE, CS_ON, CS_ASK, CS_DISCARDED };
+/* Restart game, Quit game and switching a cheat on ask once more: the
+ * action armed, or 0 (activate, below). */
+static int s_confirm;
+static const xbox_cheat *s_cheats;
+static int s_cheat_n, s_cs;
+static char s_cs_root[1024], s_cs_dir[1100], s_cs_info[200];
+static char s_cheat_label[4][120];
+
+void xbox_OverlaySetCheats(const xbox_cheat *list, int n)
+{
+    s_cheats = list;
+    s_cheat_n = list ? (n > 4 ? 4 : n) : 0;
+}
+
+/* The save root, once the kernel's paths are set up (the first time the
+ * Advanced page is built): a copy an earlier run left is removed then. */
+static bool cheat_ready()
+{
+    if (!s_cheat_n)
+        return false;
+    if (!s_cs_root[0]) {
+        const char *root = xbox_PathUserRoot();
+        if (!root || !root[0])
+            return false;
+        snprintf(s_cs_root, sizeof s_cs_root, "%s", root);
+        snprintf(s_cs_dir, sizeof s_cs_dir, "%s/cheat-session", root);
+        recomp_save_sandbox_discard(s_cs_dir);   /* an earlier run's, never kept */
+    }
+    return true;
+}
+
+static bool cheat_any_on()
+{
+    for (int i = 0; i < s_cheat_n; i++)
+        if (s_cheats[i].get())
+            return true;
+    return false;
+}
+
+static void cheat_action(int action)
+{
+    if (action == A_CHEAT_KEEP && s_cs == CS_ASK) {
+        int ok = recomp_save_sandbox_commit(s_cs_dir, s_cs_root);
+        xbox_PathSetUserRoot(NULL);
+        if (ok)
+            recomp_save_sandbox_discard(s_cs_dir);
+        s_cs = CS_NONE;
+        snprintf(s_cs_info, sizeof s_cs_info, ok
+                 ? "Kept: what the game saved meanwhile is in your save now."
+                 : "Not everything could be copied into your save; the copy is in %.80s", s_cs_dir);
+        fprintf(stderr, LOGP "cheats: progress kept (%s)\n", ok ? "copied" : "copy failed");
+        return;
+    }
+    if (action == A_CHEAT_DISCARD && s_cs == CS_ASK) {
+        s_cs = CS_DISCARDED;
+        snprintf(s_cs_info, sizeof s_cs_info,
+                 "Thrown away: your save is unchanged; saving is paused until a restart.");
+        fprintf(stderr, LOGP "cheats: progress thrown away; saves go to the copy until restart\n");
+        return;
+    }
+    int i = action - A_CHEAT0;
+    if (i < 0 || i >= s_cheat_n || !cheat_ready())
+        return;
+    if (s_cheats[i].get()) {
+        s_cheats[i].set(0);
+        fprintf(stderr, LOGP "cheats: %s off\n", s_cheats[i].name);
+        if (s_cs == CS_ON && !cheat_any_on())
+            s_cs = CS_ASK;
+        return;
+    }
+    if (s_cs == CS_NONE) {
+        if (!recomp_save_sandbox_begin(s_cs_root, s_cs_dir)) {
+            recomp_save_sandbox_discard(s_cs_dir);
+            snprintf(s_cs_info, sizeof s_cs_info, "Not switched on: the save could not be copied aside.");
+            return;
+        }
+        xbox_PathSetUserRoot(s_cs_dir);
+        fprintf(stderr, LOGP "cheats: the game's saves go to %s\n", s_cs_dir);
+    }
+    if (s_cs != CS_DISCARDED)
+        s_cs = CS_ON;
+    s_cs_info[0] = 0;
+    s_cheats[i].set(1);
+    fprintf(stderr, LOGP "cheats: %s on\n", s_cheats[i].name);
 }
 
 /* ── the bug report (xbox_report.h) ────────────────────────────────── */
@@ -864,6 +966,23 @@ static int page_rows(int page, Row *r)
             if (s_sio_info[0])
                 INFO(s_sio_info);
         }
+        /* Cheats (xbox_OverlaySetCheats): for this session only. */
+        if (cheat_ready()) {
+            INFO(s_cs == CS_NONE ? "Cheats, for this session only (your save is not changed):"
+                                 : "Cheats: while one is on, the game saves to a copy, not to your save.");
+            for (int i = 0; i < s_cheat_n; i++) {
+                snprintf(s_cheat_label[i], sizeof s_cheat_label[i], "%s: %s",
+                         s_cheats[i].name, s_cheats[i].get() ? "On" : "Off");
+                ACT(A_CHEAT0 + i, s_cheat_label[i]);
+            }
+            if (s_cs == CS_ASK) {
+                INFO("Save the progress made with cheats on?");
+                ACT(A_CHEAT_KEEP, "Yes: keep it in my save");
+                ACT(A_CHEAT_DISCARD, "No: throw it away (my save stays as it was)");
+            }
+            if (s_cs_info[0])
+                INFO(s_cs_info);
+        }
         ACT(A_RESET_ALL, "Reset all settings to the defaults");
         break;
     }
@@ -877,7 +996,7 @@ static int page_rows(int page, Row *r)
         snprintf(label, sizeof label, "Restart now to apply %d change%s", k, k == 1 ? "" : "s");
         ACT(A_RESTART_PIN, label);
     }
-    ACT(A_QUIT, "Quit game");
+    ACT(A_QUIT, s_cs != CS_NONE ? "Quit game (progress made with cheats is not saved)" : "Quit game");
 #undef SET
 #undef ACT
 #undef INFO
@@ -1098,7 +1217,6 @@ static bool s_mx_open;                 /* the Mixer page shows (overlay_mixer.in
 
 /* Restart game and Quit game ask once more: the first A (or click) arms the
  * row, the same row again does it; B, another row or another page cancels. */
-static int s_confirm;                  /* A_RESTART_PIN, A_QUIT, or 0 */
 
 /* How many rows at the end of the list are the pinned foot. */
 static int pin_count(const Row *r, int n)
@@ -1115,6 +1233,8 @@ static bool pad_hints();
 static const char *confirm_text(int action)
 {
     const bool pad = pad_hints();
+    if (action >= A_CHEAT0 && action <= A_CHEAT3)
+        return pad ? "Press A again to switch it on, B to cancel" : "Press Enter again to switch it on, Esc to cancel";
     return action == A_QUIT
         ? (pad ? "Press A again to quit, B to cancel" : "Press Enter again to quit, Esc to cancel")
         : (pad ? "Press A again to restart, B to cancel" : "Press Enter again to restart, Esc to cancel");
@@ -1136,6 +1256,17 @@ static void activate(const Row &r)
             quit_now();
         else
             restart_now();
+        return;
+    }
+    if (r.kind == R_ACTION && r.action >= A_CHEAT0 && r.action <= A_CHEAT_DISCARD) {
+        /* Switching a cheat on asks once more, under its warning. */
+        int i = r.action - A_CHEAT0;
+        if (r.action <= A_CHEAT3 && i < s_cheat_n && !s_cheats[i].get() && s_confirm != r.action) {
+            s_confirm = r.action;
+            return;
+        }
+        s_confirm = 0;
+        cheat_action(r.action);
         return;
     }
     if (r.kind == R_ACTION && r.action == A_MIXER) {
@@ -2857,6 +2988,17 @@ static void build_pages_inner()
                  rows[sel].action == A_RESTART_PIN && s_confirm == A_RESTART_PIN ? confirm_text(A_RESTART_PIN) : "",
                  rows[sel].action == A_RESTART_PIN && s_confirm == A_RESTART_PIN ? ".  " : "",
                  why, why[0] ? " " : "");
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action >= A_CHEAT0 && rows[sel].action <= A_CHEAT3) {
+        int i = rows[sel].action - A_CHEAT0;
+        snprintf(hint, sizeof hint, "%s%s%s", s_confirm == rows[sel].action ? confirm_text(rows[sel].action) : "",
+                 s_confirm == rows[sel].action ? ".  " : "",
+                 i < s_cheat_n && s_cheats[i].warning ? s_cheats[i].warning : "");
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_CHEAT_KEEP) {
+        snprintf(hint, sizeof hint, "What the game saved while cheats were on goes into your save, and saving is"
+                 " back to normal.");
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_CHEAT_DISCARD) {
+        snprintf(hint, sizeof hint, "Your save stays as it was before the cheats. The game still holds that progress,"
+                 " so its saves keep going to the side copy until you start the game again.");
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_QUIT) {
         snprintf(hint, sizeof hint, "%s%sCloses the game the way closing its window does: the settings are saved"
                  " and the game ends. What was not saved by the game is lost.",
