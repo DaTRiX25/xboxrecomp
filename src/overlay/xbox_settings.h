@@ -32,6 +32,7 @@
 #define XBOX_OVERLAY_SETTINGS_H
 
 #include "recomp_env.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -176,6 +177,29 @@ void xbox_SettingEnvString(const xs_setting *s, double v, char *out, unsigned n)
 /* The line at the top of the overlay's Advanced page: the port's name and
  * version (NULL or "": none). Here and not in overlay.h, which needs SDL. */
 void xbox_OverlaySetAbout(const char *text);
+
+/* The title's own fonts, for the overlay's titles, labels and keys: two
+ * bitmap fonts in its executable, read from the player's copy at run time
+ * (nothing of them is in this repository or written to disk). A font is a
+ * DXT5 atlas (w x h, blocks in rows) at tex_off and a glyph table of `count`
+ * 32-byte records at table_off: seven floats (u, v, w, h in the atlas;
+ * x and y offset from the cell's top left; advance; all fractions of the
+ * atlas's size) and the character as a 32-bit UTF-16 code. `body` is the
+ * text font, `title` the large one. The file must be `size` bytes with this
+ * SHA-256 (64 hex digits); else, or when it cannot be read, the overlay
+ * keeps its own font, quietly. Read and prepared on a thread of its own;
+ * call it once, before or after the window. Here and not in overlay.h,
+ * which needs SDL.
+ * RECOMP_OVERLAY_GAME_FONT=0 keeps the overlay's own font. */
+typedef struct {
+    uint32_t table_off, count;
+    uint32_t tex_off, w, h;
+} xbox_overlay_bitmap_font;
+void xbox_OverlaySetGameFonts(const char *path, uint64_t size, const char *sha256_hex,
+                              const xbox_overlay_bitmap_font *body, const xbox_overlay_bitmap_font *title);
+/* 1 the fonts are in use, -1 they are not (none named, another file),
+ * 0 still being prepared: waits up to wait_ms for an answer. */
+int xbox_OverlayGameFontsState(unsigned wait_ms);
 
 /* The "Check for updates" row of the Advanced page (xbox_update.h): the
  * GitHub repository the port's releases are published in ("owner/name") and

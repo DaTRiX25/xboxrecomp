@@ -52,14 +52,9 @@ extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include <unistd.h>
 #include <dirent.h>
 
-#include "overlay_font_ext.h"   /* k_overlay_font_ext: the second font's letters */
-/* DejaVu Sans Mono beside ProggyForever. A font's size is its ascent plus
- * descent, and of that both have the same x-height (0.47), so the scale is
- * the first font's own (ImGui gives its default 1.015). The baselines differ
- * by 0.02 of the size (ascents 0.797 and 0.777): at the 13-pixel reference
- * size the first font is moved down 0.41, this one 0.15. */
-#define OVERLAY_FONT_EXT_SCALE 1.015f
-#define OVERLAY_FONT_EXT_DY    0.15f
+#include "overlay_font_ui.h"    /* k_overlay_font_ui: Roboto Condensed Medium, the text font */
+#include "overlay_font_ext.h"   /* k_overlay_font_ext: DejaVu Sans Mono, behind it */
+#include "overlay_gamefont.h"   /* the title's own fonts, from the player's executable */
 
 #define LOGP "[OVERLAY] "
 
@@ -782,9 +777,8 @@ static int page_rows(int page, Row *r)
         SET(XS_GRAPHICS_LOD_BIAS);
         if (!nv2a_texscale_held())      /* RECOMP_DEBUG=ui_scale_hold=1 (nv2a_texscale.h) */
             SET(XS_GRAPHICS_UI_SCALE);
-#if defined(__APPLE__)          /* only the Metal presenter has the pass so far */
-        SET(XS_GRAPHICS_DITHER);
-#endif
+        /* Dither (graphics.dither) has no row: settings.toml or
+         * RECOMP_GFX_DITHER only (docs/runtime/overlay.md). */
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_BLOOM)->key))
             SET(XS_GRAPHICS_BLOOM);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_MOTION_BLUR)->key))
@@ -1983,6 +1977,10 @@ struct Theme {
     Rgb arrow;          /* the value arrows and the cursor */
     Rgb bar;            /* the footer bar */
     Rgb attn;           /* attention: restart pending, a locked row's reason (the game's yellow) */
+    Rgb rule_hi;        /* the header's and the footer's rules */
+    Rgb arc;            /* the big arc on the left */
+    Rgb head_band;      /* behind the header, over the dimmed game */
+    Rgb shadow, outline;/* the big title's shadow and outline */
 };
 
 static const Theme k_theme_game = {
@@ -1993,7 +1991,7 @@ static const Theme k_theme_game = {
     {0x30, 0x38, 0x40},             /* rule: the thin lines between the regions */
     {0x5a, 0x99, 0xc0}, 0.16f,      /* selected wash: steel blue */
     {0xc4, 0x1c, 0x1c},             /* selected bar: the title crimson */
-    {0x5a, 0x99, 0xc0}, {0x0f, 0x13, 0x19}, {0xd0, 0xe0, 0xf8}, {0x82, 0x96, 0xab},
+    {0x5a, 0x99, 0xc0}, {0x0f, 0x13, 0x19}, {0xd0, 0xe0, 0xf8}, {0x78, 0x90, 0xb0},
     {0xa8, 0xd0, 0xf8},             /* text: the list items */
     {0xd0, 0xe0, 0xf8},             /* hi: the selected item and the values */
     {0x48, 0x58, 0x68},             /* dim: disabled (locked) */
@@ -2011,6 +2009,10 @@ static const Theme k_theme_game = {
     {0x88, 0xc0, 0xe0},             /* arrow */
     {0x10, 0x10, 0x18},             /* bar */
     {0xf8, 0xc0, 0x20},             /* attn */
+    {0x38, 0x58, 0x78},             /* rule_hi */
+    {0x38, 0x50, 0x78},             /* arc */
+    {0x08, 0x0a, 0x10},             /* head_band */
+    {0x00, 0x00, 0x00}, {0xf0, 0xf0, 0xf0},
 };
 
 static const Theme k_theme_classic = {
@@ -2035,6 +2037,7 @@ static const Theme k_theme_classic = {
     {8, 8, 10}, {255, 255, 255}, {190, 190, 195},
     {90, 210, 120}, {235, 200, 70}, {235, 90, 80}, {255, 255, 255},
     {255, 140, 30}, {130, 130, 136}, {190, 190, 198}, {12, 12, 14}, {240, 190, 70},
+    {70, 70, 76}, {60, 60, 66}, {8, 8, 10}, {0, 0, 0}, {240, 240, 240},
 };
 
 static const Theme *T = &k_theme_game;
@@ -2070,33 +2073,110 @@ static void accent_style()
     st.Colors[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
 }
 
-/* The text: Dear ImGui's own vector font (ProggyForever: Basic Latin and
- * Latin-1), which is what the overlay has always drawn with, and behind it a
- * subset of DejaVu Sans Mono for the letters that one lacks: Latin
- * Extended-A and -B, Greek, Cyrillic (overlay_font_ext.h,
- * third_party/dejavu). So a folder named in Hungarian, Polish, Czech,
- * Turkish, Greek or Russian reads as it is written. Every string is UTF-8.
- * A character neither font has (CJK, Arabic, emoji ...) is drawn as a
- * square, U+25A1, not as "?", which could be part of the name.
+/* The fonts. Three faces, each a chain Dear ImGui walks for a letter:
  *
- * The second font is scaled to the first one's x-height (DejaVu's letters
- * fill more of the em) and set on the same baseline. */
-static void overlay_fonts()
+ *   ui     Roboto Condensed Medium (OFL, overlay_font_ui.h): Latin with
+ *          Latin-1 and Extended-A/-B, Greek, Cyrillic. The hints, the Mixer
+ *          page, the folder browser, the graph. Behind it a subset of DejaVu
+ *          Sans Mono (overlay_font_ext.h) for a few signs and U+25A1, the
+ *          white square shown for a character neither has (CJK, emoji ...).
+ *   body   the title's text font (GlobalFont in Burnout 3) when the port
+ *          named it and it was read (overlay_gamefont.h), with ui's chain
+ *          behind it: a folder called "Zenék – ősz" or "Музыка" mixes the
+ *          game's letters with Roboto's on one baseline, at the same
+ *          capital height. Titles, tabs, labels, values, the keys.
+ *   title  the title's large font (HeadFont: capitals only), then body.
+ *
+ * body's and title's size is the game's cell (the tallest glyph), as the
+ * game's menu is measured; ui's is Dear ImGui's usual (ascent + descent).
+ * Without the game's fonts body and title are Roboto, scaled to the same
+ * capital height for the same size, so a page looks the same size either
+ * way. The game's fonts come from a thread: they are added between two
+ * frames when they are ready (gamefont_attach). */
+static ImFont *s_f_ui, *s_f_body, *s_f_title;
+static bool s_gf_attached;
+
+/* The game's capitals over its cell, for Roboto standing in: GlobalFont
+ * 22 of 34 texels, HeadFont 38 of 47 (measured from the fonts; used only
+ * when they are not there). */
+#define CAPS_BODY_NOMINAL  0.647f
+#define CAPS_TITLE_NOMINAL 0.809f
+static float s_caps_body = CAPS_BODY_NOMINAL, s_caps_title = CAPS_TITLE_NOMINAL;
+static const float k_ui_caps = (float)OVERLAY_FONT_UI_CAPS / (float)OVERLAY_FONT_UI_HEIGHT;
+
+/* Roboto, and DejaVu behind it, into `dst` (merged) or as a font of their
+ * own (dst NULL), scaled so the capitals are `caps` of the size (0: as
+ * they are). Returns the font they are in. */
+static ImFont *add_ui_chain(ImFont *dst, float caps)
 {
     ImGuiIO &io = ImGui::GetIO();
-    ImFont *font = io.Fonts->AddFontDefaultVector();
-    if (!font)
-        return;
     ImFontConfig cfg;
-    cfg.MergeMode = true;
+    cfg.MergeMode = dst != nullptr;
+    cfg.DstFont = dst;
     cfg.FontDataOwnedByAtlas = false;
-    cfg.PixelSnapH = true;
-    cfg.ExtraSizeScale = OVERLAY_FONT_EXT_SCALE;
-    cfg.GlyphOffset.y = OVERLAY_FONT_EXT_DY;
-    snprintf(cfg.Name, sizeof cfg.Name, "DejaVuSansMono subset");
-    io.Fonts->AddFontFromMemoryTTF((void *)k_overlay_font_ext, (int)sizeof k_overlay_font_ext,
-                                   13.0f, &cfg);
-    font->FallbackChar = 0x25A1;
+    cfg.ExtraSizeScale = caps > 0.0f ? caps / k_ui_caps : 1.0f;
+    snprintf(cfg.Name, sizeof cfg.Name, "Roboto Condensed Medium subset");
+    ImFont *f = io.Fonts->AddFontFromMemoryTTF((void *)k_overlay_font_ui, (int)sizeof k_overlay_font_ui,
+                                               dst ? 0.0f : 13.0f, &cfg);
+    ImFont *into = dst ? dst : f;
+    ImFontConfig ext;
+    ext.MergeMode = true;
+    ext.DstFont = into;
+    ext.FontDataOwnedByAtlas = false;
+    ext.ExtraSizeScale = cfg.ExtraSizeScale;
+    snprintf(ext.Name, sizeof ext.Name, "DejaVuSansMono subset");
+    io.Fonts->AddFontFromMemoryTTF((void *)k_overlay_font_ext, (int)sizeof k_overlay_font_ext, 0.0f, &ext);
+    into->FallbackChar = 0x25A1;
+    return into;
+}
+
+static ImFont *add_ui_font(float caps)
+{
+    return add_ui_chain(nullptr, caps);
+}
+
+static void overlay_fonts()
+{
+    s_f_ui = add_ui_font(0.0f);
+    s_f_body = add_ui_font(CAPS_BODY_NOMINAL);
+    s_f_title = add_ui_font(CAPS_TITLE_NOMINAL);
+    ImGui::GetIO().FontDefault = s_f_ui;
+}
+
+/* The game's fonts, once the thread has them: body = GlobalFont, then ui;
+ * title = HeadFont, then GlobalFont, then ui, each scaled to the first
+ * one's capitals. Between frames only (the atlas is not in use). */
+static void gamefont_attach()
+{
+    if (s_gf_attached || gamefont_state() != 1)
+        return;
+    s_gf_attached = true;
+    ImGuiIO &io = ImGui::GetIO();
+    const GameFont *gb = gamefont(GF_BODY), *gt = gamefont(GF_TITLE);
+    auto add_game = [&](const GameFont *g, ImFont *dst, float scale) -> ImFont * {
+        ImFontConfig cfg;
+        cfg.MergeMode = dst != nullptr;
+        cfg.DstFont = dst;
+        cfg.FontData = (void *)g;
+        cfg.FontDataSize = 1;
+        cfg.FontDataOwnedByAtlas = false;
+        cfg.FontLoader = gamefont_loader();
+        cfg.ExtraSizeScale = scale;
+        snprintf(cfg.Name, sizeof cfg.Name, "%s", g == gb ? "game text font" : "game title font");
+        ImFont *f = io.Fonts->AddFont(&cfg);
+        return dst ? dst : f;
+    };
+    ImFont *body = add_game(gb, nullptr, 1.0f);
+    add_ui_chain(body, gb->caps);
+    body->FallbackChar = 0x25A1;
+    ImFont *title = add_game(gt, nullptr, 1.0f);
+    add_game(gb, title, gt->caps / gb->caps);
+    add_ui_chain(title, gt->caps);
+    title->FallbackChar = 0x25A1;
+    s_f_body = body;
+    s_f_title = title;
+    s_caps_body = gb->caps;
+    s_caps_title = gt->caps;
 }
 
 bool overlay_core_init(bool vulkan)
@@ -2375,7 +2455,7 @@ static bool pad_hints() { return s_last_input_pad; }
 struct Lay {
     float W, H;
     float cw, cx;                         /* the content's width and left edge */
-    float label, hint, foot, head, tab;   /* text sizes */
+    float label, hint, foot, head, tab, title;   /* text sizes (the game's cell; hint: ui's size) */
     float pitch;                          /* a row */
     float x_label, x_val0, x_val1;        /* the columns (screen x) */
     float y_rule, y_rows, y_foot;         /* the regions (screen y) */
@@ -2419,9 +2499,10 @@ static void layout_compute(ImVec2 disp)
     LY.cx = (W - LY.cw) * 0.5f;
     LY.label = fmaxf(0.037f * ref, 13.0f);
     LY.hint = fmaxf(0.026f * ref, 10.0f);
-    LY.foot = fmaxf(0.028f * ref, 11.0f);
-    LY.head = fmaxf(0.047f * ref, 18.0f);
-    LY.tab = fmaxf(0.030f * ref, 11.0f);
+    LY.foot = fmaxf(0.032f * ref, 11.0f);
+    LY.head = fmaxf(0.062f * ref, 18.0f);
+    LY.tab = fmaxf(0.032f * ref, 11.0f);
+    LY.title = fmaxf(0.105f * ref, 28.0f);
     LY.pitch = fmaxf(0.0625f * ref, LY.label * 1.5f);
     if (touch_sizing()) {
         float dpi = display_dpi();
@@ -2443,14 +2524,71 @@ static void layout_compute(ImVec2 disp)
 
 /* ── text and shapes at an explicit size ───────────────────────────── */
 
+/* What txt / tw / txt_fit draw with: a face (ui by default) and a shear,
+ * set for a stretch with Face. The game's italics are its upright letters
+ * leant at draw time (0.2: a fifth of the height); so are these, every
+ * vertex moved right by its height over the baseline, the fallback's
+ * letters too. */
+static ImFont *s_cur;
+static float s_shear;
+struct Face {
+    ImFont *pf;
+    float ps;
+    Face(ImFont *f, float shear = 0.0f) : pf(s_cur), ps(s_shear) { s_cur = f; s_shear = shear; }
+    ~Face() { s_cur = pf; s_shear = ps; }
+};
+static ImFont *cur_font() { return s_cur ? s_cur : ImGui::GetFont(); }
+#define SHEAR 0.2f
+
 static float tw(float size, const char *t)
 {
-    return ImGui::GetFont()->CalcTextSizeA(size, FLT_MAX, 0.0f, t).x;
+    return cur_font()->CalcTextSizeA(size, FLT_MAX, 0.0f, t).x;
 }
 
-static void txt(ImDrawList *dl, float size, ImVec2 p, ImU32 c, const char *t)
+/* Leans what was drawn since vertex v0 around the baseline of text drawn at
+ * y with `size`. */
+static void lean(ImDrawList *dl, int v0, ImFont *f, float size, float y, float shear)
 {
-    dl->AddText(ImGui::GetFont(), size, p, c, t);
+    if (shear == 0.0f)
+        return;
+    const float base = y + f->GetFontBaked(size)->Ascent;
+    for (int i = v0; i < dl->VtxBuffer.Size; i++)
+        dl->VtxBuffer[i].pos.x += (base - dl->VtxBuffer[i].pos.y) * shear;
+}
+
+static void txt(ImDrawList *dl, float size, ImVec2 p, ImU32 c, const char *t, float wrap = 0.0f)
+{
+    ImFont *f = cur_font();
+    const int v0 = dl->VtxBuffer.Size;
+    dl->AddText(f, size, p, c, t, nullptr, wrap);
+    lean(dl, v0, f, size, p.y, s_shear);
+}
+
+/* The capitals' height over the size, by face. */
+static float caps_of(ImFont *f)
+{
+    return f == s_f_title ? s_caps_title : f == s_f_body ? s_caps_body : k_ui_caps;
+}
+
+/* Where text of `size` starts (its top) for its capitals to be centred on
+ * cy, in the current face. */
+static float top_for(float cy, float size)
+{
+    ImFont *f = cur_font();
+    return cy - (f->GetFontBaked(size)->Ascent - caps_of(f) * size * 0.5f);
+}
+
+/* The labels' capitals (ASCII; anything else as it is). */
+static const char *caps(const char *t)
+{
+    static char buf[4][256];
+    static int i;
+    char *o = buf[i++ & 3];
+    size_t k = 0;
+    for (; t[k] && k < sizeof buf[0] - 1; k++)
+        o[k] = (t[k] >= 'a' && t[k] <= 'z') ? (char)(t[k] - 32) : t[k];
+    o[k] = 0;
+    return o;
 }
 
 /* A text that has to fit `w`: a smaller size for it (down to 72%), and cut
@@ -2467,7 +2605,7 @@ static float txt_fit(ImDrawList *dl, float size, ImVec2 p, ImU32 c, const char *
     }
     const float x0 = right ? p.x - (x < w ? x : w) : p.x;
     const float y = p.y + (size - s) * 0.5f;
-    dl->PushClipRect(ImVec2(x0, p.y - size * 0.2f), ImVec2(x0 + w, p.y + size * 1.4f), true);
+    dl->PushClipRect(ImVec2(x0, p.y - size * 0.2f), ImVec2(x0 + w + size * s_shear, p.y + size * 1.4f), true);
     txt(dl, s, ImVec2(x0, y), c, t);
     dl->PopClipRect();
     return x < w ? x : w;
@@ -2486,13 +2624,10 @@ static void arrow_tri(ImDrawList *dl, float cx, float cy, float r, int dir, ImU3
  * disabled grey where the setting is only read at start. Returns its width. */
 static float restart_tag(ImDrawList *dl, float x, float cy, float label, bool changed)
 {
-    const float s = label * 0.5f, padx = s * 0.45f, pady = s * 0.22f;
-    const float w = tw(s, "RESTART");
-    const ImU32 c = changed ? col(T->attn) : col(T->text_dim);
-    dl->AddRect(ImVec2(x, cy - s * 0.5f - pady), ImVec2(x + w + padx * 2.0f, cy + s * 0.5f + pady), c,
-                s * 0.25f, 0, fmaxf(1.0f, s * 0.08f));
-    txt(dl, s, ImVec2(x + padx, cy - s * 0.5f), c, "RESTART");
-    return w + padx * 2.0f;
+    Face f(s_f_body, SHEAR);
+    const float sz = label * 0.6f;
+    txt(dl, sz, ImVec2(x, top_for(cy, sz)), changed ? col(T->attn) : col(T->text_dim), "RESTART");
+    return tw(sz, "RESTART");
 }
 
 /* One row. `fs` is the label's size, `rh` the pitch; the columns are the
@@ -2512,14 +2647,16 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     ImGui::PopID();
 
     const float cy = p.y + rh * 0.5f;
-    const float ty = cy - fs * 0.5f;
-    const float ar = fs * 0.36f;                  /* the arrows' half height */
+    Face body(s_f_body);
+    const float ty = top_for(cy, fs);
+    const float ar = fs * 0.3f;                  /* the arrows' half height */
     const float lx = LY.x_label, label_w = LY.x_val0 - lx - ar * 4.0f;
     const float vr = LY.x_val1;                   /* where a value's text ends; the arrows are outside the column */
     const float arl = LY.x_val0 - ar * 1.6f, arr = LY.x_val1 + ar * 1.6f;
 
     if (r.kind == R_INFO) {
-        txt_fit(dl, LY.hint, ImVec2(lx, cy - LY.hint * 0.5f), col(T->hint), r.text, LY.x_val1 - lx);
+        Face ui(s_f_ui);
+        txt_fit(dl, LY.hint, ImVec2(lx, top_for(cy, LY.hint)), col(T->hint), r.text, LY.x_val1 - lx);
         return;
     }
     if (sel) {
@@ -2528,8 +2665,31 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     }
     if (r.kind == R_ACTION) {
         const bool pin = r.action == A_RESTART_PIN;
-        txt_fit(dl, fs, ImVec2(lx, ty), pin ? col(T->attn) : sel ? col(T->text_hi) : col(T->action), r.text,
-                pin ? LY.x_val1 - lx : label_w);
+        if (r.action >= A_CHEAT0 && r.action <= A_CHEAT3 && strrchr(r.text, ':')) {
+            /* A cheat: "Name: On" as a setting's row, the name a label and
+             * the state a value (attention yellow while it is on); while
+             * switching it on is asked, the question in the value's place. */
+            const char *c = strrchr(r.text, ':');
+            char name[120];
+            snprintf(name, sizeof name, "%.*s", (int)(c - r.text), r.text);
+            const char *v = c[1] == ' ' ? c + 2 : c + 1;
+            {
+                Face it(s_f_body, SHEAR);
+                txt_fit(dl, fs, ImVec2(lx, ty), sel ? col(T->text_hi) : col(T->text), caps(name), label_w);
+            }
+            const bool on = !strcmp(v, "On");
+            if (s_confirm && r.action == s_confirm)
+                txt_fit(dl, fs, ImVec2(vr, ty), col(T->attn), confirm_text(r.action), vr - LY.x_val0, true);
+            else
+                txt_fit(dl, fs, ImVec2(vr, ty), on ? col(T->attn) : sel ? col(T->text_hi) : col(T->text), v,
+                        vr - LY.x_val0, true);
+            return;
+        }
+        {
+            Face it(s_f_body, SHEAR);
+            txt_fit(dl, fs, ImVec2(lx, ty), pin ? col(T->attn) : sel ? col(T->text_hi) : col(T->action), caps(r.text),
+                    pin ? LY.x_val1 - lx : label_w);
+        }
         if (s_confirm && r.action == s_confirm) {
             /* Restart / Quit, asked once more: the question in the row's note. */
             const char *q = confirm_text(r.action);
@@ -2543,7 +2703,10 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         xbox_SettingsText(MUSIC_KEY, &locked);
         music_value(v, sizeof v);
         const ImU32 lc = locked ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text);
-        txt_fit(dl, fs, ImVec2(lx, ty), lc, r.text, label_w);
+        {
+            Face it(s_f_body, SHEAR);
+            txt_fit(dl, fs, ImVec2(lx, ty), lc, caps(r.text), label_w);
+        }
         txt_fit(dl, fs, ImVec2(vr, ty), locked ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text), v,
                 vr - LY.x_val0, true);
         if (sel && !locked)
@@ -2557,7 +2720,10 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         const float gap = fs * 0.3f, bw = (LY.x_val1 - LY.x_val0 - 5.0f * gap) / 6.0f, bh = fs * 1.35f;
         float bx = LY.x_val0;
         const float by = cy - bh * 0.5f;
-        txt_fit(dl, fs, ImVec2(lx, ty), sel ? col(T->text_hi) : col(T->text), r.text, label_w);
+        {
+            Face it(s_f_body, SHEAR);
+            txt_fit(dl, fs, ImVec2(lx, ty), sel ? col(T->text_hi) : col(T->text), caps(r.text), label_w);
+        }
         for (int k = 0; k < 6; k++, bx += bw + gap) {
             bool lit = playing == k && (via != 0) == (r.action == 0);
             ImVec2 a(bx, by), b(bx + bw, by + bh);
@@ -2565,7 +2731,7 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
             if (sel && s_spk_sel[r.action] == k)
                 dl->AddRect(a, b, col(T->text_hi), bh * 0.3f, 0, fs * 0.1f);
             float w = tw(fs * 0.8f, k_spk_short[k]);
-            txt(dl, fs * 0.8f, ImVec2(bx + (bw - w) * 0.5f, cy - fs * 0.4f), lit ? col(T->on_accent) : col(T->text),
+            txt(dl, fs * 0.8f, ImVec2(bx + (bw - w) * 0.5f, top_for(cy, fs * 0.8f)), lit ? col(T->on_accent) : col(T->text),
                 k_spk_short[k]);
             if (*clicked && mp.x >= a.x && mp.x < b.x + gap) {
                 s_spk_sel[r.action] = k;
@@ -2585,11 +2751,12 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         /* The label, and after it the tag for a setting read at start. */
         float tag_w = 0.0f;
         if (s->flags & XS_RESTART)
-            tag_w = tw(fs * 0.5f, "RESTART") + fs * 0.5f * 0.9f + fs * 0.4f;
+            tag_w = tw(fs * 0.6f, "RESTART") + fs * 0.6f;
+        Face it(s_f_body, SHEAR);
         const float w = txt_fit(dl, fs, ImVec2(lx, ty), dim ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text),
-                                m.label, label_w - tag_w);
+                                caps(m.label), label_w - tag_w);
         if (s->flags & XS_RESTART)
-            restart_tag(dl, lx + w + fs * 0.4f, cy, fs, s->value != s->launch);
+            restart_tag(dl, lx + w + fs * 0.5f, cy, fs, s->value != s->launch);
     }
 
     if (s->type == XS_INT || s->type == XS_FLOAT) {
@@ -2632,34 +2799,84 @@ static void foot_set(const char *keys, bool attn = false)
 
 static void draw_footer(ImDrawList *dl)
 {
-    dl->AddRectFilled(ImVec2(0, LY.y_foot), ImVec2(LY.W, LY.H), col(T->bar, 0.97f));
-    dl->AddLine(ImVec2(0, LY.y_foot), ImVec2(LY.W, LY.y_foot), col(T->rule));
+    dl->AddRectFilled(ImVec2(0, LY.y_foot), ImVec2(LY.W, LY.H), col(T->bar, 0.94f));
+    dl->AddLine(ImVec2(0, LY.y_foot), ImVec2(LY.W, LY.y_foot), col(T->rule_hi), fmaxf(1.0f, 0.0025f * LY.H));
     if (!s_foot_keys)
         return;
-    const float h = LY.H - LY.y_foot;
-    txt_fit(dl, LY.foot, ImVec2(LY.cx + 0.06f * LY.cw, LY.y_foot + (h - LY.foot) * 0.5f),
-            s_foot_attn ? col(T->attn) : col(T->hint), s_foot_keys, 0.88f * LY.cw);
+    Face body(s_f_body);
+    const float cy = (LY.y_foot + LY.H) * 0.5f;
+    txt_fit(dl, LY.foot, ImVec2(LY.cx + 0.056f * LY.cw, top_for(cy, LY.foot)),
+            s_foot_attn ? col(T->attn) : col(T->hint), s_foot_keys, 0.888f * LY.cw);
 }
 
-/* The header: SETTINGS in the title red, the page's name with its arrows on
- * the right, a rule, and the pages as a row of names. */
+/* The big blue arc of the game's menus (its big_curve picture), drawn as a
+ * curve for now: from the left edge low on the page, up and to the right
+ * to the rows' cursor, thick at the edge and thin at the end; a fainter
+ * second one under it. */
+static void draw_arc(ImDrawList *dl)
+{
+    const float s = 0.52f * LY.H, x0 = LY.cx, y0 = LY.y_rule;
+    auto band = [&](ImVec2 a, ImVec2 c1, ImVec2 c2, ImVec2 b, float w0, float w1, float alpha) {
+        /* One outline (out along one side, back along the other), filled
+         * as one polygon so its edges are smoothed and it has no seams. */
+        const int n = 64;
+        ImVec2 side[2][n + 1];
+        for (int i = 0; i <= n; i++) {
+            const float t = (float)i / n, u = 1.0f - t;
+            const ImVec2 p(u * u * u * a.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * b.x,
+                           u * u * u * a.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * b.y);
+            const ImVec2 d(3 * u * u * (c1.x - a.x) + 6 * u * t * (c2.x - c1.x) + 3 * t * t * (b.x - c2.x),
+                           3 * u * u * (c1.y - a.y) + 6 * u * t * (c2.y - c1.y) + 3 * t * t * (b.y - c2.y));
+            const float len = sqrtf(d.x * d.x + d.y * d.y) + 1e-6f;
+            /* Thick at the edge, thinning faster toward the end. */
+            const float w = (w0 + (w1 - w0) * (1.0f - u * u)) * 0.5f;
+            side[0][i] = ImVec2(p.x - d.y / len * w, p.y + d.x / len * w);
+            side[1][n - i] = ImVec2(p.x + d.y / len * w, p.y - d.x / len * w);
+        }
+        dl->AddConcavePolyFilled(&side[0][0], 2 * (n + 1), col(T->arc, alpha));
+    };
+    band(ImVec2(x0 - 0.02f * s, y0 + 0.80f * s), ImVec2(x0 + 0.30f * s, y0 + 0.62f * s),
+         ImVec2(x0 + 0.62f * s, y0 + 0.30f * s), ImVec2(x0 + 0.80f * s, y0 + 0.08f * s),
+         0.075f * s, 0.006f * s, 0.85f);
+    band(ImVec2(x0 + 0.10f * s, y0 + 1.03f * s), ImVec2(x0 + 0.40f * s, y0 + 0.98f * s),
+         ImVec2(x0 + 0.65f * s, y0 + 0.86f * s), ImVec2(x0 + 0.80f * s, y0 + 0.76f * s),
+         0.03f * s, 0.004f * s, 0.45f);
+}
+
+/* The header, as the game's menus have it: the one big word in the title
+ * font (red, a white outline, a dark shadow, leant), the page's name in
+ * white italics on the right between its arrows, a rule at 19% of the
+ * height, the pages as a row of names under it. */
 static void draw_header(ImDrawList *dl)
 {
-    const float cy = 0.105f * LY.H;
-    txt(dl, LY.head, ImVec2(LY.cx + 0.06f * LY.cw, cy - LY.head * 0.5f), col(T->title), "SETTINGS");
+    dl->AddRectFilled(ImVec2(0, 0), ImVec2(LY.W, LY.y_rule), col(T->head_band, 0.55f));
+    {
+        Face title(s_f_title, SHEAR);
+        const float sz = LY.title, x = LY.cx + 0.056f * LY.cw;
+        const float y = top_for(0.105f * LY.H, sz);
+        const float o = fmaxf(1.0f, sz * 0.022f);           /* the outline */
+        txt(dl, sz, ImVec2(x + sz * 0.03f, y + sz * 0.04f), col(T->shadow, 0.85f), "SETTINGS");
+        for (int k = 0; k < 8; k++) {
+            static const float dx[8] = { -1, 1, -1, 1, 0, 0, -1, 1 }, dy[8] = { -1, -1, 1, 1, -1, 1, 0, 0 };
+            txt(dl, sz, ImVec2(x + dx[k] * o, y + dy[k] * o), col(T->outline), "SETTINGS");
+        }
+        txt(dl, sz, ImVec2(x, y), col(T->title), "SETTINGS");
+    }
     {
         /* The page: < NAME >, a click on an arrow turns the page. */
-        const char *name = k_page_name[s_page];
-        const float ar = LY.head * 0.3f, nw = tw(LY.head, name), right = LY.cx + 0.94f * LY.cw;
-        const float xn = right - ar * 2.6f - nw;
-        txt(dl, LY.head, ImVec2(xn, cy - LY.head * 0.5f), col(T->text_hi), name);
-        arrow_tri(dl, xn - ar * 1.6f, cy, ar, -1, col(T->arrow));
-        arrow_tri(dl, right - ar * 0.6f, cy, ar, 1, col(T->arrow));
+        Face body(s_f_body, SHEAR);
+        const char *name = caps(k_page_name[s_page]);
+        const float sz = LY.head, cy = 0.105f * LY.H;
+        const float ar = sz * 0.22f, nw = tw(sz, name) + sz * SHEAR * 0.5f, right = LY.cx + 0.944f * LY.cw;
+        const float xn = right - ar * 2.8f - nw;
+        txt(dl, sz, ImVec2(xn, top_for(cy, sz)), col(T->text_hi), name);
+        arrow_tri(dl, xn - ar * 1.6f, cy, ar, -1, col(T->text_hi));
+        arrow_tri(dl, right - ar * 0.6f, cy, ar, 1, col(T->text_hi));
         for (int k = 0; k < 2; k++) {
             const float x0 = k ? right - ar * 2.4f : xn - ar * 3.4f, x1 = k ? right + ar : xn - ar * 0.2f;
-            ImGui::SetCursorScreenPos(ImVec2(x0, cy - LY.head * 0.6f));
+            ImGui::SetCursorScreenPos(ImVec2(x0, cy - sz * 0.6f));
             ImGui::PushID(k + 100);
-            ImGui::InvisibleButton("##pg", ImVec2(x1 - x0, LY.head * 1.2f));
+            ImGui::InvisibleButton("##pg", ImVec2(x1 - x0, sz * 1.2f));
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                 s_page = (s_page + (k ? 1 : -1) + P_COUNT) % P_COUNT;
                 s_scroll_to_sel = true;
@@ -2669,15 +2886,17 @@ static void draw_header(ImDrawList *dl)
             ImGui::PopID();
         }
     }
-    dl->AddLine(ImVec2(0, LY.y_rule), ImVec2(LY.W, LY.y_rule), col(T->rule));
+    dl->AddLine(ImVec2(0, LY.y_rule), ImVec2(LY.W, LY.y_rule), col(T->rule_hi), fmaxf(1.0f, 0.0025f * LY.H));
 
-    /* The pages: names in a row under the rule. */
+    /* The pages: names in a row under the rule, leant capitals. */
     {
+        Face body(s_f_body, SHEAR);
         const float th = LY.y_rows - LY.y_rule - 0.004f * LY.H, y0 = LY.y_rule + 0.002f * LY.H;
-        const float gap = LY.tab * 1.2f;
-        float x = LY.cx + 0.095f * LY.cw;
+        const float gap = LY.tab * 0.9f, cy = y0 + th * 0.5f;
+        float x = LY.cx + 0.094f * LY.cw;
         for (int i = 0; i < P_COUNT; i++) {
-            const float w = tw(LY.tab, k_page_name[i]);
+            const char *t = caps(k_page_name[i]);
+            const float w = tw(LY.tab, t);
             ImGui::SetCursorScreenPos(ImVec2(x - gap * 0.5f, y0));
             ImGui::PushID(i);
             ImGui::InvisibleButton("##tab", ImVec2(w + gap, th));
@@ -2689,16 +2908,13 @@ static void draw_header(ImDrawList *dl)
             }
             ImGui::PopID();
             const bool on = i == s_page;
-            const float ty = y0 + (th - LY.tab) * 0.5f;
-            txt(dl, LY.tab, ImVec2(x, ty), on ? col(T->text_hi) : col(T->tab_text), k_page_name[i]);
-            if (on)
-                dl->AddLine(ImVec2(x, ty + LY.tab * 1.2f), ImVec2(x + w, ty + LY.tab * 1.2f), col(T->arrow),
-                            fmaxf(2.0f, LY.tab * 0.08f));
+            txt(dl, LY.tab, ImVec2(x, top_for(cy, LY.tab)), on ? col(T->text_hi) : col(T->tab_text), t);
             x += w + gap;
         }
+        Face up(s_f_body);
         const char *hint = pad_hints() ? "LB / RB" : "PgUp / PgDn";
-        const float hw = tw(LY.hint, hint);
-        txt(dl, LY.hint, ImVec2(LY.cx + 0.94f * LY.cw - hw, y0 + (th - LY.hint) * 0.5f), col(T->hint), hint);
+        const float hw = tw(LY.foot, hint);
+        txt(dl, LY.foot, ImVec2(LY.cx + 0.944f * LY.cw - hw, top_for(cy, LY.foot)), col(T->hint), hint);
     }
 }
 
@@ -2830,8 +3046,9 @@ static void build_pages_inner()
     const ImVec2 disp = io.DisplaySize;
 
     layout_compute(disp);
-    /* Dim the game. */
-    bg->AddRectFilled(ImVec2(0, 0), disp, col(T->scrim, 0.78f));
+    /* Dim the game (it stays in sight, paused), and the arc over it. */
+    bg->AddRectFilled(ImVec2(0, 0), disp, col(T->scrim, 0.72f));
+    draw_arc(bg);
 
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(disp);
@@ -2990,6 +3207,7 @@ static void build_pages_inner()
                  why, why[0] ? " " : "");
     } else if (rows[sel].kind == R_ACTION && rows[sel].action >= A_CHEAT0 && rows[sel].action <= A_CHEAT3) {
         int i = rows[sel].action - A_CHEAT0;
+        hint_locked = true;                   /* the warning, in the attention colour */
         snprintf(hint, sizeof hint, "%s%s%s", s_confirm == rows[sel].action ? confirm_text(rows[sel].action) : "",
                  s_confirm == rows[sel].action ? ".  " : "",
                  i < s_cheat_n && s_cheats[i].warning ? s_cheats[i].warning : "");
@@ -3121,7 +3339,8 @@ static void build_pages_inner()
             const int k = restart_count();
             char t[96];
             snprintf(t, sizeof t, "Restart the game to apply %d change%s", k > 0 ? k : 1, k > 1 ? "s" : "");
-            txt_fit(dl, fs, ImVec2(LY.x_label, y + (pitch * 0.75f - fs) * 0.5f), col(T->attn), t,
+            Face it(s_f_body, SHEAR);
+            txt_fit(dl, fs, ImVec2(LY.x_label, top_for(y + pitch * 0.375f, fs)), col(T->attn), caps(t),
                     LY.x_val1 - LY.x_label);
             y += pitch * 0.75f;
         }
@@ -3180,6 +3399,7 @@ bool overlay_begin_frame()
         return false;
 
     ImGuiIO &io = ImGui::GetIO();
+    gamefont_attach();
     /* One text size for the window: 17 points at 720 high, up to 2.2x. */
     float scale = io.DisplaySize.y / 720.0f;
     scale = scale < 1.0f ? 1.0f : scale > 2.2f ? 2.2f : scale;
@@ -3194,7 +3414,8 @@ bool overlay_begin_frame()
         if (s_open || s_alpha > 0.0f) {
             /* Beside the page's title, not over it. */
             layout_compute(io.DisplaySize);
-            at = ImVec2(LY.cx + 0.06f * LY.cw + tw(LY.head, "SETTINGS") + 0.03f * LY.cw, fs * 0.3f);
+            Face title(s_f_title);
+            at = ImVec2(LY.cx + 0.056f * LY.cw + tw(LY.title, "SETTINGS") * 1.08f + 0.03f * LY.cw, fs * 0.3f);
         }
         draw_perf(ImGui::GetForegroundDrawList(), at, fs);
     }
