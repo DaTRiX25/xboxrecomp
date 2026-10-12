@@ -5,7 +5,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(restart_test C)
 set(CMAKE_C_STANDARD 11)
-add_executable(restart_test test_main.c ../../src/platform/recomp_restart.c)
+add_executable(restart_test test_main.c ../../src/platform/recomp_restart.c
+    ../../src/platform/recomp_instance.c)
 target_include_directories(restart_test PRIVATE ../../src/platform)
 enable_testing()
 add_test(NAME restart_snapshot COMMAND restart_test snapshot "a b" "ő")

@@ -1,5 +1,6 @@
 /* restart: recomp_restart.h. */
 #include "recomp_restart.h"
+#include "recomp_instance.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,14 +66,26 @@ int main(int argc, char **argv)
         return failures ? 1 : 0;       /* exits without restarting */
     }
 
+    if (argc == 3 && !strcmp(argv[1], "probe"))
+        /* Another copy: 0 when it finds the lock held, as it should. */
+        return recomp_instance_lock(argv[2], 0) == 0 ? 0 : 1;
+
     if (argc >= 4 && !strcmp(argv[1], "real")) {
         const char *mark = argv[2];
         FILE *f = fopen(mark, "r");
         if (!f) {
+            char cmd[1200];
             /* First life: leave the mark, dirty the environment, restart. */
             f = fopen(mark, "w");
             if (!f)
                 return 2;
+            /* One copy per save root (recomp_instance.h): this one holds
+             * it, another is refused, and the restart gets it back. */
+            if (recomp_instance_lock(".", 0) != 1)
+                return 3;
+            snprintf(cmd, sizeof cmd, "\"%s\" probe .", argv[0]);
+            if (system(cmd) != 0)
+                return 4;
             fprintf(f, "%ld\n", (long)getpid());
             fclose(f);
             remove("restart_order.txt");
@@ -102,6 +115,7 @@ int main(int argc, char **argv)
                   o && fgets(line, sizeof line, o) && !strncmp(line, "shutdown", 8));
             if (o) fclose(o);
             CHECK("no second restart", !recomp_restart_requested());
+            CHECK("the restart got the lock back", recomp_instance_lock(".", 5000) == 1);
             printf(failures ? "%d FAILED\n" : "ok (restarted once)\n", failures);
             return failures ? 1 : 0;
         }

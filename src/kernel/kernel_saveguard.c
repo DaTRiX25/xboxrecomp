@@ -4,6 +4,7 @@
  */
 #include "kernel.h"
 #include "kernel_saveguard.h"
+#include "recomp_exit_hook.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -675,6 +676,27 @@ static void sweep(const xbox_host_char *dir, int depth)
 #endif
 }
 
+/* Every way out: exit() (the window closed, a restart, the title's own
+ * reboot) runs this before the restart's exec, which was registered first;
+ * ExitProcess on the Win32 windows runs the exit hooks. A save still on its
+ * way gets up to two seconds. */
+static void wait_at_exit(void)
+{
+    if (xbox_SaveGuardBusy()) {
+        double t0 = now_ms();
+        int done = xbox_SaveGuardWait(2000);
+        fprintf(stderr, LOGP "the way out waited %.0f ms for a save to reach the disk%s\n",
+                now_ms() - t0, done ? "" : "; it was not done in time, the save before it stands");
+        fflush(stderr);
+    }
+}
+
+static void wait_exit_hook(const char *why)
+{
+    (void)why;
+    wait_at_exit();
+}
+
 void xbox_SaveGuardEnable(const char *title_id)
 {
     static const char *const part[] = { "UDATA", "TDATA" };
@@ -706,6 +728,10 @@ void xbox_SaveGuardEnable(const char *title_id)
             s_root_len[s_n_roots] = n;
             s_n_roots++;
         }
+    }
+    if (!s_ready && s_n_roots > 0) {
+        atexit(wait_at_exit);
+        recomp_exit_hook_add(wait_exit_hook);
     }
     s_ready = s_n_roots > 0;
 }

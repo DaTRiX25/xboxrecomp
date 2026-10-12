@@ -10,6 +10,7 @@
  *   a listing does not show the new file
  *   a file deleted on close is gone
  *   a file outside the save trees is written in place
+ *   a quit right after the close waits for the save
  *   the process ended at each step of a save (a child of this test, ended
  *   with _exit by the fault hook): the file is the old save or the new one,
  *   whole, and the next start removes what was left beside it
@@ -199,6 +200,12 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 4 && !strcmp(argv[1], "fault"))
         return child(atoi(argv[2]), argv[3]);
+    if (argc == 3 && !strcmp(argv[1], "quit")) {
+        /* A save, then the process ends at once, the ordinary way. */
+        setup(argv[2]);
+        save(SAVE, 'D', 1, NULL);
+        exit(0);
+    }
 #if defined(_WIN32)
     {
         char tmp[MAX_PATH];
@@ -271,6 +278,11 @@ int main(int argc, char **argv)
             xbox_SaveGuardWait(5000);
         }
     }
+
+    /* The process quits right after the title's close: the save is in. */
+    snprintf(cmd, sizeof cmd, "\"%s\" quit \"%s\"", argv[0], root);
+    system(cmd);
+    check(content(g_real) == 'D' && !exists(g_shadow), "a quit right after a save waits for it");
 
     /* Deleted on close, through the handle. */
     {

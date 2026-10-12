@@ -807,13 +807,6 @@ void xbox_FramebufferWindowSetRestart(void (*fn)(void))
     s_restart_fn = fn;
 }
 
-static void (*s_before_exit_fn)(void);
-
-void xbox_FramebufferWindowSetBeforeExit(void (*fn)(void))
-{
-    s_before_exit_fn = fn;
-}
-
 static void gfx_lost_handler(const char *why)
 {
     snprintf(s_gfx_lost_why, sizeof s_gfx_lost_why, "%s", why ? why : "");
@@ -1559,11 +1552,6 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_Quit();
     else
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
-    /* The host's last word before any way out from here (the quit, the
-     * restart, the lost device's two): a save still on its way to the disk
-     * gets its moment there (kernel_saveguard.h). */
-    if (s_before_exit_fn)
-        s_before_exit_fn();
     if (s_gfx_restart)
         gfx_restart();
     if (quit)

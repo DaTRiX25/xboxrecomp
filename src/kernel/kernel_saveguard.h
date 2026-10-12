@@ -49,7 +49,9 @@ void xbox_SaveGuardSetHook(void (*before_replace)(void));
  * nothing). */
 int xbox_SaveGuardBusy(void);
 
-/* Wait, at most `ms`, until that is 0. 1 when it is. For the way out. */
+/* Wait, at most `ms`, until that is 0. 1 when it is. The guard does it
+ * itself, up to two seconds, on every way out (atexit, and the exit hooks
+ * of the windows that end with ExitProcess). */
 int xbox_SaveGuardWait(unsigned ms);
 
 /* Tests: end the process (_exit, code 90 + step) at this step of the next

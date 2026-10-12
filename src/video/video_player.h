@@ -94,12 +94,6 @@ int xbox_HostWindowMain(int (*guest_main)(void));
  * with another way sets it here. */
 void xbox_FramebufferWindowSetRestart(void (*fn)(void));
 
-/* Called on the window's thread on every way out of the window's loop (the
- * quit, a restart, the lost device), after the window is gone and before
- * the process ends: the host's bounded wait for what must reach the disk
- * (kernel_saveguard.h: xbox_SaveGuardWait). */
-void xbox_FramebufferWindowSetBeforeExit(void (*fn)(void));
-
 /* The window's next present read back into `path` (BMP), whatever it shows.
  * The window's thread only (the overlay's test driver, RECOMP_OVERLAY_TEST);
  * the Metal and Vulkan presenters. */
