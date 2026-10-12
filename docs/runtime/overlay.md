@@ -42,9 +42,16 @@ the last frame.
   The pause takes hold at the next flip, so a load or movie that does not
   flip finishes first; the overlay opens at once.
 
-A pad's Back is held back from Start: with the overlay on, the title never
-sees Start while Back is held (`xbox_InputSetComboGuard`), so pressing View
-first and Menu second does not also pause the game. Menu first still does.
+Because Back+Start opens the settings, the title sees a pad's Back a moment
+late, as in SpeedBreaker (`xbox_InputSetComboGuard`, per pad, the pad only; the
+keyboard is untouched). Back down: neither it nor Start reaches the title. Start
+while Back is down: the overlay opens and the title never sees either. Back
+let go alone: the title gets a Back press then (`XBOX_INPUT_BACK_TAP_MS`, at
+least two reads). Back held `XBOX_INPUT_BACK_DELAY_MS` (250 ms) without Start:
+passed on as a held Back, with Start still hidden while it is. Start first is
+not delayed (a grace would put its wait on every pause); Back after it still
+opens the overlay. The same combo closes the overlay. Described in
+`src/input/README.md`, "Overlay hotkey".
 
 ## Post passes and anisotropy
 

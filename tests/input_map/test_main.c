@@ -967,28 +967,191 @@ static void test_exit_hooks(void)
     CHECK(f_hook_a == 1 && f_hook_b == 2, "added hook lost with the first");
 }
 
-/* The overlay's combo guard: Start is hidden while Back is held. */
-static void test_combo_guard(void)
+/* The overlay's hotkey filter (Back+Start): a backend whose pads are driven
+ * per port, with a packet number that moves on every change as a real one. */
+static WORD h_btn[4];
+static DWORD h_pkt[4];
+static DWORD h_get(DWORD p, XBOX_INPUT_STATE *s)
+{
+    static WORD last[4];
+    if (!f_plugged[p]) return ERROR_DEVICE_NOT_CONNECTED;
+    memset(s, 0, sizeof *s);
+    if (last[p] != h_btn[p]) { last[p] = h_btn[p]; h_pkt[p]++; }
+    s->Gamepad.wButtons = h_btn[p];
+    s->dwPacketNumber = h_pkt[p];
+    return ERROR_SUCCESS;
+}
+static const xbox_input_backend k_hot = { f_init, h_get, f_set, f_kb, f_clock, f_shutdown };
+
+/* One title read of a port at time t (ms after the test's origin). */
+static WORD hk_read(DWORD port, uint64_t t, DWORD *pkt)
 {
     XBOX_INPUT_STATE st;
+    f_now = 300000 + t;
+    CHECK(xbox_InputGetState(port, &st) == ERROR_SUCCESS, "hotkey: read failed");
+    if (pkt) *pkt = st.dwPacketNumber;
+    return st.Gamepad.wButtons;
+}
 
-    f_now = 95000;
-    f_plugged[0] = 1;
+/* The title's view over a stretch of 16 ms frames: the buttons ever seen, and
+ * whether the packet number moved wherever the buttons did. */
+static WORD hk_run(DWORD port, uint64_t from, uint64_t to, int *edge_ok, WORD *last_btn, DWORD *last_pkt)
+{
+    WORD seen = 0;
+    for (uint64_t t = from; t < to; t += 16) {
+        DWORD pkt;
+        WORD b = hk_read(port, t, &pkt);
+        seen |= b;
+        if (b != *last_btn && pkt == *last_pkt) *edge_ok = 0;
+        *last_btn = b;
+        *last_pkt = pkt;
+    }
+    return seen;
+}
+
+static void hk_begin(void)
+{
+    memset(h_btn, 0, sizeof h_btn);
+    f_plugged[0] = f_plugged[1] = 1;
     f_kb_on = 0;
-    f_hold_start = 1;
-    xbox_InputSetBackend(&k_fake);
+    xbox_InputSetBackend(&k_hot);
     xbox_InputInit();
+    xbox_InputSetBlocked(0);
     xbox_InputSetComboGuard(1);
-    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && st.Gamepad.wButtons == XBOX_GAMEPAD_START,
-          "guard: Start alone was hidden");
-    f_hold_back = 1;
-    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && st.Gamepad.wButtons == XBOX_GAMEPAD_BACK,
-          "guard: Start reached the title with Back held (%04X)", st.Gamepad.wButtons);
+    /* A closed overlay leaves its ports latched until seen with nothing held. */
+    hk_read(0, 0, NULL);
+    hk_read(1, 0, NULL);
+}
+
+static void test_combo_guard(void)
+{
+    WORD last = 0, seen;
+    DWORD lp = 0, pkt;
+    int edge_ok = 1;
+
+    /* Guard off: the pad is passed as it is. */
+    hk_begin();
     xbox_InputSetComboGuard(0);
-    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS
-          && st.Gamepad.wButtons == (XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START),
-          "guard off: the buttons were changed");
-    f_hold_back = 0;
+    h_btn[0] = XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START;
+    CHECK(hk_read(0, 0, NULL) == (XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START), "guard off: the buttons were changed");
+    xbox_InputSetComboGuard(1);
+    h_btn[0] = 0;
+    hk_read(0, 16, NULL);
+
+    /* A tap: nothing while it is down, a press of >= TAP_MS (and >= 2 reads)
+     * once it is let go, then released again, each a change of packet. */
+    h_btn[0] = XBOX_GAMEPAD_BACK;
+    seen = hk_run(0, 1000, 1096, &edge_ok, &last, &lp);
+    CHECK(!seen, "tap: Back reached the title while it was down (%04X)", seen);
+    h_btn[0] = 0;
+    seen = hk_run(0, 1096, 1112, &edge_ok, &last, &lp);
+    CHECK(seen == XBOX_GAMEPAD_BACK, "tap: no Back after the release (%04X)", seen);
+    hk_run(0, 1112, 1200, &edge_ok, &last, &lp);
+    seen = hk_run(0, 1200, 1400, &edge_ok, &last, &lp);
+    CHECK(!seen && !last, "tap: Back was held on (%04X)", seen);
+    CHECK(edge_ok, "tap: a change of buttons came with the same packet number");
+    {
+        /* How long the press lasted and how many reads carried it. */
+        int n = 0;
+        uint64_t first = 0, lastms = 0;
+        hk_begin();
+        h_btn[0] = XBOX_GAMEPAD_BACK;
+        hk_read(0, 0, NULL);
+        h_btn[0] = 0;
+        for (uint64_t t = 16; t < 400; t += 16)
+            if (hk_read(0, t, NULL) & XBOX_GAMEPAD_BACK) { if (!n) first = t; lastms = t; n++; }
+        CHECK(n >= 2 && lastms - first + 16 >= XBOX_INPUT_BACK_TAP_MS,
+              "tap: Back lasted %d reads, %u ms", n, (unsigned)(lastms - first + 16));
+        /* A slow title (one read every 100 ms) still sees it on two reads. */
+        hk_begin();
+        h_btn[0] = XBOX_GAMEPAD_BACK;
+        hk_read(0, 0, NULL);
+        h_btn[0] = 0;
+        n = 0;
+        for (uint64_t t = 100; t < 1000; t += 100)
+            if (hk_read(0, t, NULL) & XBOX_GAMEPAD_BACK) n++;
+        CHECK(n >= 2, "tap: a slow title saw Back on %d reads", n);
+    }
+
+    /* A hold: hidden until XBOX_INPUT_BACK_DELAY_MS, then passed on as held. */
+    hk_begin();
+    last = 0; lp = 0; edge_ok = 1;
+    h_btn[0] = XBOX_GAMEPAD_BACK;
+    seen = hk_run(0, 2000, 2000 + XBOX_INPUT_BACK_DELAY_MS - 8, &edge_ok, &last, &lp);
+    CHECK(!seen, "hold: Back arrived early (%04X)", seen);
+    seen = hk_run(0, 2000 + XBOX_INPUT_BACK_DELAY_MS, 2300, &edge_ok, &last, &lp);
+    CHECK(last == XBOX_GAMEPAD_BACK, "hold: Back not passed after %d ms (%04X)", XBOX_INPUT_BACK_DELAY_MS, last);
+    CHECK(edge_ok, "hold: Back came with the same packet number");
+    h_btn[0] = XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START;
+    CHECK(hk_read(0, 2400, NULL) == XBOX_GAMEPAD_BACK, "hold: Start reached the title with Back held");
+    h_btn[0] = 0;
+    CHECK(hk_read(0, 2416, NULL) == 0, "hold: Back stuck after the release");
+    CHECK(hk_read(0, 2600, NULL) == 0, "hold: a tap followed a hold");
+
+    /* Back, then Start: the title sees neither, and nothing till both go. */
+    hk_begin();
+    h_btn[0] = XBOX_GAMEPAD_BACK;
+    seen = hk_read(0, 3000, NULL) | hk_read(0, 3016, NULL);
+    h_btn[0] = XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START;
+    seen |= hk_read(0, 3032, NULL) | hk_read(0, 3500, NULL);
+    CHECK(!seen, "combo: the title saw %04X", seen);
+    xbox_InputSetBlocked(1);                          /* the overlay opens */
+    h_btn[0] = XBOX_GAMEPAD_START;                    /* Back let go first */
+    seen = hk_read(0, 3600, NULL);
+    h_btn[0] = 0;
+    seen |= hk_read(0, 3616, NULL);
+    xbox_InputSetBlocked(0);                          /* and closes */
+    seen |= hk_read(0, 3700, NULL) | hk_read(0, 3900, NULL);
+    CHECK(!seen, "combo: the title saw %04X around the overlay", seen);
+
+    /* Both in one read, and the overlay closed by the combo (Start let go
+     * last): still nothing for the title. */
+    hk_begin();
+    h_btn[0] = XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START;
+    seen = hk_read(0, 4000, NULL);
+    xbox_InputSetBlocked(1);
+    seen |= hk_read(0, 4100, NULL);
+    h_btn[0] = XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START;
+    seen |= hk_read(0, 4200, NULL);
+    xbox_InputSetBlocked(0);
+    seen |= hk_read(0, 4300, NULL);
+    h_btn[0] = XBOX_GAMEPAD_START;
+    seen |= hk_read(0, 4400, NULL);
+    h_btn[0] = 0;
+    seen |= hk_read(0, 4500, NULL) | hk_read(0, 4600, NULL);
+    CHECK(!seen, "combo, same read: the title saw %04X", seen);
+
+    /* Start first is not delayed. */
+    hk_begin();
+    h_btn[0] = XBOX_GAMEPAD_START;
+    CHECK(hk_read(0, 5000, NULL) == XBOX_GAMEPAD_START, "Start first was delayed");
+
+    /* Two pads are independent: pad 1's tap and pad 0's combo. */
+    hk_begin();
+    h_btn[0] = XBOX_GAMEPAD_BACK;
+    h_btn[1] = XBOX_GAMEPAD_BACK;
+    seen = hk_read(0, 6000, NULL) | hk_read(1, 6000, NULL);
+    h_btn[0] = XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START;     /* pad 0 opens it */
+    h_btn[1] = 0;                                          /* pad 1 taps */
+    seen |= hk_read(0, 6016, NULL);
+    pkt = 0;
+    CHECK(!seen, "two pads: the combo of pad 0 leaked %04X", seen);
+    CHECK(hk_read(1, 6016, &pkt) == XBOX_GAMEPAD_BACK, "two pads: pad 1's tap was lost");
+    CHECK(hk_read(0, 6032, NULL) == 0, "two pads: pad 0 showed a button");
+    hk_read(1, 6400, NULL);                         /* its second read of the tap */
+    CHECK(hk_read(1, 6416, NULL) == 0, "two pads: pad 1's tap stuck");
+
+    /* A pad pulled out in the middle starts over. */
+    h_btn[0] = XBOX_GAMEPAD_BACK;
+    hk_read(0, 7000, NULL);
+    f_plugged[0] = 0;
+    f_now = 300000 + 7016;
+    { XBOX_INPUT_STATE st; xbox_InputGetState(0, &st); }
+    f_plugged[0] = 1;
+    h_btn[0] = 0;
+    CHECK(hk_read(0, 9000, NULL) == 0, "unplug: a tap came from a pad that was gone");
+
+    xbox_InputSetComboGuard(0);
     xbox_InputSetBackend(NULL);
 }
 

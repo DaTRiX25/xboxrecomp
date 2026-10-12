@@ -101,6 +101,25 @@ static void neutral(XBOX_GAMEPAD *g)
 
 static volatile int g_combo_guard;
 
+/* The overlay's Back+Start hotkey, per port (see input_backend.h): Back is
+ * held back from the title until it is known whether Start follows. */
+enum hk_state {
+    HK_IDLE,       /* Back is up */
+    HK_PENDING,    /* Back went down; the title sees neither it nor Start */
+    HK_TAP,        /* Back came up alone: the title is given a short press */
+    HK_HELD,       /* Back stayed down XBOX_INPUT_BACK_DELAY_MS: passed on */
+    HK_SWALLOW     /* The hotkey (or a closed overlay's): nothing until let go */
+};
+static struct hk_port {
+    enum hk_state st;
+    uint64_t t;             /* PENDING: Back went down; TAP: the press began */
+    int      polls;         /* TAP: reads that carried the press */
+    DWORD    in_pkt, last_pkt;  /* the pad's, and the last one given on */
+    DWORD    extra;         /* added to the pad's, so a change we made shows */
+    WORD     last_btn;
+    int      have_last;
+} g_hk[XBOX_MAX_CONTROLLERS];
+
 /* Pads a script drives (src/usb/usb_gamepad.c), for the overlay's note. */
 static volatile unsigned g_scripted;
 
@@ -118,6 +137,85 @@ unsigned xbox_InputScriptedPads(void) { return g_scripted; }
 void xbox_InputSetComboGuard(int on) { g_combo_guard = on != 0; }
 
 int xbox_InputBlocked(void) { return g_blocked; }
+
+/* The pad's buttons for the title with the Back+Start hotkey taken out. Every
+ * read of a connected pad goes through it, whatever the overlay is doing, so
+ * the state follows the pad. The title's input layer records edges by the
+ * packet number: where this changes the buttons without the pad having done
+ * so (the end of a tap, the late Back), the number is moved on as well. */
+static void hotkey_filter(DWORD port, XBOX_INPUT_STATE *s)
+{
+    struct hk_port *h = &g_hk[port];
+    WORD *b = &s->Gamepad.wButtons;
+    int back = (*b & XBOX_GAMEPAD_BACK) != 0;
+    int start = (*b & XBOX_GAMEPAD_START) != 0;
+    int blocked = g_blocked || (g_latched & (1u << port));
+    uint64_t now = g_be->now_ms();
+    DWORD pkt;
+
+    h->in_pkt = s->dwPacketNumber;
+again:
+    switch (h->st) {
+    case HK_IDLE:
+        if (!back)
+            break;
+        h->st = HK_PENDING;
+        h->t = now;
+        /* fall through */
+    case HK_PENDING:
+        *b &= (WORD)~(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START);
+        if (blocked || start) {
+            h->st = HK_SWALLOW;
+        } else if (!back) {
+            h->st = HK_TAP;
+            h->t = now;
+            h->polls = 0;
+            goto again;
+        } else if (now - h->t >= XBOX_INPUT_BACK_DELAY_MS) {
+            h->st = HK_HELD;
+            *b |= XBOX_GAMEPAD_BACK;
+        }
+        break;
+    case HK_TAP:
+        if (blocked) {
+            h->st = back ? HK_SWALLOW : HK_IDLE;
+            *b &= (WORD)~(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START);
+        } else if (h->polls >= XBOX_INPUT_BACK_TAP_POLLS
+                   && now - h->t >= XBOX_INPUT_BACK_TAP_MS) {
+            h->st = HK_IDLE;
+            goto again;
+        } else {
+            h->polls++;
+            *b &= (WORD)~XBOX_GAMEPAD_START;
+            *b |= XBOX_GAMEPAD_BACK;
+        }
+        break;
+    case HK_HELD:
+        if (!back) {
+            h->st = HK_IDLE;
+            break;
+        }
+        *b &= (WORD)~XBOX_GAMEPAD_START;
+        break;
+    case HK_SWALLOW:
+        if (!back && !start) {
+            h->st = HK_IDLE;
+            break;
+        }
+        *b &= (WORD)~(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START);
+        break;
+    }
+
+    pkt = h->in_pkt + h->extra;
+    if (h->have_last && pkt <= h->last_pkt && *b != h->last_btn) {
+        h->extra += h->last_pkt + 1 - pkt;
+        pkt = h->last_pkt + 1;
+    }
+    s->dwPacketNumber = pkt;
+    h->last_pkt = pkt;
+    h->last_btn = *b;
+    h->have_last = 1;
+}
 
 /* RECOMP_INPUT_RUMBLE_GAIN and RECOMP_INPUT_RUMBLE_PEAK, once; the setters
  * below come after and replace them. A value that is no number is left at
@@ -424,6 +522,7 @@ void xbox_InputSetBackend(const xbox_input_backend *b)
     memset(g_last_probe, 0, sizeof g_last_probe);
     memset(g_probed, 0, sizeof g_probed);
     memset((void *)g_sources, 0, sizeof g_sources);
+    memset(g_hk, 0, sizeof g_hk);
     RUMBLE_LOCK();
     memset(g_rumble, 0, sizeof g_rumble);
     g_rumble_params = (xbox_rumble_params)XBOX_RUMBLE_PARAMS_DEFAULT;
@@ -444,6 +543,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     xbox_InputInit();
 
     rc = due(dwPort) ? probe(dwPort, pState) : ERROR_DEVICE_NOT_CONNECTED;
+    if (rc != ERROR_SUCCESS || !g_combo_guard)
+        g_hk[dwPort].st = HK_IDLE;
+    else
+        hotkey_filter(dwPort, pState);
     src = rc == ERROR_SUCCESS ? XBOX_INPUT_SRC_PAD : 0;
     /* The title's pad poll is the rumble's clock. */
     xbox_InputRumbleTick(dwPort);
@@ -473,9 +576,6 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         pState->dwPacketNumber = kb.dwPacketNumber;
     }
     g_sources[dwPort] = src;
-    if (rc == ERROR_SUCCESS && g_combo_guard
-            && (pState->Gamepad.wButtons & XBOX_GAMEPAD_BACK))
-        pState->Gamepad.wButtons &= (WORD)~XBOX_GAMEPAD_START;
     if (rc == ERROR_SUCCESS && (g_blocked || (g_latched & (1u << dwPort)))) {
         if (!g_blocked && !any_held(&pState->Gamepad))
             g_latched &= ~(1u << dwPort);
