@@ -61,6 +61,8 @@ void nv2a_host_set_lod_bias(int m, float v) { st_lod_mode = m; st_lod_val = v; }
 void nv2a_host_set_dither(int on) { st_dither = on; }
 static unsigned st_ui_scale = 99;
 void nv2a_texscale_set_factor(unsigned f) { st_ui_scale = f; }
+static int st_ui_filter = 99;
+void nv2a_texscale_set_algo(int a) { st_ui_filter = a; }
 #if !defined(_WIN32)
 /* The file writer's one-at-a-time flag (src/platform/win32_compat.c). */
 int32_t InterlockedExchange(volatile int32_t *p, int32_t v)
@@ -332,6 +334,23 @@ int main(void)
     xbox_SettingSet(XS_GRAPHICS_UI_SCALE, 0);
     CHECK(st_ui_scale == 0);
     CHECK(recomp_env(RENV_GFX_UI_SCALE) && !strcmp(recomp_env(RENV_GFX_UI_SCALE), "off"));
+    /* The filter: Super-xBR as shipped; each choice is the scaler's number
+     * (enum nv2a_texscale_algo: 0 super-xbr, 1 bicubic, 2 lanczos, 3 mmpx)
+     * and the environment's spelling; the choices' names are the file's. */
+    CHECK(xbox_SettingValue(XS_GRAPHICS_UI_SCALE_FILTER) == 0);
+    CHECK(!strcmp(xbox_SettingGet(XS_GRAPHICS_UI_SCALE_FILTER)->key, "graphics.ui_scale_filter"));
+    {
+        static const char *const want[] = { "super-xbr", "bicubic", "lanczos", "mmpx" };
+        int k;
+        for (k = 3; k >= 0; k--) {
+            xbox_SettingSet(XS_GRAPHICS_UI_SCALE_FILTER, k);
+            CHECK(st_ui_filter == k);
+            CHECK(recomp_env(RENV_GFX_UI_SCALE_FILTER)
+                  && !strcmp(recomp_env(RENV_GFX_UI_SCALE_FILTER), want[k]));
+            CHECK(!strcmp(xbox_SettingGet(XS_GRAPHICS_UI_SCALE_FILTER)->choices[k], want[k]));
+        }
+        CHECK(xbox_SettingGet(XS_GRAPHICS_UI_SCALE_FILTER)->choices[4] == NULL);
+    }
     xbox_SettingSet(XS_GRAPHICS_AA, 1);
     xbox_SettingSet(XS_GRAPHICS_SHARPEN, 0.4);
     CHECK(st_aa == 1 && st_sharpen > 0.39f && st_sharpen < 0.41f);
@@ -500,6 +519,24 @@ int main(void)
     }
     xbox_SettingReset(XS_INPUT_GLYPHS);
     CHECK(st_glyphs == 0);
+
+    /* graphics.ui_scale and its filter in the file: written by name. */
+    xbox_SettingSet(XS_GRAPHICS_UI_SCALE, 2);
+    xbox_SettingSet(XS_GRAPHICS_UI_SCALE_FILTER, 2);
+    xbox_SettingsFlush();
+    {
+        char err[256];
+        recomp_cfg *c = recomp_cfg_load_file(path, err, sizeof err);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(!strcmp(recomp_cfg_string(c, "graphics.ui_scale", ""), "4x"));
+            CHECK(!strcmp(recomp_cfg_string(c, "graphics.ui_scale_filter", ""), "lanczos"));
+            recomp_cfg_free(c);
+        }
+    }
+    xbox_SettingReset(XS_GRAPHICS_UI_SCALE_FILTER);
+    xbox_SettingReset(XS_GRAPHICS_UI_SCALE);
+    CHECK(st_ui_filter == 0 && st_ui_scale == 0);
 
     remove(path);
     fprintf(stderr, "overlay_settings: %d checks, %d failed\n", s_checks, s_fail);

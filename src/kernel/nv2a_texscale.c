@@ -28,10 +28,32 @@
  *   TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
  *   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  *
- * What is ours: the work on premultiplied colour with alpha as a fourth
- * channel and part of the edge measure, the edge clamp, the 4x by two 2x
- * steps, and everything else in the file.
+ * The MMPX scaler is written from McGuire and Gagiu's published rules, as in
+ * the MMPX.glc and cppPerf.cpp of their paper's supplement (McGuire and
+ * Gagiu, "MMPX Style-Preserving Pixel Art Magnification", Journal of
+ * Computer Graphics Techniques, 2021), under their licence:
+ *
+ *   MMPX
+ *   Copyright 2020 Morgan McGuire & Mara Gagiu.
+ *   Provided under the Open Source MIT license
+ *   https://opensource.org/licenses/MIT
+ *
+ *   (the permission notice is the one above, word for word)
+ *
+ * What is ours: Super-xBR's work on premultiplied colour with alpha as a
+ * fourth channel and part of the edge measure, the edge margin, the 4x by
+ * two 2x steps, MMPX's handling of fully transparent texels, the bicubic,
+ * the Lanczos filter, and everything else in the file. Nothing here is taken
+ * from Scale2x, hqx or xBRZ.
+ *
+ * The same texels give the same bytes on every machine: single-precision
+ * arithmetic without contraction (no fused multiply-add: the pragma below and
+ * -ffp-contract=off on this file), no library function but floorf and
+ * fabsf, and MMPX is integer compares throughout.
  */
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#endif
 #include "nv2a_texscale.h"
 #include "recomp_env.h"
 
@@ -497,7 +519,289 @@ static int bicubic(const Pic *src, Pic *dst, int f)
     return 1;
 }
 
+/* ── Lanczos-3 ───────────────────────────────────────────────────────── */
+
+/* sin(pi * x) by its series, so that the weights do not depend on a C
+ * library: x is reduced to [0, 0.5], where sixteen terms are exact to a
+ * double's last bits. */
+static double sin_pi(double x)
+{
+    double sign = 1.0, t, t2, term, sum;
+    int k;
+    if (x < 0.0) {
+        x = -x;
+        sign = -1.0;
+    }
+    k = (int)x;                       /* whole half-turns */
+    x -= (double)k;
+    if (k & 1)
+        sign = -sign;
+    if (x > 0.5)
+        x = 1.0 - x;
+    t = 3.14159265358979323846 * x;
+    t2 = t * t;
+    term = t;
+    sum = t;
+    for (k = 1; k < 16; k++) {
+        term = -term * t2 / (double)((2 * k) * (2 * k + 1));
+        sum += term;
+    }
+    return sign * sum;
+}
+
+/* sinc(x) * sinc(x / 3) for |x| < 3, else 0. */
+static double lanczos3(double x)
+{
+    double px_;
+    if (x < 0.0)
+        x = -x;
+    if (x >= 3.0)
+        return 0.0;
+    if (x < 1e-9)
+        return 1.0;
+    px_ = 3.14159265358979323846 * x;
+    return 3.0 * sin_pi(x) * sin_pi(x / 3.0) / (px_ * px_);
+}
+
+/* Six taps a way, the weights of a row or column made to sum to 1, the
+ * result held between the four nearest texels (the filter's halo beside a
+ * glyph would otherwise show as a dark or bright line). */
+static int lanczos(const Pic *src, Pic *dst, int f)
+{
+    int W = src->w * f, H = src->h * f, x, y, i, j, c, ph;
+    float wt[4][6];
+
+    if (!pic_new(dst, W, H))
+        return 0;
+    /* The f places inside a source texel: offsets (ph + 0.5) / f - 0.5. */
+    for (ph = 0; ph < f; ph++) {
+        double frac = ((double)ph + 0.5) / (double)f - 0.5, sum = 0.0, w6[6];
+        if (frac < 0.0)
+            frac += 1.0;              /* the texel to the left is the base */
+        for (i = 0; i < 6; i++) {
+            w6[i] = lanczos3((double)(i - 2) - frac);
+            sum += w6[i];
+        }
+        for (i = 0; i < 6; i++)
+            wt[ph][i] = (float)(w6[i] / sum);
+    }
+    for (y = 0; y < H; y++) {
+        float fy = ((float)y + 0.5f) / (float)f - 0.5f;
+        int iy = (int)floorf(fy);
+        const float *wy = wt[y % f];
+        for (x = 0; x < W; x++) {
+            float fx = ((float)x + 0.5f) / (float)f - 0.5f;
+            int ix = (int)floorf(fx);
+            const float *wx = wt[x % f];
+            float *o = dst->p + ((size_t)y * W + x) * CH;
+            float acc[4] = { 0, 0, 0, 0 }, lo[4], hi[4];
+            for (j = 0; j < 6; j++) {
+                for (i = 0; i < 6; i++) {
+                    const float *t = px(src, ix - 2 + i, iy - 2 + j);
+                    float wgt = wx[i] * wy[j];
+                    for (c = 0; c < 4; c++) {
+                        acc[c] += t[c] * wgt;
+                        if ((i == 2 || i == 3) && (j == 2 || j == 3)) {
+                            if ((i == 2 && j == 2) || t[c] < lo[c]) lo[c] = t[c];
+                            if ((i == 2 && j == 2) || t[c] > hi[c]) hi[c] = t[c];
+                        }
+                    }
+                }
+            }
+            for (c = 0; c < 4; c++)
+                o[c] = acc[c] < lo[c] ? lo[c] : acc[c] > hi[c] ? hi[c] : acc[c];
+            measure(o);
+        }
+    }
+    return 1;
+}
+
+/* ── MMPX ────────────────────────────────────────────────────────────── */
+
+/* The rules compare texels for equality, so they work on the texels as they
+ * are (straight alpha, no arithmetic: every result texel is one of the
+ * source's). Fully transparent texels are all the same texel to them, 0,
+ * whatever colour they carry. */
+typedef struct {
+    const uint32_t *p;
+    int             w, h;
+} Tex;
+
+static inline uint32_t mm_at(const Tex *t, int x, int y)
+{
+    if (x < 0) x = 0; else if (x >= t->w) x = t->w - 1;
+    if (y < 0) y = 0; else if (y >= t->h) y = t->h - 1;
+    return t->p[(size_t)y * t->w + x];
+}
+
+/* The authors' luma: a tie-breaker only. */
+static inline uint32_t mm_luma(uint32_t c)
+{
+    uint32_t alpha = c >> 24;
+    return (((c >> 16) & 0xFFu) + ((c >> 8) & 0xFFu) + (c & 0xFFu) + 1u) * (256u - alpha);
+}
+
+static inline int mm_all2(uint32_t b, uint32_t a0, uint32_t a1) { return b == a0 && b == a1; }
+static inline int mm_all3(uint32_t b, uint32_t a0, uint32_t a1, uint32_t a2)
+{
+    return b == a0 && b == a1 && b == a2;
+}
+static inline int mm_all4(uint32_t b, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    return b == a0 && b == a1 && b == a2 && b == a3;
+}
+static inline int mm_any3(uint32_t b, uint32_t a0, uint32_t a1, uint32_t a2)
+{
+    return b == a0 || b == a1 || b == a2;
+}
+static inline int mm_none2(uint32_t b, uint32_t a0, uint32_t a1) { return b != a0 && b != a1; }
+static inline int mm_none4(uint32_t b, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    return b != a0 && b != a1 && b != a2 && b != a3;
+}
+
+/* src (w x h) to dst (2w x 2h). The names are the paper's: E the texel, A..I
+ * its 3x3 block, P Q R S the tips of the diamond, J K L M the four results. */
+static void mmpx_2x(const uint32_t *src, int w, int h, uint32_t *dst)
+{
+    Tex t = { src, w, h };
+    int x, y;
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint32_t E = mm_at(&t, x, y), A = mm_at(&t, x - 1, y - 1), B = mm_at(&t, x, y - 1),
+                     C = mm_at(&t, x + 1, y - 1), D = mm_at(&t, x - 1, y), F = mm_at(&t, x + 1, y),
+                     G = mm_at(&t, x - 1, y + 1), Hh = mm_at(&t, x, y + 1),
+                     I = mm_at(&t, x + 1, y + 1), J = E, K = E, L = E, M = E;
+
+            if (!(E == A && E == B && E == C && E == D && E == F && E == G && E == Hh
+                  && E == I)) {
+                uint32_t P = mm_at(&t, x, y - 2), Q = mm_at(&t, x - 2, y),
+                         R = mm_at(&t, x + 2, y), S = mm_at(&t, x, y + 2);
+                uint32_t Bl = mm_luma(B), Dl = mm_luma(D), El = mm_luma(E), Fl = mm_luma(F),
+                         Hl = mm_luma(Hh);
+
+                /* 1:1 slopes: round some corners, keep sharp right angles. */
+                if ((D == B && D != Hh && D != F) && (El >= Dl || E == A)
+                        && mm_any3(E, A, C, G) && (El < Dl || A != D || E != P || E != Q))
+                    J = D;
+                if ((B == F && B != D && B != Hh) && (El >= Bl || E == C)
+                        && mm_any3(E, A, C, I) && (El < Bl || C != B || E != P || E != R))
+                    K = B;
+                if ((Hh == D && Hh != F && Hh != B) && (El >= Hl || E == G)
+                        && mm_any3(E, A, G, I) && (El < Hl || G != Hh || E != S || E != Q))
+                    L = Hh;
+                if ((F == Hh && F != B && F != D) && (El >= Fl || E == I)
+                        && mm_any3(E, C, G, I) && (El < Fl || I != Hh || E != R || E != S))
+                    M = F;
+
+                /* Line intersections that came apart. */
+                if (E != F && mm_all4(E, C, I, D, Q) && mm_all2(F, B, Hh)
+                        && F != mm_at(&t, x + 3, y))
+                    K = M = F;
+                if (E != D && mm_all4(E, A, G, F, R) && mm_all2(D, B, Hh)
+                        && D != mm_at(&t, x - 3, y))
+                    J = L = D;
+                if (E != Hh && mm_all4(E, G, I, B, P) && mm_all2(Hh, D, F)
+                        && Hh != mm_at(&t, x, y + 3))
+                    L = M = Hh;
+                if (E != B && mm_all4(E, A, C, Hh, S) && mm_all2(B, D, F)
+                        && B != mm_at(&t, x, y - 3))
+                    J = K = B;
+
+                /* Tips of bright triangles on a dark ground. */
+                if (Bl < El && mm_all4(E, G, Hh, I, S) && mm_none4(E, A, D, C, F))
+                    J = K = B;
+                if (Hl < El && mm_all4(E, A, B, C, P) && mm_none4(E, D, G, I, F))
+                    L = M = Hh;
+                if (Fl < El && mm_all4(E, A, D, G, Q) && mm_none4(E, B, C, I, Hh))
+                    K = M = F;
+                if (Dl < El && mm_all4(E, C, F, I, R) && mm_none4(E, B, A, G, Hh))
+                    J = L = D;
+
+                /* 2:1 and 1:2 slopes: these extend what the rules above gave. */
+                if (Hh != B) {
+                    if (Hh != A && Hh != E && Hh != C) {
+                        if (mm_all3(Hh, G, F, R) && mm_none2(Hh, D, mm_at(&t, x + 2, y - 1)))
+                            L = M;
+                        if (mm_all3(Hh, I, D, Q) && mm_none2(Hh, F, mm_at(&t, x - 2, y - 1)))
+                            M = L;
+                    }
+                    if (B != I && B != G && B != E) {
+                        if (mm_all3(B, A, F, R) && mm_none2(B, D, mm_at(&t, x + 2, y + 1)))
+                            J = K;
+                        if (mm_all3(B, C, D, Q) && mm_none2(B, F, mm_at(&t, x - 2, y + 1)))
+                            K = J;
+                    }
+                }
+                if (F != D) {
+                    if (D != I && D != E && D != C) {
+                        if (mm_all3(D, A, Hh, S) && mm_none2(D, B, mm_at(&t, x + 1, y + 2)))
+                            J = L;
+                        if (mm_all3(D, G, B, P) && mm_none2(D, Hh, mm_at(&t, x + 1, y - 2)))
+                            L = J;
+                    }
+                    if (F != E && F != A && F != G) {
+                        if (mm_all3(F, C, Hh, S) && mm_none2(F, B, mm_at(&t, x - 1, y + 2)))
+                            K = M;
+                        if (mm_all3(F, I, B, P) && mm_none2(F, Hh, mm_at(&t, x - 1, y - 2)))
+                            M = K;
+                    }
+                }
+            }
+            dst[(size_t)(2 * y) * (2 * w) + 2 * x] = J;
+            dst[(size_t)(2 * y) * (2 * w) + 2 * x + 1] = K;
+            dst[(size_t)(2 * y + 1) * (2 * w) + 2 * x] = L;
+            dst[(size_t)(2 * y + 1) * (2 * w) + 2 * x + 1] = M;
+        }
+    }
+}
+
+static int mmpx(const uint32_t *src, uint32_t w, uint32_t h, unsigned factor, uint32_t *dst)
+{
+    size_t i, n = (size_t)w * h;
+    uint32_t *a = (uint32_t *)malloc(n * 4), *b = NULL;
+
+    if (!a)
+        return 0;
+    for (i = 0; i < n; i++)
+        a[i] = (src[i] >> 24) ? src[i] : 0u;
+    if (factor == 2) {
+        mmpx_2x(a, (int)w, (int)h, dst);
+    } else {
+        b = (uint32_t *)malloc(n * 16);
+        if (!b) {
+            free(a);
+            return 0;
+        }
+        mmpx_2x(a, (int)w, (int)h, b);
+        mmpx_2x(b, (int)w * 2, (int)h * 2, dst);
+        free(b);
+    }
+    free(a);
+    bleed(dst, (int)(w * factor), (int)(h * factor), src, (int)w, (int)h, factor);
+    return 1;
+}
+
 /* ── the entry ───────────────────────────────────────────────────────── */
+
+static const char *const k_algo_names[NV2A_TEXSCALE_ALGOS] = {
+    "super-xbr", "bicubic", "lanczos", "mmpx"
+};
+
+const char *nv2a_texscale_algo_name(enum nv2a_texscale_algo algo)
+{
+    return (unsigned)algo < NV2A_TEXSCALE_ALGOS ? k_algo_names[algo] : k_algo_names[0];
+}
+
+enum nv2a_texscale_algo nv2a_texscale_algo_named(const char *name)
+{
+    int i;
+    for (i = 0; name && i < NV2A_TEXSCALE_ALGOS; i++)
+        if (!strcmp(name, k_algo_names[i]))
+            return (enum nv2a_texscale_algo)i;
+    return NV2A_TEXSCALE_SUPERXBR;
+}
 
 int nv2a_texscale(const uint32_t *src, uint32_t w, uint32_t h, unsigned factor,
                   enum nv2a_texscale_algo algo, uint32_t *dst)
@@ -507,10 +811,13 @@ int nv2a_texscale(const uint32_t *src, uint32_t w, uint32_t h, unsigned factor,
     if (!src || !dst || !w || !h || (factor != 2 && factor != 4) || w > 8192 || h > 8192
             || (unsigned)algo >= NV2A_TEXSCALE_ALGOS)
         return 0;
+    if (algo == NV2A_TEXSCALE_MMPX)
+        return mmpx(src, w, h, factor, dst);
     if (!pic_from_argb(&a, src, (int)w, (int)h))
         return 0;
-    if (algo == NV2A_TEXSCALE_BICUBIC) {
-        if (!bicubic(&a, &b, (int)factor)) {
+    if (algo == NV2A_TEXSCALE_BICUBIC || algo == NV2A_TEXSCALE_LANCZOS) {
+        if (!(algo == NV2A_TEXSCALE_BICUBIC ? bicubic(&a, &b, (int)factor)
+                                            : lanczos(&a, &b, (int)factor))) {
             free(a.p);
             return 0;
         }
@@ -633,14 +940,14 @@ void nv2a_texscale_set_algo(enum nv2a_texscale_algo algo)
         gen_next();
 }
 
-/* RECOMP_DEBUG=ui_scale_algo=bicubic: the comparison scaler. */
+/* RECOMP_GFX_UI_SCALE_FILTER: super-xbr (default), bicubic, lanczos, mmpx. */
 enum nv2a_texscale_algo nv2a_texscale_algo(void)
 {
     int a = atomic_load_explicit(&s_algo, memory_order_relaxed);
     if (a < 0) {
-        const char *e = recomp_env(RENV_UI_SCALE_ALGO);
+        const char *e = recomp_env(RENV_GFX_UI_SCALE_FILTER);
         int expect = -1;
-        a = e && !strcmp(e, "bicubic") ? NV2A_TEXSCALE_BICUBIC : NV2A_TEXSCALE_SUPERXBR;
+        a = (int)nv2a_texscale_algo_named(e);
         if (!atomic_compare_exchange_strong_explicit(&s_algo, &expect, a,
                                                      memory_order_relaxed,
                                                      memory_order_relaxed))

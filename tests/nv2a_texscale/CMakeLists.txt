@@ -16,6 +16,10 @@ target_include_directories(nv2a_texscale_test PRIVATE
 if(NOT WIN32)
     target_link_libraries(nv2a_texscale_test PRIVATE m)
 endif()
+if(NOT MSVC)   # as the library builds it: the checksums are of those bytes
+    set_source_files_properties(${XR_SRC}/kernel/nv2a_texscale.c
+                                PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(nv2a_texscale_test PRIVATE Threads::Threads)
 enable_testing()

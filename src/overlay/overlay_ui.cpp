@@ -146,6 +146,7 @@ static const char *const n_scale[]     = { "1x (640x480)", "1.5x (960x720)", "2x
 static const char *const n_face[]      = { "Xbox layout", "Nintendo layout", NULL };
 static const char *const n_scheme[]    = { "Xbox layout", "PS2 layout", NULL };
 static const char *const n_ui_scale[]  = { "Off", "2x", "4x", NULL };
+static const char *const n_ui_scale_filter[] = { "Super-xBR", "Bicubic", "Lanczos", "MMPX", NULL };
 static const char *const n_glyphs[]    = { "Auto (the controller in use)", "Xbox (original)", "Xbox (modern: LB RB LT RT)", "PlayStation", "Nintendo", "Steam (Deck, Steam Controller)", NULL };
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
@@ -200,6 +201,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_INPUT_GLYPHS */       { "Button prompts", "The buttons the game shows in its menus and hints. Auto follows the controller that was last used. Xbox (original) is the game's own picture: white and black buttons, L and R. The game's text and videos still name the Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
     /* XS_AUDIO_LFE_LOWPASS */  { "Subwoofer low-pass (LFE)", "120 Hz is what the console's Dolby Digital encoder did; Off sends the full-range LFE feed.", 1, FMT_PLAIN, n_lfe_lowpass, 0 },
     /* XS_GRAPHICS_UI_SCALE */  { "Menu and HUD upscaling", "Redraws the game's 2D art (menu text, HUD, icons, logos) at 2 or 4 times its size with an edge-following scaler (Super-xBR), for a render scale above 1x. Off is the original. The 3D world is not touched. Changes at once. The sharper pictures are made in the background and kept on disk, so new art can show unscaled for a moment the first time; uses more texture memory.", 1, FMT_PLAIN, n_ui_scale, 0 },
+    /* XS_GRAPHICS_UI_SCALE_FILTER */ { "Upscaling filter", "How the menu and HUD art is enlarged. Super-xBR follows edges: smooth outlines, the best on this game's text and digits. Bicubic and Lanczos are plain enlargements: softer and a little sharper, both keep the stair-steps. MMPX is a pixel-art scaler that keeps exact colours: blocky here, because this art is antialiased. Changes at once; each filter keeps its own pictures on disk.", 1, FMT_PLAIN, n_ui_scale_filter, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -399,6 +401,8 @@ static int page_rows(int page, Row *r)
         SET(XS_GRAPHICS_AA); SET(XS_GRAPHICS_SHARPEN);
         SET(XS_GRAPHICS_LOD_BIAS);
         SET(XS_GRAPHICS_UI_SCALE);
+        if (xbox_SettingValue(XS_GRAPHICS_UI_SCALE) != 0)   /* nothing to choose while it is off */
+            SET(XS_GRAPHICS_UI_SCALE_FILTER);
 #if defined(__APPLE__)          /* only the Metal presenter has the pass so far */
         SET(XS_GRAPHICS_DITHER);
 #endif
@@ -1932,7 +1936,7 @@ static void build_pages(float fs)
                          " power (diagnosis: RECOMP_PRESENT_PACING=spin).");
             else
                 snprintf(hint, sizeof hint, "%s", k_meta[rows[sel].id].hint);
-            if (rows[sel].id == XS_GRAPHICS_UI_SCALE) {
+            if (rows[sel].id == XS_GRAPHICS_UI_SCALE || rows[sel].id == XS_GRAPHICS_UI_SCALE_FILTER) {
                 /* The scaled pictures are made in the background and kept on
                  * disk: say so while that is going on. */
                 unsigned done = 0, total = 0;

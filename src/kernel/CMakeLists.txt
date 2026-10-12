@@ -92,4 +92,10 @@ else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
 
+# graphics.ui_scale's filters give the same bytes on every machine (the disk
+# cache's files and the test's checksums): no fused multiply-add there.
+if(NOT MSVC)
+    set_source_files_properties(nv2a_texscale.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
+
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)

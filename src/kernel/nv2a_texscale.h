@@ -20,8 +20,9 @@
  * output texels take the colour of the visible ones beside them, so the
  * GPU's bilinear filter does not mix a stray colour into an outline.
  *
- * Super-xBR is Hyllian's algorithm (MIT, see the .c file); the bicubic is a
- * plain Catmull-Rom for comparison.
+ * Four filters: Super-xBR (Hyllian, MIT) and MMPX (McGuire and Gagiu, MIT),
+ * see the .c file for both notices, and a Catmull-Rom bicubic and a Lanczos-3
+ * written here.
  *
  * No OS or graphics headers: shared by the Metal and Vulkan backends.
  */
@@ -35,11 +36,20 @@
 extern "C" {
 #endif
 
+/* The filters (graphics.ui_scale_filter). The numbers are in the cache
+ * files' headers: add at the end. */
 enum nv2a_texscale_algo {
-    NV2A_TEXSCALE_SUPERXBR = 0,
-    NV2A_TEXSCALE_BICUBIC  = 1,
+    NV2A_TEXSCALE_SUPERXBR = 0,   /* Hyllian's Super-xBR: follows edges (the default) */
+    NV2A_TEXSCALE_BICUBIC  = 1,   /* Catmull-Rom: smooth, keeps the stairs */
+    NV2A_TEXSCALE_LANCZOS  = 2,   /* Lanczos-3: sharper than the bicubic, keeps the stairs */
+    NV2A_TEXSCALE_MMPX     = 3,   /* McGuire and Gagiu's MMPX: pixel-art rules, exact colours */
     NV2A_TEXSCALE_ALGOS
 };
+/* A filter's name as the setting and the environment spell it ("super-xbr",
+ * "bicubic", "lanczos", "mmpx"), and the filter of a name (SUPERXBR for one
+ * that is not known). */
+const char *nv2a_texscale_algo_name(enum nv2a_texscale_algo algo);
+enum nv2a_texscale_algo nv2a_texscale_algo_named(const char *name);
 
 /* The largest texture scaled (texels of the guest's level 0). */
 #define NV2A_TEXSCALE_MAX_TEXELS (512u * 512u)
@@ -105,7 +115,7 @@ int nv2a_texscale_has_alpha(const uint32_t *texels, size_t n);
 
 /* Part of every cache file's name and header: raise it when a scaler's
  * output changes, and the files of the old one are no longer read. */
-#define NV2A_TEXSCALE_VERSION 1
+#define NV2A_TEXSCALE_VERSION 2
 
 /* A texture's key: a hash of its decoded texels (after any replacement) and
  * its size. Never 0. */
