@@ -55,6 +55,8 @@ extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include "overlay_font_ui.h"    /* k_overlay_font_ui: Roboto Condensed Medium, the text font */
 #include "overlay_font_ext.h"   /* k_overlay_font_ext: DejaVu Sans Mono, behind it */
 #include "overlay_gamefont.h"   /* the title's own fonts, from the player's executable */
+#include "overlay_gameart.h"    /* its menu sprites and button prompts, from the player's data */
+#include "pad_glyphs.h"          /* the glyph set of the pad in use */
 
 #define LOGP "[OVERLAY] "
 
@@ -1981,6 +1983,7 @@ struct Theme {
     Rgb arc;            /* the big arc on the left */
     Rgb head_band;      /* behind the header, over the dimmed game */
     Rgb shadow, outline;/* the big title's shadow and outline */
+    Rgb box_fill, box_edge;     /* the value boxes: the shade and the outline */
 };
 
 static const Theme k_theme_game = {
@@ -2013,6 +2016,7 @@ static const Theme k_theme_game = {
     {0x38, 0x50, 0x78},             /* arc */
     {0x08, 0x0a, 0x10},             /* head_band */
     {0x00, 0x00, 0x00}, {0xf0, 0xf0, 0xf0},
+    {0x10, 0x18, 0x20}, {0x38, 0x58, 0x70},
 };
 
 static const Theme k_theme_classic = {
@@ -2038,6 +2042,7 @@ static const Theme k_theme_classic = {
     {90, 210, 120}, {235, 200, 70}, {235, 90, 80}, {255, 255, 255},
     {255, 140, 30}, {130, 130, 136}, {190, 190, 198}, {12, 12, 14}, {240, 190, 70},
     {70, 70, 76}, {60, 60, 66}, {8, 8, 10}, {0, 0, 0}, {240, 240, 240},
+    {12, 12, 14}, {70, 70, 76},
 };
 
 static const Theme *T = &k_theme_game;
@@ -2594,7 +2599,8 @@ static const char *caps(const char *t)
 /* A text that has to fit `w`: a smaller size for it (down to 72%), and cut
  * at `w` when that is not enough. `right`: p.x is the right edge. Returns
  * the width it took. */
-static float txt_fit(ImDrawList *dl, float size, ImVec2 p, ImU32 c, const char *t, float w, bool right = false)
+static float txt_fit(ImDrawList *dl, float size, ImVec2 p, ImU32 c, const char *t, float w, bool right = false,
+                     bool centre = false)
 {
     float x = tw(size, t), s = size;
     if (x > w && x > 0.0f) {
@@ -2603,7 +2609,7 @@ static float txt_fit(ImDrawList *dl, float size, ImVec2 p, ImU32 c, const char *
             s = size * 0.72f;
         x = tw(s, t);
     }
-    const float x0 = right ? p.x - (x < w ? x : w) : p.x;
+    const float x0 = right ? p.x - (x < w ? x : w) : centre ? p.x - (x < w ? x : w) * 0.5f : p.x;
     const float y = p.y + (size - s) * 0.5f;
     dl->PushClipRect(ImVec2(x0, p.y - size * 0.2f), ImVec2(x0 + w + size * s_shear, p.y + size * 1.4f), true);
     txt(dl, s, ImVec2(x0, y), c, t);
@@ -2617,6 +2623,166 @@ static void arrow_tri(ImDrawList *dl, float cx, float cy, float r, int dir, ImU3
 {
     dl->AddTriangleFilled(ImVec2(cx + dir * r * 0.7f, cy), ImVec2(cx - dir * r * 0.6f, cy - r),
                           ImVec2(cx - dir * r * 0.6f, cy + r), c);
+}
+
+
+/* ── the title's own pictures (overlay_gameart.h) ──────────────────── */
+
+/* True once the sprites are in the texture Dear ImGui holds; the callers
+ * draw their own shapes otherwise. */
+static bool art_on() { return gameart_attach(); }
+
+/* Sprite `sp` into the box p0..p1, white-tinted by `c`; flipped sideways or
+ * upside down by swapping its coordinates. */
+static void spr(ImDrawList *dl, int sp, ImVec2 p0, ImVec2 p1, ImU32 c, bool flip_x = false, bool flip_y = false)
+{
+    const ArtRect *r = gameart_sprite(sp);
+    if (!r)
+        return;
+    const float u0 = flip_x ? r->u1 : r->u0, u1 = flip_x ? r->u0 : r->u1;
+    const float v0 = flip_y ? r->v1 : r->v0, v1 = flip_y ? r->v0 : r->v1;
+    dl->AddImage(gameart_tex(), p0, p1, ImVec2(u0, v0), ImVec2(u1, v1), c);
+}
+
+/* Sprite `sp` `k` pixels to a texel, its box centred on (cx, cy). */
+static void spr_at(ImDrawList *dl, int sp, float cx, float cy, float k, ImU32 c, bool flip_x = false,
+                   bool flip_y = false)
+{
+    const ArtRect *r = gameart_sprite(sp);
+    if (!r)
+        return;
+    const float hw = r->w * k * 0.5f, hh = r->h * k * 0.5f;
+    spr(dl, sp, ImVec2(floorf(cx - hw + 0.5f), floorf(cy - hh + 0.5f)), ImVec2(floorf(cx + hw + 0.5f), floorf(cy + hh + 0.5f)),
+        c, flip_x, flip_y);
+}
+
+/* The page arrows and the value arrows: the title's left-pointing triangle
+ * (dir -1), or its mirror (dir 1), `h` high; drawn shapes without it. */
+static void arrow_spr(ImDrawList *dl, float cx, float cy, float h, int dir, ImU32 c, Rgb fallback)
+{
+    if (art_on()) {
+        const ArtRect *r = gameart_sprite(AS_ARROW_LEFT);
+        spr_at(dl, AS_ARROW_LEFT, cx, cy, h / r->h, c, dir > 0);
+    } else {
+        arrow_tri(dl, cx, cy, h * 0.4f, dir, col(fallback));
+    }
+}
+
+/* The cursor before the selected row: the title's up triangle. */
+static void cursor_spr(ImDrawList *dl, float cx, float cy, float w, ImU32 c, Rgb fallback)
+{
+    if (art_on()) {
+        const ArtRect *r = gameart_sprite(AS_ARROW_UP);
+        spr_at(dl, AS_ARROW_UP, cx, cy, w / r->w, c);
+    } else {
+        arrow_tri(dl, cx, cy, w * 0.3f, 1, col(fallback));
+    }
+}
+
+/* A value box: a dark rounded box with a thin outline, its corners the
+ * title's own (the small one for a small box), its sides plain. */
+static void value_box(ImDrawList *dl, float x0, float y0, float x1, float y1, bool sel)
+{
+    x0 = floorf(x0 + 0.5f); y0 = floorf(y0 + 0.5f); x1 = floorf(x1 + 0.5f); y1 = floorf(y1 + 0.5f);
+    const float bh = y1 - y0;
+    const ImU32 fill = col(T->box_fill, 0.85f), edge = sel ? col(T->hint) : col(T->box_edge);
+    float r = floorf(bh * 0.3f + 0.5f);
+    if (!art_on()) {
+        dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), fill, r);
+        dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), edge, r, 0, fmaxf(1.0f, bh * 0.04f));
+        return;
+    }
+    const bool big = r > 40.0f;
+    const int sf = big ? AS_FILL32 : AS_FILL16, se = big ? AS_EDGE32 : AS_EDGE16;
+    const float t = fmaxf(1.0f, 2.0f * r / (big ? 32.0f : 16.0f));      /* the outline: 2 texels */
+    dl->AddRectFilled(ImVec2(x0 + r, y0), ImVec2(x1 - r, y1), fill);
+    dl->AddRectFilled(ImVec2(x0, y0 + r), ImVec2(x0 + r, y1 - r), fill);
+    dl->AddRectFilled(ImVec2(x1 - r, y0 + r), ImVec2(x1, y1 - r), fill);
+    dl->AddRectFilled(ImVec2(x0 + r, y0), ImVec2(x1 - r, y0 + t), edge);
+    dl->AddRectFilled(ImVec2(x0 + r, y1 - t), ImVec2(x1 - r, y1), edge);
+    dl->AddRectFilled(ImVec2(x0, y0 + r), ImVec2(x0 + t, y1 - r), edge);
+    dl->AddRectFilled(ImVec2(x1 - t, y0 + r), ImVec2(x1, y1 - r), edge);
+    for (int k = 0; k < 2; k++) {
+        const int sp = k ? se : sf;
+        const ImU32 c = k ? edge : fill;
+        spr(dl, sp, ImVec2(x0, y0), ImVec2(x0 + r, y0 + r), c);
+        spr(dl, sp, ImVec2(x1 - r, y0), ImVec2(x1, y0 + r), c, true);
+        spr(dl, sp, ImVec2(x0, y1 - r), ImVec2(x0 + r, y1), c, false, true);
+        spr(dl, sp, ImVec2(x1 - r, y1 - r), ImVec2(x1, y1), c, true, true);
+    }
+}
+
+/* The title's tick bar in [x0, x1], `h` high at most, `on` of its ticks lit.
+ * A tick is 4 x 8 texels at a pitch of 6; without the sprites, blocks. */
+static void tick_bar(ImDrawList *dl, float x0, float x1, float cy, float h, double t, bool dim)
+{
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    if (!art_on()) {
+        const float bh = h * 0.8f, by = cy - bh * 0.5f, seg = (x1 - x0) / 20.0f;
+        const int on = (int)floor(t * 20 + 0.5);
+        for (int k = 0; k < 20; k++)
+            dl->AddRectFilled(ImVec2(x0 + seg * k, by), ImVec2(x0 + seg * (k + 1) - seg * 0.22f, by + bh),
+                              k < on ? (dim ? col(T->fill_dim) : col(T->fill)) : col(T->track));
+        return;
+    }
+    const float k = h / 8.0f;                          /* pixels a texel */
+    int n = (int)floorf((x1 - x0) / (6.0f * k));
+    if (n < 4) n = 4;
+    const int on = (int)floor(t * n + 0.5);
+    const float pitch = (x1 - x0) / n;                 /* spread over the bar */
+    for (int i = 0; i < n; i++)
+        spr_at(dl, AS_TICK, x0 + pitch * (i + 0.5f), cy, k,
+               i < on ? col({255, 255, 255}, dim ? 0.55f : 1.0f) : col({0x30, 0x40, 0x50}, 0.9f));
+}
+
+/* The d-pad: four triangles from the title's two, `gh` high. */
+static void dpad_glyph(ImDrawList *dl, float cx, float cy, float gh, ImU32 c)
+{
+    const float k = gh / 24.0f;
+    const ArtRect *dn = gameart_sprite(AS_DPAD_DOWN), *rt = gameart_sprite(AS_DPAD_RIGHT);
+    if (!dn || !rt)
+        return;
+    auto put = [&](int sp, float x0, float y0, float w, float h, bool fx, bool fy) {
+        spr(dl, sp, ImVec2(floorf(cx + x0 * k + 0.5f), floorf(cy + y0 * k + 0.5f)),
+            ImVec2(floorf(cx + (x0 + w) * k + 0.5f), floorf(cy + (y0 + h) * k + 0.5f)), c, fx, fy);
+    };
+    put(AS_DPAD_DOWN, -8, 0, dn->w, dn->h, false, false);
+    put(AS_DPAD_DOWN, -8, -dn->h, dn->w, dn->h, false, true);
+    put(AS_DPAD_RIGHT, 0, -8, rt->w, rt->h, false, false);
+    put(AS_DPAD_RIGHT, -rt->w, -8, rt->w, rt->h, true, false);
+}
+
+/* A cell of the prompt sheet of the glyph set in use, `k` pixels a texel,
+ * its left edge at x, centred on cy. Returns its width. */
+static float pad_glyph(ImDrawList *dl, int set, int cell, float x, float cy, float k)
+{
+    ArtRect r;
+    if (!gameart_pad_cell(set, cell, &r))
+        return 0.0f;
+    const float w = r.w * k, h = r.h * k;
+    dl->AddImage(gameart_pad_tex(), ImVec2(floorf(x + 0.5f), floorf(cy - h * 0.5f + 0.5f)),
+                 ImVec2(floorf(x + w + 0.5f), floorf(cy - h * 0.5f + 0.5f) + floorf(h + 0.5f)),
+                 ImVec2(r.u0, r.v0), ImVec2(r.u1, r.v1), col({255, 255, 255}));
+    return w;
+}
+
+/* A key of the keyboard: its name in a small box. */
+static float key_width(float size, const char *name)
+{
+    Face f(s_f_ui);
+    const float sz = size * 0.78f;
+    return tw(sz, name) + sz;
+}
+
+static float key_cap(ImDrawList *dl, float x, float cy, float size, const char *name, ImU32 c)
+{
+    Face f(s_f_ui);
+    const float sz = size * 0.78f, pad = sz * 0.5f, w = tw(sz, name) + 2.0f * pad, h = sz * 1.55f;
+    dl->AddRectFilled(ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f), col(T->box_fill, 0.85f), sz * 0.3f);
+    dl->AddRect(ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f), c, sz * 0.3f, 0, fmaxf(1.0f, sz * 0.09f));
+    txt(dl, sz, ImVec2(x + pad, top_for(cy, sz)), c, name);
+    return w;
 }
 
 /* A small tag after a label: RESTART in attention yellow where the value
@@ -2651,8 +2817,10 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     const float ty = top_for(cy, fs);
     const float ar = fs * 0.3f;                  /* the arrows' half height */
     const float lx = LY.x_label, label_w = LY.x_val0 - lx - ar * 4.0f;
-    const float vr = LY.x_val1;                   /* where a value's text ends; the arrows are outside the column */
-    const float arl = LY.x_val0 - ar * 1.6f, arr = LY.x_val1 + ar * 1.6f;
+    const float vr = LY.x_val1;                   /* where a value box ends; the arrows are outside it */
+    const float bh = fmaxf(rh * 0.74f, fs * 1.2f), bpad = bh * 0.4f, ah = fs * 0.75f;
+    const float by0 = cy - bh * 0.5f, by1 = cy + bh * 0.5f, bmid = (LY.x_val0 + vr) * 0.5f;
+    const float arl = LY.x_val0 - ah * 0.9f, arr = vr + ah * 0.9f;
 
     if (r.kind == R_INFO) {
         Face ui(s_f_ui);
@@ -2660,8 +2828,12 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         return;
     }
     if (sel) {
-        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.2f);
-        arrow_tri(dl, lx - fs * 0.9f, cy, ar, 1, col(T->arrow));
+        if (art_on())
+            cursor_spr(dl, lx - fs * 0.9f, cy, fs * 0.85f, col({255, 255, 255}), T->arrow);
+        else {
+            dl->AddRectFilled(p, ImVec2(p.x + width, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.2f);
+            arrow_tri(dl, lx - fs * 0.9f, cy, ar, 1, col(T->arrow));
+        }
     }
     if (r.kind == R_ACTION) {
         const bool pin = r.action == A_RESTART_PIN;
@@ -2680,9 +2852,11 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
             const bool on = !strcmp(v, "On");
             if (s_confirm && r.action == s_confirm)
                 txt_fit(dl, fs, ImVec2(vr, ty), col(T->attn), confirm_text(r.action), vr - LY.x_val0, true);
-            else
-                txt_fit(dl, fs, ImVec2(vr, ty), on ? col(T->attn) : sel ? col(T->text_hi) : col(T->text), v,
-                        vr - LY.x_val0, true);
+            else {
+                value_box(dl, LY.x_val0, by0, vr, by1, sel);
+                txt_fit(dl, fs, ImVec2(bmid, ty), on ? col(T->attn) : sel ? col(T->text_hi) : col(T->text), v,
+                        vr - LY.x_val0 - 2.0f * bpad, false, true);
+            }
             return;
         }
         {
@@ -2707,10 +2881,11 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
             Face it(s_f_body, SHEAR);
             txt_fit(dl, fs, ImVec2(lx, ty), lc, caps(r.text), label_w);
         }
-        txt_fit(dl, fs, ImVec2(vr, ty), locked ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text), v,
-                vr - LY.x_val0, true);
+        value_box(dl, LY.x_val0, by0, vr, by1, sel);
+        txt_fit(dl, fs, ImVec2(bmid, ty), locked ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text), v,
+                vr - LY.x_val0 - 2.0f * bpad, false, true);
         if (sel && !locked)
-            arrow_tri(dl, arr, cy, ar, 1, col(T->arrow));
+            arrow_spr(dl, arr, cy, ah, 1, col({255, 255, 255}), T->arrow);
         return;
     }
     if (r.kind == R_SPEAKERS) {
@@ -2759,48 +2934,111 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
             restart_tag(dl, lx + w + fs * 0.5f, cy, fs, s->value != s->launch);
     }
 
+    value_box(dl, LY.x_val0, by0, vr, by1, sel);
     if (s->type == XS_INT || s->type == XS_FLOAT) {
-        /* A bar of blocks and the number, between the arrows. */
+        /* The title's tick bar and the number, in the box. */
         const float nw = tw(fs, "100%") + fs * 0.2f;
-        const float bx0 = LY.x_val0, bx1 = vr - nw - fs * 0.5f, bh = fs * 0.62f, by = cy - bh * 0.5f;
+        const float bx0 = LY.x_val0 + bpad, bx1 = vr - bpad - nw - bpad * 0.6f;
         const float bw = bx1 - bx0;
         double t = (s->value - s->min) / (s->max - s->min);
         t = t < 0 ? 0 : t > 1 ? 1 : t;
-        const int blocks = 20, on = (int)floor(t * blocks + 0.5);
-        const float seg = bw / blocks;
-        for (int k = 0; k < blocks; k++)
-            dl->AddRectFilled(ImVec2(bx0 + seg * k, by), ImVec2(bx0 + seg * (k + 1) - seg * 0.22f, by + bh),
-                              k < on ? (dim ? col(T->fill_dim) : col(T->fill)) : col(T->track));
-        txt(dl, fs, ImVec2(vr - tw(fs, v), ty), vc, v);
+        tick_bar(dl, bx0, bx1, cy, bh * 0.55f, t, dim);
+        txt(dl, fs, ImVec2(vr - bpad - tw(fs, v), ty), vc, v);
         if (drag_t && ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::IsItemActive()) {
             double f = (ImGui::GetIO().MousePos.x - bx0) / bw;
             *drag_t = f < 0 ? 0 : f > 1 ? 1 : f;
         }
     } else {
-        /* A choice or a switch: its value, right-aligned (On / Off for a switch). */
-        txt_fit(dl, fs, ImVec2(vr, ty), vc, v, vr - LY.x_val0, true);
+        /* A choice or a switch: its value, centred in the box (On / Off for a switch). */
+        txt_fit(dl, fs, ImVec2(bmid, ty), vc, v, vr - LY.x_val0 - 2.0f * bpad, false, true);
     }
     if (sel && !dim) {
-        arrow_tri(dl, arl, cy, ar, -1, col(T->arrow));
-        arrow_tri(dl, arr, cy, ar, 1, col(T->arrow));
+        arrow_spr(dl, arl, cy, ah, -1, col({255, 255, 255}), T->arrow);
+        arrow_spr(dl, arr, cy, ah, 1, col({255, 255, 255}), T->arrow);
     }
 }
 
 /* The footer bar: a band under the page with the keys, in the hint blue
- * (the attention yellow while the page asks for something). */
+ * (the attention yellow while the page asks for something). The pages have
+ * the title's own prompts there (B, Y, the d-pad, A: the buttons of the pad
+ * in use, or the keys of the keyboard) when its pictures are in; the text
+ * of foot_set is what is drawn without them, and on the Mixer page and in
+ * the folder browser. */
 static const char *s_foot_keys;
-static bool s_foot_attn;
+static bool s_foot_attn, s_foot_prompts;
 
 static void foot_set(const char *keys, bool attn = false)
 {
     s_foot_keys = keys;
     s_foot_attn = attn;
+    s_foot_prompts = false;
+}
+
+/* After foot_set: the page's footer is B Back, Y Default, d-pad Change, A Select. */
+static void foot_prompts() { s_foot_prompts = true; }
+
+static void draw_prompts(ImDrawList *dl)
+{
+    const bool pad = pad_hints();
+    const int set = pad ? (int)xbox_InputGlyphSet() : 0;
+    const float sz = LY.foot, cy = (LY.y_foot + LY.H) * 0.5f, k = sz * 1.25f / 30.0f, gap = sz * 0.55f;
+    const ImU32 c = s_foot_attn ? col(T->attn) : col(T->hint);
+    Face body(s_f_body, SHEAR);
+    const float x0 = LY.cx + 0.056f * LY.cw, x1 = LY.cx + 0.944f * LY.cw;
+    /* left to right: the glyph (or key) and its word */
+    auto item = [&](float x, int cell, const char *key, const char *word) {
+        float w;
+        if (pad)
+            w = pad_glyph(dl, set, cell, x, cy, k);
+        else {
+            Face up(s_f_ui);
+            w = key_cap(dl, x, cy, sz, key, c);
+        }
+        txt(dl, sz, ImVec2(x + w + gap, top_for(cy, sz)), c, word);
+        return x + w + gap + tw(sz, word);
+    };
+    item(x0, AP_B, "Esc", "Back");
+    item(x0 + 0.20f * LY.cw, AP_Y, "Del", "Default");
+    {
+        const float x = x0 + 0.38f * LY.cw;
+        float w;
+        if (pad) {
+            w = sz * 1.25f;
+            dpad_glyph(dl, x + w * 0.5f, cy, sz * 1.25f, col({255, 255, 255}));
+        } else {
+            Face up(s_f_ui);
+            w = key_cap(dl, x, cy, sz, "Arrows", c);
+        }
+        txt(dl, sz, ImVec2(x + w + gap, top_for(cy, sz)), c, "Change");
+    }
+    {
+        /* Select is at the right: its word, then its glyph. */
+        float w;
+        if (pad) {
+            ArtRect r;
+            w = gameart_pad_cell(set, AP_A, &r) ? r.w * k : sz;
+        } else {
+            w = key_width(sz, "Enter");
+        }
+        const float ww = tw(sz, "Select");
+        txt(dl, sz, ImVec2(x1 - w - gap - ww, top_for(cy, sz)), c, "Select");
+        if (pad)
+            pad_glyph(dl, set, AP_A, x1 - w, cy, k);
+        else {
+            Face up(s_f_ui);
+            key_cap(dl, x1 - w, cy, sz, "Enter", c);
+        }
+    }
 }
 
 static void draw_footer(ImDrawList *dl)
 {
     dl->AddRectFilled(ImVec2(0, LY.y_foot), ImVec2(LY.W, LY.H), col(T->bar, 0.94f));
     dl->AddLine(ImVec2(0, LY.y_foot), ImVec2(LY.W, LY.y_foot), col(T->rule_hi), fmaxf(1.0f, 0.0025f * LY.H));
+    if (s_foot_prompts && art_on()) {
+        draw_prompts(dl);
+        return;
+    }
     if (!s_foot_keys)
         return;
     Face body(s_f_body);
@@ -2809,8 +3047,35 @@ static void draw_footer(ImDrawList *dl)
             s_foot_attn ? col(T->attn) : col(T->hint), s_foot_keys, 0.888f * LY.cw);
 }
 
+/* The grid behind the page: the title's 16 x 16 tile (a line along its top
+ * and left) over the rows' region, a texel to the pixels of a 640 x 480
+ * frame scaled to this one; faint. */
+static void draw_grid(ImDrawList *dl)
+{
+    const ArtRect *g = gameart_sprite(AS_GRID);
+    if (!g)
+        return;
+    const float tile = floorf(16.0f * LY.H / 480.0f + 0.5f), y0 = LY.y_rule, y1 = LY.y_foot;
+    const ImU32 c = col(T->edge, 0.13f);
+    dl->PushClipRect(ImVec2(0, y0), ImVec2(LY.W, y1), true);
+    for (float y = y0; y < y1; y += tile)
+        for (float x = 0; x < LY.W; x += tile)
+            dl->AddImage(gameart_tex(), ImVec2(x, y), ImVec2(x + tile, y + tile), ImVec2(g->u0, g->v0),
+                         ImVec2(g->u1, g->v1), c);
+    dl->PopClipRect();
+}
+
+/* The big blue arc of the title's menus: its big_curve picture, from the
+ * left edge under the header, as wide as half the height. */
+static void draw_bigcurve(ImDrawList *dl)
+{
+    const float s = 0.52f * LY.H;
+    spr(dl, AS_BIGCURVE, ImVec2(0, LY.y_rule + 0.0125f * LY.H), ImVec2(s, LY.y_rule + 0.0125f * LY.H + s),
+        col({0xb4, 0xc0, 0xd2}, 0.9f));
+}
+
 /* The big blue arc of the game's menus (its big_curve picture), drawn as a
- * curve for now: from the left edge low on the page, up and to the right
+ * curve when the picture is not there: from the left edge low on the page, up and to the right
  * to the rows' cursor, thick at the edge and thin at the end; a fainter
  * second one under it. */
 static void draw_arc(ImDrawList *dl)
@@ -2870,8 +3135,13 @@ static void draw_header(ImDrawList *dl)
         const float ar = sz * 0.22f, nw = tw(sz, name) + sz * SHEAR * 0.5f, right = LY.cx + 0.944f * LY.cw;
         const float xn = right - ar * 2.8f - nw;
         txt(dl, sz, ImVec2(xn, top_for(cy, sz)), col(T->text_hi), name);
-        arrow_tri(dl, xn - ar * 1.6f, cy, ar, -1, col(T->text_hi));
-        arrow_tri(dl, right - ar * 0.6f, cy, ar, 1, col(T->text_hi));
+        if (art_on()) {
+            arrow_spr(dl, xn - ar * 1.6f, cy, sz * 0.62f, -1, col({255, 255, 255}), T->text_hi);
+            arrow_spr(dl, right - ar * 0.6f, cy, sz * 0.62f, 1, col({255, 255, 255}), T->text_hi);
+        } else {
+            arrow_tri(dl, xn - ar * 1.6f, cy, ar, -1, col(T->text_hi));
+            arrow_tri(dl, right - ar * 0.6f, cy, ar, 1, col(T->text_hi));
+        }
         for (int k = 0; k < 2; k++) {
             const float x0 = k ? right - ar * 2.4f : xn - ar * 3.4f, x1 = k ? right + ar : xn - ar * 0.2f;
             ImGui::SetCursorScreenPos(ImVec2(x0, cy - sz * 0.6f));
@@ -2912,9 +3182,28 @@ static void draw_header(ImDrawList *dl)
             x += w + gap;
         }
         Face up(s_f_body);
-        const char *hint = pad_hints() ? "LB / RB" : "PgUp / PgDn";
-        const float hw = tw(LY.foot, hint);
-        txt(dl, LY.foot, ImVec2(LY.cx + 0.944f * LY.cw - hw, top_for(cy, LY.foot)), col(T->hint), hint);
+        const float right = LY.cx + 0.944f * LY.cw;
+        if (art_on() && pad_hints()) {
+            /* The pad's shoulder buttons, as the title's own prompts draw them. */
+            const int set = (int)xbox_InputGlyphSet();
+            const float k = LY.foot * 1.25f / 30.0f, gap = LY.foot * 0.35f;
+            ArtRect l, r;
+            if (gameart_pad_cell(set, AP_LB, &l) && gameart_pad_cell(set, AP_RB, &r)) {
+                const float x = right - l.w * k - gap - r.w * k;
+                pad_glyph(dl, set, AP_LB, x, cy, k);
+                pad_glyph(dl, set, AP_RB, x + l.w * k + gap, cy, k);
+            }
+        } else if (art_on()) {
+            /* Keys of the keyboard. */
+            const float gap = LY.foot * 0.35f, w1 = key_width(LY.foot, "PgUp"), w2 = key_width(LY.foot, "PgDn");
+            const ImU32 c = col(T->hint);
+            key_cap(dl, right - w1 - gap - w2, cy, LY.foot, "PgUp", c);
+            key_cap(dl, right - w2, cy, LY.foot, "PgDn", c);
+        } else {
+            const char *hint = pad_hints() ? "LB / RB" : "PgUp / PgDn";
+            const float hw = tw(LY.foot, hint);
+            txt(dl, LY.foot, ImVec2(right - hw, top_for(cy, LY.foot)), col(T->hint), hint);
+        }
     }
 }
 
@@ -3048,7 +3337,12 @@ static void build_pages_inner()
     layout_compute(disp);
     /* Dim the game (it stays in sight, paused), and the arc over it. */
     bg->AddRectFilled(ImVec2(0, 0), disp, col(T->scrim, 0.72f));
-    draw_arc(bg);
+    if (art_on()) {
+        draw_grid(bg);
+        draw_bigcurve(bg);
+    } else {
+        draw_arc(bg);
+    }
 
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(disp);
@@ -3360,6 +3654,7 @@ static void build_pages_inner()
     foot_set(pad_hints()
         ? "D-pad  select / change      A  toggle      Y  default      B  close"
         : "Arrows  select / change      Enter  toggle      Del  default      Esc  close");
+    foot_prompts();
     draw_footer(dl);
     ImGui::End();
     ImGui::PopStyleVar(6);

@@ -201,6 +201,49 @@ void xbox_OverlaySetGameFonts(const char *path, uint64_t size, const char *sha25
  * 0 still being prepared: waits up to wait_ms for an answer. */
 int xbox_OverlayGameFontsState(unsigned wait_ms);
 
+/* The title's own menu pictures, for the overlay's sprites (the arrows and
+ * the cursor, the rounded value boxes, the tick bar, the d-pad, the grid and
+ * the big arc behind the rows, the button prompts of the footer): small DXT
+ * images inside a file of the player's install (Burnout 3: Data/Global.txd),
+ * read at run time like the fonts (nothing of them is in this repository or
+ * written to disk), made 4x larger with Super-xBR in memory on a thread of
+ * its own, and drawn through one texture of the overlay's. The file must be
+ * `size` bytes with this SHA-256; else, or when it cannot be read, the overlay
+ * keeps the look it has without them (drawn shapes, text), quietly. A sprite
+ * is `w` x `h` texels of DXT5 (dxt 5) or DXT1 (dxt 1), blocks in rows, from
+ * `off` in the file. `sprites` has XBOX_OVERLAY_ART_COUNT entries, in the
+ * order of the enum. Call once, after xbox_OverlaySetPadSheets, before or
+ * after the window. RECOMP_OVERLAY_GAME_ART=0 keeps the drawn look. */
+enum {
+    XBOX_OVERLAY_ART_ARROW,        /* 64x32: up triangle, left triangle, the tick */
+    XBOX_OVERLAY_ART_BUTTONS,      /* 128x64: the prompt sheet (B A X Y, white, black, L, R) */
+    XBOX_OVERLAY_ART_DPAD,         /* 32x16: down and right triangles */
+    XBOX_OVERLAY_ART_GRID,         /* 16x16: a line along the top and the left */
+    XBOX_OVERLAY_ART_BIG_CURVE,    /* 128x128: the arc */
+    XBOX_OVERLAY_ART_BOX_CURVE,    /* 32x32: a box's rounded corner, outline and shade */
+    XBOX_OVERLAY_ART_BOX_CURVE_B,  /* 32x32: the same corner as a filled shape */
+    XBOX_OVERLAY_ART_CURVE16,      /* 16x16: the small corner */
+    XBOX_OVERLAY_ART_CURVE16_B,
+    XBOX_OVERLAY_ART_COUNT
+};
+typedef struct {
+    uint32_t off, w, h, dxt;
+} xbox_overlay_sprite;
+void xbox_OverlaySetGameArt(const char *path, uint64_t size, const char *sha256_hex,
+                            const xbox_overlay_sprite *sprites);
+/* 1 the pictures are in use, -1 they are not (none named, another file), 0
+ * still being prepared: waits up to wait_ms for an answer. */
+int xbox_OverlayGameArtState(unsigned wait_ms);
+
+/* The button prompts the title draws for each pad (nv2a_texrep.h; the
+ * title's Buttons sheet with the port's own drawings over it): variants[v - 1]
+ * is the sheet for glyph set v of pad_glyphs.h (v >= 1; set 0 is the title's
+ * own sheet, in the file above). The footer shows the prompts of the pad in
+ * use from these. The images and rectangles must stay valid (static tables).
+ * Call before xbox_OverlaySetGameArt. */
+struct nv2a_texrep_variant;
+void xbox_OverlaySetPadSheets(const struct nv2a_texrep_variant *variants, unsigned n);
+
 /* The "Check for updates" row of the Advanced page (xbox_update.h): the
  * GitHub repository the port's releases are published in ("owner/name") and
  * the running version ("0.1.0"). Without this call, or on a build that

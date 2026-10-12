@@ -425,6 +425,32 @@ Roboto is made by `third_party/roboto_condensed/make_subset.py` from
 google/fonts' variable `RobotoCondensed[wght].ttf` (checked by SHA-256),
 pinned to wght 500.
 
+### The title's own sprites and prompts
+
+The same way, a port can name small DXT images inside a file of the
+player's install (`xbox_OverlaySetGameArt`, `xbox_settings.h`: offsets and
+sizes, the file's size and SHA-256; Burnout 3 names nine sprites of
+`Data/Global.txd`): the up and left triangles and the tick of `Arrow`, the
+`dpad` triangles, a rounded box's corner (`box_curve`, `16_curve` and their
+`b` shapes), the `grid` tile, `big_curve` and the `Buttons` sheet. A thread
+(`overlay_gameart.cpp`) reads and checks the file, decodes the sprites,
+makes them 4x larger with Super-xBR and packs them into two RGBA textures
+(one for the sprites, one for the prompt sheet of each of the nine glyph
+sets) that Dear ImGui's backends upload like the font atlas; nothing is
+written anywhere. They draw the cursor before the selected row, the arrows
+beside a value and the page name, the value boxes (corners from the
+sprites, sides plain, #101820 at 85% with a #385870 outline), the tick bar of
+a percentage or scale row, the grid and the arc behind the rows, and the
+footer: B Back, Y Default, the d-pad Change, A Select, as the buttons of the
+pad in use (`xbox_OverlaySetPadSheets`: the port's per-set sheets, the
+same images and rectangles it hands `nv2a_texrep`, over the title's own
+`Buttons` sheet; `input.glyphs` and the active pad decide the set), or key
+caps (Esc, Del, Arrows, Enter) when the last input was the keyboard; the
+shoulder prompts sit beside the page names. The Mixer page and the folder
+browser keep their text footer. No file or another file: the overlay draws
+its own shapes and text as before (a log line, nothing on screen).
+`RECOMP_OVERLAY_GAME_ART=0` forces that look.
+
 ### The title's own fonts
 
 A port can name two bitmap fonts inside its title's executable

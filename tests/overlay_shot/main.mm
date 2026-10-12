@@ -11,6 +11,8 @@
 #include "overlay_metal.h"
 #include "xbox_settings.h"
 #include "apu_bus.h"
+#include "nv2a_texrep.h"
+#include "pad_glyphs.h"
 
 #import <Metal/Metal.h>
 #include <SDL.h>
@@ -1027,6 +1029,69 @@ static void game_font_from_env(void)
     CHECK(got == want);
 }
 
+/* The title's menu sprites (xbox_OverlaySetGameArt) and its prompt sheets.
+ * OVERLAY_SHOT_GAME_ART="<file>;<size>;<sha256>;<off>,<w>,<h>,<dxt>;..." with one
+ * <off>,<w>,<h>,<dxt> for each of the nine sprites of the enum, as a port
+ * names them; OVERLAY_SHOT_GAME_ART_EXPECT=0 expects a refusal.
+ * OVERLAY_SHOT_PAD_SHEETS=<dir> holds set1.argb ... set8.argb (128x64 words
+ * A8R8G8B8, the port's drawings for glyph sets 1..8); set 5 replaces only the
+ * lower rectangles (the Xbox pads print A B X Y as the title does), the others
+ * the whole sheet, as a port's table does. OVERLAY_SHOT_GLYPHS=<mode> sets
+ * input.glyphs (xbox_modern, playstation ...). Nothing of a title is in this tool. */
+static uint32_t s_pad_img[8][128 * 64];
+static const nv2a_texrep_rect k_pad_all[] = { { 0, 0, 128, 64 } };
+static const nv2a_texrep_rect k_pad_lower[] = { { 0, 30, 62, 34 }, { 62, 29, 18, 35 }, { 80, 29, 48, 35 } };
+static struct nv2a_texrep_variant s_pad_var[8];
+static void game_art_from_env(void)
+{
+    const char *g = getenv("OVERLAY_SHOT_GLYPHS");
+    if (g && g[0])
+        xbox_InputSetGlyphMode(xbox_GlyphModeFromName(g));
+    const char *dir = getenv("OVERLAY_SHOT_PAD_SHEETS");
+    if (dir && dir[0]) {
+        for (int i = 0; i < 8; i++) {
+            char path[1100];
+            snprintf(path, sizeof path, "%s/set%d.argb", dir, i + 1);
+            FILE *f = fopen(path, "rb");
+            const bool ok = f && fread(s_pad_img[i], sizeof s_pad_img[i], 1, f) == 1;
+            if (f) fclose(f);
+            CHECK(ok);
+            s_pad_var[i].image = s_pad_img[i];
+            s_pad_var[i].rects = i == 4 ? k_pad_lower : k_pad_all;
+            s_pad_var[i].n_rects = i == 4 ? 3 : 1;
+        }
+        xbox_OverlaySetPadSheets(s_pad_var, 8);
+    }
+    const char *e = getenv("OVERLAY_SHOT_GAME_ART");
+    if (!e || !e[0])
+        return;
+    char path[1024], sha[80];
+    unsigned long long size = 0;
+    xbox_overlay_sprite sp[XBOX_OVERLAY_ART_COUNT];
+    memset(sp, 0, sizeof sp);
+    const char *p = strchr(e, ';');
+    if (!p || (size_t)(p - e) >= sizeof path) { CHECK(!"OVERLAY_SHOT_GAME_ART"); return; }
+    memcpy(path, e, (size_t)(p - e));
+    path[p - e] = 0;
+    int used = 0;
+    if (sscanf(p + 1, "%llu;%64[0-9a-fA-F]%n", &size, sha, &used) != 2) { CHECK(!"OVERLAY_SHOT_GAME_ART"); return; }
+    p += 1 + used;
+    for (int i = 0; i < XBOX_OVERLAY_ART_COUNT; i++) {
+        int n = 0;
+        if (sscanf(p, ";%x,%u,%u,%u%n", &sp[i].off, &sp[i].w, &sp[i].h, &sp[i].dxt, &n) != 4) {
+            CHECK(!"OVERLAY_SHOT_GAME_ART");
+            return;
+        }
+        p += n;
+    }
+    xbox_OverlaySetGameArt(path, size, sha, sp);
+    const char *x = getenv("OVERLAY_SHOT_GAME_ART_EXPECT");
+    const int want = x && x[0] == '0' ? -1 : 1;
+    const int got = xbox_OverlayGameArtState(20000);
+    fprintf(stderr, "game art: %d\n", got);
+    CHECK(got == want);
+}
+
 /* The folder browser on folders named in Hungarian, Russian and Greek:
  * the game's letters where it has them, the fallback's for the rest. */
 static void browser_utf8_shot(const char *pre)
@@ -1097,6 +1162,7 @@ int main(int argc, char **argv)
     q = [dev newCommandQueue];
     xbox_OverlaySetWindow(win);
     game_font_from_env();
+    game_art_from_env();
     xbox_BugReportSetMaker(fake_report);
     /* A port with a music folder (BO-108): its row is the Audio page's
      * first, and every tour below goes down that page as a port has it. */

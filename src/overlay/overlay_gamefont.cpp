@@ -47,7 +47,7 @@ static void rgb565(uint16_t c, uint8_t out[3])
 }
 
 /* DXT5 (BC3), blocks in rows, to A8R8G8B8 with straight alpha. */
-static void dxt5_decode(const uint8_t *src, int w, int h, uint32_t *dst)
+void gf_dxt5_decode(const uint8_t *src, int w, int h, uint32_t *dst)
 {
     for (int by = 0; by < h; by += 4)
         for (int bx = 0; bx < w; bx += 4, src += 16) {
@@ -121,7 +121,7 @@ static bool font_make(const uint8_t *file, uint64_t size, const xbox_overlay_bit
     out.base = (H->second.yo + H->second.h) * d.h / tall;
 
     std::vector<uint32_t> rgba((size_t)d.w * d.h);
-    dxt5_decode(file + d.tex_off, (int)d.w, (int)d.h, rgba.data());
+    gf_dxt5_decode(file + d.tex_off, (int)d.w, (int)d.h, rgba.data());
     /* The letters are white on clear: their alpha is all there is. White
      * under every texel so the scaler sees one colour. */
     for (uint32_t &p : rgba)
@@ -138,16 +138,17 @@ static bool font_make(const uint8_t *file, uint64_t size, const xbox_overlay_bit
     return true;
 }
 
-static int load_thread(void *)
+/* The file whole, when it is `size` bytes with this SHA-256 (lower-case hex);
+ * else NULL and the reason. Free it with free(). */
+uint8_t *gf_read_verified(const char *path, uint64_t size, const char *sha_hex, const char **why_out)
 {
-    const uint32_t t0 = SDL_GetTicks();
     const char *why = NULL;
     uint8_t *file = NULL;
-    SDL_RWops *rw = SDL_RWFromFile(s_job.path, "rb");
+    SDL_RWops *rw = SDL_RWFromFile(path, "rb");
     Sint64 n = rw ? SDL_RWsize(rw) : -1;
     if (!rw)
         why = "not readable";
-    else if (n <= 0 || (uint64_t)n != s_job.size)
+    else if (n <= 0 || (uint64_t)n != size)
         why = "another size";
     else if (!(file = (uint8_t *)malloc((size_t)n)) || SDL_RWread(rw, file, 1, (size_t)n) != (size_t)n)
         why = "not readable";
@@ -161,9 +162,23 @@ static int load_thread(void *)
         xr_sha256_update(&h, file, (size_t)n);
         xr_sha256_final(&h, dg);
         xr_sha256_hex(dg, hex);
-        if (strcmp(hex, s_job.sha))
+        if (strcmp(hex, sha_hex))
             why = "another version (SHA-256)";
     }
+    if (why) {
+        free(file);
+        file = NULL;
+    }
+    *why_out = why;
+    return file;
+}
+
+static int load_thread(void *)
+{
+    const uint32_t t0 = SDL_GetTicks();
+    const char *why = NULL;
+    uint8_t *file = gf_read_verified(s_job.path, s_job.size, s_job.sha, &why);
+    const Sint64 n = (Sint64)s_job.size;
     for (int i = 0; !why && i < GF_COUNT; i++)
         if (!font_make(file, (uint64_t)n, s_job.f[i], s_gf[i]))
             why = "no font where expected";

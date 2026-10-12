@@ -42,6 +42,12 @@ struct GameFont {
 int gamefont_state();
 const GameFont *gamefont(int which);
 
+/* Shared with the game's pictures (overlay_gameart.cpp): the file whole when
+ * it is `size` bytes with this SHA-256 (lower-case hex), else NULL and why;
+ * a DXT5 (BC3) image to A8R8G8B8 with straight alpha. */
+uint8_t *gf_read_verified(const char *path, uint64_t size, const char *sha_hex, const char **why);
+void gf_dxt5_decode(const uint8_t *src, int w, int h, uint32_t *dst);
+
 /* The loader: ImFontConfig.FontData is the GameFont, FontDataSize 1,
  * FontDataOwnedByAtlas false. Its size is the cell's height; a merged one
  * (ExtraSizeScale) sits on the first one's baseline. */
