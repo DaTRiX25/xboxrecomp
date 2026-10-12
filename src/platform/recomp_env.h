@@ -141,6 +141,7 @@ extern "C" {
     X(AUDIO_MIXER,       CONFIG, "RECOMP_AUDIO_MIXER",       NULL, "the host mixer (buses over the title's voices): off (default), on") \
     X(AUDIO_MIXER_FILE,  CONFIG, "RECOMP_AUDIO_MIXER_FILE",  NULL, "the mixer's preset file (default: mixer.toml beside settings.toml)") \
     X(AUDIO_FX_LEVEL,    CONFIG, "RECOMP_AUDIO_FX_LEVEL",    NULL, "5.1: level of the title's effect-send bins, 0..1 (default 0.25)") \
+    X(AUDIO_LFE_LOWPASS, CONFIG, "RECOMP_AUDIO_LFE_LOWPASS", NULL, "low-pass on the LFE (subwoofer) feed of a title whose effects image is modelled: 120 (default: what the console's Dolby Digital encoder did), 100, 80, or off (the full-range feed)") \
     X(AUDIO_MUSIC_DIR,   CONFIG, "RECOMP_AUDIO_MUSIC_DIR",   NULL, "audio.custom_music_dir: a folder of the user's music (mp3, flac, ogg, wav) offered to the title as Xbox custom soundtracks, for a title that plays them (xbox_soundtrack.h); default empty, off") \
     X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \
     X(AUDIO_BUF_COUNT,   CONFIG, "RECOMP_AUDIO_BUF_COUNT",   NULL, "audio output buffer count") \

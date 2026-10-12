@@ -67,11 +67,17 @@ int mcpx_apu_speaker_test_playing(int *via_map);
 void mcpx_apu_set_fx_bins(uint32_t mask);
 void mcpx_apu_set_fx_level(float level);
 
-/* 5.1: bin passes through the biquad EQ the title's GP effects image runs
- * on it, its coefficients read live from GP scratch memory at
- * scratch_offset (b0 b1 b2 a1 a2, s24, halved; apu_dsp.c). Stereo does not
- * use it. Call before mcpx_apu_init_standalone. */
-void mcpx_apu_set_bin_eq(int bin, uint32_t scratch_offset);
+/* A title whose GP effects image has been read wires it with apu_gp.h
+ * (apu_gp_direct, _eq, _drive, _export, before mcpx_apu_init_standalone):
+ * the speaker feeds then come from that model of the image, in 5.1 and in
+ * stereo, and the calls above (speaker map, effect-send level) are not
+ * used. */
+
+/* The low-pass on the LFE feed of such a title (RECOMP_AUDIO_LFE_LOWPASS,
+ * audio.lfe_lowpass: off, 80, 100, 120 Hz; the settings file or the
+ * variable, no overlay row; a change is faded over 21 ms). The
+ * title's wiring sets it until this or the variable does. Any thread. */
+void mcpx_apu_set_lfe_lowpass(int hz);
 
 /* The speaker map in use (mcpx_apu_set_speaker_map, or the default). */
 void mcpx_apu_speaker_map_get(int8_t map[32]);

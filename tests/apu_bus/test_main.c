@@ -631,6 +631,53 @@ static void test_pan(void)
     apu_bus_set_config(&cfg);
 }
 
+/* A voice's bus: what the classifier is told about a return voice (one
+ * playing the GP model's export, apu_gp.h), and the answer for a voice that
+ * is only the input of an in-place effect. */
+static int s_seen_return;
+static int classify_return(const apu_bus_voice *v)
+{
+    s_seen_return = v->gp_return;
+    if (v->gp_return == 1 + 17) return 4;           /* Player engine */
+    if (v->gp_return == 1 + 18) return 5;           /* Player exhaust */
+    for (int b = 0; b < 8; b++)
+        if (v->bins[b] == 17) return APU_BUS_BYPASS;
+    return 99;                                      /* not a bus: "Other" */
+}
+static int fill_return(void *ctx, apu_bus_voice *v)
+{
+    const int *what = (const int *)ctx;
+    v->gp_return = what[0];
+    v->bins[5] = (uint8_t)what[1];
+    return 1;
+}
+
+static void test_return_voices(void)
+{
+    int engine[2] = { 1 + 17, 19 }, exhaust[2] = { 1 + 18, 19 };
+    int feeder[2] = { 0, 17 }, plain[2] = { 0, 19 };
+
+    apu_bus_set_classifier(classify_return);
+    apu_bus_reclassify();
+    CHECK(apu_bus_voice_bus(68, 1, 0xBB8300, fill_return, engine) == 4 && s_seen_return == 18,
+          "the return voice of bin 17 is not the engine bus");
+    CHECK(apu_bus_voice_bus(69, 1, 0xBB8380, fill_return, exhaust) == 5,
+          "the return voice of bin 18 is not the exhaust bus");
+    CHECK(apu_bus_voice_bus(70, 1, 0x100000, fill_return, feeder) == APU_BUS_BYPASS,
+          "an effect's input voice does not bypass the buses");
+    /* Cached: not asked again for the same voice, serial and buffer. */
+    s_seen_return = -1;
+    CHECK(apu_bus_voice_bus(70, 1, 0x100000, fill_return, plain) == APU_BUS_BYPASS && s_seen_return == -1,
+          "a bypassed voice was classified again");
+    CHECK(apu_bus_voice_bus(71, 1, 0x200000, fill_return, plain) == 12,
+          "an answer that is no bus is not Other");
+    apu_bus_set_classifier(NULL);
+    apu_bus_reclassify();
+}
+
+#include <unistd.h>
+#include "audition.inc"
+
 int main(void)
 {
     dsp_setup();
@@ -641,7 +688,10 @@ int main(void)
     test_duck();
     test_preset();
     test_pan();
-    /* And once more after everything else ran: neutral is still today. */
+    test_return_voices();
+    test_audition();
+    /* And once more after everything else ran, now with the audition
+     * recording on: neutral is still today. */
     test_identity();
     if (s_fail) { fprintf(stderr, "%d check(s) failed\n", s_fail); return 1; }
     puts("PASS: the neutral mixer is bit-identical; controls, output stage, ducking and presets as specified.");

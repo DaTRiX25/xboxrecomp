@@ -61,6 +61,7 @@ static const char *const k_vibration[] = { "auto", "controller", "device", "off"
 static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
 static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
+static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
 static const char *const k_timing[]   = { "legacy", "auto", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
@@ -122,6 +123,10 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_GRAPHICS_VEHICLE_DETAIL] = SETTING("graphics.vehicle_detail", XS_CHOICE, 0, RENV_GFX_VEHICLE_DETAIL, k_vehicle_detail, NULL, 0, 0, 0),
     /* The title's button prompts for the pad in use (pad_glyphs.h). */
     [XS_INPUT_GLYPHS]       = SETTING("input.glyphs", XS_CHOICE, 0, RENV_INPUT_GLYPHS, k_glyphs, NULL, 0, 0, 0),
+    /* The LFE feed's low-pass where the title's effects image is modelled
+     * (apu_gp.h): 120 Hz is what the console's AC-3 encoder did after the
+     * GP stage; off is the GP stage's own full-range feed. Live. */
+    [XS_AUDIO_LFE_LOWPASS]  = SETTING("audio.lfe_lowpass", XS_CHOICE, 0, RENV_AUDIO_LFE_LOWPASS, k_lfe_lowpass, NULL, 0, 0, 3),
     /* When frames are presented (present_cadence.h, BO-115): legacy is
      * "when ready", as before; auto aims each frame at one refresh. Taken
      * while running (the presenter looks twice a second). */
@@ -370,6 +375,9 @@ static void apply(xs_id id)
         break;
     case XS_AUDIO_MIXER:
         apu_bus_enable(v != 0.0);
+        break;
+    case XS_AUDIO_LFE_LOWPASS:
+        mcpx_apu_set_lfe_lowpass(atoi(k_lfe_lowpass[(int)v]));
         break;
     case XS_INPUT_DEADZONE:
         xbox_InputSetDeadzone((int)v);

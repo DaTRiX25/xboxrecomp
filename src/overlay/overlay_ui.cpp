@@ -36,6 +36,7 @@
 extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include "apu.h"                /* the speaker test */
 #include "apu_bus.h"            /* the Mixer page */
+#include "apu_gp.h"             /* is the title's effects image modelled */
 #include "xbox_soundtrack.h"    /* the music folder browser's model (xsb_*) */
 
 #include <math.h>
@@ -137,6 +138,7 @@ static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL 
 static const char *const n_lod[]       = { "Off", "Auto (from the render scale)", "-0.5", "-1.0", "-1.5", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
+static const char *const n_lfe_lowpass[] = { "Off", "80 Hz", "100 Hz", "120 Hz", NULL };
 #if defined(__ANDROID__)
 static const char *const n_vibration[] = { "Auto", "Controller", "This device", "Off", NULL };
 #endif
@@ -190,13 +192,14 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For a display wider than 16:9, with Aspect at 16:9: the race is drawn for the whole width (more to see at the sides, nothing stretched). Menus, loading screens and videos keep their 16:9 shape in the middle. Window follows the window's or the screen's own shape. A change shows from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
     /* XS_GRAPHICS_BLOOM */     { "Bloom", "The game's own soft glow over the picture, strongest while boosting. On is the original look; off skips its three extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "The game's own blur: the streaks towards the edges of the picture at speed and while boosting. On is the original look; off skips its two extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_CRASH_60FPS */ { "60 fps crash cameras", "The game halves its frame rate to 30 in its crash and takedown cameras. On: they run at 60 like the rest of the race, at the same game speed. Off is the original. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_SPLIT_60FPS */ { "60 fps split screen", "The game runs two-player split screen at 30 frames a second. On: it runs at 60, at the same game speed; the scene is drawn twice a frame, so it needs a fast enough device. Off is the original. A change shows from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_CRASH_60FPS */ { "60 fps crash cameras", "The game halves its frame rate to 30 in its crash and takedown cameras. On: they run at 60 like the rest of the race. For strong machines: where 60 fps cannot be held, the game itself runs slower while this is on, not just the picture. Leave it off on a Steam Deck and other handhelds. Off is the original. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_SPLIT_60FPS */ { "60 fps split screen", "The game runs two-player split screen at 30 frames a second. On: it runs at 60, with the scene drawn twice a frame. For strong machines: where 60 fps cannot be held, the game itself runs slower while this is on, not just the picture. Leave it off on a Steam Deck and other handhelds. Off is the original. A change shows from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_SPLIT_MUSIC */  { "Music in split screen", "The game plays no music in two-player split screen. On: EA GAMES TRAX or your custom music plays in two-player Race and Road Rage as in a one-player race. Off is the original. A change shows from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto: -0.5 at 2x, -1.0 at 4x. Off is the original. Changes at once.", 1, FMT_PLAIN, n_lod, 0 },
     /* XS_GRAPHICS_DITHER */    { "Dither", "A faint noise in the final scale to the window that hides the stripes in smooth gradients such as the sky. Metal only for now. Off is the original; text and HUD at the exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_VEHICLE_DETAIL */ { "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Original is the console's distances; Far doubles them, Farthest is four times. Costs GPU time when many vehicles are on screen. Scenery, the track and where traffic appears are not changed. Changes at once.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
     /* XS_INPUT_GLYPHS */       { "Button prompts", "The buttons the game shows in its menus and hints. Auto follows the controller that was last used. Xbox (original) is the game's own picture: white and black buttons, L and R. The game's text and videos still name the Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
+    /* XS_AUDIO_LFE_LOWPASS */  { "Subwoofer low-pass (LFE)", "120 Hz is what the console's Dolby Digital encoder did; Off sends the full-range LFE feed.", 1, FMT_PLAIN, n_lfe_lowpass, 0 },
     /* XS_DISPLAY_PRESENT_TIMING */ { "Frame presentation", "When a finished frame is handed to the display. Legacy: as soon as it is ready. Auto: every frame is aimed at one refresh of the display, so each stays on the screen for the same time, and sooner after it was drawn: on a fixed 60/120/240 Hz display the game's clock follows the display; with variable refresh (VRR, ProMotion) frames are presented at even times. The performance overlay shows the result (the on-glass line).", 1, FMT_PLAIN, n_timing, 0 },
     /* XS_ADVANCED_PERF_STEPS */ { "Graph: simulation steps", "The frame-time graph also marks the frames in which the game ran more than one simulation step (it does when its frame rate drops).", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
@@ -449,7 +452,12 @@ static int page_rows(int page, Row *r)
         break;
     case P_AUDIO:
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
-        SET(XS_AUDIO_FX_LEVEL);
+        /* The dry effect sends' level: only where no model of the title's
+         * effects image runs (apu_gp.h); with one they are not dry. */
+        if (!apu_gp_wired())
+            SET(XS_AUDIO_FX_LEVEL);
+        /* audio.lfe_lowpass has no row: the stock 120 Hz is the console's,
+         * and the Mixer page has its own LFE low-pass for tuning. */
         if (apu_bus_count() > 0)
             ACT(A_MIXER, "Mixer: buses, sends, LFE, limiter, meters");
         if (recomp_patch_enabled(xbox_SettingGet(XS_AUDIO_SPLIT_MUSIC)->key))
@@ -827,6 +835,21 @@ static void clear_nav()
     s_activate = s_back = s_page_delta = s_reset = 0;
 }
 
+/* The title is paused while the overlay is open, except on the Mixer page:
+ * a mix is set by ear, so there the game keeps running and sounding (its
+ * input still held: the car coasts). Called wherever either changes. */
+static void pause_sync()
+{
+    static int applied = -1;
+    int want = s_open && !s_mx_open;
+    if (want != applied) {
+        applied = want;
+        xbox_HostPause(want);
+        if (s_open)
+            fprintf(stderr, LOGP "%s\n", want ? "the title is paused" : "Mixer page: the title runs while it is open");
+    }
+}
+
 static void set_open(bool on)
 {
     if (on == s_open)
@@ -836,7 +859,7 @@ static void set_open(bool on)
     if (on) {
         s_scroll_to_sel = true;
         xbox_InputSetBlocked(1);
-        xbox_HostPause(1);
+        pause_sync();
         fprintf(stderr, LOGP "open: the title is paused, its input is held\n");
     } else {
         /* A build beside a running title would cost it frames: it stops
@@ -851,7 +874,7 @@ static void set_open(bool on)
         }
         mcpx_apu_speaker_test(-1, 0);
         xsb_close();
-        xbox_HostPause(0);
+        pause_sync();
         xbox_InputSetBlocked(0);
         xbox_SettingsFlush();
         s_save_pending = false;
@@ -1179,6 +1202,7 @@ void xbox_OverlayPoll(void)
     /* B or Esc: here and not in the frame, so a window that cannot present
      * (minimised) still closes. */
     mx_poll();
+    pause_sync();
     if (s_back > 0) {
         s_back = 0;
         if (s_open && s_mx_open) {
@@ -1195,6 +1219,7 @@ void xbox_OverlayPoll(void)
         } else if (s_open)
             set_open(false);
     }
+    pause_sync();
 
     /* The fullscreen setting, when it changes. */
     if (s_win) {

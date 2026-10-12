@@ -5,13 +5,12 @@
  * processing (reverb, chorus, etc.) and final output encoding. The full
  * DSP is ~3000 lines of DSP56300 emulation code.
  *
- * For initial audio, we bypass the DSP entirely:
- * - VP mixbins are passed directly to the EP output
- * - GP effects processing is skipped
- * - The EP just copies mixbin 0/1 (front L/R) to the monitor buffer
- *
- * This gives us basic voice playback without effects. The DSP can be
- * connected later for reverb, EQ, and other processing.
+ * No DSP56300 runs here. The mixbins reach the output one of two ways:
+ * - a title that wired a model of its GP effects image (apu_gp.h): the
+ *   model's six speaker feeds, with its sends, in-place effects and the
+ *   export its return voices play
+ * - any other title: every bin folded to a speaker with the effects
+ *   bypassed (apu_speakers.c in 5.1, even/odd bins in stereo)
  *
  * Copyright (c) 2012 espes
  * Copyright (c) 2019-2025 Matt Borgerson
@@ -64,6 +63,9 @@
  */
 #define APU_DSP_ACK_MAX 8
 #define GP_DOORBELL_OFFSET 0x810u
+/* A command to the title's GP image, as modelled (apu_gp.h; below). */
+static void gp_command(MCPXAPUState *d, const uint32_t *doorbell);
+
 static uint32_t s_dsp_ack[APU_DSP_ACK_MAX];
 static int s_dsp_ack_count = -1;
 static int s_dsp_ack_auto;                /* =auto: derive from GPSADDR */
@@ -151,6 +153,7 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
             if (shown++ < 3)
                 fprintf(stderr, "[APU] DSP doorbell (auto): command 0x%08X"
                                 " acknowledged\n", *slot);
+            gp_command(d, slot);
             *slot = 0;
         }
     }
@@ -161,6 +164,7 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
             if (shown[i]++ < 3)
                 fprintf(stderr, "[APU] DSP doorbell 0x%08X: command 0x%08X"
                                 " acknowledged\n", s_dsp_ack[i], *slot);
+            gp_command(d, slot);
             *slot = 0;
         }
     }
@@ -229,35 +233,6 @@ void mcpx_apu_set_fx_level(float level)
     s_fx_level = level < 0.0f ? 0.0f : level > 1.0f ? 1.0f : level;
 }
 
-/* The title's GP EQs, 5.1 only. A bin set with mcpx_apu_set_bin_eq passes
- * through the biquad its effects image applies to it, with the
- * coefficients the title keeps in GP scratch memory: five s24 words, b0 b1
- * b2 a1 a2, stored halved,
- *
- *     y[n] = 2 (b0 x[n] + b1 x[n-1] + b2 x[n-2] + a1 y[n-1] + a2 y[n-2])
- *
- * -- the form in which Burnout 3's image defaults (0x400000 0xAD7746
- * 0x23434C 0x5288B9 0xDCBCB3) are exactly unity. The title rewrites them
- * while it runs (DirectSound's SetEffectData lands in the scratch copy the
- * GP's DMA loads from), so they are read again every EP period; the GP's
- * memory itself is not emulated. On the APU frame thread, 32 samples a bin
- * a frame. */
-#define EQ_NONE 0xFFFFFFFFu
-static uint32_t s_eq_off[NUM_MIXBINS];
-static int s_eq_any;
-static struct { float c[5]; float x1, x2, y1, y2; int bypass; } s_eq[NUM_MIXBINS];
-
-void mcpx_apu_set_bin_eq(int bin, uint32_t scratch_offset)
-{
-    if (!s_eq_any)
-        for (int b = 0; b < NUM_MIXBINS; b++)
-            s_eq_off[b] = EQ_NONE;
-    if (bin < 0 || bin >= NUM_MIXBINS)
-        return;
-    s_eq_off[bin] = scratch_offset;
-    s_eq_any = 1;
-}
-
 /* A dword of GP scratch, through the GPSADDR scatter-gather table (8 bytes
  * an entry, the page's physical address first, as xemu's scratch_rw walks
  * it). 0 with the table not set up yet. */
@@ -272,52 +247,101 @@ static uint32_t gp_scratch_word(MCPXAPUState *d, uint32_t off)
     return *(const uint32_t *)(mcpx_apu_phys(page) + (off & 0xFFF));
 }
 
-static float s24f(uint32_t v)
+/* ── the title's GP effects image, modelled (apu_gp.h) ───────────────────
+ *
+ * A title that wired its image (apu_gp_direct / _eq / _drive / _export)
+ * gets its speaker feeds from that model instead of the fold below: its
+ * commands load the model's effect states as they load the DSP's, and the
+ * model's export lands in the same guest memory the GP program writes, so
+ * the title's own voices can play it back. */
+#include "apu_gp.h"
+
+static uint32_t gp_mem_read(void *ctx, uint32_t off)
 {
-    v &= 0xFFFFFF;
-    return (float)((int32_t)(v << 8) >> 8) / 8388608.0f;
+    return gp_scratch_word((MCPXAPUState *)ctx, off);
 }
 
-static void eq_read(MCPXAPUState *d)
+/* n dwords into GP scratch at off, a page at a time; pages the table does
+ * not map yet are skipped. */
+static void gp_mem_write(void *ctx, uint32_t off, const uint32_t *words, int n)
 {
-    static int logged;
-    for (int b = 0; b < NUM_MIXBINS; b++) {
-        float c[5], c1, c2;
-        if (s_eq_off[b] == EQ_NONE)
-            continue;
-        for (int k = 0; k < 5; k++)
-            c[k] = 2.0f * s24f(gp_scratch_word(d, s_eq_off[b] + 4 * k));
-        /* 1 - c1 z^-1 - c2 z^-2 must have its poles inside the circle. */
-        c1 = c[3];
-        c2 = c[4];
-        s_eq[b].bypass = !(c2 > -1.0f && c2 < 1.0f && fabsf(c1) < 1.0f - c2);
-        if (s_eq[b].bypass && logged++ < 4)
-            fprintf(stderr, "[APU] bin %d EQ %.4f %.4f %.4f / %.4f %.4f is not"
-                            " stable: passed through\n", b, c[0], c[1], c[2], c1, c2);
-        memcpy(s_eq[b].c, c, sizeof(c));
+    MCPXAPUState *d = (MCPXAPUState *)ctx;
+    uint32_t sge = qatomic_read(&d->regs[NV_PAPU_GPSADDR]);
+
+    if (!sge || !d->ram_ptr)
+        return;
+    while (n > 0) {
+        uint32_t in_page = (0x1000u - (off & 0xFFF)) / 4u, page;
+        int k = n < (int)in_page ? n : (int)in_page;
+        if ((off >> 12) > d->regs[NV_PAPU_GPSMAXSGE])
+            return;
+        page = *(const uint32_t *)mcpx_apu_phys(sge + (off >> 12) * 8);
+        if (page && !(page & 0xFFF))
+            memcpy(mcpx_apu_phys(page) + (off & 0xFFF), words, (size_t)k * 4u);
+        off += (uint32_t)k * 4u;
+        words += k;
+        n -= k;
     }
 }
 
-static void eq_run(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+/* RECOMP_AUDIO_LFE_LOWPASS (audio.lfe_lowpass): the user's low-pass on
+ * the model's LFE feed. < 0: not set, the title's wiring stands. Followed
+ * every frame, since the model takes a change only between fades. */
+static volatile int s_lfe_user = -2;    /* -2: the variable not read yet */
+
+void mcpx_apu_set_lfe_lowpass(int hz)
 {
-    for (int b = 0; b < NUM_MIXBINS; b++) {
-        float *x = mixbins[b];
-        if (s_eq_off[b] == EQ_NONE || s_eq[b].bypass)
-            continue;
-        const float b0 = s_eq[b].c[0], b1 = s_eq[b].c[1], b2 = s_eq[b].c[2];
-        const float a1 = s_eq[b].c[3], a2 = s_eq[b].c[4];
-        float x1 = s_eq[b].x1, x2 = s_eq[b].x2, y1 = s_eq[b].y1, y2 = s_eq[b].y2;
-        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            float y = b0 * x[i] + b1 * x1 + b2 * x2 + a1 * y1 + a2 * y2;
-            x2 = x1; x1 = x[i];
-            y2 = y1; y1 = y;
-            x[i] = y;
-        }
-        /* Denormals in a silent tail cost more than they are worth. */
-        if (fabsf(y1) < 1e-20f) y1 = 0.0f;
-        if (fabsf(y2) < 1e-20f) y2 = 0.0f;
-        s_eq[b].x1 = x1; s_eq[b].x2 = x2; s_eq[b].y1 = y1; s_eq[b].y2 = y2;
+    s_lfe_user = hz <= 0 ? 0 : hz < 40 ? 40 : hz > 250 ? 250 : hz;
+}
+
+static void gp_follow_lfe(void)
+{
+    int want = s_lfe_user;
+    if (want == -2) {
+        const char *e = recomp_env(RENV_AUDIO_LFE_LOWPASS);
+        if (e && *e)
+            mcpx_apu_set_lfe_lowpass(atoi(e));     /* "off" reads as 0 */
+        else
+            s_lfe_user = -1;
+        want = s_lfe_user;
     }
+    if (want >= 0 && apu_gp_lfe_lowpass_hz() != want)
+        apu_gp_lfe_lowpass(want);
+}
+
+/* A command about to be acknowledged: its block is the five dwords before
+ * the doorbell (GP scratch 0x800..0x80C). */
+static void gp_command(MCPXAPUState *d, const uint32_t *doorbell)
+{
+    apu_gp_mem m = { gp_mem_read, gp_mem_write, d };
+    if (apu_gp_wired())
+        apu_gp_command(&m, doorbell[0], doorbell[-4], doorbell[-2], doorbell[-1]);
+}
+
+/* pa, a voice buffer's physical address, in the block the GP model exports
+ * (apu_vp.c: such a voice plays the model's output): 1 + the mixbin whose
+ * slot it starts in, 0 when it is not in the block. */
+int mcpx_apu_gp_export_buffer(MCPXAPUState *d, uint32_t pa)
+{
+    uint32_t off, bytes, sge, page;
+    int first;
+
+    if (!apu_gp_export_range(&off, &bytes, &first))
+        return 0;
+    sge = qatomic_read(&d->regs[NV_PAPU_GPSADDR]);
+    if (!sge || !d->ram_ptr)
+        return 0;
+    for (uint32_t o = off & ~0xFFFu; o < off + bytes; o += 0x1000u) {
+        uint32_t lo = o < off ? off : o, hi = o + 0x1000u;
+        if (hi > off + bytes) hi = off + bytes;
+        if ((o >> 12) > d->regs[NV_PAPU_GPSMAXSGE])
+            break;
+        page = *(const uint32_t *)mcpx_apu_phys(sge + (o >> 12) * 8);
+        if (page && !(page & 0xFFF) && pa >= page + (lo & 0xFFF) &&
+            pa < page + (hi - o))
+            return 1 + first + (int)((o + (pa - page) - off) / (NUM_SAMPLES_PER_FRAME * 4u));
+    }
+    return 0;
 }
 
 #include "apu_bus.h"
@@ -331,12 +355,10 @@ float mcpx_apu_bin_feed_gain(int bin)
     float g = 1.0f;
     if (bin < 0 || bin >= NUM_MIXBINS)
         return 0.0f;
+    if (apu_gp_wired())
+        return apu_gp_bin_gain(bin);
     if (s_fx_bins && s_fx_level >= 0.0f && ((s_fx_bins >> bin) & 1u))
         g = s_fx_level;
-    if (s_eq_any && s_eq_off[bin] != EQ_NONE && !s_eq[bin].bypass &&
-        s_eq[bin].c[1] == 0.0f && s_eq[bin].c[2] == 0.0f &&
-        s_eq[bin].c[3] == 0.0f && s_eq[bin].c[4] == 0.0f)
-        g *= s_eq[bin].c[0];
     return g;
 }
 
@@ -355,6 +377,11 @@ void mcpx_apu_mix_trace_gp(MCPXAPUState *d, FILE *f, unsigned t, uint32_t off, u
 
 void mcpx_apu_speaker_map_get(int8_t map[32])
 {
+    if (apu_gp_wired()) {
+        for (int b = 0; b < NUM_MIXBINS; b++)
+            map[b] = (int8_t)apu_gp_bin_speaker(b);
+        return;
+    }
     if (!s_spk_map_set) {
         apu_spk_default_map(s_spk_map);
         s_spk_map_set = 1;
@@ -441,6 +468,54 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
     if (s_ch_trace < 0)
         s_ch_trace = recomp_env_on(RENV_AUDIO_CHANNELS);
 
+    /* A title with its GP image wired: the model's six speaker feeds, in
+     * stereo folded as the console's analog output is taken to be (ITU-R
+     * BS.775: centre and surrounds at -3 dB, no LFE). */
+    if (apu_gp_wired() && d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        apu_gp_mem m = { gp_mem_read, gp_mem_write, d };
+        float acc[APU_SPK_CHANNELS][NUM_SAMPLES_PER_FRAME];
+        const int six = d->monitor.channels == APU_SPK_CHANNELS;
+        const int nch = six ? APU_SPK_CHANNELS : 2;
+
+        gp_follow_lfe();
+        apu_gp_frame(&m, mixbins, acc);
+        if (!six) {
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float c = 0.70710678f * acc[APU_SPK_FC][i];
+                float l = acc[APU_SPK_FL][i] + c + 0.70710678f * acc[APU_SPK_SL][i];
+                float r = acc[APU_SPK_FR][i] + c + 0.70710678f * acc[APU_SPK_SR][i];
+                acc[0][i] = l;
+                acc[1][i] = r;
+            }
+        }
+        if (apu_bus_enabled())
+            apu_bus_output(acc, nch, NUM_SAMPLES_PER_FRAME);
+        if (mcpx_apu_mix_trace_on()) {
+            float il[NUM_SAMPLES_PER_FRAME * APU_SPK_CHANNELS];
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                for (int c = 0; c < nch; c++)
+                    il[i * nch + c] = acc[c][i];
+            mcpx_apu_mix_trace_out(il, nch, NUM_SAMPLES_PER_FRAME);
+        }
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            for (int c = 0; c < nch; c++) {
+                float x = acc[c][i];
+                if (x > 1.0f) x = 1.0f;
+                if (x < -1.0f) x = -1.0f;
+                if (six)
+                    d->monitor.frame_buf6[off + i][c] = (int16_t)(x * 32767.0f);
+                else
+                    d->monitor.frame_buf[off + i][c] = (int16_t)(x * 32767.0f);
+            }
+        if (s_ch_trace)
+            ch_trace((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins,
+                     six ? &d->monitor.frame_buf6[off][0] : &d->monitor.frame_buf[off][0],
+                     nch);
+        g_dbg.gp.cycles = 0;
+        g_dbg.ep.cycles = 0;
+        return;
+    }
+
     /* 5.1: the six speaker feeds (apu_speakers.c), and the stereo fold
      * below is not run at all, so the stereo path is the same code it
      * always was. */
@@ -451,11 +526,6 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             s_spk_map_set = 1;
         }
         fx_gains();
-        if (s_eq_any) {
-            if (off == 0)
-                eq_read(d);
-            eq_run(mixbins);
-        }
         if (apu_bus_enabled()) {
             /* The host mixer on (apu_bus.h): apu_spk_mix51's sums, bin by
              * bin in the same order, kept as float for the output stage

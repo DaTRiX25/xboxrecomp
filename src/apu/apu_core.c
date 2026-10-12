@@ -524,7 +524,8 @@ static struct {
  * one of two places:
  *
  *   via the map  into the mixbins, every bin the speaker map sends to that
- *                speaker (in stereo: DirectSound's bin for it, 0..5), then
+ *                speaker (in stereo, and for a title with its GP image
+ *                wired, apu_gp.h: DirectSound's bin for it, 0..5), then
  *                the DSP stage's own mix (apu_spk_mix51 or the stereo
  *                fold), the monitor, the device -- the path the title's
  *                sounds take
@@ -572,7 +573,8 @@ static void spk_test_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
     if (g_spk.via_map) {
         int bins[NUM_MIXBINS], nb = 0;
-        if (six) {
+        extern int apu_gp_wired(void);
+        if (six && !apu_gp_wired()) {
             int8_t map[NUM_MIXBINS];
             mcpx_apu_speaker_map_get(map);
             for (int b = 0; b < NUM_MIXBINS; b++)

@@ -31,20 +31,57 @@ static void old_mix(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], const tvo
     }
 }
 
-/* Burnout 3's 5.1 wiring (its main.c), so the 5.1 arm mixes what a title
- * really sets up: a speaker map and an effects level on one send. */
+/* A title's GP image wired as Burnout 3's is (its gp_image.c), so the DSP
+ * stage is the one a title really runs: the speaker bins, eleven IIR2 sends
+ * (five of them inverted, the LFE one at a half), a distortion on bins 17
+ * and 18, which reach no speaker, and the export of bins 11..30. The state
+ * words are the title's in a race. k_map is the routing that gives, for
+ * the checks that ask where a bin goes. */
+#include "apu_gp.h"
+
 static const int8_t k_map[32] = {
-    0, 1, 2, 3, 4, 5, 0, 1, 4, 5, 0, 1, 0, 1, 4, 5, 2, 0, 1,
-    0, 1, 4, 5, 2, 3, 0, -1, 1, 0, 1, 0, 1,
+    0, 1, 2, 3, 4, 5, 0, 1, 4, 5, -1, -1, -1, 1, 4, 5, 2, -1, -1,
+    0, 1, 4, 5, 2, 3, 0, -1, -1, -1, -1, -1, -1,
 };
 
 static MCPXAPUState *s_d;
+static uint32_t s_gp_state[0x400];
+static uint32_t gp_rd(void *c, uint32_t off) { (void)c; return off / 4 < 0x400 ? s_gp_state[off / 4] : 0; }
+
+static void gp_wire(void)
+{
+    static const struct { int bin, spk; unsigned st; uint32_t b0; } eq[] = {
+        { 25, 0, 0x083, 0x800000 }, { 13, 1, 0x0AA, 0x800000 }, { 14, 4, 0x0D1, 0x800000 },
+        { 15, 5, 0x0F8, 0x800000 }, { 16, 2, 0x11F, 0x800000 }, { 19, 0, 0x146, 0x7FFFFF },
+        { 20, 1, 0x16D, 0x7FFFFF }, { 21, 4, 0x194, 0x7FFFFF }, { 22, 5, 0x1BB, 0x7FFFFF },
+        { 23, 2, 0x1E2, 0x7FFFFF }, { 24, 3, 0x209, 0x400000 },
+    };
+    static const uint32_t drive[9] = { 0x7FFFFF, 0x1FFFFF, 0x0147AE, 0x7FFFFF, 0x3FFFFF, 0, 0x1FFFFF, 0, 0x7FFFFF };
+    apu_gp_mem m = { gp_rd, NULL, NULL };
+
+    apu_gp_reset();
+    for (int b = 0; b < 6; b++) apu_gp_direct(b, b, 1.0f);
+    apu_gp_direct(6, 0, 1.0f); apu_gp_direct(7, 1, 1.0f);
+    apu_gp_direct(8, 4, 1.0f); apu_gp_direct(9, 5, 1.0f);
+    for (unsigned k = 0; k < sizeof eq / sizeof eq[0]; k++) {
+        apu_gp_eq(eq[k].bin, eq[k].spk, eq[k].st);
+        s_gp_state[eq[k].st + 7] = eq[k].b0;
+    }
+    apu_gp_drive(17, 0x02E);
+    apu_gp_drive(18, 0x045);
+    for (int k = 0; k < 9; k++) {
+        s_gp_state[0x02E + 7 + k] = drive[k];
+        s_gp_state[0x045 + 7 + k] = drive[k];
+    }
+    apu_gp_export(11, 20, 0xB000);
+    apu_gp_lfe_lowpass(120);
+    apu_gp_command(&m, 3, 0, 0, 0x400);
+}
 
 static void dsp_setup(void)
 {
     s_d = (MCPXAPUState *)calloc(1, sizeof(*s_d));
-    mcpx_apu_set_speaker_map(k_map);
-    mcpx_apu_set_fx_bins(1u << 11);
+    gp_wire();
 }
 
 /* One frame of mixbins to s16: out[32][6] (5.1) or out[32][2]. The DSP
@@ -53,6 +90,10 @@ static void dsp_out(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int
 {
     static float copy[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memcpy(copy, mixbins, sizeof(copy));
+    /* The GP model has running state (the distortion's filter, the LFE
+     * low-pass): every frame starts from the same one, so two sets of bins
+     * can be compared by their output. */
+    gp_wire();
     s_d->monitor.channels = six ? 6 : 2;
     s_d->ep_frame_div = 0;
     mcpx_apu_dsp_frame(s_d, copy);

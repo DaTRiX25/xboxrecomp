@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -452,7 +453,6 @@ void apu_bus_get_config(apu_bus_config *c)
 }
 
 static void file_open(void);
-
 void apu_bus_enable(int on)
 {
     int was = s_on > 0;
@@ -498,7 +498,7 @@ int apu_bus_voice_bus(unsigned voice, unsigned serial, uint32_t pa,
         memset(&v, 0, sizeof(v));
         if (fill(ctx, &v)) {
             bus = s_classify(&v);
-            if (bus < 0 || bus >= s_nbus) bus = other;
+            if (bus != APU_BUS_BYPASS && (bus < 0 || bus >= s_nbus)) bus = other;
         }
     }
     s_vbus[voice].gen = gen;
@@ -895,6 +895,355 @@ void apu_bus_preset_apply(int i)
 const char *apu_bus_file(void) { return s_file; }
 const char *apu_bus_file_status(void) { return s_file_status; }
 
+/* ── audition (apu_bus.h) ──────────────────────────────────────────── */
+
+/* A frame in the store: u16 voices, then per voice
+ *   u8 bus, u8 channels, u8 bin[8], float g[8], s16 samples[32 * channels].
+ * The store is a byte ring that a frame never wraps in (it restarts at 0
+ * when it would), and a ring of the frames' offsets, oldest first. */
+#define AUD_BYTES_A_SECOND (3u << 20)       /* the store's size a second kept */
+#define AUD_FRAME_MAX      (2 + 64 * (2 + 8 + 32 + 128))
+#define AUD_XFADE_FRAMES   3000u            /* 2 s across the loop point */
+
+static struct {
+    volatile int capturing;                 /* frame thread captures into the ring */
+    volatile int state;                     /* APU_BUS_AUD_* */
+    volatile int request;                   /* 1 loop last, 2 loop the loaded clip, 3 stop */
+    volatile int want_seconds;              /* asked for; the frame thread makes it so */
+    int seconds;
+    /* the ring */
+    uint8_t *buf;
+    size_t cap, wr;
+    uint32_t *off;                          /* frame offsets, a ring of nmax */
+    uint16_t *len;                          /* and their lengths */
+    uint32_t nmax, first, count;
+    size_t used;                            /* bytes of the frames held */
+    uint8_t *cur;                           /* the frame being written */
+    size_t cur_len;
+    unsigned cur_voices;
+    /* a loaded clip (apu_bus_audition_loop_file), linear */
+    uint8_t *clip;
+    uint32_t *clip_off;
+    uint32_t clip_count;
+    size_t clip_bytes;
+    /* playing */
+    uint32_t pos;
+} s_aud;
+
+static void aud_alloc(int seconds)
+{
+    free(s_aud.buf);
+    free(s_aud.off);
+    free(s_aud.len);
+    s_aud.buf = NULL;
+    s_aud.off = NULL;
+    s_aud.len = NULL;
+    s_aud.used = 0;
+    s_aud.cap = s_aud.wr = 0;
+    s_aud.nmax = s_aud.first = s_aud.count = 0;
+    s_aud.seconds = seconds;
+    if (seconds <= 0) return;
+    s_aud.cap = (size_t)seconds * AUD_BYTES_A_SECOND;
+    s_aud.nmax = (uint32_t)seconds * 1500u;
+    s_aud.buf = (uint8_t *)malloc(s_aud.cap);
+    s_aud.off = (uint32_t *)malloc(sizeof(uint32_t) * s_aud.nmax);
+    s_aud.len = (uint16_t *)malloc(sizeof(uint16_t) * s_aud.nmax);
+    if (!s_aud.buf || !s_aud.off || !s_aud.len) {
+        free(s_aud.buf);
+        free(s_aud.off);
+        free(s_aud.len);
+        s_aud.buf = NULL;
+        s_aud.off = NULL;
+        s_aud.len = NULL;
+        s_aud.cap = 0;
+        s_aud.nmax = 0;
+    }
+}
+
+/* Frames of the ring that begin inside [a, b) are overwritten: gone. */
+static void aud_drop(size_t a, size_t b)
+{
+    while (s_aud.count) {
+        const uint32_t o = s_aud.off[s_aud.first];
+        if (o < a || o >= b) break;
+        s_aud.used -= s_aud.len[s_aud.first];
+        s_aud.first = (s_aud.first + 1) % s_aud.nmax;
+        s_aud.count--;
+    }
+}
+
+static void aud_capture_voice(int bus, const float (*samples)[2], unsigned channels,
+                              const int bin[8], const float g[8])
+{
+    uint8_t *p;
+    int sounding = 0;
+    for (int b = 0; b < 8; b++) sounding |= g[b] > 0.0f;
+    if (!sounding || !s_aud.cur || s_aud.cur_voices >= 64) return;
+    p = s_aud.cur + s_aud.cur_len;
+    p[0] = (uint8_t)bus;
+    p[1] = (uint8_t)(channels > 1 ? 2 : 1);
+    for (int b = 0; b < 8; b++) p[2 + b] = (uint8_t)bin[b];
+    memcpy(p + 10, g, sizeof(float) * 8);
+    p += 42;
+    for (int i = 0; i < APU_BUS_FRAME; i++)
+        for (unsigned c = 0; c < (channels > 1 ? 2u : 1u); c++) {
+            float x = samples[i][c] * 32767.0f;
+            int16_t v = (int16_t)(x > 32767.0f ? 32767.0f : x < -32767.0f ? -32767.0f
+                                  : x < 0 ? x - 0.5f : x + 0.5f);
+            memcpy(p, &v, 2);
+            p += 2;
+        }
+    s_aud.cur_len = (size_t)(p - s_aud.cur);
+    s_aud.cur_voices++;
+}
+
+static void aud_frame_begin(void)
+{
+    /* Requests from the other thread, between frames. */
+    const int req = s_aud.request;
+    if (req) {
+        s_aud.request = 0;
+        if (req == 1 && s_aud.count > AUD_XFADE_FRAMES * 2) {
+            s_aud.state = APU_BUS_AUD_LAST;
+            s_aud.pos = 0;
+            fprintf(stderr, "[APU] audition: looping the last %.1f s (%.1f MB, %.2f MB a second)\n",
+                    s_aud.count / 1500.0, s_aud.used / 1048576.0,
+                    s_aud.used / 1048576.0 / (s_aud.count / 1500.0));
+        } else if (req == 2 && s_aud.clip && s_aud.clip_count > AUD_XFADE_FRAMES * 2) {
+            s_aud.state = APU_BUS_AUD_FILE;
+            s_aud.pos = 0;
+        } else if (req == 3) {
+            if (s_aud.state != APU_BUS_AUD_OFF)
+                fprintf(stderr, "[APU] audition: stopped, the live sound again\n");
+            s_aud.state = APU_BUS_AUD_OFF;
+            s_aud.first = s_aud.count = 0;      /* a fresh capture: no jump in it */
+            s_aud.wr = 0;
+            s_aud.used = 0;
+        }
+    }
+    s_aud.cur = NULL;
+    s_aud.capturing = 0;
+    /* The store's size, here so that no frame is ever in it meanwhile. */
+    if (s_aud.want_seconds != s_aud.seconds && s_aud.state != APU_BUS_AUD_LAST)
+        aud_alloc(s_aud.want_seconds);
+    if (s_aud.state != APU_BUS_AUD_OFF || !s_aud.buf) return;
+    if (s_aud.wr + AUD_FRAME_MAX > s_aud.cap) {
+        aud_drop(s_aud.wr, s_aud.cap);
+        s_aud.wr = 0;
+    }
+    aud_drop(s_aud.wr, s_aud.wr + AUD_FRAME_MAX);
+    s_aud.cur = s_aud.buf + s_aud.wr;
+    s_aud.cur_len = 2;
+    s_aud.cur_voices = 0;
+    s_aud.capturing = 1;
+}
+
+static void aud_frame_end(void)
+{
+    uint16_t n;
+    if (!s_aud.capturing || !s_aud.cur) return;
+    n = (uint16_t)s_aud.cur_voices;
+    memcpy(s_aud.cur, &n, 2);
+    if (s_aud.count == s_aud.nmax) {
+        s_aud.used -= s_aud.len[s_aud.first];
+        s_aud.first = (s_aud.first + 1) % s_aud.nmax;
+        s_aud.count--;
+    }
+    s_aud.off[(s_aud.first + s_aud.count) % s_aud.nmax] = (uint32_t)s_aud.wr;
+    s_aud.len[(s_aud.first + s_aud.count) % s_aud.nmax] = (uint16_t)s_aud.cur_len;
+    s_aud.used += s_aud.cur_len;
+    s_aud.count++;
+    s_aud.wr += s_aud.cur_len;
+    s_aud.capturing = 0;
+    s_aud.cur = NULL;
+}
+
+void apu_bus_audition_keep(int seconds)
+{
+    s_aud.want_seconds = seconds < 0 ? 0 : seconds > 60 ? 60 : seconds;
+}
+
+int apu_bus_audition_kept_seconds(void) { return s_aud.want_seconds; }
+
+int apu_bus_audition_playing(void) { return s_aud.state != APU_BUS_AUD_OFF; }
+int apu_bus_audition_state(void) { return s_aud.state; }
+
+static const uint8_t *aud_frame_at(uint32_t i, uint32_t *count)
+{
+    if (s_aud.state == APU_BUS_AUD_FILE) {
+        *count = s_aud.clip_count;
+        return i < s_aud.clip_count ? s_aud.clip + s_aud.clip_off[i] : NULL;
+    }
+    *count = s_aud.count;
+    return i < s_aud.count ? s_aud.buf + s_aud.off[(s_aud.first + i) % s_aud.nmax] : NULL;
+}
+
+static void aud_mix_frame(struct apu_bus_rt *rt, float (*mixbins)[APU_BUS_FRAME],
+                          const uint8_t *f, float fade)
+{
+    uint16_t n;
+    float smp[APU_BUS_FRAME][2];
+    if (!f || fade <= 0.0f) return;
+    memcpy(&n, f, 2);
+    f += 2;
+    for (unsigned k = 0; k < n; k++) {
+        const int bus = f[0];
+        const unsigned ch = f[1];
+        int bin[8];
+        float g[8];
+        for (int b = 0; b < 8; b++) bin[b] = f[2 + b] & (APU_BUS_BINS - 1);
+        memcpy(g, f + 10, sizeof(g));
+        f += 42;
+        for (int i = 0; i < APU_BUS_FRAME; i++) {
+            int16_t v;
+            memcpy(&v, f, 2);
+            f += 2;
+            smp[i][0] = (float)v * (1.0f / 32767.0f);
+            if (ch > 1) {
+                memcpy(&v, f, 2);
+                f += 2;
+                smp[i][1] = (float)v * (1.0f / 32767.0f);
+            } else {
+                smp[i][1] = smp[i][0];
+            }
+        }
+        if (fade != 1.0f)
+            for (int b = 0; b < 8; b++) g[b] *= fade;
+        apu_bus_mix_voice(rt, bus < s_nbus ? bus : (s_nbus ? s_nbus - 1 : 0), mixbins,
+                          (const float (*)[2])smp, ch, bin, g);
+    }
+}
+
+void apu_bus_audition_mix(struct apu_bus_rt *rt, float (*mixbins)[APU_BUS_FRAME])
+{
+    uint32_t count, len;
+    const uint8_t *f = aud_frame_at(0, &count);
+    (void)f;
+    if (s_aud.state == APU_BUS_AUD_OFF || count <= AUD_XFADE_FRAMES * 2) return;
+    /* The loop is the clip less the cross-fade: over its first two seconds
+     * the clip's last two fade out under it, equal power. */
+    len = count - AUD_XFADE_FRAMES;
+    if (s_aud.pos >= len) s_aud.pos = 0;
+    if (s_aud.pos < AUD_XFADE_FRAMES) {
+        const float t = ((float)s_aud.pos + 0.5f) / (float)AUD_XFADE_FRAMES;
+        aud_mix_frame(rt, mixbins, aud_frame_at(s_aud.pos, &count), sinf(t * (float)(M_PI / 2.0)));
+        aud_mix_frame(rt, mixbins, aud_frame_at(len + s_aud.pos, &count), cosf(t * (float)(M_PI / 2.0)));
+    } else {
+        aud_mix_frame(rt, mixbins, aud_frame_at(s_aud.pos, &count), 1.0f);
+    }
+    s_aud.pos++;
+}
+
+/* The control side (the overlay's thread). A request is taken at the next
+ * frame; with no frame thread running (tests) the caller's next
+ * apu_bus_frame_begin takes it. */
+int apu_bus_audition_loop_last(void)
+{
+    if (!s_aud.buf || s_aud.count <= AUD_XFADE_FRAMES * 2) return -1;
+    s_aud.request = 1;
+    return 0;
+}
+
+void apu_bus_audition_stop(void)
+{
+    s_aud.request = 3;
+}
+
+#define AUD_MAGIC "APUBUSAUD1"
+
+int apu_bus_audition_save(const char *path)
+{
+    FILE *f;
+    uint32_t count, i;
+    if (s_aud.state == APU_BUS_AUD_OFF) return -1;      /* only a clip that stands still */
+    aud_frame_at(0, &count);
+    f = fopen(path, "wb");
+    if (!f) return -1;
+    fwrite(AUD_MAGIC, 1, 10, f);
+    fwrite(&count, 4, 1, f);
+    for (i = 0; i < count; i++) {
+        const uint8_t *fr = aud_frame_at(i, &count), *p = fr + 2;
+        uint16_t n;
+        uint32_t len;
+        memcpy(&n, fr, 2);
+        for (unsigned k = 0; k < n; k++)
+            p += 42 + 2 * APU_BUS_FRAME * (p[1] > 1 ? 2 : 1);
+        len = (uint32_t)(p - fr);
+        fwrite(&len, 4, 1, f);
+        fwrite(fr, 1, len, f);
+    }
+    return fclose(f) == 0 ? 0 : -1;
+}
+
+int apu_bus_audition_loop_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    char magic[10];
+    uint32_t count, i;
+    long size;
+    uint8_t *clip;
+    uint32_t *off;
+    size_t at = 0;
+
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size < 14 || fread(magic, 1, 10, f) != 10 || memcmp(magic, AUD_MAGIC, 10) ||
+        fread(&count, 4, 1, f) != 1 || count <= AUD_XFADE_FRAMES * 2 || count > 1500u * 600u) {
+        fclose(f);
+        return -1;
+    }
+    clip = (uint8_t *)malloc((size_t)size);
+    off = (uint32_t *)malloc(sizeof(uint32_t) * count);
+    if (!clip || !off) { free(clip); free(off); fclose(f); return -1; }
+    for (i = 0; i < count; i++) {
+        uint32_t len;
+        if (fread(&len, 4, 1, f) != 1 || len < 2 || len > AUD_FRAME_MAX || at + len > (size_t)size ||
+            fread(clip + at, 1, len, f) != len)
+            break;
+        off[i] = (uint32_t)at;
+        at += len;
+    }
+    fclose(f);
+    if (i != count) { free(clip); free(off); return -1; }
+    /* Swap it in with the loop off, a frame's time apart from its use. */
+    if (s_aud.state == APU_BUS_AUD_FILE) {
+        s_aud.request = 3;
+        for (int k = 0; k < 50 && s_aud.state == APU_BUS_AUD_FILE; k++) {
+#if defined(_WIN32)
+            _sleep(2);
+#else
+            struct timespec ts = { 0, 2000000 };
+            nanosleep(&ts, NULL);
+#endif
+        }
+        s_aud.state = APU_BUS_AUD_OFF;
+    }
+    free(s_aud.clip);
+    free(s_aud.clip_off);
+    s_aud.clip = clip;
+    s_aud.clip_off = off;
+    s_aud.clip_count = count;
+    s_aud.clip_bytes = at;
+    s_aud.request = 2;
+    return 0;
+}
+
+void apu_bus_audition_get(apu_bus_audition_info *o)
+{
+    uint32_t count = 0;
+    memset(o, 0, sizeof(*o));
+    o->crossfade_s = (float)AUD_XFADE_FRAMES / 1500.0f;
+    if (s_aud.state != APU_BUS_AUD_OFF) {
+        aud_frame_at(0, &count);
+        o->length_s = count > AUD_XFADE_FRAMES ? (float)(count - AUD_XFADE_FRAMES) / 1500.0f : 0.0f;
+        o->position_s = (float)s_aud.pos / 1500.0f;
+    }
+    o->kept_s = (float)s_aud.count / 1500.0f;
+    o->bytes = s_aud.cap + (size_t)s_aud.nmax * 4 + s_aud.clip_bytes;
+}
+
 /* ── the mix ───────────────────────────────────────────────────────── */
 
 struct apu_bus_rt *apu_bus_frame_begin(int channels, const int8_t spk_map[APU_BUS_BINS])
@@ -915,6 +1264,7 @@ struct apu_bus_rt *apu_bus_frame_begin(int channels, const int8_t spk_map[APU_BU
         for (int k = 0; k < LOOKAHEAD; k++) s_st.look_gain[k] = 1.0f;
         s_st_init = 1;
     }
+    aud_frame_begin();
     r->channels = channels == APU_BUS_SPEAKERS ? APU_BUS_SPEAKERS : 2;
     for (int b = 0; b < APU_BUS_BINS; b++) {
         int sp = r->channels == APU_BUS_SPEAKERS && spk_map ? spk_map[b] : 0;
@@ -945,6 +1295,9 @@ void apu_bus_mix_voice(struct apu_bus_rt *r, int bus,
     const float eff = r->eff[bus];
     float ss[2] = { 0.0f, 0.0f }, ref = 0.0f;
     double level = 0.0;
+
+    if (s_aud.capturing)
+        aud_capture_voice(bus, samples, channels, bin, g);
 
     /* The meters: the energy of the voice's channels, once. */
     for (int i = 0; i < APU_BUS_FRAME; i++) {
@@ -1103,7 +1456,8 @@ void apu_bus_mix_voice(struct apu_bus_rt *r, int bus,
 }
 
 void apu_bus_frame_end(struct apu_bus_rt *r, float (*mixbins)[APU_BUS_FRAME])
-{
+{    aud_frame_end();
+
     if (r->any_lfe_send) {
         for (int b = 0; b < APU_BUS_MAX; b++) {
             float *acc = s_st.lfe_acc[b];
