@@ -647,6 +647,18 @@ static void flush(int wait, int why)
         t1 = now_ns();
     r = vkQueueSubmit(C->queue, 1, &si, fence);
     nvk_queue_unlock();
+    {
+        /* RECOMP_DEBUG=vk_device_lost=<flip>: this submit counts as lost. */
+        static long at = -2;
+        if (at == -2) {
+            const char *e = recomp_env(RENV_VK_DEVICE_LOST);
+            at = e && *e ? atol(e) : -1;
+        }
+        if (at >= 0 && (long)s_presents >= at && !s_failed) {
+            fprintf(stderr, LOGP "vk_device_lost=%ld: this submit is treated as lost\n", at);
+            r = VK_ERROR_DEVICE_LOST;
+        }
+    }
     if (fence && r == VK_SUCCESS)
         s_fr[s_fi].fence_serial = serial;
     if (s_vf) {
@@ -664,6 +676,7 @@ static void flush(int wait, int why)
         if (r == VK_ERROR_DEVICE_LOST) {
             fprintf(stderr, LOGP "device lost: drawing stops\n");
             s_failed = 1;
+            nvk_device_lost("vkQueueSubmit: VK_ERROR_DEVICE_LOST");
         }
     }
     s_fr[s_fi].serial = serial;

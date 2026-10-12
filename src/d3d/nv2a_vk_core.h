@@ -43,6 +43,7 @@ struct nvk_core {
     int                              portability;    /* MoltenVK */
     int                              validation;     /* layers on */
     int                              present_wait;   /* VK_KHR_present_id + _wait on */
+    int                              demote;         /* shaderDemoteToHelperInvocation on: SPIR-V 1.6's discard */
     float                            max_aniso;      /* samplerAnisotropy on: the limit; else 0 */
     char                             name[256];
 };
@@ -65,6 +66,15 @@ int nvk_core_replace_surface(VkSurfaceKHR (*make_surface)(VkInstance, void *), v
 
 /* The core if nvk_core_init has succeeded, else NULL. */
 const struct nvk_core *nvk_core_get(void);
+
+/* The device is lost (VK_ERROR_DEVICE_LOST from a submit or a present, or a
+ * swapchain that cannot be made any more): said once in the log, and passed
+ * to whoever shows the picture (nvk_set_lost_handler: the window, which tells
+ * the player and ends the run the ordinary way). Without a handler, a run
+ * that has no window: the process ends with status 70 rather than go on
+ * drawing nothing. Any thread. */
+void nvk_device_lost(const char *why);
+void nvk_set_lost_handler(void (*fn)(const char *why));
 
 void nvk_queue_lock(void);
 void nvk_queue_unlock(void);

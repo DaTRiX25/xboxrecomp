@@ -509,6 +509,8 @@ static int android_resurface(SDL_Window *win)
 }
 #endif
 
+static int s_sc_failed;      /* vkCreateSwapchainKHR failures in a row */
+
 static int make_swapchain(SDL_Window *win)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -625,8 +627,15 @@ static int make_swapchain(SDL_Window *win)
         s_sc = VK_NULL_HANDLE;
         pthread_mutex_unlock(&s_sc_mu);
         fprintf(stderr, LOGP "vkCreateSwapchainKHR: %s\n", nvk_result_str(r));
+        /* The window is there (its surface answered above) and no swapchain
+         * can be made for it: after a second of tries that is not a resize
+         * in passing. */
+        if (r == VK_ERROR_DEVICE_LOST || ++s_sc_failed >= 60)
+            nvk_device_lost(r == VK_ERROR_DEVICE_LOST ? "vkCreateSwapchainKHR: VK_ERROR_DEVICE_LOST"
+                                                      : "the window's swapchain cannot be made");
         return 0;
     }
+    s_sc_failed = 0;
     s_sc_first_id = s_present_id + 1;
     pthread_mutex_unlock(&s_sc_mu);
     s_sc_n = SC_MAX;
@@ -1786,6 +1795,8 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         static int said;
         if (said++ < 4)
             fprintf(stderr, LOGP "Vulkan present submit: %s\n", nvk_result_str(r));
+        if (r == VK_ERROR_DEVICE_LOST)
+            nvk_device_lost("the window's submit: VK_ERROR_DEVICE_LOST");
         /* The fence will not signal: make it signalled again. */
         {
             VkFenceCreateInfo fi;
@@ -1797,6 +1808,8 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         }
         return 0;
     }
+    if (pr == VK_ERROR_DEVICE_LOST)
+        nvk_device_lost("vkQueuePresentKHR: VK_ERROR_DEVICE_LOST");
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && FBV_SUBOPTIMAL_RECREATES))
         s_recreate = 1;
 #if defined(__ANDROID__)
