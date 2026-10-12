@@ -35,6 +35,7 @@
 #include "present_cadence.h"    /* what reached the glass, for the graph */
 extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include "apu.h"                /* the speaker test */
+#include "apu_bus.h"            /* the Mixer page */
 #include "xbox_soundtrack.h"    /* the music folder browser's model (xsb_*) */
 
 #include <math.h>
@@ -43,6 +44,7 @@ extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #include "overlay_font_ext.h"   /* k_overlay_font_ext: the second font's letters */
 /* DejaVu Sans Mono beside ProggyForever. A font's size is its ascent plus
@@ -175,6 +177,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_AUDIO_MUTE_BG */      { "Mute in the background", "No sound while the window is not in front.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_SPEAKERS */     { "Speakers", "Auto plays 5.1 when the system's sound output is set to 5.1 (or more), else stereo. The game picks its mix at start.", 1, FMT_PLAIN, n_speakers, 0 },
     /* XS_AUDIO_FX_LEVEL */     { "Surround effects (reverb) level", "5.1 only: the level of the game's effect sends, which play dry here (no effect DSP runs). Tune by ear.", 0.05, FMT_PERCENT, NULL, 0 },
+    /* XS_AUDIO_MIXER */        { "Mixer", "Buses over the game's sounds: gains, sends, LFE, limiter (the Mixer page below). Off: the game's mix as shipped.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_INPUT_DEADZONE */     { "Stick deadzone", "The part of the stick's travel that reads as centre.", 1638.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_TRIGGER_DEADZONE */ { "Trigger deadzone", "The part of a trigger's pull that reads as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "1.0 is the original: the game's rumble as the Xbox pad played it. Higher makes the weaker rumbles stronger (the strongest is full at any setting). 0 turns the rumble off.", 0.25, FMT_GAIN, NULL, 0 },
@@ -188,6 +191,8 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_GRAPHICS_BLOOM */     { "Bloom", "The game's own soft glow over the picture, strongest while boosting. On is the original look; off skips its three extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "The game's own blur: the streaks towards the edges of the picture at speed and while boosting. On is the original look; off skips its two extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_CRASH_60FPS */ { "60 fps crash cameras", "The game halves its frame rate to 30 in its crash and takedown cameras. On: they run at 60 like the rest of the race, at the same game speed. Off is the original. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_SPLIT_60FPS */ { "60 fps split screen", "The game runs two-player split screen at 30 frames a second. On: it runs at 60, at the same game speed; the scene is drawn twice a frame, so it needs a fast enough device. Off is the original. A change shows from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_AUDIO_SPLIT_MUSIC */  { "Music in split screen", "The game plays no music in two-player split screen. On: EA GAMES TRAX or your custom music plays in two-player Race and Road Rage as in a one-player race. Off is the original. A change shows from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto: -0.5 at 2x, -1.0 at 4x. Off is the original. Changes at once.", 1, FMT_PLAIN, n_lod, 0 },
     /* XS_GRAPHICS_DITHER */    { "Dither", "A faint noise in the final scale to the window that hides the stripes in smooth gradients such as the sky. Metal only for now. Off is the original; text and HUD at the exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_VEHICLE_DETAIL */ { "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Original is the console's distances; Far doubles them, Farthest is four times. Costs GPU time when many vehicles are on screen. Scenery, the track and where traffic appears are not changed. Changes at once.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
@@ -207,7 +212,8 @@ extern "C" const char *nvk_core_describe(void);   /* nv2a_vk_core.c */
 enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS, R_FOLDER };
 enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_HOST0, A_HOST1, A_HOST2, A_HOST3,                  /* xbox_OverlaySetHostRows */
-              A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER };      /* A_SHADERS on: the build's */
+              A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER,        /* A_SHADERS on: the build's */
+              A_MIXER };                                          /* the Mixer page (overlay_mixer.inc) */
 
 static int s_host_n;
 static const char *(*s_host_fn)(int row, int activate);
@@ -409,6 +415,8 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_MOTION_BLUR);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->key))
             SET(XS_GRAPHICS_CRASH_60FPS);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SPLIT_60FPS)->key))
+            SET(XS_GRAPHICS_SPLIT_60FPS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))
             SET(XS_GRAPHICS_VEHICLE_DETAIL);
 #if defined(__ANDROID__)
@@ -442,6 +450,10 @@ static int page_rows(int page, Row *r)
     case P_AUDIO:
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
         SET(XS_AUDIO_FX_LEVEL);
+        if (apu_bus_count() > 0)
+            ACT(A_MIXER, "Mixer: buses, sends, LFE, limiter, meters");
+        if (recomp_patch_enabled(xbox_SettingGet(XS_AUDIO_SPLIT_MUSIC)->key))
+            SET(XS_AUDIO_SPLIT_MUSIC);
         SPK(0, "Speaker test, game mix");
         SPK(1, "Speaker test, direct");
         if (mcpx_apu_title_channels() != 6)
@@ -710,8 +722,18 @@ static void adjust(xs_id id, int dir)
 }
 
 /* Activate: a bool flips, a choice moves on, an action runs. */
+static void mx_open();
+static bool mx_back();
+static void mx_poll();
+static void mx_ab_toggle();
+static bool s_mx_open;                 /* the Mixer page shows (overlay_mixer.inc) */
+
 static void activate(const Row &r)
 {
+    if (r.kind == R_ACTION && r.action == A_MIXER) {
+        mx_open();
+        return;
+    }
     if (r.kind == R_SPEAKERS) {
         spk_play(r.action);
         return;
@@ -899,6 +921,10 @@ int xbox_OverlayEvent(const SDL_Event *ev)
             hot_toggle();
             return 1;
         }
+        if (k == SDLK_F7 && apu_bus_enabled()) {
+            mx_ab_toggle();             /* the mixer's A/B, menu open or not */
+            return 1;
+        }
         if (!s_open)
             break;
         s_last_input_pad = false;
@@ -952,6 +978,11 @@ int xbox_OverlayEvent(const SDL_Event *ev)
         }
         if (!(s_back_mask | s_start_mask))
             s_combo_fired = false;
+        /* Back held + Y: the mixer's A/B, menu open or not. */
+        if (down && b == SDL_CONTROLLER_BUTTON_Y && (s_back_mask & bit) && apu_bus_enabled()) {
+            mx_ab_toggle();
+            return 1;
+        }
         if (!s_open)
             break;
         s_last_input_pad = true;
@@ -1147,9 +1178,12 @@ void xbox_OverlayPoll(void)
 
     /* B or Esc: here and not in the frame, so a window that cannot present
      * (minimised) still closes. */
+    mx_poll();
     if (s_back > 0) {
         s_back = 0;
-        if (s_open && xsb_is_open()) {
+        if (s_open && s_mx_open) {
+            mx_back();
+        } else if (s_open && xsb_is_open()) {
             /* In the folder browser: one level up, then back to the page. */
             int sel = 0;
             if (xsb_back(&sel) == XSB_CLOSED)
@@ -1897,6 +1931,8 @@ static void build_browser(float fs, ImDrawList *dl)
     }
 }
 
+#include "overlay_mixer.inc"
+
 static void build_pages(float fs)
 {
     ImGuiIO &io = ImGui::GetIO();
@@ -1907,6 +1943,10 @@ static void build_pages(float fs)
     bg->AddRectFilled(ImVec2(0, 0), disp, col(T->scrim, 0.55f));
 
     float pw = fs * 44.0f, ph = fs * 28.0f;
+    if (s_mx_open) {                    /* the Mixer page: a longer list, wider rows */
+        pw = fs * 54.0f;
+        ph = fs * 38.0f;
+    }
     if (pw > disp.x * 0.94f) pw = disp.x * 0.94f;
     if (ph > disp.y * 0.90f) ph = disp.y * 0.90f;
     ImGui::SetNextWindowPos(ImVec2((disp.x - pw) * 0.5f, (disp.y - ph) * 0.5f));
@@ -1933,6 +1973,7 @@ static void build_pages(float fs)
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                 s_page = i;
                 s_scroll_to_sel = true;
+                s_mx_open = false;
             }
             ImGui::PopID();
             bool on = i == s_page;
@@ -1950,6 +1991,12 @@ static void build_pages(float fs)
 
     if (xsb_is_open()) {
         build_browser(fs, dl);
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        return;
+    }
+    if (s_mx_open) {
+        build_mixer(fs, dl);
         ImGui::End();
         ImGui::PopStyleVar(2);
         return;
@@ -2026,10 +2073,12 @@ static void build_pages(float fs)
                      " unset it to change it here.");
         else
 #if defined(__ANDROID__)
-            snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
-                     " own music menu. The folder list shows what this app may read: on Android it"
-                     " needs the \"Music and audio\" permission (Settings > Apps > this app >"
-                     " Permissions); without it the folders look empty.");
+            /* The app does not ask for the audio permission yet (the game
+             * repository's docs/custom-music.md, "Android"), so there is
+             * nothing the player could grant: say that it is not there. */
+            snprintf(hint, sizeof hint, "Your own music in the game's music menu is not available on"
+                     " Android yet: this app cannot read the device's music folders. It works in"
+                     " the Windows, macOS and Linux versions.");
 #else
             snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
                      " own music menu: every folder with music in it becomes a soundtrack there."

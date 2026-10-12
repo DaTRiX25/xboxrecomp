@@ -12,6 +12,7 @@
 #include "nv2a_backend_common.h"
 #include "apu_xaudio2.h"
 #include "apu.h"                /* mcpx_apu_set_fx_level */
+#include "apu_bus.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -88,6 +89,7 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_AUDIO_MUTE_BG]      = SETTING("audio.mute_background", XS_BOOL, 0, RENV_AUDIO_MUTE_BG, NULL, NULL, 0, 0, 0),
     [XS_AUDIO_SPEAKERS]     = SETTING("audio.speakers", XS_CHOICE, XS_RESTART, RENV_AUDIO_SPEAKERS, k_speakers, NULL, 0, 0, 0),
     [XS_AUDIO_FX_LEVEL]     = SETTING("audio.fx_level", XS_FLOAT, 0, RENV_AUDIO_FX_LEVEL, NULL, NULL, 0, 1, 0.25),
+    [XS_AUDIO_MIXER]        = SETTING("audio.mixer", XS_BOOL, 0, RENV_AUDIO_MIXER, NULL, NULL, 0, 0, 0),
     [XS_INPUT_DEADZONE]     = SETTING("input.deadzone", XS_INT, 0, RENV_PAD_DEADZONE, NULL, NULL, 0, 32767, 0),
     [XS_INPUT_TRIGGER_DEADZONE] = SETTING("input.trigger_deadzone", XS_INT, 0, RENV_PAD_TRIGGER_DEADZONE, NULL, NULL, 0, 254, 0),
     /* 0..3 in quarters: the rumble curve's strength, motor = (speed /
@@ -108,6 +110,10 @@ static xs_setting s_set[XS_COUNT] = {
     /* The title's crash and takedown cameras at 60 instead of its own 30: the
      * patch is the "1". */
     [XS_GRAPHICS_CRASH_60FPS] = SETTING("graphics.crash_60fps", XS_BOOL, 0, RENV_GFX_CRASH_60FPS, NULL, NULL, 0, 0, 0),
+    /* Split screen at 60 instead of the title's 30, and with the title's
+     * music, which it keeps silent there: the patch is the "1" of each. */
+    [XS_GRAPHICS_SPLIT_60FPS] = SETTING("graphics.split_60fps", XS_BOOL, 0, RENV_GFX_SPLIT_60FPS, NULL, NULL, 0, 0, 0),
+    [XS_AUDIO_SPLIT_MUSIC]  = SETTING("audio.split_music", XS_BOOL, 0, RENV_AUDIO_SPLIT_MUSIC, NULL, NULL, 0, 0, 0),
     /* Both off as shipped: today's picture, bit for bit. */
     [XS_GRAPHICS_LOD_BIAS]  = SETTING("graphics.lod_bias", XS_CHOICE, 0, RENV_GFX_LOD_BIAS, k_lod, k_lod_env, 0, 0, 0),
     [XS_GRAPHICS_DITHER]    = SETTING("graphics.dither", XS_BOOL, 0, RENV_GFX_DITHER, NULL, NULL, 0, 0, 0),
@@ -361,6 +367,9 @@ static void apply(xs_id id)
         break;
     case XS_AUDIO_FX_LEVEL:
         mcpx_apu_set_fx_level((float)v);
+        break;
+    case XS_AUDIO_MIXER:
+        apu_bus_enable(v != 0.0);
         break;
     case XS_INPUT_DEADZONE:
         xbox_InputSetDeadzone((int)v);

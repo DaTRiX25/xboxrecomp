@@ -76,6 +76,19 @@ void mcpx_apu_set_bin_eq(int bin, uint32_t scratch_offset);
 /* The speaker map in use (mcpx_apu_set_speaker_map, or the default). */
 void mcpx_apu_speaker_map_get(int8_t map[32]);
 
+/* RECOMP_MIX_TRACE (apu_vp.c, the mix study): the host asks this for who is
+ * turning a voice on -- the title's return addresses on the calling guest
+ * thread's stack, innermost first, at most max; returns how many. Not set,
+ * or the trace off: never called. */
+typedef int (*mcpx_apu_voice_tag_fn)(uint32_t *out, int max);
+void mcpx_apu_set_voice_tag_hook(mcpx_apu_voice_tag_fn fn);
+/* The gain a mixbin reaches its speaker with in 5.1 (the effects level and
+ * the title's GP EQ when that is a plain gain; 1 otherwise). Trace only. */
+float mcpx_apu_bin_feed_gain(int bin);
+/* Trace only: the output before the clamp, per channel, from the DSP stage. */
+void mcpx_apu_mix_trace_out(const float *acc, int nch, int n);
+int mcpx_apu_mix_trace_on(void);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);

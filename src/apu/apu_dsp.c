@@ -320,6 +320,39 @@ static void eq_run(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
     }
 }
 
+#include "apu_bus.h"
+
+/* The mix study (RECOMP_MIX_TRACE, apu_vp.c). */
+int mcpx_apu_mix_trace_on(void);
+void mcpx_apu_mix_trace_out(const float *acc, int nch, int n);
+
+float mcpx_apu_bin_feed_gain(int bin)
+{
+    float g = 1.0f;
+    if (bin < 0 || bin >= NUM_MIXBINS)
+        return 0.0f;
+    if (s_fx_bins && s_fx_level >= 0.0f && ((s_fx_bins >> bin) & 1u))
+        g = s_fx_level;
+    if (s_eq_any && s_eq_off[bin] != EQ_NONE && !s_eq[bin].bypass &&
+        s_eq[bin].c[1] == 0.0f && s_eq[bin].c[2] == 0.0f &&
+        s_eq[bin].c[3] == 0.0f && s_eq[bin].c[4] == 0.0f)
+        g *= s_eq[bin].c[0];
+    return g;
+}
+
+/* Trace only (RECOMP_MIX_TRACE): the GP's scratch memory, where DirectSound
+ * keeps the effect states of the title's image, as "G t=<s> off=<hex>
+ * <24-bit words>" lines. */
+void mcpx_apu_mix_trace_gp(MCPXAPUState *d, FILE *f, unsigned t, uint32_t off, uint32_t end)
+{
+    for (; off < end; off += 64) {
+        fprintf(f, "G t=%u off=%04X", t, off);
+        for (uint32_t k = 0; k < 64 && off + k < end; k += 4)
+            fprintf(f, " %06X", gp_scratch_word(d, off + k) & 0xFFFFFF);
+        fputc('\n', f);
+    }
+}
+
 void mcpx_apu_speaker_map_get(int8_t map[32])
 {
     if (!s_spk_map_set) {
@@ -423,9 +456,53 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 eq_read(d);
             eq_run(mixbins);
         }
+        if (apu_bus_enabled()) {
+            /* The host mixer on (apu_bus.h): apu_spk_mix51's sums, bin by
+             * bin in the same order, kept as float for the output stage
+             * and the meters, then its conversion. */
+            float acc[APU_SPK_CHANNELS][NUM_SAMPLES_PER_FRAME];
+            const float *gain = s_fx_bins ? s_bin_gain : NULL;
+            memset(acc, 0, sizeof(acc));
+            for (int b = 0; b < NUM_MIXBINS; b++) {
+                const float *src = mixbins[b];
+                float *dst;
+                if (s_spk_map[b] < 0 || s_spk_map[b] >= APU_SPK_CHANNELS)
+                    continue;
+                dst = acc[s_spk_map[b]];
+                if (gain && gain[b] != 1.0f) {
+                    const float g = gain[b];
+                    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                        dst[i] += g * src[i];
+                } else {
+                    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                        dst[i] += src[i];
+                }
+            }
+            apu_bus_output(acc, APU_SPK_CHANNELS, NUM_SAMPLES_PER_FRAME);
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                for (int c = 0; c < APU_SPK_CHANNELS; c++) {
+                    float x = acc[c][i];
+                    if (x > 1.0f) x = 1.0f;
+                    if (x < -1.0f) x = -1.0f;
+                    d->monitor.frame_buf6[off + i][c] = (int16_t)(x * 32767.0f);
+                }
+        } else
         apu_spk_mix51(&mixbins[0][0], NUM_SAMPLES_PER_FRAME, s_spk_map,
                       s_fx_bins ? s_bin_gain : NULL,
                       &d->monitor.frame_buf6[off], NUM_SAMPLES_PER_FRAME);
+        if (mcpx_apu_mix_trace_on()) {
+            /* The same sums again, kept as float: the trace's copy. */
+            float acc[NUM_SAMPLES_PER_FRAME * APU_SPK_CHANNELS];
+            memset(acc, 0, sizeof(acc));
+            for (int b = 0; b < NUM_MIXBINS; b++) {
+                int sp = s_spk_map[b];
+                float g = s_fx_bins ? s_bin_gain[b] : 1.0f;
+                if (sp < 0 || sp >= APU_SPK_CHANNELS) continue;
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                    acc[i * APU_SPK_CHANNELS + sp] += g * mixbins[b][i];
+            }
+            mcpx_apu_mix_trace_out(acc, APU_SPK_CHANNELS, NUM_SAMPLES_PER_FRAME);
+        }
         if (s_ch_trace)
             ch_trace((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins,
                      &d->monitor.frame_buf6[off][0], APU_SPK_CHANNELS);
@@ -434,7 +511,44 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         return;
     }
 
+    if (d->monitor.point != MCPX_APU_DEBUG_MON_VP && apu_bus_enabled()) {
+        /* The host mixer on (apu_bus.h): the fold below, sample by sample
+         * in the same order, kept as float for the output stage and the
+         * meters, then the same clamp and conversion. */
+        float lr[2][NUM_SAMPLES_PER_FRAME];
+        const int all = mcpx_apu_mixdown_all();
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float left, right;
+            if (all) {
+                left = 0.0f;
+                right = 0.0f;
+                for (int b = 0; b < NUM_MIXBINS; ++b) {
+                    if (b & 1) right += mixbins[b][i];
+                    else       left  += mixbins[b][i];
+                }
+            } else {
+                left = mixbins[0][i];
+                right = mixbins[1][i];
+            }
+            lr[0][i] = left;
+            lr[1][i] = right;
+        }
+        apu_bus_output(lr, 2, NUM_SAMPLES_PER_FRAME);
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float left = lr[0][i], right = lr[1][i];
+            if (left > 1.0f) left = 1.0f;
+            if (left < -1.0f) left = -1.0f;
+            if (right > 1.0f) right = 1.0f;
+            if (right < -1.0f) right = -1.0f;
+            d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
+            d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
+        }
+        if (s_ch_trace)
+            ch_trace((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins,
+                     &d->monitor.frame_buf[off][0], 2);
+    } else
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        const int mix_trace = mcpx_apu_mix_trace_on();
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
              * On hardware the GP and EP mix the submixes down; here they are
@@ -474,6 +588,10 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             } else {
                 left = mixbins[0][i];
                 right = mixbins[1][i];
+            }
+            if (mix_trace) {
+                float lr[2] = { left, right };
+                mcpx_apu_mix_trace_out(lr, 2, 1);
             }
             /* Clamp to [-1, 1] range */
             if (left > 1.0f) left = 1.0f;

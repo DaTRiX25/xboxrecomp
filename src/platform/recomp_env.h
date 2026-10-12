@@ -123,6 +123,8 @@ extern "C" {
     X(GFX_BLOOM,         CONFIG, "RECOMP_GFX_BLOOM",         NULL, "0: the title's own bloom (glow) passes are not drawn, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 1, as shipped") \
     X(GFX_MOTION_BLUR,   CONFIG, "RECOMP_GFX_MOTION_BLUR",   NULL, "0: the title's own motion blur is not drawn, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 1, as shipped") \
     X(GFX_CRASH_60FPS,   CONFIG, "RECOMP_GFX_CRASH_60FPS",   NULL, "1: the title's 30 Hz phases (crash and takedown cameras) run at 60, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
+    X(GFX_SPLIT_60FPS,   CONFIG, "RECOMP_GFX_SPLIT_60FPS",   NULL, "1: the title's 30 Hz split screen runs at 60, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
+    X(AUDIO_SPLIT_MUSIC, CONFIG, "RECOMP_AUDIO_SPLIT_MUSIC", NULL, "1: the title's music plays in split screen too, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped (no music there)") \
     X(GFX_VEHICLE_DETAIL, CONFIG, "RECOMP_GFX_VEHICLE_DETAIL", NULL, "how far from the camera the title's vehicles keep their detailed models, for a title whose build has its level-of-detail distances behind a patch (--patches, recomp_patch.h): original (default, as shipped), far, farthest") \
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
     X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \
@@ -136,6 +138,8 @@ extern "C" {
     X(GFX_DITHER,        CONFIG, "RECOMP_GFX_DITHER",        NULL, "1: noise dither of +-0.5 LSB (interleaved gradient noise) in the Metal presenter's scale to the window, against banding of smooth gradients (default 0, off)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
+    X(AUDIO_MIXER,       CONFIG, "RECOMP_AUDIO_MIXER",       NULL, "the host mixer (buses over the title's voices): off (default), on") \
+    X(AUDIO_MIXER_FILE,  CONFIG, "RECOMP_AUDIO_MIXER_FILE",  NULL, "the mixer's preset file (default: mixer.toml beside settings.toml)") \
     X(AUDIO_FX_LEVEL,    CONFIG, "RECOMP_AUDIO_FX_LEVEL",    NULL, "5.1: level of the title's effect-send bins, 0..1 (default 0.25)") \
     X(AUDIO_MUSIC_DIR,   CONFIG, "RECOMP_AUDIO_MUSIC_DIR",   NULL, "audio.custom_music_dir: a folder of the user's music (mp3, flac, ogg, wav) offered to the title as Xbox custom soundtracks, for a title that plays them (xbox_soundtrack.h); default empty, off") \
     X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \
@@ -180,6 +184,7 @@ extern "C" {
     X(APU_TRACE,         TRACE, "apu",             "RECOMP_APU_TRACE",         "APU register and frame trace; [APU-IRQ] line every 5 s") \
     X(AUDIO_HOST,        TRACE, "audio_host",      NULL,                       "host audio playback vs wall clock; [AUDIO-HOST] starve lines (on with apu)") \
     X(AUDIO_CHANNELS,    TRACE, "audio_channels",  NULL,                       "level of every APU mixbin and output channel, once a second: [AUDIO-CH]") \
+    X(MIX_TRACE,         TRACE, "mix",             "RECOMP_MIX_TRACE",         "=file: per-voice mix study (BO-114): who turned each voice on, its bins, volumes, speaker shares and levels, once a second; output peaks before the clamp") \
     X(APU_RING,          TRACE, "apu_ring",        NULL,                       "looping APU buffers refilled by the title: [APU-RING] lead and stale-lap replays") \
     X(MMIO_TRACE,        TRACE, "mmio",            NULL,                       "trapped vs direct device-register accesses by device, register and host PC; [MMIO] block every 10 s") \
     X(USB_TRACE,         TRACE, "usb",             "RECOMP_USB_TRACE",         "OHCI trace") \

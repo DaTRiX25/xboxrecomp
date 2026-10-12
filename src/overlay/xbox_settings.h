@@ -59,6 +59,7 @@ typedef enum {
     XS_AUDIO_MUTE_BG,
     XS_AUDIO_SPEAKERS,
     XS_AUDIO_FX_LEVEL,
+    XS_AUDIO_MIXER,          /* the host mixer (apu_bus.h); its mix is in mixer.toml */
     XS_INPUT_DEADZONE,
     XS_INPUT_TRIGGER_DEADZONE,
     XS_INPUT_RUMBLE,
@@ -72,6 +73,8 @@ typedef enum {
     XS_GRAPHICS_BLOOM,       /* another: the title's own bloom, on as shipped */
     XS_GRAPHICS_MOTION_BLUR, /* another: the title's own motion blur, on as shipped */
     XS_GRAPHICS_CRASH_60FPS, /* another: the title's 30 Hz phases at 60, off as shipped */
+    XS_GRAPHICS_SPLIT_60FPS, /* another: the title's 30 Hz split screen at 60, off as shipped */
+    XS_AUDIO_SPLIT_MUSIC,    /* another: the title's music in split screen, off as shipped */
     XS_GRAPHICS_LOD_BIAS,    /* extra mip LOD bias: off, auto (from the render scale), or a value */
     XS_GRAPHICS_DITHER,      /* noise dither in the presenter's scale to the window (Metal) */
     XS_GRAPHICS_VEHICLE_DETAIL, /* an opt-in guest patch: the title's vehicle LOD distances */
