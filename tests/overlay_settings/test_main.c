@@ -109,7 +109,7 @@ int main(void)
         "[audio]\n"
         "volume = 0.5\n"               /* the environment sets it too */
         "mute = true\n"
-        "custom_music_dir = \"/music/My \\\"Best\\\" Of\"\n"   /* a text setting */
+        "custom_music_dir = \"/music/My \\\"Best\\\" \xC5\x90szi \xC5\xB1r\"\n"   /* a text setting, UTF-8 */
         "[input]\n"
         "deadzone = 3277\n"
         "rumble = 1.8\n"               /* an older slider's value, between two steps */
@@ -137,10 +137,10 @@ int main(void)
     CHECK(!strcmp(xbox_SettingsPath(), path));
     /* A text setting: into its variable, readable, not "unknown". */
     CHECK(getenv("RECOMP_AUDIO_MUSIC_DIR")
-          && !strcmp(getenv("RECOMP_AUDIO_MUSIC_DIR"), "/music/My \"Best\" Of"));
+          && !strcmp(getenv("RECOMP_AUDIO_MUSIC_DIR"), "/music/My \"Best\" \xC5\x90szi \xC5\xB1r"));
     {
         int locked = 1;
-        CHECK(!strcmp(xbox_SettingsText("audio.custom_music_dir", &locked), "/music/My \"Best\" Of"));
+        CHECK(!strcmp(xbox_SettingsText("audio.custom_music_dir", &locked), "/music/My \"Best\" \xC5\x90szi \xC5\xB1r"));
         CHECK(!locked);
         CHECK(!strcmp(xbox_SettingsText("no.such_key", NULL), ""));
     }
@@ -355,7 +355,7 @@ int main(void)
         {
             /* The text setting: in its section, once, escaped; the strict
              * reader above took the file, so no table is opened twice. */
-            const char *m = strstr(text, "custom_music_dir = \"/music/My \\\"Best\\\" Of\"");
+            const char *m = strstr(text, "custom_music_dir = \"/music/My \\\"Best\\\" \xC5\x90szi \xC5\xB1r\"");
             CHECK(m && a && m > a);
             CHECK(!strstr(text, "audio.custom_music_dir"));
         }

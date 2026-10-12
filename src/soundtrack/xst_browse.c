@@ -259,7 +259,8 @@ static void add_row(xsb_kind kind, const char *label, const char *path)
     r = &s_rows[s_n++];
     memset(r, 0, sizeof *r);
     r->kind = kind;
-    snprintf(r->label, sizeof r->label, "%s", label);
+    /* The label is for a screen: composed. The path stays as the disk has it. */
+    xst_utf8_compose(r->label, sizeof r->label, label);
     snprintf(r->path, sizeof r->path, "%s", path ? path : "");
     r->songs = (kind == XSB_OFF || kind == XSB_UP) ? 0 : -1;
 }
@@ -310,7 +311,11 @@ static void list_places(void)
         home = s_test_home;
     } else {
 #if defined(_WIN32)
-        home = getenv("USERPROFILE");
+        /* Wide, then UTF-8: the narrow environment is in the ANSI code page. */
+        static char home_utf8[1024];
+        const wchar_t *w = _wgetenv(L"USERPROFILE");
+        home = w && WideCharToMultiByte(CP_UTF8, 0, w, -1, home_utf8, sizeof home_utf8, NULL, NULL) > 0
+             ? home_utf8 : NULL;
 #elif defined(__ANDROID__)
         home = NULL;
 #else

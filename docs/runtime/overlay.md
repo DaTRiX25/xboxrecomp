@@ -155,6 +155,37 @@ locks the row. The choice is one table, `k_stock_hidden` in
 again); `xbox_PowerModeAtLoad(host, stored)` is the rule, testable per host
 (`tests/overlay_settings`).
 
+## Text and fonts
+
+Every string the overlay draws is UTF-8: its own labels and hints, a port's
+rows, folder names in the music folder browser. Two fonts, both embedded
+(no file is read at run time), merged into one (`overlay_fonts` in
+`overlay_ui.cpp`); Dear ImGui rasterises a glyph when it is first drawn, so
+there is no baked atlas and no list of ranges to keep:
+
+| font | covers | licence |
+|---|---|---|
+| ProggyForever, Dear ImGui's own default (in `imgui_draw.cpp`) | Basic Latin, Latin-1 | MIT |
+| DejaVu Sans Mono 2.37, a subset (`overlay_font_ext.h`, 41 KB, 630 characters) | Latin Extended-A and -B (U+0100-024F), Greek (U+0370-03FF), Cyrillic (U+0400-04FF), dashes and quotes (U+2010-2027), U+25A1 | Bitstream Vera licence (MIT kind; the notices go with every copy: `third_party/dejavu/LICENSE.txt`, which a binary release carries) |
+
+The first font decides wherever it has the character, so the overlay looks
+as it did; the second is set to its x-height and baseline. The subset is
+made by `third_party/dejavu/make_subset.py` from the release's
+`DejaVuSansMono.ttf` (checked by SHA-256); ProggyForever's own full font has
+no Latin Extended-A either (193 characters), which is why a second font is
+needed at all.
+
+A character neither font has is drawn as a square (U+25A1), not as "?".
+That is the case for CJK, Arabic, Hebrew, Indic scripts and emoji: out of
+scope (a CJK font is megabytes, and right-to-left and combining scripts need
+shaping this renderer does not do). A name in such a script still works: the
+folder is found, chosen and stored by its real name; only its drawing is
+squares.
+
+Names from a disk may be decomposed (macOS stores "ő" as "o" + U+030B): the
+browser's labels are composed first (`xst_utf8_compose`, Latin-1 and Latin
+Extended-A), since the renderer does not stack combining marks.
+
 ## Shader pre-build
 
 A host that can build its shaders ahead of time gives the overlay five calls

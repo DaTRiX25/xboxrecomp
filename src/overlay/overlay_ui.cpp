@@ -42,6 +42,15 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "overlay_font_ext.h"   /* k_overlay_font_ext: the second font's letters */
+/* DejaVu Sans Mono beside ProggyForever. A font's size is its ascent plus
+ * descent, and of that both have the same x-height (0.47), so the scale is
+ * the first font's own (ImGui gives its default 1.015). The baselines differ
+ * by 0.02 of the size (ascents 0.797 and 0.777): at the 13-pixel reference
+ * size the first font is moved down 0.41, this one 0.15. */
+#define OVERLAY_FONT_EXT_SCALE 1.015f
+#define OVERLAY_FONT_EXT_DY    0.15f
+
 #define LOGP "[OVERLAY] "
 
 /* ── state ─────────────────────────────────────────────────────────── */
@@ -1353,6 +1362,35 @@ static void accent_style()
     st.Colors[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
 }
 
+/* The text: Dear ImGui's own vector font (ProggyForever: Basic Latin and
+ * Latin-1), which is what the overlay has always drawn with, and behind it a
+ * subset of DejaVu Sans Mono for the letters that one lacks: Latin
+ * Extended-A and -B, Greek, Cyrillic (overlay_font_ext.h,
+ * third_party/dejavu). So a folder named in Hungarian, Polish, Czech,
+ * Turkish, Greek or Russian reads as it is written. Every string is UTF-8.
+ * A character neither font has (CJK, Arabic, emoji ...) is drawn as a
+ * square, U+25A1, not as "?", which could be part of the name.
+ *
+ * The second font is scaled to the first one's x-height (DejaVu's letters
+ * fill more of the em) and set on the same baseline. */
+static void overlay_fonts()
+{
+    ImGuiIO &io = ImGui::GetIO();
+    ImFont *font = io.Fonts->AddFontDefaultVector();
+    if (!font)
+        return;
+    ImFontConfig cfg;
+    cfg.MergeMode = true;
+    cfg.FontDataOwnedByAtlas = false;
+    cfg.PixelSnapH = true;
+    cfg.ExtraSizeScale = OVERLAY_FONT_EXT_SCALE;
+    cfg.GlyphOffset.y = OVERLAY_FONT_EXT_DY;
+    snprintf(cfg.Name, sizeof cfg.Name, "DejaVuSansMono subset");
+    io.Fonts->AddFontFromMemoryTTF((void *)k_overlay_font_ext, (int)sizeof k_overlay_font_ext,
+                                   13.0f, &cfg);
+    font->FallbackChar = 0x25A1;
+}
+
 bool overlay_core_init(bool vulkan)
 {
     if (s_core_ready)
@@ -1365,6 +1403,7 @@ bool overlay_core_init(bool vulkan)
     /* Navigation is the overlay's own (see the top); ImGui is the renderer
      * and the mouse. */
     io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
+    overlay_fonts();
     theme_pick();
     accent_style();
     bool ok = vulkan ? ImGui_ImplSDL2_InitForVulkan(s_win) : ImGui_ImplSDL2_InitForMetal(s_win);

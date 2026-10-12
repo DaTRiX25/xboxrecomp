@@ -210,6 +210,21 @@ Public domain - dr_libs and stb_vorbis (music decoders)
   with binaries; they are credited here all the same.
 
 
+Bitstream Vera licence - DejaVu Sans Mono (overlay font, a subset)
+-------------------------------------------------------------------
+
+  https://github.com/dejavu-fonts/dejavu-fonts (release 2.37)
+
+  src/overlay/overlay_font_ext.h: a subset of DejaVu Sans Mono (Latin
+  Extended-A and -B, Greek, Cyrillic, some punctuation), embedded in the
+  settings overlay behind Dear ImGui's own font for the letters that one
+  lacks. Fonts (c) 2003 Bitstream, Inc.; glyphs imported from Arev (c) 2006
+  Tavmjong Bah; the DejaVu changes are in the public domain. The licence is
+  third_party/dejavu/LICENSE.txt: free to use, copy, merge and distribute,
+  with its copyright and permission notices in every copy. A program
+  distributed in binary form with the overlay built in carries that file.
+
+
 Reference material (no code taken)
 -----------------------------------
 

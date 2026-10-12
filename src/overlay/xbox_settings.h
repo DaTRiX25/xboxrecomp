@@ -132,6 +132,10 @@ const char *xbox_SettingsPath(void);
  * the environment's when it sets the variable (*locked, may be NULL). ""
  * when unset or unknown. Set: remembered for the file (an empty value
  * removes the key); the runtime reads it at the next start. */
+/* Always UTF-8: the file is; on Windows the environment's value is taken
+ * from the wide environment and converted (the narrow one is in the ANSI
+ * code page), so a folder with any letters in its name opens. A reader of
+ * such a setting uses this, not getenv. */
 const char *xbox_SettingsText(const char *key, int *locked);
 void        xbox_SettingsSetText(const char *key, const char *value);
 
