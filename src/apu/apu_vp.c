@@ -1615,10 +1615,13 @@ static void mix_trace_voice(MCPXAPUState *d, unsigned v,
  * record (voice, channels, the eight bins and gains, the 32 samples), per
  * VP frame an 'F' record (the 32 mixbins after every voice). From
  * RECOMP_MIX_TRACE_REC_START seconds (default 0) for
- * RECOMP_MIX_TRACE_REC_SECONDS (default 10). */
+ * RECOMP_MIX_TRACE_REC_SECONDS (default 10). RECOMP_MIX_TRACE_REC_START=@path:
+ * from the moment the file path exists (looked for once a second), for a
+ * driver that knows when the race is on. */
 static FILE *s_rec_f;
 static int s_rec_state = -1;            /* -1 unread, 0 off, 1 waiting, 2 recording, 3 done */
 static unsigned s_rec_start, s_rec_frames_left, s_rec_multipass;
+static char s_rec_trigger[1024];        /* RECOMP_MIX_TRACE_REC_START=@path */
 
 static int mix_rec_on(void)
 {
@@ -1627,7 +1630,9 @@ static int mix_rec_on(void)
         s_rec_state = 0;
         if (e && *e && mcpx_apu_mix_trace_on() && (s_rec_f = fopen(e, "wb")) != NULL) {
             t = getenv("RECOMP_MIX_TRACE_REC_START");
-            s_rec_start = t ? (unsigned)atoi(t) * 1500u : 0;
+            s_rec_start = t && *t != '@' ? (unsigned)atoi(t) * 1500u : 0;
+            if (t && *t == '@')
+                snprintf(s_rec_trigger, sizeof(s_rec_trigger), "%s", t + 1);
             t = getenv("RECOMP_MIX_TRACE_REC_SECONDS");
             s_rec_frames_left = (t ? (unsigned)atoi(t) : 10u) * 1500u;
             s_rec_state = 1;
@@ -1663,7 +1668,11 @@ static void mix_rec_voice(MCPXAPUState *d, unsigned v,
 
 static void mix_rec_frame(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
-    if (s_rec_state == 1 && s_mix_frames >= s_rec_start) {
+    if (s_rec_state == 1 && s_rec_trigger[0]) {
+        FILE *t = s_mix_frames % 1500 == 0 ? fopen(s_rec_trigger, "rb") : NULL;
+        if (t) { fclose(t); s_rec_trigger[0] = 0; s_rec_start = 0; }
+    }
+    if (s_rec_state == 1 && !s_rec_trigger[0] && s_mix_frames >= s_rec_start) {
         s_rec_state = 2;                /* from the next frame's first voice */
         return;
     }
