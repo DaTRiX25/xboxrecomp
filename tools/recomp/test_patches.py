@@ -160,6 +160,59 @@ def test_cmp_kind_refuses_other_shapes():
     assert report.finish()
 
 
+# cmp dword [DATA], 1 ; jg +1 ; nop ; ret
+CMP_MEM32_IMM = f"833d{D32}017f0190c3"
+# cmp [DATA], ebx ; mov eax, [DATA] ; je +1 ; nop ; ret
+CMP_MEM32_REG = f"391d{D32}a1{D32}740190c3"
+# mov byte [DATA], 1 ; ret   /   mov [DATA], bl ; ret
+STORE_B_IMM = f"c605{D32}01c3"
+STORE_B_BL = f"881d{D32}c3"
+# mov dword [DATA], 1 ; ret
+STORE_D_IMM = f"c705{D32}01000000c3"
+
+
+def test_cmp_u32_rewrites_the_compare_snapshot():
+    for hexcode in (CMP_MEM32_IMM, CMP_MEM32_REG):
+        code, report = _translate(hexcode, patch=True, kind="cmp_u32", value=1)
+        want = ('_fa = RECOMP_PATCH_U32("game.speed_units", "kmh", 0x1u, _fa);'
+                " _fas = (int32_t)(_fa);")
+        assert want in code, code
+        assert code.index("_fa = (uint32_t)(MEM32(0x20000))") < code.index(want)
+        assert code.index(want) < code.index("if (CMP_"), code
+        assert report.finish() == []
+        plain, _ = _translate(hexcode)
+        assert [l for l in code.splitlines() if "RECOMP_PATCH" not in l] \
+            == plain.splitlines()
+    # A byte compare, a load, a store are not it; and the byte kind refuses
+    # the 32-bit compare.
+    for hexcode in (CMP_MEM_BL, LOAD_EAX, STORE, CMP_BL_MEM):
+        code, report = _translate(hexcode, patch=True, kind="cmp_u32", value=1)
+        assert "RECOMP_PATCH_U32" not in code, hexcode
+        assert any("is not a 32-bit `cmp" in e for e in report.finish()), hexcode
+    code, report = _translate(CMP_MEM32_IMM, patch=True, kind="cmp_u8", value=0)
+    assert "RECOMP_PATCH_U32" not in code and report.finish()
+
+
+def test_store_u8_stores_the_value_again():
+    for hexcode in (STORE_B_IMM, STORE_B_BL):
+        code, report = _translate(hexcode, patch=True, kind="store_u8", value=0)
+        want = ('MEM8(0x20000) = (uint8_t)RECOMP_PATCH_U32("game.speed_units", '
+                '"kmh", 0x0u, MEM8(0x20000));')
+        assert want in code, code
+        assert code.index("MEM8(0x20000) = ") < code.index(want)
+        assert report.finish() == []
+        plain, _ = _translate(hexcode)
+        assert [l for l in code.splitlines() if "RECOMP_PATCH" not in l] \
+            == plain.splitlines()
+    for hexcode in (STORE_D_IMM, STORE, LOAD_AL, CMP_MEM_BL):
+        code, report = _translate(hexcode, patch=True, kind="store_u8", value=0)
+        assert "RECOMP_PATCH_U32" not in code, hexcode
+        assert any("is not an 8-bit `mov byte" in e for e in report.finish()), hexcode
+    code, report = _translate(STORE_B_IMM, patch=True, kind="store_u8", value=0,
+                              latch="set")
+    assert "RECOMP_PATCH_U32" not in code and report.finish()
+
+
 def test_file_round_trip_and_bad_keys():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "patches.json")
@@ -193,7 +246,13 @@ def test_file_round_trip_and_bad_keys():
                     {"va": "0x1", "setting": "a.b", "when": "k", "value": 256,
                      "kind": "cmp_u8"},
                     {"va": "0x1", "setting": "a.b", "when": "k", "value": 0,
-                     "kind": "cmp_u8", "latch": "set"}):
+                     "kind": "cmp_u8", "latch": "set"},
+                    {"va": "0x1", "setting": "a.b", "when": "k", "value": 256,
+                     "kind": "store_u8"},
+                    {"va": "0x1", "setting": "a.b", "when": "k", "value": 0,
+                     "kind": "store_u8", "latch": "use"},
+                    {"va": "0x1", "setting": "a.b", "when": "k", "value": 1,
+                     "kind": "cmp_u32", "latch": "set"}):
             with open(path, "w") as f:
                 json.dump({"patches": [bad]}, f)
             try:
