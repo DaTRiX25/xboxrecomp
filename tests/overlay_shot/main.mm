@@ -186,9 +186,14 @@ static void e2e_render(int voices)
             st[i][1] = cosf(2.0f * 3.14159265f * 4.0f * (float)i / 32.0f);
             mono[i][0] = mono[i][1] = sinf(2.0f * 3.14159265f * 3.0f * (float)i / 32.0f);
         }
+        if (apu_bus_audition_playing()) {
+            /* A clip loops: its voices in place of the live ones (apu_vp.c). */
+            apu_bus_audition_mix(rt, bins);
+        } else {
         if (voices & V_MUSIC)  apu_bus_mix_voice(rt, 0, bins, (const float (*)[2])st, 2, b_music, g_music);
         if (voices & V_IMPACT) apu_bus_mix_voice(rt, 9, bins, (const float (*)[2])mono, 1, b_pos, g_pos);
         if (voices & V_ENGINE) apu_bus_mix_voice(rt, 4, bins, (const float (*)[2])low, 1, b_eng, g_eng);
+        }
         apu_bus_frame_end(rt, bins);
         memset(feeds, 0, sizeof feeds);
         for (int b = 0; b < 32; b++)
@@ -444,6 +449,52 @@ static int mixer_e2e(const char *file)
     SEL("Ducking"); ptap(P_A);
     ptap(P_B); run(2);
 
+    /* Audition: record, loop, the mixer acts on the loop, save, stop, the
+     * saved clip. */
+    {
+        apu_bus_audition_info ai;
+        char clip[600];
+        snprintf(clip, sizeof clip, "%s", file);
+        char *sl = strrchr(clip, '/');
+        snprintf(sl ? sl + 1 : clip, 40, "mixer-audition.clip");
+        remove(clip);
+        SEL("Audition"); ptap(P_A); run(1);                          /* nothing recorded: stays live */
+        e2e_render(V_MUSIC);
+        CHECK(apu_bus_audition_state() == APU_BUS_AUD_OFF);
+        SEL("Audition recording"); ptap(P_RIGHT); run(1);            /* the last 30 s */
+        CHECK(apu_bus_audition_kept_seconds() == 30);
+        for (int i = 0; i < 8; i++) e2e_render(V_MUSIC | V_IMPACT);  /* 6.4 s of "play" */
+        memcpy(base, e_spk, sizeof base);
+        apu_bus_audition_get(&ai);
+        CHECK(ai.kept_s > 6.0f && ai.bytes > 1000000);
+        SEL("Audition"); ptap(P_A); run(1);
+        /* No live voice: the loop sounds. Past its first 2 s, where the
+         * clip's end fades out under its start (the test's tones are the
+         * same there, so they add; real sound does not). */
+        for (int i = 0; i < 3; i++) e2e_render(0);
+        CHECK(apu_bus_audition_state() == APU_BUS_AUD_LAST);
+        CHECK(fabs(e_db(e_spk[0], base[0])) < 0.2 && fabs(e_db(e_spk[2], base[2])) < 0.2);
+        SEL("Music"); ptap(P_LB);                                    /* mute acts on the loop */
+        e2e_render(0);
+        CHECK(e_db(e_spk[5], base[5]) < -6.0 && fabs(e_db(e_spk[2], base[2])) < 0.2);
+        ptap(P_LB);
+        SEL("Save this clip"); ptap(P_A); run(1);
+        { FILE *fp = fopen(clip, "rb"); CHECK(fp != NULL); if (fp) fclose(fp); }
+        SEL("Audition"); ptap(P_A); run(1);                          /* back to live */
+        e2e_render(V_MUSIC);
+        CHECK(apu_bus_audition_state() == APU_BUS_AUD_OFF && SILENT(2) && e_spk[0] > 0.1);
+        SEL("Audition"); ptap(P_RIGHT); run(1);                      /* the saved clip */
+        for (int i = 0; i < 3; i++) e2e_render(0);
+        CHECK(apu_bus_audition_state() == APU_BUS_AUD_FILE && fabs(e_db(e_spk[2], base[2])) < 0.2);
+        ptap(P_A); run(1);
+        e2e_render(V_MUSIC);
+        CHECK(apu_bus_audition_state() == APU_BUS_AUD_OFF);
+        SEL("Audition recording"); ptap(P_LEFT); run(1);
+        e2e_render(V_MUSIC);
+        CHECK(apu_bus_audition_kept_seconds() == 0);
+        remove(clip);
+    }
+
     /* Presets and A/B. */
     SEL("Load a preset into A"); ptap(P_RIGHT); ptap(P_A);
     apu_bus_get_config(&c); CHECK(c.bus[0].route == APU_BUS_ROUTE_PAN);
@@ -511,7 +562,7 @@ static int mixer_tour(const char *pre, const char *file)
     tap(SDLK_RETURN); run(3);                                      /* Mixer: On */
     CHECK(apu_bus_enabled() && xbox_SettingValue(XS_AUDIO_MIXER) != 0);
     mixer_signal();
-    for (int i = 0; i < 5; i++) { tap(SDLK_DOWN); run(1); }        /* Music */
+    for (int i = 0; i < 7; i++) { tap(SDLK_DOWN); run(1); }        /* Music */
     for (int i = 0; i < 4; i++) { tap(SDLK_RIGHT); run(1); }       /* +2 dB */
     apu_bus_get_config(&c);
     CHECK(c.bus[0].gain_db == 2.0f);
