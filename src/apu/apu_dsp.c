@@ -22,6 +22,8 @@
  */
 
 #include "apu_state.h"
+#include "apu_limit.h"
+#include "apu_level.h"
 #include "apu_speakers.h"
 #include "recomp_env.h"
 #include "fpconv.h"
@@ -297,6 +299,11 @@ static void gp_mem_write(void *ctx, uint32_t off, const uint32_t *words, int n)
  * every frame, since the model takes a change only between fades. */
 static volatile int s_lfe_user = -2;    /* -2: the variable not read yet */
 
+void mcpx_apu_set_custom_level(int mode)
+{
+    apu_level_set_mode(mode);
+}
+
 void mcpx_apu_set_lfe_lowpass(int hz)
 {
     s_lfe_user = hz <= 0 ? 0 : hz < 40 ? 40 : hz > 250 ? 250 : hz;
@@ -518,6 +525,17 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
+    {
+        /* RECOMP_AUDIO_SAFETY_LIMITER=0: the clamp alone, for comparison. */
+        static int s_lim_env;
+        if (!s_lim_env) {
+            const char *e = recomp_env(RENV_AUDIO_SAFETY_LIMITER);
+            s_lim_env = 1;
+            if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "false")))
+                apu_limit_enable(0);
+        }
+    }
+
     if (apu_ocap_on())
         apu_ocap_bins(d, (const float (*)[NUM_SAMPLES_PER_FRAME])mixbins);
 
@@ -560,6 +578,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                     il[i * nch + c] = acc[c][i];
             mcpx_apu_mix_trace_out(il, nch, NUM_SAMPLES_PER_FRAME);
         }
+        apu_limit(acc, nch, NUM_SAMPLES_PER_FRAME);     /* the safety limiter (apu_limit.h) */
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
             for (int c = 0; c < nch; c++) {
                 float x = acc[c][i];
@@ -612,6 +631,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 }
             }
             apu_bus_output(acc, APU_SPK_CHANNELS, NUM_SAMPLES_PER_FRAME);
+            apu_limit(acc, APU_SPK_CHANNELS, NUM_SAMPLES_PER_FRAME);
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
                 for (int c = 0; c < APU_SPK_CHANNELS; c++) {
                     float x = acc[c][i];
@@ -670,6 +690,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             lr[1][i] = right;
         }
         apu_bus_output(lr, 2, NUM_SAMPLES_PER_FRAME);
+        apu_limit(lr, 2, NUM_SAMPLES_PER_FRAME);
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             float left = lr[0][i], right = lr[1][i];
             if (left > 1.0f) left = 1.0f;
@@ -685,6 +706,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
     } else
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         const int mix_trace = mcpx_apu_mix_trace_on();
+        float fold[2][NUM_SAMPLES_PER_FRAME];
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
              * On hardware the GP and EP mix the submixes down; here they are
@@ -729,6 +751,12 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 float lr[2] = { left, right };
                 mcpx_apu_mix_trace_out(lr, 2, 1);
             }
+            fold[0][i] = left;
+            fold[1][i] = right;
+        }
+        apu_limit(fold, 2, NUM_SAMPLES_PER_FRAME);      /* the safety limiter (apu_limit.h) */
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float left = fold[0][i], right = fold[1][i];
             /* Clamp to [-1, 1] range */
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;

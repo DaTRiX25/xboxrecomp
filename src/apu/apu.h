@@ -79,6 +79,11 @@ void mcpx_apu_set_fx_level(float level);
  * title's wiring sets it until this or the variable does. Any thread. */
 void mcpx_apu_set_lfe_lowpass(int hz);
 
+/* The level of a title's custom soundtrack (apu_level.h): 0 off, 1 quieter,
+ * 2 match, 3 louder. RECOMP_AUDIO_CUSTOM_LEVEL, audio.custom_music_level;
+ * live, any thread. */
+void mcpx_apu_set_custom_level(int mode);
+
 /* The speaker map in use (mcpx_apu_set_speaker_map, or the default). */
 void mcpx_apu_speaker_map_get(int8_t map[32]);
 

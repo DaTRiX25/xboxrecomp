@@ -38,6 +38,7 @@
  * without one may still hand a plain map to mcpx_apu_set_speaker_map.
  */
 #include "apu_speakers.h"
+#include "apu_limit.h"
 
 #include <string.h>
 #if defined(_WIN32)
@@ -127,6 +128,7 @@ void apu_spk_mix51(const float *mixbins, int stride, const apu_spk_map map,
                 dst[i] += src[i];
         }
     }
+    apu_limit(acc, APU_SPK_CHANNELS, n);    /* the safety limiter (apu_limit.h) */
     for (int i = 0; i < n; i++)
         for (int c = 0; c < APU_SPK_CHANNELS; c++)
             out[i][c] = to_s16(acc[c][i]);
@@ -151,7 +153,9 @@ void apu_spk_downmix(const int16_t (*in)[APU_SPK_CHANNELS], int16_t (*out)[2], i
                   + (int64_t)in[i][APU_SPK_SL] * ITU_M3DB;
         int64_t r = (int64_t)in[i][APU_SPK_FR] * 32768 + c
                   + (int64_t)in[i][APU_SPK_SR] * ITU_M3DB;
-        out[i][0] = sat16((int32_t)(l >> 15));
-        out[i][1] = sat16((int32_t)(r >> 15));
+        int32_t lo = (int32_t)(l >> 15), ro = (int32_t)(r >> 15);
+        apu_limit_fold16(&lo, &ro);         /* after the fold, before the saturation (apu_limit.h) */
+        out[i][0] = sat16(lo);
+        out[i][1] = sat16(ro);
     }
 }
