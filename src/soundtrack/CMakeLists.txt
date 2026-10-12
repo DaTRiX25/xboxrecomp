@@ -10,6 +10,7 @@
 add_library(xbox_soundtrack STATIC
     xst_library.c
     xst_decode.c
+    xst_browse.c
     xst_host.c
 )
 target_include_directories(xbox_soundtrack PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -21,11 +22,16 @@ target_include_directories(xbox_soundtrack PRIVATE
 # kernel.h is written in.
 target_link_libraries(xbox_soundtrack PUBLIC platform)
 if(NOT WIN32)
-    target_link_libraries(xbox_soundtrack PRIVATE m)
+    find_package(Threads REQUIRED)
+    target_link_libraries(xbox_soundtrack PRIVATE m Threads::Threads)
 endif()
 if(MSVC)
     target_compile_options(xbox_soundtrack PRIVATE /W3 /O2)
     target_compile_definitions(xbox_soundtrack PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_soundtrack PRIVATE -Wall -Wextra -O2)
+endif()
+if(APPLE)
+    # m4a (AAC, Apple Lossless) through the system's decoder: xst_decode.c.
+    target_link_libraries(xbox_soundtrack PUBLIC "-framework AudioToolbox" "-framework CoreFoundation")
 endif()

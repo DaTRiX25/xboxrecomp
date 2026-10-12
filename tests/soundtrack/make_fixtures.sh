@@ -21,5 +21,10 @@ ff -i /tmp/xst_tone48.wav -c:a libmp3lame -b:a 64k -id3v2_version 4 \
    -metadata title="Tone 48k" tone48_id3v24.mp3
 ff -i /tmp/xst_tone.wav -c:a flac -metadata title="Flac Title" tone.flac
 ff -i /tmp/xst_tone48.wav -c:a vorbis -strict -2 -b:a 64k -metadata title="Ogg Title" tone48.ogg
+# macOS only (the system's decoder is what plays them there): Apple's encoder.
+if command -v afconvert >/dev/null 2>&1; then
+    afconvert -f m4af -d aac -b 96000 /tmp/xst_tone.wav tone_aac.m4a
+    afconvert -f m4af -d alac /tmp/xst_tone.wav tone_alac.m4a
+fi
 rm -f /tmp/xst_tone.wav /tmp/xst_tone48.wav
 ls -l

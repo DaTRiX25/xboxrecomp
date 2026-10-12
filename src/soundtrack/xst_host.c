@@ -37,7 +37,9 @@ static const char HOST_DIR[]   = "\\Device\\Harddisk0\\Partition1\\TDATA\\FFFE00
 static const char HOST_DB[]    = "\\Device\\Harddisk0\\Partition1\\TDATA\\FFFE0000\\MUSIC.HOST\\ST.DB";
 
 static xst_library *s_lib;
-static int          s_active;
+static volatile int s_active;
+static int          s_hooked;
+static char         s_dir[1024];          /* the folder in use */
 static const char *(*s_prev_hook)(const char *xbox_path);
 
 /* The last handles XOpenSoundtrackSong returned. The title holds one or two
@@ -96,53 +98,46 @@ static int write_db(const uint8_t *db, size_t size)
             dir[i] = c;
         }
     }
+    /* Written beside and moved over: the title may be reading the old one
+     * (it opens the database at every song and every menu step). */
 #if defined(_WIN32)
-    _wmkdir(dir);
-    f = _wfopen(file, L"wb");
-#else
-    mkdir(dir, 0755);
-    f = fopen(file, "wb");
-#endif
-    if (!f)
+    {
+        WCHAR tmp[MAX_PATH + 8];
+        int tries;
+        _wmkdir(dir);
+        _snwprintf(tmp, MAX_PATH + 8, L"%ls.new", file);
+        f = _wfopen(tmp, L"wb");
+        if (!f)
+            return 0;
+        ok = fwrite(db, 1, size, f) == size;
+        if (fclose(f) != 0 || !ok)
+            return 0;
+        for (tries = 0; tries < 50; tries++) {
+            if (MoveFileExW(tmp, file, MOVEFILE_REPLACE_EXISTING))
+                return 1;
+            Sleep(20);
+        }
         return 0;
-    ok = fwrite(db, 1, size, f) == size;
-    return fclose(f) == 0 && ok;
+    }
+#else
+    {
+        char tmp[MAX_PATH + 8];
+        mkdir(dir, 0755);
+        snprintf(tmp, sizeof tmp, "%s.new", file);
+        f = fopen(tmp, "wb");
+        if (!f)
+            return 0;
+        ok = fwrite(db, 1, size, f) == size;
+        if (fclose(f) != 0 || !ok)
+            return 0;
+        return rename(tmp, file) == 0;
+    }
+#endif
 }
 
-int xbox_SoundtrackInit(const char *music_dir)
+static void log_library(const xst_library *lib, const char *music_dir)
 {
-    xst_library *lib;
-    uint8_t *db;
-    size_t size;
     int i;
-
-    if (s_active || !music_dir || !*music_dir)
-        return s_active ? s_lib->n_songs : 0;
-    lib = xst_scan(music_dir);
-    if (!lib) {
-        fprintf(stderr, LOGP "%s: cannot read the folder; custom music is off\n", music_dir);
-        return 0;
-    }
-    if (lib->n_songs == 0) {
-        fprintf(stderr, LOGP "%s: no mp3, flac, ogg or wav file found; custom music is off\n",
-                music_dir);
-        xst_free(lib);
-        return 0;
-    }
-    size = xst_db_size(lib);
-    db = (uint8_t *)malloc(size);
-    if (!db || xst_db_build(lib, db, size) != size || !write_db(db, size)) {
-        fprintf(stderr, LOGP "cannot write the soundtrack database; custom music is off\n");
-        free(db);
-        xst_free(lib);
-        return 0;
-    }
-    free(db);
-
-    s_lib = lib;
-    s_prev_hook = xbox_PathRedirectHook;
-    s_active = 1;
-    xbox_PathRedirectHook = redirect;
 
     fprintf(stderr, LOGP "%s: %d soundtrack%s, %d song%s\n", music_dir,
             lib->n_st, lib->n_st == 1 ? "" : "s", lib->n_songs, lib->n_songs == 1 ? "" : "s");
@@ -162,7 +157,64 @@ int xbox_SoundtrackInit(const char *music_dir)
                 lib->dropped_folders, lib->dropped_folders == 1 ? "" : "s", XST_MAX_SOUNDTRACKS,
                 lib->dropped_songs, lib->dropped_songs == 1 ? "" : "s", XST_MAX_SONGS,
                 lib->bad_files, lib->bad_files == 1 ? "" : "s");
-    return lib->n_songs;
+}
+
+/* `lib` (scanned from `music_dir`) becomes the library in use: its database
+ * on the disk, the redirect on. NULL or an empty one: none in use, the
+ * title's paths its own again. Returns the songs now offered. Takes `lib`. */
+static int use_library(xst_library *lib, const char *music_dir)
+{
+    xst_library *old;
+    uint8_t *db = NULL;
+    size_t size;
+
+    if (lib && lib->n_songs == 0) {
+        fprintf(stderr, LOGP "%s: no mp3, flac, ogg or wav file found; custom music is off\n",
+                music_dir);
+        xst_free(lib);
+        lib = NULL;
+    }
+    if (lib) {
+        size = xst_db_size(lib);
+        db = (uint8_t *)malloc(size);
+        if (!db || xst_db_build(lib, db, size) != size || !write_db(db, size)) {
+            fprintf(stderr, LOGP "cannot write the soundtrack database; custom music is off\n");
+            xst_free(lib);
+            lib = NULL;
+        }
+        free(db);
+    }
+
+    open_lock();
+    old = s_lib;
+    s_lib = lib;
+    s_active = lib != NULL;
+    snprintf(s_dir, sizeof s_dir, "%s", lib ? music_dir : "");
+    if (lib && !s_hooked) {
+        s_hooked = 1;
+        s_prev_hook = xbox_PathRedirectHook;
+        xbox_PathRedirectHook = redirect;
+    }
+    open_unlock();
+    xst_free(old);
+
+    if (lib)
+        log_library(lib, music_dir);
+    return lib ? lib->n_songs : 0;
+}
+
+int xbox_SoundtrackInit(const char *music_dir)
+{
+    xst_library *lib;
+
+    if (s_active || !music_dir || !*music_dir)
+        return s_active ? s_lib->n_songs : 0;
+    lib = xst_scan(music_dir);
+    if (!lib) {
+        fprintf(stderr, LOGP "%s: cannot read the folder; custom music is off\n", music_dir);
+        return 0;
+    }
+    return use_library(lib, music_dir);
 }
 
 int xbox_SoundtrackActive(void)
@@ -173,6 +225,107 @@ int xbox_SoundtrackActive(void)
 const xst_library *xbox_SoundtrackLibrary(void)
 {
     return s_lib;
+}
+
+void xbox_SoundtrackInfo(char *dir, size_t cap, int *soundtracks, int *songs)
+{
+    open_lock();
+    if (dir && cap)
+        snprintf(dir, cap, "%s", s_dir);
+    if (soundtracks)
+        *soundtracks = s_lib ? s_lib->n_st : 0;
+    if (songs)
+        *songs = s_lib ? s_lib->n_songs : 0;
+    open_unlock();
+}
+
+/* ── a change while the title runs ─────────────────────────────────── */
+
+static char          s_want[1024];
+static volatile LONG s_want_gen;
+static volatile LONG s_scanning;
+static xst_progress  s_progress;
+static void        (*s_done)(int soundtracks, int songs);
+
+static DWORD WINAPI scan_thread(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        char dir[1024];
+        void (*done)(int, int);
+        xst_library *lib = NULL;
+        LONG gen;
+        int n_st = 0, n_songs = 0, last;
+
+        open_lock();
+        gen = s_want_gen;
+        snprintf(dir, sizeof dir, "%s", s_want);
+        done = s_done;
+        s_progress.folders = s_progress.files = s_progress.songs = 0;
+        s_progress.cancel = 0;
+        open_unlock();
+
+        if (dir[0]) {
+            lib = xst_scan_progress(dir, &s_progress);
+            if (!lib && !s_progress.cancel)
+                fprintf(stderr, LOGP "%s: cannot read the folder; custom music is off\n", dir);
+        } else {
+            fprintf(stderr, LOGP "custom music is off\n");
+        }
+
+        open_lock();
+        last = gen == s_want_gen;
+        open_unlock();
+        if (!last) {                      /* asked again meanwhile */
+            xst_free(lib);
+            continue;
+        }
+        use_library(lib, dir);
+        xbox_SoundtrackInfo(NULL, 0, &n_st, &n_songs);
+        if (done)
+            done(n_st, n_songs);
+        open_lock();
+        last = gen == s_want_gen;
+        if (last)
+            s_scanning = 0;
+        open_unlock();
+        if (last)
+            return 0;
+    }
+}
+
+int xbox_SoundtrackSetFolder(const char *music_dir, void (*done)(int soundtracks, int songs))
+{
+    int start;
+
+    open_lock();
+    snprintf(s_want, sizeof s_want, "%s", music_dir ? music_dir : "");
+    s_done = done;
+    s_want_gen++;
+    s_progress.cancel = 1;
+    start = !s_scanning;
+    if (start)
+        s_scanning = 1;
+    open_unlock();
+    if (start) {
+        HANDLE t = CreateThread(NULL, 0, scan_thread, NULL, 0, NULL);
+        if (!t) {
+            open_lock();
+            s_scanning = 0;
+            open_unlock();
+            return 0;
+        }
+        CloseHandle(t);
+    }
+    return 1;
+}
+
+int xbox_SoundtrackScanning(int *folders, int *files, int *songs)
+{
+    if (folders) *folders = s_progress.folders;
+    if (files)   *files = s_progress.files;
+    if (songs)   *songs = s_progress.songs;
+    return s_scanning != 0;
 }
 
 void xbox_SoundtrackNoteOpen(uint32_t handle, uint32_t song_id)
@@ -194,9 +347,11 @@ void xbox_SoundtrackNoteOpen(uint32_t handle, uint32_t song_id)
 
 xst_stream *xbox_SoundtrackOpenHandle(uint32_t handle, int *ours)
 {
-    const xst_song *song = NULL;
+    char path[1024] = "";
+    uint32_t id = 0;
     xst_stream *s;
     unsigned i, rate = 0, ch = 0;
+    int found = 0;
 
     if (ours)
         *ours = 0;
@@ -205,20 +360,26 @@ xst_stream *xbox_SoundtrackOpenHandle(uint32_t handle, int *ours)
     open_lock();
     for (i = 0; i < OPEN_SLOTS; i++)
         if (s_open[i].handle == handle && handle) {
-            song = xst_song_by_id(s_lib, s_open[i].song);
+            /* A song noted before the folder changed may not be in the new
+             * library: it is still ours, and over at once. */
+            const xst_song *song = xst_song_by_id(s_lib, s_open[i].song);
+            found = 1;
+            id = s_open[i].song;
+            if (song)
+                snprintf(path, sizeof path, "%s", song->path);
             break;
         }
     open_unlock();
-    if (!song)
+    if (!found)
         return NULL;
     if (ours)
         *ours = 1;
-    s = xst_stream_open(song->path);
+    s = path[0] ? xst_stream_open(path) : NULL;
     if (!s) {
-        fprintf(stderr, LOGP "cannot play %s\n", song->path);
+        fprintf(stderr, LOGP "cannot play song %08X %s\n", (unsigned)id, path);
         return NULL;
     }
     xst_stream_format(s, &rate, &ch);
-    fprintf(stderr, LOGP "song %08X: %s (%u Hz, %u ch)\n", (unsigned)song->id, song->path, rate, ch);
+    fprintf(stderr, LOGP "song %08X: %s (%u Hz, %u ch)\n", (unsigned)id, path, rate, ch);
     return s;
 }

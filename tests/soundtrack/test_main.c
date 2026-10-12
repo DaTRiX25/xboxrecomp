@@ -12,7 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #if defined(_WIN32)
+#include <windows.h>
 #include <direct.h>
 #define mkdir(p, m) _mkdir(p)
 #endif
@@ -154,7 +156,12 @@ static void test_names(void)
 
     CHECK("mp3", xst_is_playable_name("a.MP3"));
     CHECK("flac", xst_is_playable_name("a.b.flac"));
+#if defined(__APPLE__)
+    CHECK("m4a where the system decodes it", xst_is_playable_name("a.m4a"));
+#else
     CHECK("not m4a", !xst_is_playable_name("a.m4a"));
+#endif
+    CHECK("not wma", !xst_is_playable_name("a.wma"));
     CHECK("not hidden", !xst_is_playable_name("._a.mp3"));
     CHECK("no extension", !xst_is_playable_name("mp3"));
 }
@@ -372,6 +379,24 @@ static void test_decode(void)
                  && tone_share(pcm + 4000, n - 8000, 0, 1000) > 0.99
                  && fabs(rms_db(pcm + 4000, n - 8000) - (-9.03)) < 0.3);
 
+#if defined(__APPLE__)
+    /* macOS: m4a through the system's decoder, AAC and Apple Lossless. */
+    fixture("tone_aac.m4a", "f_aac.m4a");
+    n = decode_all(in_work("f_aac.m4a"), pcm, cap, &rate, &ch);
+    CHECK("m4a aac", n > 21000 && n < 26000 && rate == 44100 && ch == 2
+                     && tone_share(pcm + 4000, n - 8000, 0, 1000) > 0.99
+                     && fabs(rms_db(pcm + 4000, n - 8000) - (-9.03)) < 0.3);
+    fixture("tone_alac.m4a", "f_alac.m4a");
+    n = decode_all(in_work("f_alac.m4a"), pcm, cap, &rate, &ch);
+    CHECK("m4a apple lossless", n == 22050 && tone_share(pcm, n, 0, 1000) > 0.999
+                                && fabs(rms_db(pcm, n) - (-9.03)) < 0.05);
+    {
+        uint32_t ms = 0;
+        char title[8];
+        CHECK("probe m4a", xst_probe(in_work("f_alac.m4a"), &ms, title, sizeof title) && ms == 500);
+    }
+#endif
+
     {
         char title[64];
         uint32_t ms = 0;
@@ -386,6 +411,143 @@ static void test_decode(void)
     }
 }
 
+static void wait_counts(void)
+{
+    int tries, i, pending = 1;
+    for (tries = 0; tries < 400 && pending; tries++) {
+        xsb_row r;
+        pending = 0;
+        for (i = 0; xsb_row_at(i, &r); i++)
+            if (r.songs < 0)
+                pending = 1;
+        if (pending) {
+#if defined(_WIN32)
+            Sleep(10);
+#else
+            struct timespec ts = { 0, 10 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+#endif
+        }
+    }
+    CHECK("counts arrive", !pending);
+}
+
+static int find_row(const char *label)
+{
+    xsb_row r;
+    int i;
+    for (i = 0; xsb_row_at(i, &r); i++)
+        if (!strcmp(r.label, label))
+            return i;
+    return -1;
+}
+
+/* The browser's model over the tree test_scan_and_db made (lib/) and a made
+ * home folder and media root. */
+static void test_browse(void)
+{
+    char home[1400], media[1400], chosen[1024], where[1024];
+    const char *roots[2];
+    xsb_row r;
+    int i, sel = -1;
+
+    snprintf(home, sizeof home, "%s", in_work("home/deck"));
+    snprintf(media, sizeof media, "%s", in_work("media"));
+    mkdir(in_work("home"), 0755);
+    mkdir(home, 0755);
+    mkdir(in_work("home/deck/Music"), 0755);
+    mkdir(in_work("home/deck/Music/Album"), 0755);
+    mkdir(in_work("home/deck/Music/Empty"), 0755);
+    mkdir(in_work("home/deck/Music/.hidden"), 0755);
+    mkdir(media, 0755);
+    mkdir(in_work("media/deck"), 0755);
+    mkdir(in_work("media/deck/SDCARD"), 0755);
+    mkdir(in_work("media/USB"), 0755);
+    write_wav(in_work("home/deck/Music/loose.wav"), 8000, 1, 440, 10);
+    write_wav(in_work("home/deck/Music/Album/1.wav"), 8000, 1, 440, 10);
+    write_wav(in_work("home/deck/Music/Album/2.wav"), 8000, 1, 440, 10);
+    copy_file(in_work("home/deck/Music/loose.wav"), in_work("home/deck/Music/Album/cover.jpg"));
+    roots[0] = media; roots[1] = NULL;
+    xsb_set_roots(home, roots);
+
+    CHECK("closed: no rows", xsb_rows() == 0 && !xsb_is_open());
+    xsb_open(in_work("lib"));
+    CHECK("open", xsb_is_open());
+    /* The places: off, the current folder, Music, Home, the card under the
+     * user's name and the drive beside it; no Downloads (there is none). */
+    CHECK("turn off first", xsb_row_at(0, &r) && r.kind == XSB_OFF);
+    CHECK("current folder", xsb_row_at(1, &r) && r.kind == XSB_PLACE
+                            && !strcmp(r.label, "Current folder: lib"));
+    CHECK("music", find_row("Music") == 2);
+    CHECK("home", find_row("Home") == 3);
+    CHECK("no downloads", find_row("Downloads") < 0);
+    CHECK("the user's card", find_row("Drive: SDCARD") == 4);
+    CHECK("a drive", find_row("Drive: USB") == 5);
+    CHECK("not the user's folder itself", find_row("Drive: deck") < 0);
+    CHECK("six places", xsb_rows() == 6);
+    xsb_where(where, sizeof where);
+    CHECK("on the places", where[0] == 0);
+    wait_counts();
+    /* By name: the broken .flac counts here, a scan leaves it out. */
+    CHECK("songs under the current folder", xsb_row_at(1, &r) && r.songs == 20 && !r.more);
+    CHECK("songs under Music", xsb_row_at(2, &r) && r.songs == 3);
+    CHECK("an empty card", xsb_row_at(4, &r) && r.songs == 0);
+
+    CHECK("into Music", xsb_activate(2, chosen, sizeof chosen, &sel) == XSB_MOVED);
+    xsb_where(where, sizeof where);
+    CHECK("where", !strcmp(where, in_work("home/deck/Music")));
+    CHECK("use, up, then the folders", xsb_rows() == 4 && xsb_row_at(0, &r) && r.kind == XSB_USE
+                                       && xsb_row_at(1, &r) && r.kind == XSB_UP
+                                       && xsb_row_at(2, &r) && r.kind == XSB_DIR && !strcmp(r.label, "Album")
+                                       && xsb_row_at(3, &r) && !strcmp(r.label, "Empty"));
+    CHECK("cursor on the first folder", sel == 2);
+    wait_counts();
+    CHECK("counts", xsb_row_at(0, &r) && r.songs == 3 && xsb_row_at(2, &r) && r.songs == 2
+                    && xsb_row_at(3, &r) && r.songs == 0);
+    CHECK("into Album", xsb_activate(2, chosen, sizeof chosen, &sel) == XSB_MOVED && sel == 0);
+    CHECK("no folders there", xsb_rows() == 2);
+    CHECK("use it", xsb_activate(0, chosen, sizeof chosen, &sel) == XSB_CHOSEN
+                    && !strcmp(chosen, in_work("home/deck/Music/Album")));
+    /* Up: the folder left is under the cursor. */
+    CHECK("..", xsb_activate(1, chosen, sizeof chosen, &sel) == XSB_MOVED && sel == 2);
+    xsb_where(where, sizeof where);
+    CHECK("in Music again", !strcmp(where, in_work("home/deck/Music")));
+    /* Up from the place's own folder: the places, on that place. */
+    CHECK("back to the places", xsb_back(&sel) == XSB_MOVED && sel == 2 && xsb_rows() == 6);
+    CHECK("back from the places closes", xsb_back(&sel) == XSB_CLOSED);
+    CHECK("turn off", xsb_activate(0, chosen, sizeof chosen, &sel) == XSB_TURNED_OFF);
+    /* Home: its Music is a folder of it; going up from it stays inside Home. */
+    CHECK("into Home", xsb_activate(3, chosen, sizeof chosen, &sel) == XSB_MOVED);
+    i = find_row("Music");
+    CHECK("Music in Home", i == 2 && xsb_activate(i, chosen, sizeof chosen, &sel) == XSB_MOVED);
+    CHECK("up to Home", xsb_back(&sel) == XSB_MOVED && sel == 2);
+    xsb_where(where, sizeof where);
+    CHECK("Home", !strcmp(where, home));
+    xsb_close();
+    CHECK("closed", !xsb_is_open() && xsb_rows() == 0);
+
+    /* Nothing chosen yet: no "turn off", no current folder. */
+    xsb_open("");
+    CHECK("no current folder", xsb_rows() == 4 && xsb_row_at(0, &r) && !strcmp(r.label, "Music"));
+    xsb_close();
+    xsb_set_roots(NULL, NULL);
+}
+
+static void test_progress(void)
+{
+    xst_progress pr;
+    xst_library *lib;
+
+    memset(&pr, 0, sizeof pr);
+    lib = xst_scan_progress(in_work("lib"), &pr);
+    CHECK("progress counts", lib && pr.songs == lib->n_songs && pr.files == lib->n_songs + 1
+                             && pr.folders >= 4);
+    xst_free(lib);
+    memset(&pr, 0, sizeof pr);
+    pr.cancel = 1;
+    CHECK("a cancelled scan", xst_scan_progress(in_work("lib"), &pr) == NULL && pr.files == 0);
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -398,6 +560,8 @@ int main(int argc, char **argv)
     test_names();
     test_scan_and_db();
     test_limits();
+    test_browse();
+    test_progress();
     test_decode();
     printf(failures ? "%d FAILED\n" : "ok\n", failures);
     return failures ? 1 : 0;

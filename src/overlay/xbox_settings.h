@@ -163,10 +163,18 @@ void xbox_SettingEnvString(const xs_setting *s, double v, char *out, unsigned n)
  * version (NULL or "": none). Here and not in overlay.h, which needs SDL. */
 void xbox_OverlaySetAbout(const char *text);
 
-/* Up to two lines of text on the overlay's Audio page, under its settings
- * (NULL or "": none): what a port has to say there that is not a setting the
- * overlay steps through (its custom-music folder). */
-void xbox_OverlaySetAudioNote(const char *line1, const char *line2);
+/* The "Custom music folder" row of the overlay's Audio page, for a port
+ * whose title plays the user's music (xbox_soundtrack.h); none until this is
+ * called. The row opens a folder browser inside the overlay (a pad is
+ * enough); the folder picked there is stored as audio.custom_music_dir and
+ * handed to `chosen` ("" for "turn off"), on the overlay's thread. `status`
+ * fills the line under the row: what is in use, a scan's progress, when a
+ * change shows ("" for no line). */
+typedef struct xbox_music_folder_ops {
+    void (*status)(char *out, unsigned n);
+    void (*chosen)(const char *dir);
+} xbox_music_folder_ops;
+void xbox_OverlaySetMusicFolder(const xbox_music_folder_ops *ops);
 
 #ifdef __cplusplus
 }

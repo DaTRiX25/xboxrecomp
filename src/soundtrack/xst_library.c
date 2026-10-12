@@ -3,6 +3,7 @@
  * See xbox_soundtrack.h.
  */
 #include "xbox_soundtrack.h"
+#include "xst_internal.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -136,7 +137,12 @@ void xst_name_from_utf8(uint16_t out[XST_NAME_UNITS], const char *utf8)
 
 int xst_is_playable_name(const char *name)
 {
-    static const char *const ext[] = { ".mp3", ".flac", ".ogg", ".oga", ".wav", NULL };
+    static const char *const ext[] = { ".mp3", ".flac", ".ogg", ".oga", ".wav",
+#if defined(__APPLE__)
+        /* The system's decoder (xst_decode.c): macOS only. */
+        ".m4a", ".aac", ".aif", ".aiff", ".caf",
+#endif
+        NULL };
     const char *dot = strrchr(name, '.');
     int i;
 
@@ -153,9 +159,8 @@ int xst_is_playable_name(const char *name)
 
 /* ── one folder's entries ──────────────────────────────────────────── */
 
-typedef struct { char **v; int n, cap; } names;
 
-static int names_add(names *l, const char *s)
+int xst_names_add(xst_names *l, const char *s)
 {
     if (l->n == l->cap) {
         int cap = l->cap ? l->cap * 2 : 32;
@@ -171,7 +176,7 @@ static int names_add(names *l, const char *s)
     return 1;
 }
 
-static void names_free(names *l)
+void xst_names_free(xst_names *l)
 {
     int i;
     for (i = 0; i < l->n; i++)
@@ -186,7 +191,7 @@ static int names_cmp(const void *a, const void *b)
 }
 
 /* The playable files and the folders of `dir`, each sorted. 0: unreadable. */
-static int list_dir(const char *dir, names *files, names *dirs)
+int xst_list_dir(const char *dir, xst_names *files, xst_names *dirs)
 {
 #if defined(_WIN32)
     wchar_t pat[1024];
@@ -206,9 +211,9 @@ static int list_dir(const char *dir, names *files, names *dirs)
         if (name[0] == '.' || (fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN))
             continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            names_add(dirs, name);
-        else if (xst_is_playable_name(name))
-            names_add(files, name);
+            xst_names_add(dirs, name);
+        else if (files && xst_is_playable_name(name))
+            xst_names_add(files, name);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 #else
@@ -225,13 +230,13 @@ static int list_dir(const char *dir, names *files, names *dirs)
         if (stat(path, &st) != 0)
             continue;
         if (S_ISDIR(st.st_mode))
-            names_add(dirs, e->d_name);
-        else if (S_ISREG(st.st_mode) && xst_is_playable_name(e->d_name))
-            names_add(files, e->d_name);
+            xst_names_add(dirs, e->d_name);
+        else if (files && S_ISREG(st.st_mode) && xst_is_playable_name(e->d_name))
+            xst_names_add(files, e->d_name);
     }
     closedir(d);
 #endif
-    if (files->n)
+    if (files && files->n)
         qsort(files->v, (size_t)files->n, sizeof files->v[0], names_cmp);
     if (dirs->n)
         qsort(dirs->v, (size_t)dirs->n, sizeof dirs->v[0], names_cmp);
@@ -273,14 +278,16 @@ static int add_song(xst_library *lib, const char *path, const char *title, uint3
     return 1;
 }
 
-static void scan_dir(xst_library *lib, const char *dir, int depth)
+static void scan_dir(xst_library *lib, const char *dir, int depth, xst_progress *pr)
 {
-    names files = { 0 }, dirs = { 0 };
+    xst_names files = { 0 }, dirs = { 0 };
     char path[2048];
     int i;
 
-    if (!list_dir(dir, &files, &dirs))
+    if ((pr && pr->cancel) || !xst_list_dir(dir, &files, &dirs))
         return;
+    if (pr)
+        pr->folders++;
 
     if (files.n && lib->n_st == XST_MAX_SOUNDTRACKS) {
         lib->dropped_folders++;
@@ -300,6 +307,11 @@ static void scan_dir(xst_library *lib, const char *dir, int depth)
                 lib->dropped_songs += files.n - i;
                 break;
             }
+            if (pr) {
+                if (pr->cancel)
+                    break;
+                pr->files++;
+            }
             snprintf(path, sizeof path, "%s/%s", dir, files.v[i]);
             title[0] = 0;
             if (!xst_probe(path, &ms, title, sizeof title)) {
@@ -317,6 +329,8 @@ static void scan_dir(xst_library *lib, const char *dir, int depth)
                 break;
             lib->songs[lib->n_songs - 1].id = (st->id << 16) | (uint32_t)st->count;
             st->count++;
+            if (pr)
+                pr->songs++;
             st->ms += ms;
         }
         if (st->count) {
@@ -333,16 +347,21 @@ static void scan_dir(xst_library *lib, const char *dir, int depth)
     if (depth < XST_MAX_DEPTH)
         for (i = 0; i < dirs.n; i++) {
             snprintf(path, sizeof path, "%s/%s", dir, dirs.v[i]);
-            scan_dir(lib, path, depth + 1);
+            scan_dir(lib, path, depth + 1, pr);
         }
-    names_free(&files);
-    names_free(&dirs);
+    xst_names_free(&files);
+    xst_names_free(&dirs);
 }
 
 xst_library *xst_scan(const char *dir)
 {
+    return xst_scan_progress(dir, NULL);
+}
+
+xst_library *xst_scan_progress(const char *dir, xst_progress *pr)
+{
     xst_library *lib;
-    names files = { 0 }, dirs = { 0 };
+    xst_names files = { 0 }, dirs = { 0 };
     char root[2048];
     size_t n;
 
@@ -352,15 +371,19 @@ xst_library *xst_scan(const char *dir)
     n = strlen(root);
     while (n > 1 && (root[n - 1] == '/' || root[n - 1] == '\\'))
         root[--n] = 0;
-    if (!list_dir(root, &files, &dirs))
+    if (!xst_list_dir(root, &files, &dirs))
         return NULL;
-    names_free(&files);
-    names_free(&dirs);
+    xst_names_free(&files);
+    xst_names_free(&dirs);
 
     lib = (xst_library *)calloc(1, sizeof *lib);
     if (!lib)
         return NULL;
-    scan_dir(lib, root, 0);
+    scan_dir(lib, root, 0, pr);
+    if (pr && pr->cancel) {
+        xst_free(lib);
+        return NULL;
+    }
     return lib;
 }
 

@@ -29,6 +29,8 @@ target_include_directories(xbox_overlay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../d
 # Seen by the presenters and the host that call into it.
 target_compile_definitions(xbox_overlay PUBLIC XBOXRECOMP_HAVE_OVERLAY=1)
 target_link_libraries(xbox_overlay PUBLIC SDL2::SDL2 recomp_env xbox_enhance xbox_input xbox_kernel xbox_apu)
+# The music folder browser's model (xsb_*).
+target_link_libraries(xbox_overlay PUBLIC xbox_soundtrack)
 
 if(APPLE)
     target_sources(xbox_overlay PRIVATE
