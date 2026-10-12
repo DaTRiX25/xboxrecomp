@@ -334,7 +334,8 @@ static void commit(guard_entry *e)
         /* The same bytes again (a title rewrites its meta file at every
          * save): nothing to replace, nothing to keep a copy of. */
         h_unlink(e->shadow);
-        fprintf(stderr, LOGP LEAF_FMT ": written with the same content (%u writes, %llu bytes), left as it is\n",
+        if (e->writes)                /* opened for writing and not written: not worth a line */
+            fprintf(stderr, LOGP LEAF_FMT ": written with the same content (%u writes, %llu bytes), left as it is\n",
                 leaf(e->real), e->writes, e->bytes);
         return;
     }
