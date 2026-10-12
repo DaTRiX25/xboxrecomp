@@ -9,6 +9,39 @@
  * and the DSP stage's s16 output of A with the mixer off against B's with
  * the mixer on, stereo and 5.1. Bytes, not levels. */
 #include "common.h"
+#include <time.h>
+
+static double now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+}
+
+/* Everything on at once: what the mixer costs at most. */
+static void busy_config(apu_bus_config *c)
+{
+    apu_bus_config_neutral(c);
+    for (int b = 0; b < 13; b++) {
+        c->bus[b].gain_db = -1.0f;
+        c->bus[b].route = (b & 1) ? APU_BUS_ROUTE_SENDS : APU_BUS_ROUTE_TITLE;
+        for (int t = 0; t < APU_BUS_TRIMS; t++) c->bus[b].trim_db[t] = -0.5f;
+        for (int s = 0; s < APU_BUS_SPEAKERS; s++) c->bus[b].send_db[s] = -6.0f;
+        c->bus[b].lfe_send_db = -6.0f;
+        c->bus[b].lfe_crossover_hz = 80;
+    }
+    for (int s = 0; s < APU_BUS_SPEAKERS; s++) {
+        c->speaker_trim_db[s] = -1.0f;
+        c->speaker_delay_ms[s] = 2.0f;
+    }
+    c->lfe_lowpass_hz = 120;
+    c->mains_highpass_hz = 80;
+    c->limiter = APU_BUS_LIM_PEAK;
+    c->ceiling_db = -1.0f;
+    c->duck.enabled = 1;
+    c->duck.source = 9;
+    c->duck.target = 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -21,8 +54,11 @@ int main(int argc, char **argv)
     unsigned long sounding = 0;
     double peak = 0;
     int nv = 0, c;
-    apu_bus_config cfg;
+    apu_bus_config cfg, busy;
+    double t_old = 0, t_neutral = 0, t_busy = 0, t0;
+    static float feeds[6][NUM_SAMPLES_PER_FRAME];
 
+    busy_config(&busy);
     if (!f) { fprintf(stderr, "usage: apu_bus_replay <recording>\n"); return 2; }
     dsp_setup();
     apu_bus_set_names(k_names, 13);
@@ -42,12 +78,32 @@ int main(int argc, char **argv)
             voices++;
         } else if (c == 'F') {
             int16_t oa[NUM_SAMPLES_PER_FRAME * 6], ob[NUM_SAMPLES_PER_FRAME * 6];
-            struct apu_bus_rt *rt;
+            struct apu_bus_rt *rt = NULL;
             if (fread(R, sizeof(R), 1, f) != 1) break;
             memset(A, 0, sizeof(A));
             memset(B, 0, sizeof(B));
+            t0 = now_us();
             for (int i = 0; i < nv; i++) old_mix(A, &vv[i]);
+            t_old += now_us() - t0;
             if (memcmp(A, R, sizeof(A))) bad_game++;
+            /* The cost: the same frame through the mixer, neutral and
+             * with everything on (5.1), the sums and the output stage. */
+            for (int pass = 0; pass < 2; pass++) {
+                apu_bus_set_config(pass ? &busy : &cfg);
+                apu_bus_enable(1);
+                memset(B, 0, sizeof(B));
+                t0 = now_us();
+                rt = apu_bus_frame_begin(6, k_map);
+                for (int i = 0; i < nv; i++)
+                    apu_bus_mix_voice(rt, (int)((unsigned)vv[i].bin[5] + (unsigned)i) % 13, B,
+                                      (const float (*)[2])vv[i].samples, vv[i].channels,
+                                      vv[i].bin, vv[i].g);
+                apu_bus_frame_end(rt, B);
+                for (int ch = 0; ch < 6; ch++) memcpy(feeds[ch], B[ch], sizeof(feeds[ch]));
+                apu_bus_output(feeds, 6, NUM_SAMPLES_PER_FRAME);
+                if (pass) t_busy += now_us() - t0; else t_neutral += now_us() - t0;
+            }
+            apu_bus_set_config(&cfg);
             for (int six = 0; six < 2; six++) {
                 apu_bus_enable(1);
                 rt = apu_bus_frame_begin(six ? 6 : 2, k_map);
@@ -80,5 +136,9 @@ int main(int argc, char **argv)
     printf("frames where the mixer's mixbins (on, neutral) differ from it:   %lu\n", bad_bins);
     printf("frames where the s16 output differs, mixer off vs on, stereo:    %lu\n", bad_st);
     printf("frames where the s16 output differs, mixer off vs on, 5.1:       %lu\n", bad_51);
+    printf("cost a VP frame (32 samples, %.0f voices): the loop alone %.2f us, mixer neutral %.2f us,"
+           " mixer with everything on %.2f us; a second of audio is 1500 frames: %.2f%% / %.2f%% / %.2f%% of a core\n",
+           (double)voices / frames, t_old / frames, t_neutral / frames, t_busy / frames,
+           t_old / frames * 0.15, t_neutral / frames * 0.15, t_busy / frames * 0.15);
     return frames && !bad_game && !bad_bins && !bad_st && !bad_51 ? 0 : 1;
 }
