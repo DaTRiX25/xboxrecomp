@@ -350,6 +350,208 @@ static int pmove_post(dsp56k *d, uint32_t w, uint32_t ext, const struct pre *p, 
     return 0;
 }
 
+/* ── native versions of library routines ─────────────────────────────
+ *
+ * The effects of DirectSound's images are built from a few small loops
+ * over a block of 16 samples (copy, scale, mix, a one-pole filter, the
+ * taps of a delay network). Most of a reverb's instructions are spent in
+ * them. Each is recognised by its exact code words; the native version
+ * leaves X memory and every register as the interpreted routine does (the
+ * interpreter's own arithmetic), which tests/apu_dsp56k holds by running
+ * the same program both ways. */
+#define BLK 16
+
+static const uint32_t k_copy[] = { 0x061090, 0x000003, 0x44D800, 0x445900, 0x00000C };
+static const uint32_t k_scale[] = { 0x061090, 0x000004, 0x45E000, 0x2000A0, 0x565800, 0x00000C };
+static const uint32_t k_macr_into[] = { 0x061090, 0x000005, 0x45D800, 0x56E100, 0x2000A3, 0x565900, 0x00000C };
+static const uint32_t k_add_into[] = { 0x061090, 0x000005, 0x44D800, 0x56E100, 0x200040, 0x565900, 0x00000C };
+static const uint32_t k_add3[] = { 0x061090, 0x000005, 0x44D800, 0x56D900, 0x200040, 0x565A00, 0x00000C };
+static const uint32_t k_onepole[] = { 0x0201D6, 0x020997, 0x061090, 0x000007, 0x020194, 0x2000D0, 0x45E000,
+                                      0x2000F2, 0x02018E, 0x565800, 0x00000C };
+static const uint32_t k_taps1[] = { 0x391000, 0x3A1000, 0x44D800, 0x061090, 0x00000F, 0x45E900, 0x44D000,
+                                    0x2000A0, 0x45D900, 0x44D800, 0x2000A3, 0x45EA00, 0x2000E3, 0x45DA00,
+                                    0x2000E3, 0x45DB00, 0x2000F3, 0x0C1D0E, 0x565C00, 0x00000C };
+static const uint32_t k_taps2[] = { 0x3C1000, 0x3A1000, 0x391000, 0x44D800, 0x20EE00, 0x200022, 0x21C700,
+                                    0x061090, 0x000012, 0x45E900, 0x44D000, 0x2000A8, 0x45D900, 0x44D800,
+                                    0x2000A0, 0x45EA00, 0x2000EB, 0x45DA00, 0x2000E3, 0x45DB00, 0x2000FB,
+                                    0x2000F3, 0x0C1D8F, 0x0C1D0E, 0x576C00, 0x565C00, 0x00000C };
+
+/* Not a routine: a stretch of straight-line code, four 16-sample outputs
+ * each the rounded sum of four inputs (16 words apart) with four
+ * coefficients, the coefficient row moving back a word for each output:
+ * a feedback network's mixing matrix. */
+static const uint32_t k_matrix[] = { 0x381000, 0x060490, 0x000010, 0x0A75D1, 0x000024, 0x061090, 0x00000B,
+                                     0x223000, 0x227200, 0x200013, 0x060490, 0x000004, 0x44C800, 0x45DA00,
+                                     0x2000A3, 0x565C00, 0x44D900, 0x44D300 };
+
+enum { AC_COPY = 1, AC_SCALE, AC_MACR_INTO, AC_ADD_INTO, AC_ADD3, AC_ONEPOLE, AC_TAPS1, AC_TAPS2,
+       AC_MATRIX /* from here on: inline stretches, entered by falling into them */ };
+
+static const struct { const uint32_t *w; unsigned n; } k_accel[] = {
+    { NULL, 0 },
+    { k_copy, sizeof k_copy / 4 }, { k_scale, sizeof k_scale / 4 },
+    { k_macr_into, sizeof k_macr_into / 4 }, { k_add_into, sizeof k_add_into / 4 },
+    { k_add3, sizeof k_add3 / 4 }, { k_onepole, sizeof k_onepole / 4 },
+    { k_taps1, sizeof k_taps1 / 4 }, { k_taps2, sizeof k_taps2 / 4 },
+    { k_matrix, sizeof k_matrix / 4 },
+};
+
+static void accel_scan(dsp56k *d)
+{
+    memset(d->accel, 0, sizeof(d->accel));
+    d->accel_p = d->p;
+    if (d->pn > sizeof(d->accel))
+        return;
+    for (unsigned k = 1; k < sizeof k_accel / sizeof k_accel[0]; k++)
+        for (uint32_t pc = 0; pc + k_accel[k].n <= d->pn; pc++) {
+            unsigned i = 0;
+            while (i < k_accel[k].n && (d->p[pc + i] & 0xFFFFFF) == k_accel[k].w[i])
+                i++;
+            if (i == k_accel[k].n)
+                d->accel[pc] = (uint8_t)k;
+        }
+}
+
+static inline int64_t macr(int64_t acc, int32_t a, int32_t b)
+{
+    return rnd56(w56(acc + (int64_t)a * b * 2));
+}
+
+/* 1 when it ran; 0 when the routine must be interpreted (a pointer out of
+ * X memory: the interpreter then stops at the right word). */
+static int accel_run(dsp56k *d, unsigned which)
+{
+    int32_t *x = d->x;
+    uint32_t r0 = d->r[0], r1 = d->r[1], r2 = d->r[2], r3 = d->r[3], r4 = d->r[4];
+    const uint32_t lim = DSP56K_X_WORDS - 2 * BLK - 2;
+
+    if (which < AC_MATRIX && r0 >= lim)
+        return 0;
+    switch (which) {
+    case AC_COPY:
+        if (r1 >= lim) return 0;
+        for (int i = 0; i < BLK; i++) x[r1 + i] = x[r0 + i];
+        d->x0 = x[r0 + BLK - 1];
+        d->r[0] = r0 + BLK; d->r[1] = r1 + BLK;
+        return 1;
+    case AC_SCALE:
+        for (int i = 0; i < BLK; i++) {
+            d->x1 = x[r0 + i];
+            d->a = w56((int64_t)d->x1 * d->x0 * 2);
+            x[r0 + i] = lim24(d->a);
+        }
+        d->r[0] = r0 + BLK;
+        return 1;
+    case AC_MACR_INTO:
+        if (r1 >= lim) return 0;
+        for (int i = 0; i < BLK; i++) {
+            d->x1 = x[r0 + i];
+            d->a = macr(ld(x[r1 + i]), d->x1, d->x0);
+            x[r1 + i] = lim24(d->a);
+        }
+        d->r[0] = r0 + BLK; d->r[1] = r1 + BLK;
+        return 1;
+    case AC_ADD_INTO:
+        if (r1 >= lim) return 0;
+        for (int i = 0; i < BLK; i++) {
+            d->x0 = x[r0 + i];
+            d->a = w56(ld(x[r1 + i]) + ld(d->x0));
+            x[r1 + i] = lim24(d->a);
+        }
+        d->r[0] = r0 + BLK; d->r[1] = r1 + BLK;
+        return 1;
+    case AC_ADD3:
+        if (r1 >= lim || r2 >= lim) return 0;
+        for (int i = 0; i < BLK; i++) {
+            d->x0 = x[r0 + i];
+            d->a = w56(ld(x[r1 + i]) + ld(d->x0));
+            x[r2 + i] = lim24(d->a);
+        }
+        d->r[0] = r0 + BLK; d->r[1] = r1 + BLK; d->r[2] = r2 + BLK;
+        return 1;
+    case AC_ONEPOLE:
+        if (r1 >= lim) return 0;
+        d->y0 = x[r1 + 1];
+        d->y1 = x[r1 + 2];
+        for (int i = 0; i < BLK; i++) {
+            d->x0 = x[r1];
+            d->x1 = x[r0 + i];
+            d->a = w56((int64_t)d->y0 * d->x0 * 2 + (int64_t)d->y1 * d->x1 * 2);
+            x[r1] = lim24(d->a);
+            x[r0 + i] = x[r1];
+        }
+        d->r[0] = r0 + BLK;
+        return 1;
+    case AC_TAPS1:
+        if (r1 >= lim || r2 >= lim || r3 >= lim || r4 >= lim) return 0;
+        d->n[1] = BLK; d->n[2] = BLK;
+        /* r0 walks one word on and back: its two coefficients. */
+        for (int i = 0; i < BLK; i++) {
+            int64_t a = w56((int64_t)x[r1 + BLK + i] * x[r0 + 1] * 2);
+            a = macr(a, x[r1 + i], x[r0]);
+            a = macr(a, x[r2 + BLK + i], d->y0);
+            a = macr(a, x[r2 + i], d->y0);
+            d->x1 = x[r3 + i];
+            a = macr(a, d->y1, d->x1);
+            d->a = w56((int64_t)((uint64_t)a << 7));
+            x[r4 + i] = lim24(d->a);
+        }
+        d->x0 = x[r0];
+        d->r[0] = r0 + 1; d->r[1] = r1 + BLK; d->r[2] = r2 + BLK; d->r[3] = r3 + BLK; d->r[4] = r4 + BLK;
+        return 1;
+    case AC_TAPS2:
+        if (r1 >= lim || r2 >= lim || r3 >= lim || r4 >= lim) return 0;
+        d->n[4] = BLK; d->n[2] = BLK; d->n[1] = BLK;
+        d->a = ld(d->y1) >> 1;
+        d->y1 = lim24(d->a);
+        for (int i = 0; i < BLK; i++) {
+            int64_t b = w56((int64_t)x[r1 + BLK + i] * x[r0 + 1] * 2);
+            int64_t a = w56((int64_t)x[r1 + i] * x[r0] * 2);
+            b = macr(b, x[r2 + BLK + i], d->y0);
+            a = macr(a, x[r2 + i], d->y0);
+            d->x1 = x[r3 + i];
+            b = macr(b, d->y1, d->x1);
+            a = macr(a, d->y1, d->x1);
+            d->b = w56((int64_t)((uint64_t)b << 7));
+            d->a = w56((int64_t)((uint64_t)a << 7));
+            x[r4 + BLK + i] = lim24(d->b);
+            x[r4 + i] = lim24(d->a);
+        }
+        d->x0 = x[r0];
+        d->r[0] = r0 + 1; d->r[1] = r1 + BLK; d->r[2] = r2 + BLK; d->r[3] = r3 + BLK; d->r[4] = r4 + BLK;
+        return 1;
+    case AC_MATRIX: {
+        uint32_t base, r5 = d->r[5];
+        if (r5 + 0x24 >= DSP56K_X_WORDS) return 0;
+        base = (uint32_t)x[r5 + 0x24] & 0xFFFFFF;
+        if (base >= DSP56K_X_WORDS - 5 * BLK || r3 < 4 || r3 >= DSP56K_X_WORDS - 4 ||
+            r4 >= DSP56K_X_WORDS - 4 * BLK)
+            return 0;
+        for (int o = 0; o < 4; o++) {
+            for (int i = 0; i < BLK; i++) {
+                int64_t a = 0;
+                for (int k = 0; k < 4; k++)
+                    a = macr(a, x[r3 + k], x[base + i + BLK * k]);
+                x[r4++] = lim24(a);
+                d->a = a;
+            }
+            d->x0 = x[r3];
+            r3--;
+        }
+        d->x1 = x[r3 + 1 + 3];
+        d->n[0] = BLK;
+        d->r[0] = base + BLK - 1 + 4 * BLK;
+        d->r[1] = base + BLK;
+        d->r[2] = r3 + 1 + 4;
+        d->r[3] = r3;
+        d->r[4] = r4;
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
 /* ── the run ────────────────────────────────────────────────────────── */
 
 #define STACK 16
@@ -361,6 +563,9 @@ int dsp56k_run(dsp56k *d, uint32_t pc, uint32_t end, unsigned long max_steps)
     int nloop = 0, nret = 0;
     unsigned long steps = 0;
 
+    if (d->accel_p != d->p)
+        accel_scan(d);
+
 #define FAULT() do { d->fault_pc = pc; d->fault_word = w; d->steps += steps; return 1; } while (0)
 
     while (pc != end) {
@@ -368,6 +573,11 @@ int dsp56k_run(dsp56k *d, uint32_t pc, uint32_t end, unsigned long max_steps)
         int len = 1;
         int32_t v;
 
+        if (pc < sizeof(d->accel) && d->accel[pc] >= AC_MATRIX && !d->no_accel &&
+            accel_run(d, d->accel[pc])) {
+            pc += k_accel[d->accel[pc]].n;
+            continue;
+        }
         if (pc >= d->pn || ++steps > max_steps) { w = 0xFFFFFFFF; FAULT(); }
         w = d->p[pc] & 0xFFFFFF;
         ext = pc + 1 < d->pn ? d->p[pc + 1] & 0xFFFFFF : 0;
@@ -394,12 +604,18 @@ int dsp56k_run(dsp56k *d, uint32_t pc, uint32_t end, unsigned long max_steps)
             if (!nret) FAULT();
             next = ret[--nret];
         } else if ((w & 0xFFFFC0) == 0x0D1080 || (w & 0xFFFFC0) == 0x0D10C0) {
+            uint32_t t = (pc + ext) & 0xFFFFFF;
             len = 2;                                            /* BSR / BRA long */
-            if (!(w & 0x40)) {
-                if (nret == STACK) FAULT();
-                ret[nret++] = pc + 2;
+            if (!(w & 0x40) && !d->no_accel && t < d->pn && t < sizeof(d->accel) &&
+                d->accel[t] && d->accel[t] < AC_MATRIX && accel_run(d, d->accel[t])) {
+                /* the routine ran natively: on with the next instruction */
+            } else {
+                if (!(w & 0x40)) {
+                    if (nret == STACK) FAULT();
+                    ret[nret++] = pc + 2;
+                }
+                next = t;
             }
-            next = (pc + ext) & 0xFFFFFF;
         } else if ((w & 0xFFFFF0) == 0x0D1040) {                /* Bcc long */
             int c = cond(d, w & 15);
             if (c < 0) FAULT();

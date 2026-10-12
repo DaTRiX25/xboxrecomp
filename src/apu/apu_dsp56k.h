@@ -46,6 +46,13 @@ typedef struct dsp56k {
     void (*mem_write)(void *ctx, uint32_t byte_off, const uint32_t *words, int n);
     void *ctx;
 
+    /* Routines of the program that have a native version here (the
+     * library loops DirectSound's effects share), found by their exact
+     * code words: 0 none, else which, by the routine's first word. */
+    const uint32_t *accel_p;
+    uint8_t accel[2048];
+    int no_accel;                       /* 1: interpret everything (tests) */
+
     unsigned long steps;                /* instructions run, in all */
     uint32_t fault_pc, fault_word;      /* where a run stopped */
 } dsp56k;
