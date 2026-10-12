@@ -57,7 +57,7 @@ static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
 static const char *const k_units[]    = { "mph", "kmh", NULL };
 static const char *const k_face[]     = { "xbox", "nintendo", NULL };
 static const char *const k_scheme[]   = { "xbox", "ps2", NULL };
-static const char *const k_glyphs[]   = { "auto", "xbox", "xbox_modern", "playstation", "nintendo", "steam", NULL };
+static const char *const k_glyphs[]   = { "auto", "xbox", "xbox_modern", "playstation", "playstation5", "nintendo", "steam", "positional", NULL };
 #if defined(__ANDROID__)
 static const char *const k_vibration[] = { "auto", "controller", "device", "off", NULL };
 #endif

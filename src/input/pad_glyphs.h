@@ -5,15 +5,23 @@
  * triggers, white and black buttons, START. input.glyphs (the overlay's Input
  * page, RECOMP_INPUT_GLYPHS) chooses whose pad they are drawn for instead:
  *
- *   auto         the family of the pad that last pressed a button
+ *   auto         the family of the pad that last pressed a button; a pad of
+ *                an unknown family gets the positional set
  *   xbox         the title's own prompts, nothing replaced (the original
  *                pad: white and black buttons, L and R triggers)
  *   xbox_modern  A B X Y as they are, LB RB LT RT and the Menu button: an
  *                Xbox 360 / One / Series pad, which has no white or black
- *   playstation  cross / circle / square / triangle, L1 R1 L2 R2
+ *   playstation  cross / circle / square / triangle (coloured, as on the
+ *                DualShock 3 and 4), L1 R1 L2 R2
+ *   playstation5 the same four symbols as a DualSense prints them: light
+ *                grey, no colours
  *   nintendo     A B X Y as a Nintendo pad prints them, L R ZL ZR
  *   steam        Valve's: the Steam Deck's own controls and the Steam
  *                Controllers. A B X Y as they are, L1 R1 L2 R2, Menu
+ *   positional   any pad: no letters on the face buttons, a diamond of four
+ *                dots with the one to press filled (bottom, right, left,
+ *                top); L1 R1 L2 R2, Menu. auto picks it for
+ *                a pad of unknown family (a handheld's built-in pad)
  *
  * This file is the choice, without SDL and without a renderer: the family of
  * a pad from what the host knows about it, and the glyph set that follows
@@ -29,11 +37,13 @@ extern "C" {
 #endif
 
 typedef enum {
-    XBOX_PAD_FAMILY_XBOX,          /* nothing is known about the pad: the title's own */
+    XBOX_PAD_FAMILY_XBOX,          /* a pad nothing is known about (an unknown family) */
     XBOX_PAD_FAMILY_XBOX_MODERN,   /* an Xbox 360 / One / Series pad (XInput) */
     XBOX_PAD_FAMILY_PLAYSTATION,
     XBOX_PAD_FAMILY_NINTENDO,
     XBOX_PAD_FAMILY_STEAM,
+    XBOX_PAD_FAMILY_PLAYSTATION5,  /* a DualSense / DualSense Edge */
+    XBOX_PAD_FAMILY_NONE,          /* no pad has been used (the state before the first button): the title's own */
     XBOX_PAD_FAMILY_COUNT
 } xbox_pad_family;
 
@@ -43,8 +53,10 @@ typedef enum {
     XBOX_GLYPHS_XBOX,
     XBOX_GLYPHS_XBOX_MODERN,
     XBOX_GLYPHS_PLAYSTATION,
+    XBOX_GLYPHS_PLAYSTATION5,
     XBOX_GLYPHS_NINTENDO,
     XBOX_GLYPHS_STEAM,
+    XBOX_GLYPHS_POSITIONAL,
     XBOX_GLYPHS_MODE_COUNT
 } xbox_glyph_mode;
 
@@ -53,7 +65,13 @@ typedef enum {
  *   POSITION  the title's A is the bottom button, which a Nintendo pad
  *             prints B: the prompt for A shows B, for B A, for X Y, for Y X
  *   LABEL     the title's A is the button printed A: the letters stay, only
- *             the look changes */
+ *             the look changes
+ * Positional is two sets for the same reason, and names the place of the
+ * button instead of its letter:
+ *   POSITIONAL          the title's A is the bottom button, B the right one,
+ *                       X the left one, Y the top one
+ *   POSITIONAL_SWAPPED  the pad is read by letter: A is the right button, B the
+ *                       bottom one, X the top one, Y the left one */
 typedef enum {
     XBOX_GLYPH_SET_XBOX,
     XBOX_GLYPH_SET_PLAYSTATION,
@@ -61,6 +79,9 @@ typedef enum {
     XBOX_GLYPH_SET_NINTENDO_LABEL,
     XBOX_GLYPH_SET_STEAM,
     XBOX_GLYPH_SET_XBOX_MODERN,
+    XBOX_GLYPH_SET_POSITIONAL,
+    XBOX_GLYPH_SET_POSITIONAL_SWAPPED,
+    XBOX_GLYPH_SET_PLAYSTATION5,
     XBOX_GLYPH_SET_COUNT
 } xbox_glyph_set;
 
@@ -79,6 +100,8 @@ typedef enum {
  *     SteamDeck=1 Steam sets there: its own controls are what is most likely
  *     held); elsewhere XBOX_MODERN: Steam hands every wrapped pad on as an
  *     Xbox 360 pad
+ *   Sony 054C:0CE6 (DualSense) and 054C:0DF2 (DualSense Edge): PLAYSTATION5,
+ *     whatever type the host gave (an SDL that predates the type says PS4)
  *   Sony (054C) and Nintendo (057E) pads the host has no type for
  *   a name with "Steam Deck" in it: STEAM
  *
@@ -102,10 +125,16 @@ xbox_pad_family xbox_PadFamilyFromIds(xbox_pad_family by_type, unsigned vendor,
  *   read by letter,   face layout nintendo  the bottom button, printed B
  * so one of the two gives NINTENDO_LABEL, both or neither NINTENDO_POSITION,
  * and the same for B, X and Y (the footer's confirm and cancel with them).
- * auto with an Xbox-family (or unknown) pad and face_nintendo on is
+ * The positional set asks the same question and answers with the place: the
+ * button to press is the bottom one (POSITIONAL) or the right one
+ * (POSITIONAL_SWAPPED) for the title's A. It works for any pad.
+ * auto with an Xbox 360 / One / Series pad and face_nintendo on is
  * NINTENDO_LABEL: the player said the pad is printed the Nintendo way.
- * auto with a pad nothing is known about (and with no pad) is XBOX: the
- * title's own prompts, nothing replaced. */
+ * auto with a pad nothing is known about (FAMILY_XBOX: an SDL pad of no
+ * known type or vendor, a handheld's built-in pad) is POSITIONAL: no letters
+ * to be wrong (POSITIONAL_SWAPPED when face_nintendo says the pad is read by
+ * letter). auto with no pad at all (FAMILY_NONE) is XBOX: the title's own
+ * prompts, nothing replaced. */
 xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family,
                                     int label_mapped, int face_nintendo);
 
