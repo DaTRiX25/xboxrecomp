@@ -138,6 +138,13 @@ static volatile int s_face_nintendo;
 void xbox_InputSetFaceLayoutNintendo(int on) { s_face_nintendo = on != 0; }
 int  xbox_InputFaceLayoutNintendo(void)     { return s_face_nintendo; }
 
+static volatile int s_control_scheme, s_control_scheme_offered;
+
+void xbox_InputSetControlScheme(int scheme) { s_control_scheme = scheme > 0 ? scheme : 0; }
+int  xbox_InputControlScheme(void)          { return s_control_scheme; }
+void xbox_InputOfferControlScheme(int on)   { s_control_scheme_offered = on != 0; }
+int  xbox_InputControlSchemeOffered(void)   { return s_control_scheme_offered; }
+
 void xbox_InputMirrorFaceXInput(XBOX_HOST_XINPUT_GAMEPAD *pad)
 {
     uint16_t b = pad->wButtons, o = (uint16_t)(b & ~(XBOX_XI_A | XBOX_XI_B | XBOX_XI_X | XBOX_XI_Y));

@@ -43,6 +43,20 @@ register's low byte changes:
     SET_LO8(eax, MEM8(0x4D61D2));
     SET_LO8(eax, RECOMP_PATCH_U32("graphics.motion_blur", "0", 0x0u, LO8(eax))); /* patch 0x... */
 
+kind "cmp_u8": the flag is not loaded but compared where it lies, `cmp byte
+ptr [mem], r8|imm8` (Burnout 3's "a crash camera is on" byte, compared with a
+zeroed bl and branched on some instructions later). The lifter snapshots a
+compare's operands into _fa / _fb, and every later jcc, setcc and cmovcc
+reads the snapshot: the call rewrites the left one, so the compare reads
+`value` where the memory byte was, whatever sits between it and the branch:
+
+    _fa = (uint32_t)(MEM8(0x73BACA)) & 0xFFu; _fb = (uint32_t)(LO8(ebx)) & 0xFFu;
+    _fas = (int32_t)(int8_t)(_fa); _fbs = (int32_t)(int8_t)(_fb); /* cmp ... */
+    _fa = RECOMP_PATCH_U32("graphics.crash_60fps", "1", 0x0u, _fa) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* patch 0x... */
+
+(and `_cf = (int)(_fa < _fb);` again in a function that tracks the carry).
+No latch.
+
 kind "load_f32" and "store_f32": the value is a float, and it is not a
 constant but an expression ("expr" instead of "value"), because a layout
 value depends on the picture's shape:
@@ -85,8 +99,10 @@ another for those).
 import json
 import re
 
-_KINDS = frozenset({"load_u32", "load_u8", "load_f32", "store_f32", "mark"})
-_INT_KINDS = frozenset({"load_u32", "load_u8"})
+_KINDS = frozenset({"load_u32", "load_u8", "cmp_u8", "load_f32", "store_f32",
+                    "mark"})
+_INT_KINDS = frozenset({"load_u32", "load_u8", "cmp_u8"})
+_BYTE_KINDS = frozenset({"load_u8", "cmp_u8"})
 _REG8 = {"al": "eax", "bl": "ebx", "cl": "ecx", "dl": "edx"}
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _XMM = frozenset(f"xmm{i}" for i in range(8))
@@ -252,11 +268,13 @@ class PatchConfig:
                 if "expr" in s:
                     raise ValueError(f"{path}: {kind} takes 'value'")
                 value = _parse_va(s["value"])
-                top = 0xFF if kind == "load_u8" else 0xFFFFFFFF
+                top = 0xFF if kind in _BYTE_KINDS else 0xFFFFFFFF
                 if not 0 <= value <= top:
                     raise ValueError(
                         f"{path}: value {value} is not a "
-                        f"{'uint8' if kind == 'load_u8' else 'uint32'}")
+                        f"{'uint8' if kind in _BYTE_KINDS else 'uint32'}")
+                if kind == "cmp_u8" and "latch" in s:
+                    raise ValueError(f"{path}: cmp_u8 takes no latch")
             else:
                 if "value" in s or not isinstance(s.get("expr"), str):
                     raise ValueError(f"{path}: {kind} takes 'expr', a string")
@@ -291,7 +309,7 @@ class PatchReport:
         if msg not in self.errors:       # a block is lifted more than once
             self.errors.append(msg)
 
-    def after(self, insn, func_addr=None):
+    def after(self, insn, func_addr=None, needs_cf=False):
         """Statements to emit after the lifted instruction, or []."""
         p = self.config.patches.get(insn.address)
         if p is None:
@@ -306,6 +324,8 @@ class PatchReport:
                 out = self._load_u32(p, insn)
             elif p.kind == "load_u8":
                 out = self._load_u8(p, insn)
+            elif p.kind == "cmp_u8":
+                out = self._cmp_u8(p, insn, needs_cf)
             else:
                 out = self._float(p, insn)
             if out is None:
@@ -353,6 +373,23 @@ class PatchReport:
                     f"{1 if p.latch == 'set' else 2}));"]
         return [f'SET_LO8({reg}, RECOMP_PATCH_U32("{p.setting}", "{p.when}", '
                 f"0x{p.value:X}u, LO8({reg})));"]
+
+    def _cmp_u8(self, p, insn, needs_cf):
+        """`cmp byte ptr [mem], r8|imm8`: the snapshot of the memory byte the
+        lifter took for the compare (_fa, and _fas, its sign-extended twin)
+        becomes the value; the carry is taken again where it is tracked."""
+        ops = insn.operands
+        if (insn.mnemonic != "cmp" or len(ops) != 2 or ops[0].type != "mem"
+                or ops[0].mem_size != 1 or ops[1].type not in ("reg", "imm")
+                or p.latch):
+            self._err(
+                f"patch 0x{p.va:08X}: {insn.mnemonic} is not an 8-bit "
+                f"`cmp byte ptr [mem], r8|imm8` compare")
+            return None
+        return [f'_fa = RECOMP_PATCH_U32("{p.setting}", "{p.when}", '
+                f"0x{p.value:X}u, _fa) & 0xFFu; "
+                f"_fas = (int32_t)(int8_t)(_fa);"
+                + (" _cf = (int)(_fa < _fb);" if needs_cf else "")]
 
     def _float(self, p, insn):
         """load_f32 / store_f32: the moved float, as an lvalue of the right

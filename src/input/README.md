@@ -8,6 +8,7 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 |------|---------|
 | `xinput_xbox.h` | Public header: types, button constants, function prototypes |
 | `input_map.h`, `input_map.c` | The host → Xbox mapping table, the pure map and deadzone helpers |
+| `pad_glyphs.h`, `pad_glyphs.c` | Which button prompts go with the pad in use (`input.glyphs`): a pad's family from SDL's type and its USB ids, the glyph set from the setting, the family and the face layout. Pure, plus the state a title listens to |
 | `input_core.c` | The public API: connection cache, probe backoff, keyboard merge, shutdown |
 | `input_backend.h` | The seam between `input_core.c` and a host backend (tests swap it) |
 | `xinput_device.c` | Host backends: XInput (Windows, Proton) and SDL2 GameController |
@@ -213,6 +214,27 @@ table below and the code disagree; regenerate it with
 | J | Right stick left |
 | L | Right stick right |
 <!-- keyboard_map:end -->
+
+## A title's second control scheme
+
+`input.control_scheme` (settings.toml, the overlay's Input page as "Driving
+controls", `RECOMP_INPUT_CONTROL_SCHEME=xbox|ps2`) is a choice the toolkit
+only keeps: `xbox_InputControlScheme()` is 0 for the title's own layout and 1
+for an alternative that the title's host code provides, and the overlay shows
+the row once that code has called `xbox_InputOfferControlScheme(1)`. What the
+alternative is, and when it holds, is the title's business, because only the
+title knows when it is in a menu: it rewrites the pad state its game has just
+read (Burnout 3: `src/game/controls.c` there, the PS2 version's driving
+controls, only while driving). Two things here serve that code:
+
+- `xbox_InputSources(port)`: whether the port's last state came from a
+  controller (`XBOX_INPUT_SRC_PAD`) and whether a keyboard key was held in it
+  (`XBOX_INPUT_SRC_KEYS`), so the keys can keep their documented buttons;
+- `xbox_InputScriptedPads()`: the pads a pad script drives, so a script's
+  `rt` means the same on every machine whatever the player's setting.
+
+The Nintendo face layout (`input.face_layout`) is applied before this, as the
+host pad is read.
 
 ## Connection state and rumble
 

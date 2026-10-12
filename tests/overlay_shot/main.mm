@@ -40,6 +40,8 @@ static int fake_report(int screenshot, char *out, unsigned n)
     return 1;
 }
 
+extern "C" void xbox_InputOfferControlScheme(int on);    /* input_map.h */
+
 static int s_fail;
 #define CHECK(c) do { if (!(c)) { s_fail++; fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); } } while (0)
 
@@ -123,6 +125,7 @@ int main(int argc, char **argv)
     setenv("SDL_VIDEODRIVER", "dummy", 1);
     setenv("RECOMP_SETTINGS", "none", 1);
     setenv("RECOMP_OVERLAY_PERF", "1", 1);
+    xbox_InputOfferControlScheme(1);     /* a title with a second driving layout: the Input page shows the row */
     xbox_SettingsInit("Test");
     xbox_SettingsFinish();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 2; }

@@ -129,9 +129,19 @@ static const char *const n_vibration[] = { "Auto", "Controller", "This device", 
 static const char *const n_scale[]     = { "1x (640x480)", "1.5x (960x720)", "2x (1280x960)", "3x", "4x", NULL };
 #endif
 static const char *const n_face[]      = { "Xbox layout", "Nintendo layout", NULL };
+static const char *const n_scheme[]    = { "Xbox layout", "PS2 layout", NULL };
+static const char *const n_glyphs[]    = { "Auto (the controller in use)", "Xbox (original)", "Xbox (modern: LB RB LT RT)", "PlayStation", "Nintendo", "Steam (Deck, Steam Controller)", NULL };
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
+static const char *const n_vehicle_detail[] = { "Original", "Far (2x)", "Farthest (4x)", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
+/* Off the Steam Deck the watts are somebody else's: the names alone. */
+static const char *const n_power_plain[] = { "Maximum", "Balanced (recommended)", "Battery saver", NULL };
+static bool on_steam_deck()
+{
+    const char *sd = getenv("SteamDeck");
+    return sd && sd[0] == '1';
+}
 
 static const Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_FULLSCREEN */ { "Fullscreen", "Borderless fullscreen on the desktop.", 1, FMT_PLAIN, NULL, 0 },
@@ -156,15 +166,19 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_INPUT_TRIGGER_DEADZONE */ { "Trigger deadzone", "The part of a trigger's pull that reads as released.", 13.0, FMT_PERCENT_OF_MAX, NULL, 0 },
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "1.0 is the original: the game's rumble as the Xbox pad played it. Higher makes the weaker rumbles stronger (the strongest is full at any setting). 0 turns the rumble off.", 0.25, FMT_GAIN, NULL, 0 },
     /* XS_INPUT_FACE_LAYOUT */  { "Face buttons", "Nintendo layout: for a pad printed with A on the right and B below. A and B, X and Y change places, here and in the game.", 1, FMT_PLAIN, n_face, 0 },
-    /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits all the time (steadiest, hottest). Balanced sleeps and spins only the last 8 ms before each frame (steady 60). Battery saver only sleeps (coolest, an occasional small dip). Watts measured on a Steam Deck.", 1, FMT_PLAIN, n_power, 0 },
+    /* XS_INPUT_CONTROL_SCHEME */ { "Driving controls", "PS2 layout: the PlayStation 2 version's driving controls. Accelerate on the bottom face button, brake on the left one, boost on the right shoulder, look back on the left shoulder. Only while driving: menus are not changed. Changes at once.", 1, FMT_PLAIN, n_scheme, 0 },
+    /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits all the time (steadiest, hottest). Balanced sleeps and spins only the last 8 ms before each frame (steady 60). Battery saver only sleeps (coolest, an occasional small dip).", 1, FMT_PLAIN, n_power, 0 },
     /* XS_ADVANCED_PERF */      { "Performance overlay", "FPS and frame-time graph in the corner. Greetings to the DF team!", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speedometer and distances in km/h and metres instead of mph and miles: the game's own metric display, which the US disc keeps for its other languages. A change shows from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
     /* XS_DISPLAY_HUD_FIX */    { "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On: the HUD keeps its 4:3 shape and stays at the screen edges, by the game's own layout values. A change shows from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For a display wider than 16:9, with Aspect at 16:9: the race is drawn for the whole width (more to see at the sides, nothing stretched). Menus, loading screens and videos keep their 16:9 shape in the middle. Window follows the window's or the screen's own shape. A change shows from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
     /* XS_GRAPHICS_BLOOM */     { "Bloom", "The game's own soft glow over the picture, strongest while boosting. On is the original look; off skips its three extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "The game's own blur: the streaks towards the edges of the picture at speed and while boosting. On is the original look; off skips its two extra render passes. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_CRASH_60FPS */ { "60 fps crash cameras", "The game halves its frame rate to 30 in its crash and takedown cameras. On: they run at 60 like the rest of the race, at the same game speed. Off is the original. Changes at once.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto: -0.5 at 2x, -1.0 at 4x. Off is the original. Changes at once.", 1, FMT_PLAIN, n_lod, 0 },
     /* XS_GRAPHICS_DITHER */    { "Dither", "A faint noise in the final scale to the window that hides the stripes in smooth gradients such as the sky. Metal only for now. Off is the original; text and HUD at the exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_VEHICLE_DETAIL */ { "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Original is the console's distances; Far doubles them, Farthest is four times. Costs GPU time when many vehicles are on screen. Scenery, the track and where traffic appears are not changed. Changes at once.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
+    /* XS_INPUT_GLYPHS */       { "Button prompts", "The buttons the game shows in its menus and hints. Auto follows the controller that was last used. Xbox (original) is the game's own picture: white and black buttons, L and R. The game's text and videos still name the Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -303,6 +317,10 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_BLOOM);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_MOTION_BLUR)->key))
             SET(XS_GRAPHICS_MOTION_BLUR);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->key))
+            SET(XS_GRAPHICS_CRASH_60FPS);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))
+            SET(XS_GRAPHICS_VEHICLE_DETAIL);
 #if defined(__ANDROID__)
         {
             /* Which driver draws: chosen before the game starts, in the app's
@@ -347,6 +365,9 @@ static int page_rows(int page, Row *r)
     case P_INPUT:
         SET(XS_INPUT_DEADZONE); SET(XS_INPUT_TRIGGER_DEADZONE); SET(XS_INPUT_RUMBLE);
         SET(XS_INPUT_FACE_LAYOUT);
+        if (xbox_InputControlSchemeOffered())
+            SET(XS_INPUT_CONTROL_SCHEME);
+        SET(XS_INPUT_GLYPHS);
 #if defined(__ANDROID__)
         SET(XS_INPUT_VIBRATION);
 #endif
@@ -494,7 +515,10 @@ static void value_text(xs_id id, char *out, size_t n)
         snprintf(out, n, "%s", v != 0.0 ? "On" : "Off");
         break;
     case XS_CHOICE:
-        snprintf(out, n, "%s", m.names ? m.names[(int)v] : s->choices[(int)v]);
+        {
+            const char *const *names = m.names == n_power && !on_steam_deck() ? n_power_plain : m.names;
+            snprintf(out, n, "%s", names ? names[(int)v] : s->choices[(int)v]);
+        }
         break;
     default:
         switch (m.fmt) {

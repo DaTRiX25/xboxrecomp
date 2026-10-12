@@ -32,6 +32,11 @@ void xbox_InputSetTriggerDeadzone(int dz) { st_trigger = dz; }
 void xbox_InputSetRumbleStrength(double g) { st_rumble = g; }
 static int st_face;
 void xbox_InputSetFaceLayoutNintendo(int on) { st_face = on; }
+static int st_scheme = -1;
+void xbox_InputSetControlScheme(int s) { st_scheme = s; }
+static int st_glyphs = -2, st_glyph_refresh;
+void xbox_InputSetGlyphMode(int mode) { st_glyphs = mode; }
+void xbox_InputGlyphsRefresh(void) { st_glyph_refresh++; }
 void xbox_PacingSetMode(int m) { st_pacing = m; }
 void xbox_PacingSetSpinLead(uint64_t ns) { st_lead = ns; }
 void nv2a_present_set_overscan(int c) { st_overscan = c; }
@@ -125,6 +130,8 @@ int main(void)
     set_env("RECOMP_PAD_DEADZONE", NULL);
     set_env("RECOMP_GFX_BLOOM", NULL);
     set_env("RECOMP_GFX_MOTION_BLUR", NULL);
+    set_env("RECOMP_GFX_CRASH_60FPS", NULL);
+    set_env("RECOMP_GFX_VEHICLE_DETAIL", NULL);
 
     xbox_SettingsInit("Test");
     CHECK(!strcmp(xbox_SettingsPath(), path));
@@ -207,12 +214,39 @@ int main(void)
         const char *e = recomp_env(RENV_GFX_MOTION_BLUR);
         CHECK(!e || strcmp(e, "0") != 0);
     }
+    {
+        /* The vehicle detail distance (a guest patch on anything but
+         * "original"): untouched it never reads far or farthest; a choice
+         * reaches the environment at once and goes back. */
+        const char *e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
+        CHECK(xbox_SettingValue(XS_GRAPHICS_VEHICLE_DETAIL) == 0 && !xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->user);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+        xbox_SettingSet(XS_GRAPHICS_VEHICLE_DETAIL, 2);
+        e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
+        CHECK(e && !strcmp(e, "farthest"));
+        CHECK(!xbox_SettingsNeedRestart());          /* live */
+        xbox_SettingReset(XS_GRAPHICS_VEHICLE_DETAIL);
+        e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+    }
     xbox_SettingSet(XS_GRAPHICS_MOTION_BLUR, 0);
     CHECK(recomp_env(RENV_GFX_MOTION_BLUR) && !strcmp(recomp_env(RENV_GFX_MOTION_BLUR), "0"));
     CHECK(!xbox_SettingsNeedRestart());              /* live */
     xbox_SettingSet(XS_GRAPHICS_BLOOM, 1);
     CHECK(recomp_env(RENV_GFX_BLOOM) && !strcmp(recomp_env(RENV_GFX_BLOOM), "1"));
     xbox_SettingSet(XS_GRAPHICS_BLOOM, 0);
+    /* The title's 30 Hz phases at 60 (a guest patch on the "1"): off as
+     * shipped, and untouched the variable never reads "1". */
+    CHECK(!strcmp(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->key, "graphics.crash_60fps"));
+    CHECK(xbox_SettingValue(XS_GRAPHICS_CRASH_60FPS) == 0 && !xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->user);
+    CHECK(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->def == 0);
+    {
+        const char *e = recomp_env(RENV_GFX_CRASH_60FPS);
+        CHECK(!e || strcmp(e, "1") != 0);
+    }
+    xbox_SettingSet(XS_GRAPHICS_CRASH_60FPS, 1);
+    CHECK(recomp_env(RENV_GFX_CRASH_60FPS) && !strcmp(recomp_env(RENV_GFX_CRASH_60FPS), "1"));
+    CHECK(!xbox_SettingsNeedRestart());              /* live */
 
     /* A live change reaches the runtime, the cached environment and the file. */
     xbox_SettingSet(XS_POWER_MODE, 1);
@@ -341,6 +375,11 @@ int main(void)
             const char *m = strstr(text, "motion_blur = false");
             CHECK(g && !strstr(g + 1, "[graphics]"));
             CHECK(g && b && m && b > g && m > g);
+            /* And the 60 fps crash cameras' "on", in the same table. */
+            {
+                const char *c = strstr(text, "crash_60fps = true");
+                CHECK(c && c > g);
+            }
         }
     }
 
@@ -351,6 +390,13 @@ int main(void)
     xbox_SettingsFlush();
     text = read_file(path);
     CHECK(text && !strstr(text, "motion_blur") && strstr(text, "bloom = false"));
+    /* Off again: the default, as shipped, and the file forgets it. */
+    xbox_SettingReset(XS_GRAPHICS_CRASH_60FPS);
+    CHECK(xbox_SettingValue(XS_GRAPHICS_CRASH_60FPS) == 0 && !xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->user);
+    CHECK(recomp_env(RENV_GFX_CRASH_60FPS) && !strcmp(recomp_env(RENV_GFX_CRASH_60FPS), "0"));
+    xbox_SettingsFlush();
+    text = read_file(path);
+    CHECK(text && !strstr(text, "crash_60fps"));
 
     /* Reset goes back to the host's default and forgets the setting. */
     xbox_SettingReset(XS_DISPLAY_OVERSCAN);
@@ -384,6 +430,34 @@ int main(void)
     CHECK(st_face == 1);
     xbox_SettingReset(XS_INPUT_FACE_LAYOUT);
     CHECK(st_face == 0);
+    /* The driving controls: xbox unless set, and the input layer hears of a
+     * change at once (BO-106). */
+    CHECK(xbox_SettingValue(XS_INPUT_CONTROL_SCHEME) == 0);
+    CHECK(xbox_SettingGet(XS_INPUT_CONTROL_SCHEME)->def == 0);
+    CHECK(!strcmp(xbox_SettingGet(XS_INPUT_CONTROL_SCHEME)->key, "input.control_scheme"));
+    xbox_SettingSet(XS_INPUT_CONTROL_SCHEME, 1);
+    CHECK(st_scheme == 1);
+    xbox_SettingReset(XS_INPUT_CONTROL_SCHEME);
+    CHECK(st_scheme == 0);
+    CHECK(st_glyph_refresh >= 2);       /* the Nintendo prompts follow it */
+
+    /* The button prompts (input.glyphs): auto by default, a choice reaches
+     * the input layer as it is set and is written by its name. */
+    CHECK(xbox_SettingValue(XS_INPUT_GLYPHS) == 0);
+    xbox_SettingSet(XS_INPUT_GLYPHS, 3);
+    CHECK(st_glyphs == 3);
+    xbox_SettingsFlush();
+    {
+        char err[256];
+        recomp_cfg *c = recomp_cfg_load_file(path, err, sizeof err);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(!strcmp(recomp_cfg_string(c, "input.glyphs", ""), "playstation"));
+            recomp_cfg_free(c);
+        }
+    }
+    xbox_SettingReset(XS_INPUT_GLYPHS);
+    CHECK(st_glyphs == 0);
 
     remove(path);
     fprintf(stderr, "overlay_settings: %d checks, %d failed\n", s_checks, s_fail);
