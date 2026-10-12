@@ -15,9 +15,33 @@ void recomp_exit_hook_set(recomp_exit_hook_fn fn)
     s_hook = fn;
 }
 
+#define EXIT_HOOKS_MAX 4
+static recomp_exit_hook_fn volatile s_more[EXIT_HOOKS_MAX];
+
+void recomp_exit_hook_add(recomp_exit_hook_fn fn)
+{
+    int i;
+
+    for (i = 0; i < EXIT_HOOKS_MAX; i++) {
+        if (s_more[i] == fn)
+            return;
+        if (s_more[i] == NULL) {
+            s_more[i] = fn;
+            return;
+        }
+    }
+}
+
 void recomp_exit_hook_run(const char *why)
 {
     recomp_exit_hook_fn fn = s_hook;
+    int i;
+
     if (fn != NULL)
         fn(why);
+    for (i = 0; i < EXIT_HOOKS_MAX; i++) {
+        fn = s_more[i];
+        if (fn != NULL)
+            fn(why);
+    }
 }
