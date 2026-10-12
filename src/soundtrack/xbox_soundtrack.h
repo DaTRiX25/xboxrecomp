@@ -78,6 +78,13 @@ typedef struct xst_library {
  * leading dot) are skipped. NULL when `dir` cannot be read; a folder with no
  * playable file gives a library with n_st == 0. */
 xst_library *xst_scan(const char *dir);
+/* The same, watched: the counts grow while it runs (another thread may read
+ * them), and setting `cancel` ends it early with NULL. */
+typedef struct xst_progress {
+    volatile int folders, files, songs;
+    volatile int cancel;
+} xst_progress;
+xst_library *xst_scan_progress(const char *dir, xst_progress *progress);
 void         xst_free(xst_library *lib);
 
 const xst_song *xst_song_by_id(const xst_library *lib, uint32_t id);
@@ -114,6 +121,54 @@ void        xst_stream_close(xst_stream *s);
 /* The file's own rate and channel count (tests, the log). */
 void        xst_stream_format(const xst_stream *s, unsigned *rate, unsigned *channels);
 
+/* ── xst_browse.c ──────────────────────────────────────────────────── */
+
+/*
+ * A folder browser's model, for a settings screen that has no file dialog
+ * (the in-game overlay, driven with a pad): where to start, a folder's
+ * folders, and how much music is in each. No drawing here.
+ *
+ * It opens on the places: the current choice, the home folder, Music,
+ * Downloads, and what is mounted (/Volumes on macOS; /run/media, /media and
+ * /mnt on Linux, the Steam Deck's SD card among them; the drive letters on
+ * Windows; shared storage on Android). In a folder the rows are "use this
+ * folder", "..", and its folders in natural order. The number of playable
+ * files in and below each row (XST_MAX_DEPTH deep, as a scan looks) is
+ * counted on a thread of the browser's own and shows when it is known; a
+ * count stops at XSB_COUNT_BUDGET entries and says so (`more`).
+ */
+#define XSB_MAX_ROWS      1024
+#define XSB_COUNT_BUDGET  20000
+
+typedef enum { XSB_USE, XSB_OFF, XSB_UP, XSB_PLACE, XSB_DIR } xsb_kind;
+typedef struct xsb_row {
+    xsb_kind kind;
+    char label[200];
+    char path[1024];
+    int  songs;                           /* -1: not counted yet */
+    int  more;                            /* the count stopped at the budget */
+} xsb_row;
+typedef enum { XSB_NOTHING, XSB_MOVED, XSB_CHOSEN, XSB_TURNED_OFF, XSB_CLOSED } xsb_result;
+
+/* Open on the places; `current` is the folder in use ("" or NULL: none). */
+void xsb_open(const char *current);
+void xsb_close(void);
+int  xsb_is_open(void);
+int  xsb_rows(void);
+int  xsb_row_at(int i, xsb_row *out);     /* 1 when there is such a row */
+/* The folder being shown, "" on the places. */
+void xsb_where(char *out, size_t cap);
+/* A row is picked: a folder or place is entered (XSB_MOVED), "use this
+ * folder" gives its path in `chosen` (XSB_CHOSEN), "turn off" XSB_TURNED_OFF.
+ * *select is the row to put the cursor on after a move. */
+xsb_result xsb_activate(int i, char *chosen, size_t cap, int *select);
+/* One level up; from a place's own folder back to the places; from the
+ * places XSB_CLOSED. */
+xsb_result xsb_back(int *select);
+/* Tests: the places come from these instead of the system's (home folder,
+ * NULL-terminated media roots). NULL, NULL: the system's again. */
+void xsb_set_roots(const char *home, const char *const *media_roots);
+
 /* ── xst_host.c ────────────────────────────────────────────────────── */
 
 /* Scan `music_dir`, write the database to the emulated disk (beside, not
@@ -125,6 +180,20 @@ void        xst_stream_format(const xst_stream *s, unsigned *rate, unsigned *cha
 int  xbox_SoundtrackInit(const char *music_dir);
 int  xbox_SoundtrackActive(void);
 const xst_library *xbox_SoundtrackLibrary(void);
+
+/* A change while the title runs: scan `music_dir` on a thread of its own
+ * and, when the scan is through, put its database in place of the one in
+ * use ("" or NULL: none, the title's MUSIC paths are its own again). A song
+ * that is playing plays on; the next one comes from the new folder. `done`
+ * (may be NULL) is called on that thread once the change is in, with the
+ * number of soundtracks and songs now offered (0, 0: off or nothing found).
+ * A change asked for while one runs replaces it. Returns 0 when the thread
+ * could not be started. */
+int  xbox_SoundtrackSetFolder(const char *music_dir, void (*done)(int soundtracks, int songs));
+/* 1 while a scan runs; the counts so far (each may be NULL). */
+int  xbox_SoundtrackScanning(int *folders, int *files, int *songs);
+/* The folder in use ("" when off) and its counts. */
+void xbox_SoundtrackInfo(char *dir, size_t cap, int *soundtracks, int *songs);
 
 /* The port's hook on the title's XOpenSoundtrackSong: `handle` (the guest's
  * 32-bit handle value) is the song `song_id` until it is noted again. */

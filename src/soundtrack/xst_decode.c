@@ -60,7 +60,7 @@
 
 /* ── files ─────────────────────────────────────────────────────────── */
 
-typedef enum { K_NONE, K_MP3, K_FLAC, K_OGG, K_WAV } xst_kind;
+typedef enum { K_NONE, K_MP3, K_FLAC, K_OGG, K_WAV, K_SYSTEM } xst_kind;
 
 static xst_kind kind_of(const char *path)
 {
@@ -77,6 +77,12 @@ static xst_kind kind_of(const char *path)
     if (!strcmp(e, ".flac")) return K_FLAC;
     if (!strcmp(e, ".ogg") || !strcmp(e, ".oga")) return K_OGG;
     if (!strcmp(e, ".wav"))  return K_WAV;
+#if defined(__APPLE__)
+    /* What the system decodes (sys_* below): Apple Music's and iTunes' own. */
+    if (!strcmp(e, ".m4a") || !strcmp(e, ".aac") || !strcmp(e, ".aif") || !strcmp(e, ".aiff")
+        || !strcmp(e, ".caf"))
+        return K_SYSTEM;
+#endif
     return K_NONE;
 }
 
@@ -286,6 +292,136 @@ static int mp3_probe(const char *path, uint32_t *ms, char *title, size_t cap)
     return ok;
 }
 
+/* ── macOS: the system's decoder for m4a (AAC, Apple Lossless) ─────── */
+
+/*
+ * No AAC decoder with a licence this project can ship is small enough to
+ * vendor (FAAD2 is GPL, FDK-AAC's licence is its own, FFmpeg's is LGPL and
+ * large). On macOS the system has one: AudioToolbox's ExtAudioFile reads
+ * m4a (AAC and Apple Lossless), AIFF and CAF, so an Apple Music or iTunes
+ * library plays there. Protected files (m4p) do not open. Other hosts do
+ * not list these files.
+ */
+#if defined(__APPLE__)
+#include <AudioToolbox/AudioToolbox.h>
+
+typedef struct {
+    ExtAudioFileRef file;
+    unsigned rate, channels;
+    uint64_t frames;
+} sys_audio;
+
+static CFURLRef sys_url(const char *path)
+{
+    return CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path,
+                                                   (CFIndex)strlen(path), false);
+}
+
+/* Open for reading as 32-bit float at the file's own rate and channels. */
+static int sys_open(sys_audio *a, const char *path)
+{
+    AudioStreamBasicDescription in, out;
+    UInt32 size = sizeof in;
+    SInt64 frames = 0;
+    CFURLRef url = sys_url(path);
+    OSStatus st;
+
+    memset(a, 0, sizeof *a);
+    if (!url)
+        return 0;
+    st = ExtAudioFileOpenURL(url, &a->file);
+    CFRelease(url);
+    if (st != noErr || !a->file)
+        return 0;
+    memset(&in, 0, sizeof in);
+    if (ExtAudioFileGetProperty(a->file, kExtAudioFileProperty_FileDataFormat, &size, &in) != noErr
+        || in.mSampleRate < 4000 || in.mChannelsPerFrame < 1 || in.mChannelsPerFrame > 8)
+        goto fail;
+    memset(&out, 0, sizeof out);
+    out.mSampleRate = in.mSampleRate;
+    out.mFormatID = kAudioFormatLinearPCM;
+    out.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    out.mBitsPerChannel = 32;
+    out.mChannelsPerFrame = in.mChannelsPerFrame;
+    out.mBytesPerFrame = 4 * out.mChannelsPerFrame;
+    out.mFramesPerPacket = 1;
+    out.mBytesPerPacket = out.mBytesPerFrame;
+    if (ExtAudioFileSetProperty(a->file, kExtAudioFileProperty_ClientDataFormat, sizeof out, &out) != noErr)
+        goto fail;
+    size = sizeof frames;
+    if (ExtAudioFileGetProperty(a->file, kExtAudioFileProperty_FileLengthFrames, &size, &frames) == noErr
+        && frames > 0)
+        a->frames = (uint64_t)frames;
+    a->rate = (unsigned)in.mSampleRate;
+    a->channels = in.mChannelsPerFrame;
+    return 1;
+fail:
+    ExtAudioFileDispose(a->file);
+    a->file = NULL;
+    return 0;
+}
+
+static void sys_close(sys_audio *a)
+{
+    if (a->file)
+        ExtAudioFileDispose(a->file);
+    a->file = NULL;
+}
+
+static size_t sys_read(sys_audio *a, float *out, size_t frames)
+{
+    size_t got = 0;
+
+    while (got < frames) {
+        AudioBufferList bl;
+        UInt32 n = (UInt32)(frames - got);
+        bl.mNumberBuffers = 1;
+        bl.mBuffers[0].mNumberChannels = a->channels;
+        bl.mBuffers[0].mDataByteSize = n * 4 * a->channels;
+        bl.mBuffers[0].mData = out + got * a->channels;
+        if (ExtAudioFileRead(a->file, &n, &bl) != noErr || n == 0)
+            break;
+        got += n;
+    }
+    return got;
+}
+
+static void sys_title(const char *path, char *title, size_t cap)
+{
+    AudioFileID af = NULL;
+    CFDictionaryRef info = NULL;
+    UInt32 size = sizeof info;
+    CFURLRef url = sys_url(path);
+
+    if (!url)
+        return;
+    if (AudioFileOpenURL(url, kAudioFileReadPermission, 0, &af) == noErr && af) {
+        if (AudioFileGetProperty(af, kAudioFilePropertyInfoDictionary, &size, &info) == noErr && info) {
+            CFStringRef t = (CFStringRef)CFDictionaryGetValue(info, CFSTR(kAFInfoDictionary_Title));
+            if (t && CFGetTypeID(t) == CFStringGetTypeID())
+                CFStringGetCString(t, title, (CFIndex)cap, kCFStringEncodingUTF8);
+            CFRelease(info);
+        }
+        AudioFileClose(af);
+    }
+    CFRelease(url);
+}
+
+static int sys_probe(const char *path, uint32_t *ms, char *title, size_t cap)
+{
+    sys_audio a;
+
+    if (!sys_open(&a, path))
+        return 0;
+    if (a.rate)
+        *ms = (uint32_t)(a.frames * 1000 / a.rate);
+    sys_close(&a);
+    if (cap > 1)
+        sys_title(path, title, cap);
+    return 1;
+}
+#endif /* __APPLE__ */
+
 /* ── flac, ogg, wav: the decoders' own headers ─────────────────────── */
 
 typedef struct { char *title; size_t cap; } meta_ctx;
@@ -407,6 +543,10 @@ int xst_probe(const char *path, uint32_t *ms, char *title, size_t title_cap)
         drwav_uninit(&w);
         return 1;
     }
+#if defined(__APPLE__)
+    case K_SYSTEM:
+        return sys_probe(path, ms, title, title_cap);
+#endif
     default:
         return 0;
     }
@@ -431,6 +571,9 @@ struct xst_stream {
     drflac     *flac;
     drwav       wav;
     stb_vorbis *ogg;
+#if defined(__APPLE__)
+    sys_audio   sys;
+#endif
     unsigned    rate, channels;
     int         src_eof;
 
@@ -509,6 +652,9 @@ static size_t src_read(xst_stream *s, float *out, size_t frames)
         got = (size_t)stb_vorbis_get_samples_float_interleaved(s->ogg, (int)ch, buf,
                                                                (int)(frames * ch));
         break;
+#if defined(__APPLE__)
+    case K_SYSTEM: got = sys_read(&s->sys, buf, frames); break;
+#endif
     default: break;
     }
     if (got < frames)
@@ -581,6 +727,12 @@ xst_stream *xst_stream_open(const char *path)
             s->rate = info.sample_rate; s->channels = (unsigned)info.channels;
         }
         break;
+#if defined(__APPLE__)
+    case K_SYSTEM:
+        ok = sys_open(&s->sys, path);
+        if (ok) { s->rate = s->sys.rate; s->channels = s->sys.channels; }
+        break;
+#endif
     default:
         break;
     }
@@ -617,6 +769,9 @@ void xst_stream_close(xst_stream *s)
     case K_FLAC: if (s->flac) drflac_close(s->flac); break;
     case K_WAV:  drwav_uninit(&s->wav); break;
     case K_OGG:  if (s->ogg) stb_vorbis_close(s->ogg); break;
+#if defined(__APPLE__)
+    case K_SYSTEM: sys_close(&s->sys); break;
+#endif
     default: break;
     }
     free(s->taps);

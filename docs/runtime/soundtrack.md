@@ -79,10 +79,16 @@ channels the front pair is taken (with the centre at -3 dB).
 | wav | dr_wav 0.14.6 | public domain / MIT-0 |
 | ogg (Vorbis) | stb_vorbis 1.22 | public domain / MIT |
 
+On macOS also m4a (AAC, Apple Lossless), aiff and caf, through the system's
+AudioToolbox (`ExtAudioFile`): no code of anyone's is added for it, and it is
+where Apple Music and iTunes libraries are. Other hosts do not list those
+files.
+
 All single files under `third_party/`, compiled into `xst_decode.c`; no
 library is linked, so every host (Windows, Linux, macOS, Android) builds the
-same code. Not played: m4a/AAC and Opus (no single-file decoder with a
-permissive licence), WMA (the title's own decoder plays a console's real
+same code. Not played: m4a/AAC off macOS and Opus (no decoder small enough to
+vendor under a licence this project ships: FAAD2 is GPL, FDK-AAC's licence
+is its own, FFmpeg is LGPL and large), WMA (the title's own decoder plays a console's real
 `MUSIC` folder, see below).
 
 ## On the emulated disk
@@ -115,6 +121,33 @@ Burnout 3's are in `src/game/soundtrack.c` of that port, with the addresses
 and the player's state machine. Everything after the decoder (the title's
 stream, its volume and mix bins, pause, skip, shuffle) is the title's code,
 unchanged.
+
+## Choosing the folder in the overlay
+
+`xbox_OverlaySetMusicFolder(&ops)` (xbox_settings.h) puts a "Custom music
+folder" row on the overlay's Audio page. The row opens a folder browser
+drawn in the place of the page's rows; D-pad or arrows, A or Enter, B or Esc,
+the mouse. Its model is `xst_browse.c` (`xsb_*`, no drawing, unit-tested):
+
+- places: the folder in use, Music, Home, Downloads, the mounts (macOS
+  /Volumes; Linux /run/media/<user>/<label>, /run/media/<label>, /media,
+  /mnt; Windows drive letters; Android shared storage and /storage/<card>)
+  and, off Windows, "Computer: /". The same list as the Burnout 3 setup
+  window's disc browser, with Music first.
+- a folder: "Use this folder", "..", its folders in natural order (1024 rows
+  at most), each with the playable files in and below it, counted by name on
+  the browser's own thread, six levels deep, 20 000 entries a row.
+- B goes up one folder, from a place's own folder to the places, from the
+  places back to the page.
+
+The folder picked is stored (`xbox_SettingsSetText`) and handed to
+`ops->chosen`; `ops->status` fills the line under the row. A port that can
+take the change while its title runs calls
+`xbox_SoundtrackSetFolder(dir, done)`: the scan runs on a thread
+(`xbox_SoundtrackScanning` gives the counts for a progress line), then the
+database is replaced (written beside and renamed over) and `done` is called
+on that thread. What a title has cached of the old list is the port's to
+know (Burnout 3 keeps the soundtrack count: its `soundtrack.c`).
 
 ## Settings
 

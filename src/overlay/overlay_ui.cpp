@@ -33,6 +33,7 @@
 #include "input_map.h"
 #include "kernel_pause.h"
 #include "apu.h"                /* the speaker test */
+#include "xbox_soundtrack.h"    /* the music folder browser's model (xsb_*) */
 
 #include <math.h>
 #include <stdint.h>
@@ -189,7 +190,7 @@ static const Meta k_meta[XS_COUNT] = {
 #if defined(__ANDROID__)
 extern "C" const char *nvk_core_describe(void);   /* nv2a_vk_core.c */
 #endif
-enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS };
+enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS, R_FOLDER };
 enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_HOST0, A_HOST1, A_HOST2, A_HOST3,                  /* xbox_OverlaySetHostRows */
               A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER };      /* A_SHADERS on: the build's */
@@ -212,13 +213,77 @@ static char s_rep_done[1400];         /* where the last one went, or why none */
 
 static char s_about[200];
 
-/* The Audio page's note, two lines (xbox_settings.h). */
-static char s_audio_note[2][96];
+/* ── the music folder (xbox_OverlaySetMusicFolder) ─────────────────── */
 
-void xbox_OverlaySetAudioNote(const char *line1, const char *line2)
+#define MUSIC_KEY "audio.custom_music_dir"
+static const xbox_music_folder_ops *s_mf;
+static char s_mf_status[200];
+static int s_fb_sel;                  /* the browser's row */
+static bool s_fb_scroll;
+
+void xbox_OverlaySetMusicFolder(const xbox_music_folder_ops *ops)
 {
-    snprintf(s_audio_note[0], sizeof s_audio_note[0], "%s", line1 ? line1 : "");
-    snprintf(s_audio_note[1], sizeof s_audio_note[1], "%s", line2 ? line2 : "");
+    s_mf = ops;
+}
+
+static const char *path_leaf(const char *p)
+{
+    const char *e = p + strlen(p), *b;
+    while (e > p && (e[-1] == '/' || e[-1] == '\\'))
+        e--;
+    b = e;
+    while (b > p && b[-1] != '/' && b[-1] != '\\')
+        b--;
+    return b;
+}
+
+/* "Off", or the folder's own name. */
+static void music_value(char *out, size_t n)
+{
+    const char *dir = xbox_SettingsText(MUSIC_KEY, NULL);
+    if (!dir[0]) {
+        snprintf(out, n, "Off");
+        return;
+    }
+    const char *b = path_leaf(dir);
+    int len = (int)strcspn(b, "/\\");
+    snprintf(out, n, "%.*s", len > 40 ? 40 : len, b);
+}
+
+static void browser_count(const xsb_row &r, char *out, size_t n)
+{
+    out[0] = 0;
+    if (r.kind == XSB_OFF || r.kind == XSB_UP)
+        return;
+    if (r.songs < 0)
+        snprintf(out, n, "...");
+    else if (r.songs == 0)
+        snprintf(out, n, r.more ? "none found yet" : "no music");
+    else
+        snprintf(out, n, "%d%s song%s", r.songs, r.more ? "+" : "", r.songs == 1 && !r.more ? "" : "s");
+}
+
+static void changed();
+
+/* A browser row is picked. */
+static void browser_pick(int i)
+{
+    char dir[1024] = "";
+    int sel = 0;
+    xsb_result res = xsb_activate(i, dir, sizeof dir, &sel);
+    if (res == XSB_MOVED) {
+        s_fb_sel = sel;
+        s_fb_scroll = true;
+    } else if (res == XSB_CHOSEN || res == XSB_TURNED_OFF) {
+        if (res == XSB_TURNED_OFF)
+            dir[0] = 0;
+        xbox_SettingsSetText(MUSIC_KEY, dir);
+        changed();
+        fprintf(stderr, LOGP "music folder: %s\n", dir[0] ? dir : "off");
+        if (s_mf && s_mf->chosen)
+            s_mf->chosen(dir);
+        xsb_close();
+    }
 }
 
 void xbox_OverlaySetAbout(const char *text)
@@ -356,10 +421,14 @@ static int page_rows(int page, Row *r)
         SPK(1, "Speaker test, direct");
         if (mcpx_apu_title_channels() != 6)
             INFO("The output is stereo: each speaker is folded to left/right.");
-        if (s_audio_note[0][0])
-            INFO(s_audio_note[0]);
-        if (s_audio_note[1][0])
-            INFO(s_audio_note[1]);
+        if (s_mf) {
+            r[n++] = Row{ R_FOLDER, XS_COUNT, 0, "Custom music folder" };
+            s_mf_status[0] = 0;
+            if (s_mf->status)
+                s_mf->status(s_mf_status, sizeof s_mf_status);
+            if (s_mf_status[0])
+                INFO(s_mf_status);
+        }
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_INPUT:
@@ -421,7 +490,8 @@ static void value_text(xs_id id, char *out, size_t n);
 
 static void test_state(const char *path)
 {
-    static const char *const kinds[] = { "setting", "action", "info", "speakers" };
+    static const char *const kinds[] = { "setting", "action", "info", "speakers", "folder" };
+    static const char *const bkinds[] = { "use", "off", "up", "place", "dir" };
     Row r[16];
     int n = page_rows(s_page, r);
     FILE *f = fopen(path, "w");
@@ -429,12 +499,28 @@ static void test_state(const char *path)
         return;
     fprintf(f, "open %d\npage %s\noffer %d\npaused %d\n", s_open ? 1 : 0, k_page_name[s_page],
             s_sb_offer ? 1 : 0, xbox_HostPaused());
+    if (xsb_is_open()) {
+        /* The folder browser, over the page: where it is and its rows. */
+        char where[1024], c[48];
+        xsb_row b;
+        xsb_where(where, sizeof where);
+        fprintf(f, "browser %s\n", where[0] ? where : "(places)");
+        for (int i = 0; xsb_row_at(i, &b); i++) {
+            browser_count(b, c, sizeof c);
+            fprintf(f, "%c %s: %s%s%s\n", i == s_fb_sel ? '>' : ' ', bkinds[b.kind], b.label,
+                    c[0] ? " = " : "", c);
+        }
+        fclose(f);
+        return;
+    }
     for (int i = 0; i < n; i++) {
         char v[96] = "";
         const char *label = r[i].text;
         if (r[i].kind == R_SETTING) {
             label = k_meta[r[i].id].label;
             value_text(r[i].id, v, sizeof v);
+        } else if (r[i].kind == R_FOLDER) {
+            music_value(v, sizeof v);
         }
         fprintf(f, "%c %s: %s%s%s\n", s_open && i == s_sel[s_page] ? '>' : ' ', kinds[r[i].kind],
                 label ? label : "", v[0] ? " = " : "", v);
@@ -591,6 +677,17 @@ static void activate(const Row &r)
         spk_play(r.action);
         return;
     }
+    if (r.kind == R_FOLDER) {
+        int locked = 0;
+        const char *dir = xbox_SettingsText(MUSIC_KEY, &locked);
+        if (!locked) {
+            xsb_open(dir);
+            /* On the current folder when there is one ("turn off" is above it). */
+            s_fb_sel = dir[0] ? 1 : 0;
+            s_fb_scroll = true;
+        }
+        return;
+    }
     if (r.kind == R_ACTION && r.action >= A_HOST0 && r.action <= A_HOST3) {
         if (s_host_fn)
             s_host_fn(r.action - A_HOST0, 1);
@@ -692,6 +789,7 @@ static void set_open(bool on)
             sb_select();
         }
         mcpx_apu_speaker_test(-1, 0);
+        xsb_close();
         xbox_HostPause(0);
         xbox_InputSetBlocked(0);
         xbox_SettingsFlush();
@@ -1012,7 +1110,16 @@ void xbox_OverlayPoll(void)
      * (minimised) still closes. */
     if (s_back > 0) {
         s_back = 0;
-        if (s_open)
+        if (s_open && xsb_is_open()) {
+            /* In the folder browser: one level up, then back to the page. */
+            int sel = 0;
+            if (xsb_back(&sel) == XSB_CLOSED)
+                xsb_close();
+            else {
+                s_fb_sel = sel;
+                s_fb_scroll = true;
+            }
+        } else if (s_open)
             set_open(false);
     }
 
@@ -1388,6 +1495,19 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(T->action), r.text);
         return;
     }
+    if (r.kind == R_FOLDER) {
+        char v[64], t[80];
+        int locked = 0;
+        xbox_SettingsText(MUSIC_KEY, &locked);
+        music_value(v, sizeof v);
+        snprintf(t, sizeof t, sel && !locked ? "%s  >" : "%s", v);
+        dl->AddText(ImVec2(p.x + fs * 0.8f, ty),
+                    locked ? col(T->text_dim) : col(sel ? T->text_hi : T->text), r.text);
+        float tw = ImGui::CalcTextSize(t).x;
+        dl->AddText(ImVec2(p.x + width - fs * 0.8f - tw, ty),
+                    locked ? col(T->text_dim) : col(T->text_hi), t);
+        return;
+    }
     if (r.kind == R_SPEAKERS) {
         /* Six buttons on the right; the one playing lit, the picked one
          * outlined while the row is selected. A click plays its button. */
@@ -1459,6 +1579,113 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     }
 }
 
+/* The folder browser, in the place of a page's rows: where it is, the rows
+ * (a place or folder with the music found in and below it), the keys. */
+static void build_browser(float fs, ImDrawList *dl)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    int n = xsb_rows();
+
+    collect_steps();
+    if (s_fb_sel >= n) s_fb_sel = n - 1;
+    if (s_fb_sel < 0) s_fb_sel = 0;
+    while (s_steps[D_UP]-- > 0)   { s_fb_sel = (s_fb_sel + n - 1) % (n ? n : 1); s_fb_scroll = true; }
+    while (s_steps[D_DOWN]-- > 0) { s_fb_sel = (s_fb_sel + 1) % (n ? n : 1); s_fb_scroll = true; }
+    memset(s_steps, 0, sizeof s_steps);
+    s_reset = 0;
+    s_page_delta = 0;
+    if (s_activate > 0) {
+        s_activate = 0;
+        browser_pick(s_fb_sel);
+        if (!xsb_is_open())
+            return;
+        n = xsb_rows();
+    }
+
+    /* Where: the folder, cut from the left when it is too long. */
+    char where[1024];
+    xsb_where(where, sizeof where);
+    const float wrap_w = ImGui::GetContentRegionAvail().x;
+    {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        const char *t = where[0] ? where : "Custom music folder: choose where to look";
+        char cut[1100];
+        if (ImGui::CalcTextSize(t).x > wrap_w) {
+            const char *q = t;
+            do {
+                q++;
+                snprintf(cut, sizeof cut, "...%s", q);
+            } while (*q && ImGui::CalcTextSize(cut).x > wrap_w);
+            t = cut;
+        }
+        dl->AddText(ImVec2(p.x, p.y), col(T->text_hi), t);
+        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + fs * 1.6f));
+    }
+
+    const float footer = fs * 0.5f + fs + fs * 2.9f;
+    const float rh = fs * 2.0f;
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImGui::BeginChild("folders", ImVec2(avail.x, avail.y - footer), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoNav);
+    ImDrawList *cdl = ImGui::GetWindowDrawList();
+    const float rw = ImGui::GetContentRegionAvail().x - fs * 0.5f;
+    int picked = -1;
+    xsb_row r;
+    for (int i = 0; xsb_row_at(i, &r); i++) {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        bool sel = i == s_fb_sel;
+        ImGui::PushID(i);
+        ImGui::InvisibleButton("##dir", ImVec2(rw, rh));
+        if (ImGui::IsItemHovered() && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
+            s_fb_sel = i;
+            s_last_input_pad = false;
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+            picked = i;
+        ImGui::PopID();
+        if (!ImGui::IsRectVisible(p, ImVec2(p.x + rw, p.y + rh)) && !(sel && s_fb_scroll))
+            continue;
+        if (sel) {
+            cdl->AddRectFilled(p, ImVec2(p.x + rw, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.35f);
+            cdl->AddRectFilled(p, ImVec2(p.x + fs * 0.22f, p.y + rh), col(T->sel_bar), fs * 0.11f);
+        }
+        const float ty = p.y + (rh - fs) * 0.5f;
+        bool act = r.kind == XSB_USE || r.kind == XSB_OFF;
+        char c[48];
+        browser_count(r, c, sizeof c);
+        float cw = ImGui::CalcTextSize(c).x;
+        cdl->PushClipRect(p, ImVec2(p.x + rw - cw - fs * 1.6f, p.y + rh), true);
+        cdl->AddText(ImVec2(p.x + fs * 0.8f, ty),
+                     act ? col(T->action) : col(sel ? T->text_hi : T->text), r.label);
+        cdl->PopClipRect();
+        if (c[0])
+            cdl->AddText(ImVec2(p.x + rw - fs * 0.8f - cw, ty),
+                         r.songs > 0 ? col(T->text_hi) : col(T->text_dim), c);
+        if (sel && s_fb_scroll) {
+            ImGui::SetScrollHereY(0.5f);
+            s_fb_scroll = false;
+        }
+    }
+    ImGui::EndChild();
+    if (picked >= 0) {
+        s_fb_sel = picked;
+        browser_pick(picked);
+    }
+
+    {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        dl->AddLine(ImVec2(p.x, p.y + fs * 0.2f), ImVec2(p.x + avail.x, p.y + fs * 0.2f), col(T->rule));
+        float y = p.y + fs * 0.5f;
+        dl->AddText(ImVec2(p.x, y), col(T->text_dim),
+                    "Every folder with music in it becomes a soundtrack in the game's own music menu.");
+        y += fs + fs * 0.3f + fs * 1.3f;
+        const char *keys = pad_hints()
+            ? "D-pad  select      A  open / choose      B  back"
+            : "Arrows  select      Enter  open / choose      Esc  back";
+        dl->AddText(ImVec2(p.x, y), col(T->text_dim), keys);
+    }
+}
+
 static void build_pages(float fs)
 {
     ImGuiIO &io = ImGui::GetIO();
@@ -1508,6 +1735,13 @@ static void build_pages(float fs)
         float hw = ImGui::CalcTextSize(hint).x;
         dl->AddText(ImVec2(p.x + pw - fs * 2.0f - hw, p.y + (th - fs) * 0.5f), col(T->tab_hint), hint);
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + th + fs * 0.5f));
+    }
+
+    if (xsb_is_open()) {
+        build_browser(fs, dl);
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        return;
     }
 
     /* The rows. */
@@ -1572,6 +1806,24 @@ static void build_pages(float fs)
         }
     } else if (rows[sel].kind == R_SPEAKERS) {
         spk_hint(rows[sel].action, hint, sizeof hint);
+    } else if (rows[sel].kind == R_FOLDER) {
+        int locked = 0;
+        xbox_SettingsText(MUSIC_KEY, &locked);
+        hint_locked = locked != 0;
+        if (locked)
+            snprintf(hint, sizeof hint, "Set by the environment (RECOMP_AUDIO_MUSIC_DIR or --music-dir);"
+                     " unset it to change it here.");
+        else
+#if defined(__ANDROID__)
+            snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
+                     " own music menu. The folder list shows what this app may read: on Android it"
+                     " needs the \"Music and audio\" permission (Settings > Apps > this app >"
+                     " Permissions); without it the folders look empty.");
+#else
+            snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
+                     " own music menu: every folder with music in it becomes a soundtrack there."
+                     " A opens a folder list.");
+#endif
     } else if (rows[sel].kind == R_ACTION
                && (rows[sel].action == A_REPORT || rows[sel].action == A_REPORT_SHOT)) {
         snprintf(hint, sizeof hint, "%s%sA zip in the reports folder beside the settings: the logs of"
@@ -1626,7 +1878,7 @@ static void build_pages(float fs)
             } else if (clicked) {
                 sel = i;
             }
-        } else if (clicked && rows[i].kind == R_ACTION) {
+        } else if (clicked && (rows[i].kind == R_ACTION || rows[i].kind == R_FOLDER)) {
             sel = i;
             activate(rows[i]);
         } else if (clicked && rows[i].kind == R_SPEAKERS) {
