@@ -333,6 +333,49 @@ static void test_lfe(void)
         double db = 10.0 * log10(sq / sq_in);
         CHECK(fabs(db - pt[k].db) < pt[k].tol, "LFE low-pass at %g Hz: %.2f dB, want %.2f", pt[k].hz, db, pt[k].db);
     }
+    /* Changed while it plays (the user's setting): the feed fades from one
+     * to the other over 32 frames, nothing steps, and a 40 Hz tone that
+     * passes both keeps its level throughout. */
+    {
+        double ph = 0, worst_step = 0, lo = 1e9, hi = 0;
+        float last = 0;
+        wire(120);
+        load_all();
+        for (int f = 0; f < 400; f++) {
+            clear();
+            for (int i = 0; i < N; i++) {
+                bins[3][i] = 0.5f * (float)sin(ph);
+                ph += 2.0 * 3.14159265358979323846 * 40.0 / 48000.0;
+            }
+            if (f == 200) {
+                apu_gp_lfe_lowpass(0);
+                CHECK(apu_gp_lfe_lowpass_hz() == 0, "the change is not reported");
+                apu_gp_lfe_lowpass(80);         /* during the fade: ignored */
+                CHECK(apu_gp_lfe_lowpass_hz() == 0, "a change during a fade was taken");
+            }
+            float in[N];
+            memcpy(in, bins[3], sizeof in);
+            frame();
+            if (f >= 100) {
+                for (int i = 0; i < N; i++) {
+                    worst_step = fmax(worst_step, fabs(out[LFE][i] - last));
+                    last = out[LFE][i];
+                }
+                /* The peak of each 40 frames (longer than a cycle). */
+                static double pk;
+                for (int i = 0; i < N; i++) pk = fmax(pk, fabs(out[LFE][i]));
+                if (f % 40 == 39) { lo = fmin(lo, pk); hi = fmax(hi, pk); pk = 0; }
+            } else {
+                last = out[LFE][N - 1];
+            }
+            if (f == 240)
+                CHECK(!memcmp(in, out[LFE], sizeof in), "after the fade to off the feed is not the input");
+        }
+        /* A 40 Hz sine at 0.5 moves 0.0026 a sample at most. */
+        CHECK(worst_step < 0.004, "the LFE feed steps by %g at a change", worst_step);
+        CHECK(hi / lo < 1.03, "the tone's peak moved %g..%g through the change", lo, hi);
+    }
+
     /* Off: the feed as it is. */
     wire(0);
     load_all();

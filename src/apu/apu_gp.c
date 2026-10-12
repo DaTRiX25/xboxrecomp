@@ -21,8 +21,11 @@ static struct {
     int ndrive;
     int exp_first, exp_count;
     uint32_t exp_off;
-    int lfe_hz;
-    double lfe_c[2][5], lfe_z[2][2];
+    /* The LFE low-pass: the one running, and during a change the one it
+     * is fading to. */
+    struct gp_lfe { int hz; double c[2][5], z[2][2]; } lfe, lfe_to;
+    int lfe_fade;                       /* frames of the fade left */
+    int ran;                            /* a frame has run */
     /* The effects' state words, signed 24-bit, as the GP program has them:
      * loaded from GP scratch by the title's commands. */
     int32_t st[APU_GP_STATE_MAX];
@@ -99,23 +102,65 @@ int apu_gp_export_range(uint32_t *scratch_off, uint32_t *bytes, int *first_bin)
 
 /* 4th order Butterworth low-pass as two biquads (Q 0.5412, 1.3066), the
  * bilinear transform with the cutoff pre-warped. */
-void apu_gp_lfe_lowpass(int hz)
+static void lfe_design(struct gp_lfe *l, int hz)
 {
     static const double q[2] = { 0.54119610014619698, 1.3065629648763766 };
-    wire();
-    g.lfe_hz = hz > 0 ? hz : 0;
-    memset(g.lfe_z, 0, sizeof(g.lfe_z));
-    if (!g.lfe_hz)
-        return;
-    for (int s = 0; s < 2; s++) {
-        double w = 2.0 * 3.14159265358979323846 * g.lfe_hz / 48000.0;
+    memset(l, 0, sizeof(*l));
+    l->hz = hz > 0 ? hz : 0;
+    for (int s = 0; s < 2 && l->hz; s++) {
+        double w = 2.0 * 3.14159265358979323846 * l->hz / 48000.0;
         double al = sin(w) / (2.0 * q[s]), cs = cos(w), a0 = 1.0 + al;
-        g.lfe_c[s][0] = (1.0 - cs) / 2.0 / a0;
-        g.lfe_c[s][1] = (1.0 - cs) / a0;
-        g.lfe_c[s][2] = (1.0 - cs) / 2.0 / a0;
-        g.lfe_c[s][3] = -2.0 * cs / a0;
-        g.lfe_c[s][4] = (1.0 - al) / a0;
+        l->c[s][0] = (1.0 - cs) / 2.0 / a0;
+        l->c[s][1] = (1.0 - cs) / a0;
+        l->c[s][2] = (1.0 - cs) / 2.0 / a0;
+        l->c[s][3] = -2.0 * cs / a0;
+        l->c[s][4] = (1.0 - al) / a0;
     }
+}
+
+static void lfe_run(struct gp_lfe *l, const float *in, float *out)
+{
+    double x[APU_GP_FRAME];
+    for (int i = 0; i < APU_GP_FRAME; i++) x[i] = in[i];
+    for (int s = 0; s < 2 && l->hz; s++) {
+        const double *c = l->c[s];
+        double z1 = l->z[s][0], z2 = l->z[s][1];
+        for (int i = 0; i < APU_GP_FRAME; i++) {
+            double v = x[i], y = c[0] * v + z1;
+            z1 = c[1] * v - c[3] * y + z2;
+            z2 = c[2] * v - c[4] * y;
+            x[i] = y;
+        }
+        if (fabs(z1) < 1e-30) z1 = 0.0;
+        if (fabs(z2) < 1e-30) z2 = 0.0;
+        l->z[s][0] = z1; l->z[s][1] = z2;
+    }
+    for (int i = 0; i < APU_GP_FRAME; i++) out[i] = (float)x[i];
+}
+
+#define LFE_FADE_FRAMES 32              /* 21 ms */
+
+void apu_gp_lfe_lowpass(int hz)
+{
+    wire();
+    if (hz < 0) hz = 0;
+    if (!g.ran) {                       /* wiring: from the first frame */
+        lfe_design(&g.lfe, hz);
+        g.lfe_fade = 0;
+        return;
+    }
+    /* While it plays: the new filter starts from rest beside the old one
+     * and the feed fades across, so nothing steps. A change during a fade
+     * waits for it (apu_gp_frame). */
+    if (g.lfe_fade || hz == g.lfe.hz)
+        return;
+    lfe_design(&g.lfe_to, hz);
+    g.lfe_fade = LFE_FADE_FRAMES;
+}
+
+int apu_gp_lfe_lowpass_hz(void)
+{
+    return g.lfe_fade ? g.lfe_to.hz : g.lfe.hz;
 }
 
 static float s24f(int32_t v) { return (float)v / 8388608.0f; }
@@ -366,20 +411,19 @@ void apu_gp_frame(const apu_gp_mem *m, float bins[APU_GP_BINS][APU_GP_FRAME],
         }
     }
 
-    if (g.lfe_hz) {
-        float *x = out[3];
-        for (int s = 0; s < 2; s++) {
-            const double *c = g.lfe_c[s];
-            double z1 = g.lfe_z[s][0], z2 = g.lfe_z[s][1];
-            for (int i = 0; i < APU_GP_FRAME; i++) {
-                double in = x[i], y = c[0] * in + z1;
-                z1 = c[1] * in - c[3] * y + z2;
-                z2 = c[2] * in - c[4] * y;
-                x[i] = (float)y;
-            }
-            if (fabs(z1) < 1e-30) z1 = 0.0;
-            if (fabs(z2) < 1e-30) z2 = 0.0;
-            g.lfe_z[s][0] = z1; g.lfe_z[s][1] = z2;
+    if (g.lfe_fade) {
+        float a[APU_GP_FRAME], b[APU_GP_FRAME];
+        const float t0 = (float)(LFE_FADE_FRAMES - g.lfe_fade) / LFE_FADE_FRAMES;
+        lfe_run(&g.lfe, out[3], a);
+        lfe_run(&g.lfe_to, out[3], b);
+        for (int i = 0; i < APU_GP_FRAME; i++) {
+            float t = t0 + (float)i / (APU_GP_FRAME * LFE_FADE_FRAMES);
+            out[3][i] = a[i] + t * (b[i] - a[i]);
         }
+        if (--g.lfe_fade == 0)
+            g.lfe = g.lfe_to;
+    } else if (g.lfe.hz) {
+        lfe_run(&g.lfe, out[3], out[3]);
     }
+    g.ran = 1;
 }

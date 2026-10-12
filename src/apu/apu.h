@@ -73,6 +73,11 @@ void mcpx_apu_set_fx_level(float level);
  * stereo, and the calls above (speaker map, effect-send level) are not
  * used. */
 
+/* The low-pass on the LFE feed of such a title (RECOMP_AUDIO_LFE_LOWPASS,
+ * audio.lfe_lowpass: off, 80, 100, 120 Hz; live, faded over 21 ms). The
+ * title's wiring sets it until this or the variable does. Any thread. */
+void mcpx_apu_set_lfe_lowpass(int hz);
+
 /* The speaker map in use (mcpx_apu_set_speaker_map, or the default). */
 void mcpx_apu_speaker_map_get(int8_t map[32]);
 

@@ -284,6 +284,31 @@ static void gp_mem_write(void *ctx, uint32_t off, const uint32_t *words, int n)
     }
 }
 
+/* RECOMP_AUDIO_LFE_LOWPASS (audio.lfe_lowpass): the user's low-pass on
+ * the model's LFE feed. < 0: not set, the title's wiring stands. Followed
+ * every frame, since the model takes a change only between fades. */
+static volatile int s_lfe_user = -2;    /* -2: the variable not read yet */
+
+void mcpx_apu_set_lfe_lowpass(int hz)
+{
+    s_lfe_user = hz <= 0 ? 0 : hz < 40 ? 40 : hz > 250 ? 250 : hz;
+}
+
+static void gp_follow_lfe(void)
+{
+    int want = s_lfe_user;
+    if (want == -2) {
+        const char *e = recomp_env(RENV_AUDIO_LFE_LOWPASS);
+        if (e && *e)
+            mcpx_apu_set_lfe_lowpass(atoi(e));     /* "off" reads as 0 */
+        else
+            s_lfe_user = -1;
+        want = s_lfe_user;
+    }
+    if (want >= 0 && apu_gp_lfe_lowpass_hz() != want)
+        apu_gp_lfe_lowpass(want);
+}
+
 /* A command about to be acknowledged: its block is the five dwords before
  * the doorbell (GP scratch 0x800..0x80C). */
 static void gp_command(MCPXAPUState *d, const uint32_t *doorbell)
@@ -452,6 +477,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         const int six = d->monitor.channels == APU_SPK_CHANNELS;
         const int nch = six ? APU_SPK_CHANNELS : 2;
 
+        gp_follow_lfe();
         apu_gp_frame(&m, mixbins, acc);
         if (!six) {
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {

@@ -71,8 +71,12 @@ void apu_gp_drive(int bin, uint32_t state);
 void apu_gp_export(int first, int count, uint32_t scratch_off);
 /* The block: 0 when nothing is exported. */
 int  apu_gp_export_range(uint32_t *scratch_off, uint32_t *bytes, int *first_bin);
-/* The LFE feed's low-pass (4th order Butterworth). 0: none. */
+/* The LFE feed's low-pass (4th order Butterworth). 0: none. Also while it
+ * plays (frame thread): the feed then fades to the new setting over 21 ms;
+ * a call during a fade is ignored, so a caller that follows a setting
+ * compares with apu_gp_lfe_lowpass_hz() every frame. */
 void apu_gp_lfe_lowpass(int hz);
+int  apu_gp_lfe_lowpass_hz(void);       /* the setting in force or being faded to */
 
 /* What a bin reaches (for meters and the host mixer): its speaker, or -1,
  * and its gain there now. */
