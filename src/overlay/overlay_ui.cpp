@@ -227,6 +227,8 @@ static char s_about[200];
 #define MUSIC_KEY "audio.custom_music_dir"
 static const xbox_music_folder_ops *s_mf;
 static char s_mf_status[200];
+#define MUSIC_NOTES 4
+static char s_mf_note[MUSIC_NOTES][200];
 static int s_fb_sel;                  /* the browser's row */
 static bool s_fb_scroll;
 
@@ -437,6 +439,14 @@ static int page_rows(int page, Row *r)
                 s_mf->status(s_mf_status, sizeof s_mf_status);
             if (s_mf_status[0])
                 INFO(s_mf_status);
+            /* More lines of the port's (what a scan left out, by name), as
+             * far as the page has room. */
+            for (int k = 0; k < MUSIC_NOTES && s_mf->note && n < 15; k++) {
+                s_mf_note[k][0] = 0;
+                if (!s_mf->note(k, s_mf_note[k], sizeof s_mf_note[k]) || !s_mf_note[k][0])
+                    break;
+                INFO(s_mf_note[k]);
+            }
         }
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
@@ -1636,8 +1646,12 @@ static void build_browser(float fs, ImDrawList *dl)
     if (s_activate > 0) {
         s_activate = 0;
         browser_pick(s_fb_sel);
-        if (!xsb_is_open())
+        if (!xsb_is_open()) {
+            /* Chosen: nothing more is drawn this frame, and the header left
+             * the cursor moved with no item after it, which ImGui reports. */
+            ImGui::Dummy(ImVec2(0, 0));
             return;
+        }
         n = xsb_rows();
     }
 

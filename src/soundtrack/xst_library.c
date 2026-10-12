@@ -422,9 +422,21 @@ static void scan_dir(xst_library *lib, const char *dir, int depth, xst_progress 
             }
             snprintf(path, sizeof path, "%s/%s", dir, files.v[i]);
             title[0] = 0;
-            if (!xst_probe(path, &ms, title, sizeof title)) {
-                lib->bad_files++;
-                continue;
+            {
+                const char *why = "";
+                if (!xst_probe_why(path, &ms, title, sizeof title, &why)) {
+                    if (lib->n_left_out < XST_LEFT_OUT_KEPT) {
+                        char *copy = (char *)malloc(strlen(path) + 1);
+                        if (copy) {
+                            strcpy(copy, path);
+                            lib->left_out[lib->n_left_out].path = copy;
+                            lib->left_out[lib->n_left_out].why = why;
+                            lib->n_left_out++;
+                        }
+                    }
+                    lib->bad_files++;
+                    continue;
+                }
             }
             if (!title[0]) {
                 snprintf(stem, sizeof stem, "%s", files.v[i]);
@@ -502,6 +514,8 @@ void xst_free(xst_library *lib)
         return;
     for (i = 0; i < lib->n_songs; i++)
         free(lib->songs[i].path);
+    for (i = 0; i < lib->n_left_out; i++)
+        free(lib->left_out[i].path);
     free(lib->songs);
     free(lib);
 }
