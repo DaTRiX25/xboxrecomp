@@ -36,6 +36,28 @@ void xbox_HostSleepNs(uint64_t ns);
  * Call on the thread itself. */
 void xbox_HostTimerThreadInit(void);
 
+/* ── A gap in the run: the machine slept, or the process was stopped ──
+ *
+ * xbox_HostWakeTick is called by a thread that wakes every few milliseconds
+ * (the kernel's timer thread, each pass). When a second or more went by
+ * between two calls -- on the host clock (a stopped process; a sleep on
+ * macOS and Windows, whose clocks count it) or on the clock that counts the
+ * machine's sleep where the host clock does not (Linux: CLOCK_BOOTTIME) --
+ * it says so in the log once and tells the listeners, on that thread: they
+ * set a flag and return (the audio sink closes its device and opens the
+ * default output anew, the Vulkan presenter makes a new swapchain).
+ *
+ * The guest's clocks are not held back over the gap, as they are not over
+ * the overlay's pause (kernel_pause.h): the vblank schedule restarts from
+ * now when it finds itself more than 100 ms behind, periodic timers are due
+ * one period from now, the APU's frame clock restarts, and a title that
+ * steps by elapsed time is bounded by its own catch-up limit. On Linux the
+ * host clock does not count a sleep at all. */
+void xbox_HostWakeTick(void);
+/* fn(gap_ns) at each gap; `what` is the listener's part of the log line
+ * ("the audio queue"). At most 4. Any thread, before the gap. */
+void xbox_HostWakeListener(const char *what, void (*fn)(uint64_t gap_ns));
+
 /* ── The guest's clock, and a run that does not wait for it ──
  *
  * Everything the title can read time from (the vblank schedule, rdtsc and

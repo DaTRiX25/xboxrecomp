@@ -224,6 +224,9 @@ extern "C" {
     X(ZPASS_FIXED,       DEBUG, "zpass_fixed",     "RECOMP_ZPASS_FIXED",       "=n: every occlusion report reads n") \
     X(PB_NULL_DRAW_US,   DEBUG, "null_draw_us",    "RECOMP_PB_NULL_DRAW_US",   "=us: null backend cost per draw") \
     X(PB_INJECT_STOP,    DEBUG, "pb_inject_stop",  "RECOMP_PB_INJECT_STOP",    "=n: stop every nth walk (test hook)") \
+    X(AUDIO_STALL,       DEBUG, "audio_stall",     NULL,                       "=at[:for]: the audio device stops taking samples at second `at`, for `for` seconds or for good (test hook; SDL sink)") \
+    X(AUDIO_OPEN_HANG,   DEBUG, "audio_open_hang", NULL,                       "the audio device's reopen never returns (test hook; SDL sink)") \
+    X(VK_PRESENT_FAIL,   DEBUG, "vk_present_fail", NULL,                       "=at:n[:what]: from second `at`, n acquires in a row fail with what: outdated (default), surface, timeout (test hook; Vulkan window)") \
     X(FAST_KICK,         DEBUG, "fast_kick",       "RECOMP_FAST_KICK",         "=0: ack loop ticks at Sleep(1)") \
     X(FORCE_RETURN,      DEBUG, "force_return",    "RECOMP_FORCE_RETURN",      "honour forced returns in the build") \
     X(TRAP_NULL,         DEBUG, "trap_null",       "RECOMP_TRAP_NULL",         "guest page zero faults") \

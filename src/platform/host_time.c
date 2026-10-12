@@ -8,6 +8,7 @@
  * POSIX: CLOCK_MONOTONIC and nanosleep.
  */
 #include "host_time.h"
+#include <stdio.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -117,6 +118,79 @@ void xbox_HostTimerThreadInit(void)
                     " (%d); vblank wake-ups may run late by a few ms\n", (int)kr);
     }
 #endif
+}
+
+/* ── A gap in the run ─────────────────────────────────────── */
+
+#define WAKE_GAP_NS 1000000000ull
+#define WAKE_LISTENERS 4
+static struct { const char *what; void (*fn)(uint64_t); } s_wake_l[WAKE_LISTENERS];
+static volatile int s_wake_n;
+
+/* Time the machine has spent asleep, where the host clock does not count
+ * it; 0 where it does (macOS's CLOCK_MONOTONIC, Windows's performance
+ * counter) or where there is no such clock. */
+static uint64_t slept_ns(void)
+{
+#if defined(__linux__) && defined(CLOCK_BOOTTIME)
+    struct timespec b, m;
+    uint64_t bn, mn;
+
+    if (clock_gettime(CLOCK_BOOTTIME, &b) || clock_gettime(CLOCK_MONOTONIC, &m))
+        return 0;
+    bn = (uint64_t)b.tv_sec * 1000000000ull + (uint64_t)b.tv_nsec;
+    mn = (uint64_t)m.tv_sec * 1000000000ull + (uint64_t)m.tv_nsec;
+    return bn > mn ? bn - mn : 0;
+#else
+    return 0;
+#endif
+}
+
+void xbox_HostWakeListener(const char *what, void (*fn)(uint64_t gap_ns))
+{
+    int n = s_wake_n;
+
+    if (n >= WAKE_LISTENERS)
+        return;
+    s_wake_l[n].what = what;
+    s_wake_l[n].fn = fn;
+    s_wake_n = n + 1;
+}
+
+void xbox_HostWakeTick(void)
+{
+    static uint64_t last_ns, last_slept;
+    uint64_t now = xbox_HostNowNs(), slept = slept_ns();
+    uint64_t run_gap = last_ns ? now - last_ns : 0;
+    uint64_t sleep_gap = last_ns && slept > last_slept ? slept - last_slept : 0;
+    int n = s_wake_n, i;
+
+    last_ns = now;
+    last_slept = slept;
+    if (run_gap < WAKE_GAP_NS && sleep_gap < WAKE_GAP_NS)
+        return;
+    {
+        char did[256];
+        size_t len = 0;
+
+        did[0] = 0;
+        for (i = 0; i < n; i++) {
+            int w = snprintf(did + len, sizeof did - len, "%s%s", i ? ", " : "",
+                             s_wake_l[i].what);
+            if (w < 0 || (size_t)w >= sizeof did - len)
+                break;
+            len += (size_t)w;
+        }
+        fprintf(stderr, "[HOST] a gap of %.1f s in the run (%s): the vblank"
+                " schedule and the timers go on from now%s%s\n",
+                (double)(run_gap > sleep_gap ? run_gap : sleep_gap) / 1e9,
+                sleep_gap >= WAKE_GAP_NS ? "the machine slept"
+                    : "the machine slept or the process was stopped",
+                n ? "; started again: " : "", did);
+        fflush(stderr);
+    }
+    for (i = 0; i < n; i++)
+        s_wake_l[i].fn(run_gap > sleep_gap ? run_gap : sleep_gap);
 }
 
 /* ── The guest's clock ────────────────────────────────────── */
