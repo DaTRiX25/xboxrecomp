@@ -513,6 +513,12 @@ int main(void)
             recomp_cfg_free(c);
         }
     }
+    /* Where the upscaling is held off (Android for now) this layer does not
+     * decide: the stored value stays in the file as the player set it and is
+     * handed on as it is; the scaler ignores it and says so
+     * (nv2a_texscale_held, tests/nv2a_texscale). So nothing here may rewrite
+     * or drop the key. */
+    CHECK(st_ui_scale == 4 && xbox_SettingValue(XS_GRAPHICS_UI_SCALE) == 2);
     xbox_SettingReset(XS_GRAPHICS_UI_SCALE);
     CHECK(st_ui_scale == 0);
 

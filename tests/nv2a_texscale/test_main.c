@@ -1,6 +1,7 @@
 /* nv2a_texscale: the 2D art scalers and the rule that picks what they scale,
  * on synthetic textures. No GPU. */
 #include "nv2a_texscale.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -676,6 +677,32 @@ int main(int argc, char **argv)
             for (x = 0; x < 480; x++)
                 bad += ob[y * 1024 + x] != oc[y * 576 + x];
         CHECK(bad == 0);
+    }
+
+    /* Held off: whatever is asked for, the factor stays 0 and nothing moves;
+     * lifted, the setting works. (On Android the hold is the default.) */
+    {
+        uint32_t g0;
+        (void)nv2a_texscale_factor();          /* the environment is read: off */
+        g0 = nv2a_texscale_generation();
+        recomp_env_set(RENV_UI_SCALE_HOLD, "1");
+        CHECK(nv2a_texscale_held() == 1);
+        nv2a_texscale_set_factor(2);
+        CHECK(nv2a_texscale_factor() == 0 && nv2a_texscale_generation() == g0);
+        nv2a_texscale_set_factor(4);
+        CHECK(nv2a_texscale_factor() == 0 && nv2a_texscale_generation() == g0);
+        recomp_env_set(RENV_UI_SCALE_HOLD, "0");
+        CHECK(nv2a_texscale_held() == 0);
+        nv2a_texscale_set_factor(2);
+        CHECK(nv2a_texscale_factor() == 2);
+        nv2a_texscale_set_factor(0);
+        recomp_env_set(RENV_UI_SCALE_HOLD, NULL);
+#if defined(__ANDROID__)
+        CHECK(nv2a_texscale_held() == 1);
+        recomp_env_set(RENV_UI_SCALE_HOLD, "0");   /* the rest tests the setting itself */
+#else
+        CHECK(nv2a_texscale_held() == 0);
+#endif
     }
 
     /* The setting: off unless asked; 2 and 4 only; a change moves the

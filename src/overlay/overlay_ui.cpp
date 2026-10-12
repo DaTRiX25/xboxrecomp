@@ -412,7 +412,8 @@ static int page_rows(int page, Row *r)
         SET(XS_GRAPHICS_RENDER_SCALE); SET(XS_GRAPHICS_ANISO);
         SET(XS_GRAPHICS_AA); SET(XS_GRAPHICS_SHARPEN);
         SET(XS_GRAPHICS_LOD_BIAS);
-        SET(XS_GRAPHICS_UI_SCALE);
+        if (!nv2a_texscale_held())      /* held off on Android for now (nv2a_texscale.h) */
+            SET(XS_GRAPHICS_UI_SCALE);
 #if defined(__APPLE__)          /* only the Metal presenter has the pass so far */
         SET(XS_GRAPHICS_DITHER);
 #endif
