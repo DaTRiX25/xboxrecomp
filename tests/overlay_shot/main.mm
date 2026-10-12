@@ -721,6 +721,10 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     CHECK(xbox_OverlayTestHasRow("Import save from home folder (none found"));
     CHECK(xbox_OverlayTestHasRow("Import save from another folder"));
     CHECK(xbox_OverlayTestHasRow("Restart game") && !xbox_OverlayTestHasRow("Restart game now"));
+    /* Restart game and Quit game are the last two rows of the page, and the
+     * Advanced page has no Restart row of its own above its reset row. */
+    CHECK(xbox_OverlayTestRowIndex("Restart game") > xbox_OverlayTestRowIndex("Reset all settings"));
+    CHECK(xbox_OverlayTestRowIndex("Quit game") == xbox_OverlayTestRowIndex("Restart game") + 1);
     CHECK(!xbox_OverlayTestHasRow("Cancel the import"));
 
     /* Import with nothing exported: a message, nothing staged. */
@@ -823,6 +827,50 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     run(2);
     CHECK(!xbox_OverlayTestHasRow("Restart game now"));
     CHECK(!recomp_restart_requested());
+
+    /* Restart game and Quit game: on every page, each asks once more. */
+    for (int p = 0; p < 6; p++) {
+        CHECK(xbox_OverlayTestHasRow("Restart game") && xbox_OverlayTestHasRow("Quit game"));
+        CHECK(xbox_OverlayTestRowIndex("Quit game") == xbox_OverlayTestRowIndex("Restart game") + 1);
+        CHECK(xbox_OverlayTestRowIndex("Restart game") > xbox_OverlayTestRowIndex("Reset "));
+        press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+    }
+    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);                  /* the Advanced page */
+    CHECK(xbox_OverlayTestSelectRow("Restart game"));
+    run(3);
+    snprintf(path, sizeof path, "%squitrow.bmp", pre);
+    frame(path);
+    press_a();                                                  /* the question: nothing yet */
+    CHECK(xbox_OverlayOpen() && !recomp_restart_requested() && !SDL_HasEvent(SDL_QUIT));
+    snprintf(path, sizeof path, "%squitrow_confirm.bmp", pre);
+    frame(path);
+    press(SDL_CONTROLLER_BUTTON_B);                             /* B takes it back and stays */
+    xbox_OverlayPoll();
+    CHECK(xbox_OverlayOpen() && !recomp_restart_requested());
+    press_a();                                                  /* asked again: it does not remember */
+    CHECK(xbox_OverlayOpen() && !recomp_restart_requested());
+    press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);                     /* off the row: cancelled */
+    press(SDL_CONTROLLER_BUTTON_DPAD_UP);
+    press_a();
+    CHECK(xbox_OverlayOpen() && !recomp_restart_requested());
+    press_a();                                                  /* and the same row again does it */
+    CHECK(!xbox_OverlayOpen() && recomp_restart_requested() && SDL_HasEvent(SDL_QUIT));
+    recomp_restart_cancel();                                    /* or this tool would start again */
+    SDL_FlushEvent(SDL_QUIT);
+
+    tap(SDLK_F1);
+    CHECK(xbox_OverlayOpen());
+    CHECK(xbox_OverlayTestSelectRow("Quit game"));
+    run(3);
+    press_a();
+    CHECK(xbox_OverlayOpen() && !SDL_HasEvent(SDL_QUIT));
+    press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);                 /* another page: cancelled */
+    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+    press_a();
+    CHECK(xbox_OverlayOpen() && !SDL_HasEvent(SDL_QUIT));
+    press_a();
+    CHECK(!xbox_OverlayOpen() && SDL_HasEvent(SDL_QUIT) && !recomp_restart_requested());
+    SDL_FlushEvent(SDL_QUIT);
 
     fprintf(stderr, "overlay_shot save and restart rows: %s\n", s_fail ? "FAILED" : "ok");
     xbox_OverlayShutdown();
@@ -935,6 +983,7 @@ int main(int argc, char **argv)
             }
             CHECK(xbox_SettingValue(XS_AUDIO_SPEAKERS) != 2);   /* 5.1 cannot be picked */
         }
+        CHECK(xbox_OverlayTestHasRow("Quit game"));           /* the foot of every page */
         snprintf(path, sizeof path, "%spage%d.bmp", pre, p);
         frame(path);
         if (p == 5) {                                         /* advanced: the bug report */

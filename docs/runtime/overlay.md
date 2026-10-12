@@ -264,9 +264,8 @@ running or read each time it is used.
 
 While a flagged setting differs from its value at launch, or a port asked
 with `xbox_OverlayWantRestart(reason)`, every page has a "Restart game now"
-row above its reset row, with the reason in its note; the Advanced page
-always has "Restart game". Nothing restarts unless the row is picked. The
-row closes the overlay (the settings are written), asks `recomp_restart`
+row above its reset row, with the reason in its note. Nothing restarts
+unless a row is picked. The row closes the overlay (the settings are written), asks `recomp_restart`
 for a restart and closes the window the ordinary way: the program's own
 shutdown runs (motors off, audio closed, logs finished), and its last exit
 handler starts it again with the arguments, directory and environment it
@@ -277,10 +276,28 @@ Windows, through the activity (`restartGame()`) on Android. A port calls
 `recomp_restart_init(argc, argv)` first thing in `main`; without that there
 is no row.
 
+### Restart game and Quit game (the foot of every page)
+
+Every page ends with two rows that stay in view below the page's own rows
+(the rows scroll above them): "Restart game" (the Advanced page's only
+Restart row; with a save import waiting it reads "Restart now (the save is
+imported at the start)") and "Quit game". Both ask first: A (Enter, a click)
+on the row shows "Press A again to restart / quit, B to cancel" in the row
+and its note; the same row again does it. B or Esc, another row or another
+page takes it back. Without `recomp_restart_init` the Restart row is not
+offered; Quit always is.
+
+Quit game closes the overlay (settings written) and posts SDL_QUIT, the same
+event as the window's close button, so the presenter's ordinary way out
+runs: pads stopped, window and audio closed, `exit(0)`. Before that it calls
+`recomp_quit_request` (`src/platform/recomp_restart.h`), whose host hook, set
+by the SDL presenter on Android, calls `Activity.finishAndRemoveTask()`, so
+the task does not stay behind. The Android part is not tested on a device.
+
 ## Save data: export and import
 
 `xbox_OverlaySetSaveIO({save_dir, title_id, export_dir, note})` puts three
-rows on the Advanced page, above the Restart row (the functions are
+rows on the Advanced page, above the reset row (the functions are
 `recomp_save_dir.h`'s; `tests/save_io` covers them on a made tree):
 
 - **Export save to home folder**: copies the title's own save files,

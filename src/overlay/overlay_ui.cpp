@@ -223,11 +223,12 @@ enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER,        /* A_SHADERS on: the build's */
               A_MIXER,                                            /* the Mixer page (overlay_mixer.inc) */
               A_RESTART,                                          /* start the program again (recomp_restart.h) */
-              A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_CANCEL };  /* xbox_OverlaySetSaveIO */
+              A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_CANCEL,  /* xbox_OverlaySetSaveIO */
+              A_RESTART_PIN, A_QUIT };       /* the two rows at the foot of every page: they ask first */
 
 /* The most rows a page has (the Audio page, with the music folder's lines
  * above its settings; the Advanced page with the save and restart rows). */
-#define OVERLAY_ROWS 28
+#define OVERLAY_ROWS 32
 
 /* ── restart (recomp_restart.h) ────────────────────────────────────── */
 
@@ -536,6 +537,7 @@ static void glass_info();
 static int page_rows(int page, Row *r)
 {
     int n = 0;
+    bool staged = false;              /* a save import waits for the next start (Advanced) */
 #define SET(i)  r[n++] = Row{ R_SETTING, (i), 0, NULL }
 #define ACT(a, t) r[n++] = Row{ R_ACTION, XS_COUNT, (a), (t) }
 #define INFO(t) r[n++] = Row{ R_INFO, XS_COUNT, 0, (t) }
@@ -706,7 +708,6 @@ static int page_rows(int page, Row *r)
             ACT(A_REPORT_SHOT, "Create bug report with a screenshot");
         }
         /* Save data: a copy out of the profile, and one back in. */
-        bool staged = false;
         if (s_sio_on) {
             static char imp[160];
             char found[1024];
@@ -725,13 +726,14 @@ static int page_rows(int page, Row *r)
             if (s_sio_info[0])
                 INFO(s_sio_info);
         }
-        /* Always here; on the other pages only while one is wanted. */
-        if (recomp_restart_available())
-            ACT(A_RESTART, staged ? "Restart now (the save is imported at the start)"
-                         : restart_wanted() ? "Restart game now" : "Restart game");
         ACT(A_RESET_ALL, "Reset all settings to the defaults");
         break;
     }
+    /* The foot of every page, kept in view below the page's own rows (the
+     * last two rows; see pin_count). Each asks once more before it acts. */
+    if (recomp_restart_available())
+        ACT(A_RESTART_PIN, staged ? "Restart now (the save is imported at the start)" : "Restart game");
+    ACT(A_QUIT, "Quit game");
 #undef SET
 #undef ACT
 #undef INFO
@@ -960,8 +962,48 @@ static void mx_poll();
 static void mx_ab_toggle();
 static bool s_mx_open;                 /* the Mixer page shows (overlay_mixer.inc) */
 
+/* Restart game and Quit game ask once more: the first A (or click) arms the
+ * row, the same row again does it; B, another row or another page cancels. */
+static int s_confirm;                  /* A_RESTART_PIN, A_QUIT, or 0 */
+
+/* How many rows at the end of the list are the pinned foot. */
+static int pin_count(const Row *r, int n)
+{
+    int k = 0;
+    while (k < n && r[n - 1 - k].kind == R_ACTION
+           && (r[n - 1 - k].action == A_RESTART_PIN || r[n - 1 - k].action == A_QUIT))
+        k++;
+    return k;
+}
+
+static bool pad_hints();
+
+static const char *confirm_text(int action)
+{
+    const bool pad = pad_hints();
+    return action == A_QUIT
+        ? (pad ? "Press A again to quit, B to cancel" : "Press Enter again to quit, Esc to cancel")
+        : (pad ? "Press A again to restart, B to cancel" : "Press Enter again to restart, Esc to cancel");
+}
+
+static void quit_now();
+
 static void activate(const Row &r)
 {
+    if (s_confirm && !(r.kind == R_ACTION && r.action == s_confirm))
+        s_confirm = 0;
+    if (r.kind == R_ACTION && (r.action == A_RESTART_PIN || r.action == A_QUIT)) {
+        if (s_confirm != r.action) {
+            s_confirm = r.action;
+            return;
+        }
+        s_confirm = 0;
+        if (r.action == A_QUIT)
+            quit_now();
+        else
+            restart_now();
+        return;
+    }
     if (r.kind == R_ACTION && r.action == A_MIXER) {
         mx_open();
         return;
@@ -1066,6 +1108,7 @@ static void clear_nav()
     memset(s_key, 0, sizeof s_key);
     memset(s_steps, 0, sizeof s_steps);
     s_activate = s_back = s_page_delta = s_reset = 0;
+    s_confirm = 0;
 }
 
 /* The title is paused while the overlay is open, except on the Mixer page:
@@ -1152,6 +1195,21 @@ static void restart_now()
     restart_reason(why, sizeof why);
     set_open(false);
     recomp_restart_request(why[0] ? why : "the overlay's Restart game");
+    memset(&q, 0, sizeof q);
+    q.type = SDL_QUIT;
+    SDL_PushEvent(&q);
+}
+
+/* Quit game: as closing the window. The overlay closes (the settings are
+ * written), then SDL_QUIT takes the window layer's ordinary way out: pads
+ * stopped, the window and audio closed, exit(0). On Android the host's hook
+ * also finishes the activity (recomp_quit_request). */
+static void quit_now()
+{
+    SDL_Event q;
+
+    set_open(false);
+    recomp_quit_request("the overlay's Quit game");
     memset(&q, 0, sizeof q);
     q.type = SDL_QUIT;
     SDL_PushEvent(&q);
@@ -1480,7 +1538,9 @@ void xbox_OverlayPoll(void)
     pause_sync();
     if (s_back > 0) {
         s_back = 0;
-        if (s_open && s_mx_open) {
+        if (s_open && s_confirm) {
+            s_confirm = 0;                /* B takes back a Restart / Quit question */
+        } else if (s_open && s_mx_open) {
             mx_back();
         } else if (s_open && xsb_is_open()) {
             /* In the folder browser: one level up, then back to the page. */
@@ -2040,6 +2100,12 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     }
     if (r.kind == R_ACTION) {
         dl->AddText(ImVec2(p.x + fs * 0.8f, ty), col(T->action), r.text);
+        if (s_confirm && r.action == s_confirm) {
+            /* Restart / Quit, asked once more: the question in the row's note. */
+            const char *q = confirm_text(r.action);
+            float tw = ImGui::CalcTextSize(q).x;
+            dl->AddText(ImVec2(p.x + width - fs * 0.8f - tw, ty), col(T->warn), q);
+        }
         return;
     }
     if (r.kind == R_FOLDER) {
@@ -2335,6 +2401,8 @@ static void build_pages(float fs)
     while (s_steps[D_UP]-- > 0) move(-1);
     while (s_steps[D_DOWN]-- > 0) move(1);
     s_steps[D_UP] = s_steps[D_DOWN] = 0;
+    if (s_confirm && !(rows[sel].kind == R_ACTION && rows[sel].action == s_confirm))
+        s_confirm = 0;                    /* moved off the row that was asked */
     if (rows[sel].kind == R_SETTING) {
         while (s_steps[D_LEFT]-- > 0) adjust(rows[sel].id, -1);
         while (s_steps[D_RIGHT]-- > 0) adjust(rows[sel].id, 1);
@@ -2409,11 +2477,19 @@ static void build_pages(float fs)
               " nothing changes under the running game.";
         snprintf(hint, sizeof hint, "%s%s%s %s. %s", s_sio_msg, s_sio_msg[0] ? "  |  " : "", what,
                  s_sio_dest, then);
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_RESTART) {
+    } else if (rows[sel].kind == R_ACTION
+               && (rows[sel].action == A_RESTART || rows[sel].action == A_RESTART_PIN)) {
         char why[400];
         restart_reason(why, sizeof why);
-        snprintf(hint, sizeof hint, "%s%sThe game closes and starts again by itself, with the same options."
-                 " What was not saved by the game is lost, as when quitting.", why, why[0] ? " " : "");
+        snprintf(hint, sizeof hint, "%s%s%s%sThe game closes and starts again by itself, with the same options."
+                 " What was not saved by the game is lost, as when quitting.",
+                 rows[sel].action == A_RESTART_PIN && s_confirm == A_RESTART_PIN ? confirm_text(A_RESTART_PIN) : "",
+                 rows[sel].action == A_RESTART_PIN && s_confirm == A_RESTART_PIN ? ".  " : "",
+                 why, why[0] ? " " : "");
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_QUIT) {
+        snprintf(hint, sizeof hint, "%s%sCloses the game the way closing its window does: the settings are saved"
+                 " and the game ends. What was not saved by the game is lost.",
+                 s_confirm == A_QUIT ? confirm_text(A_QUIT) : "", s_confirm == A_QUIT ? ".  " : "");
     } else if (rows[sel].kind == R_SPEAKERS) {
         spk_hint(rows[sel].action, hint, sizeof hint);
     } else if (rows[sel].kind == R_FOLDER) {
@@ -2454,19 +2530,21 @@ static void build_pages(float fs)
     }
     const float wrap_w = ImGui::GetContentRegionAvail().x;
     const float hint_h = hint[0] ? ImGui::CalcTextSize(hint, nullptr, false, wrap_w).y : fs;
-    const float footer = fs * 0.5f + hint_h + fs * 2.9f;
     const float rh = fs * 2.0f;
+    const int pins = pin_count(rows, n);   /* Restart game, Quit game: below the scrolling rows */
+    const float footer = fs * 0.5f + hint_h + fs * 2.9f + (pins ? pins * rh + fs * 0.4f : 0.0f);
     ImVec2 avail = ImGui::GetContentRegionAvail();
     ImGui::BeginChild("rows", ImVec2(avail.x, avail.y - footer), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoNav);
     ImDrawList *cdl = ImGui::GetWindowDrawList();
     const float rw = ImGui::GetContentRegionAvail().x - fs * 0.5f;
-    for (int i = 0; i < n; i++) {
+    auto rows_run = [&](int from, int to, ImDrawList *rdl) {
+    for (int i = from; i < to; i++) {
         bool clicked, hov;
         int cdir;
         double drag = -1;
         ImVec2 y0 = ImGui::GetCursorScreenPos();
-        draw_row(rows[i], i, i == sel, rw, rh, fs, cdl, &clicked, &cdir, &hov, &drag);
+        draw_row(rows[i], i, i == sel, rw, rh, fs, rdl, &clicked, &cdir, &hov, &drag);
         if (hov && selectable(rows[i]) && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
             sel = i;
             s_last_input_pad = false;
@@ -2505,7 +2583,18 @@ static void build_pages(float fs)
         }
         (void)y0;
     }
+    };
+    rows_run(0, n - pins, cdl);
     ImGui::EndChild();
+    if (pins) {
+        /* The foot of the page, always in view. */
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        dl->AddLine(ImVec2(p.x, p.y + fs * 0.1f), ImVec2(p.x + avail.x, p.y + fs * 0.1f), col(T->rule));
+        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + fs * 0.2f));
+        ImGui::PushID("foot");
+        rows_run(n - pins, n, dl);
+        ImGui::PopID();
+    }
 
     {
         ImVec2 p = ImGui::GetCursorScreenPos();
@@ -2535,6 +2624,7 @@ static void build_pages(float fs)
     if (s_page_delta) {
         s_page = (s_page + (s_page_delta > 0 ? 1 : -1) + P_COUNT) % P_COUNT;
         s_page_delta = 0;
+        s_confirm = 0;
         s_scroll_to_sel = true;
     }
 }

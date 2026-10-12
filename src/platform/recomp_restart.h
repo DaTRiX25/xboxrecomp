@@ -52,6 +52,14 @@ void recomp_restart_cancel(void);
 /* A host whose restart is not an exec (Android: the activity). */
 void recomp_restart_set_hook(void (*fn)(void));
 
+/* Quit for good (the overlay's "Quit game"): the caller closes the window the
+ * ordinary way (an SDL_QUIT event: settings written, pads stopped, the
+ * window layer's own wait for the saves, then exit(0)). This only runs the
+ * host's hook first, if it has one: on Android the activity is finished, so
+ * the task does not stay behind in the recents or come back on its own. */
+void recomp_quit_set_hook(void (*fn)(void));
+void recomp_quit_request(const char *why);
+
 /* Tests: what would be started. Pointers into the module's copies; envp is
  * NULL-terminated "NAME=value" strings. */
 void recomp_restart_snapshot(int *argc, char ***argv, char ***envp, const char **cwd);
