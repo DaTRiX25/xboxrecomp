@@ -66,6 +66,30 @@ freed when none does), so switching live costs nothing while it is off.
 tile-based GPU such as MoltenVK's does not give meaningfully). The
 `aa_cycle=<s>` form of `RECOMP_OVERLAY` steps the setting for such a test.
 
+## LOD bias and dither (both off by default)
+
+`graphics.lod_bias` adds a mip LOD bias to every mipmapped texture, on top of
+the title's own (SET_TEXTURE_FILTER's bias field). It is added to the per-draw
+`tex_bias` constant that both backends hand the pixel shader (Metal's
+`bias()`, GLSL's `texture(..., bias)`), because Metal has no sampler-state LOD
+bias; so it composes with the title's bias by plain addition and with
+anisotropic filtering as any shader bias does (the sampler's anisotropy and
+min/max LOD clamps act on the biased level). A stage that is not mipmapped
+gets none. `off` (default) adds exactly 0.0: the picture is the one it was.
+`auto` is -log2(render scale) / 2: -0.5 at 2x, -1.0 at 4x (about -0.29 at
+1.5x), 0 at 1x; `-0.5`, `-1`, `-1.5` are explicit. The environment takes any
+number: `RECOMP_GFX_LOD_BIAS=-0.75`. Metal and Vulkan share the code
+(`nv2a_host_lod_bias`); the Vulkan side has not been run.
+
+`graphics.dither` adds interleaved gradient noise (Jimenez 2014) of just
+under +-0.5 LSB to the Metal presenter's scale to the window, the last step
+before the 8-bit drawable. A texel that is already an exact 8-bit value
+(1:1 text, flat colour) rounds back to itself, so only filtered, in-between
+values move by one level at most. The source frame is itself 8-bit, so the
+gain is at the edges of its bands when the frame is scaled to the window.
+Off (default) skips the branch. The Vulkan presenter ends in `vkCmdBlitImage`
+and has no such pass yet; the row is shown on macOS only.
+
 ## Settings
 
 Each is one RECOMP_* knob. Precedence, high to low: the environment, then
@@ -96,6 +120,8 @@ title's defaults when those change. Keys it does not know are kept.
 | `graphics.aniso` (`off`, `2x` .. `16x`) | `RECOMP_GFX_ANISO` | yes (the sampler caches key on the level) |
 | `graphics.aa` (`off`, `fxaa`, `smaa`) | `RECOMP_GFX_AA` | yes |
 | `graphics.sharpen` (0..1) | `RECOMP_GFX_SHARPEN` | yes |
+| `graphics.lod_bias` (`off`, `auto`, `-0.5`, `-1`, `-1.5`) | `RECOMP_GFX_LOD_BIAS` (`0`, `auto` or a number) | yes (a per-draw constant) |
+| `graphics.dither` (bool) | `RECOMP_GFX_DITHER` | yes; Metal only |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |
 | `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins |

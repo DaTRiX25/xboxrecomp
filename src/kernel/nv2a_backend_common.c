@@ -5,6 +5,7 @@
 #include "nv2a_backend_common.h"
 #include "recomp_env.h"
 
+#include <math.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -683,6 +684,59 @@ float nv2a_host_sharpen(void)
 void nv2a_host_set_sharpen(float strength)
 {
     s_sharpen = strength < 0.0f ? 0.0f : strength > 1.0f ? 1.0f : strength;
+}
+
+static volatile int s_lod_mode = -1;        /* -1: not read yet */
+static volatile float s_lod_value;
+
+static void lod_read(void)
+{
+    const char *e = recomp_env(RENV_GFX_LOD_BIAS);
+    s_lod_value = 0.0f;
+    if (e && !strcmp(e, "auto")) {
+        s_lod_mode = NV2A_LOD_AUTO;
+    } else if (e && *e && atof(e) != 0.0) {
+        float v = (float)atof(e);
+        s_lod_value = v < -4.0f ? -4.0f : v > 4.0f ? 4.0f : v;
+        s_lod_mode = NV2A_LOD_VALUE;
+    } else {
+        s_lod_mode = NV2A_LOD_OFF;
+    }
+}
+
+float nv2a_host_lod_bias(void)
+{
+    if (s_lod_mode < 0)
+        lod_read();
+    if (s_lod_mode == NV2A_LOD_AUTO) {
+        /* x2 is the scale in halves (1.5x is 3), so 2 / x2 is 1 / scale. */
+        unsigned x2 = nv2a_host_render_scale_x2();
+        return x2 > 2 ? -0.5f * log2f((float)x2 * 0.5f) : 0.0f;
+    }
+    return s_lod_mode == NV2A_LOD_VALUE ? s_lod_value : 0.0f;
+}
+
+void nv2a_host_set_lod_bias(int mode, float value)
+{
+    s_lod_value = value < -4.0f ? -4.0f : value > 4.0f ? 4.0f : value;
+    s_lod_mode = mode == NV2A_LOD_AUTO ? NV2A_LOD_AUTO
+               : mode == NV2A_LOD_VALUE ? NV2A_LOD_VALUE : NV2A_LOD_OFF;
+}
+
+static volatile int s_dither = -1;          /* -1: not read yet */
+
+int nv2a_host_dither(void)
+{
+    if (s_dither < 0) {
+        const char *e = recomp_env(RENV_GFX_DITHER);
+        s_dither = e && *e && strcmp(e, "0") && strcmp(e, "off") ? 1 : 0;
+    }
+    return s_dither;
+}
+
+void nv2a_host_set_dither(int on)
+{
+    s_dither = on ? 1 : 0;
 }
 
 unsigned nv2a_host_render_scale(void)
