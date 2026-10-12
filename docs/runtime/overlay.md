@@ -248,6 +248,74 @@ locks the row. The choice is one table, `k_stock_hidden` in
 again); `xbox_PowerModeAtLoad(host, stored)` is the rule, testable per host
 (`tests/overlay_settings`).
 
+## Restart
+
+Some settings are read once, when the game starts. The table in
+`xbox_settings.c` says which with a flag, `XS_RESTART`, and that flag is the
+only list: the row's "(restart)" mark and note, `xbox_SettingsNeedRestart`
+and the Restart row all read it (the `overlay_settings` test names the
+flagged ones, so adding a setting means deciding). Flagged today:
+`display.aspect` (the dashboard bit the title reads at boot),
+`graphics.render_scale` (render targets are made at start),
+`audio.speakers` (the title picks its mix, and the device is opened, at
+start), on Android `input.vibration`. Everything else is applied while
+running or read each time it is used.
+
+While a flagged setting differs from its value at launch, or a port asked
+with `xbox_OverlayWantRestart(reason)`, every page has a "Restart game now"
+row above its reset row, with the reason in its note; the Advanced page
+always has "Restart game". Nothing restarts unless the row is picked. The
+row closes the overlay (the settings are written), asks `recomp_restart`
+for a restart and closes the window the ordinary way: the program's own
+shutdown runs (motors off, audio closed, logs finished), and its last exit
+handler starts it again with the arguments, directory and environment it
+was first given (`src/platform/recomp_restart.h`): in place on Linux and
+macOS (the same process id, so Steam, a launcher script, an AppImage's
+runtime or a Mac bundle see one program throughout), as a new process on
+Windows, through the activity (`restartGame()`) on Android. A port calls
+`recomp_restart_init(argc, argv)` first thing in `main`; without that there
+is no row.
+
+## Save data: export and import
+
+`xbox_OverlaySetSaveIO({save_dir, title_id, export_dir, note})` puts three
+rows on the Advanced page, above the Restart row (the functions are
+`recomp_save_dir.h`'s; `tests/save_io` covers them on a made tree):
+
+- **Export save to home folder**: copies the title's own save files,
+  `UDATA/<title id>` and `TDATA/<title id>` of the save root, unchanged, to
+  `<export_dir>/<YYYYMMDD-HHMMSS>/`, with a `save-export.txt` naming the
+  title. Nothing else of the save root goes along. The full path is shown.
+  The layout under the save root is the same on every host, so the dated
+  folder can be carried to another machine's folder of the same name.
+- **Import save from home folder (newest: ...)**: the newest export of this
+  title in `export_dir`.
+- **Import save from another folder...**: the folder browser (the music
+  folder's, opened with other words: `xsb_open_with`), starting on "Exported
+  saves", each folder marked when it is a save of this title.
+
+An import never touches the save under the running title (the title holds
+its save in memory and writes it back when it saves). The folder is checked
+(it has `UDATA/<title id>` with files; its `save-export.txt`, if any, names
+this title) and noted in the save root; the rows become "Cancel the import"
+and "Restart now (the save is imported at the start)". At the next start the
+port calls `recomp_save_import_apply` before anything else looks at the save
+root: the save in use is copied to
+`<save root>/save-before-import/<date-time>/` (a folder of its own, which
+the start-up backups' rotation never deletes), then replaced; if the copy
+fails the old save is put back. The result is in the log (`[SAVE] Imported
+the save from ...`) and under the rows for that run.
+
+Messages, not silence: nothing to export yet, no export found, the target
+cannot be written, not a save of this game, a save of another game.
+
+Android: `export_dir` is in the app's own external files folder
+(`/storage/emulated/0/Android/data/<package>/files/...`), the one place an
+app writes without a permission; the row shows the full path. It is reached
+over USB and by some file managers, not by all on Android 11 and later. A
+place every file manager reaches (Download, Documents) needs the storage
+access framework or a zip through MediaStore: not built.
+
 ## Text and fonts
 
 Every string the overlay draws is UTF-8: its own labels and hints, a port's

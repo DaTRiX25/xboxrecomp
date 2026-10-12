@@ -88,6 +88,7 @@
 
 #include <SDL.h>
 #include "recomp_env.h"
+#include "recomp_restart.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -703,6 +704,36 @@ void fbv_android_surface_gone(void);
  * 0 asks, 1 chooses the driver in the app and starts the app again); an
  * activity without that method gets the plain warning. Returns 1 when the
  * window with the choice was shown. */
+/* recomp_restart.h on Android: the activity starts the app again (int
+ * restartGame(): the same path as its driver reset, a page in another
+ * process that starts the game once this process is gone). An activity
+ * without the method: nothing happens, and the log says so. */
+static void android_restart(void)
+{
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    jobject act = env ? (jobject)SDL_AndroidGetActivity() : NULL;
+    jclass cls;
+    jmethodID m;
+
+    if (!act)
+        return;
+    cls = (*env)->GetObjectClass(env, act);
+    m = (*env)->GetMethodID(env, cls, "restartGame", "()I");
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        m = NULL;
+    }
+    if (m) {
+        (*env)->CallIntMethod(env, act, m);
+        if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+    } else {
+        fprintf(stderr, "[RESTART] this app's activity has no restartGame(): not restarted\n");
+    }
+    (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, act);
+}
+
 static int android_offer_driver_reset(const char *msg)
 {
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
@@ -907,6 +938,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     int filter = eo->present_filter;
     SDL_Rect dst;                /* integer: where the frame goes */
     int dst_ok = 0, out_w = 0, out_h = 0;
+
+#if defined(__ANDROID__)
+    /* A restart is the activity's to do (recomp_restart.h). */
+    recomp_restart_set_hook(android_restart);
+#endif
 
     /* Ctrl-C and SIGTERM keep their default meaning (benches rely on it);
      * SDL would turn them into SDL_QUIT. Set before the headless return:

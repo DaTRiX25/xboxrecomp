@@ -47,6 +47,12 @@ static pthread_t s_thread;
 #endif
 static int       s_thread_on;
 
+/* What this opening of the browser is for (xsb_open_with). */
+static char      s_use_label[80] = "Use this folder";
+static char      s_off_label[80] = "Turn custom music off";
+static char      s_top_label[80], s_top_path[1024];
+static int     (*s_mark)(const char *dir);
+
 static const char *s_test_home;
 static const char *const *s_test_media;
 static int       s_test_roots;
@@ -229,7 +235,9 @@ static void *count_thread(void *arg)
             nap();
             continue;
         }
-        n = count_tree(path, 0, &budget, gen);
+        /* Music: the playable files in and below it. Another purpose: its
+         * own yes or no for the folder itself. */
+        n = s_mark ? (s_mark(path) ? 1 : 0) : count_tree(path, 0, &budget, gen);
         LOCK();
         if (gen == s_gen && found < s_n) {
             s_rows[found].songs = n;
@@ -303,10 +311,13 @@ static void list_places(void)
     s_n = 0;
     s_dir[0] = s_root[0] = 0;
     if (s_current[0]) {
-        add_row(XSB_OFF, "Turn custom music off", "");
+        if (s_off_label[0])
+            add_row(XSB_OFF, s_off_label, "");
         snprintf(label, sizeof label, "Current folder: %s", leaf(s_current));
         add_row(XSB_PLACE, label, s_current);
     }
+    if (s_top_path[0])
+        add_row(XSB_PLACE, s_top_label, s_top_path);
     if (s_test_roots) {
         home = s_test_home;
     } else {
@@ -404,7 +415,7 @@ static int list_folder(const char *dir)
     s_n = 0;
     snprintf(path, sizeof path, "%s", dir);
     snprintf(s_dir, sizeof s_dir, "%s", path);
-    add_row(XSB_USE, "Use this folder", s_dir);
+    add_row(XSB_USE, s_use_label, s_dir);
     add_row(XSB_UP, "..", "");
     for (i = 0; i < dirs.n; i++) {
         join(path, sizeof path, s_dir, dirs.v[i]);
@@ -416,6 +427,8 @@ static int list_folder(const char *dir)
 
 /* ── the interface ─────────────────────────────────────────────────── */
 
+static void xsb_open_places(const char *current);
+
 void xsb_set_roots(const char *home, const char *const *media_roots)
 {
     s_test_home = home;
@@ -423,7 +436,27 @@ void xsb_set_roots(const char *home, const char *const *media_roots)
     s_test_roots = home || media_roots;
 }
 
+void xsb_open_with(const xsb_options *o)
+{
+    xsb_close();
+    snprintf(s_use_label, sizeof s_use_label, "%s", o && o->use_label ? o->use_label : "Use this folder");
+    snprintf(s_off_label, sizeof s_off_label, "%s", o && o->off_label ? o->off_label : "");
+    snprintf(s_top_label, sizeof s_top_label, "%s", o && o->top_label ? o->top_label : "");
+    snprintf(s_top_path, sizeof s_top_path, "%s", o && o->top_path ? o->top_path : "");
+    s_mark = o ? o->mark : NULL;
+    xsb_open_places(o ? o->current : NULL);
+}
+
 void xsb_open(const char *current)
+{
+    xsb_options o;
+    memset(&o, 0, sizeof o);
+    o.current = current;
+    o.off_label = "Turn custom music off";
+    xsb_open_with(&o);
+}
+
+static void xsb_open_places(const char *current)
 {
     if (!s_mu_ready) {
 #if defined(_WIN32)

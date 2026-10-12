@@ -165,6 +165,18 @@ typedef enum { XSB_NOTHING, XSB_MOVED, XSB_CHOSEN, XSB_TURNED_OFF, XSB_CLOSED } 
 
 /* Open on the places; `current` is the folder in use ("" or NULL: none). */
 void xsb_open(const char *current);
+/* The same browser for another purpose than the music folder (a save to
+ * import): its own words, a place of its own at the top, and in the place
+ * of the song counts a yes or no of its own for each folder (`mark`, called
+ * on the browser's thread; a row's `songs` is then 1 or 0). NULL fields:
+ * "Use this folder", no "turn off" row, no extra place, song counts. */
+typedef struct xsb_options {
+    const char *current;
+    const char *use_label, *off_label;
+    const char *top_label, *top_path;
+    int (*mark)(const char *dir);
+} xsb_options;
+void xsb_open_with(const xsb_options *o);
 void xsb_close(void);
 int  xsb_is_open(void);
 int  xsb_rows(void);
