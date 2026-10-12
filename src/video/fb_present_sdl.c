@@ -734,6 +734,36 @@ static void android_restart(void)
     (*env)->DeleteLocalRef(env, act);
 }
 
+/* recomp_quit_request (the overlay's Quit game) on Android: the activity is
+ * finished and its task removed, so the app is closed and does not stay in
+ * the recents. The window is closed the ordinary way right after (the
+ * SDL_QUIT the overlay posts), which ends the process. Activity.
+ * finishAndRemoveTask() is the platform's (API 21): no method of the app's
+ * own is needed. Untested on a device. */
+static void android_quit(void)
+{
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    jobject act = env ? (jobject)SDL_AndroidGetActivity() : NULL;
+    jclass cls;
+    jmethodID m;
+
+    if (!act)
+        return;
+    cls = (*env)->GetObjectClass(env, act);
+    m = (*env)->GetMethodID(env, cls, "finishAndRemoveTask", "()V");
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        m = NULL;
+    }
+    if (m) {
+        (*env)->CallVoidMethod(env, act, m);
+        if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+    }
+    (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, act);
+}
+
 static int android_offer_driver_reset(const char *msg)
 {
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
@@ -942,6 +972,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
 #if defined(__ANDROID__)
     /* A restart is the activity's to do (recomp_restart.h). */
     recomp_restart_set_hook(android_restart);
+    recomp_quit_set_hook(android_quit);
 #endif
 
     /* Ctrl-C and SIGTERM keep their default meaning (benches rely on it);

@@ -192,6 +192,20 @@ void recomp_restart_cancel(void)
     s_requested = 0;
 }
 
+static void (*s_quit_hook)(void);
+
+void recomp_quit_set_hook(void (*fn)(void))
+{
+    s_quit_hook = fn;
+}
+
+void recomp_quit_request(const char *why)
+{
+    fprintf(stderr, "[QUIT] asked for: %s\n", why && *why ? why : "(no reason given)");
+    if (s_quit_hook)
+        s_quit_hook();
+}
+
 void recomp_restart_snapshot(int *argc, char ***argv, char ***envp, const char **cwd)
 {
     if (argc) *argc = s_argc;
