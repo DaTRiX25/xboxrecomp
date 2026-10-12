@@ -29,9 +29,13 @@
  * reverb; it is what the stereo path has always done with it.
  *
  * Which speaker an FX send ends up on is the title's: its effects image
- * routes each send through its own chain to a speaker. A title that mixes
- * its 5.1 sounds into sends (Burnout 3 does) hands its routing to
- * mcpx_apu_set_speaker_map; the map is data, read off the title's image.
+ * routes each send through its own chain to a speaker, with a gain and a
+ * sign, and may take a send to no speaker at all (a bin that only feeds an
+ * in-place effect whose output the title plays back through a voice). A
+ * map of bin to speaker cannot say that: a title that mixes its 5.1 sounds
+ * into sends (Burnout 3 does) wires a model of its image instead
+ * (apu_gp.h), and the map here is then the model's routing. A title
+ * without one may still hand a plain map to mcpx_apu_set_speaker_map.
  */
 #include "apu_speakers.h"
 

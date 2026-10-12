@@ -5,13 +5,12 @@
  * processing (reverb, chorus, etc.) and final output encoding. The full
  * DSP is ~3000 lines of DSP56300 emulation code.
  *
- * For initial audio, we bypass the DSP entirely:
- * - VP mixbins are passed directly to the EP output
- * - GP effects processing is skipped
- * - The EP just copies mixbin 0/1 (front L/R) to the monitor buffer
- *
- * This gives us basic voice playback without effects. The DSP can be
- * connected later for reverb, EQ, and other processing.
+ * No DSP56300 runs here. The mixbins reach the output one of two ways:
+ * - a title that wired a model of its GP effects image (apu_gp.h): the
+ *   model's six speaker feeds, with its sends, in-place effects and the
+ *   export its return voices play
+ * - any other title: every bin folded to a speaker with the effects
+ *   bypassed (apu_speakers.c in 5.1, even/odd bins in stereo)
  *
  * Copyright (c) 2012 espes
  * Copyright (c) 2019-2025 Matt Borgerson

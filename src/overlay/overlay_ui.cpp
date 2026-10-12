@@ -34,6 +34,7 @@
 #include "kernel_pause.h"
 #include "apu.h"                /* the speaker test */
 #include "apu_bus.h"            /* the Mixer page */
+#include "apu_gp.h"             /* is the title's effects image modelled */
 #include "xbox_soundtrack.h"    /* the music folder browser's model (xsb_*) */
 
 #include <math.h>
@@ -431,7 +432,10 @@ static int page_rows(int page, Row *r)
         break;
     case P_AUDIO:
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
-        SET(XS_AUDIO_FX_LEVEL);
+        /* The dry effect sends' level: only where no model of the title's
+         * effects image runs (apu_gp.h); with one they are not dry. */
+        if (!apu_gp_wired())
+            SET(XS_AUDIO_FX_LEVEL);
         if (apu_bus_count() > 0)
             ACT(A_MIXER, "Mixer: buses, sends, LFE, limiter, meters");
         SPK(0, "Speaker test, game mix");
