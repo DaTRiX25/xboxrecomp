@@ -231,7 +231,11 @@ static void test_scan_and_db(void)
     mkdir(in_work("lib/B album"), 0755);
     mkdir(in_work("lib/a first"), 0755);
     mkdir(in_work("lib/a second"), 0755);
-    mkdir(in_work("lib/a first/too deep"), 0755);       /* one level only: not read */
+    /* An album layout: counted into "a first", not soundtracks of their own;
+     * three levels below "a first" is not read. */
+    mkdir(in_work("lib/a first/album"), 0755);
+    mkdir(in_work("lib/a first/album/disc 1"), 0755);
+    mkdir(in_work("lib/a first/album/disc 1/too deep"), 0755);
     mkdir(in_work("elsewhere"), 0755);
     mkdir(in_work("lib/empty"), 0755);
     mkdir(in_work("lib/.hidden"), 0755);
@@ -244,7 +248,9 @@ static void test_scan_and_db(void)
     fixture("tone_id3v23.mp3", "lib/a first/01.mp3");
     fixture("tone.flac", "lib/a first/02.flac");
     fixture("tone48.ogg", "lib/a second/a.ogg");
-    write_wav(in_work("lib/a first/too deep/deep.wav"), 44100, 1, 440, 200);
+    write_wav(in_work("lib/a first/album/1 in album.wav"), 44100, 1, 440, 200);
+    write_wav(in_work("lib/a first/album/disc 1/1 on disc.wav"), 44100, 1, 440, 200);
+    write_wav(in_work("lib/a first/album/disc 1/too deep/deep.wav"), 44100, 1, 440, 200);
     write_wav(in_work("elsewhere/linked.wav"), 44100, 1, 440, 200);
 #if !defined(_WIN32)
     /* A folder that is a link is not followed (a link to / would be the
@@ -262,7 +268,10 @@ static void test_scan_and_db(void)
     if (!lib)
         return;
     CHECK("four soundtracks", lib->n_st == 4);
-    CHECK("songs (none from too deep, none through the link)", lib->n_songs == 2 + 2 + 1 + 14);
+    CHECK("songs (none from too deep, none through the link)", lib->n_songs == 2 + 4 + 1 + 14);
+    CHECK("the album and its disc counted into 'a first', in order",
+          lib->st[1].count == 4 && name_is(lib->songs[4].name, "1 in album")
+          && name_is(lib->songs[5].name, "1 on disc"));
     CHECK("the whole folder was read", !lib->budget_hit);
     CHECK("the broken file is counted", lib->bad_files == 1);
     /* The folder itself first, then its folders in natural order, each
@@ -279,13 +288,13 @@ static void test_scan_and_db(void)
     CHECK("id3 title", lib->songs[2].name[0] == 0xC1 && lib->songs[2].name[6] == 0xFC
                        && lib->songs[2].name[9] == ' ');
     CHECK("flac title", name_is(lib->songs[3].name, "Flac Title"));
-    CHECK("ogg title", name_is(lib->songs[4].name, "Ogg Title"));
+    CHECK("ogg title", name_is(lib->songs[6].name, "Ogg Title"));
     CHECK("mp3 length about 0.5 s", lib->songs[2].ms > 400 && lib->songs[2].ms < 650);
     CHECK("flac length", lib->songs[3].ms == 500);
-    CHECK("ogg length", lib->songs[4].ms >= 495 && lib->songs[4].ms <= 505);
+    CHECK("ogg length", lib->songs[6].ms >= 495 && lib->songs[6].ms <= 505);
     CHECK("song ids", lib->songs[0].id == 0x00010000 && lib->songs[1].id == 0x00010001
-                      && lib->songs[5].id == 0x00040000);
-    CHECK("by id", xst_song_by_id(lib, 0x00040003) == &lib->songs[5 + 3]);
+                      && lib->songs[5].id == 0x00020003 && lib->songs[7].id == 0x00040000);
+    CHECK("by id", xst_song_by_id(lib, 0x00040003) == &lib->songs[7 + 3]);
     CHECK("no such song", !xst_song_by_id(lib, 0x00040010) && !xst_song_by_id(lib, 0x00000000)
                           && !xst_song_by_id(lib, 0x00050000));
 
@@ -547,7 +556,7 @@ static void test_browse(void)
     CHECK("on the places", where[0] == 0);
     wait_counts();
     /* By name: the broken .flac counts here, a scan leaves it out. */
-    CHECK("songs under the current folder", xsb_row_at(1, &r) && r.songs == 20 && !r.more);
+    CHECK("songs under the current folder", xsb_row_at(1, &r) && r.songs == 22 && !r.more);
     CHECK("songs under Music", xsb_row_at(2, &r) && r.songs == 3);
     CHECK("an empty card", xsb_row_at(4, &r) && r.songs == 0);
 
