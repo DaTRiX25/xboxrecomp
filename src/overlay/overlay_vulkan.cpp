@@ -47,7 +47,7 @@ extern "C" void xbox_OverlayVulkanDraw(const struct nvk_core *core, VkCommandBuf
         ii.Device = core->dev;
         ii.QueueFamily = core->qfam;
         ii.Queue = core->queue;
-        ii.DescriptorPoolSize = 16;
+        ii.DescriptorPoolSize = 32;
         ii.MinImageCount = 2;
         ii.ImageCount = s_images;
         ii.UseDynamicRendering = true;

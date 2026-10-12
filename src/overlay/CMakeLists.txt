@@ -2,6 +2,7 @@
 #   xbox_settings.c        the settings, settings.toml, the precedence (no ImGui)
 #   overlay_ui.cpp    hotkeys, pause, input routing, the pages, the graph
 #   overlay_gamefont.cpp the title's bitmap fonts from the player's executable
+#   overlay_gameart.cpp  the title's menu sprites and button prompts, from the player's data
 #   overlay_metal.mm  the Metal renderer glue (macOS)
 #   overlay_vulkan.cpp the Vulkan renderer glue
 # Dear ImGui is vendored in third_party/imgui (see VENDORED.txt): the core and
@@ -17,6 +18,7 @@ add_library(xbox_overlay STATIC
     xbox_settings_report.c
     overlay_ui.cpp
     overlay_gamefont.cpp
+    overlay_gameart.cpp
     xbox_update.c
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
@@ -77,7 +79,7 @@ endif()
 if(NOT MSVC)
     # The vendored files are built as they are; the glue is held to the
     # runtime's own warnings.
-    set_source_files_properties(xbox_settings.c xbox_settings_report.c overlay_ui.cpp overlay_gamefont.cpp overlay_vulkan.cpp xbox_update.c
+    set_source_files_properties(xbox_settings.c xbox_settings_report.c overlay_ui.cpp overlay_gamefont.cpp overlay_gameart.cpp overlay_vulkan.cpp xbox_update.c
         PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
     if(APPLE)
         set_source_files_properties(overlay_metal.mm
