@@ -317,12 +317,74 @@ static int exists(const char *p)
 #endif
 }
 
+/* A real folder, not a link to one: the old name left behind as a link
+ * (off Windows) is not a folder waiting to be moved. */
+static int is_real_dir(const char *p)
+{
+#if defined(_WIN32)
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)
+        && !(a & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+    struct stat st;
+    return lstat(p, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+/* A folder with no file anywhere under it: empty, or only empty folders
+ * (a cache folder made inside it by something that asked where it is). */
+static int hollow_entry(const char *dir, const char *name, int dir_entry, void *ctx);
+
+static int is_hollow_dir(const char *p)
+{
+    return is_real_dir(p) && for_each(p, hollow_entry, NULL);
+}
+
+static int hollow_entry(const char *dir, const char *name, int dir_entry, void *ctx)
+{
+    char p[RS_PATH];
+    (void)ctx;
+    if (!dir_entry)
+        return 0;                       /* a file: not hollow */
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return is_hollow_dir(p);            /* a link to a folder is not */
+}
+
+static int remove_hollow_entry(const char *dir, const char *name, int dir_entry, void *ctx);
+
+/* Only ever folders, and only empty ones: a file that turns up stops it. */
+static int remove_hollow_dir(const char *p)
+{
+    if (!for_each(p, remove_hollow_entry, NULL))
+        return 0;
+#if defined(_WIN32)
+    return RemoveDirectoryA(p) != 0;
+#else
+    return rmdir(p) == 0;
+#endif
+}
+
+static int remove_hollow_entry(const char *dir, const char *name, int dir_entry, void *ctx)
+{
+    char p[RS_PATH];
+    (void)ctx;
+    if (!dir_entry)
+        return 0;
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return is_real_dir(p) && remove_hollow_dir(p);
+}
+
+int recomp_dir_migrate_pending(const char *old_dir, const char *new_dir)
+{
+    return is_real_dir(old_dir) && (!exists(new_dir) || is_hollow_dir(new_dir));
+}
+
 int recomp_dir_migrate(const char *old_dir, const char *new_dir)
 {
     char parent[RS_PATH];
     size_t n = strlen(new_dir);
 
-    if (!is_dir(old_dir) || exists(new_dir) || n >= sizeof parent)
+    if (!recomp_dir_migrate_pending(old_dir, new_dir) || n >= sizeof parent)
         return 0;
     memcpy(parent, new_dir, n + 1);
     while (n > 1 && parent[n - 1] != '/' && parent[n - 1] != '\\')
@@ -331,8 +393,11 @@ int recomp_dir_migrate(const char *old_dir, const char *new_dir)
         parent[n - 1] = '\0';
         mkdir_p(parent);
     }
-    /* rename does not replace a folder that came to be there meanwhile
-     * unless it is empty, and never crosses to another disk. */
+    /* A folder of the new name with no file in it (something asked where it
+     * is before the move and made it) gives way; one with a file never does.
+     * rename does not cross to another disk. */
+    if (exists(new_dir) && !remove_hollow_dir(new_dir))
+        return -1;
     return rename(old_dir, new_dir) == 0 ? 1 : -1;
 }
 
