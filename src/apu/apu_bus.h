@@ -39,7 +39,7 @@ extern "C" {
 #define APU_BUS_FRAME    32             /* samples a VP frame */
 #define APU_BUS_BINS     32
 
-enum { APU_BUS_ROUTE_TITLE = 0, APU_BUS_ROUTE_SENDS = 1 };
+enum { APU_BUS_ROUTE_TITLE = 0, APU_BUS_ROUTE_SENDS = 1, APU_BUS_ROUTE_PAN = 2 };
 enum { APU_BUS_TRIM_FRONT = 0, APU_BUS_TRIM_CENTRE, APU_BUS_TRIM_LFE, APU_BUS_TRIM_REAR,
        APU_BUS_TRIMS };
 enum { APU_BUS_LIM_OFF = 0, APU_BUS_LIM_SOFT = 1, APU_BUS_LIM_PEAK = 2 };
@@ -50,6 +50,13 @@ typedef struct {
     int   route;                        /* APU_BUS_ROUTE_* */
     float trim_db[APU_BUS_TRIMS];       /* route title: front, centre, LFE, rear */
     float send_db[APU_BUS_SPEAKERS];    /* route sends: FL FR C LFE SL SR */
+    /* Route pan: a place in the 5.1 plane (apu_bus_pan_gains). */
+    float pan_x, pan_y;                 /* -1 left .. +1 right, -1 rear .. +1 front */
+    float pan_width;                    /* 0 a point .. 1 the two channels a full width apart */
+    float pan_divergence;               /* 0 the centre speaker .. 1 a phantom centre */
+    /* Route title: shaping of the title's own panning. Neutral 1 and 0. */
+    float field_width;                  /* 0 everything on the centre line .. 1 as panned .. 2 wider */
+    float field_divergence;             /* > 0: the centre send to FL/FR; < 0: FL/FR's common part to the centre */
     float lfe_send_db;                  /* extra send to the LFE, off by default */
     int   lfe_crossover_hz;             /* low-pass on that send: 0 none, 40..250 */
 } apu_bus_params;
@@ -81,6 +88,29 @@ void apu_bus_config_neutral(apu_bus_config *c);
 void apu_bus_set_duck_default(int source, int target);
 /* 1 when c changes nothing (what the bit-identity holds for). */
 int  apu_bus_config_is_neutral(const apu_bus_config *c);
+
+/* The pan law of route "pan" (pure; the overlay draws with it).
+ *
+ * The plane is a square room: x -1 left .. +1 right, y -1 rear .. +1 front,
+ * the listener in the middle, the speakers on its edge: C (0, 1),
+ * FL (-1, 1), FR (1, 1), SL (-1, -1), SR (1, -1). A point on the edge is
+ * panned between the two speakers next to it with the constant-power
+ * sine/cosine law, over the angle between them as ITU-R BS.775 places them
+ * (C 0, FL/FR +-30, SL/SR +-110 degrees; the room's corners are mapped
+ * onto those angles, linearly in between). Inside the room, at distance r
+ * from the middle (r = max(|x|, |y|)), the power of each speaker is
+ * (1 - r) / 5 + r * edge power: in the middle all five play equally.
+ * divergence moves that share of the centre speaker's power to FL and FR,
+ * half each. The squares of the five gains always sum to 1.
+ * out: FL FR C SL SR. */
+void apu_bus_pan_gains(float x, float y, float divergence, float out[5]);
+/* The stereo output's: x only, constant power, squares sum to 1. out: L R. */
+void apu_bus_pan_gains_stereo(float x, float out[2]);
+/* The title's FL/FR (or SL/SR) pair of one voice with field_width w:
+ * amplitudes in and out, power kept. */
+void apu_bus_field_width(float w, float *left, float *right);
+/* field_divergence d on one voice's FL, FR and C amplitudes, power kept. */
+void apu_bus_field_divergence(float d, float *fl, float *fr, float *c);
 
 /* ── the buses (set once by the title's port, before the mixer is used) ── */
 void apu_bus_set_names(const char *const *names, int count);

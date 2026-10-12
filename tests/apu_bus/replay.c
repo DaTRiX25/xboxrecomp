@@ -24,7 +24,11 @@ static void busy_config(apu_bus_config *c)
     apu_bus_config_neutral(c);
     for (int b = 0; b < 13; b++) {
         c->bus[b].gain_db = -1.0f;
-        c->bus[b].route = (b & 1) ? APU_BUS_ROUTE_SENDS : APU_BUS_ROUTE_TITLE;
+        /* A third each: sends, a place in the room, the title's panning
+         * with the field shaping. */
+        c->bus[b].route = b % 3 == 0 ? APU_BUS_ROUTE_SENDS : b % 3 == 1 ? APU_BUS_ROUTE_PAN : APU_BUS_ROUTE_TITLE;
+        c->bus[b].pan_x = 0.3f; c->bus[b].pan_y = 0.4f; c->bus[b].pan_width = 0.5f; c->bus[b].pan_divergence = 0.5f;
+        c->bus[b].field_width = 0.7f; c->bus[b].field_divergence = 0.3f;
         for (int t = 0; t < APU_BUS_TRIMS; t++) c->bus[b].trim_db[t] = -0.5f;
         for (int s = 0; s < APU_BUS_SPEAKERS; s++) c->bus[b].send_db[s] = -6.0f;
         c->bus[b].lfe_send_db = -6.0f;
