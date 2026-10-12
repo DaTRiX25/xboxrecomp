@@ -40,9 +40,8 @@ LGPL-2.1-or-later — extracted from xemu
 
   src/apu/apu_state.h also holds the HRTF filter of xemu's
   hw/xbox/mcpx/apu/vp/hrtf.h ((c) 2025 Matt Borgerson, the same licence), and
-  pieces that are NOT under this licence: the ADPCM decoder (see
-  "BSD-3-Clause" below) and the declaration of the DSP core's state (see
-  "GPL-2.0-or-later" below).
+  one piece that is NOT under this licence: the ADPCM decoder (see
+  "BSD-3-Clause" below).
 
   The upstream files say "version 2 of the License, or (at your option) any
   later version" of the GNU Lesser General Public License; that wording is
@@ -105,25 +104,29 @@ The voice low-pass — this project's own (replaced xemu's GPL-2.0 filter)
   tests/apu_lowpass checks it over the whole range of the registers.
 
 
-GPL-2.0-or-later — the DSP core's state declaration (through xemu)  *** OPEN ***
+The DSP processors' state — this project's own (xemu's GPL declarations removed)
 --------------------------------------------------------------------------------
 
-  src/apu/apu_state.h, the DSP_*_SIZE / DSP_REG_MAX constants, `struct
-  dsp_core_s` (dsp_core_t) and `struct DSPState`: about seventy lines of
-  declarations, the same as in xemu's hw/xbox/mcpx/apu/dsp/interp/dsp_cpu.h,
-  dsp_cpu_regs.h and dsp/dsp.h. Those three files are not LGPL: their headers
-  read "Copyright (c) 2015 espes ... Adapted from Hatari DSP M56001
-  emulation" and the GNU General Public License, version 2 or later.
-  apu_state.h's own header says LGPL; for these lines that is wrong.
+  Until this commit src/apu/apu_state.h declared the state of xemu's DSP56300
+  core (the DSP_*_SIZE / DSP_REG_MAX constants, struct dsp_core_s, struct
+  DSPState and the DMA state that points into it): about a hundred lines, the
+  same as in xemu's hw/xbox/mcpx/apu/dsp/interp/dsp_cpu.h, dsp_cpu_regs.h and
+  dsp/dsp.h, which are GNU General Public License, version 2 or later
+  ("Copyright (c) 2015 espes ... Adapted from Hatari DSP M56001 emulation"),
+  not LGPL. They were declarations only, and nothing in them was ever read:
+  the toolkit runs no DSP program. They are removed, and the constants with
+  them. What stands in their place (ApuDspUnit, ApuDspStandIn) is this
+  project's own: a marker that a processor was set up, and nothing else.
 
-  They are declarations only: a structure layout and six sizes, no function,
-  no table. Nothing but two memsets of one member (apu_core.c) uses them, and
-  the interpreter they belong to (xemu's hw/xbox/mcpx/apu/dsp: dsp.c,
-  dsp_cpu.c, the instruction emulation) is NOT in this repository:
+  xemu's DSP56300 interpreter itself (hw/xbox/mcpx/apu/dsp: dsp.c, dsp_cpu.c,
+  the instruction emulation, GPL-2.0-or-later) was never in this repository:
   src/apu/apu_dsp.c is a stand-in written against the LGPL apu.c, with no
-  code from it. The declarations should still go before a program is
-  distributed (an own, smaller structure does the same job); until then this
-  notice says what is there.
+  code from it.
+
+  A comparison of every source file here against the 148 C sources and
+  headers of xemu's hw/xbox (2026-10-12, exact lines) finds lines in common
+  only with files that are LGPL-2.1-or-later there and with the BSD-3-Clause
+  ADPCM decoder: none with a GPL file.
 
 
 Derived algorithms — credited, independently implemented
