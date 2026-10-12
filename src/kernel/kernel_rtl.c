@@ -75,7 +75,7 @@ NTSTATUS __stdcall xbox_RtlAnsiStringToUnicodeString(
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    int result = MultiByteToWideChar(CP_ACP, 0,
+    int result = MultiByteToWideChar(XBOX_GUEST_CP, 0,
         SourceString->Buffer, SourceString->Length,
         DestinationString->Buffer, DestinationString->MaximumLength / sizeof(WCHAR));
 
@@ -109,7 +109,7 @@ NTSTATUS __stdcall xbox_RtlUnicodeStringToAnsiString(
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    int result = WideCharToMultiByte(CP_ACP, 0,
+    int result = WideCharToMultiByte(XBOX_GUEST_CP, 0,
         SourceString->Buffer, SourceString->Length / sizeof(WCHAR),
         DestinationString->Buffer, DestinationString->MaximumLength,
         NULL, NULL);

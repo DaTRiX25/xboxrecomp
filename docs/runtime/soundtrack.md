@@ -168,11 +168,12 @@ included, and is handed to the system unchanged on POSIX hosts. On Windows
 every call that takes a path converts to UTF-16 and uses the wide function:
 the scan and the browser (`FindFirstFileW`, `GetFileAttributesW`), the
 probes and decoders (`_wfopen`, dr_libs' `_w` opens, stb_vorbis through a
-`FILE *`), the database (`_wfopen`, `MoveFileExW`). The two places where
-Windows hands over a name in the ANSI code page are converted from the wide
-environment: the home folder for the browser's places (`_wgetenv`), and
-`RECOMP_AUDIO_MUSIC_DIR` when the user set it (`xbox_SettingsText`, which a
-port reads the setting through; `--music-dir` arrives that way too).
+`FILE *`), the database (`_wfopen`, `MoveFileExW`). A port's executable also carries the manifest that
+makes its code page UTF-8 (`recomp_utf8_args.h`), so arguments and the
+environment are UTF-8 as well; where this library reads the environment
+itself it takes the wide one (`_wgetenv`: the home folder for the browser's
+places, `RECOMP_AUDIO_MUSIC_DIR` through `xbox_SettingsText`), which is
+right with or without the manifest.
 `tests/soundtrack` scans, lists, probes and decodes through a folder named
 "Árvíztűrő tükörfúrógép"; the test and the library cross-compile for Windows
 (llvm-mingw) but have not been run there.
