@@ -32,6 +32,8 @@
 #include "input_backend.h"
 #include "input_map.h"
 #include "kernel_pause.h"
+#include "present_cadence.h"    /* what reached the glass, for the graph */
+extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include "apu.h"                /* the speaker test */
 #include "xbox_soundtrack.h"    /* the music folder browser's model (xsb_*) */
 
@@ -127,6 +129,7 @@ struct Meta {
 static const char *const n_aspect[]    = { "4:3", "16:9", NULL };
 static const char *const n_filter[]    = { "Nearest", "Linear", "Integer", NULL };
 static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", NULL };
+static const char *const n_timing[]    = { "Legacy (when ready)", "Auto (even frames)", NULL };
 static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the sides)", NULL };
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_lod[]       = { "Off", "Auto (from the render scale)", "-0.5", "-1.0", "-1.5", NULL };
@@ -189,6 +192,8 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_GRAPHICS_DITHER */    { "Dither", "A faint noise in the final scale to the window that hides the stripes in smooth gradients such as the sky. Metal only for now. Off is the original; text and HUD at the exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_VEHICLE_DETAIL */ { "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Original is the console's distances; Far doubles them, Farthest is four times. Costs GPU time when many vehicles are on screen. Scenery, the track and where traffic appears are not changed. Changes at once.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
     /* XS_INPUT_GLYPHS */       { "Button prompts", "The buttons the game shows in its menus and hints. Auto follows the controller that was last used. Xbox (original) is the game's own picture: white and black buttons, L and R. The game's text and videos still name the Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
+    /* XS_DISPLAY_PRESENT_TIMING */ { "Frame presentation", "When a finished frame is handed to the display. Legacy: as soon as it is ready. Auto: every frame is aimed at one refresh of the display, so each stays on the screen for the same time, and sooner after it was drawn: on a fixed 60/120/240 Hz display the game's clock follows the display; with variable refresh (VRR, ProMotion) frames are presented at even times. The performance overlay shows the result (the on-glass line).", 1, FMT_PLAIN, n_timing, 0 },
+    /* XS_ADVANCED_PERF_STEPS */ { "Graph: simulation steps", "The frame-time graph also marks the frames in which the game ran more than one simulation step (it does when its frame rate drops).", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -363,6 +368,11 @@ struct Row {
     const char *text;                 /* R_ACTION label, R_INFO line */
 };
 
+/* The Advanced page's three lines on what reaches the glass (below, with
+ * the frame-time graph). */
+static char s_glass_info[3][160];
+static void glass_info();
+
 static int page_rows(int page, Row *r)
 {
     int n = 0;
@@ -374,6 +384,10 @@ static int page_rows(int page, Row *r)
     case P_DISPLAY:
         SET(XS_DISPLAY_FULLSCREEN); SET(XS_DISPLAY_ASPECT); SET(XS_DISPLAY_FILTER);
         SET(XS_DISPLAY_OVERSCAN); SET(XS_DISPLAY_FIT);
+#if defined(__APPLE__)
+        if (!s_vulkan)                 /* the Metal presenter's (BO-115) */
+            SET(XS_DISPLAY_PRESENT_TIMING);
+#endif
         if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_SPEED_UNITS)->key))
             SET(XS_GAME_SPEED_UNITS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_HUD_FIX)->key))
@@ -490,6 +504,12 @@ static int page_rows(int page, Row *r)
         if (s_about[0])
             INFO(s_about);
         SET(XS_ADVANCED_PERF);
+        SET(XS_ADVANCED_PERF_STEPS);
+        /* What reaches the glass, in words (the graph has one line of it). */
+        glass_info();
+        INFO(s_glass_info[0]);
+        INFO(s_glass_info[1]);
+        INFO(s_glass_info[2]);
         if (xbox_BugReportHasMaker()) {
             INFO(s_rep_info);
             ACT(A_REPORT, "Create bug report");
@@ -1436,6 +1456,76 @@ static int cmp_float(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
+/* What reached the glass (present_cadence.h): looked at once per drawn
+ * frame at most, shared by the graph and the Advanced page's lines. */
+static pc_report s_glass;
+static pc_status s_glass_st;
+static pc_sample s_glass_smp[PC_RING];
+static int s_glass_n;
+static uint32_t s_glass_ms;
+
+static void glass_update()
+{
+    uint32_t now = now_ms();
+    if (s_glass_ms && now - s_glass_ms < 100)
+        return;
+    s_glass_ms = now ? now : 1;
+    s_glass_n = xbox_PresentCadenceSnapshot(s_glass_smp, PC_RING, &s_glass_st);
+    pc_analyze(s_glass_smp, s_glass_n, &s_glass_st.display, xbox_HostNowNs(), &s_glass);
+}
+
+/* "120 Hz fixed", "48-120 Hz VRR", "display rate unknown". */
+static void glass_display_text(char *out, size_t n)
+{
+    const pc_display &d = s_glass_st.display;
+    if (d.refresh_hz <= 0)
+        snprintf(out, n, "display rate unknown");
+    else if (d.vrr)
+        snprintf(out, n, "%.0f-%.0f Hz VRR", d.min_hz, d.refresh_hz);
+    else
+        snprintf(out, n, "%.4g Hz fixed", d.refresh_hz);
+}
+
+static void glass_info()
+{
+    char disp[48];
+    glass_update();
+    glass_display_text(disp, sizeof disp);
+    snprintf(s_glass_info[0], sizeof s_glass_info[0], "Display: %s. Presentation: %s%s", disp,
+             pc_strategy_name(s_glass_st.strategy),
+             s_glass_st.strategy == PC_LOCK ? " (the game's clock follows the display)" : "");
+    if (!s_glass_st.measured) {
+        snprintf(s_glass_info[1], sizeof s_glass_info[1],
+                 "On-glass times: not available (this graphics backend does not report them).");
+        s_glass_info[2][0] = 0;
+        return;
+    }
+    if (!s_glass.available) {
+        snprintf(s_glass_info[1], sizeof s_glass_info[1],
+                 "On-glass times: not available right now (the window is hidden or covered).");
+        s_glass_info[2][0] = 0;
+        return;
+    }
+    if (s_glass.expected)
+        snprintf(s_glass_info[1], sizeof s_glass_info[1],
+                 "On glass: a frame every %.2f ms (%.2f refreshes, should be %d); %d uneven of the last %d;"
+                 " shown %.1f ms after its vblank (95%%: %.1f).",
+                 s_glass.iv_p50_ms, s_glass.iv_p50_ms * s_glass_st.display.refresh_hz / 1000.0,
+                 s_glass.expected, s_glass.uneven, s_glass.n_iv, s_glass.lat_p50_ms, s_glass.lat_p95_ms);
+    else
+        snprintf(s_glass_info[1], sizeof s_glass_info[1],
+                 "On glass: a frame every %.2f ms (%.2f to %.2f); %d uneven of the last %d;"
+                 " shown %.1f ms after its vblank (95%%: %.1f).",
+                 s_glass.iv_p50_ms, s_glass.iv_min_ms, s_glass.iv_max_ms, s_glass.uneven, s_glass.n_iv,
+                 s_glass.lat_p50_ms, s_glass.lat_p95_ms);
+    snprintf(s_glass_info[2], sizeof s_glass_info[2],
+             "Since the start: %u frames skipped (no free drawable), %u late for their refresh%s. Source: %s.",
+             s_glass_st.skips, s_glass_st.slips + s_glass_st.lates,
+             s_glass.steps_max ? (s_glass.steps_multi ? "; some frames ran 2+ simulation steps"
+                                                      : "; 1 simulation step per frame") : "",
+             s_glass_st.source);
+}
+
 static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
 {
     uint64_t t[256];
@@ -1455,7 +1545,6 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
             newest = t[i];
     if (m) {
         float srt[255];
-        double sum = 0;
         int cnt = 0;
         /* The rate over the last second of flips. */
         for (i = n - 1; i >= 0 && t[i]; i--) {
@@ -1471,7 +1560,6 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
         p50 = srt[m / 2];
         p99 = srt[(int)((m - 1) * 0.99)];
         mx = srt[m - 1];
-        (void)sum;
     }
     if (now - pres_ms >= 1000) {
         uint32_t p = s_presents;
@@ -1479,24 +1567,61 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
         pres_prev = p;
         pres_ms = now;
     }
+    glass_update();
+    const pc_report &g = s_glass;
+    const bool steps = xbox_SettingValue(XS_ADVANCED_PERF_STEPS) != 0.0;
 
-    char l1[128], l2[128];
+    /* Three lines of text: the title's flips, what reached the glass, and a
+     * warning only when there is something to warn of. */
+    char l1[128], l2[128], l3[160], l4[160], disp[48];
+    glass_display_text(disp, sizeof disp);
     snprintf(l1, sizeof l1, "%.1f fps   %.1f ms", fps, last);
     snprintf(l2, sizeof l2, "p50 %.1f  p99 %.1f  max %.1f ms   window %.0f/s", p50, p99, mx, pres_rate);
-    /* The panel is as wide as its longer line: a fixed width left the stats
+    if (!s_glass_st.measured)
+        snprintf(l3, sizeof l3, "on glass: not available (this graphics backend)   %s", disp);
+    else if (!g.available)
+        snprintf(l3, sizeof l3, "on glass: not available (window hidden?)   %s", disp);
+    else if (g.expected)
+        snprintf(l3, sizeof l3, "on glass %.1f ms = %.1f refr   %s   uneven %d   lag %.0f ms",
+                 g.iv_p50_ms, g.iv_p50_ms * s_glass_st.display.refresh_hz / 1000.0, disp,
+                 g.uneven, g.lat_p50_ms);
+    else
+        snprintf(l3, sizeof l3, "on glass %.1f ms (%.1f-%.1f)   %s   uneven %d   lag %.0f ms",
+                 g.iv_p50_ms, g.iv_min_ms, g.iv_max_ms, disp, g.uneven, g.lat_p50_ms);
+    l4[0] = 0;
+    if (s_glass_st.measured && g.warn_rate)
+        snprintf(l4, sizeof l4, "! %.4g Hz is not a multiple of 60: uneven frames",
+                 s_glass_st.display.refresh_hz);
+    else if (g.warn_uneven)
+        snprintf(l4, sizeof l4, "! uneven on the glass: %d of %d frames", g.uneven, g.n_iv);
+    else if (steps && g.steps_multi)
+        snprintf(l4, sizeof l4, "%d frames ran 2+ simulation steps (dots)", g.steps_multi);
+
+    /* The panel is as wide as its longest line: a fixed width left the stats
      * line running past the backdrop at larger values (a 100+ ms max). */
-    const float pad = fs * 0.6f, h = fs * 6.4f;
-    float tw = ImGui::CalcTextSize(l1).x, tw2 = ImGui::CalcTextSize(l2).x;
-    if (tw2 > tw) tw = tw2;
+    const float pad = fs * 0.6f, lh = fs * 1.15f;
+    const int lines = l4[0] ? 4 : 3;
+    const float h = fs * 4.1f + lh * lines;
+    float tw = ImGui::CalcTextSize(l1).x;
+    const char *const ls[4] = { l1, l2, l3, l4 };
+    for (i = 1; i < lines; i++) {
+        float w2 = ImGui::CalcTextSize(ls[i]).x;
+        if (w2 > tw) tw = w2;
+    }
     const float w = tw + 2 * pad > fs * 15.0f ? tw + 2 * pad : fs * 15.0f;
     ImVec2 a = origin, b(origin.x + w, origin.y + h);
     dl->AddRectFilled(a, b, solid(T->perf_bg, 200 / 255.0f), fs * 0.5f);
     dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f), solid(T->perf_text), l1);
-    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + fs * 1.15f), solid(T->perf_text2), l2);
+    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + lh), solid(T->perf_text2), l2);
+    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + lh * 2),
+                solid(g.warn_uneven || g.warn_rate ? T->perf_warn : T->perf_text2), l3);
+    if (l4[0])
+        dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + lh * 3),
+                    solid(g.warn_uneven || g.warn_rate ? T->perf_bad : T->perf_text2), l4);
 
-    /* Bars: the last 120 flip intervals against a 50 ms ceiling; the line
-     * is one frame at 60 Hz. */
-    const float gx = a.x + pad, gy1 = b.y - pad, gh = h - fs * 3.0f - pad, gw = w - 2 * pad;
+    /* Bars: the last 120 flip intervals against a 50 ms ceiling; the thin
+     * line across is one frame at 60 Hz. */
+    const float gx = a.x + pad, gy1 = b.y - pad, gh = h - lh * lines - fs * 0.9f - pad, gw = w - 2 * pad;
     const int bars = 120;
     const float bw = gw / bars;
     for (i = 0; i < bars && i < m; i++) {
@@ -1510,6 +1635,39 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
     }
     float ly = gy1 - gh * (16.667f / 50.0f);
     dl->AddLine(ImVec2(gx, ly), ImVec2(gx + gw, ly), solid(T->perf_line, 90 / 255.0f));
+
+    /* The second trace: the on-glass interval of the same frames, a line
+     * over the bars on the same scale. Even frames draw it flat on the 60 Hz
+     * line; a 1-3-1-3 repeat is a saw the bars do not have. An uneven
+     * interval gets a mark. Nothing is drawn when the system gives no
+     * on-glass times: a flat line there would say "even". */
+    if (s_glass_st.measured && g.available && g.n_iv > 1) {
+        ImU32 lc = solid(T->perf_text), bad = solid(T->perf_bad);
+        ImVec2 prev(0, 0);
+        bool have = false;
+        for (i = 0; i < bars && i < g.n_iv; i++) {
+            int k = g.n_iv - 1 - i;
+            float v = g.iv_ms[k], f = v / 50.0f;
+            if (f > 1.0f) f = 1.0f;
+            ImVec2 pt(gx + gw - (i + 0.5f) * bw, gy1 - gh * f);
+            if (have)
+                dl->AddLine(prev, pt, lc, fs * 0.09f);
+            if (g.iv_uneven[k])
+                dl->AddCircleFilled(pt, fs * 0.16f, bad);
+            prev = pt;
+            have = true;
+        }
+    }
+    /* The optional third: frames of more than one simulation step, a dot
+     * under the bar (newest sample at the right, as the bars). */
+    if (steps && g.steps_max) {
+        for (i = 0; i < bars && i < s_glass_n; i++) {
+            const pc_sample &sm = s_glass_smp[s_glass_n - 1 - i];
+            if (sm.steps > 1)
+                dl->AddCircleFilled(ImVec2(gx + gw - (i + 0.5f) * bw, gy1 + pad * 0.35f), fs * 0.13f,
+                                    solid(T->perf_warn));
+        }
+    }
 }
 
 /* ── the pages ─────────────────────────────────────────────────────── */

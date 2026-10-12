@@ -60,6 +60,7 @@ static const char *const k_vibration[] = { "auto", "controller", "device", "off"
 static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
 static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
+static const char *const k_timing[]   = { "legacy", "auto", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
 #define SETTING(k, t, f, e, c, ev, mn, mx, b) \
@@ -115,6 +116,11 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_GRAPHICS_VEHICLE_DETAIL] = SETTING("graphics.vehicle_detail", XS_CHOICE, 0, RENV_GFX_VEHICLE_DETAIL, k_vehicle_detail, NULL, 0, 0, 0),
     /* The title's button prompts for the pad in use (pad_glyphs.h). */
     [XS_INPUT_GLYPHS]       = SETTING("input.glyphs", XS_CHOICE, 0, RENV_INPUT_GLYPHS, k_glyphs, NULL, 0, 0, 0),
+    /* When frames are presented (present_cadence.h, BO-115): legacy is
+     * "when ready", as before; auto aims each frame at one refresh. Taken
+     * while running (the presenter looks twice a second). */
+    [XS_DISPLAY_PRESENT_TIMING] = SETTING("display.present_timing", XS_CHOICE, 0, RENV_PRESENT_TIMING, k_timing, NULL, 0, 0, 0),
+    [XS_ADVANCED_PERF_STEPS] = SETTING("advanced.perf_steps", XS_BOOL, 0, RENV_OVERLAY_PERF_STEPS, NULL, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
 #endif

@@ -71,6 +71,7 @@
 #endif
 
 uint64_t xbox_HostNowNs(void);
+#include "kernel/present_cadence.h"
 void xbox_PacingPresent(uint64_t when_ns);
 void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
 int xbox_VblankDisplayLockOn(void);
@@ -154,6 +155,12 @@ static pthread_t       s_waiter;
 static FILE           *s_csv;
 #define ID_RING 64
 static uint32_t        s_id_flip[ID_RING];   /* present id -> the flip it showed */
+/* Present id -> the emulated vblank of the game frame it showed for the
+ * first time, 0 for a redraw (present_cadence.h: the measurement only; this
+ * presenter's behaviour is as it was). */
+static uint64_t        s_id_vbl[ID_RING];
+static uint64_t        s_next_vbl;           /* fbv_frame_vblank, main thread */
+static unsigned        s_status_n;
 static uint64_t        s_vbl_ns, s_vbl_period_ns;
 static PFN_vkWaitForPresentKHR s_wait_present;   /* a device function */
 
@@ -274,6 +281,17 @@ static void *waiter_main(void *arg)
                 char b[32];
                 snprintf(b, sizeof b, "%llu", (unsigned long long)t);
                 xbox_LatRow('D', s_id_flip[next % ID_RING], t, b);
+            }
+            /* The overlay's on-glass trace: the frame, its vblank, and when
+             * the wait for it came back. */
+            if (s_id_vbl[next % ID_RING]) {
+                pc_sample smp;
+                memset(&smp, 0, sizeof smp);
+                smp.flip = s_id_flip[next % ID_RING];
+                smp.vblank_ns = s_id_vbl[next % ID_RING];
+                smp.glass_ns = t;
+                smp.steps = (uint8_t)xbox_PresentCadenceStepsOf(smp.flip);
+                xbox_PresentCadenceNote(&smp);
             }
             if (s_csv)
                 fprintf(s_csv, "%llu,display,%llu,\n", (unsigned long long)next,
@@ -1557,6 +1575,33 @@ static void post_run(VkCommandBuffer cb, int k, VkImage *src, VkImageLayout *lay
     }
 }
 
+void fbv_frame_vblank(uint64_t vblank_ns)
+{
+    s_next_vbl = vblank_ns;
+}
+
+/* The overlay's display line (present_cadence.h): the mode's rate as SDL
+ * states it, and whether this swapchain can tell when a frame is shown.
+ * Whether the display is variable is not known here. */
+static void cadence_status(SDL_Window *win)
+{
+    pc_status st;
+    SDL_DisplayMode dm;
+    int di;
+
+    if (s_status_n++ % 60)
+        return;
+    memset(&st, 0, sizeof st);
+    di = SDL_GetWindowDisplayIndex(win);
+    if (di >= 0 && SDL_GetCurrentDisplayMode(di, &dm) == 0 && dm.refresh_rate > 0)
+        st.display.refresh_hz = st.display.min_hz = (double)dm.refresh_rate;
+    st.strategy = PC_LEGACY;
+    st.measured = s_waiter_run != 0;
+    snprintf(st.source, sizeof st.source, "%s",
+             st.measured ? "Vulkan present wait (VK_KHR_present_wait)" : "none");
+    xbox_PresentCadenceStatus(&st);
+}
+
 int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 const char *shot_path, uint32_t flip)
 {
@@ -1573,6 +1618,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
 
     if (!C)
         return 0;
+    cadence_status(win);
     SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
     if (dw <= 0 || dh <= 0)
         return 0;
@@ -1776,6 +1822,8 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         pthread_mutex_lock(&s_id_mu);
         s_present_id++;
         s_id_flip[s_present_id % ID_RING] = flip;
+        s_id_vbl[s_present_id % ID_RING] = s_next_vbl;
+        s_next_vbl = 0;
         if (s_csv)
             fprintf(s_csv, "%llu,present,%llu,%u\n", (unsigned long long)s_present_id,
                     (unsigned long long)t, flip);
