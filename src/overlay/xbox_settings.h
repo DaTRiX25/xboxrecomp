@@ -76,6 +76,7 @@ typedef enum {
     XS_GRAPHICS_DITHER,      /* noise dither in the presenter's scale to the window (Metal) */
     XS_GRAPHICS_VEHICLE_DETAIL, /* an opt-in guest patch: the title's vehicle LOD distances */
     XS_INPUT_GLYPHS,         /* auto / xbox / xbox_modern / playstation / nintendo / steam (pad_glyphs.h) */
+    XS_GRAPHICS_UI_SCALE,    /* the title's 2D art scaled before upload: off, 2x, 4x (nv2a_texscale.h) */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
 #endif

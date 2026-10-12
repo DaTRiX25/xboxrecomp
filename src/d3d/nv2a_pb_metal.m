@@ -85,6 +85,7 @@
 #include "d3d8_msl.h"
 #include "d3d8_swizzle.h"
 #include "nv2a_texrep.h"
+#include "nv2a_texscale.h"
 #include "nv2a_pcache.h"
 #include "latency_trace.h"
 #include "host_time.h"
@@ -1601,6 +1602,11 @@ typedef struct {
     uint32_t       gen, used;
     uint64_t       hash;
     uint32_t       rep;           /* nv2a_texrep generation it was uploaded at; 0: not a replaced texture */
+    uint8_t        ui;            /* a 2D draw has bound it (nv2a_texscale.h); stays */
+    uint8_t        scale;         /* the factor it was uploaded at: 0 (as the title's), 2, 4 */
+    uint8_t        salgo;         /* and the scaler */
+    uint8_t        up_scale;      /* the factor the texture on the GPU has (0 where the scaler refused) */
+    uint8_t        use;           /* RECOMP_DEBUG=ui_scale_log: the kinds of draw seen */
     int            live;
     id<MTLTexture> tex;
 } TexEntry;
@@ -1669,7 +1675,62 @@ static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
 
 static uint32_t s_tex_rep;    /* the last tex_upload's nv2a_texrep_apply */
 
-static id<MTLTexture> tex_upload(const Stage *t)
+/* graphics.ui_scale (nv2a_texscale.h): the draw being encoded is a 2D one,
+ * and what tex_bind found for the stage it last bound: the factor its
+ * texture was uploaded at (0: the title's own size). */
+static int      s_draw_2d;
+static unsigned s_bind_scale;
+static uint32_t *s_scaled;
+static size_t    s_scaled_cap;
+
+static unsigned scale_levels(unsigned f)
+{
+    return f == 4 ? 3u : f == 2 ? 2u : 1u;
+}
+
+/* The texture f times as large, with the levels down to the title's size
+ * (a 2D element drawn smaller than the scaled texture is minified through
+ * them, not point-skipped). nil: no memory, or the scaler refused. */
+static id<MTLTexture> tex_upload_scaled(const Stage *t, unsigned f, int algo)
+{
+    uint32_t w = t->width * f, h = t->height * f, levels = scale_levels(f), l;
+    size_t n = nv2a_tex_texels(w, h, levels);
+    const uint32_t *src;
+    MTLTextureDescriptor *td;
+    id<MTLTexture> tex;
+    uint64_t t0 = xbox_HostNowNs();
+
+    if (n > s_scaled_cap) {
+        uint32_t *p = (uint32_t *)realloc(s_scaled, n * 4);
+        if (!p)
+            return nil;
+        s_scaled = p;
+        s_scaled_cap = n;
+    }
+    if (!nv2a_texscale(s_texels, t->width, t->height, f, (enum nv2a_texscale_algo)algo,
+                       s_scaled))
+        return nil;
+    nv2a_texscale_mips(s_scaled, w, h, levels);
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                            width:w
+                                                           height:h
+                                                        mipmapped:YES];
+    td.mipmapLevelCount = levels;
+    td.usage = MTLTextureUsageShaderRead;
+    tex = [s_dev newTextureWithDescriptor:td];
+    if (!tex)
+        return nil;
+    for (l = 0, src = s_scaled; l < levels; l++) {
+        uint32_t lw = nv2a_tex_level_dim(w, l), lh = nv2a_tex_level_dim(h, l);
+        [tex replaceRegion:MTLRegionMake2D(0, 0, lw, lh) mipmapLevel:l withBytes:src
+               bytesPerRow:lw * 4];
+        src += (size_t)lw * lh;
+    }
+    nv2a_texscale_note(t->width, t->height, f, (xbox_HostNowNs() - t0) / 1000u);
+    return tex;
+}
+
+static id<MTLTexture> tex_upload(const Stage *t, unsigned scale, int algo)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
@@ -1699,6 +1760,15 @@ static id<MTLTexture> tex_upload(const Stage *t)
         for (i = 0; i < n; i++)
             s_texels[i] ^= x;
     }
+    s_bind_scale = 0;
+    if (scale) {
+        tex = tex_upload_scaled(t, scale, algo);
+        if (tex) {
+            s_bind_scale = scale;
+            s_tex_uploads++;
+            return tex;
+        }
+    }
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                             width:t->width
                                                            height:t->height
@@ -1719,13 +1789,40 @@ static id<MTLTexture> tex_upload(const Stage *t)
     return tex;
 }
 
+/* RECOMP_DEBUG=ui_scale_log: one line whenever a texture is seen in a kind
+ * of draw it was not seen in before (bit 0: a 2D draw, bit 1: another), with
+ * the hash texrep_dump names its file by. For checking the rule. */
+static int ui_scale_log(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_UI_SCALE_LOG) != NULL;
+    return on;
+}
+
+static void ui_scale_use(TexEntry *e, const Stage *t, const uint8_t *mem)
+{
+    uint8_t bit = s_draw_2d ? 1 : 2;
+    if (e->use & bit)
+        return;
+    e->use |= bit;
+    fprintf(stderr, "[UISCALE] tex %016llx fmt 0x%02x %ux%u levels %u use %u scale %u flip %llu\n",
+            (unsigned long long)nv2a_texrep_hash(mem + t->offset, t->color, t->width,
+                                                 t->height, t->pitch),
+            t->color, t->width, t->height, t->levels, e->use, e->up_scale,
+            (unsigned long long)s_presents);
+}
+
 static id<MTLTexture> tex_bind(const Stage *t)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bytes = 0, i;
     TexEntry *e = NULL, *victim = &s_tc[0];
+    unsigned want;
+    int algo;
 
+    s_bind_scale = 0;
     if (t->valid && (uint64_t)t->width * t->height <= TEX_MAX_TEXELS)
         bytes = nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
     /* The guest bytes are about to be hashed and decoded: a render target
@@ -1776,9 +1873,21 @@ static id<MTLTexture> tex_bind(const Stage *t)
         if (!c->live || (victim->live && c->used < victim->used))
             victim = c;
     }
+    /* graphics.ui_scale: a texture a 2D draw binds is scaled, from then on
+     * and for every draw (off: want is 0 and nothing here differs). */
+    want = nv2a_texscale_factor();
+    algo = (int)nv2a_texscale_algo();
+    if (want && !((s_draw_2d || (e && e->ui)) && !stage_signed(t)
+                  && nv2a_texscale_tex_ok(nv2a_tex_size_from_format(t->color), t->width,
+                                          t->height, t->levels)))
+        want = 0;
     if (e) {
-        /* A replaced texture whose variant changed is uploaded again. */
-        int stale = e->rep && e->rep != nv2a_texrep_generation();
+        /* A replaced texture whose variant changed is uploaded again; so is
+         * one whose scale is not the one wanted now. */
+        int stale = (e->rep && e->rep != nv2a_texrep_generation())
+                 || e->scale != want || (want && e->salgo != algo);
+        if (s_draw_2d)
+            e->ui = 1;
         if (e->gen != g->flips || stale) {
             uint64_t tp = prof_t(), h = tex_hash_pal(mem, t, bytes);
             prof_add(&s_pa.texh, tp);
@@ -1789,7 +1898,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
             if (h != e->hash || stale) {
                 id<MTLTexture> nt;
                 tp = prof_t();
-                nt = tex_upload(t);
+                nt = tex_upload(t, want, algo);
                 prof_add(&s_pa.texup, tp);
                 s_pa.texup_n++;
                 e->hash = h;
@@ -1799,6 +1908,11 @@ static id<MTLTexture> tex_bind(const Stage *t)
                     return s_black;
                 [e->tex release];
                 e->tex = nt;
+                /* The factor wanted, also when the scaler refused: it is
+                 * not asked again until the bytes or the setting change. */
+                e->scale = (uint8_t)want;
+                e->salgo = (uint8_t)algo;
+                e->up_scale = (uint8_t)s_bind_scale;
             }
         }
     } else {
@@ -1809,12 +1923,17 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->live = 0;
         {
             uint64_t tp = prof_t();
-            nt = tex_upload(t);
+            nt = tex_upload(t, want, algo);
             prof_add(&s_pa.texup, tp);
             s_pa.texup_n++;
         }
         if (!nt)
             return s_black;
+        e->ui = (uint8_t)(s_draw_2d != 0);
+        e->scale = (uint8_t)want;
+        e->salgo = (uint8_t)algo;
+        e->up_scale = (uint8_t)s_bind_scale;
+        e->use = 0;
         e->offset = t->offset;
         e->color = t->color;
         e->width = t->width;
@@ -1830,6 +1949,9 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->live = 1;
     }
     e->used = ++s_tc_clock;
+    s_bind_scale = e->up_scale;
+    if (ui_scale_log())
+        ui_scale_use(e, t, mem);
     return e->tex;
 }
 
@@ -1853,7 +1975,7 @@ static MTLSamplerAddressMode address_mode(uint32_t m)
 static struct { uint64_t key; id<MTLSamplerState> s; } s_smp[SMP_MAX];
 static int s_smp_n;
 
-static id<MTLSamplerState> sampler(const Stage *t)
+static id<MTLSamplerState> sampler(const Stage *t, unsigned scale)
 {
     static int point = -1;
     MTLSamplerDescriptor *sd;
@@ -1867,13 +1989,19 @@ static id<MTLSamplerState> sampler(const Stage *t)
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
+    /* A scaled 2D texture (one level in the title) has the levels down to
+     * the title's size: blended between, so its look does not step with the
+     * size it is drawn at. */
+    if (scale)
+        mip = 2;
     /* Anisotropy only on a mipmapped sampler with a linear minification
      * filter, as asked (RECOMP_GFX_ANISO). */
-    aniso = (mip && mn) ? nv2a_host_aniso() : 1;
+    aniso = (mip && mn && !scale) ? nv2a_host_aniso() : 1;
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9 | (uint64_t)mip << 10;
     if (mip)
         key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
     key |= (uint64_t)aniso << 33;       /* the level is part of the sampler */
+    key |= (uint64_t)scale << 40;
     for (i = 0; i < s_smp_n; i++)
         if (s_smp[i].key == key)
             return s_smp[i].s;
@@ -1886,8 +2014,8 @@ static id<MTLSamplerState> sampler(const Stage *t)
     sd.sAddressMode = address_mode(u);
     sd.tAddressMode = address_mode(v);
     sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
-    sd.lodMinClamp = mip ? (float)t->lod_min : 0.0f;
-    sd.lodMaxClamp = mip ? (float)t->lod_max : 0.0f;
+    sd.lodMinClamp = scale ? 0.0f : mip ? (float)t->lod_min : 0.0f;
+    sd.lodMaxClamp = scale ? (float)(scale_levels(scale) - 1u) : mip ? (float)t->lod_max : 0.0f;
     st = [s_dev newSamplerStateWithDescriptor:sd];
     [sd release];
     if (!st)
@@ -3026,6 +3154,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
     id<MTLTexture> stex[4];
+    unsigned sscale[4] = { 0, 0, 0, 0 };
 
     if (!init())
         return;
@@ -3166,6 +3295,14 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         /* Textures before the pass: a self copy is a blit between passes. */
         {
             int textured = 0;
+            s_draw_2d = 0;
+            if (nv2a_texscale_factor() || ui_scale_log()) {
+                const struct nv2a_pb_present *pr = nv2a_pb_present_state();
+                struct nv2a_texscale_draw td2 = { d->program, v->depth_enable,
+                                                  v->depth_enable && v->depth_mask,
+                                                  rt->w, rt->h, pr->w, pr->h };
+                s_draw_2d = nv2a_texscale_draw_is_2d(&td2);
+            }
             for (k = 0; k < 4; k++) {
                 const Stage *t = &s_stage[k];
                 RenderTarget *src;
@@ -3186,6 +3323,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     s_rtt_binds++;
                 } else {
                     stex[k] = tex_bind(t);
+                    sscale[k] = s_bind_scale;
                 }
             }
             if (textured)
@@ -3249,7 +3387,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         [s_enc setFragmentBytes:&mpc length:sizeof mpc atIndex:0];
         for (k = 0; k < 4; k++) {
             [s_enc setFragmentTexture:stex[k] atIndex:k];
-            [s_enc setFragmentSamplerState:sampler(&s_stage[k]) atIndex:k];
+            [s_enc setFragmentSamplerState:sampler(&s_stage[k], sscale[k]) atIndex:k];
         }
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
