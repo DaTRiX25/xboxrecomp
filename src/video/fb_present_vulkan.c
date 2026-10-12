@@ -305,7 +305,7 @@ static DWORD WINAPI dxgi_vblank_main(LPVOID param)
 {
     IDXGIOutput *out = (IDXGIOutput *)param;
     uint64_t last = 0;
-    unsigned fails = 0;
+    unsigned fails = 0, fast = 0;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     while (s_dxgi_run) {
         uint64_t t;
@@ -317,6 +317,23 @@ static DWORD WINAPI dxgi_vblank_main(LPVOID param)
         }
         fails = 0;
         t = mono_ns();
+        /* An output that is asleep answers at once, with success: this
+         * thread then spun at time-critical priority, a core gone and, on a
+         * loaded PC, the title's core with it (BO-75: the monitor had gone
+         * to sleep before a run; under sixteen CPU-bound jobs the title
+         * stood for up to 0.7 s with this thread on its core). No refresh
+         * comes within half a millisecond of the last: three in a row is
+         * not a display, so nothing is reported and the thread sleeps as
+         * for a lost output, until a wait takes its time again. */
+        if (last && t - last < 500000ull) {
+            if (++fast >= 3) {
+                Sleep(fast < 64 ? 16 : 250);
+                last = mono_ns();
+                continue;
+            }
+        } else {
+            fast = 0;
+        }
         if (last && t - last < 60000000ull) {
             pthread_mutex_lock(&s_tm_mu);
             iv_add(&s_disp_iv, t);
