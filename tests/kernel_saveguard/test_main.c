@@ -14,6 +14,13 @@
  *   the process ended at each step of a save (a child of this test, ended
  *   with _exit by the fault hook): the file is the old save or the new one,
  *   whole, and the next start removes what was left beside it
+ *   the rename over the old file fails (as on Windows when another program
+ *   holds it; the fault hook): the new save is kept beside it, a read sees
+ *   it, the next save's close puts it in place; failing to the end the
+ *   overlay is told, a newer save overtakes it, the way out tries once more;
+ *   a process that ended with one pending: the next start puts it in place,
+ *   or, when it cannot, keeps it in the save history and pending; an older
+ *   one is moved to the history, never just removed
  */
 #include "kernel.h"
 #include "kernel_saveguard.h"
@@ -23,6 +30,7 @@
 #include <string.h>
 #if !defined(_WIN32)
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #endif
@@ -41,10 +49,11 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 
 #define TITLE "4541005b"
 #define SAVE  "\\Device\\Harddisk0\\Partition1\\UDATA\\" TITLE "\\0123456789AB\\Profile 1"
+#define SAVE2 "\\Device\\Harddisk0\\Partition1\\UDATA\\" TITLE "\\0123456789AB\\Profile 2"
 #define SIZE  59904
 
 static int failures, hooks;
-static char g_root[400], g_real[600], g_shadow[600];
+static char g_root[400], g_real[600], g_shadow[600], g_pend[600];
 
 static void check(int ok, const char *what)
 {
@@ -208,6 +217,8 @@ static int listed_shadow(void)
         seen++;
         if (e->FileNameLength > 5 && !memcmp(e->FileName + e->FileNameLength - 5, ".~new", 5))
             seen_new = 1;
+        if (e->FileNameLength > 6 && !memcmp(e->FileName + e->FileNameLength - 6, ".~pend", 6))
+            seen_new = 1;
     }
     xbox_NtClose(d);
     return seen_new ? 1 : seen ? 0 : -1;
@@ -229,6 +240,7 @@ static void setup(const char *root)
 #endif
     snprintf(g_real, sizeof g_real, "%s" SEP "UDATA" SEP TITLE SEP "0123456789AB" SEP "Profile 1", root);
     snprintf(g_shadow, sizeof g_shadow, "%s.~new", g_real);
+    snprintf(g_pend, sizeof g_pend, "%s.~pend", g_real);
     xbox_SaveGuardEnable(TITLE);
     xbox_SaveGuardSetHook(on_replace);
 }
@@ -243,15 +255,91 @@ static int child(int step, const char *root)
     return 0;
 }
 
+/* Folders in <root>/save-history holding a save file of `fill`. */
+static int history_with(const char *root, int fill)
+{
+    char p[900];
+    int found = 0;
+#if defined(_WIN32)
+    WIN32_FIND_DATAA fd;
+    HANDLE f;
+    snprintf(p, sizeof p, "%s\\save-history\\*", root);
+    f = FindFirstFileA(p, &fd);
+    if (f == INVALID_HANDLE_VALUE)
+        return 0;
+    do {
+        if (fd.cFileName[0] == '.')
+            continue;
+        snprintf(p, sizeof p, "%s\\save-history\\%s\\UDATA\\" TITLE "\\0123456789AB\\Profile 1", root,
+                 fd.cFileName);
+        found += content(p) == fill;
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+#else
+    DIR *d;
+    struct dirent *e;
+    snprintf(p, sizeof p, "%s/save-history", root);
+    d = opendir(p);
+    if (!d)
+        return 0;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.')
+            continue;
+        snprintf(p, sizeof p, "%s/save-history/%s/UDATA/" TITLE "/0123456789AB/Profile 1", root, e->d_name);
+        found += content(p) == fill;
+    }
+    closedir(d);
+#endif
+    return found;
+}
+
+/* A plain file written from outside (an older pending one, by hand). */
+static void put_file(const char *p, unsigned char fill)
+{
+    static unsigned char buf[SIZE];
+    FILE *f = fopen(p, "wb");
+    memset(buf, fill, sizeof buf);
+    if (f) {
+        fwrite(buf, 1, sizeof buf, f);
+        fclose(f);
+    }
+}
+
+static void pause_ms(unsigned ms)
+{
+#if defined(_WIN32)
+    Sleep(ms);
+#else
+    usleep(ms * 1000);
+#endif
+}
+
 int main(int argc, char **argv)
 {
-    char root[400], cmd[1200], what[120];
+    char root[400], cmd[1200], what[120], text[400];
     HANDLE h = NULL;
     int step;
 
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 4 && !strcmp(argv[1], "fault"))
         return child(atoi(argv[2]), argv[3]);
+    if (argc == 3 && !strcmp(argv[1], "pendexit")) {
+        /* The rename fails once; the way out tries again. */
+        setup(argv[2]);
+        xbox_SaveGuardFailReplace(1);
+        save(SAVE, 'H', 1, NULL);
+        xbox_SaveGuardWait(5000);
+        exit(0);
+    }
+    if (argc == 4 && !strcmp(argv[1], "pendkill")) {
+        /* The rename keeps failing, then the process is killed. */
+        setup(argv[3]);
+        xbox_SaveGuardFailReplace(1000);
+        save(SAVE, (unsigned char)argv[2][0], 1, NULL);
+        xbox_SaveGuardWait(5000);
+        fflush(NULL);
+        _exit(0);
+    }
     if (argc == 3 && !strcmp(argv[1], "quit")) {
         /* A save, then the process ends at once, the ordinary way. */
         setup(argv[2]);
@@ -337,6 +425,83 @@ int main(int argc, char **argv)
     /* The process quits right after the title's close: the save is in. */
     check(run_self(argv[0], "quit", root) == 0, "a quit right after a save: the child ran");
     check(content(g_real) == 'D' && !exists(g_shadow), "a quit right after a save waits for it");
+
+    /* The rename over the old file fails (Windows: another program holds
+     * it). Real 'D' here. */
+    xbox_SaveGuardFailReplace(1);
+    check(save(SAVE, 'E', 1, NULL) && xbox_SaveGuardWait(5000), "the rename fails once");
+    check(content(g_real) == 'D' && content(g_pend) == 'E' && !exists(g_shadow),
+          "  the old file stands, the new one is kept beside it");
+    check(xbox_SaveGuardPending() == 1 && xbox_SaveGuardProblem(text, sizeof text) == 0,
+          "  pending, the player not told yet");
+    check(read_back() == 'E', "  a read sees the newer save");
+    check(listed_shadow() == 0, "  a listing does not show it");
+    check(save(SAVE2, 'X', 1, NULL) && xbox_SaveGuardWait(5000), "the next save's close");
+    {
+        int tries;
+        for (tries = 0; tries < 50 && xbox_SaveGuardPending(); tries++)
+            pause_ms(20);
+    }
+    check(content(g_real) == 'E' && !exists(g_pend) && !xbox_SaveGuardPending(),
+          "  the waiting save is put in place");
+
+    xbox_SaveGuardFailReplace(1000);
+    save(SAVE, 'F', 1, NULL);
+    xbox_SaveGuardWait(5000);
+    for (step = 0; step < 3; step++) {
+        int tries;
+        save(SAVE2, (unsigned char)('Y' + (step & 1)), 1, NULL);
+        xbox_SaveGuardWait(5000);
+        for (tries = 0; tries < 10; tries++)
+            pause_ms(20);
+    }
+    check(xbox_SaveGuardProblem(text, sizeof text) > 0 && strstr(text, "A save could not be written") != NULL
+          && strstr(text, "previous save is kept") != NULL, "failing to the end: the overlay is told");
+    printf("    (%s)\n", text);
+    check(content(g_real) == 'E' && content(g_pend) == 'F' && read_back() == 'F',
+          "  the previous save stands, the newer one is kept and read");
+    xbox_SaveGuardFailReplace(0);
+    check(save(SAVE, 'G', 1, NULL) && save(SAVE2, 'Q', 1, NULL) && xbox_SaveGuardWait(5000),
+          "newer saves, the rename works again");
+    check(content(g_real) == 'G' && !exists(g_pend) && !exists(g_shadow) && !xbox_SaveGuardPending()
+          && xbox_SaveGuardProblem(text, sizeof text) == 0, "  it is in place, the waiting one overtaken, the line gone");
+
+    /* The way out tries once more. */
+    check(run_self(argv[0], "pendexit", root) == 0, "the way out with a save pending: the child ran");
+    check(content(g_real) == 'H' && !exists(g_pend), "  it was put in place on the way out");
+
+    /* Killed with one pending: the next start puts it in place. */
+    run_self(argv[0], "pendkill K", root);
+    check(content(g_real) == 'H' && content(g_pend) == 'K', "killed with a save pending: both on the disk");
+    xbox_SaveGuardEnable(TITLE);
+    check(content(g_real) == 'K' && !exists(g_pend), "  the next start puts it in place");
+
+    /* ... and when it cannot: kept in the history, pending, the player told. */
+    run_self(argv[0], "pendkill L", root);
+    xbox_SaveGuardFailReplace(1);
+    xbox_SaveGuardEnable(TITLE);
+    check(content(g_real) == 'K' && content(g_pend) == 'L', "  a start that cannot put it in place keeps it");
+    check(history_with(root, 'L') == 1, "  and a whole save with it is in the save history");
+    check(xbox_SaveGuardProblem(text, sizeof text) > 0 && read_back() == 'L', "  pending, read, the player told");
+    save(SAVE2, 'Z', 1, NULL);
+    xbox_SaveGuardWait(5000);
+    {
+        int tries;
+        for (tries = 0; tries < 50 && xbox_SaveGuardPending(); tries++)
+            pause_ms(20);
+    }
+    check(content(g_real) == 'L' && !exists(g_pend) && xbox_SaveGuardProblem(text, sizeof text) == 0,
+          "  the next save's close puts it in place");
+
+    /* An older one (the file beside it was written after it): moved to the
+     * history, not removed. */
+    put_file(g_pend, 'M');
+    pause_ms(1100);
+    save(SAVE, 'N', 1, NULL);
+    xbox_SaveGuardWait(5000);
+    xbox_SaveGuardEnable(TITLE);
+    check(content(g_real) == 'N' && !exists(g_pend) && history_with(root, 'M') == 1,
+          "an older waiting file: the save stands, the file is kept in the history");
 
     /* Deleted on close, through the handle. */
     {

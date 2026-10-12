@@ -28,6 +28,7 @@
 #define rs_unlink(p) _unlink(p)
 #else
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
@@ -239,14 +240,97 @@ static int copy_file(const char *from, const char *to, CopyFail *fail)
 }
 #endif
 
+/* A file copied over a save file that is there: whole or not at all. The
+ * bytes go to "<to>.~new" (the save guard's name for a file on its way: a
+ * listing does not show it, the next start removes one left behind), are
+ * flushed to the disk, and the new file is renamed over the old one. */
+static int sync_file(const char *path, CopyFail *fail)
+{
+#if defined(_WIN32)
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    int ok;
+    if (h == INVALID_HANDLE_VALUE) {
+        copy_failed(fail, path, GetLastError());
+        return 0;
+    }
+    ok = FlushFileBuffers(h) != 0;
+    if (!ok)
+        copy_failed(fail, path, GetLastError());
+    CloseHandle(h);
+    return ok;
+#else
+    int fd = open(path, O_RDONLY), ok;
+    if (fd < 0) {
+        copy_failed(fail, path, (unsigned)errno);
+        return 0;
+    }
+#if defined(__APPLE__) && defined(F_FULLFSYNC)
+    ok = fcntl(fd, F_FULLFSYNC) == 0 || fsync(fd) == 0;
+#else
+    ok = fsync(fd) == 0;
+#endif
+    if (!ok)
+        copy_failed(fail, path, (unsigned)errno);
+    close(fd);
+    return ok;
+#endif
+}
+
+static int replace_file(const char *from, const char *to, CopyFail *fail)
+{
+#if defined(_WIN32)
+    int tries;
+    DWORD e = 0;
+    for (tries = 0; tries < 25; tries++) {
+        if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            return 1;
+        e = GetLastError();
+        Sleep(20);
+    }
+    copy_failed(fail, to, e);
+    return 0;
+#else
+    char dir[RS_PATH];
+    char *slash;
+    int fd;
+    if (rename(from, to) != 0) {
+        copy_failed(fail, to, (unsigned)errno);
+        return 0;
+    }
+    snprintf(dir, sizeof dir, "%s", to);
+    slash = strrchr(dir, '/');
+    if (slash && slash != dir) {
+        *slash = 0;
+        fd = open(dir, O_RDONLY);
+        if (fd >= 0) {
+            fsync(fd);
+            close(fd);
+        }
+    }
+    return 1;
+#endif
+}
+
+static int copy_file_atomic(const char *from, const char *to, CopyFail *fail)
+{
+    char tmp[RS_PATH + 8];
+    snprintf(tmp, sizeof tmp, "%s.~new", to);
+    rs_unlink(tmp);
+    if (copy_file(from, tmp, fail) && sync_file(tmp, fail) && replace_file(tmp, to, fail))
+        return 1;
+    rs_unlink(tmp);
+    return 0;
+}
+
 typedef struct {
     const char *to;
     int skip_images;
+    int atomic;
     int ok;
     CopyFail *fail;
 } CopyCtx;
 
-static int copy_tree_f(const char *from, const char *to, int skip_images, CopyFail *fail);
+static int copy_tree_a(const char *from, const char *to, int skip_images, int atomic, CopyFail *fail);
 
 static int copy_entry(const char *dir, const char *name, int dir_entry, void *vctx)
 {
@@ -257,14 +341,16 @@ static int copy_entry(const char *dir, const char *name, int dir_entry, void *vc
     snprintf(src, sizeof src, "%s/%s", dir, name);
     snprintf(dst, sizeof dst, "%s/%s", c->to, name);
     /* A save file on its way to the disk (kernel_saveguard.h) is not a
-     * save: the file beside it is. */
-    if (!dir_entry && n > 5 && !strcmp(name + n - 5, ".~new"))
+     * save: the file beside it is. A pending one (".~pend") is kept by the
+     * guard itself, and the copy of a save tree that is put in place here
+     * would carry it over the save it waits for. */
+    if (!dir_entry && ((n > 5 && !strcmp(name + n - 5, ".~new")) || (n > 6 && !strcmp(name + n - 6, ".~pend"))))
         return 1;
     if (dir_entry) {
-        if (!copy_tree_f(src, dst, c->skip_images, c->fail))
+        if (!copy_tree_a(src, dst, c->skip_images, c->atomic, c->fail))
             c->ok = 0;
     } else if (!(c->skip_images && n > 4 && !strcmp(name + n - 4, ".img"))) {
-        if (!copy_file(src, dst, c->fail))
+        if (!(c->atomic ? copy_file_atomic(src, dst, c->fail) : copy_file(src, dst, c->fail)))
             c->ok = 0;
     }
     return 1;
@@ -272,9 +358,15 @@ static int copy_entry(const char *dir, const char *name, int dir_entry, void *vc
 
 static int copy_tree_f(const char *from, const char *to, int skip_images, CopyFail *fail)
 {
+    return copy_tree_a(from, to, skip_images, 0, fail);
+}
+
+static int copy_tree_a(const char *from, const char *to, int skip_images, int atomic, CopyFail *fail)
+{
     CopyCtx c;
     c.to = to;
     c.skip_images = skip_images;
+    c.atomic = atomic;
     c.ok = 1;
     c.fail = fail;
     mkdir_p(to);
@@ -702,18 +794,27 @@ int recomp_save_sandbox_begin(const char *root, const char *sandbox)
     return ok;
 }
 
+/* Over the player's save: each file whole or not at all (copy_file_atomic);
+ * the caller keeps a history copy of the save first. */
 int recomp_save_sandbox_commit(const char *sandbox, const char *root)
 {
     char from[RS_PATH], to[RS_PATH];
     int ok = 1;
     unsigned i;
+    CopyFail fail;
 
+    fail.path[0] = 0;
+    fail.code = 0;
+    fail.waits = COPY_WAITS;
     for (i = 0; i < 2; i++) {
         snprintf(from, sizeof from, "%s/%s", sandbox, k_sio_parts[i]);
         snprintf(to, sizeof to, "%s/%s", root, k_sio_parts[i]);
-        if (is_dir(from) && !copy_tree(from, to, 1))
+        if (is_dir(from) && !copy_tree_a(from, to, 1, 1, &fail))
             ok = 0;
     }
+    if (!ok && fail.path[0])
+        fprintf(stderr, "[SAVE] the cheat session's copy could not be put over the save: %s (error %u)\n",
+                fail.path, fail.code);
     return ok;
 }
 

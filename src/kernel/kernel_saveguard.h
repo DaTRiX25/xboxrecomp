@@ -54,6 +54,24 @@ int xbox_SaveGuardBusy(void);
  * of the windows that end with ExitProcess). */
 int xbox_SaveGuardWait(unsigned ms);
 
+/* A save that could not be put in place (Windows: another program held the
+ * old file, so the rename over it failed). The newer file is never thrown
+ * away: it is kept beside the old one ("<name>.~pend"), reads of the name see
+ * it, and the rename is tried again at the next save's close and on the way
+ * out; what is still pending at the end is put in place by the next start
+ * (or, when it cannot be, kept in the save history and pending again).
+ * After a few failed tries this returns a sequence number (> 0, new for each
+ * new failure) and the text for the player in `out`; 0 while nothing is
+ * wrong. Any thread. */
+int xbox_SaveGuardProblem(char *out, unsigned n);
+
+/* How many saves wait to be put in place (above). */
+int xbox_SaveGuardPending(void);
+
+/* Tests: the next `n` renames of a new save over the old one fail, as a
+ * Windows rename fails while another program holds the old file. */
+void xbox_SaveGuardFailReplace(int n);
+
 /* Tests: end the process (_exit, code 90 + step) at this step of the next
  * save. 0 turns it off. */
 #define XBOX_SAVE_FAULT_AFTER_OPEN      1   /* the new file is there, a copy   */
@@ -91,7 +109,8 @@ void xbox_saveguard_close(HANDLE h);
  * the answer is the one after the save. */
 void xbox_saveguard_settle(const xbox_host_char *host_path);
 
-/* 1 for a name the title must not see in a listing ("<name>.~new"). */
+/* 1 for a name the title must not see in a listing ("<name>.~new",
+ * "<name>.~pend"). */
 int xbox_saveguard_hidden_name(const xbox_host_char *name);
 
 #ifdef __cplusplus

@@ -1291,6 +1291,35 @@ int main(int argc, char **argv)
             CHECK(s_cheat[0] == 0);                           /* asked, not yet on */
             snprintf(path, sizeof path, "%scheats_confirm.bmp", pre);
             frame(path);
+            /* On, then both off: the question; "No" throws it away, and
+             * the page and the foot say saving waits for a restart. */
+            pad(SDL_CONTROLLER_BUTTON_A, true);
+            pad(SDL_CONTROLLER_BUTTON_A, false);
+            run(2);
+            CHECK(s_cheat[0] == 1 && xbox_OverlayTestHasRow("Quit game (progress made with cheats is not saved)"));
+            CHECK(xbox_OverlayTestSelectRow("Unlock everything"));
+            run(1);
+            pad(SDL_CONTROLLER_BUTTON_A, true);
+            pad(SDL_CONTROLLER_BUTTON_A, false);
+            run(1);
+            CHECK(xbox_OverlayTestSelectRow("Endless boost"));
+            run(1);
+            pad(SDL_CONTROLLER_BUTTON_A, true);
+            pad(SDL_CONTROLLER_BUTTON_A, false);
+            run(2);
+            CHECK(s_cheat[0] == 0 && s_cheat[1] == 0 && xbox_OverlayTestHasRow("Yes: keep it in my save"));
+            CHECK(!xbox_OverlayTestHasRow("Progress is not being saved until you restart."));
+            CHECK(xbox_OverlayTestSelectRow("No: throw it away"));
+            run(1);
+            pad(SDL_CONTROLLER_BUTTON_A, true);
+            pad(SDL_CONTROLLER_BUTTON_A, false);
+            run(2);
+            CHECK(!xbox_OverlayTestHasRow("Yes: keep it in my save"));
+            CHECK(xbox_OverlayTestHasRow("Progress is not being saved until you restart."));
+            CHECK(xbox_OverlayTestHasRow("Restart now to apply 3 changes"));
+            CHECK(xbox_OverlayTestHasRow("Quit game (progress is not being saved until a restart)"));
+            snprintf(path, sizeof path, "%scheats_discarded.bmp", pre);
+            frame(path);
             pad(SDL_CONTROLLER_BUTTON_DPAD_UP, true);
             pad(SDL_CONTROLLER_BUTTON_DPAD_UP, false);
             run(1);

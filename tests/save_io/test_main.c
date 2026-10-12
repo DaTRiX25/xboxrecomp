@@ -412,6 +412,41 @@ int main(int argc, char **argv)
         CHECK("history: a folder of another name is left alone", there(in("H/save-history/keep-me/note.txt")));
         CHECK("history: the save itself is untouched", has(in("H/UDATA/" ID "/57BD267AFF58/Profile 1"), "profile of H"));
     }
+    /* A cheat session's copy kept over the save (recomp_save_sandbox_commit):
+     * every file of it in place, whole, through a new file beside the old
+     * one and a rename; nothing left beside; the rest of the save stays; a
+     * new file of the save's (".~new", a save on its way) in the copy is not
+     * carried over. */
+    make_root("S", "profile before cheats");
+    {
+        char sb[1024];
+        snprintf(sb, sizeof sb, "%s", in("S/cheat-session"));
+        CHECK("sandbox: begin", recomp_save_sandbox_begin(in("S"), sb));
+        CHECK("sandbox: the copy holds the save", has(join(sb, "UDATA/" ID "/57BD267AFF58/Profile 1"),
+                                                      "profile before cheats"));
+        put("S/cheat-session/UDATA/" ID "/57BD267AFF58/Profile 1", "profile with cheats");
+        put("S/cheat-session/UDATA/" ID "/57BD267AFF58/Profile 2", "a new profile");
+        put("S/cheat-session/UDATA/" ID "/57BD267AFF58/Profile 1.~new", "half a save");
+        CHECK("sandbox: commit", recomp_save_sandbox_commit(sb, in("S")));
+        CHECK("sandbox: the changed file is in the save",
+              has(in("S/UDATA/" ID "/57BD267AFF58/Profile 1"), "profile with cheats"));
+        CHECK("sandbox: the new file is in the save", has(in("S/UDATA/" ID "/57BD267AFF58/Profile 2"), "a new profile"));
+        CHECK("sandbox: the rest of the save stays", has(in("S/UDATA/" ID "/TitleMeta.xbx"), "meta")
+              && has(in("S/UDATA/11112222/other title"), "not ours"));
+#if !defined(_WIN32)
+        {
+            static char list[16384];
+            list[0] = 0;
+            listing(in("S"), "UDATA", list, sizeof list);
+            CHECK("sandbox: nothing left beside the save's files", list[0] && !strstr(list, ".~new"));
+        }
+#else
+        CHECK("sandbox: nothing left beside the save's files",
+              !there(in("S/UDATA/" ID "/57BD267AFF58/Profile 1.~new")));
+#endif
+        recomp_save_sandbox_discard(sb);
+        CHECK("sandbox: discard removes the copy", !there(sb));
+    }
 #if defined(_WIN32)
     test_history_beside_open_files();
 #endif

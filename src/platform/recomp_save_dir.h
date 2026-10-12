@@ -93,7 +93,10 @@ int recomp_save_backup(const char *dir, int keep, char *out, unsigned out_size);
  * While a cheat is on (xbox_OverlaySetCheats), the title's saves go to a copy
  * (xbox_PathSetUserRoot), so its UDATA and TDATA are not written: begin copies
  * root/UDATA and root/TDATA to `sandbox` (anything there before is removed
- * first), commit copies them back over the root, discard removes the copy.
+ * first), commit copies them back over the root (each file written beside
+ * the old one, flushed, and renamed over it: a file of the save is the old
+ * one or the new one, whole, whatever happens; the caller takes a history
+ * copy of the save first, recomp_save_history_take), discard removes the copy.
  * Paths UTF-8. 1 when every file was copied.
  */
 int recomp_save_sandbox_begin(const char *root, const char *sandbox);

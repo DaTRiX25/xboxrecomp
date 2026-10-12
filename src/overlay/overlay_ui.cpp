@@ -248,10 +248,14 @@ void xbox_OverlayWantRestart(const char *reason)
 
 /* And the overlay's own: a save import that waits for the start. */
 static char s_restart_save[200];
+/* And cheats' progress thrown away: the title still holds it in memory, so
+ * its saves go to the side copy until a restart (cheat_action). Its own
+ * slot: the port's reason (a music folder) must not overwrite it. */
+static char s_restart_cheat[200];
 
 static bool restart_wanted()
 {
-    return xbox_SettingsNeedRestart() || s_restart_why[0] || s_restart_save[0];
+    return xbox_SettingsNeedRestart() || s_restart_why[0] || s_restart_save[0] || s_restart_cheat[0];
 }
 
 /* How many changes wait for a restart: the settings changed that are read at
@@ -264,7 +268,7 @@ static int restart_count()
         if ((s->flags & XS_RESTART) && s->value != s->launch)
             n++;
     }
-    return n + (s_restart_why[0] ? 1 : 0) + (s_restart_save[0] ? 1 : 0);
+    return n + (s_restart_why[0] ? 1 : 0) + (s_restart_save[0] ? 1 : 0) + (s_restart_cheat[0] ? 1 : 0);
 }
 
 /* Why: the settings changed that are read at start, by their table flag,
@@ -294,6 +298,7 @@ void xbox_OverlaySetHostRows(int n, const char *(*fn)(int row, int activate))
  * start. */
 extern "C" const char *xbox_PathUserRoot(void);           /* kernel/kernel.h */
 extern "C" void xbox_PathSetUserRoot(const char *utf8);
+extern "C" int xbox_SaveGuardProblem(char *out, unsigned n);  /* kernel/kernel_saveguard.h */
 enum { CS_NONE, CS_ON, CS_ASK, CS_DISCARDED };
 /* Restart game, Quit game and switching a cheat on ask once more: the
  * action armed, or 0 (activate, below). */
@@ -334,9 +339,29 @@ static bool cheat_any_on()
     return false;
 }
 
+static bool s_sio_on;
+static char s_sio_id[16];
+
 static void cheat_action(int action)
 {
     if (action == A_CHEAT_KEEP && s_cs == CS_ASK) {
+        /* The save as it is, kept in the save history first (restorable
+         * from "Restore an earlier save"); then each file of the copy goes
+         * over it whole or not at all (recomp_save_sandbox_commit). No
+         * history copy, no keep: the save is left as it is. */
+        if (s_sio_on && s_sio_id[0]) {
+            char made[1024];
+            if (!recomp_save_history_take(s_cs_root, s_sio_id, made, sizeof made)
+                && recomp_save_has_data(s_cs_root, s_sio_id)) {
+                snprintf(s_cs_info, sizeof s_cs_info,
+                         "Not kept: your save could not be backed up first, so it was not changed. Try again,"
+                         " or throw the progress away.");
+                fprintf(stderr, LOGP "cheats: not kept, the save could not be kept in the history first\n");
+                return;
+            }
+            if (made[0])
+                fprintf(stderr, LOGP "cheats: the save before keeping is in %s\n", made);
+        }
         int ok = recomp_save_sandbox_commit(s_cs_dir, s_cs_root);
         xbox_PathSetUserRoot(NULL);
         if (ok)
@@ -349,9 +374,14 @@ static void cheat_action(int action)
         return;
     }
     if (action == A_CHEAT_DISCARD && s_cs == CS_ASK) {
+        /* The title still holds the cheats' progress in memory, so its saves
+         * keep going to the side copy, and nothing played from now on
+         * reaches the save until the game starts again: said in yellow on
+         * the page and at the foot, and the restart offered. */
         s_cs = CS_DISCARDED;
-        snprintf(s_cs_info, sizeof s_cs_info,
-                 "Thrown away: your save is unchanged; saving is paused until a restart.");
+        s_cs_info[0] = 0;
+        snprintf(s_restart_cheat, sizeof s_restart_cheat,
+                 "Progress is not being saved until you restart (the cheats' progress was thrown away).");
         fprintf(stderr, LOGP "cheats: progress thrown away; saves go to the copy until restart\n");
         return;
     }
@@ -443,8 +473,7 @@ static uint32_t now_ms();
 
 /* ── save data (xbox_OverlaySetSaveIO, recomp_save_dir.h) ─────────── */
 
-static bool s_sio_on;
-static char s_sio_dir[1024], s_sio_id[16], s_sio_dest[1024], s_sio_note[200];
+static char s_sio_dir[1024], s_sio_dest[1024], s_sio_note[200];
 static char s_sio_info[200];          /* the line under the rows */
 static char s_sio_msg[2600];          /* the whole of it, for the rows' note */
 enum { FB_MUSIC, FB_SAVE };
@@ -756,6 +785,7 @@ static int page_rows(int page, Row *r)
 #define SET(i)  r[n++] = Row{ R_SETTING, (i), 0, NULL }
 #define ACT(a, t) r[n++] = Row{ R_ACTION, XS_COUNT, (a), (t) }
 #define INFO(t) r[n++] = Row{ R_INFO, XS_COUNT, 0, (t) }
+#define WARN(t) r[n++] = Row{ R_INFO, XS_COUNT, 1, (t) }   /* in the attention yellow */
 #define SPK(a, t) r[n++] = Row{ R_SPEAKERS, XS_COUNT, (a), (t) }
     switch (page) {
     case P_DISPLAY:
@@ -976,8 +1006,16 @@ static int page_rows(int page, Row *r)
                 ACT(A_CHEAT_KEEP, "Yes: keep it in my save");
                 ACT(A_CHEAT_DISCARD, "No: throw it away (my save stays as it was)");
             }
+            if (s_cs == CS_DISCARDED)
+                WARN("Progress is not being saved until you restart.");
             if (s_cs_info[0])
                 INFO(s_cs_info);
+        }
+        /* A save the save guard could not put in place (kernel_saveguard.h). */
+        {
+            static char sg[400];
+            if (xbox_SaveGuardProblem(sg, sizeof sg))
+                WARN(sg);
         }
         ACT(A_RESET_ALL, "Reset all settings to the defaults");
         break;
@@ -992,10 +1030,12 @@ static int page_rows(int page, Row *r)
         snprintf(label, sizeof label, "Restart now to apply %d change%s", k, k == 1 ? "" : "s");
         ACT(A_RESTART_PIN, label);
     }
-    ACT(A_QUIT, s_cs != CS_NONE ? "Quit game (progress made with cheats is not saved)" : "Quit game");
+    ACT(A_QUIT, s_cs == CS_DISCARDED ? "Quit game (progress is not being saved until a restart)"
+                : s_cs != CS_NONE ? "Quit game (progress made with cheats is not saved)" : "Quit game");
 #undef SET
 #undef ACT
 #undef INFO
+#undef WARN
 #undef SPK
     return n;
 }
@@ -1432,7 +1472,9 @@ static void restart_reason(char *out, size_t n)
     if (s_restart_why[0] && at < n)
         at += (size_t)snprintf(out + at, n - at, "%s%s", at ? " " : "", s_restart_why);
     if (s_restart_save[0] && at < n)
-        snprintf(out + at, n - at, "%s%s", at ? " " : "", s_restart_save);
+        at += (size_t)snprintf(out + at, n - at, "%s%s", at ? " " : "", s_restart_save);
+    if (s_restart_cheat[0] && at < n)
+        snprintf(out + at, n - at, "%s%s", at ? " " : "", s_restart_cheat);
 }
 
 /* The overlay closes as at any time (the settings are written), then the
@@ -1918,6 +1960,23 @@ static bool scripted_on()
     return show && xbox_InputScriptedPads() != 0;
 }
 
+/* A save the save guard could not put in place (kernel_saveguard.h): a
+ * new failure is shown over the game for a while, overlay open or not; the
+ * Advanced page keeps the line while it stands. */
+static char s_sg_text[400];
+static bool sg_banner_on()
+{
+    static int seen;
+    static uint32_t until;
+    const int seq = xbox_SaveGuardProblem(s_sg_text, sizeof s_sg_text);
+    const uint32_t now = now_ms();
+    if (seq && seq != seen) {
+        seen = seq;
+        until = now + 15000u;
+    }
+    return seq && (int32_t)(until - now) > 0;
+}
+
 int xbox_OverlayNotice(void)
 {
     return s_enabled && notice_on();
@@ -1926,7 +1985,7 @@ int xbox_OverlayNotice(void)
 int xbox_OverlayWants(void)
 {
     return s_enabled && (s_open || s_alpha > 0.0f || xbox_SettingValue(XS_ADVANCED_PERF) != 0.0
-                         || notice_on() || scripted_on());
+                         || notice_on() || scripted_on() || sg_banner_on());
 }
 
 void xbox_OverlayFramePresented(void)
@@ -2837,7 +2896,8 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
 
     if (r.kind == R_INFO) {
         Face ui(s_f_ui);
-        txt_fit(dl, LY.hint, ImVec2(lx, top_for(cy, LY.hint)), col(T->hint), r.text, LY.x_val1 - lx);
+        txt_fit(dl, LY.hint, ImVec2(lx, top_for(cy, LY.hint)), r.action ? col(T->attn) : col(T->hint), r.text,
+                LY.x_val1 - lx);
         return;
     }
     if (sel) {
@@ -3527,10 +3587,11 @@ static void build_pages_inner()
                  i < s_cheat_n && s_cheats[i].warning ? s_cheats[i].warning : "");
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_CHEAT_KEEP) {
         snprintf(hint, sizeof hint, "What the game saved while cheats were on goes into your save, and saving is"
-                 " back to normal.");
+                 " back to normal. Your save as it is now is kept in the save history first.");
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_CHEAT_DISCARD) {
         snprintf(hint, sizeof hint, "Your save stays as it was before the cheats. The game still holds that progress,"
-                 " so its saves keep going to the side copy until you start the game again.");
+                 " so nothing you play from now on is saved until you restart the game (the Restart row"
+                 " appears at the foot).");
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_QUIT) {
         snprintf(hint, sizeof hint, "%s%sCloses the game the way closing its window does: the settings are saved"
                  " and the game ends. What was not saved by the game is lost.",
@@ -3709,8 +3770,8 @@ bool overlay_begin_frame()
     s_alpha += (s_open ? 1.0f : -1.0f) * dt / 0.14f;
     s_alpha = s_alpha < 0 ? 0 : s_alpha > 1 ? 1 : s_alpha;
     bool perf = xbox_SettingValue(XS_ADVANCED_PERF) != 0.0;
-    bool note = notice_on(), scripted = scripted_on();
-    if (!s_open && s_alpha <= 0.0f && !perf && !note && !scripted)
+    bool note = notice_on(), scripted = scripted_on(), sg = sg_banner_on();
+    if (!s_open && s_alpha <= 0.0f && !perf && !note && !scripted && !sg)
         return false;
 
     ImGuiIO &io = ImGui::GetIO();
@@ -3778,6 +3839,17 @@ bool overlay_begin_frame()
         dl->AddRectFilled(ImVec2(p.x - fs, p.y - fs * 0.5f), ImVec2(p.x + tw + fs, p.y + fs * 1.5f),
                           solid(T->notice_bg, 235 / 255.0f), fs * 0.5f);
         dl->AddText(p, solid(T->notice_text), text);
+    }
+    if (sg) {
+        /* Top centre, below where the script line goes; the red band. */
+        ImDrawList *dl = ImGui::GetForegroundDrawList();
+        const ImVec2 disp = ImGui::GetIO().DisplaySize;
+        const float wrap = disp.x * 0.8f;
+        const ImVec2 ts = ImGui::CalcTextSize(s_sg_text, NULL, false, wrap);
+        const ImVec2 p((disp.x - ts.x) * 0.5f, fs * (scripted ? 3.4f : 1.2f));
+        dl->AddRectFilled(ImVec2(p.x - fs, p.y - fs * 0.5f), ImVec2(p.x + ts.x + fs, p.y + ts.y + fs * 0.5f),
+                          solid(T->notice_bg, 235 / 255.0f), fs * 0.5f);
+        dl->AddText(ImGui::GetFont(), fs, p, solid(T->notice_text), s_sg_text, NULL, wrap);
     }
     if (s_open || s_alpha > 0.0f) {
         /* A closing overlay still draws, fading. */

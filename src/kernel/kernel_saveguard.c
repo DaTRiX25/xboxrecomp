@@ -5,10 +5,13 @@
 #include "kernel.h"
 #include "kernel_saveguard.h"
 #include "recomp_exit_hook.h"
+#include "recomp_save_dir.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -46,6 +49,11 @@
 
 static const xbox_host_char k_suffix[] = HC(".~new");
 #define SUFFIX_LEN 5
+/* A new file that is whole and flushed but could not be renamed over the old
+ * one (Windows: another program held the old file): "<name>.~pend". Kept,
+ * tried again, and never removed unread (see "pending", below). */
+static const xbox_host_char k_pend[] = HC(".~pend");
+#define PEND_LEN 6
 
 /* ── state ─────────────────────────────────────────────────────────── */
 
@@ -78,6 +86,26 @@ static int            s_n_roots;
 static guard_entry    s_entry[ENTRIES];
 static void         (*s_hook)(void);
 static volatile int   s_fault_at;
+static int            s_fail_replace;     /* tests: replaces made to fail */
+
+/* Pending: a save whose rename over the old file failed. Its new file is
+ * kept as <name>.~pend; reads of the name see it, the next open for writing
+ * starts from it, and the rename is tried again at the next save's close
+ * and on the way out. After SG_TRIES failed tries the overlay is told
+ * (xbox_SaveGuardProblem). What is still pending at the end stays on the
+ * disk and the next start puts it in place (sweep_pend). */
+#define SG_TRIES 4                        /* the failed one and three more */
+typedef struct {
+    int            used;
+    int            tries;
+    unsigned       code;                  /* the system's error of the last try */
+    xbox_host_char real[MAX_PATH];
+    xbox_host_char pend[MAX_PATH];
+} pend_entry;
+static pend_entry     s_pend[ENTRIES];
+static int            s_retry_due;
+static char           s_problem[400];
+static int            s_problem_seq, s_problem_on;
 
 #if defined(_WIN32)
 static CRITICAL_SECTION   s_mu;
@@ -102,7 +130,7 @@ static void WAIT(unsigned ms)
     pthread_cond_timedwait(&s_cv, &s_mu, &ts);
 }
 #endif
-static int s_ready, s_worker;
+static int s_ready, s_worker, s_lock_ready;
 
 /* The process ends here when a test asked for it (kernel_saveguard.h). */
 static void fault(int step)
@@ -246,23 +274,30 @@ static int h_same(const xbox_host_char *a, const xbox_host_char *b)
     return same;
 }
 
-static int h_replace(const xbox_host_char *from, const xbox_host_char *to)
+static int h_replace(const xbox_host_char *from, const xbox_host_char *to, unsigned *code)
 {
 #if defined(_WIN32)
     int tries;
+    DWORD e = 0;
     for (tries = 0; tries < 25; tries++) {
         if (MoveFileExW(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
             return 1;
+        e = GetLastError();
         Sleep(20);                    /* a reader has the old one open */
     }
+    if (code)
+        *code = (unsigned)e;
     return 0;
 #else
     char dir[MAX_PATH];
     char *slash;
     int fd;
 
-    if (rename(from, to) != 0)
+    if (rename(from, to) != 0) {
+        if (code)
+            *code = (unsigned)errno;
         return 0;
+    }
     /* The name's change is in the folder: that goes to the disk too. */
     snprintf(dir, sizeof dir, "%s", to);
     slash = strrchr(dir, '/');
@@ -275,6 +310,70 @@ static int h_replace(const xbox_host_char *from, const xbox_host_char *to)
         }
     }
     return 1;
+#endif
+}
+
+/* The rename of a whole new save over the old one; the tests' fault hook
+ * can make it fail (xbox_SaveGuardFailReplace). */
+static int put_in_place(const xbox_host_char *from, const xbox_host_char *to, unsigned *code)
+{
+    if (s_fail_replace > 0) {
+        s_fail_replace--;
+#if defined(_WIN32)
+        *code = ERROR_SHARING_VIOLATION;
+#else
+        *code = EBUSY;
+#endif
+        return 0;
+    }
+    return h_replace(from, to, code);
+}
+
+static long long h_mtime(const xbox_host_char *p)
+{
+#if defined(_WIN32)
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExW(p, GetFileExInfoStandard, &a))
+        return -1;
+    return ((long long)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
+#else
+    struct stat st;
+    if (stat(p, &st) != 0)
+        return -1;
+#if defined(__APPLE__)
+    return (long long)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
+#else
+    return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+#endif
+#endif
+}
+
+/* The system's reason, in words a player can act on. */
+static void reason_text(unsigned code, char *out, size_t n)
+{
+#if defined(_WIN32)
+    switch (code) {
+    case ERROR_ACCESS_DENIED:
+        snprintf(out, n, "access was denied (another program, such as a virus scanner or a sync tool, "
+                 "may hold the file)");
+        break;
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+        snprintf(out, n, "another program has the save file open");
+        break;
+    case ERROR_DISK_FULL:
+    case ERROR_HANDLE_DISK_FULL:
+        snprintf(out, n, "the disk is full");
+        break;
+    case ERROR_WRITE_PROTECT:
+        snprintf(out, n, "the disk is write-protected");
+        break;
+    default:
+        snprintf(out, n, "Windows error %u", code);
+        break;
+    }
+#else
+    snprintf(out, n, "%s", strerror((int)code));
 #endif
 }
 
@@ -292,7 +391,121 @@ static int guarded(const xbox_host_char *p)
 int xbox_saveguard_hidden_name(const xbox_host_char *name)
 {
     size_t n = hlen(name);
-    return n > SUFFIX_LEN && !hcmp(name + n - SUFFIX_LEN, k_suffix);
+    return (n > SUFFIX_LEN && !hcmp(name + n - SUFFIX_LEN, k_suffix))
+        || (n > PEND_LEN && !hcmp(name + n - PEND_LEN, k_pend));
+}
+
+/* ── pending saves (see s_pend) ────────────────────────────────────── */
+
+/* With the lock held. */
+static pend_entry *pend_of(const xbox_host_char *real)
+{
+    int i;
+    for (i = 0; i < ENTRIES; i++)
+        if (s_pend[i].used && !hcmp(s_pend[i].real, real))
+            return &s_pend[i];
+    return NULL;
+}
+
+/* The overlay's line, from the latest failure; with the lock held. */
+static void problem_set(const pend_entry *p)
+{
+    char why[200];
+    reason_text(p->code, why, sizeof why);
+    snprintf(s_problem, sizeof s_problem, "A save could not be written: %s; your previous save is kept "
+             "(the newer one waits beside it and is tried again).", why);
+    s_problem_seq++;
+    s_problem_on = 1;
+    fprintf(stderr, LOGP LEAF_FMT ": %s\n", leaf(p->real), s_problem);
+}
+
+/* A pending save is done with (put in place, or overtaken by a newer one
+ * that was); with the lock held. */
+static void pend_drop(pend_entry *p, int remove_file)
+{
+    int i, left = 0;
+    if (remove_file && hcmp(p->pend, p->real))
+        h_unlink(p->pend);
+    p->used = 0;
+    for (i = 0; i < ENTRIES; i++)
+        left |= s_pend[i].used && s_pend[i].tries >= SG_TRIES;
+    if (!left)
+        s_problem_on = 0;
+}
+
+/* The rename of `shadow` over `real` failed (code): the new file is kept as
+ * <real>.~pend (or, when even that fails, where it is). Without the lock. */
+static void pend_add(const xbox_host_char *real, const xbox_host_char *shadow, unsigned code)
+{
+    xbox_host_char pend[MAX_PATH];
+    pend_entry *p;
+    unsigned c2 = 0;
+    int i;
+
+    hcpy(pend, MAX_PATH, real);
+    if (hlen(real) + PEND_LEN + 1 <= MAX_PATH)
+        memcpy(pend + hlen(real), k_pend, sizeof k_pend);
+    if (hlen(real) + PEND_LEN + 1 > MAX_PATH || !h_replace(shadow, pend, &c2)) {
+        hcpy(pend, MAX_PATH, shadow);
+        fprintf(stderr, LOGP LEAF_FMT ": kept as the new file beside it (it could not be renamed either)\n",
+                leaf(real));
+    }
+    LOCK();
+    p = pend_of(real);
+    if (!p)
+        for (i = 0; i < ENTRIES && !p; i++)
+            if (!s_pend[i].used) {
+                p = &s_pend[i];
+                memset(p, 0, sizeof *p);
+            }
+    if (p) {
+        if (p->used && hcmp(p->pend, pend) && hcmp(p->pend, p->real))
+            h_unlink(p->pend);        /* an older pending one: this is newer */
+        p->used = 1;
+        hcpy(p->real, MAX_PATH, real);
+        hcpy(p->pend, MAX_PATH, pend);
+        p->tries++;
+        p->code = code;
+        if (p->tries >= SG_TRIES)
+            problem_set(p);
+    }
+    UNLOCK();
+    if (!p) {
+        pend_entry tmp;
+        hcpy(tmp.real, MAX_PATH, real);
+        tmp.code = code;
+        LOCK();
+        problem_set(&tmp);
+        UNLOCK();
+    }
+}
+
+/* Try the pending renames again: those under SG_TRIES tries, or all of them
+ * (the way out). With the lock held; a rename can take half a second on
+ * Windows (h_replace), and only a save that failed pays it. */
+static void pend_retry(int all)
+{
+    int i;
+    for (i = 0; i < ENTRIES; i++) {
+        pend_entry *p = &s_pend[i];
+        unsigned code = 0;
+        if (!p->used || (!all && p->tries >= SG_TRIES))
+            continue;
+        if (!h_exists(p->pend)) {
+            pend_drop(p, 0);
+            continue;
+        }
+        if (put_in_place(p->pend, p->real, &code)) {
+            fprintf(stderr, LOGP LEAF_FMT ": the save that could not be put in place is in place now "
+                    "(try %d)\n", leaf(p->real), p->tries + 1);
+            pend_drop(p, 0);
+            continue;
+        }
+        p->tries++;
+        p->code = code;
+        if (p->tries == SG_TRIES)
+            problem_set(p);
+    }
 }
 
 static guard_entry *entry_of_path(const xbox_host_char *real)
@@ -321,9 +534,22 @@ static guard_entry *entry_of_handle(HANDLE h, int *slot)
 
 /* Flush what the title wrote, then put it in the real file's place: the
  * rename is the one moment the save changes, and it changes whole. */
+/* A newer whole save of `real` is in place (or it was deleted): what was
+ * pending for it is overtaken. Without the lock. */
+static void pend_done(const xbox_host_char *real)
+{
+    pend_entry *p;
+    LOCK();
+    p = pend_of(real);
+    if (p)
+        pend_drop(p, 1);
+    UNLOCK();
+}
+
 static void commit(guard_entry *e)
 {
     double t0 = now_ms(), t_flush;
+    unsigned code = 0;
     int changed;
 
     fault(XBOX_SAVE_FAULT_BEFORE_FLUSH);
@@ -349,6 +575,7 @@ static void commit(guard_entry *e)
          * renamed it away. */
         if (e->deleted) {
             h_unlink(e->real);
+            pend_done(e->real);
             fprintf(stderr, LOGP LEAF_FMT ": deleted by the title\n", leaf(e->real));
         }
         return;
@@ -358,6 +585,7 @@ static void commit(guard_entry *e)
         /* The same bytes again (a title rewrites its meta file at every
          * save): nothing to replace, nothing to keep a copy of. */
         h_unlink(e->shadow);
+        pend_done(e->real);
         if (e->writes)                /* opened for writing and not written: not worth a line */
             fprintf(stderr, LOGP LEAF_FMT ": written with the same content (%u writes, %llu bytes), left as it is\n",
                 leaf(e->real), e->writes, e->bytes);
@@ -366,14 +594,20 @@ static void commit(guard_entry *e)
     /* The port's moment to keep the save as it still is (the history). */
     if (s_hook)
         s_hook();
-    if (!h_replace(e->shadow, e->real)) {
+    if (!put_in_place(e->shadow, e->real, &code)) {
+        char why[200];
+        reason_text(code, why, sizeof why);
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "save: the new file could not replace the old one; "
-                 "the old one stays");
-        fprintf(stderr, LOGP LEAF_FMT ": the new file could not be put in place; the previous one stays\n",
-                leaf(e->real));
-        h_unlink(e->shadow);
+                 "both are kept");
+        fprintf(stderr, LOGP LEAF_FMT ": the new file could not be put in place (%s); the previous one "
+                "stays, the new one is kept beside it and tried again\n", leaf(e->real), why);
+        /* Never thrown away: kept, tried again at the next close and on the
+         * way out, put in place by the next start at the latest. */
+        pend_add(e->real, e->shadow, code);
         return;
     }
+    /* A newer save is in place: one that waited is overtaken. */
+    pend_done(e->real);
     fprintf(stderr, LOGP LEAF_FMT ": replaced (%u writes, %llu bytes; flush %.1f ms, all %.1f ms)\n",
             leaf(e->real), e->writes, e->bytes, t_flush, now_ms() - t0);
     fault(XBOX_SAVE_FAULT_AFTER_REPLACE);
@@ -392,6 +626,14 @@ static void *worker(void *arg)
         int i;
         for (i = 0; i < ENTRIES; i++)
             if (s_entry[i].state == E_QUEUED) { e = &s_entry[i]; break; }
+        if (!e && s_retry_due) {
+            /* A save was closed after one that could not be put in place:
+             * the pending ones are tried again, after that save. */
+            s_retry_due = 0;
+            pend_retry(0);
+            SIGNAL();
+            continue;
+        }
         if (!e) {
             WAIT(1000);
             continue;
@@ -449,6 +691,10 @@ void *xbox_saveguard_open(xbox_host_char *host_path, unsigned n, int write_acces
     LOCK();
     wait_committed(host_path);
     if (!write_access) {
+        /* A newer save waits beside the file: a read sees that one. */
+        pend_entry *p = pend_of(host_path);
+        if (p && hlen(p->pend) + 1 <= n && h_exists(p->pend))
+            hcpy(host_path, n, p->pend);
         UNLOCK();
         return NULL;
     }
@@ -477,11 +723,21 @@ void *xbox_saveguard_open(xbox_host_char *host_path, unsigned n, int write_acces
     hcpy(e->shadow, MAX_PATH, host_path);
     memcpy(e->shadow + hlen(e->shadow), k_suffix, sizeof k_suffix);
     /* The new file starts as the old one, so an open that keeps what is
-     * there, and a write of a part, see the bytes they expect. */
-    h_unlink(e->shadow);
-    if (h_exists(e->real) && !h_copy(e->real, e->shadow)) {
-        UNLOCK();
-        return NULL;                  /* no room for a second copy: in place */
+     * there, and a write of a part, see the bytes they expect; the newest
+     * one: a save that waits to be put in place (pending) when there is. */
+    {
+        pend_entry *p = pend_of(e->real);
+        if (p && !hcmp(p->pend, e->shadow)) {
+            /* Kept under the new file's own name: it is the start already. */
+        } else {
+            h_unlink(e->shadow);
+            if (p && h_exists(p->pend) && h_copy(p->pend, e->shadow)) {
+                /* from the pending one */
+            } else if (h_exists(e->real) && !h_copy(e->real, e->shadow)) {
+                UNLOCK();
+                return NULL;          /* no room for a second copy: in place */
+            }
+        }
     }
     e->state = E_OPEN;
     e->n_handles = 1;
@@ -604,6 +860,12 @@ void xbox_saveguard_close(HANDLE h)
     e->flush = dup(w32_handle_fd(h));
 #endif
     e->state = E_QUEUED;
+    {
+        int i;
+        for (i = 0; i < ENTRIES; i++)
+            if (s_pend[i].used && s_pend[i].tries < SG_TRIES)
+                s_retry_due = 1;
+    }
     start_worker();
     if (!s_worker) {                  /* no thread: here and now */
         e->state = E_COMMITTING;
@@ -611,6 +873,10 @@ void xbox_saveguard_close(HANDLE h)
         commit(e);
         LOCK();
         e->state = E_FREE;
+        if (s_retry_due) {
+            s_retry_due = 0;
+            pend_retry(0);
+        }
     }
     SIGNAL();
     UNLOCK();
@@ -649,8 +915,152 @@ void xbox_SaveGuardSetHook(void (*before_replace)(void))
     s_hook = before_replace;
 }
 
+int xbox_SaveGuardProblem(char *out, unsigned n)
+{
+    int seq = 0;
+    if (out && n)
+        out[0] = 0;
+    if (!s_lock_ready)
+        return 0;
+    LOCK();
+    if (s_problem_on) {
+        seq = s_problem_seq;
+        if (out && n)
+            snprintf(out, n, "%s", s_problem);
+    }
+    UNLOCK();
+    return seq;
+}
+
+int xbox_SaveGuardPending(void)
+{
+    int i, k = 0;
+    if (!s_lock_ready)
+        return 0;
+    LOCK();
+    for (i = 0; i < ENTRIES; i++)
+        k += s_pend[i].used;
+    UNLOCK();
+    return k;
+}
+
+void xbox_SaveGuardFailReplace(int n)
+{
+    s_fail_replace = n;
+}
+
+/* A save that an earlier run could not put in place (<name>.~pend: whole
+ * and flushed; the rename over the old file failed to the end). Never just
+ * removed: when it is newer than the file beside it, it is put in place;
+ * when that fails, or it is older, the save with it in place is kept in the
+ * save history first (a whole save, restorable from the overlay), and a
+ * newer one that still cannot be put in place stays pending for this run.
+ * At enable, single-threaded. */
+static const char *s_title_id;
+
+static void keep_aside(const xbox_host_char *pend, const xbox_host_char *real, char *made, size_t made_n)
+{
+    char root8[MAX_PATH * 3], out[MAX_PATH * 3], err[600], rel8[MAX_PATH * 3];
+    xbox_host_char hroot[MAX_PATH], dest[MAX_PATH];
+    const char *r = xbox_PathUserRoot();
+    size_t rl;
+
+    made[0] = 0;
+    if (!r || !*r || !s_title_id)
+        return;
+    snprintf(root8, sizeof root8, "%s", r);
+#if defined(_WIN32)
+    if (!MultiByteToWideChar(CP_UTF8, 0, root8, -1, hroot, MAX_PATH))
+        return;
+#else
+    snprintf(hroot, sizeof hroot, "%s", root8);
+#endif
+    rl = hlen(hroot);
+    while (rl > 1 && HSEP(hroot[rl - 1]))
+        hroot[--rl] = 0;
+    if (hncmp(real, hroot, rl) || !HSEP(real[rl]))
+        return;
+    {
+        char hist[MAX_PATH * 3];
+        snprintf(hist, sizeof hist, "%s/save-history", root8);
+        if (!recomp_save_export(root8, s_title_id, hist,
+                                "kept at the start: a newer save file an earlier run could not put in place "
+                                "is in it", out, sizeof out, err, sizeof err)) {
+            fprintf(stderr, LOGP "the waiting save could not be kept in the history: %s\n", err);
+            return;
+        }
+    }
+#if defined(_WIN32)
+    if (!WideCharToMultiByte(CP_UTF8, 0, real + rl + 1, -1, rel8, (int)sizeof rel8, NULL, NULL))
+        return;
+    {
+        char d8[MAX_PATH * 3];
+        snprintf(d8, sizeof d8, "%s/%s", out, rel8);
+        if (!MultiByteToWideChar(CP_UTF8, 0, d8, -1, dest, MAX_PATH))
+            return;
+    }
+#else
+    snprintf(rel8, sizeof rel8, "%s", real + rl + 1);
+    snprintf(dest, sizeof dest, "%s/%s", out, rel8);
+#endif
+    if (h_copy(pend, dest))
+        snprintf(made, made_n, "%s", out);
+}
+
+static void sweep_pend(const xbox_host_char *pend)
+{
+    xbox_host_char real[MAX_PATH];
+    char made[MAX_PATH * 3];
+    unsigned code = 0;
+    int newer;
+    size_t n = hlen(pend);
+
+    hcpy(real, MAX_PATH, pend);
+    real[n - PEND_LEN] = 0;
+    newer = !h_exists(real) || h_mtime(pend) >= h_mtime(real);
+    if (newer && put_in_place(pend, real, &code)) {
+        fprintf(stderr, LOGP LEAF_FMT ": a save an earlier run could not put in place is in place now\n",
+                leaf(real));
+        return;
+    }
+    keep_aside(pend, real, made, sizeof made);
+    if (newer) {
+        pend_entry *p = NULL;
+        int i;
+        LOCK();
+        for (i = 0; i < ENTRIES && !p; i++)
+            if (!s_pend[i].used)
+                p = &s_pend[i];
+        if (p) {
+            memset(p, 0, sizeof *p);
+            p->used = 1;
+            p->tries = SG_TRIES - 1;      /* one more try at the next save's close */
+            p->code = code;
+            hcpy(p->real, MAX_PATH, real);
+            hcpy(p->pend, MAX_PATH, pend);
+            problem_set(p);
+        }
+        UNLOCK();
+        fprintf(stderr, LOGP LEAF_FMT ": a save an earlier run could not put in place still cannot be "
+                "(kept beside it%s%s)\n", leaf(real), made[0] ? " and in " : "", made);
+    } else if (made[0]) {
+        h_unlink(pend);
+        fprintf(stderr, LOGP LEAF_FMT ": an older save file an earlier run could not put in place was "
+                "moved to %s\n", leaf(real), made);
+    } else {
+        fprintf(stderr, LOGP LEAF_FMT ": an older save file an earlier run could not put in place is "
+                "left beside it (it could not be kept in the history)\n", leaf(real));
+    }
+}
+
+static int is_pend_name(const xbox_host_char *name)
+{
+    size_t n = hlen(name);
+    return n > PEND_LEN && !hcmp(name + n - PEND_LEN, k_pend);
+}
+
 /* A new file that never took its place (the process ended first) is not a
- * save: the old file beside it is. */
+ * save: the old file beside it is. A pending one (whole) is: sweep_pend. */
 static void sweep(const xbox_host_char *dir, int depth)
 {
 #if defined(_WIN32)
@@ -670,6 +1080,8 @@ static void sweep(const xbox_host_char *dir, int depth)
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (depth < 6 && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
                 sweep(path, depth + 1);
+        } else if (is_pend_name(fd.cFileName)) {
+            sweep_pend(path);
         } else if (xbox_saveguard_hidden_name(fd.cFileName)) {
             fprintf(stderr, LOGP "an unfinished save write was found and removed; the save before it stands\n");
             h_unlink(path);
@@ -692,6 +1104,8 @@ static void sweep(const xbox_host_char *dir, int depth)
         if (S_ISDIR(st.st_mode)) {
             if (depth < 6)
                 sweep(path, depth + 1);
+        } else if (S_ISREG(st.st_mode) && is_pend_name(e->d_name)) {
+            sweep_pend(path);
         } else if (S_ISREG(st.st_mode) && xbox_saveguard_hidden_name(e->d_name)) {
             fprintf(stderr, LOGP "an unfinished save write was found and removed; the save before it stands\n");
             h_unlink(path);
@@ -707,11 +1121,23 @@ static void sweep(const xbox_host_char *dir, int depth)
  * way gets up to two seconds. */
 static void wait_at_exit(void)
 {
+    int i, left = 0;
     if (xbox_SaveGuardBusy()) {
         double t0 = now_ms();
         int done = xbox_SaveGuardWait(2000);
         fprintf(stderr, LOGP "the way out waited %.0f ms for a save to reach the disk%s\n",
                 now_ms() - t0, done ? "" : "; it was not done in time, the save before it stands");
+        fflush(stderr);
+    }
+    /* A save that could not be put in place: a last try. */
+    LOCK();
+    pend_retry(1);
+    for (i = 0; i < ENTRIES; i++)
+        left += s_pend[i].used;
+    UNLOCK();
+    if (left) {
+        fprintf(stderr, LOGP "%d save file%s could not be put in place; the newer version is kept beside "
+                "the old one and is put in place at the next start\n", left, left == 1 ? "" : "s");
         fflush(stderr);
     }
 }
@@ -730,11 +1156,17 @@ void xbox_SaveGuardEnable(const char *title_id)
 
     if (!title_id || !*title_id)
         return;
-    if (!s_ready) {
+    if (!s_lock_ready) {
 #if defined(_WIN32)
         InitializeCriticalSection(&s_mu);
         InitializeConditionVariable(&s_cv);
 #endif
+        s_lock_ready = 1;
+    }
+    {
+        static char id[16];
+        snprintf(id, sizeof id, "%s", title_id);
+        s_title_id = id;
     }
     for (i = 0; i < 2; i++) {
         xbox_host_char *r = s_root[s_n_roots < ROOTS ? s_n_roots : ROOTS - 1];
