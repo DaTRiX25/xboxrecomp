@@ -149,6 +149,393 @@ static void mixer_signal(void)
     }
 }
 
+/* ── OVERLAY_SHOT_MIXER_E2E=<preset file>: every control of the Mixer page,
+ * worked with pad buttons as a player does, and after each: the mixer's
+ * active configuration changed AND what it renders changed. Three voices
+ * as the game makes them: music (a stereo stream on the speaker bins), a
+ * positioned impact (six sends), the player's engine (mixbin 17). */
+extern "C" int xbox_OverlayMixerSelect(const char *label);
+extern "C" int xbox_OverlayMixerView(void);
+
+enum { V_MUSIC = 1, V_IMPACT = 2, V_ENGINE = 4 };
+static double e_spk[6], e_peak;                 /* speaker feeds: RMS, and the peak */
+
+static void e2e_render(int voices)
+{
+    static const int8_t map[32] = { 0, 1, 2, 3, 4, 5, 0, 1, 4, 5, 0, 1, 0, 1, 4, 5, 2, 0, 1,
+                                    0, 1, 4, 5, 2, 3, 0, -1, 1, 0, 1, 0, 1 };
+    static const int b_music[8] = { 0, 1, 4, 5, 2, 3, 6, 7 }, b_pos[8] = { 19, 20, 16, 24, 14, 15, 11, 0 },
+                     b_eng[8] = { 0, 1, 4, 5, 2, 17, 3, 6 };
+    static const float g_music[8] = { 0.5f, 0.5f, 0.4f, 0.4f, 0, 0.07f, 0, 0 },
+                       g_pos[8] = { 0.5f, 0.1f, 0.2f, 0.05f, 0.3f, 0.1f, 0, 0 },
+                       g_eng[8] = { 0, 0, 0, 0, 0, 0.5f, 0, 0 };
+    static float bins[32][32], feeds[6][32], st[32][2], mono[32][2], low[32][2];
+    static unsigned long t_low;
+    double sq[6] = { 0, 0, 0, 0, 0, 0 };
+    int n = 0;
+    e_peak = 0;
+    for (int f = 0; f < 1200; f++) {
+        struct apu_bus_rt *rt = apu_bus_frame_begin(6, map);
+        if (!rt) { memset(e_spk, 0, sizeof e_spk); return; }
+        memset(bins, 0, sizeof bins);
+        for (int i = 0; i < 32; i++) {
+            /* 6 kHz: whole periods in a frame, left and right orthogonal.
+             * The engine: 100 Hz, running on from frame to frame. */
+            low[i][0] = low[i][1] = sinf(2.0f * 3.14159265f * 100.0f * (float)(t_low++ % 480) / 48000.0f);
+            st[i][0] = sinf(2.0f * 3.14159265f * 4.0f * (float)i / 32.0f);
+            st[i][1] = cosf(2.0f * 3.14159265f * 4.0f * (float)i / 32.0f);
+            mono[i][0] = mono[i][1] = sinf(2.0f * 3.14159265f * 3.0f * (float)i / 32.0f);
+        }
+        if (apu_bus_audition_playing()) {
+            /* A clip loops: its voices in place of the live ones (apu_vp.c). */
+            apu_bus_audition_mix(rt, bins);
+        } else {
+        if (voices & V_MUSIC)  apu_bus_mix_voice(rt, 0, bins, (const float (*)[2])st, 2, b_music, g_music);
+        if (voices & V_IMPACT) apu_bus_mix_voice(rt, 9, bins, (const float (*)[2])mono, 1, b_pos, g_pos);
+        if (voices & V_ENGINE) apu_bus_mix_voice(rt, 4, bins, (const float (*)[2])low, 1, b_eng, g_eng);
+        }
+        apu_bus_frame_end(rt, bins);
+        memset(feeds, 0, sizeof feeds);
+        for (int b = 0; b < 32; b++)
+            if (map[b] >= 0)
+                for (int i = 0; i < 32; i++) feeds[map[b]][i] += bins[b][i];
+        apu_bus_output(feeds, 6, 32);
+        if (f < 900) continue;                  /* filters, ducking and the limiter settled */
+        for (int c = 0; c < 6; c++)
+            for (int i = 0; i < 32; i++) {
+                sq[c] += (double)feeds[c][i] * feeds[c][i];
+                if (fabs(feeds[c][i]) > e_peak) e_peak = fabs(feeds[c][i]);
+            }
+        n += 32;
+    }
+    for (int c = 0; c < 6; c++) e_spk[c] = sqrt(sq[c] / n);
+}
+
+static double e_db(double a, double b) { return a > 1e-9 && b > 1e-9 ? 20.0 * log10(a / b) : a > 1e-9 ? 200.0 : -200.0; }
+#define SILENT(c) (e_spk[c] < 1e-6)
+
+static void ptap(int button, int times = 1)
+{
+    for (int i = 0; i < times; i++) {
+        pad(button, true); run(1);
+        pad(button, false); run(1);
+    }
+}
+#define P_A     SDL_CONTROLLER_BUTTON_A
+#define P_B     SDL_CONTROLLER_BUTTON_B
+#define P_Y     SDL_CONTROLLER_BUTTON_Y
+#define P_UP    SDL_CONTROLLER_BUTTON_DPAD_UP
+#define P_DOWN  SDL_CONTROLLER_BUTTON_DPAD_DOWN
+#define P_LEFT  SDL_CONTROLLER_BUTTON_DPAD_LEFT
+#define P_RIGHT SDL_CONTROLLER_BUTTON_DPAD_RIGHT
+#define P_LB    SDL_CONTROLLER_BUTTON_LEFTSHOULDER
+#define P_RB    SDL_CONTROLLER_BUTTON_RIGHTSHOULDER
+#define SEL(label) do { CHECK(xbox_OverlayMixerSelect(label)); run(1); } while (0)
+
+static int mixer_e2e(const char *file)
+{
+    static const char *const names[13] = {
+        "Music", "DJ", "Film", "Streams", "Player engine", "Player exhaust", "Other cars",
+        "Traffic", "Tyres/road/wind", "Impacts/crash", "Boost", "UI/HUD", "Other" };
+    apu_bus_config c;
+    double base[6], v;
+
+    remove(file);
+    apu_bus_set_names(names, 13);
+    apu_bus_set_duck_default(9, 0);
+    apu_bus_add_preset("Factory", "", "");
+    apu_bus_add_preset("Music front", "", "[bus.music]\nroute = \"pan\"\npan_x = 0\npan_y = 1\npan_width = 1\n");
+    apu_bus_set_file(file);
+
+    /* Open, Audio, the Mixer row; on. The other pages pause the title, the
+     * Mixer page does not. */
+    pad(SDL_CONTROLLER_BUTTON_BACK, true); pad(SDL_CONTROLLER_BUTTON_START, true);
+    pad(SDL_CONTROLLER_BUTTON_START, false); pad(SDL_CONTROLLER_BUTTON_BACK, false);
+    run(12);
+    CHECK(xbox_OverlayOpen() && xbox_HostPaused() && xbox_InputBlocked());
+    ptap(P_RB, 2); run(3);
+    ptap(P_DOWN, 5);
+    ptap(P_A); run(3);
+    CHECK(xbox_OverlayMixerView() == 0);
+    CHECK(!xbox_HostPaused() && xbox_InputBlocked());               /* live: runs, input still ours */
+    SEL("Mixer"); ptap(P_A); run(2);
+    CHECK(apu_bus_enabled());
+    e2e_render(V_MUSIC);
+    memcpy(base, e_spk, sizeof base);
+    CHECK(base[0] > 0.1 && base[4] > 0.1 && SILENT(2));             /* the game's music: four corners */
+
+    /* Bus gain, mute (LB), solo (RB), reset (Y), from the list. */
+    SEL("Music"); ptap(P_RIGHT, 4);
+    apu_bus_get_config(&c); CHECK(c.bus[0].gain_db == 2.0f);
+    e2e_render(V_MUSIC); CHECK(fabs(e_db(e_spk[0], base[0]) - 2.0) < 0.01);
+    ptap(P_LB);
+    apu_bus_get_config(&c); CHECK(c.bus[0].mute);
+    e2e_render(V_MUSIC); CHECK(SILENT(0) && SILENT(4));
+    ptap(P_LB);
+    SEL("Film"); ptap(P_RB);
+    apu_bus_get_config(&c); CHECK(c.bus[2].solo && !c.bus[0].mute);
+    e2e_render(V_MUSIC); CHECK(SILENT(0));
+    ptap(P_RB);
+    SEL("Music"); ptap(P_Y);
+    apu_bus_get_config(&c); CHECK(c.bus[0].gain_db == 0.0f);
+    e2e_render(V_MUSIC); CHECK(fabs(e_db(e_spk[0], base[0])) < 0.001);
+
+    /* The Music bus. Its own Gain / Mute / Solo rows. */
+    SEL("Music"); ptap(P_A); run(2);
+    CHECK(xbox_OverlayMixerView() == 1 && !xbox_HostPaused());
+    SEL("Gain"); ptap(P_LEFT, 6);
+    e2e_render(V_MUSIC); CHECK(fabs(e_db(e_spk[1], base[1]) + 3.0) < 0.01);
+    ptap(P_Y);
+    SEL("Mute"); ptap(P_A);
+    e2e_render(V_MUSIC); CHECK(SILENT(0));
+    ptap(P_A);
+    SEL("Solo"); ptap(P_A);
+    e2e_render(V_MUSIC | V_IMPACT); v = e_spk[2];                   /* the impact's centre is gone */
+    CHECK(v < 1e-6 && e_spk[0] > 0.1);
+    ptap(P_A);
+
+    /* Route "the game's panning": the trims. */
+    SEL("Front trim"); ptap(P_A);                                    /* A: off */
+    apu_bus_get_config(&c); CHECK(c.bus[0].trim_db[APU_BUS_TRIM_FRONT] <= APU_BUS_OFF_DB);
+    e2e_render(V_MUSIC); CHECK(SILENT(0) && SILENT(1) && fabs(e_db(e_spk[4], base[4])) < 0.001);
+    ptap(P_A);                                                       /* A: back at 0 dB */
+    SEL("Rear trim"); ptap(P_LEFT, 12);
+    e2e_render(V_MUSIC); CHECK(fabs(e_db(e_spk[4], base[4]) + 6.0) < 0.01 && fabs(e_db(e_spk[0], base[0])) < 0.001);
+    ptap(P_Y);
+    SEL("LFE trim"); ptap(P_A);
+    e2e_render(V_MUSIC); CHECK(SILENT(3));
+    ptap(P_A);
+    SEL("Centre trim"); ptap(P_RIGHT, 2);
+    apu_bus_get_config(&c); CHECK(c.bus[0].trim_db[APU_BUS_TRIM_CENTRE] == 1.0f);
+    ptap(P_Y);
+
+    /* Route "sends". */
+    SEL("Route"); ptap(P_RIGHT);
+    apu_bus_get_config(&c); CHECK(c.bus[0].route == APU_BUS_ROUTE_SENDS);
+    e2e_render(V_MUSIC); CHECK(e_spk[0] > 0.1 && SILENT(4) && SILENT(5) && SILENT(3));
+    SEL("Send to surround left"); ptap(P_A);                         /* off -> 0 dB */
+    e2e_render(V_MUSIC); CHECK(fabs(e_db(e_spk[4], e_spk[0])) < 0.01 && SILENT(5));
+    ptap(P_LEFT, 12);                                                /* -6 dB */
+    e2e_render(V_MUSIC); CHECK(fabs(e_db(e_spk[4], e_spk[0]) + 6.0) < 0.01);
+    SEL("Send to front left"); ptap(P_A);                            /* off */
+    SEL("Send to front right"); ptap(P_A);
+    SEL("Send to surround right"); ptap(P_RIGHT);                    /* from off: in at -20 dB */
+    apu_bus_get_config(&c); CHECK(c.bus[0].send_db[5] == -20.0f);
+    ptap(P_A); ptap(P_A);                                            /* off, then 0 dB */
+    e2e_render(V_MUSIC); CHECK(SILENT(0) && SILENT(1) && SILENT(2) && e_spk[4] > 0.05 && e_spk[5] > 0.1);  /* rear only */
+    SEL("Send to centre"); ptap(P_A);
+    SEL("Send to LFE (full range)"); ptap(P_A);
+    e2e_render(V_MUSIC); CHECK(e_spk[2] > 0.1 && e_spk[3] > 0.1);
+
+    /* Route "a place in the room": front, full width; then by hand to the
+     * rear wall (rear only), then narrow and to the left wall (SL only). */
+    SEL("Route"); ptap(P_RIGHT);
+    apu_bus_get_config(&c); CHECK(c.bus[0].route == APU_BUS_ROUTE_PAN);
+    e2e_render(V_MUSIC); CHECK(e_spk[0] > 0.1 && e_spk[1] > 0.1 && SILENT(2) && SILENT(4) && SILENT(5) && SILENT(3));
+    SEL("Position"); ptap(P_A);                                      /* move */
+    ptap(P_DOWN, 40);
+    apu_bus_get_config(&c); CHECK(fabsf(c.bus[0].pan_y + 1.0f) < 1e-4f);
+    e2e_render(V_MUSIC); CHECK(SILENT(0) && SILENT(1) && SILENT(2) && e_spk[4] > 0.1 && e_spk[5] > 0.1);   /* rear only */
+    ptap(P_A);                                                       /* done */
+    CHECK(xbox_OverlayMixerView() == 1);
+    SEL("Width"); ptap(P_LEFT, 20);
+    apu_bus_get_config(&c); CHECK(fabsf(c.bus[0].pan_width) < 1e-4f);
+    e2e_render(V_MUSIC); CHECK(fabs(e_db(e_spk[4], e_spk[5])) < 0.01);                                       /* rear centre */
+    SEL("Position X (left - right)"); ptap(P_LEFT, 20);
+    apu_bus_get_config(&c); CHECK(fabsf(c.bus[0].pan_x + 1.0f) < 1e-4f);
+    e2e_render(V_MUSIC); CHECK(e_spk[4] > 0.1 && SILENT(5) && SILENT(0) && SILENT(1));                       /* SL only */
+    SEL("Position Y (rear - front)"); ptap(P_RIGHT, 40);
+    e2e_render(V_MUSIC); CHECK(e_spk[0] > 0.1 && SILENT(4) && SILENT(1));                                    /* FL only */
+    SEL("Position X (left - right)"); ptap(P_RIGHT, 20);
+    e2e_render(V_MUSIC); CHECK(e_spk[2] > 0.1 && SILENT(0) && SILENT(1));                                    /* C only */
+    SEL("Centre divergence"); ptap(P_RIGHT, 20);
+    apu_bus_get_config(&c); CHECK(fabsf(c.bus[0].pan_divergence - 1.0f) < 1e-4f);
+    e2e_render(V_MUSIC); CHECK(SILENT(2) && e_spk[0] > 0.1 && fabs(e_db(e_spk[0], e_spk[1])) < 0.01);        /* phantom centre */
+    /* The position with the stick held: it speeds up, and gets there. */
+    SEL("Position"); ptap(P_A);
+    pad(P_DOWN, true);
+    for (int i = 0; i < 60; i++) { SDL_Delay(20); run(1); }
+    pad(P_DOWN, false); run(1);
+    apu_bus_get_config(&c); CHECK(c.bus[0].pan_y == -1.0f);
+    ptap(P_B);                                                       /* B ends the move, not the view */
+    CHECK(xbox_OverlayMixerView() == 1);
+
+    /* The LFE send and its crossover (the music tone is 6 kHz: through an
+     * 80 Hz crossover nothing of it arrives, full range all of it). */
+    SEL("LFE send (through the crossover)"); ptap(P_A);
+    apu_bus_get_config(&c); CHECK(c.bus[0].lfe_send_db == -10.0f);
+    e2e_render(V_MUSIC); CHECK(e_spk[3] < 1e-4);
+    SEL("LFE send crossover"); ptap(P_LEFT);                         /* 80 Hz -> 60 Hz */
+    apu_bus_get_config(&c); CHECK(c.bus[0].lfe_crossover_hz == 60);
+    ptap(P_LEFT);                                                    /* full range */
+    apu_bus_get_config(&c); CHECK(c.bus[0].lfe_crossover_hz == 0);
+    e2e_render(V_MUSIC); CHECK(e_spk[3] > 0.05);
+    SEL("Reset this bus"); ptap(P_A);
+    apu_bus_get_config(&c); CHECK(c.bus[0].route == APU_BUS_ROUTE_TITLE && c.bus[0].lfe_send_db <= APU_BUS_OFF_DB);
+    e2e_render(V_MUSIC);
+    for (int k = 0; k < 6; k++) CHECK(fabs(e_spk[k] - base[k]) < 1e-9);
+    ptap(P_B); run(2);
+    CHECK(xbox_OverlayMixerView() == 0 && !xbox_HostPaused());
+
+    /* A positioned bus: the field shaping. */
+    e2e_render(V_IMPACT);
+    memcpy(base, e_spk, sizeof base);
+    CHECK(base[0] > base[1] * 3 && base[2] > 0.05);
+    SEL("Impacts/crash"); ptap(P_A); run(2);
+    SEL("Field width"); ptap(P_LEFT, 20);
+    apu_bus_get_config(&c); CHECK(fabsf(c.bus[9].field_width) < 1e-4f);
+    e2e_render(V_IMPACT); CHECK(fabs(e_db(e_spk[0], e_spk[1])) < 0.01 && fabs(e_db(e_spk[4], e_spk[5])) < 0.01);
+    ptap(P_Y);
+    apu_bus_get_config(&c); CHECK(c.bus[9].field_width == 1.0f);
+    SEL("Centre divergence"); ptap(P_RIGHT, 20);
+    e2e_render(V_IMPACT); CHECK(SILENT(2) && e_spk[0] > base[0]);
+    ptap(P_Y);
+    e2e_render(V_IMPACT);
+    for (int k = 0; k < 6; k++) CHECK(fabs(e_spk[k] - base[k]) < 1e-9);
+    ptap(P_B); run(2);
+
+    /* The master rows. */
+    SEL("Limiter"); ptap(P_RIGHT);                                   /* soft clip */
+    apu_bus_get_config(&c); CHECK(c.limiter == APU_BUS_LIM_SOFT);
+    SEL("Ceiling"); ptap(P_LEFT, 12);                                /* -0.3 -> -6.5 (the row's grid) */
+    apu_bus_get_config(&c); CHECK(c.ceiling_db < -6.0f && c.ceiling_db > -7.0f);
+    SEL("Music"); ptap(P_RIGHT, 24);                                 /* +12 dB: over the ceiling */
+    e2e_render(V_MUSIC); CHECK(e_peak <= pow(10.0, c.ceiling_db / 20.0) + 1e-4 && e_peak > 0.3);
+    SEL("Limiter"); ptap(P_RIGHT);                                   /* peak limiter */
+    apu_bus_get_config(&c); CHECK(c.limiter == APU_BUS_LIM_PEAK);
+    e2e_render(V_MUSIC); CHECK(e_peak <= pow(10.0, c.ceiling_db / 20.0) + 1e-4 && e_peak > 0.3);
+    ptap(P_RIGHT);                                                   /* off */
+    e2e_render(V_MUSIC); CHECK(e_peak > 1.0);
+    SEL("Music"); ptap(P_Y);
+    SEL("LFE low-pass"); ptap(P_RIGHT, 1);                           /* 60 Hz */
+    apu_bus_get_config(&c); CHECK(c.lfe_lowpass_hz == 60);
+    e2e_render(V_MUSIC); v = e_spk[3];
+    ptap(P_LEFT);
+    e2e_render(V_MUSIC); CHECK(v < e_spk[3] * 0.1);
+    SEL("Mains high-pass"); ptap(P_LEFT);                            /* 150 Hz (wraps) */
+    apu_bus_get_config(&c); CHECK(c.mains_highpass_hz == 150);
+    e2e_render(V_ENGINE); v = e_spk[0];                              /* the engine's 100 Hz, on FL */
+    ptap(P_RIGHT);
+    e2e_render(V_ENGINE); e2e_render(V_ENGINE);
+    CHECK(e_spk[0] > 0.3 && e_db(v, e_spk[0]) < -10.0);
+
+    /* Speakers. */
+    e2e_render(V_MUSIC); memcpy(base, e_spk, sizeof base);
+    SEL("Speakers: trim and delay"); ptap(P_A); run(2);
+    CHECK(xbox_OverlayMixerView() == 2 && !xbox_HostPaused());
+    SEL("Front right trim"); ptap(P_LEFT, 12);
+    e2e_render(V_MUSIC); CHECK(fabs(e_db(e_spk[1], base[1]) + 6.0) < 0.01 && fabs(e_db(e_spk[0], base[0])) < 0.001);
+    ptap(P_Y);
+    SEL("Surround left delay"); ptap(P_RIGHT, 2);
+    apu_bus_get_config(&c); CHECK(c.speaker_delay_ms[4] == 1.0f);
+    e2e_render(V_MUSIC); CHECK(fabs(e_db(e_spk[4], base[4])) < 0.01);       /* delayed, not changed */
+    ptap(P_Y);
+    ptap(P_B); run(2);
+
+    /* Ducking: music under impacts. */
+    SEL("Ducking"); ptap(P_A); run(2);
+    CHECK(xbox_OverlayMixerView() == 3);
+    SEL("Ducking"); ptap(P_A);
+    apu_bus_get_config(&c); CHECK(c.duck.enabled && c.duck.source == 9 && c.duck.target == 0);
+    SEL("Depth"); ptap(P_RIGHT, 4);                                  /* 6 -> 8 dB */
+    apu_bus_get_config(&c); CHECK(c.duck.depth_db == 8.0f);
+    e2e_render(V_MUSIC); v = e_spk[5];                               /* SR: music only (the impact's is small there) */
+    CHECK(fabs(e_db(v, base[5])) < 0.01);                            /* nothing to duck under */
+    e2e_render(V_MUSIC | V_IMPACT);
+    CHECK(e_db(e_spk[1], base[1]) < -5.0);                           /* music's FR well down */
+    SEL("Threshold"); ptap(P_RIGHT, 60);                             /* 0 dBFS: never reached */
+    e2e_render(V_MUSIC | V_IMPACT); e2e_render(V_MUSIC | V_IMPACT);  /* the release, 400 ms, run out */
+    CHECK(e_db(e_spk[1], base[1]) > -1.0);
+    SEL("Ducking"); ptap(P_A);
+    ptap(P_B); run(2);
+
+    /* Audition: record, loop, the mixer acts on the loop, save, stop, the
+     * saved clip. */
+    {
+        apu_bus_audition_info ai;
+        char clip[600];
+        snprintf(clip, sizeof clip, "%s", file);
+        char *sl = strrchr(clip, '/');
+        snprintf(sl ? sl + 1 : clip, 40, "mixer-audition.clip");
+        remove(clip);
+        SEL("Audition"); ptap(P_A); run(1);                          /* nothing recorded: stays live */
+        e2e_render(V_MUSIC);
+        CHECK(apu_bus_audition_state() == APU_BUS_AUD_OFF);
+        SEL("Audition recording"); ptap(P_RIGHT); run(1);            /* the last 30 s */
+        CHECK(apu_bus_audition_kept_seconds() == 30);
+        for (int i = 0; i < 8; i++) e2e_render(V_MUSIC | V_IMPACT);  /* 6.4 s of "play" */
+        memcpy(base, e_spk, sizeof base);
+        apu_bus_audition_get(&ai);
+        CHECK(ai.kept_s > 6.0f && ai.bytes > 1000000);
+        SEL("Audition"); ptap(P_A); run(1);
+        /* No live voice: the loop sounds. Past its first 2 s, where the
+         * clip's end fades out under its start (the test's tones are the
+         * same there, so they add; real sound does not). */
+        for (int i = 0; i < 3; i++) e2e_render(0);
+        CHECK(apu_bus_audition_state() == APU_BUS_AUD_LAST);
+        CHECK(fabs(e_db(e_spk[0], base[0])) < 0.2 && fabs(e_db(e_spk[2], base[2])) < 0.2);
+        SEL("Music"); ptap(P_LB);                                    /* mute acts on the loop */
+        e2e_render(0);
+        CHECK(e_db(e_spk[5], base[5]) < -6.0 && fabs(e_db(e_spk[2], base[2])) < 0.2);
+        ptap(P_LB);
+        SEL("Save this clip"); ptap(P_A); run(1);
+        { FILE *fp = fopen(clip, "rb"); CHECK(fp != NULL); if (fp) fclose(fp); }
+        SEL("Audition"); ptap(P_A); run(1);                          /* back to live */
+        e2e_render(V_MUSIC);
+        CHECK(apu_bus_audition_state() == APU_BUS_AUD_OFF && SILENT(2) && e_spk[0] > 0.1);
+        SEL("Audition"); ptap(P_RIGHT); run(1);                      /* the saved clip */
+        for (int i = 0; i < 3; i++) e2e_render(0);
+        CHECK(apu_bus_audition_state() == APU_BUS_AUD_FILE && fabs(e_db(e_spk[2], base[2])) < 0.2);
+        ptap(P_A); run(1);
+        e2e_render(V_MUSIC);
+        CHECK(apu_bus_audition_state() == APU_BUS_AUD_OFF);
+        SEL("Audition recording"); ptap(P_LEFT); run(1);
+        e2e_render(V_MUSIC);
+        CHECK(apu_bus_audition_kept_seconds() == 0);
+        remove(clip);
+    }
+
+    /* Presets and A/B. */
+    SEL("Load a preset into A"); ptap(P_RIGHT); ptap(P_A);
+    apu_bus_get_config(&c); CHECK(c.bus[0].route == APU_BUS_ROUTE_PAN);
+    e2e_render(V_MUSIC); CHECK(SILENT(4) && e_spk[0] > 0.1);
+    SEL("Listening to"); ptap(P_A); run(1);                          /* B = Factory */
+    apu_bus_get_config(&c); CHECK(apu_bus_config_is_neutral(&c));
+    e2e_render(V_MUSIC); CHECK(e_spk[4] > 0.1);
+    pad(SDL_CONTROLLER_BUTTON_BACK, true); pad(P_Y, true); pad(P_Y, false); pad(SDL_CONTROLLER_BUTTON_BACK, false);
+    run(2);                                                          /* Back + Y: A again */
+    apu_bus_get_config(&c); CHECK(c.bus[0].route == APU_BUS_ROUTE_PAN);
+    e2e_render(V_MUSIC); CHECK(SILENT(4));
+
+    /* The file has what is heard; an edit of the file is heard too. */
+    SDL_Delay(500); run(3);
+    {
+        apu_bus_config f;
+        char err[160];
+        apu_bus_config_neutral(&f);
+        CHECK(apu_bus_load_file(file, &f, err, sizeof err) == 0 && f.bus[0].route == APU_BUS_ROUTE_PAN);
+        FILE *fp = fopen(file, "ab");
+        fputs("\n[bus.music]\nroute = \"pan\"\npan_y = -1\npan_width = 0\n", fp);
+        fclose(fp);
+        for (int i = 0; i < 4; i++) e2e_render(V_MUSIC);            /* 3.2 s of frames: the once-a-second look */
+        apu_bus_get_config(&c); CHECK(c.bus[0].pan_y == -1.0f);
+        CHECK(SILENT(0) && e_spk[4] > 0.1);
+        run(3);
+        SEL("Music"); ptap(P_A); run(2);
+        SEL("Position Y (rear - front)"); ptap(P_RIGHT, 2);          /* the page works on from the file's values */
+        apu_bus_get_config(&c); CHECK(fabsf(c.bus[0].pan_y + 0.9f) < 1e-4f && c.bus[0].pan_width == 0.0f);
+        ptap(P_B); run(2);
+    }
+
+    /* Out: the Audio page pauses again; closed, nothing is paused. */
+    ptap(P_B); run(3);
+    CHECK(xbox_OverlayOpen() && xbox_OverlayMixerView() == -1 && xbox_HostPaused());
+    ptap(P_B); run(12);
+    CHECK(!xbox_OverlayOpen() && !xbox_HostPaused() && !xbox_InputBlocked());
+    fprintf(stderr, s_fail ? "overlay_shot mixer e2e: %d failed\n" : "overlay_shot mixer e2e: ok\n", s_fail);
+    return s_fail ? 1 : 0;
+}
+
 static int mixer_tour(const char *pre, const char *file)
 {
     static const char *const names[13] = {
@@ -175,7 +562,7 @@ static int mixer_tour(const char *pre, const char *file)
     tap(SDLK_RETURN); run(3);                                      /* Mixer: On */
     CHECK(apu_bus_enabled() && xbox_SettingValue(XS_AUDIO_MIXER) != 0);
     mixer_signal();
-    for (int i = 0; i < 5; i++) { tap(SDLK_DOWN); run(1); }        /* Music */
+    for (int i = 0; i < 7; i++) { tap(SDLK_DOWN); run(1); }        /* Music */
     for (int i = 0; i < 4; i++) { tap(SDLK_RIGHT); run(1); }       /* +2 dB */
     apu_bus_get_config(&c);
     CHECK(c.bus[0].gain_db == 2.0f);
@@ -198,8 +585,8 @@ static int mixer_tour(const char *pre, const char *file)
     for (int i = 0; i < 3; i++) { tap(SDLK_DOWN); run(1); }        /* send to centre: off -> -60 -> up */
     tap(SDLK_RIGHT); run(1);
     apu_bus_get_config(&c);
-    CHECK(c.bus[0].send_db[2] == -60.0f);
-    tap(SDLK_LEFT); run(1);
+    CHECK(c.bus[0].send_db[2] == -20.0f);            /* from off: in at -20 dB */
+    tap(SDLK_RETURN); run(1);                                      /* Enter on a level: off */
     apu_bus_get_config(&c);
     CHECK(c.bus[0].send_db[2] <= APU_BUS_OFF_DB);
     snprintf(path, sizeof path, "%smixer_4_bus_sends.bmp", pre); frame(path);
@@ -292,6 +679,8 @@ int main(int argc, char **argv)
     q = [dev newCommandQueue];
     xbox_OverlaySetWindow(win);
     xbox_BugReportSetMaker(fake_report);
+    if (getenv("OVERLAY_SHOT_MIXER_E2E"))
+        return mixer_e2e(getenv("OVERLAY_SHOT_MIXER_E2E"));
     if (getenv("OVERLAY_SHOT_MIXER"))
         return mixer_tour(pre, getenv("OVERLAY_SHOT_MIXER"));
 

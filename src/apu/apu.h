@@ -74,7 +74,8 @@ void mcpx_apu_set_fx_level(float level);
  * used. */
 
 /* The low-pass on the LFE feed of such a title (RECOMP_AUDIO_LFE_LOWPASS,
- * audio.lfe_lowpass: off, 80, 100, 120 Hz; live, faded over 21 ms). The
+ * audio.lfe_lowpass: off, 80, 100, 120 Hz; the settings file or the
+ * variable, no overlay row; a change is faded over 21 ms). The
  * title's wiring sets it until this or the variable does. Any thread. */
 void mcpx_apu_set_lfe_lowpass(int hz);
 

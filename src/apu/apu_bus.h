@@ -204,6 +204,48 @@ typedef struct {
 void apu_bus_get_meters(apu_bus_meters *m);
 void apu_bus_reset_overs(void);
 
+/* ── audition: a stretch of the game's own sound, looped through the mixer ──
+ *
+ * While the mixer is on and recording is asked for (apu_bus_audition_keep),
+ * the last seconds of what it mixed are kept: per
+ * frame, each sounding voice's samples (16 bit), its eight bins and gains
+ * and its bus. Looping that clip puts those voices through the mix again,
+ * frame for frame, in place of the live ones (which stay silent meanwhile):
+ * every bus control, route, send, the ducking, the output stage and the
+ * meters act on it exactly as on live sound, on the same material each
+ * time round. With the neutral configuration the loop's sum is the live
+ * one's to the 16-bit quantisation of the samples (about -96 dB).
+ *
+ * The clip is the player's own recording; it is kept in memory, and in a
+ * file only when asked. */
+struct apu_bus_rt;
+enum { APU_BUS_AUD_OFF = 0, APU_BUS_AUD_LAST = 1, APU_BUS_AUD_FILE = 2 };
+/* How much is kept: 0 (the default: nothing is recorded and no memory is
+ * held) to 60 seconds. The store takes 3 MB a second kept; a stretch too
+ * dense for that is kept shorter. Takes effect at the next frame. */
+void apu_bus_audition_keep(int seconds);
+int  apu_bus_audition_kept_seconds(void);
+/* Loop what was kept until now (the capture stops while it loops). */
+int  apu_bus_audition_loop_last(void);
+/* Loop a saved clip; 0, or -1 when it cannot be read. */
+int  apu_bus_audition_loop_file(const char *path);
+/* Back to live sound; the capture starts afresh. */
+void apu_bus_audition_stop(void);
+/* The clip that loops, to a file; 0, or -1. Only while a clip loops. */
+int  apu_bus_audition_save(const char *path);
+int  apu_bus_audition_state(void);              /* APU_BUS_AUD_* */
+typedef struct {
+    float position_s, length_s;                 /* of the loop (the cross-fade taken off) */
+    float kept_s;                               /* captured so far, when not looping */
+    size_t bytes;                               /* held in memory */
+    float crossfade_s;
+} apu_bus_audition_info;
+void apu_bus_audition_get(apu_bus_audition_info *info);
+/* Frame thread (apu_vp.c): 1 while a clip loops: the live voices are not
+ * mixed; then the clip's frame into the mixbins. */
+int  apu_bus_audition_playing(void);
+void apu_bus_audition_mix(struct apu_bus_rt *rt, float (*mixbins)[APU_BUS_FRAME]);
+
 /* ── the mix (apu_vp.c / apu_dsp.c; frame thread) ── */
 struct apu_bus_rt;
 /* Start of a VP frame: the runtime state to mix with, NULL when off. */
