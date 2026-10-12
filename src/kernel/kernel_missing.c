@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #define SLOTS      4096
 #define GUEST_MAX  160      /* the per-attempt line's truncation */

@@ -28,6 +28,7 @@
 #include <direct.h>
 #else
 #include <sys/stat.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 #endif
 
 #define LOGP "[SOUNDTRACK] "

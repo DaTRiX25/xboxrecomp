@@ -2266,6 +2266,7 @@ static void build_browser(float fs, ImDrawList *dl)
 }
 
 #include "overlay_mixer.inc"
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 static void build_pages(float fs)
 {

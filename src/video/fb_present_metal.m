@@ -60,6 +60,7 @@
 #include "kernel/present_cadence.h"
 #include <os/lock.h>
 #include <stdatomic.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #if __has_feature(objc_arc)
 #error "fb_present_metal.m is manual retain/release: build it without -fobjc-arc"

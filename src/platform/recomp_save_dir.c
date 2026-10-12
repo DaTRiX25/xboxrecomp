@@ -29,6 +29,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 #define rs_mkdir(p) mkdir(p, 0755)
 #define rs_rmdir(p) rmdir(p)
 #define rs_unlink(p) unlink(p)

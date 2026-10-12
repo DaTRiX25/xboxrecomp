@@ -74,6 +74,7 @@ static int ui_scale_log(void);
 #include "nv2a_pcache.h"
 #include "recomp_env.h"
 #include <pthread.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 ptrdiff_t xbox_GetMemoryOffset(void);
 

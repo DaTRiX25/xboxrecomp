@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 extern ptrdiff_t g_xbox_mem_offset;
 

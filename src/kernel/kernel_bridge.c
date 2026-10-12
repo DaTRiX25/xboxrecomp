@@ -52,6 +52,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <wctype.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
  * xbox_memory_layout.h and must match the definitions there -- a plain extern

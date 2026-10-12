@@ -40,6 +40,7 @@
 #include "recomp_env.h"
 #include "nv2a_pcache.h"
 #include "nv2a_backend_common.h"
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #define LOGP "[vulkan] "
 

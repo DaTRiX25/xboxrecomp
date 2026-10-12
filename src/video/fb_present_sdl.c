@@ -696,6 +696,7 @@ void fbv_android_surface_gone(void);
 
 #include <jni.h>
 #include <SDL_system.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 /* The warning that no usable Vulkan driver was found, with the way back on
  * it (BO-121): without the Vulkan window there is no settings overlay, so a
  * player who chose a driver that cannot run the game could not choose

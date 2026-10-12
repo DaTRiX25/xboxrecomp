@@ -76,6 +76,7 @@ const xbox_input_backend xbox_input_host_backend = {
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 /* Port -> controller. Read by the pad thread (OHCI) under g_pads_lock;
  * changed only by the thread that pumps SDL events (or, headless, by the

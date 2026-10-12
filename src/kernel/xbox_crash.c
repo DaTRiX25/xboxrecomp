@@ -48,6 +48,7 @@
 #include <sys/ioctl.h>
 #if defined(__linux__)
 #include <execinfo.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 #endif
 #endif
 

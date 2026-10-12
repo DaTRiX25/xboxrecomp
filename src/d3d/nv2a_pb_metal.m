@@ -94,6 +94,7 @@ static int ui_scale_log(void);
 #include "host_time.h"
 #include <mach/mach_time.h>
 #include <dispatch/dispatch.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
  * which collides with Objective-C and CoreServices: declare what is used. */
 ptrdiff_t xbox_GetMemoryOffset(void);

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #define ENHANCE_MAX_BINDS 64
 #define ENHANCE_FILES 2   /* title, root */

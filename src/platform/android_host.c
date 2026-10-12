@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 static char s_tag[32] = "xboxrecomp";
 static int s_log_fd = -1;       /* the log file, or -1 */

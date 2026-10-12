@@ -32,6 +32,7 @@ static void sx_setenv_keep(const char *n, const char *v)
 }
 #else
 #include <strings.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 #define sx_strcasecmp strcasecmp
 #define sx_setenv_keep(n, v) setenv((n), (v), 0)
 #endif

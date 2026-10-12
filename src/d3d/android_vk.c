@@ -30,6 +30,7 @@
 
 #if defined(XBOXRECOMP_HAVE_ADRENOTOOLS)
 #include <adrenotools/driver.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 #endif
 
 static pthread_once_t s_once = PTHREAD_ONCE_INIT;

@@ -2577,6 +2577,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 #include <dlfcn.h>
 #include <pthread.h>
 #include <time.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 static uint32_t g_watch_len = 4;
 static uintptr_t g_watch_hpage, g_watch_hsize;   /* host page (16 KB on arm64 Darwin) */

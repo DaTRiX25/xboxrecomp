@@ -1603,6 +1603,16 @@ int xbox_BugReport(const xbox_bug_report_opts *o, char *out_path, size_t n)
     if (!have_cur)
         xbox_report_printf(&readme, "logs: no log of %s was found in %s.\n",
                            o->no_current_run ? "an earlier run" : "this run", log_dir);
+    /* The print gate (xr_log.h, BO-125): a quiet run's log has errors and
+     * the start-up facts only. Said, with the way to a full one. */
+    if (!XR_DIAG_ON())
+        xbox_report_printf(&readme, "logs: diagnostic logging was off in this run (%s): the log has"
+                           " only errors and the start-up facts. For a full log switch on"
+                           " Advanced > Diagnostic logging in the overlay (Back+Start or F1),"
+                           " restart the game, make the problem happen again, then create the"
+                           " report again.\n", xr_log_source());
+    else
+        xbox_report_printf(&readme, "logs: diagnostic logging was on (%s).\n", xr_log_source());
 
     /* system.txt */
     xbox_report_printf(&sys, "[build]\ntoolkit: xboxrecomp %s, built %s, %s\n", XR_BUILD_COMMIT,
@@ -1829,6 +1839,7 @@ void xbox_BugReportArm(void)
 #if !defined(XBOX_REPORT_STANDALONE)
 #include "kernel_pause.h"
 #include "xbox_crash.h"
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 int nv2a_pb_capture_frame(const char *path, unsigned timeout_ms);   /* nv2a_pb_state.h */
 

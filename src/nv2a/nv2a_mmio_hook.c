@@ -8,6 +8,7 @@
 #include "nv2a_mmio_hook.h"
 #include "nv2a_state.h"
 #include <stdio.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 /* NV2A MMIO base in Xbox VA space */
 #define NV2A_MMIO_BASE  0xFD000000u

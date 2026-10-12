@@ -12,6 +12,7 @@
 #include "kernel.h"
 #include "kernel_pacing.h"
 #include "nv2a_backend_common.h"
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #define LOGP "[ENHANCE] "
 #define SCALE_MAX 4

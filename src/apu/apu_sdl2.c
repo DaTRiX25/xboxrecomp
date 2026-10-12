@@ -37,6 +37,7 @@
 
 #include <SDL.h>
 #include <time.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #define SDLA_SAMPLE_RATE   48000
 #define SDLA_CHANNELS_MAX  6

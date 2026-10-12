@@ -648,6 +648,7 @@ int mcpx_apu_speaker_test_playing(int *via_map)
 
 #if defined(_WIN32)
 #include <mmsystem.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 #pragma comment(lib, "winmm.lib")
 #endif
 /* On Linux, waveOut* are inert stubs from win32_compat.h: the APU's

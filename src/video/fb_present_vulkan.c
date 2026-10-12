@@ -76,6 +76,7 @@ void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
 int xbox_VblankDisplayLockOn(void);
 #include "kernel/nv2a_backend_common.h"
 #include "fb_present_vulkan.h"
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #define LOGP "[PRESENT] "
 #define SC_MAX 8

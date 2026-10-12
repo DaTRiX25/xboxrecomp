@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "recomp_env.h"
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 static struct nvk_core s_core;
 static int             s_state;          /* 0 not tried, 1 up, -1 failed */
