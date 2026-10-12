@@ -79,6 +79,16 @@ void nvk_set_lost_handler(void (*fn)(const char *why));
 void nvk_queue_lock(void);
 void nvk_queue_unlock(void);
 
+/* BO-128: the queue's submits that carried command buffers, counted and the
+ * last 64 kept with a line from the submitter on what they held. Called
+ * under nvk_queue_lock right after a vkQueueSubmit that succeeded with at
+ * least one command buffer; returns the submit's ordinal (1 = the first).
+ * Turnip on KGSL makes one kernel command batch of each such submit and none
+ * of an empty one, so the ordinal is the context timestamp the kernel names
+ * in 'gpu fault ctx N ... ts T' (both count from the device's creation).
+ * nvk_device_lost prints the kept ones. */
+uint64_t nvk_submit_note(const char *what);
+
 /* A memory type index for `bits` with all of `want`, preferring one that
  * also has `prefer`; -1 if none. */
 int nvk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags prefer);
