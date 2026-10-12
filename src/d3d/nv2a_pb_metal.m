@@ -84,6 +84,7 @@
 #include "nv2a_backend_common.h"
 #include "d3d8_msl.h"
 #include "d3d8_swizzle.h"
+#include "nv2a_texrep.h"
 #include "nv2a_pcache.h"
 #include "latency_trace.h"
 #include "host_time.h"
@@ -1599,6 +1600,7 @@ typedef struct {
     uint32_t       sign;          /* nv2a_tex_signed_mask the bytes carry */
     uint32_t       gen, used;
     uint64_t       hash;
+    uint32_t       rep;           /* nv2a_texrep generation it was uploaded at; 0: not a replaced texture */
     int            live;
     id<MTLTexture> tex;
 } TexEntry;
@@ -1665,6 +1667,8 @@ static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
     return h;
 }
 
+static uint32_t s_tex_rep;    /* the last tex_upload's nv2a_texrep_apply */
+
 static id<MTLTexture> tex_upload(const Stage *t)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -1685,6 +1689,10 @@ static id<MTLTexture> tex_upload(const Stage *t)
         pal = (const uint32_t *)(mem + t->palette);
     nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
                     t->levels, pal, pal ? t->pal_len : 0, s_texels);
+    /* The title's button prompts as the pad in use prints them (input.glyphs,
+     * nv2a_texrep.h): rectangles of a registered texture replaced here. */
+    s_tex_rep = nv2a_texrep_apply(mem + t->offset, t->color, t->width, t->height,
+                                  t->pitch, t->levels, s_texels);
     if (stage_signed(t)) {
         uint32_t x = nv2a_tex_signed_xor(stage_signed(t));
         size_t i;
@@ -1769,20 +1777,23 @@ static id<MTLTexture> tex_bind(const Stage *t)
             victim = c;
     }
     if (e) {
-        if (e->gen != g->flips) {
+        /* A replaced texture whose variant changed is uploaded again. */
+        int stale = e->rep && e->rep != nv2a_texrep_generation();
+        if (e->gen != g->flips || stale) {
             uint64_t tp = prof_t(), h = tex_hash_pal(mem, t, bytes);
             prof_add(&s_pa.texh, tp);
             s_pa.texh_bytes += bytes;
             s_pa.texh_n++;
             s_tex_rehash++;
             e->gen = g->flips;
-            if (h != e->hash) {
+            if (h != e->hash || stale) {
                 id<MTLTexture> nt;
                 tp = prof_t();
                 nt = tex_upload(t);
                 prof_add(&s_pa.texup, tp);
                 s_pa.texup_n++;
                 e->hash = h;
+                e->rep = s_tex_rep;
                 s_tex_changed++;
                 if (!nt)
                     return s_black;
@@ -1814,6 +1825,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->sign = stage_signed(t);
         e->gen = g->flips;
         e->hash = tex_hash_pal(mem, t, bytes);
+        e->rep = s_tex_rep;
         e->tex = nt;
         e->live = 1;
     }

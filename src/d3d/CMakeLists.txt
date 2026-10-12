@@ -165,6 +165,12 @@ if(NOT WIN32)
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_tex_cache)
 endif()
 
+# Regions of a title's textures replaced at upload (src/kernel/nv2a_texrep.c:
+# the button prompts for the pad in use), against synthetic textures (every
+# host, no GPU).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texrep
+                 ${CMAKE_CURRENT_BINARY_DIR}/nv2a_texrep)
+
 # The HLSL the parse -> generate pipeline emits, against recorded hashes
 # (every host: the emitters are API-free).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_hlsl_split

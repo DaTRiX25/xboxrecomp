@@ -34,6 +34,9 @@ static int st_face;
 void xbox_InputSetFaceLayoutNintendo(int on) { st_face = on; }
 static int st_scheme = -1;
 void xbox_InputSetControlScheme(int s) { st_scheme = s; }
+static int st_glyphs = -2, st_glyph_refresh;
+void xbox_InputSetGlyphMode(int mode) { st_glyphs = mode; }
+void xbox_InputGlyphsRefresh(void) { st_glyph_refresh++; }
 void xbox_PacingSetMode(int m) { st_pacing = m; }
 void xbox_PacingSetSpinLead(uint64_t ns) { st_lead = ns; }
 void nv2a_present_set_overscan(int c) { st_overscan = c; }
@@ -393,6 +396,25 @@ int main(void)
     CHECK(st_scheme == 1);
     xbox_SettingReset(XS_INPUT_CONTROL_SCHEME);
     CHECK(st_scheme == 0);
+    CHECK(st_glyph_refresh >= 2);       /* the Nintendo prompts follow it */
+
+    /* The button prompts (input.glyphs): auto by default, a choice reaches
+     * the input layer as it is set and is written by its name. */
+    CHECK(xbox_SettingValue(XS_INPUT_GLYPHS) == 0);
+    xbox_SettingSet(XS_INPUT_GLYPHS, 3);
+    CHECK(st_glyphs == 3);
+    xbox_SettingsFlush();
+    {
+        char err[256];
+        recomp_cfg *c = recomp_cfg_load_file(path, err, sizeof err);
+        CHECK(c != NULL);
+        if (c) {
+            CHECK(!strcmp(recomp_cfg_string(c, "input.glyphs", ""), "playstation"));
+            recomp_cfg_free(c);
+        }
+    }
+    xbox_SettingReset(XS_INPUT_GLYPHS);
+    CHECK(st_glyphs == 0);
 
     remove(path);
     fprintf(stderr, "overlay_settings: %d checks, %d failed\n", s_checks, s_fail);

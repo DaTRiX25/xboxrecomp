@@ -130,6 +130,7 @@ static const char *const n_scale[]     = { "1x (640x480)", "1.5x (960x720)", "2x
 #endif
 static const char *const n_face[]      = { "Xbox layout", "Nintendo layout", NULL };
 static const char *const n_scheme[]    = { "Xbox layout", "PS2 layout", NULL };
+static const char *const n_glyphs[]    = { "Auto (the controller in use)", "Xbox (original)", "Xbox (modern: LB RB LT RT)", "PlayStation", "Nintendo", "Steam (Deck, Steam Controller)", NULL };
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_vehicle_detail[] = { "Original", "Far (2x)", "Farthest (4x)", NULL };
@@ -169,6 +170,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto: -0.5 at 2x, -1.0 at 4x. Off is the original. Changes at once.", 1, FMT_PLAIN, n_lod, 0 },
     /* XS_GRAPHICS_DITHER */    { "Dither", "A faint noise in the final scale to the window that hides the stripes in smooth gradients such as the sky. Metal only for now. Off is the original; text and HUD at the exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_VEHICLE_DETAIL */ { "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Original is the console's distances; Far doubles them, Farthest is four times. Costs GPU time when many vehicles are on screen. Scenery, the track and where traffic appears are not changed. Changes at once.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
+    /* XS_INPUT_GLYPHS */       { "Button prompts", "The buttons the game shows in its menus and hints. Auto follows the controller that was last used. Xbox (original) is the game's own picture: white and black buttons, L and R. The game's text and videos still name the Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -342,6 +344,7 @@ static int page_rows(int page, Row *r)
         SET(XS_INPUT_FACE_LAYOUT);
         if (xbox_InputControlSchemeOffered())
             SET(XS_INPUT_CONTROL_SCHEME);
+        SET(XS_INPUT_GLYPHS);
 #if defined(__ANDROID__)
         SET(XS_INPUT_VIBRATION);
 #endif

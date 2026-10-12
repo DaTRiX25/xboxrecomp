@@ -7,6 +7,7 @@
 #include "recomp_save_dir.h"
 #include "input_backend.h"
 #include "input_map.h"
+#include "pad_glyphs.h"
 #include "kernel_pacing.h"
 #include "nv2a_backend_common.h"
 #include "apu_xaudio2.h"
@@ -52,6 +53,7 @@ static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
 static const char *const k_units[]    = { "mph", "kmh", NULL };
 static const char *const k_face[]     = { "xbox", "nintendo", NULL };
 static const char *const k_scheme[]   = { "xbox", "ps2", NULL };
+static const char *const k_glyphs[]   = { "auto", "xbox", "xbox_modern", "playstation", "nintendo", "steam", NULL };
 #if defined(__ANDROID__)
 static const char *const k_vibration[] = { "auto", "controller", "device", "off", NULL };
 #endif
@@ -108,6 +110,8 @@ static xs_setting s_set[XS_COUNT] = {
     /* The title's vehicle level-of-detail distances: the patch is anything
      * but "original". */
     [XS_GRAPHICS_VEHICLE_DETAIL] = SETTING("graphics.vehicle_detail", XS_CHOICE, 0, RENV_GFX_VEHICLE_DETAIL, k_vehicle_detail, NULL, 0, 0, 0),
+    /* The title's button prompts for the pad in use (pad_glyphs.h). */
+    [XS_INPUT_GLYPHS]       = SETTING("input.glyphs", XS_CHOICE, 0, RENV_INPUT_GLYPHS, k_glyphs, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
 #endif
@@ -347,6 +351,10 @@ static void apply(xs_id id)
         break;
     case XS_INPUT_FACE_LAYOUT:
         xbox_InputSetFaceLayoutNintendo(v != 0.0);
+        xbox_InputGlyphsRefresh();     /* the Nintendo prompts follow it */
+        break;
+    case XS_INPUT_GLYPHS:
+        xbox_InputSetGlyphMode((int)v);
         break;
     case XS_INPUT_CONTROL_SCHEME:
         xbox_InputSetControlScheme((int)v);
@@ -695,6 +703,7 @@ void xbox_SettingsFinish(void)
     xbox_InputSetRumbleStrength(s_set[XS_INPUT_RUMBLE].value);
     xbox_InputSetFaceLayoutNintendo(s_set[XS_INPUT_FACE_LAYOUT].value != 0.0);
     xbox_InputSetControlScheme((int)s_set[XS_INPUT_CONTROL_SCHEME].value);
+    xbox_InputSetGlyphMode((int)s_set[XS_INPUT_GLYPHS].value);
 }
 
 /* ── access ────────────────────────────────────────────────────────── */
