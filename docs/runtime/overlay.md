@@ -66,6 +66,30 @@ freed when none does), so switching live costs nothing while it is off.
 tile-based GPU such as MoltenVK's does not give meaningfully). The
 `aa_cycle=<s>` form of `RECOMP_OVERLAY` steps the setting for such a test.
 
+## LOD bias and dither (both off by default)
+
+`graphics.lod_bias` adds a mip LOD bias to every mipmapped texture, on top of
+the title's own (SET_TEXTURE_FILTER's bias field). It is added to the per-draw
+`tex_bias` constant that both backends hand the pixel shader (Metal's
+`bias()`, GLSL's `texture(..., bias)`), because Metal has no sampler-state LOD
+bias; so it composes with the title's bias by plain addition and with
+anisotropic filtering as any shader bias does (the sampler's anisotropy and
+min/max LOD clamps act on the biased level). A stage that is not mipmapped
+gets none. `off` (default) adds exactly 0.0: the picture is the one it was.
+`auto` is -log2(render scale) / 2: -0.5 at 2x, -1.0 at 4x (about -0.29 at
+1.5x), 0 at 1x; `-0.5`, `-1`, `-1.5` are explicit. The environment takes any
+number: `RECOMP_GFX_LOD_BIAS=-0.75`. Metal and Vulkan share the code
+(`nv2a_host_lod_bias`); the Vulkan side has not been run.
+
+`graphics.dither` adds interleaved gradient noise (Jimenez 2014) of just
+under +-0.5 LSB to the Metal presenter's scale to the window, the last step
+before the 8-bit drawable. A texel that is already an exact 8-bit value
+(1:1 text, flat colour) rounds back to itself, so only filtered, in-between
+values move by one level at most. The source frame is itself 8-bit, so the
+gain is at the edges of its bands when the frame is scaled to the window.
+Off (default) skips the branch. The Vulkan presenter ends in `vkCmdBlitImage`
+and has no such pass yet; the row is shown on macOS only.
+
 ## Settings
 
 Each is one RECOMP_* knob. Precedence, high to low: the environment, then
@@ -96,6 +120,8 @@ title's defaults when those change. Keys it does not know are kept.
 | `graphics.aniso` (`off`, `2x` .. `16x`) | `RECOMP_GFX_ANISO` | yes (the sampler caches key on the level) |
 | `graphics.aa` (`off`, `fxaa`, `smaa`) | `RECOMP_GFX_AA` | yes |
 | `graphics.sharpen` (0..1) | `RECOMP_GFX_SHARPEN` | yes |
+| `graphics.lod_bias` (`off`, `auto`, `-0.5`, `-1`, `-1.5`) | `RECOMP_GFX_LOD_BIAS` (`0`, `auto` or a number) | yes (a per-draw constant) |
+| `graphics.dither` (bool) | `RECOMP_GFX_DITHER` | yes; Metal only |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |
 | `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins |
@@ -104,8 +130,10 @@ title's defaults when those change. Keys it does not know are kept.
 | `display.hud_fix` (bool) | `RECOMP_GFX_HUD_FIX` | live, shown whole from the title's next HUD set-up; Display page, only when the title enabled a guest patch for it |
 | `graphics.bloom`, `graphics.motion_blur` (bool, default on) | `RECOMP_GFX_BLOOM`, `RECOMP_GFX_MOTION_BLUR` | live, from the next frame; the title's own effects, which a guest patch skips at `0`; Graphics page, only when the title enabled a guest patch for them |
 | `graphics.crash_60fps` (bool, default off) | `RECOMP_GFX_CRASH_60FPS` | live, from the title's next frame; the title's own 30 Hz phases (Burnout 3: crash and takedown cameras) at 60, by a guest patch on the title's own rate choice at `1`; Graphics page, only when the title enabled a guest patch for it |
+| `graphics.vehicle_detail` (`original`, `far`, `farthest`) | `RECOMP_GFX_VEHICLE_DETAIL` | live, from the next frame; the distances at which the title swaps its vehicle models for simpler ones, scaled by a guest patch (2x, 4x); Graphics page, only when the title enabled a guest patch for it |
 | `input.deadzone`, `input.trigger_deadzone` | `RECOMP_PAD_DEADZONE`, `RECOMP_PAD_TRIGGER_DEADZONE` | yes |
 | `input.rumble` (strength, 0 to 3 in steps of 0.25; 1 the original, 0 off; motor = (speed / peak) ^ (1 / strength), see src/input/README.md) | `RECOMP_INPUT_RUMBLE_GAIN` | yes |
+| `input.glyphs` (`auto`, `xbox`, `xbox_modern`, `playstation`, `nintendo`, `steam`) | `RECOMP_INPUT_GLYPHS` | live: the title's button prompts drawn for the pad in use (`src/input/pad_glyphs.h`). `auto` follows the pad that last pressed a button; `xbox` is the title's own picture, nothing replaced. Only a title that registers its prompt textures and brings pictures for them has anything to change (`src/kernel/nv2a_texrep.h`; Metal and Vulkan backends) |
 | `power.mode` (`stock`, `performance`, `battery`) | `RECOMP_PRESENT_PACING` + `RECOMP_PRESENT_SPIN_LEAD` | yes |
 | `advanced.perf_overlay` | `RECOMP_OVERLAY_PERF` | yes |
 
@@ -113,7 +141,10 @@ Power modes: *stock* is the busy-wait; *performance* sleeps and spins the
 last 8 ms before each frame (steady frame time, about 10 W on the Deck);
 *battery* sleeps throughout (about 8 W, small dips).
 
-*stock* (shown as Maximum) is offered on macOS only. On Windows, Android and
+The host's default is Balanced on every platform; the Burnout 3 port's macOS
+default became Balanced too (BO-75, measured: as steady as Stock at about half
+the CPU), with Maximum still offered there and a stored `power.mode = "stock"`
+still honoured. *stock* (shown as Maximum) is offered on macOS only. On Windows, Android and
 Linux / Steam Deck the Power page has Balanced (`performance`) and Battery
 saver; a stored `stock` is read as `performance` at load (the file is not
 rewritten for that; the next save writes the new value). The spin pacing

@@ -1,6 +1,7 @@
 # Xbox Input → XInput Compatibility Layer
 #   input_map.c     the host -> Duke mapping table and pure helpers
 #   input_core.c    public API, connection cache, probe backoff, rumble
+#   pad_glyphs.c    which button prompts go with the pad in use (pure + state)
 #   rumble_curve.c  a title's motor speed to a host motor's level (pure)
 #   xinput_device.c host backends (XInput on Windows, SDL2 elsewhere)
 #   keyboard.c      the key table and the one key map (every host)
@@ -8,6 +9,7 @@
 
 add_library(xbox_input STATIC
     input_map.c
+    pad_glyphs.c
     input_core.c
     rumble_curve.c
     xinput_device.c
@@ -38,6 +40,9 @@ endif()
 # (every host, no device needed).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_map
                  ${CMAKE_CURRENT_BINARY_DIR}/input_map)
+# Which button prompts go with the pad in use (every host, pure).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pad_glyphs
+                 ${CMAKE_CURRENT_BINARY_DIR}/pad_glyphs)
 # The rumble curve: peak, gate, strength, release, the vibrator's steps
 # (every host, pure arithmetic).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_rumble

@@ -701,6 +701,48 @@ static void test_face_layout(void)
     xbox_InputSetFaceLayoutNintendo(0);
 }
 
+/* The driving-controls choice is kept for the title's host code, and that
+ * code can tell a controller's state from the keyboard's (BO-106). */
+static void test_control_scheme(void)
+{
+    XBOX_INPUT_STATE st;
+
+    CHECK(xbox_InputControlScheme() == 0, "the default is the title's own layout");
+    CHECK(!xbox_InputControlSchemeOffered(), "no title has offered a second layout");
+    xbox_InputOfferControlScheme(1);
+    xbox_InputSetControlScheme(1);
+    CHECK(xbox_InputControlSchemeOffered() && xbox_InputControlScheme() == 1, "the choice is kept");
+    xbox_InputSetControlScheme(-3);
+    CHECK(xbox_InputControlScheme() == 0, "a negative scheme is the default");
+    xbox_InputOfferControlScheme(0);
+
+    xbox_InputSetBackend(&k_fake);
+    memset(f_plugged, 0, sizeof f_plugged);
+    f_now = 5000;
+    f_hold_start = 0;
+    f_kb_on = 0;
+    CHECK(xbox_InputSources(0) == 0, "sources before any read");
+    f_plugged[0] = f_plugged[1] = 1;
+    xbox_InputGetState(0, &st);
+    CHECK(xbox_InputSources(0) == XBOX_INPUT_SRC_PAD, "a controller alone: %u", xbox_InputSources(0));
+    f_kb_on = 1;                                /* the fake keyboard holds A */
+    xbox_InputGetState(0, &st);
+    CHECK(xbox_InputSources(0) == (XBOX_INPUT_SRC_PAD | XBOX_INPUT_SRC_KEYS),
+          "controller and a held key: %u", xbox_InputSources(0));
+    xbox_InputGetState(1, &st);
+    CHECK(xbox_InputSources(1) == XBOX_INPUT_SRC_PAD, "the keyboard is port 0's only");
+    f_plugged[0] = 0;
+    f_now += 2 * XBOX_INPUT_PROBE_MS;
+    xbox_InputGetState(0, &st);
+    CHECK(xbox_InputSources(0) == XBOX_INPUT_SRC_KEYS, "keys alone: %u", xbox_InputSources(0));
+    f_kb_on = 0;
+    xbox_InputGetState(0, &st);
+    CHECK(xbox_InputSources(0) == 0, "nothing on the port: %u", xbox_InputSources(0));
+    CHECK(xbox_InputSources(9) == 0, "a port that does not exist");
+    f_hold_start = 1;
+    xbox_InputSetBackend(NULL);
+}
+
 int main(int argc, char **argv)
 {
     xbox_InputSetDeadzone(0);
@@ -713,6 +755,7 @@ int main(int argc, char **argv)
     test_combo_guard();
     test_trigger_deadzone();
     test_face_layout();
+    test_control_scheme();
     printf("input_map: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

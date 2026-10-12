@@ -66,6 +66,7 @@
 #include "nv2a_backend_common.h"
 #include "d3d8_glsl.h"
 #include "d3d8_swizzle.h"
+#include "nv2a_texrep.h"
 #include "nv2a_pcache.h"
 #include "recomp_env.h"
 #include <pthread.h>
@@ -2113,6 +2114,7 @@ typedef struct {
     uint32_t         sign;          /* nv2a_tex_signed_mask the bytes carry */
     uint32_t         gen, used;
     uint64_t         hash;
+    uint32_t         rep;           /* nv2a_texrep generation it was uploaded at; 0: not a replaced texture */
     int              live;
     struct nvk_image im;
 } TexEntry;
@@ -2182,6 +2184,8 @@ static struct { uint32_t n; uint64_t texels, decode, image, copy; } s_fup;
 /* Decoded on the CPU by the shared decode, uploaded as BGRA8 into a new
  * image: a draw already recorded this frame keeps the texels it was
  * recorded with, as Metal's new MTLTexture per change. */
+static uint32_t s_tex_rep;    /* the last tex_upload's nv2a_texrep_apply */
+
 static int tex_upload(const Stage *t, struct nvk_image *out)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -2202,6 +2206,10 @@ static int tex_upload(const Stage *t, struct nvk_image *out)
     t0 = s_pc_trace ? now_ns() : 0;
     nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
                     t->levels, pal, pal ? t->pal_len : 0, s_texels);
+    /* The title's button prompts as the pad in use prints them (input.glyphs,
+     * nv2a_texrep.h): rectangles of a registered texture replaced here. */
+    s_tex_rep = nv2a_texrep_apply(mem + t->offset, t->color, t->width, t->height,
+                                  t->pitch, t->levels, s_texels);
     if (stage_signed(t)) {
         uint32_t x = nv2a_tex_signed_xor(stage_signed(t));
         size_t i;
@@ -2309,17 +2317,20 @@ static VkImageView tex_bind(const Stage *t)
             victim = c;
     }
     if (e) {
-        if (e->gen != g->flips) {
+        /* A replaced texture whose variant changed is uploaded again. */
+        int stale = e->rep && e->rep != nv2a_texrep_generation();
+        if (e->gen != g->flips || stale) {
             uint64_t h = tex_hash_pal(mem, t, bytes);
             s_tex_rehash++;
             e->gen = g->flips;
-            if (h != e->hash) {
+            if (h != e->hash || stale) {
                 struct nvk_image ni;
                 e->hash = h;
                 s_tex_changed++;
                 if (!tex_upload(t, &ni))
                     return s_black.view;
                 garbage_push(&e->im, VK_NULL_HANDLE, NULL);
+                e->rep = s_tex_rep;
                 e->im = ni;
             }
         }
@@ -2342,6 +2353,7 @@ static VkImageView tex_bind(const Stage *t)
         e->sign = stage_signed(t);
         e->gen = g->flips;
         e->hash = tex_hash_pal(mem, t, bytes);
+        e->rep = s_tex_rep;
         e->im = ni;
         e->live = 1;
     }
@@ -2926,10 +2938,11 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     }
     build_stages();
     nv2a_ps_consts_fill(v, s_stage, &pc.b);
+    const float host_bias = nv2a_host_lod_bias();   /* RECOMP_GFX_LOD_BIAS; 0 by default */
     for (k = 0; k < 4; k++) {
         const Stage *t = &s_stage[k];
         float b = t->levels > 1 && nv2a_tex_filter_mip(t->filter)
-                ? nv2a_tex_lod_bias(t->filter) : 0.0f;
+                ? nv2a_tex_lod_bias(t->filter) + host_bias : 0.0f;
         pc.tex_bias[k] = b > 15.99f ? 15.99f : b < -16.0f ? -16.0f : b;
     }
     {   /* Bump-env registers: methods 0x1B28..0x1B3C of each stage block. */

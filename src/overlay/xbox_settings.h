@@ -63,6 +63,7 @@ typedef enum {
     XS_INPUT_TRIGGER_DEADZONE,
     XS_INPUT_RUMBLE,
     XS_INPUT_FACE_LAYOUT,    /* xbox / nintendo (A-B and X-Y mirrored) */
+    XS_INPUT_CONTROL_SCHEME, /* xbox / ps2: the driving controls, where the title offers them */
     XS_POWER_MODE,
     XS_ADVANCED_PERF,
     XS_GAME_SPEED_UNITS,     /* an opt-in guest patch (recomp_patch.h) */
@@ -71,6 +72,10 @@ typedef enum {
     XS_GRAPHICS_BLOOM,       /* another: the title's own bloom, on as shipped */
     XS_GRAPHICS_MOTION_BLUR, /* another: the title's own motion blur, on as shipped */
     XS_GRAPHICS_CRASH_60FPS, /* another: the title's 30 Hz phases at 60, off as shipped */
+    XS_GRAPHICS_LOD_BIAS,    /* extra mip LOD bias: off, auto (from the render scale), or a value */
+    XS_GRAPHICS_DITHER,      /* noise dither in the presenter's scale to the window (Metal) */
+    XS_GRAPHICS_VEHICLE_DETAIL, /* an opt-in guest patch: the title's vehicle LOD distances */
+    XS_INPUT_GLYPHS,         /* auto / xbox / xbox_modern / playstation / nintendo / steam (pad_glyphs.h) */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
 #endif

@@ -886,6 +886,7 @@ static int run(inst *in)
         remove(path);
     }
 
+    say(in, "sha256 %s", xr_sha256_backend());   /* which code checks the files */
     have = (uint8_t *)calloc(m->count ? m->count : 1, 1);
     if (!have)
         return set_fail(in, XR_INSTALL_INTERNAL, "Out of memory.");

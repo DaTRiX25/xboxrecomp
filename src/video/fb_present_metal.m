@@ -177,8 +177,18 @@ static const char s_blit_msl[] =
     "}\n"
     /* uv: the shown part of the slot (nv2a_present_layout), offset and size. */
     "fragment float4 fs_blit(VO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
-    "                        sampler s [[sampler(0)]], constant float4 &uv [[buffer(0)]]) {\n"
-    "    return float4(t.sample(s, uv.xy + i.t * uv.zw).rgb, 1);\n"
+    "                        sampler s [[sampler(0)]], constant float4 &uv [[buffer(0)]],\n"
+    "                        constant float &dither [[buffer(1)]]) {\n"
+    "    float3 c = t.sample(s, uv.xy + i.t * uv.zw).rgb;\n"
+    /* RECOMP_GFX_DITHER: interleaved gradient noise (Jimenez, 2014) at the
+     * window pixel, scaled to just under +-0.5 LSB of the 8-bit target, so
+     * a texel that is already an exact 8-bit value (1:1 text, flat colour)
+     * rounds back to itself and only a filtered, in-between value moves. */
+    "    if (dither > 0.0) {\n"
+    "        float n = fract(52.9829189 * fract(dot(floor(i.p.xy), float2(0.06711056, 0.00583715))));\n"
+    "        c += (n - 0.5) * (0.98 / 255.0);\n"
+    "    }\n"
+    "    return float4(c, 1);\n"
     "}\n"
     /* The post passes (post_shaders.h): the frame at its own size, one pixel
      * to one texel, so a bilinear fetch at an offset of whole texels is that
@@ -754,7 +764,9 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 [enc setViewport:vp];
                 [enc setFragmentTexture:src atIndex:0];
                 [enc setFragmentSamplerState:s_smp[lin] atIndex:0];
+                float dither = nv2a_host_dither() ? 1.0f : 0.0f;
                 [enc setFragmentBytes:uv length:sizeof uv atIndex:0];
+                [enc setFragmentBytes:&dither length:sizeof dither atIndex:1];
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             }
         }
