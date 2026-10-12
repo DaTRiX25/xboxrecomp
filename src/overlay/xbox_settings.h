@@ -80,6 +80,8 @@ typedef enum {
     XS_GRAPHICS_VEHICLE_DETAIL, /* an opt-in guest patch: the title's vehicle LOD distances */
     XS_INPUT_GLYPHS,         /* auto / xbox / xbox_modern / playstation / nintendo / steam (pad_glyphs.h) */
     XS_AUDIO_LFE_LOWPASS,    /* the LFE feed's low-pass: off / 80 / 100 / 120 Hz (apu_gp.h) */
+    XS_DISPLAY_PRESENT_TIMING, /* legacy / auto: when frames are presented (present_cadence.h) */
+    XS_ADVANCED_PERF_STEPS,  /* the graph marks frames of more than one simulation step */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
 #endif

@@ -100,6 +100,16 @@ int xbox_VblankDisplayLockOn(void)
     return display_lock_on();
 }
 
+/* display.present_timing = auto: a presenter turns the lock on for a display
+ * it can follow (and off again), while RECOMP_VBLANK_SYNC says nothing. A
+ * given RECOMP_VBLANK_SYNC stays what it says. */
+void xbox_VblankDisplayLockAuto(int on)
+{
+    display_lock_on();
+    if (!recomp_env(RENV_VBLANK_SYNC))
+        s_disp_lock = on ? 1 : 0;
+}
+
 /* The longest period both steps are whole multiples of, within an eighth
  * of it (Euclid's algorithm with a tolerance); 0 when it would be under
  * 2 ms, so the steps disagree by more than a reporting thread's jitter. */
@@ -456,6 +466,9 @@ void xbox_SpinWait(uint32_t va)
 static uint64_t s_spin_lead_ns;
 /* When the vblank after the last one raised is due (the timer thread). */
 static volatile LONGLONG s_vbl_next_ns;
+/* The edge of the last vblank raised, and the vblank of the frame the
+ * executor is handing to the host (xbox_PacingFrameVblank). */
+static volatile LONGLONG s_vbl_last_ns, s_frame_vbl_ns;
 
 void xbox_PacingSetSpinLead(uint64_t ns)
 {
@@ -464,7 +477,39 @@ void xbox_PacingSetSpinLead(uint64_t ns)
 
 void xbox_VblankNextDue(uint64_t ns)
 {
+    /* The edge raised now is the one that was due next. */
+    s_vbl_last_ns = s_vbl_next_ns;
     s_vbl_next_ns = (LONGLONG)ns;
+}
+
+uint64_t xbox_VblankLastDue(void)
+{
+    return (uint64_t)s_vbl_last_ns;
+}
+
+uint64_t xbox_VblankEdgeNs(uint32_t count)
+{
+    uint64_t last = (uint64_t)s_vbl_last_ns, next = (uint64_t)s_vbl_next_ns;
+    uint64_t p = next > last && last ? next - last : 1000000000ull / XBOX_VBLANK_HZ;
+    int32_t ahead = (int32_t)(count - xbox_VblankCount());
+
+    if (!next)
+        return 0;
+    if (ahead >= 1)
+        return next + (uint64_t)(ahead - 1) * p;
+    if (!last)
+        return 0;
+    return last - (uint64_t)(-ahead) * p;
+}
+
+void xbox_PacingFrameVblank(uint64_t ns)
+{
+    s_frame_vbl_ns = (LONGLONG)ns;
+}
+
+uint64_t xbox_PacingFrameVblankNs(void)
+{
+    return (uint64_t)s_frame_vbl_ns;
 }
 
 static void cpu_relax(void)
