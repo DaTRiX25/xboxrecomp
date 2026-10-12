@@ -317,12 +317,47 @@ static int exists(const char *p)
 #endif
 }
 
+/* A real folder, not a link to one: the old name left behind as a link
+ * (off Windows) is not a folder waiting to be moved. */
+static int is_real_dir(const char *p)
+{
+#if defined(_WIN32)
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)
+        && !(a & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+    struct stat st;
+    return lstat(p, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static int any_entry(const char *dir, const char *name, int dir_entry, void *ctx)
+{
+    (void)dir; (void)name; (void)dir_entry;
+    ++*(int *)ctx;
+    return 0;                           /* one is enough */
+}
+
+static int is_empty_dir(const char *p)
+{
+    int n = 0;
+    if (!is_real_dir(p))
+        return 0;
+    for_each(p, any_entry, &n);
+    return n == 0;
+}
+
+int recomp_dir_migrate_pending(const char *old_dir, const char *new_dir)
+{
+    return is_real_dir(old_dir) && (!exists(new_dir) || is_empty_dir(new_dir));
+}
+
 int recomp_dir_migrate(const char *old_dir, const char *new_dir)
 {
     char parent[RS_PATH];
     size_t n = strlen(new_dir);
 
-    if (!is_dir(old_dir) || exists(new_dir) || n >= sizeof parent)
+    if (!recomp_dir_migrate_pending(old_dir, new_dir) || n >= sizeof parent)
         return 0;
     memcpy(parent, new_dir, n + 1);
     while (n > 1 && parent[n - 1] != '/' && parent[n - 1] != '\\')
@@ -331,8 +366,17 @@ int recomp_dir_migrate(const char *old_dir, const char *new_dir)
         parent[n - 1] = '\0';
         mkdir_p(parent);
     }
-    /* rename does not replace a folder that came to be there meanwhile
-     * unless it is empty, and never crosses to another disk. */
+    /* An empty folder of the new name (something asked where it is before
+     * the move and made it) gives way; one with anything in it never does.
+     * rename does not cross to another disk. */
+    if (exists(new_dir) &&
+#if defined(_WIN32)
+        !RemoveDirectoryA(new_dir)
+#else
+        rmdir(new_dir) != 0
+#endif
+        )
+        return -1;
     return rename(old_dir, new_dir) == 0 ? 1 : -1;
 }
 
