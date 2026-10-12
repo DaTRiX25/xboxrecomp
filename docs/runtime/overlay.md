@@ -381,6 +381,19 @@ other save rows, when there is at least one) opens the folder browser in
 is staged exactly like an import: "Restart now (the save is imported at the
 start)", the save in use copied to `save-before-import/` first.
 
+## Cheats (a tester's tool)
+
+`xbox_OverlaySetCheats` registers up to four cheats, but their rows on the
+Advanced page show only with `RECOMP_DEBUG=cheats`; players do not see them.
+With the key set, a cheat on asks once more, and from the first one on the
+title's saves go to a copy of the save (`<save root>/cheat-session`). When
+the last goes off, the page asks whether to keep that progress (the save
+goes into the save history first, then the copy replaces it) or throw it
+away (the save stays as it was and saving waits for a restart). A copy left
+behind by a quit is removed at the next start, with or without the key. A
+port can also switch a cheat on without the row (the Burnout 3 port reads
+`BO3_UNLOCK_ALL=1`; give such a run a scratch save).
+
 ## Saves are replaced whole (kernel_saveguard.h)
 
 A port turns it on with `xbox_SaveGuardEnable("<title id>")` after
