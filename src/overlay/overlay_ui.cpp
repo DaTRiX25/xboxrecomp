@@ -38,6 +38,7 @@ extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include "apu_bus.h"            /* the Mixer page */
 #include "apu_gp.h"             /* is the title's effects image modelled */
 #include "recomp_restart.h"
+#include "recomp_save_dir.h"
 #include "xbox_soundtrack.h"    /* the music folder browser's model (xsb_*) */
 
 #include <math.h>
@@ -218,7 +219,8 @@ enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_HOST0, A_HOST1, A_HOST2, A_HOST3,                  /* xbox_OverlaySetHostRows */
               A_SHADERS, A_SHADERS_LATER, A_SHADERS_NEVER,        /* A_SHADERS on: the build's */
               A_MIXER,                                            /* the Mixer page (overlay_mixer.inc) */
-              A_RESTART };                                        /* start the program again (recomp_restart.h) */
+              A_RESTART,                                          /* start the program again (recomp_restart.h) */
+              A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_CANCEL };  /* xbox_OverlaySetSaveIO */
 
 /* The most rows a page has. */
 #define OVERLAY_ROWS 28
@@ -234,9 +236,12 @@ void xbox_OverlayWantRestart(const char *reason)
     snprintf(s_restart_why, sizeof s_restart_why, "%s", reason ? reason : "");
 }
 
+/* And the overlay's own: a save import that waits for the start. */
+static char s_restart_save[200];
+
 static bool restart_wanted()
 {
-    return xbox_SettingsNeedRestart() || s_restart_why[0];
+    return xbox_SettingsNeedRestart() || s_restart_why[0] || s_restart_save[0];
 }
 
 /* Why: the settings changed that are read at start, by their table flag,
@@ -301,11 +306,123 @@ static void music_value(char *out, size_t n)
     snprintf(out, n, "%.*s", len > 40 ? 40 : len, b);
 }
 
+/* ── save data (xbox_OverlaySetSaveIO, recomp_save_dir.h) ─────────── */
+
+static bool s_sio_on;
+static char s_sio_dir[1024], s_sio_id[16], s_sio_dest[1024], s_sio_note[200];
+static char s_sio_info[200];          /* the line under the rows */
+static char s_sio_msg[2600];          /* the whole of it, for the rows' note */
+enum { FB_MUSIC, FB_SAVE };
+static int s_fb_purpose;              /* what the folder browser is open for */
+
+void xbox_OverlaySetSaveIO(const xbox_save_io *io)
+{
+    s_sio_on = io && io->save_dir && io->title_id && io->export_dir;
+    if (!s_sio_on)
+        return;
+    snprintf(s_sio_dir, sizeof s_sio_dir, "%s", io->save_dir);
+    snprintf(s_sio_id, sizeof s_sio_id, "%s", io->title_id);
+    snprintf(s_sio_dest, sizeof s_sio_dest, "%s", io->export_dir);
+    snprintf(s_sio_note, sizeof s_sio_note, "%s", io->note ? io->note : "");
+    /* What this start did with an import asked for before it. */
+    if (recomp_save_import_result(s_sio_dir, s_sio_msg, sizeof s_sio_msg))
+        snprintf(s_sio_info, sizeof s_sio_info, "%s",
+                 strncmp(s_sio_msg, "Imported", 8) ? "The save was NOT imported (the reason is in the rows' note)."
+                                                   : "The save was imported at this start (details in the rows' note).");
+}
+
+static int sio_mark(const char *dir)
+{
+    return recomp_save_export_check(dir, s_sio_id, NULL, 0);
+}
+
+static bool sio_staged(char *folder, unsigned n)
+{
+    return s_sio_on && recomp_save_import_staged(s_sio_dir, folder, n);
+}
+
+/* Ask for `folder` at the next start, and say what will happen. */
+static void sio_stage(const char *folder)
+{
+    char err[1400] = "";
+    if (recomp_save_import_stage(s_sio_dir, folder, s_sio_id, err, sizeof err)) {
+        snprintf(s_sio_msg, sizeof s_sio_msg, "Waiting for the next start: the save in %s is imported"
+                 " then, before the game runs. The save in use now is copied to %s/save-before-import"
+                 " first. Until the restart the game goes on with the save it has, and what it saves"
+                 " meanwhile ends up in that copy.", folder, s_sio_dir);
+        snprintf(s_sio_info, sizeof s_sio_info, "Import waiting for the next start: %.120s", path_leaf(folder));
+        snprintf(s_restart_save, sizeof s_restart_save, "A save import is waiting: it is done when the game starts.");
+        fprintf(stderr, LOGP "save import staged: %s\n", folder);
+    } else {
+        snprintf(s_sio_msg, sizeof s_sio_msg, "%s", err);
+        snprintf(s_sio_info, sizeof s_sio_info, "Not imported (the reason is in this row's note).");
+        fprintf(stderr, LOGP "save import refused: %s\n", err);
+    }
+}
+
+static void sio_action(int action)
+{
+    char path[1024] = "", err[1400] = "";
+
+    if (!s_sio_on)
+        return;
+    switch (action) {
+    case A_SAVE_EXPORT:
+        if (recomp_save_export(s_sio_dir, s_sio_id, s_sio_dest, s_sio_note, path, sizeof path,
+                               err, sizeof err)) {
+            snprintf(s_sio_msg, sizeof s_sio_msg, "Exported to %s", path);
+            snprintf(s_sio_info, sizeof s_sio_info, "Exported: %.80s (the full path is in this row's note)",
+                     path_leaf(path));
+            fprintf(stderr, LOGP "save exported to %s\n", path);
+        } else {
+            snprintf(s_sio_msg, sizeof s_sio_msg, "%s", err);
+            snprintf(s_sio_info, sizeof s_sio_info, "Not exported (the reason is in this row's note).");
+            fprintf(stderr, LOGP "save export failed: %s\n", err);
+        }
+        break;
+    case A_SAVE_IMPORT:
+        if (recomp_save_export_newest(s_sio_dest, s_sio_id, path, sizeof path)) {
+            sio_stage(path);
+        } else {
+            snprintf(s_sio_msg, sizeof s_sio_msg, "No exported save was found in %s. Export one on the"
+                     " other machine and copy its dated folder there, or pick a folder with"
+                     " \"Import save from another folder\".", s_sio_dest);
+            snprintf(s_sio_info, sizeof s_sio_info, "No exported save found (see this row's note).");
+        }
+        break;
+    case A_SAVE_BROWSE: {
+        xsb_options o;
+        memset(&o, 0, sizeof o);
+        o.use_label = "Import the save in this folder";
+        o.top_label = "Exported saves";
+        o.top_path = s_sio_dest;
+        o.mark = sio_mark;
+        s_fb_purpose = FB_SAVE;
+        xsb_open_with(&o);
+        s_fb_sel = 0;
+        s_fb_scroll = true;
+        break;
+    }
+    case A_SAVE_CANCEL:
+        recomp_save_import_cancel(s_sio_dir);
+        s_restart_save[0] = 0;
+        snprintf(s_sio_msg, sizeof s_sio_msg, "The import was cancelled: the save in use stays.");
+        snprintf(s_sio_info, sizeof s_sio_info, "Import cancelled.");
+        break;
+    default:
+        break;
+    }
+}
+
 static void browser_count(const xsb_row &r, char *out, size_t n)
 {
     out[0] = 0;
     if (r.kind == XSB_OFF || r.kind == XSB_UP)
         return;
+    if (s_fb_purpose == FB_SAVE) {
+        snprintf(out, n, "%s", r.songs < 0 ? "..." : r.songs ? "a save of this game" : "");
+        return;
+    }
     if (r.songs < 0)
         snprintf(out, n, "...");
     else if (r.songs == 0)
@@ -325,6 +442,10 @@ static void browser_pick(int i)
     if (res == XSB_MOVED) {
         s_fb_sel = sel;
         s_fb_scroll = true;
+    } else if (res == XSB_CHOSEN && s_fb_purpose == FB_SAVE) {
+        /* A folder for the import: checked, and either way back to the page. */
+        sio_stage(dir);
+        xsb_close();
     } else if (res == XSB_CHOSEN || res == XSB_TURNED_OFF) {
         if (res == XSB_TURNED_OFF)
             dir[0] = 0;
@@ -575,9 +696,30 @@ static int page_rows(int page, Row *r)
             ACT(A_REPORT, "Create bug report");
             ACT(A_REPORT_SHOT, "Create bug report with a screenshot");
         }
+        /* Save data: a copy out of the profile, and one back in. */
+        bool staged = false;
+        if (s_sio_on) {
+            static char imp[160];
+            char found[1024];
+            staged = sio_staged(found, sizeof found);
+            ACT(A_SAVE_EXPORT, "Export save to home folder");
+            if (staged) {
+                ACT(A_SAVE_CANCEL, "Cancel the import");
+            } else {
+                if (recomp_save_export_newest(s_sio_dest, s_sio_id, found, sizeof found))
+                    snprintf(imp, sizeof imp, "Import save from home folder (newest: %.60s)", path_leaf(found));
+                else
+                    snprintf(imp, sizeof imp, "Import save from home folder (none found there)");
+                ACT(A_SAVE_IMPORT, imp);
+                ACT(A_SAVE_BROWSE, "Import save from another folder...");
+            }
+            if (s_sio_info[0])
+                INFO(s_sio_info);
+        }
         /* Always here; on the other pages only while one is wanted. */
         if (recomp_restart_available())
-            ACT(A_RESTART, restart_wanted() ? "Restart game now" : "Restart game");
+            ACT(A_RESTART, staged ? "Restart now (the save is imported at the start)"
+                         : restart_wanted() ? "Restart game now" : "Restart game");
         ACT(A_RESET_ALL, "Reset all settings to the defaults");
         break;
     }
@@ -629,6 +771,35 @@ static void test_state(const char *path)
                 label ? label : "", v[0] ? " = " : "", v);
     }
     fclose(f);
+}
+
+/* Tests (overlay_shot): the open page's row whose text starts with
+ * `prefix`: whether there is one, and the cursor put on it. */
+static int row_starting(const char *prefix)
+{
+    Row r[OVERLAY_ROWS];
+    int n = page_rows(s_page, r);
+    for (int i = 0; i < n; i++) {
+        const char *t = r[i].kind == R_SETTING ? k_meta[r[i].id].label : r[i].text;
+        if (t && !strncmp(t, prefix, strlen(prefix)))
+            return i;
+    }
+    return -1;
+}
+
+int xbox_OverlayTestHasRow(const char *prefix)
+{
+    return row_starting(prefix) >= 0;
+}
+
+int xbox_OverlayTestSelectRow(const char *prefix)
+{
+    int i = row_starting(prefix);
+    if (i < 0)
+        return 0;
+    s_sel[s_page] = i;
+    s_scroll_to_sel = true;
+    return 1;
 }
 
 static void sb_select()
@@ -794,6 +965,7 @@ static void activate(const Row &r)
         int locked = 0;
         const char *dir = xbox_SettingsText(MUSIC_KEY, &locked);
         if (!locked) {
+            s_fb_purpose = FB_MUSIC;
             xsb_open(dir);
             /* On the current folder when there is one ("turn off" is above it). */
             s_fb_sel = dir[0] ? 1 : 0;
@@ -803,6 +975,10 @@ static void activate(const Row &r)
     }
     if (r.kind == R_ACTION && r.action == A_RESTART) {
         restart_now();
+        return;
+    }
+    if (r.kind == R_ACTION && r.action >= A_SAVE_EXPORT && r.action <= A_SAVE_CANCEL) {
+        sio_action(r.action);
         return;
     }
     if (r.kind == R_ACTION && r.action >= A_HOST0 && r.action <= A_HOST3) {
@@ -951,7 +1127,9 @@ static void restart_reason(char *out, size_t n)
         at += (size_t)snprintf(out + at, at < n ? n - at : 0, " %s read when the game starts.",
                                count == 1 ? "is" : "are");
     if (s_restart_why[0] && at < n)
-        snprintf(out + at, n - at, "%s%s", count ? " " : "", s_restart_why);
+        at += (size_t)snprintf(out + at, n - at, "%s%s", at ? " " : "", s_restart_why);
+    if (s_restart_save[0] && at < n)
+        snprintf(out + at, n - at, "%s%s", at ? " " : "", s_restart_save);
 }
 
 /* The overlay closes as at any time (the settings are written), then the
@@ -1972,7 +2150,9 @@ static void build_browser(float fs, ImDrawList *dl)
     const float wrap_w = ImGui::GetContentRegionAvail().x;
     {
         ImVec2 p = ImGui::GetCursorScreenPos();
-        const char *t = where[0] ? where : "Custom music folder: choose where to look";
+        const char *t = where[0] ? where
+                      : s_fb_purpose == FB_SAVE ? "Import save: choose the folder of an exported save"
+                      : "Custom music folder: choose where to look";
         char cut[1100];
         if (ImGui::CalcTextSize(t).x > wrap_w) {
             const char *q = t;
@@ -2041,7 +2221,9 @@ static void build_browser(float fs, ImDrawList *dl)
         dl->AddLine(ImVec2(p.x, p.y + fs * 0.2f), ImVec2(p.x + avail.x, p.y + fs * 0.2f), col(T->rule));
         float y = p.y + fs * 0.5f;
         dl->AddText(ImVec2(p.x, y), col(T->text_dim),
-                    "Every folder with music in it becomes a soundtrack in the game's own music menu.");
+                    s_fb_purpose == FB_SAVE
+                    ? "An exported save is a dated folder with UDATA inside. It is imported at the next start."
+                    : "Every folder with music in it becomes a soundtrack in the game's own music menu.");
         y += fs + fs * 0.3f + fs * 1.3f;
         const char *keys = pad_hints()
             ? "D-pad  select      A  open / choose      B  back"
@@ -2188,6 +2370,24 @@ static void build_pages(float fs)
                          ? " (\"Restart game now\" appears below once it is changed)" : "");
             }
         }
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action >= A_SAVE_EXPORT
+               && rows[sel].action <= A_SAVE_CANCEL) {
+        const char *what =
+            rows[sel].action == A_SAVE_EXPORT
+            ? "Copies your save (the game's own files, nothing else) to a dated folder in"
+            : rows[sel].action == A_SAVE_IMPORT
+            ? "Takes the newest exported save in"
+            : rows[sel].action == A_SAVE_BROWSE
+            ? "Pick the dated folder of an exported save, on a drive or card too; the usual place is"
+            : "Forgets the import that is waiting; the exported folder stays in";
+        const char *then =
+            rows[sel].action == A_SAVE_EXPORT
+            ? "Copy that folder to another machine's folder of the same name to carry the save over."
+            : rows[sel].action == A_SAVE_CANCEL ? ""
+            : "It replaces the save at the next start, after the save in use is copied aside;"
+              " nothing changes under the running game.";
+        snprintf(hint, sizeof hint, "%s%s%s %s. %s", s_sio_msg, s_sio_msg[0] ? "  |  " : "", what,
+                 s_sio_dest, then);
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_RESTART) {
         char why[400];
         restart_reason(why, sizeof why);
@@ -2298,8 +2498,8 @@ static void build_pages(float fs)
                         recomp_restart_available()
                         ? "The changes marked (restart) apply after a restart: \"Restart game now\" on this page."
                         : "Restart the game for the changes marked (restart) to apply.");
-        else if (s_restart_why[0])
-            dl->AddText(ImVec2(p.x, y), col(T->warn), "A restart is waiting: \"Restart game now\" on this page.");
+        else if (s_restart_why[0] || s_restart_save[0])
+            dl->AddText(ImVec2(p.x, y), col(T->warn), "A restart is waiting: the Restart row on this page does it.");
         y += fs * 1.3f;
         const char *keys = pad_hints()
             ? "D-pad  select / change      A  toggle      Y  default      B  close"

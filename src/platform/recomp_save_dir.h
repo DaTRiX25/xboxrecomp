@@ -64,6 +64,59 @@ int recomp_save_dir_migrate(const char *legacy, const char *dir);
  * the backup made, or "" when none was needed. 1 when it made one. */
 int recomp_save_backup(const char *dir, int keep, char *out, unsigned out_size);
 
+/* ── a save out of the profile and back ────────────────────────────── */
+
+/*
+ * An export is a folder holding the title's own save files as they are in
+ * the save root, UDATA/<title id>/... and TDATA/<title id>/... (title_id as
+ * the title names its folder: eight hex digits), and a small text file
+ * (save-export.txt: "title <id>", when it was made, a line of the port's).
+ * The layout under the save root is the same on every host, so an export
+ * made on one imports on another. Nothing else of the save root goes along
+ * (other titles' folders, the dashboard's music database, partition images,
+ * backups, settings).
+ *
+ * An import is not done under a running title: the title holds its save in
+ * memory once a profile is loaded and writes it back when it saves. It is
+ * staged (a note in the save root) and applied by recomp_save_import_apply
+ * at the next start, before the title runs: the save in use is copied to
+ * <save root>/save-before-import/<date-time>/ first (never deleted by the
+ * start-up backups' rotation), then replaced; if the copy fails it is put
+ * back. Paths are UTF-8.
+ */
+
+/* 1 when the save root has files of this title to export. */
+int recomp_save_has_data(const char *dir, const char *title_id);
+/* Copy the save to <dest_root>/<YYYYMMDD-HHMMSS>/ (made as needed; `note`
+ * is a line for save-export.txt, may be NULL). 1 with the folder in `out`;
+ * 0 with a sentence for the player in `err`. */
+int recomp_save_export(const char *dir, const char *title_id, const char *dest_root, const char *note,
+                       char *out, unsigned out_size, char *err, unsigned err_size);
+/* Whether `folder` is an export of this title (or a hand copy with the same
+ * shape): it has UDATA/<title id> with a file in it, and its save-export.txt,
+ * if any, names this title. 0 with a sentence in `err` (may be NULL). */
+int recomp_save_export_check(const char *folder, const char *title_id, char *err, unsigned err_size);
+/* The newest export of this title in `dest_root` (by its dated name). */
+int recomp_save_export_newest(const char *dest_root, const char *title_id, char *out, unsigned out_size);
+
+/* Ask for `folder` to be imported at the next start (checked first). */
+int recomp_save_import_stage(const char *dir, const char *folder, const char *title_id,
+                             char *err, unsigned err_size);
+/* 1 and the folder when an import is asked for. */
+int recomp_save_import_staged(const char *dir, char *folder, unsigned size);
+void recomp_save_import_cancel(const char *dir);
+/* At start, before the title and before anything else looks at the save
+ * root: do the import asked for. 0 nothing was asked, 1 imported, -1 not
+ * imported (the save in use is as it was). `report` gets a sentence for the
+ * log; the same is kept for recomp_save_import_result until the next start. */
+int recomp_save_import_apply(const char *dir, const char *title_id, char *report, unsigned size);
+int recomp_save_import_result(const char *dir, char *text, unsigned size);
+
+/* The player's home folder: $HOME, %USERPROFILE% on Windows; on Android the
+ * app's own external files directory (the one place it may write without a
+ * permission). Not created. */
+int recomp_home_dir(char *out, unsigned size);
+
 #ifdef __cplusplus
 }
 #endif

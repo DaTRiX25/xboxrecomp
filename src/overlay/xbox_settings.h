@@ -189,6 +189,24 @@ typedef struct xbox_music_folder_ops {
 } xbox_music_folder_ops;
 void xbox_OverlaySetMusicFolder(const xbox_music_folder_ops *ops);
 
+/* The "save data" rows of the overlay's Advanced page (recomp_save_dir.h's
+ * export and import), for a port that names its title's save: "Export save
+ * to home folder" copies UDATA/<title id> and TDATA/<title id> of the save
+ * root to a dated folder in `export_dir` and shows the full path; "Import
+ * save from home folder" takes the newest export there, "Import save from
+ * another folder..." one picked in the folder browser. An import is checked,
+ * staged, and done at the next start by the port's call of
+ * recomp_save_import_apply (the save in use is set aside first); meanwhile
+ * the rows offer "Restart now" and "Cancel the import". `note` is a line
+ * for the export's text file (may be NULL). The strings are copied. */
+typedef struct xbox_save_io {
+    const char *save_dir;
+    const char *title_id;
+    const char *export_dir;
+    const char *note;
+} xbox_save_io;
+void xbox_OverlaySetSaveIO(const xbox_save_io *io);
+
 /* Restart (recomp_restart.h). The overlay offers "Restart game now" on a
  * page while one is wanted: a setting flagged XS_RESTART in the table
  * differs from its value at launch (xbox_SettingsNeedRestart: the table is

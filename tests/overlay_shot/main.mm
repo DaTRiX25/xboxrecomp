@@ -660,6 +660,174 @@ static int mixer_tour(const char *pre, const char *file)
     return s_fail ? 1 : 0;
 }
 
+/* OVERLAY_SHOT_SAVEIO=<work dir>: the save rows (BO-123) and the Restart
+ * row (BO-124), over a made save tree in the work dir: no real profile, no
+ * home folder. Nothing is restarted: the row is found and selected, not
+ * picked (the request would start this tool again). */
+extern "C" {
+#include "recomp_save_dir.h"
+#include "recomp_restart.h"
+#include "xbox_soundtrack.h"
+}
+#include <sys/stat.h>
+
+static void put_file(const char *root, const char *rel, const char *text)
+{
+    char p[1400];
+    snprintf(p, sizeof p, "%s/%s", root, rel);
+    for (char *c = p + 1; *c; c++)
+        if (*c == '/') { *c = 0; mkdir(p, 0755); *c = '/'; }
+    FILE *f = fopen(p, "wb");
+    if (f) { fputs(text, f); fclose(f); }
+}
+
+static void press_a()
+{
+    pad(SDL_CONTROLLER_BUTTON_A, true);
+    pad(SDL_CONTROLLER_BUTTON_A, false);
+    run(3);
+}
+
+static void press(int button)
+{
+    pad(button, true);
+    pad(button, false);
+    run(2);
+}
+
+static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
+{
+    char save[1024], dest[1024], path[1400], found[1024];
+    xbox_save_io io;
+
+    snprintf(path, sizeof path, "rm -rf '%s'", work);
+    if (system(path) != 0) return 2;
+    mkdir(work, 0755);
+    snprintf(save, sizeof save, "%s/profile", work);
+    snprintf(dest, sizeof dest, "%s/home/Takedawn-saves", work);
+    put_file(save, "UDATA/4541005b/TitleMeta.xbx", "meta");
+    put_file(save, "UDATA/4541005b/57BD267AFF58/Profile 1", "the profile");
+    put_file(save, "TDATA/4541005b/x.dat", "title data");
+    io.save_dir = save; io.title_id = "4541005b"; io.export_dir = dest; io.note = "from the overlay_shot tour";
+    xbox_OverlaySetSaveIO(&io);
+    recomp_restart_init(argc, argv);
+
+    tap(SDLK_F1);
+    CHECK(xbox_OverlayOpen());
+    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);                 /* the last page: Advanced */
+    run(10);
+    CHECK(xbox_OverlayTestHasRow("Export save to home folder"));
+    CHECK(xbox_OverlayTestHasRow("Import save from home folder (none found"));
+    CHECK(xbox_OverlayTestHasRow("Import save from another folder"));
+    CHECK(xbox_OverlayTestHasRow("Restart game") && !xbox_OverlayTestHasRow("Restart game now"));
+    CHECK(!xbox_OverlayTestHasRow("Cancel the import"));
+
+    /* Import with nothing exported: a message, nothing staged. */
+    CHECK(xbox_OverlayTestSelectRow("Import save from home folder"));
+    press_a();
+    CHECK(!recomp_save_import_staged(save, found, sizeof found));
+    CHECK(xbox_OverlayTestHasRow("No exported save found"));
+    snprintf(path, sizeof path, "%ssave_none.bmp", pre);
+    frame(path);
+
+    /* Export. */
+    CHECK(xbox_OverlayTestSelectRow("Export save to home folder"));
+    press_a();
+    CHECK(recomp_save_export_newest(dest, "4541005b", found, sizeof found));
+    CHECK(xbox_OverlayTestHasRow("Exported: "));
+    CHECK(xbox_OverlayTestHasRow("Import save from home folder (newest: 20"));
+    snprintf(path, sizeof path, "%ssave_exported.bmp", pre);
+    frame(path);
+
+    /* Import the newest: staged, the rows change, a restart is offered. */
+    CHECK(xbox_OverlayTestSelectRow("Import save from home folder"));
+    press_a();
+    CHECK(recomp_save_import_staged(save, path, sizeof path) && !strcmp(path, found));
+    CHECK(xbox_OverlayTestHasRow("Cancel the import"));
+    CHECK(xbox_OverlayTestHasRow("Restart now (the save is imported at the start)"));
+    CHECK(xbox_OverlayTestHasRow("Import waiting for the next start"));
+    CHECK(!xbox_OverlayTestHasRow("Import save from another folder"));
+    CHECK(xbox_OverlayTestSelectRow("Restart now"));
+    run(3);
+    snprintf(path, sizeof path, "%ssave_staged.bmp", pre);
+    frame(path);
+    /* And on another page too, while it waits. */
+    press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+    CHECK(xbox_OverlayTestHasRow("Restart game now"));
+    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+
+    /* Cancel. */
+    CHECK(xbox_OverlayTestSelectRow("Cancel the import"));
+    press_a();
+    CHECK(!recomp_save_import_staged(save, path, sizeof path));
+    CHECK(!xbox_OverlayTestHasRow("Cancel the import") && xbox_OverlayTestHasRow("Import cancelled"));
+    CHECK(!xbox_OverlayTestHasRow("Restart now"));
+
+    /* Another folder: the browser, on the exported saves. */
+    CHECK(xbox_OverlayTestSelectRow("Import save from another folder"));
+    press_a();
+    CHECK(xsb_is_open());
+    {
+        xsb_row r;
+        CHECK(xsb_row_at(0, &r) && !strcmp(r.label, "Exported saves"));
+    }
+    run(10);
+    snprintf(path, sizeof path, "%ssave_browser_places.bmp", pre);
+    frame(path);
+    press_a();                                                  /* into the exported saves */
+    run(15);                                                    /* the marks arrive */
+    {
+        xsb_row r;
+        CHECK(xsb_row_at(0, &r) && r.kind == XSB_USE && !strcmp(r.label, "Import the save in this folder"));
+        CHECK(xsb_row_at(2, &r) && r.kind == XSB_DIR && r.songs == 1);
+    }
+    snprintf(path, sizeof path, "%ssave_browser_list.bmp", pre);
+    frame(path);
+    /* The folder of saves itself is not a save: refused, with a message. */
+    press(SDL_CONTROLLER_BUTTON_DPAD_UP); press(SDL_CONTROLLER_BUTTON_DPAD_UP);
+    press_a();
+    CHECK(!xsb_is_open() && !recomp_save_import_staged(save, path, sizeof path));
+    CHECK(xbox_OverlayTestHasRow("Not imported"));
+    /* Into the dated folder, and that one is taken. */
+    CHECK(xbox_OverlayTestSelectRow("Import save from another folder"));
+    press_a();
+    press_a();                                                  /* exported saves */
+    press_a();                                                  /* the cursor is on the first folder */
+    CHECK(xsb_is_open());
+    press(SDL_CONTROLLER_BUTTON_DPAD_UP); press(SDL_CONTROLLER_BUTTON_DPAD_UP);
+    press_a();                                                  /* "Import the save in this folder" */
+    CHECK(!xsb_is_open() && recomp_save_import_staged(save, path, sizeof path) && !strcmp(path, found));
+    /* B in the browser goes back to the page without choosing. */
+    CHECK(xbox_OverlayTestSelectRow("Cancel the import"));
+    press_a();
+    CHECK(xbox_OverlayTestSelectRow("Import save from another folder"));
+    press_a();
+    press(SDL_CONTROLLER_BUTTON_B);
+    xbox_OverlayPoll();
+    CHECK(!xsb_is_open() && xbox_OverlayOpen());
+
+    /* A setting the table flags: the Restart row comes and goes with it. */
+    for (int p = 0; p < 12 && !xbox_OverlayTestHasRow("Aspect ratio"); p++)
+        press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+    CHECK(xbox_OverlayTestHasRow("Aspect ratio"));
+    CHECK(!xbox_OverlayTestHasRow("Restart game now"));
+    xbox_SettingSet(XS_DISPLAY_ASPECT, 1);
+    run(2);
+    CHECK(xbox_SettingsNeedRestart() && xbox_OverlayTestHasRow("Restart game now"));
+    CHECK(xbox_OverlayTestSelectRow("Restart game now"));
+    run(3);
+    snprintf(path, sizeof path, "%srestart_row.bmp", pre);
+    frame(path);
+    xbox_SettingSet(XS_DISPLAY_ASPECT, 0);
+    run(2);
+    CHECK(!xbox_OverlayTestHasRow("Restart game now"));
+    CHECK(!recomp_restart_requested());
+
+    fprintf(stderr, "overlay_shot save and restart rows: %s\n", s_fail ? "FAILED" : "ok");
+    xbox_OverlayShutdown();
+    return s_fail ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *pre = argc > 1 ? argv[1] : "overlay_";
@@ -683,6 +851,8 @@ int main(int argc, char **argv)
         return mixer_e2e(getenv("OVERLAY_SHOT_MIXER_E2E"));
     if (getenv("OVERLAY_SHOT_MIXER"))
         return mixer_tour(pre, getenv("OVERLAY_SHOT_MIXER"));
+    if (getenv("OVERLAY_SHOT_SAVEIO"))
+        return saveio_tour(pre, getenv("OVERLAY_SHOT_SAVEIO"), argc, argv);
 
     /* Flips for the graph: mostly 60 Hz, a few long ones. */
     for (int i = 0; i < 150; i++) {
@@ -737,8 +907,9 @@ int main(int argc, char **argv)
         snprintf(path, sizeof path, "%spage%d.bmp", pre, p);
         frame(path);
         if (p == 5) {                                         /* advanced: the bug report */
-            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, true);       /* past the info line */
-            pad(SDL_CONTROLLER_BUTTON_DPAD_DOWN, false);
+            /* By its text: the rows above it have grown since this was
+             * written (it used to be one step down). */
+            CHECK(xbox_OverlayTestSelectRow("Create bug report"));
             run(2);
             pad(SDL_CONTROLLER_BUTTON_A, true);
             pad(SDL_CONTROLLER_BUTTON_A, false);
