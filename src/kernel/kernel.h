@@ -1259,6 +1259,14 @@ extern void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
  * asks for a long one it cannot skip). Installed before the game starts. */
 extern const char *(*xbox_PathRedirectHook)(const char *xbox_path);
 
+/* The root of the title's UDATA and TDATA (the save root, or RECOMP_SAVE_DIR),
+ * UTF-8. xbox_PathSetUserRoot puts another root in its place for every path
+ * translated from then on (NULL or "": back to the real one): a cheat
+ * session's copy of the save (recomp_save_sandbox_begin). Set while the
+ * title is paused (the overlay is open), not in the middle of its I/O. */
+const char *xbox_PathUserRoot(void);
+void xbox_PathSetUserRoot(const char *utf8);
+
 /* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off).
  * Interlaced output shows one field per vblank, so its low bit is the field
  * parity that the field pin (port 0x80C0) reports. */

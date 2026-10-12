@@ -181,6 +181,20 @@ void xbox_OverlaySetAbout(const char *text);
  * turn, as the hotkey opens it. 0 when there is no overlay to open (not
  * built, or switched off). */
 int xbox_OverlayRequestOpen(void);
+
+/* Cheats, for the session only: rows on the Advanced page, each switched with
+ * A (on asks once more, showing `warning`). While one is on the title's saves
+ * go to a copy of the save (recomp_save_sandbox_begin); when the last goes
+ * off the player keeps that progress or throws it away. get and set run on
+ * the main thread while the overlay is open (the title is paused). Up to 4;
+ * call once, after the save root is known (the kernel's paths are set up). */
+typedef struct xbox_cheat {
+    const char *name;
+    const char *warning;
+    int  (*get)(void);
+    void (*set)(int on);
+} xbox_cheat;
+void xbox_OverlaySetCheats(const xbox_cheat *list, int n);
 /* Whether there is an overlay to open (built and not switched off). */
 int xbox_OverlayAvailable(void);
 
