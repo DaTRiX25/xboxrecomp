@@ -1065,6 +1065,19 @@ static void browser_utf8_shot(const char *pre)
     run(1);
 }
 
+/* Two cheats as a port registers them, for the Advanced page's rows (one
+ * shown on); the save root a temporary folder. */
+extern "C" void xbox_path_init(const char *game_dir, const char *save_dir);
+static int s_cheat[2] = { 0, 1 };
+static int cheat0_get(void) { return s_cheat[0]; }
+static void cheat0_set(int on) { s_cheat[0] = on; }
+static int cheat1_get(void) { return s_cheat[1]; }
+static void cheat1_set(int on) { s_cheat[1] = on; }
+static const xbox_cheat k_cheats[2] = {
+    { "Unlock everything", "Every event, car and track opens for this session.", cheat0_get, cheat0_set },
+    { "Endless boost", "The boost bar never empties.", cheat1_get, cheat1_set },
+};
+
 int main(int argc, char **argv)
 {
     const char *pre = argc > 1 ? argv[1] : "overlay_";
@@ -1098,6 +1111,14 @@ int main(int argc, char **argv)
         return saveio_tour(pre, getenv("OVERLAY_SHOT_SAVEIO"), argc, argv);
 
     recomp_restart_init(argc, argv);     /* the host can restart: the pending-restart row shows */
+    {
+        char root[1024];
+        const char *tmp = getenv("TMPDIR");
+        snprintf(root, sizeof root, "%s/overlay_shot_root_%d", tmp && tmp[0] ? tmp : "/tmp", (int)getpid());
+        mkdir(root, 0755);
+        xbox_path_init(root, root);              /* the save root the cheat rows wait for */
+        xbox_OverlaySetCheats(k_cheats, 2);
+    }
 
     /* Flips for the graph: mostly 60 Hz, a few long ones. */
     for (int i = 0; i < 150; i++) {
@@ -1192,6 +1213,21 @@ int main(int argc, char **argv)
             pad(SDL_CONTROLLER_BUTTON_A, false);
             run(2);
             CHECK(s_reports == 2 && s_report_shot == 1);
+            /* The cheats: label and state as a setting's row; A once shows
+             * the warning and asks again. */
+            CHECK(xbox_OverlayTestSelectRow("Unlock everything"));
+            run(2);
+            snprintf(path, sizeof path, "%scheats.bmp", pre);
+            frame(path);
+            pad(SDL_CONTROLLER_BUTTON_A, true);
+            pad(SDL_CONTROLLER_BUTTON_A, false);
+            run(2);
+            CHECK(s_cheat[0] == 0);                           /* asked, not yet on */
+            snprintf(path, sizeof path, "%scheats_confirm.bmp", pre);
+            frame(path);
+            pad(SDL_CONTROLLER_BUTTON_DPAD_UP, true);
+            pad(SDL_CONTROLLER_BUTTON_DPAD_UP, false);
+            run(1);
         }
     }
     CHECK(xbox_SettingValue(XS_AUDIO_VOLUME) < 1.0);

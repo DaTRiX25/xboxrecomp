@@ -2665,6 +2665,26 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     }
     if (r.kind == R_ACTION) {
         const bool pin = r.action == A_RESTART_PIN;
+        if (r.action >= A_CHEAT0 && r.action <= A_CHEAT3 && strrchr(r.text, ':')) {
+            /* A cheat: "Name: On" as a setting's row, the name a label and
+             * the state a value (attention yellow while it is on); while
+             * switching it on is asked, the question in the value's place. */
+            const char *c = strrchr(r.text, ':');
+            char name[120];
+            snprintf(name, sizeof name, "%.*s", (int)(c - r.text), r.text);
+            const char *v = c[1] == ' ' ? c + 2 : c + 1;
+            {
+                Face it(s_f_body, SHEAR);
+                txt_fit(dl, fs, ImVec2(lx, ty), sel ? col(T->text_hi) : col(T->text), caps(name), label_w);
+            }
+            const bool on = !strcmp(v, "On");
+            if (s_confirm && r.action == s_confirm)
+                txt_fit(dl, fs, ImVec2(vr, ty), col(T->attn), confirm_text(r.action), vr - LY.x_val0, true);
+            else
+                txt_fit(dl, fs, ImVec2(vr, ty), on ? col(T->attn) : sel ? col(T->text_hi) : col(T->text), v,
+                        vr - LY.x_val0, true);
+            return;
+        }
         {
             Face it(s_f_body, SHEAR);
             txt_fit(dl, fs, ImVec2(lx, ty), pin ? col(T->attn) : sel ? col(T->text_hi) : col(T->action), caps(r.text),
@@ -3187,6 +3207,7 @@ static void build_pages_inner()
                  why, why[0] ? " " : "");
     } else if (rows[sel].kind == R_ACTION && rows[sel].action >= A_CHEAT0 && rows[sel].action <= A_CHEAT3) {
         int i = rows[sel].action - A_CHEAT0;
+        hint_locked = true;                   /* the warning, in the attention colour */
         snprintf(hint, sizeof hint, "%s%s%s", s_confirm == rows[sel].action ? confirm_text(rows[sel].action) : "",
                  s_confirm == rows[sel].action ? ".  " : "",
                  i < s_cheat_n && s_cheats[i].warning ? s_cheats[i].warning : "");
