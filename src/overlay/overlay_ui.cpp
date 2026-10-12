@@ -524,12 +524,19 @@ static int page_rows(int page, Row *r)
         if (s_about[0])
             INFO(s_about);
         SET(XS_ADVANCED_PERF);
-        SET(XS_ADVANCED_PERF_STEPS);
-        /* What reaches the glass, in words (the graph has one line of it). */
-        glass_info();
-        INFO(s_glass_info[0]);
-        INFO(s_glass_info[1]);
-        INFO(s_glass_info[2]);
+#if defined(__APPLE__)
+        /* The Metal presenter's (BO-115); the other presenters do not
+         * record when frames reach the glass, and their pages are as they
+         * were. */
+        if (!s_vulkan) {
+            SET(XS_ADVANCED_PERF_STEPS);
+            /* What reaches the glass, in words (the graph has one line of it). */
+            glass_info();
+            INFO(s_glass_info[0]);
+            INFO(s_glass_info[1]);
+            INFO(s_glass_info[2]);
+        }
+#endif
         if (xbox_BugReportHasMaker()) {
             INFO(s_rep_info);
             ACT(A_REPORT, "Create bug report");
@@ -1628,7 +1635,10 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
     }
     glass_update();
     const pc_report &g = s_glass;
-    const bool steps = xbox_SettingValue(XS_ADVANCED_PERF_STEPS) != 0.0;
+    /* A presenter that records on-glass times has said so (its status);
+     * without one the panel is the two lines and the bars it always was. */
+    const bool have_glass = s_glass_st.source[0] != 0;
+    const bool steps = have_glass && xbox_SettingValue(XS_ADVANCED_PERF_STEPS) != 0.0;
 
     /* Three lines of text: the title's flips, what reached the glass, and a
      * warning only when there is something to warn of. */
@@ -1659,7 +1669,9 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
     /* The panel is as wide as its longest line: a fixed width left the stats
      * line running past the backdrop at larger values (a 100+ ms max). */
     const float pad = fs * 0.6f, lh = fs * 1.15f;
-    const int lines = l4[0] ? 4 : 3;
+    if (!have_glass)
+        l4[0] = 0;
+    const int lines = !have_glass ? 2 : l4[0] ? 4 : 3;
     const float h = fs * 4.1f + lh * lines;
     float tw = ImGui::CalcTextSize(l1).x;
     const char *const ls[4] = { l1, l2, l3, l4 };
@@ -1672,15 +1684,16 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs)
     dl->AddRectFilled(a, b, solid(T->perf_bg, 200 / 255.0f), fs * 0.5f);
     dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f), solid(T->perf_text), l1);
     dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + lh), solid(T->perf_text2), l2);
-    dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + lh * 2),
-                solid(g.warn_uneven || g.warn_rate ? T->perf_warn : T->perf_text2), l3);
+    if (have_glass)
+        dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + lh * 2),
+                    solid(g.warn_uneven || g.warn_rate ? T->perf_warn : T->perf_text2), l3);
     if (l4[0])
         dl->AddText(ImVec2(a.x + pad, a.y + pad * 0.7f + lh * 3),
                     solid(g.warn_uneven || g.warn_rate ? T->perf_bad : T->perf_text2), l4);
 
     /* Bars: the last 120 flip intervals against a 50 ms ceiling; the thin
      * line across is one frame at 60 Hz. */
-    const float gx = a.x + pad, gy1 = b.y - pad, gh = h - lh * lines - fs * 0.9f - pad, gw = w - 2 * pad;
+    const float gx = a.x + pad, gy1 = b.y - pad, gh = h - lh * lines - fs * 0.7f - pad, gw = w - 2 * pad;
     const int bars = 120;
     const float bw = gw / bars;
     for (i = 0; i < bars && i < m; i++) {
