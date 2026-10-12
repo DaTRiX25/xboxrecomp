@@ -27,6 +27,7 @@
 #include "recomp_env.h"
 
 #include "imgui.h"
+#include <atomic>
 #include "imgui_internal.h"
 #include "backends/imgui_impl_sdl2.h"
 
@@ -208,6 +209,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_ADVANCED_PERF_STEPS */ { "Graph: simulation steps", "The frame-time graph also marks the frames in which the game ran more than one simulation step (it does when its frame rate drops).", 1, FMT_PLAIN, NULL, 0 },
     /* XS_ADVANCED_DIAG_LOG */  { "Diagnostic logging", "Off: the game writes only errors and a few start-up facts. On: it writes the full diagnostic log, which a bug report then includes (at most about 830 KB a run, the last three runs kept). Switch it on, restart the game so the log has the start too, reproduce the problem, then create the bug report.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_UI_SCALE */  { "Menu and HUD upscaling", "Redraws the game's 2D art (menu text, HUD, icons, logos) at 2 or 4 times its size with an edge-following scaler (Super-xBR), for a render scale above 1x. Off is the original. The 3D world is not touched. Changes at once. The sharper pictures are made in the background and kept on disk, so new art can show unscaled for a moment the first time; uses more texture memory.", 1, FMT_PLAIN, n_ui_scale, 0 },
+    /* XS_INTERFACE_MENU_ENTRY */ { "Entry in the game's menu", "On: the game's own Settings menu (Driver Details > Settings) lists TAKEDAWN SETTINGS, which opens this menu, as the hotkey does. Off: the game's menu as it was. Shows the next time that menu opens.", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
 #endif
@@ -743,6 +745,7 @@ static int page_rows(int page, Row *r)
                 INFO(s_glass_info[2]);
         }
 #endif
+        SET(XS_INTERFACE_MENU_ENTRY);
         /* The print gate (BO-125), next to the report it feeds. */
         SET(XS_ADVANCED_DIAG_LOG);
         diag_info();
@@ -1279,6 +1282,22 @@ static void hot_toggle()
     set_open(!s_open);
 }
 
+/* xbox_OverlayRequestOpen: set on any thread, taken on the main loop. */
+static std::atomic<int> s_open_request{0};
+
+int xbox_OverlayAvailable(void)
+{
+    return s_enabled ? 1 : 0;
+}
+
+int xbox_OverlayRequestOpen(void)
+{
+    if (!s_enabled)
+        return 0;
+    s_open_request.store(1);
+    return 1;
+}
+
 /* A direction goes down or up on one of the three sources. A press counts a
  * step at once (a tap shorter than a frame still moves), and a hold repeats
  * from the frame (collect_steps). */
@@ -1571,6 +1590,9 @@ void xbox_OverlayPoll(void)
     if (!s_enabled)
         return;
     test_poll();
+
+    if (s_open_request.exchange(0) && !s_open)
+        set_open(true);
 
     while (s_toggle_i < s_toggle_n && (int32_t)(now_ms() - s_t0_ms - s_toggle_ms[s_toggle_i]) >= 0) {
         s_toggle_i++;
