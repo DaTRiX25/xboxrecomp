@@ -37,15 +37,16 @@ enum { RECOMP_DIR_DATA, RECOMP_DIR_LOCAL, RECOMP_DIR_CACHE };
 int recomp_user_dir(int kind, const char *name, char *out, unsigned out_size);
 
 /* A folder that got a new name: move `old_dir` to `new_dir`, once. Only when
- * `old_dir` is a folder and nothing is at `new_dir` (an empty folder there is
- * nothing); no file is ever deleted or written over, so a second call, or
+ * `old_dir` is a folder and nothing is at `new_dir` (a folder without a file
+ * in it is nothing); no file is ever deleted or written over, so a second call, or
  * both being there, changes nothing.
  * 1 moved, 0 nothing to do, -1 it could not be moved (both are as they
  * were). Call it before anything makes `new_dir` (recomp_save_dir does). */
 int recomp_dir_migrate(const char *old_dir, const char *new_dir);
 /* Whether recomp_dir_migrate would move it: `old_dir` is a folder (not a
- * link) and `new_dir` is not there, or is there and empty (an empty one gives
- * way: something that only asked where the folder is may have made it).
+ * link) and `new_dir` is not there, or is there with no file anywhere in it
+ * (such a one gives way: something that only asked where the folder is may
+ * have made it, and an empty cache folder inside it).
  * Reads only. */
 int recomp_dir_migrate_pending(const char *old_dir, const char *new_dir);
 
