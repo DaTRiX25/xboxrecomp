@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <utime.h>
 
 static int s_checks, s_fail;
 #define CHECK(c) do { s_checks++; if (!(c)) { s_fail++; \
@@ -478,6 +480,53 @@ static void store(const char *dir)
     nv2a_texscale_store_stats(&st);
     CHECK(st.dir_bytes <= 6u * (W * H * 16 * 4 + 48) * 3 / 4 + 48);
     CHECK(st.dir_bytes > 0);
+
+    /* Which files go: the least recently used, not the oldest written. Eight
+     * files written long ago, one after another; the two oldest are then
+     * read (the fonts a player sees in every run); the bound makes room for
+     * three: the two that were read and the newest stay. */
+    {
+        uint64_t k[8];
+        char pth[8][1200];
+        struct utimbuf ut;
+        time_t now = time(NULL);
+        FILE *fp;
+        nv2a_texscale_cache_trim(0);
+        nv2a_texscale_store_stats(&st);
+        CHECK(st.dir_bytes == 0);
+        for (i = 0; i < 8; i++) {
+            other[0] = 0xFF00AA00u | (uint32_t)(i + 1);
+            k[i] = nv2a_texscale_key(other, W, H);
+            CHECK(nv2a_texscale_get(k[i], other, W, H, 4, NV2A_TEXSCALE_SUPERXBR,
+                                    NV2A_TEXSCALE_DISK_ONLY, NULL) == NV2A_TEXSCALE_PENDING);
+        }
+        CHECK(nv2a_texscale_flush(20000) == 1);
+        for (i = 0; i < 8; i++) {
+            snprintf(pth[i], sizeof pth[i], "%s/%016llx_%ux%u_x4_sx%u.tsc", dir,
+                     (unsigned long long)k[i], (unsigned)W, (unsigned)H,
+                     (unsigned)NV2A_TEXSCALE_VERSION);
+            ut.actime = ut.modtime = now - 100000 + i * 100;
+            CHECK(utime(pth[i], &ut) == 0);
+        }
+        for (i = 0; i < 2; i++) {
+            other[0] = 0xFF00AA00u | (uint32_t)(i + 1);
+            CHECK(nv2a_texscale_get(k[i], other, W, H, 4, NV2A_TEXSCALE_SUPERXBR, 0, got)
+                  == NV2A_TEXSCALE_PENDING);
+            wait_ready(k[i], W, H, 4, got, &r);
+            CHECK(r == NV2A_TEXSCALE_READY);
+        }
+        nv2a_texscale_cache_trim(4u * (W * H * 16 * 4 + 48) + 3);   /* three quarters of it: three files */
+        for (i = 0; i < 8; i++) {
+            int there;
+            fp = fopen(pth[i], "rb");
+            there = fp != NULL;
+            if (fp)
+                fclose(fp);
+            CHECK(there == (i == 0 || i == 1 || i == 7));
+        }
+        nv2a_texscale_store_stats(&st);
+        CHECK(st.dir_bytes == 3u * (W * H * 16 * 4 + 48));
+    }
     nv2a_texscale_cache_dir(NULL);
     CHECK(nv2a_texscale_cache_path(found, sizeof found) == 0);
 }
