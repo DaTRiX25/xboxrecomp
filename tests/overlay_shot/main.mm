@@ -912,6 +912,60 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     return s_fail ? 1 : 0;
 }
 
+/* OVERLAY_SHOT_UPDATE=<owner/repo>: the Advanced page's "Check for updates"
+ * (xbox_update.h). The row is pressed once, against the real GitHub (one
+ * request), and the answer is shot. OVERLAY_SHOT_UPDATE_EXPECT is none (no
+ * release published yet), newer, latest or error; OVERLAY_SHOT_UPDATE_VERSION
+ * is the running version (default 0.1.0). The download row is not pressed:
+ * that would start a browser. */
+static int update_tour(const char *pre, const char *repo)
+{
+    char path[1400];
+    const char *expect = getenv("OVERLAY_SHOT_UPDATE_EXPECT");
+    const char *ver = getenv("OVERLAY_SHOT_UPDATE_VERSION");
+    if (!ver) ver = "0.1.0";
+    xbox_OverlaySetAbout("Takedawn 0.1.0 \"Lazy Generation\"  (game 0123abc, toolkit 4567def)");
+    xbox_OverlaySetUpdateCheck(repo, ver);
+
+    tap(SDLK_F1);
+    CHECK(xbox_OverlayOpen());
+    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);                 /* the last page: Advanced */
+    run(10);
+    CHECK(xbox_OverlayTestHasRow("Check for updates"));
+    CHECK(xbox_OverlayTestRowIndex("Check for updates") == xbox_OverlayTestRowIndex("Takedawn 0.1.0") + 1);
+    CHECK(!xbox_OverlayTestHasRow("Open the download page"));
+    CHECK(xbox_OverlayTestSelectRow("Check for updates"));
+    run(3);
+    snprintf(path, sizeof path, "%supdate_before.bmp", pre);
+    frame(path);
+    press_a();
+    for (int i = 0; i < 400 && xbox_OverlayTestHasRow("Checking for updates"); i++) {
+        run(1);
+        SDL_Delay(30);
+    }
+    run(5);
+    CHECK(xbox_OverlayTestHasRow("Check for updates"));
+    if (!expect || !strcmp(expect, "none")) {
+        CHECK(xbox_OverlayTestHasRow("No release published yet"));
+    } else if (!strcmp(expect, "newer")) {
+        CHECK(xbox_OverlayTestHasRow("Version "));
+        CHECK(xbox_OverlayTestHasRow("Open the download page"));
+    } else if (!strcmp(expect, "latest")) {
+        CHECK(xbox_OverlayTestHasRow("You have the latest version"));
+    } else {
+        CHECK(xbox_OverlayTestHasRow("Could not check: "));
+    }
+    snprintf(path, sizeof path, "%supdate_%s.bmp", pre, expect ? expect : "none");
+    frame(path);
+    pad(SDL_CONTROLLER_BUTTON_B, true);
+    pad(SDL_CONTROLLER_BUTTON_B, false);
+    xbox_OverlayPoll();
+    CHECK(!xbox_OverlayOpen());
+    fprintf(stderr, "overlay_shot update check (%s): %s\n", expect ? expect : "none", s_fail ? "FAILED" : "ok");
+    xbox_OverlayShutdown();
+    return s_fail ? 1 : 0;
+}
+
 /* The music folder row's port side, stood in for: a status line and two
  * notes, nothing chosen. */
 static void music_status(char *out, unsigned n) { snprintf(out, n, "2 soundtracks, 34 songs: in the game's music menu."); }
@@ -951,6 +1005,8 @@ int main(int argc, char **argv)
         return mixer_e2e(getenv("OVERLAY_SHOT_MIXER_E2E"));
     if (getenv("OVERLAY_SHOT_MIXER"))
         return mixer_tour(pre, getenv("OVERLAY_SHOT_MIXER"));
+    if (getenv("OVERLAY_SHOT_UPDATE"))
+        return update_tour(pre, getenv("OVERLAY_SHOT_UPDATE"));
     if (getenv("OVERLAY_SHOT_SAVEIO"))
         return saveio_tour(pre, getenv("OVERLAY_SHOT_SAVEIO"), argc, argv);
 

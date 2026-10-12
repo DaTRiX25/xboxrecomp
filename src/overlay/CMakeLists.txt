@@ -15,6 +15,7 @@ add_library(xbox_overlay STATIC
     xbox_settings.c
     xbox_settings_report.c
     overlay_ui.cpp
+    xbox_update.c
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
     ${IMGUI_DIR}/imgui_tables.cpp
@@ -43,6 +44,20 @@ if(APPLE)
         "-framework Foundation" "-framework AppKit")
 endif()
 
+# "Check for updates": the one HTTPS GET (xbox_update.h). macOS NSURLSession,
+# Windows WinHTTP, other Unixes the system's curl, Android none (no row).
+if(APPLE)
+    target_sources(xbox_overlay PRIVATE xbox_update_http_mac.mm)
+    set_source_files_properties(xbox_update_http_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+elseif(WIN32)
+    target_sources(xbox_overlay PRIVATE xbox_update_http_win.c)
+    target_link_libraries(xbox_overlay PUBLIC winhttp)
+elseif(ANDROID)
+    target_sources(xbox_overlay PRIVATE xbox_update_http_none.c)
+else()
+    target_sources(xbox_overlay PRIVATE xbox_update_http_posix.c)
+endif()
+
 if(XBOXRECOMP_HAVE_VULKAN)
     target_sources(xbox_overlay PRIVATE
         overlay_vulkan.cpp
@@ -58,13 +73,17 @@ endif()
 if(NOT MSVC)
     # The vendored files are built as they are; the glue is held to the
     # runtime's own warnings.
-    set_source_files_properties(xbox_settings.c xbox_settings_report.c overlay_ui.cpp overlay_vulkan.cpp
+    set_source_files_properties(xbox_settings.c xbox_settings_report.c overlay_ui.cpp overlay_vulkan.cpp xbox_update.c
         PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
     if(APPLE)
         set_source_files_properties(overlay_metal.mm
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall;-Wextra")
     endif()
 endif()
+
+# Check for updates: the JSON fields, the tag comparison, the answer.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/overlay_update
+                 ${CMAKE_CURRENT_BINARY_DIR}/overlay_update)
 
 # settings.toml: the file, the precedence, the power mode's two knobs.
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/overlay_settings
