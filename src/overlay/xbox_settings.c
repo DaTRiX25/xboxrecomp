@@ -32,6 +32,7 @@ static void sx_setenv_keep(const char *n, const char *v)
 }
 #else
 #include <strings.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 #define sx_strcasecmp strcasecmp
 #define sx_setenv_keep(n, v) setenv((n), (v), 0)
 #endif
@@ -134,6 +135,9 @@ static xs_setting s_set[XS_COUNT] = {
      * while running (the presenter looks twice a second). */
     [XS_DISPLAY_PRESENT_TIMING] = SETTING("display.present_timing", XS_CHOICE, 0, RENV_PRESENT_TIMING, k_timing, NULL, 0, 0, 0),
     [XS_ADVANCED_PERF_STEPS] = SETTING("advanced.perf_steps", XS_BOOL, 0, RENV_OVERLAY_PERF_STEPS, NULL, NULL, 0, 0, 0),
+    /* The print gate (xr_log.h, BO-125). The built-in value is the build's:
+     * on in a developer build, off in a release (set at load). Live. */
+    [XS_ADVANCED_DIAG_LOG]  = SETTING("advanced.diagnostic_log", XS_BOOL, 0, RENV_LOG_DIAG, NULL, NULL, 0, 0, 1),
     /* Off as shipped: the title's own textures, bit for bit. */
     [XS_GRAPHICS_UI_SCALE]  = SETTING("graphics.ui_scale", XS_CHOICE, 0, RENV_GFX_UI_SCALE, k_ui_scale, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
@@ -385,6 +389,12 @@ static void apply(xs_id id)
     case XS_AUDIO_MIXER:
         apu_bus_enable(v != 0.0);
         break;
+    case XS_ADVANCED_DIAG_LOG: {
+        int was = g_xr_log_diag, now = xr_log_set_diag(v != 0.0);
+        if (was != now)
+            XR_NOTICE("[LOG] diagnostic logging %s\n", now ? "on" : "off");
+        break;
+    }
     case XS_AUDIO_LFE_LOWPASS:
         mcpx_apu_set_lfe_lowpass(atoi(k_lfe_lowpass[(int)v]));
         break;
@@ -521,7 +531,7 @@ void xbox_SettingsFlush(void)
     snprintf(tmp, sizeof tmp, "%s.tmp", s_path);
     f = fopen(tmp, "wb");
     if (!f) {
-        fprintf(stderr, LOGP "cannot write %s\n", tmp);
+        XR_ERROR( LOGP "cannot write %s\n", tmp);
         InterlockedExchange(&writing, 0);
         return;
     }
@@ -557,7 +567,7 @@ void xbox_SettingsFlush(void)
     }
     write_texts(f, NULL, 0);
     if (fclose(f) != 0) {
-        fprintf(stderr, LOGP "cannot write %s\n", tmp);
+        XR_ERROR( LOGP "cannot write %s\n", tmp);
         InterlockedExchange(&writing, 0);
         return;
     }
@@ -565,7 +575,7 @@ void xbox_SettingsFlush(void)
     remove(s_path);
 #endif
     if (rename(tmp, s_path) != 0)
-        fprintf(stderr, LOGP "cannot replace %s\n", s_path);
+        XR_ERROR( LOGP "cannot replace %s\n", s_path);
     else
         fprintf(stderr, LOGP "saved\n");
     InterlockedExchange(&writing, 0);
@@ -610,7 +620,7 @@ static void load_file(void)
     int i;
 
     if (!probe) {
-        fprintf(stderr, LOGP "%s: no file yet\n", s_path);
+        XR_NOTICE( LOGP "%s: no file yet\n", s_path);
         return;
     }
     fclose(probe);
@@ -618,7 +628,7 @@ static void load_file(void)
      * two when its keys were not next to each other in the enum. */
     c = recomp_cfg_load_file_flags(s_path, RCFG_REOPEN_TABLES, err, sizeof err);
     if (!c) {
-        fprintf(stderr, LOGP "%s (file ignored, the next change replaces it)\n", err);
+        XR_ERROR( LOGP "%s (file ignored, the next change replaces it)\n", err);
         return;
     }
     for (i = 0; i < XS_COUNT; i++) {
@@ -697,6 +707,8 @@ void xbox_SettingsInit(const char *title)
     if (s_ready)
         return;
     s_ready = 1;
+    /* Diagnostic logging defaults to what this build does (xr_log.h). */
+    s_set[XS_ADVANCED_DIAG_LOG].builtin = xr_log_default();
     for (i = 0; i < XS_COUNT; i++) {
         xs_setting *s = &s_set[i];
         s->value = s->def = s->builtin;
@@ -746,7 +758,7 @@ void xbox_SettingsInit(const char *title)
             sx_setenv_keep(recomp_env_name(s_text[i].env), s_text[i].val);
     /* recomp_save_dir read the table before these were set. */
     recomp_env_reload();
-    fprintf(stderr, LOGP "%s\n", s_path);
+    XR_NOTICE( LOGP "%s\n", s_path);
 }
 
 void xbox_SettingsGameDefault(const char *name, const char *value)
@@ -796,7 +808,7 @@ void xbox_SettingsFinish(void)
     for (i = 0; i < XS_COUNT; i++) {
         s_set[i].launch = s_set[i].value;
         if (s_set[i].locked)
-            fprintf(stderr, LOGP "%s: %s is set in the environment\n", s_set[i].key,
+            XR_NOTICE( LOGP "%s: %s is set in the environment\n", s_set[i].key,
                     s_set[i].env == RENV_COUNT ? "RECOMP_PRESENT_PACING/SPIN_LEAD"
                                                : recomp_env_name(s_set[i].env));
     }

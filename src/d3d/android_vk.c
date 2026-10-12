@@ -30,6 +30,7 @@
 
 #if defined(XBOXRECOMP_HAVE_ADRENOTOOLS)
 #include <adrenotools/driver.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 #endif
 
 static pthread_once_t s_once = PTHREAD_ONCE_INIT;
@@ -65,7 +66,7 @@ static void open_loader(void)
             const char *fdir = getenv("RECOMP_ANDROID_DRIVER_FALLBACK_DIR");
             const char *fname = getenv("RECOMP_ANDROID_DRIVER_FALLBACK_NAME");
             s_failed = 1;
-            fprintf(stderr, "[vulkan] replacement driver %s%s could not be opened through"
+            XR_ERROR( "[vulkan] replacement driver %s%s could not be opened through"
                     " libadrenotools (hooks in %s)\n",
                     d, name, lib && *lib ? lib : "(RECOMP_ANDROID_LIB_DIR not set)");
             if (fdir && *fdir && fname && *fname && lib && *lib) {
@@ -98,7 +99,7 @@ static void open_loader(void)
     if (h)
         s_gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
     if (!s_gipa)
-        fprintf(stderr, "[vulkan] no Vulkan loader: %s\n", dlerror());
+        XR_ERROR( "[vulkan] no Vulkan loader: %s\n", dlerror());
 }
 
 const char *xr_android_vk_driver(void)

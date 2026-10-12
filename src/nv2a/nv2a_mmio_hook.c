@@ -8,6 +8,7 @@
 #include "nv2a_mmio_hook.h"
 #include "nv2a_state.h"
 #include <stdio.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 /* NV2A MMIO base in Xbox VA space */
 #define NV2A_MMIO_BASE  0xFD000000u
@@ -374,7 +375,7 @@ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
     g_nv2a_vram = (uint8_t *)VirtualAlloc(NULL, NV2A_VRAM_SIZE + NV2A_RAMIN_SIZE,
                                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!g_nv2a_vram) {
-        fprintf(stderr, "[NV2A] Failed to allocate %u MB for VRAM!\n",
+        XR_ERROR( "[NV2A] Failed to allocate %u MB for VRAM!\n",
                 (NV2A_VRAM_SIZE + NV2A_RAMIN_SIZE) / (1024*1024));
         return;
     }

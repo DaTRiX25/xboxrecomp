@@ -206,6 +206,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_AUDIO_LFE_LOWPASS */  { "Subwoofer low-pass (LFE)", "120 Hz is what the console's Dolby Digital encoder did; Off sends the full-range LFE feed.", 1, FMT_PLAIN, n_lfe_lowpass, 0 },
     /* XS_DISPLAY_PRESENT_TIMING */ { "Frame presentation", "When a finished frame is handed to the display. Legacy: as soon as it is ready. Auto: every frame is aimed at one refresh of the display, so each stays on the screen for the same time, and sooner after it was drawn: on a fixed 60/120/240 Hz display the game's clock follows the display; with variable refresh (VRR, ProMotion) frames are presented at even times. The performance overlay shows the result (the on-glass line).", 1, FMT_PLAIN, n_timing, 0 },
     /* XS_ADVANCED_PERF_STEPS */ { "Graph: simulation steps", "The frame-time graph also marks the frames in which the game ran more than one simulation step (it does when its frame rate drops).", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_ADVANCED_DIAG_LOG */  { "Diagnostic logging", "Off: the game writes only errors and a few start-up facts. On: it writes the full diagnostic log, which a bug report then includes (at most about 830 KB a run, the last three runs kept). Switch it on, restart the game so the log has the start too, reproduce the problem, then create the bug report.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_UI_SCALE */  { "Menu and HUD upscaling", "Redraws the game's 2D art (menu text, HUD, icons, logos) at 2 or 4 times its size with an edge-following scaler (Super-xBR), for a render scale above 1x. Off is the original. The 3D world is not touched. Changes at once. The sharper pictures are made in the background and kept on disk, so new art can show unscaled for a moment the first time; uses more texture memory.", 1, FMT_PLAIN, n_ui_scale, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where the rumble goes. Auto: this device's own vibrator while its built-in controls are the ones in use. An external controller does not rumble on Android; This device shakes the device anyway.", 1, FMT_PLAIN, n_vibration, 0 },
@@ -555,6 +556,25 @@ struct Row {
 static char s_glass_info[3][160];
 static void glass_info();
 
+/* Where the log is, and what decides when the row does not. */
+extern "C" const char *xbox_crash_log_dir(void);      /* kernel/xbox_crash.h */
+static char s_diag_info[256];
+static void diag_info()
+{
+    const char *dir = xbox_crash_log_dir();
+    const char *home = getenv("HOME");
+    char shown[200];
+    if (dir && *dir && home && *home && !strncmp(dir, home, strlen(home)))
+        snprintf(shown, sizeof shown, "~%s", dir + strlen(home));
+    else
+        snprintf(shown, sizeof shown, "%s", dir && *dir ? dir : "the logs folder beside the saves");
+    if (xr_log_forced())
+        snprintf(s_diag_info, sizeof s_diag_info, "Log: %s (set by %s for this run)", shown,
+                 xr_log_source());
+    else
+        snprintf(s_diag_info, sizeof s_diag_info, "Log: %s", shown);
+}
+
 static int page_rows(int page, Row *r)
 {
     int n = 0;
@@ -723,6 +743,10 @@ static int page_rows(int page, Row *r)
                 INFO(s_glass_info[2]);
         }
 #endif
+        /* The print gate (BO-125), next to the report it feeds. */
+        SET(XS_ADVANCED_DIAG_LOG);
+        diag_info();
+        INFO(s_diag_info);
         if (xbox_BugReportHasMaker()) {
             INFO(s_rep_info);
             ACT(A_REPORT, "Create bug report");
@@ -2353,6 +2377,7 @@ static void build_browser(float fs, ImDrawList *dl)
 }
 
 #include "overlay_mixer.inc"
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 static void build_pages(float fs)
 {

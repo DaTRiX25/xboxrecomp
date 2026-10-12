@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #define ENHANCE_MAX_BINDS 64
 #define ENHANCE_FILES 2   /* title, root */
@@ -133,7 +134,7 @@ static int load_slot(int i, const char *path, int optional)
         return 0;
     c = recomp_cfg_load_file(path, err, sizeof err);
     if (!c) {
-        fprintf(stderr, "[ENHANCE] config error: %s (file ignored)\n", err);
+        XR_ERROR( "[ENHANCE] config error: %s (file ignored)\n", err);
         return -1;
     }
     s_file[i] = c;

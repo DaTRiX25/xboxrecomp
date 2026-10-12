@@ -74,6 +74,7 @@ static int ui_scale_log(void);
 #include "nv2a_pcache.h"
 #include "recomp_env.h"
 #include <pthread.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -672,7 +673,7 @@ static void flush(int wait, int why)
     if (r != VK_SUCCESS) {
         s_submit_errors++;
         if (s_submit_errors <= 4)
-            fprintf(stderr, LOGP "vkQueueSubmit failed: %s\n", nvk_result_str(r));
+            XR_ERROR( LOGP "vkQueueSubmit failed: %s\n", nvk_result_str(r));
         if (r == VK_ERROR_DEVICE_LOST) {
             fprintf(stderr, LOGP "device lost: drawing stops\n");
             s_failed = 1;
@@ -1511,7 +1512,7 @@ static VkShaderModule module_from_glsl(enum nvk_stage stage, const char *src, co
 
     if (!nvk_glsl_spirv(stage, src, &w, &n, &compiled, err, sizeof err)) {
         if (COUNT(s_compile_errors) <= 4)
-            fprintf(stderr, LOGP "\x1b[1;31m%s: GLSL compile failed: %s\x1b[0m\n%s\n",
+            XR_ERROR( LOGP "\x1b[1;31m%s: GLSL compile failed: %s\x1b[0m\n%s\n",
                     what, err, src);
         return VK_NULL_HANDLE;
     }
@@ -1523,7 +1524,7 @@ static VkShaderModule module_from_glsl(enum nvk_stage stage, const char *src, co
     ci.pCode = w;
     if (vkCreateShaderModule(s_dev, &ci, NULL, &m) != VK_SUCCESS) {
         COUNT(s_compile_errors);
-        fprintf(stderr, LOGP "%s: vkCreateShaderModule failed\n", what);
+        XR_ERROR( LOGP "%s: vkCreateShaderModule failed\n", what);
         return VK_NULL_HANDLE;
     }
     if (vk_trace())
@@ -1988,7 +1989,7 @@ static VkPipeline pipeline_new(const PsoKey *k, int prewarm)
     if (r != VK_SUCCESS) {
         static int said;
         if (!said++)
-            fprintf(stderr, LOGP "pipeline failed: %s\n", nvk_result_str(r));
+            XR_ERROR( LOGP "pipeline failed: %s\n", nvk_result_str(r));
         return VK_NULL_HANDLE;
     }
     COUNT(s_pso_created);
@@ -4169,7 +4170,7 @@ static void pc_put(uint32_t type, const void *data, uint32_t len)
     if (s_pcf && nv2a_pcache_put(s_pcf, type, data, len) < 0) {
         static int said;
         if (!said++)
-            fprintf(stderr, LOGP "pcache: cannot append; the key list is not written\n");
+            XR_ERROR( LOGP "pcache: cannot append; the key list is not written\n");
     }
     pthread_mutex_unlock(&s_pcf_mu);
 }
@@ -4404,7 +4405,7 @@ static void pc_start(void)
             if ((s_pc_csv = fopen(tr, "w")) != NULL)
                 fprintf(s_pc_csv, "flip,t_ms,interval_ms,ack_compiles,ack_compile_ms\n");
             else
-                fprintf(stderr, LOGP "pcache: cannot write %s\n", tr);
+                XR_ERROR( LOGP "pcache: cannot write %s\n", tr);
         }
     }
     if (!nvk_cache_dir(dir, sizeof dir)) {
@@ -4526,7 +4527,7 @@ static int init(void)
     sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     sci.pNext = &st;
     if (vkCreateSemaphore(s_dev, &sci, NULL, &s_timeline) != VK_SUCCESS) {
-        fprintf(stderr, LOGP "timeline semaphore failed\n");
+        XR_ERROR( LOGP "timeline semaphore failed\n");
         return 0;
     }
     for (i = 0; i < s_frames; i++) {
@@ -4543,7 +4544,7 @@ static int init(void)
                 s_fr[i].fence = VK_NULL_HANDLE;
         }
         if (vkCreateCommandPool(s_dev, &cp, NULL, &s_fr[i].pool) != VK_SUCCESS) {
-            fprintf(stderr, LOGP "command pool failed\n");
+            XR_ERROR( LOGP "command pool failed\n");
             return 0;
         }
     }
@@ -4565,7 +4566,7 @@ static int init(void)
                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                                 | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                 i == RING_UP ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                fprintf(stderr, LOGP "ring buffer %d failed\n", i);
+                XR_ERROR( LOGP "ring buffer %d failed\n", i);
                 return 0;
             }
     }
@@ -4671,12 +4672,12 @@ static int init(void)
     s_vs_pass = module_from_glsl(NVK_STAGE_VERTEX, s_vs_pass_glsl, "vs_pass");
     s_fs_basic = module_from_glsl(NVK_STAGE_FRAGMENT, s_fs_basic_glsl, "fs_basic");
     if (!s_vs_pass || !s_fs_basic) {
-        fprintf(stderr, LOGP "base shaders failed\n");
+        XR_ERROR( LOGP "base shaders failed\n");
         return 0;
     }
     pc_start();
     if (!solid_texture(&s_black, 0xFF000000u) || !solid_texture(&s_magenta, NV2A_TEX_MAGENTA)) {
-        fprintf(stderr, LOGP "base textures failed\n");
+        XR_ERROR( LOGP "base textures failed\n");
         return 0;
     }
     atexit(at_exit_save);

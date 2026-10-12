@@ -139,6 +139,7 @@ extern "C" {
     X(GFX_DITHER,        CONFIG, "RECOMP_GFX_DITHER",        NULL, "1: noise dither of +-0.5 LSB (interleaved gradient noise) in the Metal presenter's scale to the window, against banding of smooth gradients (default 0, off)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
+    X(LOG_DIAG,          CONFIG, "RECOMP_LOG_DIAG",          NULL, "advanced.diagnostic_log: 1 prints the diagnostic lines (the default of a developer build), 0 only errors and the start-up facts (the default of a release build); see xr_log.h for what else switches it on") \
     X(AUDIO_MIXER,       CONFIG, "RECOMP_AUDIO_MIXER",       NULL, "the host mixer (buses over the title's voices): off (default), on") \
     X(AUDIO_MIXER_FILE,  CONFIG, "RECOMP_AUDIO_MIXER_FILE",  NULL, "the mixer's preset file (default: mixer.toml beside settings.toml)") \
     X(AUDIO_FX_LEVEL,    CONFIG, "RECOMP_AUDIO_FX_LEVEL",    NULL, "5.1: level of the title's effect-send bins, 0..1 (default 0.25)") \
@@ -258,6 +259,7 @@ extern "C" {
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
     X(WINDOW_DISPLAY,    DEBUG, "window_display",  NULL,                       "=n: open the window centred on display n (0 = main)") \
     X(WINDOW_FLOAT,      DEBUG, "window_float",    NULL,                       "1: the window stays above other windows (macOS; a measured run needs it visible: an occluded window reports no on-glass times)") \
+    X(GLASS_MEASURE,     DEBUG, "glass_measure",   NULL,                       "=0: the Metal presenter installs no on-glass handler with display.present_timing = legacy (A/B of the measurement's own cost, BO-125); the graph's on-glass line then says not available") \
     X(EARLY_COMMIT,      DEBUG, "early_commit",    NULL,                       "=0: submit a frame's GPU work after the vblank hold, not at FLIP_STALL (A/B)") \
     X(METAL_FRAMES,      DEBUG, "metal_frames",    NULL,                       "=1: Metal waits for each frame at its flip; default 2 frames in flight") \
     X(METAL_PRESENT,     DEBUG, "metal_present",   NULL,                       "=layer|readback: Metal window present, CAMetalLayer from GPU slots (default) or the old texture readback") \

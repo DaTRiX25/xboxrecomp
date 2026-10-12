@@ -54,6 +54,18 @@ add_compile_definitions(
 # Platform: Win32/NT type vocabulary + POSIX implementation of generic
 # Win32 host primitives. Carries no Xbox semantics; provides the foundation
 # the kernel HLE and the graphics/audio/input layers build on.
+# The print gate (src/platform/xr_log.h, BO-125): force-included into every
+# source built from here, so the existing fprintf(stderr, ...) call sites go
+# through it unedited. A release build of a port is quiet unless diagnostic
+# logging is switched on; without xr_log_init() everything prints as before.
+if(MSVC)
+    set(XR_LOG_FORCE_INCLUDE "/FI${CMAKE_CURRENT_SOURCE_DIR}/src/platform/xr_log.h")
+else()
+    # SHELL: keeps the pair together (options are de-duplicated one by one).
+    set(XR_LOG_FORCE_INCLUDE "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/src/platform/xr_log.h\"")
+endif()
+add_compile_options(${XR_LOG_FORCE_INCLUDE})
+
 add_subdirectory(src/platform)
 
 # Enhancements (render scale, aspect, frame pacing, mods) and their config
@@ -146,6 +158,8 @@ add_subdirectory(src/install)
 
 # Convenience target that links all runtime libraries
 add_library(xboxrecomp INTERFACE)
+# The print gate reaches the port's own sources and its generated code too.
+target_compile_options(xboxrecomp INTERFACE ${XR_LOG_FORCE_INCLUDE})
 target_link_libraries(xboxrecomp INTERFACE
     xbox_kernel
     xbox_d3d8

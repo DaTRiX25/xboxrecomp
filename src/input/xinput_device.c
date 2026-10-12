@@ -76,6 +76,7 @@ const xbox_input_backend xbox_input_host_backend = {
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 /* Port -> controller. Read by the pad thread (OHCI) under g_pads_lock;
  * changed only by the thread that pumps SDL events (or, headless, by the
@@ -235,7 +236,7 @@ static void pad_open_index(int i)
     if (!g_open[free_k].c)
         return;
     pad_describe(g_open[free_k].c, d, sizeof d);
-    fprintf(stderr, "[INPUT] controller %s opened; it gets a port at its first input\n", d);
+    XR_NOTICE( "[INPUT] controller %s opened; it gets a port at its first input\n", d);
 }
 
 /* Window thread: the lowest free port for the controller with this

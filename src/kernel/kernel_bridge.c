@@ -52,6 +52,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <wctype.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
  * xbox_memory_layout.h and must match the definitions there -- a plain extern
@@ -1001,7 +1002,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 }
             }
         } else {
-            fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: start routine 0x%08X not found in dispatch!\n",
+            XR_ERROR( "  [KERNEL] PsCreateSystemThreadEx: start routine 0x%08X not found in dispatch!\n",
                     start_routine);
         }
     }
@@ -8888,7 +8889,7 @@ static void bridge_PsCreateSystemThread(void)
                 }
             }
         } else {
-            fprintf(stderr, "  [KERNEL] PsCreateSystemThread: start routine 0x%08X not found in dispatch!\n",
+            XR_ERROR( "  [KERNEL] PsCreateSystemThread: start routine 0x%08X not found in dispatch!\n",
                     start_routine);
         }
     }

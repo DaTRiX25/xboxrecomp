@@ -60,6 +60,7 @@
 #include "kernel/present_cadence.h"
 #include <os/lock.h>
 #include <stdatomic.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #if __has_feature(objc_arc)
 #error "fb_present_metal.m is manual retain/release: build it without -fobjc-arc"
@@ -369,6 +370,18 @@ static void timing_poll(SDL_Window *win)
     timing_status();
 }
 
+/* RECOMP_DEBUG=glass_measure=0: no on-glass handler in legacy (an A/B of
+ * what the measurement itself costs). */
+static int glass_measure_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_GLASS_MEASURE);
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
 /* RECOMP_TRACE=glass=<file>. */
 static FILE *glass_file(void)
 {
@@ -518,12 +531,12 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             pd.fragmentFunction = [[lib newFunctionWithName:@"fs_fxaa"] autorelease];
             s_pso_fxaa = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
             if (!s_pso_fxaa)
-                fprintf(stderr, "[PRESENT] FXAA pass unavailable: %s\n",
+                XR_ERROR( "[PRESENT] FXAA pass unavailable: %s\n",
                         e ? [[e localizedDescription] UTF8String] : "?");
             pd.fragmentFunction = [[lib newFunctionWithName:@"fs_cas"] autorelease];
             s_pso_cas = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
             if (!s_pso_cas)
-                fprintf(stderr, "[PRESENT] CAS pass unavailable: %s\n",
+                XR_ERROR( "[PRESENT] CAS pass unavailable: %s\n",
                         e ? [[e localizedDescription] UTF8String] : "?");
         }
         [pd release];
@@ -845,13 +858,13 @@ static int smaa_init(void)
     s_smaa_state = -1;
     src = smaa_msl_source();
     if (!src) {
-        fprintf(stderr, "[PRESENT] SMAA unavailable: its shader source did not adapt\n");
+        XR_ERROR( "[PRESENT] SMAA unavailable: its shader source did not adapt\n");
         return 0;
     }
     lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:src] options:nil error:&e];
     free(src);
     if (!lib) {
-        fprintf(stderr, "[PRESENT] SMAA unavailable: %s\n",
+        XR_ERROR( "[PRESENT] SMAA unavailable: %s\n",
                 e ? [[e localizedDescription] UTF8String] : "shader compile failed");
         return 0;
     }
@@ -864,7 +877,7 @@ static int smaa_init(void)
         s_pso_sm[k] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         [pd release];
         if (!s_pso_sm[k]) {
-            fprintf(stderr, "[PRESENT] SMAA unavailable: pipeline %s: %s\n", fn[k],
+            XR_ERROR( "[PRESENT] SMAA unavailable: pipeline %s: %s\n", fn[k],
                     e ? [[e localizedDescription] UTF8String] : "?");
             [lib release];
             return 0;
@@ -1113,7 +1126,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         }
         /* When it reached the glass: the pacer's feedback and the graph's
          * trace (a redraw of the same frame only gives its drawable back). */
-        {
+        if (timed || glass_measure_on()) {
             uint64_t vb = vblank_ns, commit_ns = xbox_HostNowNs();
             uint32_t fl2 = flip;
             pc_aim aim2 = aim;

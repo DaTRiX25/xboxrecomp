@@ -2577,6 +2577,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 #include <dlfcn.h>
 #include <pthread.h>
 #include <time.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 static uint32_t g_watch_len = 4;
 static uintptr_t g_watch_hpage, g_watch_hsize;   /* host page (16 KB on arm64 Darwin) */
@@ -3119,7 +3120,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         NULL                    /* unnamed mapping */
     );
     if (!g_mapping_handle) {
-        fprintf(stderr, "xbox_MemoryLayoutInit: CreateFileMapping failed (error %lu)\n",
+        XR_ERROR( "xbox_MemoryLayoutInit: CreateFileMapping failed (error %lu)\n",
                 GetLastError());
         return FALSE;
     }
@@ -3226,7 +3227,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     if (!g_memory_base) {
-        fprintf(stderr, "xbox_MemoryLayoutInit: failed to map base view (%zu KB)\n",
+        XR_ERROR( "xbox_MemoryLayoutInit: failed to map base view (%zu KB)\n",
                 g_memory_size / 1024);
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
@@ -3783,7 +3784,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     "0x%08X (zeroed, no register semantics)\n",
                     XBOX_NV2A_SIZE / (1024 * 1024), XBOX_NV2A_BASE);
         } else {
-            fprintf(stderr, "  WARNING: NV2A aperture at 0x%08X failed "
+            XR_ERROR( "  WARNING: NV2A aperture at 0x%08X failed "
                     "(error %lu); D3D register access will fault\n",
                     XBOX_NV2A_BASE, GetLastError());
         }
@@ -3895,7 +3896,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
                     XBOX_MCPX_SIZE / (1024 * 1024), XBOX_MCPX_BASE);
         } else {
-            fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
+            XR_ERROR( "  WARNING: MCPX aperture at 0x%08X failed "
                     "(error %lu); USB/audio register access will fault\n",
                     XBOX_MCPX_BASE, GetLastError());
         }
@@ -3912,7 +3913,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     "0x%08X (zeroed, not a real BIOS image)\n",
                     XBOX_FLASH_SIZE / (1024 * 1024), XBOX_FLASH_BASE);
         } else {
-            fprintf(stderr, "  WARNING: flash aperture at 0x%08X failed "
+            XR_ERROR( "  WARNING: flash aperture at 0x%08X failed "
                     "(error %lu); a title reading flash will fault\n",
                     XBOX_FLASH_BASE, GetLastError());
         }
@@ -3957,7 +3958,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             fprintf(stderr, "  Kernel: fake PE header at Xbox VA 0x%08X (native %p)\n",
                     XBOX_KERNEL_BASE, g_kernel_memory);
         } else {
-            fprintf(stderr, "  WARNING: could not map Xbox kernel VA 0x%08X\n",
+            XR_ERROR( "  WARNING: could not map Xbox kernel VA 0x%08X\n",
                     XBOX_KERNEL_BASE);
         }
         #undef XBOX_KERNEL_BASE
@@ -4100,7 +4101,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * should be: if it fell back or failed, reading it would fault. */
             if (g_contig_memory !=
                     (void *)(uintptr_t)(XBOX_CONTIG_BASE + g_memory_offset)) {
-                fprintf(stderr, "  WARNING: tiled aperture alias not checked:"
+                XR_ERROR( "  WARNING: tiled aperture alias not checked:"
                         " contiguous window is not mapped\n");
             } else {
                 volatile uint32_t *via_tiled =
@@ -4113,7 +4114,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
                 *via_tiled = 0xA5C30F17u;
                 if (*via_contig != 0xA5C30F17u)
-                    fprintf(stderr, "  WARNING: tiled aperture does NOT alias"
+                    XR_ERROR( "  WARNING: tiled aperture does NOT alias"
                             " the contiguous window (wrote A5C30F17, read"
                             " %08X) -- the GPU will sample empty textures\n",
                             *via_contig);
@@ -4128,7 +4129,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     (unsigned)(g_memory_size / (1024 * 1024)),
                     XBOX_TILED_BASE);
         } else {
-            fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"
+            XR_ERROR( "  WARNING: tiled aperture at 0x%08X failed"
                     " (error %lu); rendering writes will fault\n",
                     XBOX_TILED_BASE, GetLastError());
         }
@@ -4806,7 +4807,7 @@ static uint32_t heap_alloc_unlocked(uint32_t size, uint32_t alignment)
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
     if (result + size > XBOX_HEAP_TOP) {
-        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
+        XR_ERROR( "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
                 size, g_heap_next - XBOX_HEAP_BASE,
                 (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
         /* Who ate the heap? Group live blocks by size -- an exhausted heap is

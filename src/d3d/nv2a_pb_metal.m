@@ -94,6 +94,7 @@ static int ui_scale_log(void);
 #include "host_time.h"
 #include <mach/mach_time.h>
 #include <dispatch/dispatch.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
  * which collides with Objective-C and CoreServices: declare what is used. */
 ptrdiff_t xbox_GetMemoryOffset(void);
@@ -431,7 +432,7 @@ static void flush(int wait)
         if ([s_cmd status] == MTLCommandBufferStatusError) {
             s_cmd_errors++;
             if (s_cmd_errors <= 4)
-                fprintf(stderr, LOGP "command buffer error: %s\n",
+                XR_ERROR( LOGP "command buffer error: %s\n",
                         [[[s_cmd error] localizedDescription] UTF8String]);
         }
         s_vb_pos = 0;
@@ -642,7 +643,7 @@ static int init(void)
         lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:s_msl]
                                   options:opts error:&err];
         if (!lib) {
-            fprintf(stderr, LOGP "MSL compile failed: %s\n",
+            XR_ERROR( LOGP "MSL compile failed: %s\n",
                     err ? [[err localizedDescription] UTF8String] : "?");
             return 0;
         }
@@ -652,7 +653,7 @@ static int init(void)
         s_fs_clear = [lib newFunctionWithName:@"fs_clear"];
         [lib release];
         if (!s_vs_pass || !s_fs_basic || !s_vs_clear || !s_fs_clear) {
-            fprintf(stderr, LOGP "MSL functions missing\n");
+            XR_ERROR( LOGP "MSL functions missing\n");
             return 0;
         }
 
@@ -674,14 +675,14 @@ static int init(void)
                                    options:MTLResourceStorageModeShared];
         if (!s_vbf[0] || !s_ibf[0] || !s_vbf[NUM_FRAMES - 1] || !s_ibf[NUM_FRAMES - 1]
                 || !s_vis) {
-            fprintf(stderr, LOGP "buffer creation failed\n");
+            XR_ERROR( LOGP "buffer creation failed\n");
             return 0;
         }
         if (!pc_start()) {
-            fprintf(stderr, LOGP "pipeline cache allocation failed\n");
+            XR_ERROR( LOGP "pipeline cache allocation failed\n");
             return 0;
         }
-        fprintf(stderr, LOGP "device up: %s (unified memory %d), fast math off; present %s,"
+        XR_NOTICE( LOGP "device up: %s (unified memory %d), fast math off; present %s,"
                 " write-back %s\n", [[s_dev name] UTF8String], s_unified,
                 s_layer ? "CAMetalLayer slots" : "texture readback",
                 wb_always() ? "every flip" : "on demand");
@@ -1114,7 +1115,7 @@ static id<MTLRenderPipelineState> clear_pso(int dt)
     [pd release];
     if (!s_clear_pso[dt]) {
         failed[dt] = 1;
-        fprintf(stderr, LOGP "partial-clear pipeline failed (%s): a partial clear clears"
+        XR_ERROR( LOGP "partial-clear pipeline failed (%s): a partial clear clears"
                 " the whole target\n", err ? [[err localizedDescription] UTF8String] : "?");
     }
     return s_clear_pso[dt];
@@ -1523,7 +1524,7 @@ static id<MTLRenderPipelineState> pso_build(const PsoKey *pk, id<MTLFunction> vs
     if (!pso) {
         static int said;
         if (!said++)
-            fprintf(stderr, LOGP "pipeline failed: %s\n",
+            XR_ERROR( LOGP "pipeline failed: %s\n",
                     err ? [[err localizedDescription] UTF8String] : "?");
         return nil;
     }
@@ -2237,7 +2238,7 @@ static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *w
         if (!lib) {
             uint64_t n = __atomic_add_fetch(&s_compile_errors, 1, __ATOMIC_RELAXED);
             if (n <= 4)
-                fprintf(stderr, LOGP "\x1b[1;31m%s: MSL compile failed: %s\x1b[0m\n%s\n",
+                XR_ERROR( LOGP "\x1b[1;31m%s: MSL compile failed: %s\x1b[0m\n%s\n",
                         what, err ? [[err localizedDescription] UTF8String] : "?", src);
             return nil;
         }
@@ -2561,7 +2562,7 @@ static void pc_put(uint32_t type, const void *data, uint32_t len)
     if (s_pcf && nv2a_pcache_put(s_pcf, type, data, len) < 0) {
         static int said;
         if (!said++)
-            fprintf(stderr, LOGP "pcache: cannot append; the key list is not written\n");
+            XR_ERROR( LOGP "pcache: cannot append; the key list is not written\n");
     }
     pthread_mutex_unlock(&s_pcf_mu);
 }
@@ -2815,7 +2816,7 @@ static int pc_start(void)
             if ((s_pc_csv = fopen(tr, "w")) != NULL)
                 fprintf(s_pc_csv, "flip,t_ms,interval_ms,ack_compiles,ack_compile_ms\n");
             else
-                fprintf(stderr, LOGP "pcache: cannot write %s\n", tr);
+                XR_ERROR( LOGP "pcache: cannot write %s\n", tr);
         }
     }
 

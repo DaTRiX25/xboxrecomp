@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "recomp_env.h"
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 static struct nvk_core s_core;
 static int             s_state;          /* 0 not tried, 1 up, -1 failed */
@@ -350,7 +351,7 @@ const struct nvk_core *nvk_core_init(const char *const *inst_exts, unsigned n,
                     }
                 }
 #endif
-                fprintf(stderr, "[vulkan] device up: %s (Vulkan %u.%u.%u, driver 0x%X%s),"
+                XR_NOTICE( "[vulkan] device up: %s (Vulkan %u.%u.%u, driver 0x%X%s),"
                         " queue family %u, depth %s%s\n", s_core.name,
                         VK_API_VERSION_MAJOR(s_core.props.apiVersion),
                         VK_API_VERSION_MINOR(s_core.props.apiVersion),

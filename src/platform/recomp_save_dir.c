@@ -29,6 +29,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 #define rs_mkdir(p) mkdir(p, 0755)
 #define rs_rmdir(p) rmdir(p)
 #define rs_unlink(p) unlink(p)
@@ -446,7 +447,7 @@ int recomp_save_dir_migrate(const char *legacy, const char *dir)
     }
     if (!copy_tree(legacy, dir, 1)) {
         char part[RS_PATH];
-        fprintf(stderr, "[SAVE] copying %s to %s failed part way; the old folder "
+        XR_ERROR( "[SAVE] copying %s to %s failed part way; the old folder "
                         "is untouched and is copied again next start\n", legacy, dir);
         rm_tree(to);
         snprintf(part, sizeof part, "%s/TDATA", dir);
@@ -542,7 +543,7 @@ int recomp_save_backup(const char *dir, int keep, char *out, unsigned out_size)
                 ok = 0;
         }
         if (!ok) {
-            fprintf(stderr, "[SAVE] backup to %s failed; removed\n", path);
+            XR_ERROR( "[SAVE] backup to %s failed; removed\n", path);
             rm_tree(path);
             return 0;
         }

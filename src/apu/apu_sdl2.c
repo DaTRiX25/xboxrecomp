@@ -60,6 +60,7 @@
 
 #include <SDL.h>
 #include <time.h>
+#include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #define SDLA_SAMPLE_RATE   48000
 #define SDLA_CHANNELS_MAX  6
@@ -155,7 +156,7 @@ static int audio_subsystem_up(void)
      * Ctrl-C would be swallowed. Keep the process defaults. */
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
-        fprintf(stderr, "[SDL2] audio init failed: %s\n", SDL_GetError());
+        XR_ERROR( "[SDL2] audio init failed: %s\n", SDL_GetError());
         return 0;
     }
     g_audio_opened = 1;
@@ -223,7 +224,7 @@ static int open_device(int channels)
 
     g_dev = open_device_id(channels, &buf);
     if (g_dev == 0) {
-        fprintf(stderr, "[SDL2] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+        XR_ERROR( "[SDL2] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         return 0;
     }
     if (buf != g_buf_samples) {
@@ -520,7 +521,7 @@ int xa2_init(void)
     }
 
     driver = SDL_GetCurrentAudioDriver();
-    fprintf(stderr, "[SDL2] audio initialized: driver %s (%d Hz %s 16-bit, %d x %d-sample buffers, %.1f ms queued max)%s\n",
+    XR_NOTICE( "[SDL2] audio initialized: driver %s (%d Hz %s 16-bit, %d x %d-sample buffers, %.1f ms queued max)%s\n",
             driver ? driver : "?", SDLA_SAMPLE_RATE,
             g_channels == SDLA_CHANNELS_MAX ? "5.1" : "stereo",
             g_num_bufs, g_buf_samples,
