@@ -32,6 +32,21 @@
 #define DPRINTF(fmt, ...) do { } while (0)
 #endif
 
+/* The mix study (RECOMP_MIX_TRACE, further down). 0: off. */
+static int s_mix_on = -1;
+static void mix_trace_on_off(MCPXAPUState *d, unsigned v, int on);
+
+/* The host mixer (apu_bus.h): the runtime block of this VP frame, NULL with
+ * the mixer off; each voice's turn-on count and, with the mixer or the mix
+ * study on, the guest return addresses of who turned it on. */
+#include "apu_bus.h"
+#include "apu.h"
+static struct apu_bus_rt *s_bus_rt;
+static unsigned s_von_serial[MCPX_HW_MAX_VOICES];
+static uint32_t s_von_stack[MCPX_HW_MAX_VOICES][16];
+static uint8_t s_von_nstack[MCPX_HW_MAX_VOICES];
+static mcpx_apu_voice_tag_fn s_mix_tag_fn;
+
 /* ============================================================
  * Voice list register table
  * ============================================================ */
@@ -293,6 +308,15 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
 
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
+        if (selected_handle < MCPX_HW_MAX_VOICES) {
+            s_von_serial[selected_handle]++;
+            if ((s_mix_on || apu_bus_enabled()) && s_mix_tag_fn)
+                s_von_nstack[selected_handle] =
+                    (uint8_t)s_mix_tag_fn(s_von_stack[selected_handle], 16);
+            else
+                s_von_nstack[selected_handle] = 0;
+        }
+        if (s_mix_on) mix_trace_on_off(d, selected_handle, 1);
         break;
     }
 
@@ -325,6 +349,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_OFF:
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
+        if (s_mix_on) mix_trace_on_off(d, argument & NV1BA0_PIO_VOICE_OFF_HANDLE, 0);
         break;
 
     case NV1BA0_PIO_VOICE_PAUSE:
@@ -1417,8 +1442,370 @@ done:
 }
 
 /* ============================================================
+ * Mix study (RECOMP_MIX_TRACE=<file>, BO-114)
+ *
+ * What a host mixer could tell apart, measured: nothing here feeds back
+ * into the mix, and with the variable unset each hook is one branch.
+ *
+ *   ON id=<n> v=<voice> f=<vp frame> stack=<a>,<b>,...
+ *       a voice turned on (NV1BA0_PIO_VOICE_ON): the title's return
+ *       addresses on the guest stack of the thread that did it, innermost
+ *       first (mcpx_apu_set_voice_tag_hook)
+ *   OFF id=<n> v=<voice> f=<vp frame>
+ *   V t=<s> id=<n> v=<voice> 3d= st= stream= fmt= fmode= hrtf= rate= ea=
+ *     ba=<buffer base> ebo=<end offset> frames=<vp frames mixed> src=<rms of
+ *     the samples before gain, s16 units> bins=<8> vols=<8, attenuation>
+ *     spk=<sum of squares the voice put into each speaker: FL FR C LFE SL SR
+ *     in 5.1, L R in stereo> peak=<its largest speaker sample>
+ *       once a second for every voice that mixed anything
+ *   O t=<s> ch=<n> sq=<sum of squares per channel> peak=<per channel, before
+ *     the clamp> over=<samples past full scale per channel> n=<samples>
+ * ============================================================ */
+
+#include <time.h>
+#include "apu_speakers.h"
+
+static FILE *s_mix_f;
+static unsigned s_mix_serial, s_mix_frames, s_mix_secs;
+static struct MixVoice {
+    unsigned id, frames;
+    double src_sq, spk_sq[APU_SPK_CHANNELS];
+    float peak, rate, ea;
+    uint32_t fmt, ba, ebo;
+    uint8_t bins[8], fmode, hrtf, d3;
+    uint16_t vols[8];
+} s_mix_v[MCPX_HW_MAX_VOICES];
+static double s_mix_out_sq[APU_SPK_CHANNELS];
+static float s_mix_out_peak[APU_SPK_CHANNELS];
+static unsigned s_mix_out_over[APU_SPK_CHANNELS], s_mix_out_n, s_mix_out_ch;
+
+void mcpx_apu_set_voice_tag_hook(mcpx_apu_voice_tag_fn fn) { s_mix_tag_fn = fn; }
+
+int mcpx_apu_mix_trace_on(void)
+{
+    if (s_mix_on < 0) {
+        const char *e = recomp_env(RENV_MIX_TRACE);
+        s_mix_f = e && *e && *e != '0' ? fopen(e, "w") : NULL;
+        s_mix_on = s_mix_f != NULL;
+        if (e && *e && *e != '0')
+            fprintf(stderr, "[APU] mix trace -> %s%s\n", e, s_mix_f ? "" : " (open failed)");
+    }
+    return s_mix_on;
+}
+
+void mcpx_apu_mix_trace_out(const float *acc, int nch, int n)
+{
+    s_mix_out_ch = (unsigned)nch;
+    for (int i = 0; i < n; i++)
+        for (int c = 0; c < nch && c < APU_SPK_CHANNELS; c++) {
+            float x = acc[i * nch + c], a = fabsf(x);
+            s_mix_out_sq[c] += (double)x * x;
+            if (a > s_mix_out_peak[c]) s_mix_out_peak[c] = a;
+            if (a > 1.0f) s_mix_out_over[c]++;
+        }
+    s_mix_out_n += (unsigned)n;
+}
+
+static void mix_trace_on_off(MCPXAPUState *d, unsigned v, int on)
+{
+    (void)d;
+    if (!mcpx_apu_mix_trace_on() || v >= MCPX_HW_MAX_VOICES) return;
+    if (!on) {
+        fprintf(s_mix_f, "OFF id=%u v=%u f=%u\n", s_mix_v[v].id, v, s_mix_frames);
+        return;
+    }
+    const uint32_t *st = s_von_stack[v];
+    int n = s_von_nstack[v];
+    char line[16 * 9 + 1];
+    int len = 0;
+    line[0] = 0;
+    for (int i = 0; i < n; i++)
+        len += snprintf(line + len, sizeof(line) - (size_t)len, "%s%08X", i ? "," : "", st[i]);
+    s_mix_v[v].id = ++s_mix_serial;
+    fprintf(s_mix_f, "ON id=%u v=%u f=%u stack=%s\n", s_mix_v[v].id, v, s_mix_frames, line);
+}
+
+static void mix_trace_voice(MCPXAPUState *d, unsigned v,
+                            const float samples[NUM_SAMPLES_PER_FRAME][2],
+                            unsigned channels, const int bin[8],
+                            const uint16_t vol[8], float ea, float rate,
+                            int fmode)
+{
+    struct MixVoice *m = &s_mix_v[v];
+    static apu_spk_map map;
+    static int have_map;
+    float spk[APU_SPK_CHANNELS][NUM_SAMPLES_PER_FRAME];
+    int six = d->monitor.channels == APU_SPK_CHANNELS;
+    int nsp = six ? APU_SPK_CHANNELS : 2;
+
+    if (!have_map) { mcpx_apu_speaker_map_get(map); have_map = 1; }
+    memset(spk, 0, sizeof(spk));
+    for (int b = 0; b < 8; b++) {
+        float g = ea, hr;
+        int sp;
+        if (v < MCPX_HW_MAX_3D_VOICES && b < 4)
+            hr = (float)(1 << d->vp.hrtf_headroom);
+        else
+            hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
+        g *= attenuate(vol[b]) / hr;
+        if (six) {
+            sp = map[bin[b]];
+            g *= mcpx_apu_bin_feed_gain(bin[b]);
+        } else {
+            sp = bin[b] & 1;   /* the stereo fold: even left, odd right */
+        }
+        if (sp < 0 || sp >= nsp || g == 0.0f) continue;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            spk[sp][i] += g * samples[i][(unsigned)b % channels];
+    }
+    for (int c = 0; c < nsp; c++)
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float a = fabsf(spk[c][i]);
+            m->spk_sq[c] += (double)spk[c][i] * spk[c][i];
+            if (a > m->peak) m->peak = a;
+        }
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        m->src_sq += (double)samples[i][0] * samples[i][0];
+    m->frames++;
+    m->rate = rate; m->ea = ea; m->fmode = (uint8_t)fmode;
+    m->d3 = v < MCPX_HW_MAX_3D_VOICES;
+    m->hrtf = m->d3 && voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
+                  NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE) != HRTF_NULL_HANDLE;
+    m->fmt = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+    m->ba = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CUR_PSL_START,
+                           NV_PAVS_VOICE_CUR_PSL_START_BA);
+    m->ebo = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_NEXT,
+                            NV_PAVS_VOICE_PAR_NEXT_EBO);
+    for (int b = 0; b < 8; b++) { m->bins[b] = (uint8_t)bin[b]; m->vols[b] = vol[b]; }
+    if (!(m->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE)) {
+        /* A buffer's bytes, once: which wave of the title's wave
+         * dictionaries it is (matched against the disc's files offline).
+         * ba is an offset into the VP's scatter-gather space; the pages
+         * behind it need not be contiguous, so each chunk stays in a page. */
+        static uint32_t seen[4096];
+        uint32_t sge = d->regs[NV_PAPU_VPSGEADDR];
+        uint32_t pa = (uint32_t)get_data_ptr(sge, 0xFFFFFFFF, m->ba);
+        uint32_t h = (pa * 2654435761u) >> 20, k;
+        for (k = 0; k < 4096 && seen[(h + k) & 4095] && seen[(h + k) & 4095] != pa; k++) {}
+        if (pa && k < 4096 && !seen[(h + k) & 4095]) {
+            uint32_t o2 = 0x400;
+            seen[(h + k) & 4095] = pa;
+            if (((m->ba + o2) & 0xFFF) > 0x1000 - 32) o2 += 0x40;
+            fprintf(s_mix_f, "B ba=%06X pa=%08X ebo=%u fmt=%08X o2=%u hex=", m->ba, pa, m->ebo, m->fmt, o2);
+            for (int c = 0; c < 2; c++) {
+                uint32_t a = c ? (uint32_t)get_data_ptr(sge, 0xFFFFFFFF, m->ba + o2) : pa;
+                const uint8_t *p8 = (const uint8_t *)mcpx_apu_phys(a);
+                int lim = 0x1000 - (int)(a & 0xFFF); if (lim > 32) lim = 32;
+                for (int i = 0; p8 && i < lim; i++) fprintf(s_mix_f, "%02X", p8[i]);
+                fputc(c ? '\n' : ',', s_mix_f);
+            }
+        }
+        m->ba = pa;     /* reported as the physical address: the wave's identity */
+    }
+}
+
+/* RECOMP_MIX_TRACE_REC=<file> (with RECOMP_MIX_TRACE): the mix loop's
+ * inputs and its result, raw, for tests/apu_bus's replay: per voice a 'V'
+ * record (voice, channels, the eight bins and gains, the 32 samples), per
+ * VP frame an 'F' record (the 32 mixbins after every voice). From
+ * RECOMP_MIX_TRACE_REC_START seconds (default 0) for
+ * RECOMP_MIX_TRACE_REC_SECONDS (default 10). */
+static FILE *s_rec_f;
+static int s_rec_state = -1;            /* -1 unread, 0 off, 1 waiting, 2 recording, 3 done */
+static unsigned s_rec_start, s_rec_frames_left, s_rec_multipass;
+
+static int mix_rec_on(void)
+{
+    if (s_rec_state < 0) {
+        const char *e = getenv("RECOMP_MIX_TRACE_REC"), *t;
+        s_rec_state = 0;
+        if (e && *e && mcpx_apu_mix_trace_on() && (s_rec_f = fopen(e, "wb")) != NULL) {
+            t = getenv("RECOMP_MIX_TRACE_REC_START");
+            s_rec_start = t ? (unsigned)atoi(t) * 1500u : 0;
+            t = getenv("RECOMP_MIX_TRACE_REC_SECONDS");
+            s_rec_frames_left = (t ? (unsigned)atoi(t) : 10u) * 1500u;
+            s_rec_state = 1;
+        }
+    }
+    return s_rec_state == 2;
+}
+
+static void mix_rec_voice(MCPXAPUState *d, unsigned v,
+                          const float samples[NUM_SAMPLES_PER_FRAME][2],
+                          unsigned channels, const int bin[8],
+                          const uint16_t vol[8], float ea, int multipass)
+{
+    struct { uint8_t tag, channels; uint16_t v; int32_t bin[8]; float g[8]; } h;
+    memset(&h, 0, sizeof(h));
+    h.tag = 'V'; h.channels = (uint8_t)channels; h.v = (uint16_t)v;
+    for (int b = 0; b < 8; b++) {
+        float g = ea;
+        float hr;
+        if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
+            hr = (float)(1 << d->vp.hrtf_headroom);
+        } else {
+            hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
+        }
+        g *= attenuate(vol[b]) / hr;
+        h.bin[b] = bin[b];
+        h.g[b] = g;
+    }
+    if (multipass) s_rec_multipass++;
+    fwrite(&h, sizeof(h), 1, s_rec_f);
+    fwrite(samples, sizeof(float) * 2, NUM_SAMPLES_PER_FRAME, s_rec_f);
+}
+
+static void mix_rec_frame(const float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    if (s_rec_state == 1 && s_mix_frames >= s_rec_start) {
+        s_rec_state = 2;                /* from the next frame's first voice */
+        return;
+    }
+    if (s_rec_state != 2) return;
+    fputc('F', s_rec_f);
+    fwrite(mixbins, sizeof(float) * NUM_SAMPLES_PER_FRAME, NUM_MIXBINS, s_rec_f);
+    if (--s_rec_frames_left == 0) {
+        fclose(s_rec_f);
+        s_rec_f = NULL;
+        s_rec_state = 3;
+        fprintf(stderr, "[APU] mix trace: recording done (%u multipass voice frames)\n",
+                s_rec_multipass);
+    }
+}
+
+static void mix_trace_report(MCPXAPUState *d)
+{
+    if (!mcpx_apu_mix_trace_on()) return;
+    if (++s_mix_frames % 1500) return;
+    s_mix_secs++;
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        struct MixVoice *m = &s_mix_v[v];
+        if (!m->frames) continue;
+        fprintf(s_mix_f, "V t=%u id=%u v=%u 3d=%u st=%u stream=%u fmt=%08X fmode=%u hrtf=%u"
+                " rate=%.4f ea=%.3f ba=%08X ebo=%u frames=%u src=%.1f"
+                " bins=%u,%u,%u,%u,%u,%u,%u,%u vols=%03X,%03X,%03X,%03X,%03X,%03X,%03X,%03X"
+                " spk=%.6g,%.6g,%.6g,%.6g,%.6g,%.6g peak=%.5f\n",
+                s_mix_secs, m->id, v, m->d3,
+                (unsigned)((m->fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) != 0),
+                (unsigned)((m->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
+                m->fmt, m->fmode, m->hrtf, m->rate, m->ea, m->ba, m->ebo, m->frames,
+                sqrt(m->src_sq / ((double)m->frames * NUM_SAMPLES_PER_FRAME)) * 32768.0,
+                m->bins[0], m->bins[1], m->bins[2], m->bins[3],
+                m->bins[4], m->bins[5], m->bins[6], m->bins[7],
+                m->vols[0], m->vols[1], m->vols[2], m->vols[3],
+                m->vols[4], m->vols[5], m->vols[6], m->vols[7],
+                m->spk_sq[0], m->spk_sq[1], m->spk_sq[2], m->spk_sq[3],
+                m->spk_sq[4], m->spk_sq[5], m->peak);
+        m->frames = 0; m->src_sq = 0; m->peak = 0;
+        memset(m->spk_sq, 0, sizeof(m->spk_sq));
+    }
+    fprintf(s_mix_f, "T t=%u wall=%ld\n", s_mix_secs, (long)time(NULL));
+    if (s_bus_rt) {
+        /* The mixer's own meters: each bus's level into the mix and its
+         * sounding voices. */
+        apu_bus_meters mm;
+        apu_bus_get_meters(&mm);
+        fprintf(s_mix_f, "M t=%u", s_mix_secs);
+        for (int b = 0; b < apu_bus_count(); b++) {
+            char key[32];
+            apu_bus_key(b, key, sizeof(key));
+            fprintf(s_mix_f, " %s=%.1f/%.1f", key, mm.bus_rms_db[b], mm.bus_voices[b]);
+        }
+        fprintf(s_mix_f, " duck=%.1f lim=%.1f\n", mm.duck_db, mm.limiter_db);
+    }
+    fprintf(s_mix_f, "O t=%u ch=%u sq=%.6g,%.6g,%.6g,%.6g,%.6g,%.6g"
+            " peak=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f over=%u,%u,%u,%u,%u,%u n=%u"
+            " hrtf_sub=%u,%u,%u,%u hrtf_hr=%u\n", s_mix_secs, s_mix_out_ch,
+            s_mix_out_sq[0], s_mix_out_sq[1], s_mix_out_sq[2], s_mix_out_sq[3],
+            s_mix_out_sq[4], s_mix_out_sq[5],
+            s_mix_out_peak[0], s_mix_out_peak[1], s_mix_out_peak[2],
+            s_mix_out_peak[3], s_mix_out_peak[4], s_mix_out_peak[5],
+            s_mix_out_over[0], s_mix_out_over[1], s_mix_out_over[2],
+            s_mix_out_over[3], s_mix_out_over[4], s_mix_out_over[5], s_mix_out_n,
+            d->vp.hrtf_submix[0], d->vp.hrtf_submix[1], d->vp.hrtf_submix[2],
+            d->vp.hrtf_submix[3], d->vp.hrtf_headroom);
+    {
+        /* RECOMP_MIX_TRACE_GP=<from>-<to> (hex offsets into the effects
+         * image): its states as the title has them now, every 10 s. */
+        static int gp = -1;
+        static unsigned long g0, g1;
+        if (gp < 0) {
+            const char *e = getenv("RECOMP_MIX_TRACE_GP");
+            gp = e && sscanf(e, "%lx-%lx", &g0, &g1) == 2 && g1 > g0;
+        }
+        if (gp && s_mix_secs % 10 == 0) {
+            extern void mcpx_apu_mix_trace_gp(MCPXAPUState *, FILE *, unsigned, uint32_t, uint32_t);
+            mcpx_apu_mix_trace_gp(d, s_mix_f, s_mix_secs, (uint32_t)g0, (uint32_t)g1);
+        }
+    }
+    memset(s_mix_out_sq, 0, sizeof(s_mix_out_sq));
+    memset(s_mix_out_peak, 0, sizeof(s_mix_out_peak));
+    memset(s_mix_out_over, 0, sizeof(s_mix_out_over));
+    s_mix_out_n = 0;
+    fflush(s_mix_f);
+}
+
+/* A voice buffer in the GP model's export block (apu_dsp.c): 1 + its
+ * mixbin, else 0. */
+int mcpx_apu_gp_export_buffer(MCPXAPUState *d, uint32_t pa);
+int apu_gp_wired(void);
+
+/* What the mixer's classifier is told about voice v (apu_bus.h). */
+struct bus_fill_ctx { MCPXAPUState *d; unsigned v; const int *bin; uint32_t pa, ba; };
+
+static int bus_fill(void *ctx_, apu_bus_voice *o)
+{
+    struct bus_fill_ctx *c = (struct bus_fill_ctx *)ctx_;
+    MCPXAPUState *d = c->d;
+    uint32_t fmt = voice_get_mask(d, (uint16_t)c->v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+    uint32_t ebo = voice_get_mask(d, (uint16_t)c->v, NV_PAVS_VOICE_PAR_NEXT,
+                                  NV_PAVS_VOICE_PAR_NEXT_EBO);
+    uint32_t sge = d->regs[NV_PAPU_VPSGEADDR];
+    o->stream = (fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0;
+    o->stereo = (fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) != 0;
+    o->fmt = fmt;
+    for (int b = 0; b < 8; b++) o->bins[b] = (uint8_t)c->bin[b];
+    /* At least this many bytes: ADPCM is the densest, 36 bytes for 64. */
+    o->bytes = (ebo + 1) / 16 * 9 * (o->stereo ? 2u : 1u);
+    if (!o->stream && c->pa) {
+        static const uint32_t offs[2] = { 0x400, 0x440 };
+        const uint8_t *at[2] = { NULL, NULL };
+        if ((c->ba & 0xFFF) <= 0x1000 - 16)
+            o->head = mcpx_apu_phys(c->pa);
+        for (int k = 0; k < 2; k++)
+            if (o->bytes >= offs[k] + 16 && ((c->ba + offs[k]) & 0xFFF) <= 0x1000 - 16)
+                at[k] = mcpx_apu_phys(get_data_ptr(sge, 0xFFFFFFFF, c->ba + offs[k]));
+        o->at_400 = at[0];
+        o->at_440 = at[1];
+    }
+    o->stack = s_von_stack[c->v];
+    o->nstack = s_von_nstack[c->v];
+    o->gp_return = !o->stream && c->pa ? mcpx_apu_gp_export_buffer(d, c->pa) : 0;
+    return 1;
+}
+
+/* ============================================================
  * Voice processing (main per-voice function)
  * ============================================================ */
+
+/* A looping buffer voice at the frame rate whose buffer lies in the GP
+ * model's export block (apu_dsp.c): a title's return voice. */
+
+static bool voice_plays_gp_export(MCPXAPUState *d, uint16_t v, float rate)
+{
+    uint32_t fmt, ba;
+
+    if (!apu_gp_wired() || rate != 1.0f)
+        return false;
+    fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+    if ((fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) || !(fmt & NV_PAVS_VOICE_CFG_FMT_LOOP) ||
+        ((fmt & NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE) >> 30) !=
+            NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B32)
+        return false;
+    ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START, NV_PAVS_VOICE_CUR_PSL_START_BA);
+    return mcpx_apu_gp_export_buffer(
+        d, (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, ba)) != 0;
+}
 
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
@@ -1484,6 +1871,32 @@ static void voice_process(MCPXAPUState *d,
                                         NV_PAVS_VOICE_CFG_FMT_CLEAR_MIX) != 0;
         if (clear_mix) {
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
+        }
+    } else if (voice_plays_gp_export(d, v, rate)) {
+        /* A voice whose buffer is the block the GP model exports each
+         * frame (apu_gp.h), at the frame rate: the block as it is, one
+         * frame after the bins it was made from, since the voices are
+         * mixed before the GP stage runs. Not through the interpolator
+         * below: that keeps one source sample in hand, so the first sample
+         * of every frame would come from the block before. */
+        MCPXAPUVoiceFilter *f = &d->vp.filters[v];
+        if (f->rs_have) {
+            /* Back over what the interpolator had fetched and not played. */
+            uint32_t len = 1 + voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT,
+                                              NV_PAVS_VOICE_PAR_NEXT_EBO);
+            uint32_t cbo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                                          NV_PAVS_VOICE_PAR_OFFSET_CBO);
+            uint32_t held = f->rs_pos >= 1.0f ? 1 : 2;
+            voice_set_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                           NV_PAVS_VOICE_PAR_OFFSET_CBO, (cbo + len - held % len) % len);
+            f->rs_have = 0;
+        }
+        for (int sample_count = 0, tries = 0;
+             sample_count < NUM_SAMPLES_PER_FRAME && tries < 4; tries++) {
+            int count = voice_get_samples(d, v, &samples[sample_count],
+                                          NUM_SAMPLES_PER_FRAME - sample_count);
+            if (count < 0) break;
+            sample_count += count;
         }
     } else {
         int empty = 0;
@@ -1595,7 +2008,49 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    if (mcpx_apu_mix_trace_on()) {
+        mix_trace_voice(d, v, (const float (*)[2])samples, channels, bin, vol,
+                        ea_value, rate, fmode);
+        if (mix_rec_on())
+            mix_rec_voice(d, v, (const float (*)[2])samples, channels, bin, vol,
+                          ea_value, multipass);
+    }
+
     /* Mix into bins */
+    if (s_bus_rt) {
+        /* The host mixer on (apu_bus.h): the same gains, summed by the
+         * voice's bus. */
+        float gs[8];
+        struct bus_fill_ctx fc = { d, v, bin, 0, 0 };
+        bool is_stream = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                        NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0;
+        int bus;
+        for (int b = 0; b < 8; b++) {
+            float g = ea_value;
+            float hr;
+            if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
+                hr = (float)(1 << d->vp.hrtf_headroom);
+            } else {
+                hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
+            }
+            g *= attenuate(vol[b]) / hr;
+            gs[b] = g;
+        }
+        if (!is_stream) {
+            fc.ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START,
+                                   NV_PAVS_VOICE_CUR_PSL_START_BA);
+            fc.pa = (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, fc.ba);
+        }
+        bus = apu_bus_voice_bus(v, s_von_serial[v], fc.pa, bus_fill, &fc);
+        if (bus == APU_BUS_BYPASS) {
+            /* The input of an in-place GP effect: as with the mixer off. */
+            for (int b = 0; b < 8; b++)
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                    mixbins[bin[b]][i] += gs[b] * samples[i][(unsigned)b % channels];
+        } else
+        apu_bus_mix_voice(s_bus_rt, bus, mixbins, (const float (*)[2])samples,
+                          channels, bin, gs);
+    } else
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
@@ -1715,6 +2170,16 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
+    /* The host mixer: off (the default) this is one branch. */
+    if (apu_bus_enabled()) {
+        static int8_t map[32];
+        static int have_map;
+        if (!have_map) { mcpx_apu_speaker_map_get(map); have_map = 1; }
+        s_bus_rt = apu_bus_frame_begin(d->monitor.channels, map);
+    } else {
+        s_bus_rt = NULL;
+    }
+
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
         top = voice_list_regs[list].top;
@@ -1750,8 +2215,14 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         }
     }
 
+    if (s_bus_rt)
+        apu_bus_frame_end(s_bus_rt, mixbins);
+    if (s_mix_on > 0 && s_rec_state > 0)
+        mix_rec_frame((const float (*)[NUM_SAMPLES_PER_FRAME])mixbins);
+
     vp_trace_positions(d);
     vp_stat_report();
+    mix_trace_report(d);
     {
         static unsigned ring_frames, ring_secs;
         if (s_ring_on > 0 && ++ring_frames % 1500 == 0)

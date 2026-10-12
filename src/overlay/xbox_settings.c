@@ -13,6 +13,7 @@
 #include "nv2a_texscale.h"
 #include "apu_xaudio2.h"
 #include "apu.h"                /* mcpx_apu_set_fx_level */
+#include "apu_bus.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -62,6 +63,7 @@ static const char *const k_vibration[] = { "auto", "controller", "device", "off"
 static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
 static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
+static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
 #define SETTING(k, t, f, e, c, ev, mn, mx, b) \
@@ -89,6 +91,7 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_AUDIO_MUTE_BG]      = SETTING("audio.mute_background", XS_BOOL, 0, RENV_AUDIO_MUTE_BG, NULL, NULL, 0, 0, 0),
     [XS_AUDIO_SPEAKERS]     = SETTING("audio.speakers", XS_CHOICE, XS_RESTART, RENV_AUDIO_SPEAKERS, k_speakers, NULL, 0, 0, 0),
     [XS_AUDIO_FX_LEVEL]     = SETTING("audio.fx_level", XS_FLOAT, 0, RENV_AUDIO_FX_LEVEL, NULL, NULL, 0, 1, 0.25),
+    [XS_AUDIO_MIXER]        = SETTING("audio.mixer", XS_BOOL, 0, RENV_AUDIO_MIXER, NULL, NULL, 0, 0, 0),
     [XS_INPUT_DEADZONE]     = SETTING("input.deadzone", XS_INT, 0, RENV_PAD_DEADZONE, NULL, NULL, 0, 32767, 0),
     [XS_INPUT_TRIGGER_DEADZONE] = SETTING("input.trigger_deadzone", XS_INT, 0, RENV_PAD_TRIGGER_DEADZONE, NULL, NULL, 0, 254, 0),
     /* 0..3 in quarters: the rumble curve's strength, motor = (speed /
@@ -109,6 +112,10 @@ static xs_setting s_set[XS_COUNT] = {
     /* The title's crash and takedown cameras at 60 instead of its own 30: the
      * patch is the "1". */
     [XS_GRAPHICS_CRASH_60FPS] = SETTING("graphics.crash_60fps", XS_BOOL, 0, RENV_GFX_CRASH_60FPS, NULL, NULL, 0, 0, 0),
+    /* Split screen at 60 instead of the title's 30, and with the title's
+     * music, which it keeps silent there: the patch is the "1" of each. */
+    [XS_GRAPHICS_SPLIT_60FPS] = SETTING("graphics.split_60fps", XS_BOOL, 0, RENV_GFX_SPLIT_60FPS, NULL, NULL, 0, 0, 0),
+    [XS_AUDIO_SPLIT_MUSIC]  = SETTING("audio.split_music", XS_BOOL, 0, RENV_AUDIO_SPLIT_MUSIC, NULL, NULL, 0, 0, 0),
     /* Both off as shipped: today's picture, bit for bit. */
     [XS_GRAPHICS_LOD_BIAS]  = SETTING("graphics.lod_bias", XS_CHOICE, 0, RENV_GFX_LOD_BIAS, k_lod, k_lod_env, 0, 0, 0),
     [XS_GRAPHICS_DITHER]    = SETTING("graphics.dither", XS_BOOL, 0, RENV_GFX_DITHER, NULL, NULL, 0, 0, 0),
@@ -117,6 +124,10 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_GRAPHICS_VEHICLE_DETAIL] = SETTING("graphics.vehicle_detail", XS_CHOICE, 0, RENV_GFX_VEHICLE_DETAIL, k_vehicle_detail, NULL, 0, 0, 0),
     /* The title's button prompts for the pad in use (pad_glyphs.h). */
     [XS_INPUT_GLYPHS]       = SETTING("input.glyphs", XS_CHOICE, 0, RENV_INPUT_GLYPHS, k_glyphs, NULL, 0, 0, 0),
+    /* The LFE feed's low-pass where the title's effects image is modelled
+     * (apu_gp.h): 120 Hz is what the console's AC-3 encoder did after the
+     * GP stage; off is the GP stage's own full-range feed. Live. */
+    [XS_AUDIO_LFE_LOWPASS]  = SETTING("audio.lfe_lowpass", XS_CHOICE, 0, RENV_AUDIO_LFE_LOWPASS, k_lfe_lowpass, NULL, 0, 0, 3),
     /* Off as shipped: the title's own textures, bit for bit. */
     [XS_GRAPHICS_UI_SCALE]  = SETTING("graphics.ui_scale", XS_CHOICE, 0, RENV_GFX_UI_SCALE, k_ui_scale, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
@@ -362,6 +373,12 @@ static void apply(xs_id id)
         break;
     case XS_AUDIO_FX_LEVEL:
         mcpx_apu_set_fx_level((float)v);
+        break;
+    case XS_AUDIO_MIXER:
+        apu_bus_enable(v != 0.0);
+        break;
+    case XS_AUDIO_LFE_LOWPASS:
+        mcpx_apu_set_lfe_lowpass(atoi(k_lfe_lowpass[(int)v]));
         break;
     case XS_INPUT_DEADZONE:
         xbox_InputSetDeadzone((int)v);
