@@ -201,6 +201,33 @@ int main(void)
         }
     }
 
+    /* ---- RECOMP_GFX_LOD_BIAS: auto is -log2(scale) / 2, off is 0 ---- */
+    {
+        struct nv2a_host_opts o = *nv2a_host_opts();
+        o.render_scale = 1;
+        o.render_scale_half = 0;
+        nv2a_host_opts_set(&o);
+        nv2a_host_set_lod_bias(NV2A_LOD_AUTO, 0.0f);
+        CHECK(nv2a_host_lod_bias() == 0.0f);                 /* 1x: nothing to bias */
+        o.render_scale = 2;
+        nv2a_host_opts_set(&o);
+        CHECK(nv2a_host_lod_bias() == -0.5f);
+        o.render_scale = 4;
+        nv2a_host_opts_set(&o);
+        CHECK(nv2a_host_lod_bias() == -1.0f);
+        nv2a_host_set_lod_bias(NV2A_LOD_OFF, -0.5f);         /* off ignores the value */
+        CHECK(nv2a_host_lod_bias() == 0.0f);
+        nv2a_host_set_lod_bias(NV2A_LOD_VALUE, -1.5f);
+        CHECK(nv2a_host_lod_bias() == -1.5f);
+        nv2a_host_set_lod_bias(NV2A_LOD_VALUE, -9.0f);       /* clamped */
+        CHECK(nv2a_host_lod_bias() == -4.0f);
+        nv2a_host_set_lod_bias(NV2A_LOD_OFF, 0.0f);
+        nv2a_host_set_dither(1);
+        CHECK(nv2a_host_dither() == 1);
+        nv2a_host_set_dither(0);
+        CHECK(nv2a_host_dither() == 0);
+    }
+
     printf("render_scale: all passed\n");
     return 0;
 }

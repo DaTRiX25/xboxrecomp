@@ -16,8 +16,12 @@ else()
     # presenters' post passes.
     # host_probe.c: displays, controllers and GPUs for the bug report.
     target_sources(xbox_video PRIVATE fb_present_sdl.c smaa.c host_probe.c)
+    # ../kernel: host_probe.c includes xbox_report.h. With the overlay built
+    # the directory comes along through xbox_overlay; a build without it (the
+    # standalone tests) has to be given it here.
     target_include_directories(xbox_video PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/smaa)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/smaa
+        ${CMAKE_CURRENT_SOURCE_DIR}/../kernel)
     target_link_libraries(xbox_video PUBLIC SDL2::SDL2 xbox_input)
     if(WIN32)
         # Vulkan on Windows: the FMV player (Media Foundation) is not built, as

@@ -2938,10 +2938,11 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     }
     build_stages();
     nv2a_ps_consts_fill(v, s_stage, &pc.b);
+    const float host_bias = nv2a_host_lod_bias();   /* RECOMP_GFX_LOD_BIAS; 0 by default */
     for (k = 0; k < 4; k++) {
         const Stage *t = &s_stage[k];
         float b = t->levels > 1 && nv2a_tex_filter_mip(t->filter)
-                ? nv2a_tex_lod_bias(t->filter) : 0.0f;
+                ? nv2a_tex_lod_bias(t->filter) + host_bias : 0.0f;
         pc.tex_bias[k] = b > 15.99f ? 15.99f : b < -16.0f ? -16.0f : b;
     }
     {   /* Bump-env registers: methods 0x1B28..0x1B3C of each stage block. */
