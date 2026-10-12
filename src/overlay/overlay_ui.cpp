@@ -185,6 +185,15 @@ static char s_rep_done[1400];         /* where the last one went, or why none */
 
 static char s_about[200];
 
+/* The Audio page's note, two lines (xbox_settings.h). */
+static char s_audio_note[2][96];
+
+void xbox_OverlaySetAudioNote(const char *line1, const char *line2)
+{
+    snprintf(s_audio_note[0], sizeof s_audio_note[0], "%s", line1 ? line1 : "");
+    snprintf(s_audio_note[1], sizeof s_audio_note[1], "%s", line2 ? line2 : "");
+}
+
 void xbox_OverlaySetAbout(const char *text)
 {
     snprintf(s_about, sizeof s_about, "%s", text ? text : "");
@@ -308,6 +317,10 @@ static int page_rows(int page, Row *r)
         SPK(1, "Speaker test, direct");
         if (mcpx_apu_title_channels() != 6)
             INFO("The output is stereo: each speaker is folded to left/right.");
+        if (s_audio_note[0][0])
+            INFO(s_audio_note[0]);
+        if (s_audio_note[1][0])
+            INFO(s_audio_note[1]);
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_INPUT:

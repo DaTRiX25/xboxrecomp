@@ -122,6 +122,13 @@ void xbox_SettingsFlush(void);
 /* The file in use, or "" (none). */
 const char *xbox_SettingsPath(void);
 
+/* A text setting (audio.custom_music_dir: a folder): what the file holds, or
+ * the environment's when it sets the variable (*locked, may be NULL). ""
+ * when unset or unknown. Set: remembered for the file (an empty value
+ * removes the key); the runtime reads it at the next start. */
+const char *xbox_SettingsText(const char *key, int *locked);
+void        xbox_SettingsSetText(const char *key, const char *value);
+
 /* The power mode's "stock" (Maximum, the busy-wait) is offered on some hosts
  * only (BO-75: on the Deck and Windows it measured no steadier than Balanced
  * and costs 2.7 W / stutters). Where it is hidden the overlay steps over it
@@ -149,6 +156,11 @@ void xbox_SettingEnvString(const xs_setting *s, double v, char *out, unsigned n)
 /* The line at the top of the overlay's Advanced page: the port's name and
  * version (NULL or "": none). Here and not in overlay.h, which needs SDL. */
 void xbox_OverlaySetAbout(const char *text);
+
+/* Up to two lines of text on the overlay's Audio page, under its settings
+ * (NULL or "": none): what a port has to say there that is not a setting the
+ * overlay steps through (its custom-music folder). */
+void xbox_OverlaySetAudioNote(const char *line1, const char *line2);
 
 #ifdef __cplusplus
 }
