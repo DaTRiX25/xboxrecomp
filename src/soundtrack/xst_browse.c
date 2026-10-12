@@ -349,6 +349,17 @@ static void list_places(void)
 #elif defined(__APPLE__)
     add_mounts("/Volumes", NULL);
 #elif defined(__ANDROID__)
+    /* The app's own files folder first: the one place it can read without
+     * a permission (it has none for the shared Music folder yet), and one a
+     * PC reaches over USB: <files>/Music. */
+    {
+        const char *own = getenv("RECOMP_ANDROID_DIR");
+        if (own && *own) {
+            join(path, sizeof path, own, "Music");
+            mkdir(path, 0775);
+            add_row(XSB_PLACE, "This app's Music folder", path);
+        }
+    }
     /* Shared storage, readable as files with the audio permission; a card
      * is /storage/<id>. */
     add_row(XSB_PLACE, "Music", "/storage/emulated/0/Music");

@@ -2149,11 +2149,12 @@ static void build_pages(float fs)
         else
 #if defined(__ANDROID__)
             /* The app does not ask for the audio permission yet (the game
-             * repository's docs/custom-music.md, "Android"), so there is
-             * nothing the player could grant: say that it is not there. */
-            snprintf(hint, sizeof hint, "Your own music in the game's music menu is not available on"
-                     " Android yet: this app cannot read the device's music folders. It works in"
-                     " the Windows, macOS and Linux versions.");
+             * repository's docs/custom-music.md, "Android"): its own files
+             * folder is what it can read, and the browser lists it first. */
+            snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
+                     " own music menu. On Android the app reads its own folder only: copy music"
+                     " folders into Android/data/<this app>/files/Music, then press A and choose"
+                     " \"This app's Music folder\".");
 #else
             snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
                      " own music menu: every folder with music in it becomes a soundtrack there."
