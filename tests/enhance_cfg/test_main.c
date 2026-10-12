@@ -447,6 +447,10 @@ static void test_layers(void)
 static int s_pacing_mode = -1;
 void xbox_PacingSetMode(int mode);
 void xbox_PacingSetMode(int mode) { s_pacing_mode = mode; }
+/* The spin lead (kernel_pacing.h), stubbed the same way. */
+static unsigned long long s_spin_lead_ns;
+void xbox_PacingSetSpinLead(unsigned long long ns);
+void xbox_PacingSetSpinLead(unsigned long long ns) { s_spin_lead_ns = ns; }
 /* The kernel's video settings (kernel.h), stubbed as the pacing mode is. */
 static ULONG s_xc_video = 1, s_smc_mode = 1;
 void xbox_SetVideoSettings(ULONG xc_video, ULONG smc_video_mode);
