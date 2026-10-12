@@ -1868,10 +1868,12 @@ static void build_pages(float fs)
                      " unset it to change it here.");
         else
 #if defined(__ANDROID__)
-            snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
-                     " own music menu. The folder list shows what this app may read: on Android it"
-                     " needs the \"Music and audio\" permission (Settings > Apps > this app >"
-                     " Permissions); without it the folders look empty.");
+            /* The app does not ask for the audio permission yet (the game
+             * repository's docs/custom-music.md, "Android"), so there is
+             * nothing the player could grant: say that it is not there. */
+            snprintf(hint, sizeof hint, "Your own music in the game's music menu is not available on"
+                     " Android yet: this app cannot read the device's music folders. It works in"
+                     " the Windows, macOS and Linux versions.");
 #else
             snprintf(hint, sizeof hint, "A folder of your own music (mp3, flac, ogg, wav) for the game's"
                      " own music menu: every folder with music in it becomes a soundtrack there."
