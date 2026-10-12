@@ -80,7 +80,7 @@ int  apu_gp_lfe_lowpass_hz(void);       /* the setting in force or being faded t
 
 /* An effect of the image that is not modelled, and the state words that
  * say how far the title has it open: count words from state, harmless up
- * to quiet (as signed 24-bit integers). When a command loads a larger
+ * to quiet (as signed 24-bit integers). When the title (command 2) loads a larger
  * value the log says so, once for each new maximum: a sound that is
  * missing can then be traced to it. what must stay valid. */
 void apu_gp_unmodelled(const char *what, uint32_t state, int count, int32_t quiet);

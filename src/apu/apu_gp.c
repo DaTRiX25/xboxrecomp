@@ -220,7 +220,9 @@ void apu_gp_command(const apu_gp_mem *m, uint32_t cmd, uint32_t dst,
     for (uint32_t k = 0; k < count; k++)
         g.st[dst + k] = sx24(m->read(m->ctx, src + 4 * k));
 
-    if (g.un.count && dst < g.un.st + (uint32_t)g.un.count && dst + count > g.un.st) {
+    /* The title's own moves only: the first load is the image's defaults,
+     * before the title has set anything. */
+    if (cmd == 2 && g.un.count && dst < g.un.st + (uint32_t)g.un.count && dst + count > g.un.st) {
         int32_t mx = 0;
         for (int k = 0; k < g.un.count; k++) {
             int32_t v = g.st[g.un.st + (uint32_t)k];
