@@ -144,6 +144,17 @@ void nv2a_texscale_cache_dir(const char *dir)
         if (e && !strcmp(e, "0"))
             s_dir_on = 0;            /* =0: no disk cache */
     }
+    /* Said once a change, without any trace switch: a backend names the
+     * directory when the setting is first on, so this is the line that says
+     * the 2D art is being scaled and where its pictures are kept. */
+    if (s_dir_on)
+        fprintf(stderr, LOGP "2D art upscaling on (%ux, %s); scaled textures kept in %s"
+                " (at most %.0f MB)\n", nv2a_texscale_factor(),
+                nv2a_texscale_algo_name(nv2a_texscale_algo()), s_dir,
+                (double)s_limit / 1048576.0);
+    else if (dir && *dir)
+        fprintf(stderr, LOGP "2D art upscaling on (%ux, %s); no disk cache\n",
+                nv2a_texscale_factor(), nv2a_texscale_algo_name(nv2a_texscale_algo()));
     pthread_mutex_unlock(&s_mx);
 }
 
