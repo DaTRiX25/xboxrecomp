@@ -9,6 +9,7 @@
 #include "apu_gp.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 enum { GP_NONE = 0, GP_DIRECT, GP_EQ };
@@ -19,6 +20,7 @@ static struct {
              float x1, x2, y1, y2; } route[APU_GP_BINS];
     struct { int bin; uint32_t st; } drive[4];
     int ndrive;
+    struct { const char *what; uint32_t st; int count; int32_t quiet, max; } un;
     int exp_first, exp_count;
     uint32_t exp_off;
     /* The LFE low-pass: the one running, and during a change the one it
@@ -79,6 +81,20 @@ void apu_gp_drive(int bin, uint32_t state)
     g.drive[g.ndrive].st = state;
     g.ndrive++;
 }
+
+void apu_gp_unmodelled(const char *what, uint32_t state, int count, int32_t quiet)
+{
+    wire();
+    if (count < 0 || state + (uint32_t)count > APU_GP_STATE_MAX)
+        return;
+    g.un.what = what;
+    g.un.st = state;
+    g.un.count = count;
+    g.un.quiet = quiet;
+    g.un.max = 0;
+}
+
+int32_t apu_gp_unmodelled_max(void) { return g.un.max; }
 
 void apu_gp_export(int first, int count, uint32_t scratch_off)
 {
@@ -203,6 +219,22 @@ void apu_gp_command(const apu_gp_mem *m, uint32_t cmd, uint32_t dst,
         count = APU_GP_STATE_MAX - dst;
     for (uint32_t k = 0; k < count; k++)
         g.st[dst + k] = sx24(m->read(m->ctx, src + 4 * k));
+
+    if (g.un.count && dst < g.un.st + (uint32_t)g.un.count && dst + count > g.un.st) {
+        int32_t mx = 0;
+        for (int k = 0; k < g.un.count; k++) {
+            int32_t v = g.st[g.un.st + (uint32_t)k];
+            if (v < 0) v = -v;
+            if (v > mx) mx = v;
+        }
+        if (mx > g.un.max) {
+            g.un.max = mx;
+            if (mx > g.un.quiet)
+                fprintf(stderr, "[APU] GP image: %s is not modelled and the title has it"
+                                " open to 0x%06X (quiet up to 0x%06X)\n",
+                        g.un.what ? g.un.what : "an effect", (unsigned)mx, (unsigned)g.un.quiet);
+        }
+    }
 }
 
 /* ── the distortion ──────────────────────────────────────────────────────
