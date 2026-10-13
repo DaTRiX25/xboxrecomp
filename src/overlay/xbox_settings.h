@@ -251,6 +251,14 @@ void xbox_OverlaySetPadSheets(const struct nv2a_texrep_variant *variants, unsign
  * only when the row is pressed. */
 void xbox_OverlaySetUpdateCheck(const char *repo, const char *version);
 
+/* The "Add Steam library art" row of the Advanced page, for a port whose
+ * setup program can write the pictures of its existing Steam shortcut. `run`
+ * is called on its own thread when the row is pressed; it puts one line for
+ * the player in `line` (what was done, or why not) and returns 1 when art was
+ * written. The row is for the caller to offer where Steam shortcuts exist; with
+ * run NULL, or without this call, there is none. */
+void xbox_OverlaySetSteamArt(int (*run)(char *line, unsigned n));
+
 /* Ask for the overlay to open, from any thread (a host hook on the title's
  * thread: a menu entry of the game's own). It opens on the main loop's next
  * turn, as the hotkey opens it. 0 when there is no overlay to open (not
