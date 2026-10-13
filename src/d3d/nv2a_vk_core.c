@@ -501,6 +501,47 @@ void nvk_device_lost(const char *why)
     }
 }
 
+static double shut_ms(const struct timespec *t0)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)(t.tv_sec - t0->tv_sec) * 1e3 + (double)(t.tv_nsec - t0->tv_nsec) / 1e6;
+}
+
+void nvk_core_shutdown(void)
+{
+    struct timespec t0;
+    VkResult r;
+
+    pthread_mutex_lock(&s_init_lock);
+    if (s_state != 1) {
+        pthread_mutex_unlock(&s_init_lock);
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* Taken for good: a submit or present that still comes waits here
+     * rather than reach a destroyed device. The process ends next. */
+    pthread_mutex_lock(&s_queue_lock);
+    r = vkDeviceWaitIdle(s_core.dev);
+    fprintf(stderr, "[vulkan] teardown: vkDeviceWaitIdle %s (%.1f ms)\n", nvk_result_str(r),
+            shut_ms(&t0));
+    if (s_core.surface) {
+        vkDestroySurfaceKHR(s_core.inst, s_core.surface, NULL);
+        fprintf(stderr, "[vulkan] teardown: surface destroyed (%.1f ms)\n", shut_ms(&t0));
+    }
+    vkDestroyDevice(s_core.dev, NULL);
+    fprintf(stderr, "[vulkan] teardown: device destroyed (%.1f ms)\n", shut_ms(&t0));
+    vkDestroyInstance(s_core.inst, NULL);
+    fprintf(stderr, "[vulkan] teardown: instance destroyed (%.1f ms)\n", shut_ms(&t0));
+    fflush(stderr);
+    s_core.surface = VK_NULL_HANDLE;
+    s_core.dev = VK_NULL_HANDLE;
+    s_core.queue = VK_NULL_HANDLE;
+    s_core.inst = VK_NULL_HANDLE;
+    s_state = -1;
+    pthread_mutex_unlock(&s_init_lock);
+}
+
 void nvk_queue_lock(void)   { pthread_mutex_lock(&s_queue_lock); }
 void nvk_queue_unlock(void) { pthread_mutex_unlock(&s_queue_lock); }
 

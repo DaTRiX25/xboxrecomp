@@ -15,6 +15,10 @@
 #define PAUSE_TICK_MS 50
 
 static volatile LONG s_paused;
+/* xbox_HostHoldForExit: the hold is for good (no resume, no hold work), and
+ * whether the executor is in it now. */
+static volatile LONG s_exiting;
+static volatile LONG s_held;
 static CRITICAL_SECTION s_lock;
 static CONDITION_VARIABLE s_cv;
 static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
@@ -55,6 +59,10 @@ void xbox_HostPause(int on)
 
     pause_once();
     EnterCriticalSection(&s_lock);
+    if (s_exiting && !on) {          /* the way out: no resume */
+        LeaveCriticalSection(&s_lock);
+        return;
+    }
     changed = (s_paused != 0) != (on != 0);
     s_paused = on ? 1 : 0;
     n = s_n_listeners;
@@ -202,22 +210,49 @@ void xbox_HostPauseHold(void)
         return;
     pause_once();
     EnterCriticalSection(&s_lock);
+    s_held = 1;
     while (s_paused) {
         void (*fn)(void) = s_hold_fn, (*idle)(void) = s_idle_fn;
+        if (s_exiting) {
+            /* Held for the way out: the GPU device is being destroyed, so
+             * no hold work (it may use the device) and no return. */
+            SleepConditionVariableCS(&s_cv, &s_lock, PAUSE_TICK_MS);
+            g_xbox_flip_count++;     /* not a hang, for the watchdog */
+            continue;
+        }
         if (fn || idle) {
-            /* Outside the lock: it may take a while (a frame read back). */
+            /* Outside the lock: it may take a while (a frame read back).
+             * Not held meanwhile: the work may use the GPU. */
+            s_held = 0;
             LeaveCriticalSection(&s_lock);
             if (fn)
                 fn();
             if (idle)
                 idle();
             EnterCriticalSection(&s_lock);
+            s_held = 1;
             if (!s_paused)
                 break;
         }
         SleepConditionVariableCS(&s_cv, &s_lock, PAUSE_TICK_MS);
         g_xbox_flip_count++;
     }
+    s_held = 0;
     LeaveCriticalSection(&s_lock);
     flip_note(0);                /* a gap in the flip times */
+}
+
+int xbox_HostHoldForExit(int timeout_ms)
+{
+    int waited = 0;
+    pause_once();
+    EnterCriticalSection(&s_lock);
+    s_exiting = 1;
+    LeaveCriticalSection(&s_lock);
+    xbox_HostPause(1);
+    while (!s_held && waited < timeout_ms) {
+        Sleep(5);
+        waited += 5;
+    }
+    return s_held ? 1 : 0;
 }

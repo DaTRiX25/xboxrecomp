@@ -806,14 +806,105 @@ static int android_offer_driver_reset(const char *msg)
             (*env)->CallIntMethod(env, act, m, (jint)1);
             if ((*env)->ExceptionCheck(env))
                 (*env)->ExceptionClear(env);
-            /* The activity ends this process in a moment; nothing more is
-             * started here meanwhile. */
-            SDL_Delay(5000);
+            /* The restart page is started and waits for this process to
+             * be gone; the game never drew on this driver (that is why
+             * the box is up), so there is no GPU work to wait for. */
+            fprintf(stderr, "[TEARDOWN] driver reset: exit(0)\n");
+            fflush(stderr);
+            exit(0);
         }
     }
     (*env)->DeleteLocalRef(env, cls);
     (*env)->DeleteLocalRef(env, act);
     return shown;
+}
+
+/* ── the way out on Android: the GPU torn down before the process ends ──
+ *
+ * Every way the game ends on Android comes through the window loop's end
+ * (Quit game, Restart game, a driver change, Back or the system finishing
+ * the activity, the box after a lost device): the activity is finished, SDL
+ * sends SDL_QUIT, the loop ends. Before exit(0) the Vulkan side goes in
+ * order, as the emulators do at their own stop: the executor held (it
+ * submits no more), the pre-warm thread stopped and the pipeline cache
+ * written, the swapchain, then vkDeviceWaitIdle and the surface, the device
+ * and the instance (nvk_core_shutdown). The kernel driver (kgsl) then has
+ * nothing of this process's left when the next one opens the GPU: the app
+ * restarts only once this process is gone (RestartActivity waits for it).
+ * A step that cannot be done safely (the executor not held in time) leaves
+ * the device to the process's end, and says so. A watchdog ends the process
+ * if the teardown itself hangs (a wedged GPU). Each step is in the log with
+ * the time since the teardown began. */
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+int  xbox_HostHoldForExit(int timeout_ms);
+int  nvk_backend_quiesce(int timeout_ms);
+void nvk_core_shutdown(void);
+#endif
+#include <unistd.h>
+
+static struct timespec s_td_t0;
+static volatile int s_td_done;
+
+static double td_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)(t.tv_sec - s_td_t0.tv_sec) * 1e3
+         + (double)(t.tv_nsec - s_td_t0.tv_nsec) / 1e6;
+}
+
+static void *td_watchdog(void *arg)
+{
+    (void)arg;
+    sleep(4);
+    if (!s_td_done) {
+        fprintf(stderr, "[TEARDOWN] not done after %.0f ms: the process ends now (_exit)\n",
+                td_ms());
+        fflush(stderr);
+        _exit(0);
+    }
+    return NULL;
+}
+
+/* Before the swapchain goes. Returns 1 when the device may be destroyed. */
+static int android_teardown_begin(int vk)
+{
+    pthread_t th;
+    int held = 0, quiet = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &s_td_t0);
+    fprintf(stderr, "[TEARDOWN] begin (%s)\n", vk ? "Vulkan" : "no Vulkan device");
+    if (pthread_create(&th, NULL, td_watchdog, NULL) == 0)
+        pthread_detach(th);
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (vk) {
+        held = xbox_HostHoldForExit(1500);
+        fprintf(stderr, "[TEARDOWN] the title's executor %s (%.1f ms)\n",
+                held ? "is held" : "was not held in time", td_ms());
+        quiet = nvk_backend_quiesce(1000);
+        fprintf(stderr, "[TEARDOWN] backend %s (%.1f ms)\n",
+                quiet ? "quiet" : "not quiet", td_ms());
+    }
+#endif
+    fflush(stderr);
+    return held && quiet;
+}
+
+/* After the swapchain is gone (close_present). */
+static void android_teardown_end(int vk, int destroy)
+{
+    fprintf(stderr, "[TEARDOWN] swapchain destroyed (%.1f ms)\n", td_ms());
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (vk && destroy)
+        nvk_core_shutdown();
+    else if (vk)
+        fprintf(stderr, "[TEARDOWN] the device is left to the process's end (not safe to"
+                " destroy now)\n");
+#endif
+    (void)destroy;
+    fprintf(stderr, "[TEARDOWN] GPU done (%.1f ms)\n", td_ms());
+    fflush(stderr);
+    s_td_done = 1;
 }
 
 #endif /* __ANDROID__ (reopened below) */
@@ -873,7 +964,7 @@ static void gfx_restart(void)
             (*env)->CallVoidMethod(env, act, m);
         if ((*env)->ExceptionCheck(env))
             (*env)->ExceptionClear(env);
-        SDL_Delay(1500);        /* the activity ends this process */
+        /* The restart page is started; the caller ends this process. */
     }
 #else
     if (s_restart_fn)
@@ -1579,9 +1670,17 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * Window and renderer go first, on this thread as AppKit wants. SDL_Quit
      * is only safe once nothing else uses SDL: a run that had a controller
      * open keeps SDL up, as before, and exit() reclaims it. */
+#if defined(__ANDROID__)
+    {
+        int vk = s_vk, destroy = android_teardown_begin(vk);
+#endif
     if (tex)
         SDL_DestroyTexture(tex);
     close_present(ren);
+#if defined(__ANDROID__)
+        android_teardown_end(vk, destroy);
+    }
+#endif
     SDL_DestroyWindow(win);
     /* The main pump flag stays set: guest and OHCI threads keep running
      * until exit(), and must not start calling SDL_GameControllerUpdate
@@ -1592,6 +1691,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
     if (s_gfx_restart)
         gfx_restart();
+#if defined(__ANDROID__)
+    /* Every way out ends the process here (a guest that returned too): the
+     * next start, or the restart page, waits for this process to be gone. */
+    fprintf(stderr, "[TEARDOWN] exit(0) (%.1f ms)\n", td_ms());
+    fflush(stderr);
+    exit(0);
+#endif
     if (quit)
         exit(0);
     return s_guest_rc;

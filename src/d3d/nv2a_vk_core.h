@@ -79,6 +79,18 @@ int nvk_core_is_software(void);
 void nvk_device_lost(const char *why);
 void nvk_set_lost_handler(void (*fn)(const char *why));
 
+/* The way out (Android: every quit and restart, before the process ends;
+ * fb_present_sdl.c). nvk_backend_quiesce first: the backend's pre-warm
+ * thread stops and its pipeline cache is written; 0 when that thread did
+ * not stop within timeout_ms (the device must then be left alone). Then,
+ * with the executor held (xbox_HostHoldForExit) and the window's swapchain
+ * gone: nvk_core_shutdown takes the queue lock for good, waits for the
+ * device to be idle and destroys the surface, the device and the instance,
+ * each step in the log. Objects the backend still holds go with the device
+ * (the process ends next). */
+int  nvk_backend_quiesce(int timeout_ms);
+void nvk_core_shutdown(void);
+
 void nvk_queue_lock(void);
 void nvk_queue_unlock(void);
 
