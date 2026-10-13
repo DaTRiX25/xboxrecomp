@@ -38,17 +38,22 @@ static PFN_vkGetInstanceProcAddr s_gipa;
 static char s_driver[256] = "system";
 static int s_failed;
 
-/* BO-128: on Adreno 6xx, Turnip's GMEM rendering with hardware binning
- * wedges the GPU now and then (a hang every 30 min to a few hours in races on
- * the Retroid Pocket 5's Adreno 650: RBBM_STATUS 0x00E59005, the vertex
- * front end and the shader cores busy with no memory traffic, inside a
- * tile's draws; the family of Mesa issues #5220 and #4923). Without the
- * binning pass (TU_DEBUG=nobin) the tiles still render in GMEM. Without UBWC
- * compression as well (noubwc) the RP5 ran 77 minutes in one process with no
- * hang (2026-10-13), where nobin alone hung about every 40. Asked before
- * the driver is opened; a TU_DEBUG the player set (env.txt, even empty) is
- * left as it is. */
-static void turnip_defaults(void)
+/* TU_DEBUG defaults, asked before the driver is opened; a TU_DEBUG the player
+ * set (env.txt, even empty) is left as it is.
+ *
+ * The Turnip in the app (opened from the native library directory) is, since
+ * BO-152, a prebuilt Mesa 26.2.0-devel build (whitebelyash's, as
+ * UnleashedRecomp-Android ships it for its "A725 Performance" setting; see
+ * docs/android.md). It runs with TU_DEBUG=sysmem,nobin on every Adreno, as
+ * that app runs it: on the Retroid Pocket 5's Adreno 650 that pair ran with no
+ * GPU hang where Mesa 26.2.4 hung every few minutes in races.
+ *
+ * BO-128: for a driver of the player's choosing on an Adreno 6xx, Turnip's
+ * GMEM rendering with hardware binning wedges the GPU now and then
+ * (RBBM_STATUS 0x00E59005, the vertex front end and the shader cores busy with
+ * no memory traffic; the family of Mesa issues #5220 and #4923), so there the
+ * old default stays: no binning pass and no UBWC (nobin,noubwc). */
+static void turnip_defaults(int bundled)
 {
     char model[64] = "";
     FILE *f;
@@ -61,10 +66,31 @@ static void turnip_defaults(void)
         fclose(f);
     }
     model[strcspn(model, "\r\n")] = 0;
+    if (bundled) {
+        setenv("TU_DEBUG", "sysmem,nobin", 0);
+        fprintf(stderr, "[vulkan] %s, the Turnip in the app: TU_DEBUG=sysmem,nobin\n",
+                model[0] ? model : "GPU");
+        return;
+    }
     if (strncmp(model, "Adreno6", 7))
         return;
     setenv("TU_DEBUG", "nobin,noubwc", 0);
     fprintf(stderr, "[vulkan] %s: TU_DEBUG=nobin,noubwc (no binning pass, no UBWC)\n", model);
+}
+
+/* The driver in the app: the one in the native library directory. */
+static int same_dir(const char *a, const char *b)
+{
+    size_t na, nb;
+    if (!a || !b)
+        return 0;
+    na = strlen(a);
+    nb = strlen(b);
+    while (na > 1 && a[na - 1] == '/')
+        na--;
+    while (nb > 1 && b[nb - 1] == '/')
+        nb--;
+    return na == nb && !strncmp(a, b, na);
 }
 
 static void open_loader(void)
@@ -77,7 +103,7 @@ static void open_loader(void)
     if (dir && *dir && name && *name && strcmp(name, "system")) {
 #if defined(XBOXRECOMP_HAVE_ADRENOTOOLS)
         char d[1024];
-        turnip_defaults();
+        turnip_defaults(same_dir(dir, lib));
         size_t n = strlen(dir);
         /* libadrenotools joins directory and name as they are. */
         snprintf(d, sizeof d, "%s%s", dir, n && dir[n - 1] == '/' ? "" : "/");
