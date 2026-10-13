@@ -39,7 +39,9 @@
 #include <unistd.h>
 
 #define LOGA "[ANDROID-PERF] "
-#define TARGET_NS 16666667ll
+/* RECOMP_ANDROID_ADPF_TARGET_MS=<ms>: another target, for tests. */
+static int64_t s_target_ns = 16666667ll;
+#define TARGET_NS s_target_ns
 
 static void *libandroid(void)
 {
@@ -72,7 +74,7 @@ void xbox_AndroidSetFrameRate(void *window, const char *why)
     if (!window)
         return;
     if (env_off("RECOMP_ANDROID_FRAMERATE")) {
-        fprintf(stderr, LOGA "frame rate: not asked for (RECOMP_ANDROID_FRAMERATE=0)\n");
+        XR_NOTICE(LOGA "frame rate: not asked for (RECOMP_ANDROID_FRAMERATE=0)\n");
         return;
     }
     if (!resolved) {
@@ -81,13 +83,13 @@ void xbox_AndroidSetFrameRate(void *window, const char *why)
             fn = (set_frame_rate_fn)dlsym(libandroid(), "ANativeWindow_setFrameRate");
     }
     if (!fn) {
-        fprintf(stderr, LOGA "frame rate: ANativeWindow_setFrameRate is not there (API %d)\n",
+        XR_NOTICE(LOGA "frame rate: ANativeWindow_setFrameRate is not there (API %d)\n",
                 api);
         return;
     }
     /* ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE = 1 */
     r = fn((ANativeWindow *)window, 60.0f, 1);
-    fprintf(stderr, LOGA "frame rate: 60 fps, fixed source, asked for on the %s surface"
+    XR_NOTICE(LOGA "frame rate: 60 fps, fixed source, asked for on the %s surface"
             " (API %d): %s (%d)\n", why, api, r == 0 ? "ok" : "refused", (int)r);
 }
 
@@ -137,11 +139,11 @@ static int ph_load(void)
     s_ph.state = -1;
     api = android_get_device_api_level();
     if (env_off("RECOMP_ANDROID_ADPF")) {
-        fprintf(stderr, LOGA "ADPF: off (RECOMP_ANDROID_ADPF=0)\n");
+        XR_NOTICE(LOGA "ADPF: off (RECOMP_ANDROID_ADPF=0)\n");
         return 0;
     }
     if (api < 33 || !libandroid()) {
-        fprintf(stderr, LOGA "ADPF: not on this system (API %d, needs 33)\n", api);
+        XR_NOTICE(LOGA "ADPF: not on this system (API %d, needs 33)\n", api);
         return 0;
     }
     get = (ph_get_manager_fn)dlsym(libandroid(), "APerformanceHint_getManager");
@@ -150,16 +152,22 @@ static int ph_load(void)
     s_ph.report = (ph_report_fn)dlsym(libandroid(), "APerformanceHint_reportActualWorkDuration");
     s_ph.close = (ph_close_fn)dlsym(libandroid(), "APerformanceHint_closeSession");
     if (!get || !s_ph.create || !s_ph.report || !s_ph.close) {
-        fprintf(stderr, LOGA "ADPF: APerformanceHint is missing from libandroid (API %d)\n", api);
+        XR_NOTICE(LOGA "ADPF: APerformanceHint is missing from libandroid (API %d)\n", api);
         return 0;
+    }
+    {
+        const char *e = getenv("RECOMP_ANDROID_ADPF_TARGET_MS");
+        double ms = e ? atof(e) : 0.0;
+        if (ms >= 1.0 && ms <= 100.0)
+            s_target_ns = (int64_t)(ms * 1e6);
     }
     s_ph.mgr = get();
     if (!s_ph.mgr) {
-        fprintf(stderr, LOGA "ADPF: no performance hint manager (API %d): the device"
+        XR_NOTICE(LOGA "ADPF: no performance hint manager (API %d): the device"
                 " does not support it\n", api);
         return 0;
     }
-    fprintf(stderr, LOGA "ADPF: performance hint manager ok (API %d, preferred update"
+    XR_NOTICE(LOGA "ADPF: performance hint manager ok (API %d, preferred update"
             " every %.1f ms)\n", api, rate ? (double)rate(s_ph.mgr) / 1e6 : -1.0);
     s_ph.state = 1;
     return 1;
@@ -224,19 +232,20 @@ void xbox_AndroidPerfFrame(void)
             h->session = s_ph.create(s_ph.mgr, &tid, 1, TARGET_NS);
             if (!h->session) {
                 h->failed = 1;
-                fprintf(stderr, LOGA "ADPF: no session for %s (tid %d)\n", k_roles[i], (int)tid);
+                XR_NOTICE(LOGA "ADPF: no session for %s (tid %d): the system refused it (no"
+                          " ADPF support in this device's power HAL?)\n", k_roles[i], (int)tid);
                 continue;
             }
             h->session_tid = tid;
             h->last_cpu = clock_ns(h->clock, &ok);
-            fprintf(stderr, LOGA "ADPF: session for %s (tid %d), target %.2f ms: ok\n",
+            XR_NOTICE(LOGA "ADPF: session for %s (tid %d), target %.2f ms: ok\n",
                     k_roles[i], (int)tid, (double)TARGET_NS / 1e6);
             continue;
         }
         cpu = clock_ns(h->clock, &ok);
         if (!ok) {
             /* The thread is gone. */
-            fprintf(stderr, LOGA "ADPF: %s (tid %d) ended; its session is closed\n",
+            XR_NOTICE(LOGA "ADPF: %s (tid %d) ended; its session is closed\n",
                     k_roles[i], (int)tid);
             close_slot(h);
             h->failed = 1;
@@ -250,7 +259,7 @@ void xbox_AndroidPerfFrame(void)
             if (r != 0) {
                 static int said;
                 if (!said++)
-                    fprintf(stderr, LOGA "ADPF: report for %s refused (%d)\n", k_roles[i], r);
+                    XR_NOTICE(LOGA "ADPF: report for %s refused (%d)\n", k_roles[i], r);
             }
         }
         h->last_cpu = cpu;
@@ -274,7 +283,7 @@ void xbox_AndroidPerfClose(void)
             n++;
         close_slot(&s_hot[i]);
     }
-    fprintf(stderr, LOGA "ADPF: %d session%s closed\n", n, n == 1 ? "" : "s");
+    XR_NOTICE(LOGA "ADPF: %d session%s closed\n", n, n == 1 ? "" : "s");
 }
 
 #else
