@@ -46,7 +46,7 @@ struct ArtRect {
  * (the title's white and black ones, or L1 / R1 / LB; the original Xbox's
  * own sheet has the L and R triggers where they are drawn). */
 enum { AP_B, AP_A, AP_X, AP_Y, AP_LB, AP_RB, AP_COUNT };
-#define AP_SETS 10             /* the glyph sets of pad_glyphs.h */
+#define AP_SETS 15             /* the glyph sets of pad_glyphs.h (XBOX_GLYPH_SET_COUNT) */
 
 /* 1 the pictures are ready (or in use), -1 there are none (nothing named,
  * another file, off), 0 still being made. */

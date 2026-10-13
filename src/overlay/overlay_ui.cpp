@@ -1318,14 +1318,37 @@ static int pin_count(const Row *r, int n)
 
 static bool pad_hints();
 
+/* The button that does the title's A (0, select), B (1, back), X (2) or Y (3,
+ * reset) as the pad's hints name it: the same table as the glyphs in the
+ * footer (pad_glyphs.h), so the Nintendo face layout, which swaps A with B and
+ * X with Y here as in the game, is followed by the words too. On the keyboard
+ * the overlay's own keys. `cap`: the first letter capital (a sentence's start). */
+static const char *act_name(int action, bool cap = false)
+{
+    static char ring[4][40];
+    static unsigned n;
+    static const char *const keys[4] = { "Enter", "Esc", "", "Del" };
+    const char *w = pad_hints() ? xbox_GlyphButtonName(xbox_InputGlyphSet(), action) : keys[action & 3];
+    char *b;
+
+    if (!cap)
+        return w;
+    b = ring[n++ & 3];
+    snprintf(b, sizeof ring[0], "%s", w);
+    if (b[0] >= 'a' && b[0] <= 'z')
+        b[0] = (char)(b[0] - 32);
+    return b;
+}
+
 static const char *confirm_text(int action)
 {
-    const bool pad = pad_hints();
-    if (action >= A_CHEAT0 && action <= A_CHEAT3)
-        return pad ? "Press A again to switch it on, B to cancel" : "Press Enter again to switch it on, Esc to cancel";
-    return action == A_QUIT
-        ? (pad ? "Press A again to quit, B to cancel" : "Press Enter again to quit, Esc to cancel")
-        : (pad ? "Press A again to restart, B to cancel" : "Press Enter again to restart, Esc to cancel");
+    static char ring[4][160];
+    static unsigned n;
+    char *b = ring[n++ & 3];
+    const char *what = action >= A_CHEAT0 && action <= A_CHEAT3 ? "switch it on" : action == A_QUIT ? "quit" : "restart";
+
+    snprintf(b, sizeof ring[0], "Press %s again to %s, %s to cancel", act_name(0), what, act_name(1));
+    return b;
 }
 
 static void quit_now();
@@ -3568,9 +3591,11 @@ static void build_browser(float fs, ImDrawList *dl)
         dl->PushClipRect(ImVec2(p.x, p.y), ImVec2(p.x + avail.x, p.y + footer), true);
         dl->AddText(ImGui::GetFont(), LY.hint, ImVec2(p.x, p.y + 0.012f * LY.H), col(T->hint), note, nullptr, wrap_w);
         dl->PopClipRect();
-        foot_set(pad_hints()
-            ? "D-pad  select      A  open / choose      B  back"
-            : "Arrows  select      Enter  open / choose      Esc  back");
+        static char keys[160];
+        snprintf(keys, sizeof keys, pad_hints() ? "D-pad  select      %s  open / choose      %s  back"
+                                                : "Arrows  select      %s  open / choose      %s  back",
+                 act_name(0), act_name(1));
+        foot_set(keys);
     }
 }
 
@@ -3783,11 +3808,11 @@ static void build_pages_inner()
             snprintf(hint, sizeof hint, "Your own music (mp3, flac, ogg, wav) for the game's music menu."
                      " Pick a folder of songs, or a folder of folders for one soundtrack each. On Android,"
                      " copy music folders into Android/data/<this app>/files/Music (the app can read"
-                     " only its own folder), then press A and choose \"This app's Music folder\".");
+                     " only its own folder), then press %s and choose \"This app's Music folder\".", act_name(0));
 #else
             snprintf(hint, sizeof hint, "Your own music (mp3, flac, ogg, wav) for the game's music menu."
                      " Pick a folder of songs, or a folder of folders for one soundtrack each."
-                     " A opens the folder list.");
+                     " %s opens the folder list.", act_name(0, true));
 #endif
     } else if (rows[sel].kind == R_ACTION
                && (rows[sel].action == A_REPORT || rows[sel].action == A_REPORT_SHOT)) {
@@ -3902,9 +3927,13 @@ static void build_pages_inner()
                     hint, nullptr, hw);
         dl->PopClipRect();
     }
-    foot_set(pad_hints()
-        ? "D-pad  select / change      A  toggle      Y  default      B  close"
-        : "Arrows  select / change      Enter  toggle      Del  default      Esc  close");
+    {
+        static char keys[200];
+        snprintf(keys, sizeof keys, pad_hints() ? "D-pad  select / change      %s  toggle      %s  default      %s  close"
+                                                : "Arrows  select / change      %s  toggle      %s  default      %s  close",
+                 act_name(0), act_name(3), act_name(1));
+        foot_set(keys);
+    }
     foot_prompts();
     draw_footer(dl);
     ImGui::End();

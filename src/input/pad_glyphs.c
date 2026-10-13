@@ -17,7 +17,9 @@ static const char *const k_set[XBOX_GLYPH_SET_COUNT] = {
     "xbox (the title's own)", "playstation", "nintendo (by position)",
     "nintendo (by letter)", "steam", "xbox modern (LB RB LT RT)",
     "positional", "positional (read by letter)", "playstation 5 (DualSense)",
-    "keyboard"
+    "keyboard", "xbox (read by letter)", "playstation (read by letter)",
+    "playstation 5 (read by letter)", "steam (read by letter)",
+    "xbox modern (read by letter)"
 };
 
 static int ci_has(const char *s, const char *sub)
@@ -77,24 +79,27 @@ xbox_pad_family xbox_PadFamilyFromIds(xbox_pad_family by_type, unsigned vendor,
     return XBOX_PAD_FAMILY_XBOX;
 }
 
+/* The table of what each set draws, and why, is in pad_glyphs.h. */
 xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family,
                                     int label_mapped, int face_nintendo)
 {
     int nintendo_pad = family == XBOX_PAD_FAMILY_NINTENDO;
-    /* The title's A is the button printed A. */
+    /* The title's A is on the right-hand button when the pad is read by
+     * letter: SDL maps a Nintendo pad by letter, and the Nintendo face layout
+     * swaps it back (or, on any other pad, away from the bottom one). */
     int by_letter = ((nintendo_pad && label_mapped) ? 1 : 0) ^ (face_nintendo ? 1 : 0);
 
     switch (mode) {
     case XBOX_GLYPHS_XBOX:
-        return XBOX_GLYPH_SET_XBOX;
+        return by_letter ? XBOX_GLYPH_SET_XBOX_SWAPPED : XBOX_GLYPH_SET_XBOX;
     case XBOX_GLYPHS_XBOX_MODERN:
-        return XBOX_GLYPH_SET_XBOX_MODERN;
+        return by_letter ? XBOX_GLYPH_SET_XBOX_MODERN_SWAPPED : XBOX_GLYPH_SET_XBOX_MODERN;
     case XBOX_GLYPHS_PLAYSTATION:
-        return XBOX_GLYPH_SET_PLAYSTATION;
+        return by_letter ? XBOX_GLYPH_SET_PLAYSTATION_SWAPPED : XBOX_GLYPH_SET_PLAYSTATION;
     case XBOX_GLYPHS_PLAYSTATION5:
-        return XBOX_GLYPH_SET_PLAYSTATION5;
+        return by_letter ? XBOX_GLYPH_SET_PLAYSTATION5_SWAPPED : XBOX_GLYPH_SET_PLAYSTATION5;
     case XBOX_GLYPHS_STEAM:
-        return XBOX_GLYPH_SET_STEAM;
+        return by_letter ? XBOX_GLYPH_SET_STEAM_SWAPPED : XBOX_GLYPH_SET_STEAM;
     case XBOX_GLYPHS_KEYBOARD:
         return XBOX_GLYPH_SET_KEYBOARD;
     case XBOX_GLYPHS_POSITIONAL:
@@ -106,11 +111,11 @@ xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family
     }
     switch (family) {
     case XBOX_PAD_FAMILY_PLAYSTATION:
-        return XBOX_GLYPH_SET_PLAYSTATION;
+        return by_letter ? XBOX_GLYPH_SET_PLAYSTATION_SWAPPED : XBOX_GLYPH_SET_PLAYSTATION;
     case XBOX_PAD_FAMILY_PLAYSTATION5:
-        return XBOX_GLYPH_SET_PLAYSTATION5;
+        return by_letter ? XBOX_GLYPH_SET_PLAYSTATION5_SWAPPED : XBOX_GLYPH_SET_PLAYSTATION5;
     case XBOX_PAD_FAMILY_STEAM:
-        return XBOX_GLYPH_SET_STEAM;
+        return by_letter ? XBOX_GLYPH_SET_STEAM_SWAPPED : XBOX_GLYPH_SET_STEAM;
     case XBOX_PAD_FAMILY_NINTENDO:
         return by_letter ? XBOX_GLYPH_SET_NINTENDO_LABEL : XBOX_GLYPH_SET_NINTENDO_POSITION;
     case XBOX_PAD_FAMILY_XBOX_MODERN:
@@ -122,6 +127,33 @@ xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family
     default:                        /* no pad yet */
         return face_nintendo ? XBOX_GLYPH_SET_NINTENDO_LABEL : XBOX_GLYPH_SET_XBOX;
     }
+}
+
+/* The words for what each set draws on the title's A B X Y (the table in
+ * pad_glyphs.h): one row per set, in xbox_glyph_set order. */
+static const char *const k_button_name[XBOX_GLYPH_SET_COUNT][4] = {
+    /* XBOX                 */ { "A", "B", "X", "Y" },
+    /* PLAYSTATION          */ { "Cross", "Circle", "Square", "Triangle" },
+    /* NINTENDO_POSITION    */ { "B", "A", "Y", "X" },
+    /* NINTENDO_LABEL       */ { "A", "B", "X", "Y" },
+    /* STEAM                */ { "A", "B", "X", "Y" },
+    /* XBOX_MODERN          */ { "A", "B", "X", "Y" },
+    /* POSITIONAL           */ { "bottom button", "right button", "left button", "top button" },
+    /* POSITIONAL_SWAPPED   */ { "right button", "bottom button", "top button", "left button" },
+    /* PLAYSTATION5         */ { "Cross", "Circle", "Square", "Triangle" },
+    /* KEYBOARD             */ { "Space", "Backspace", "Shift", "Ctrl" },
+    /* XBOX_SWAPPED         */ { "B", "A", "Y", "X" },
+    /* PLAYSTATION_SWAPPED  */ { "Circle", "Cross", "Triangle", "Square" },
+    /* PLAYSTATION5_SWAPPED */ { "Circle", "Cross", "Triangle", "Square" },
+    /* STEAM_SWAPPED        */ { "B", "A", "Y", "X" },
+    /* XBOX_MODERN_SWAPPED  */ { "B", "A", "Y", "X" },
+};
+
+const char *xbox_GlyphButtonName(xbox_glyph_set set, int action)
+{
+    if ((unsigned)set >= XBOX_GLYPH_SET_COUNT || (unsigned)action > 3u)
+        return "";
+    return k_button_name[set][action];
 }
 
 const char *xbox_GlyphModeName(xbox_glyph_mode m)
