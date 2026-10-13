@@ -354,7 +354,19 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        /* The title's VOICE_OFF comes in on its own thread (an MMIO write,
+         * mcpx_apu_vp_write), while the frame thread rewrites the same
+         * PAR_STATE word for every active voice each VP frame, under
+         * d->lock (voice_process: NEW_VOICE, the envelope stages). Unlocked,
+         * a clear that lands between that load and store is undone: the
+         * voice plays on to its own end, and DirectSound's StopEx-and-wait
+         * (Burnout 3's 0x0020B590, Sleep(0) until the buffer stops) spins
+         * that long on guest-main, mid-race freezes of 0.35-1.6 s (BO-138).
+         * Held here, the clear and the notification land between frames,
+         * as voice_lock's own writes do. */
+        qemu_mutex_lock(&d->lock);
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
+        qemu_mutex_unlock(&d->lock);
         if (s_mix_on) mix_trace_on_off(d, argument & NV1BA0_PIO_VOICE_OFF_HANDLE, 0);
         break;
 
