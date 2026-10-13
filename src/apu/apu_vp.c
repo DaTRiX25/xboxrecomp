@@ -45,6 +45,10 @@ static void mix_trace_on_off(MCPXAPUState *d, unsigned v, int on);
 static struct apu_bus_rt *s_bus_rt;
 static int s_bus_audition;              /* this frame: an audition clip loops */
 static unsigned s_von_serial[MCPX_HW_MAX_VOICES];
+/* A title VOICE_OFF still to be seen by the VP: 1 + the voice's VOICE_ON
+ * serial at the off, 0 once checked or turned on again (voice_off_sticky). */
+static unsigned s_off_pending[MCPX_HW_MAX_VOICES];
+static unsigned long s_off_redone;
 static uint32_t s_von_stack[MCPX_HW_MAX_VOICES][16];
 static uint8_t s_von_nstack[MCPX_HW_MAX_VOICES];
 static mcpx_apu_voice_tag_fn s_mix_tag_fn;
@@ -169,28 +173,51 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
-/* RECOMP_TRACE=dpc (kernel_prof.h): how long a title thread, or a DPC on
- * the timer thread, waits here for the frame thread's lock. */
-static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
+/* The VP's first look at a voice since the title turned it off (the walk and
+ * the idle scan, under d->lock). The hardware has no way from off back to on
+ * but VOICE_ON, so a voice found on again with no VOICE_ON since had its off
+ * undone behind the VP's back: soaks caught the ACTIVE bit back between the
+ * title's VOICE_OFF and the next pass, with every FE method under d->lock, so
+ * the store comes from outside the APU model (BO-138). The voice then played
+ * to its own end (for good, if it loops) while DirectSound's StopEx-and-wait
+ * (Burnout 3's 0x0020B590, Sleep(0) until the buffer stops) held guest-main:
+ * mid-race freezes of 0.35-1.6 s. The off stands: the bit is cleared again and
+ * the voice traps idle as it would have. The off already raised its
+ * notification. */
+static void voice_off_sticky(MCPXAPUState *d, uint16_t v)
+{
+    unsigned p;
+
+    if (v >= MCPX_HW_MAX_VOICES || !(p = s_off_pending[v]))
+        return;
+    s_off_pending[v] = 0;
+    if (p - 1 != s_von_serial[v])
+        return;
+    if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                       NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+        voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                       NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
+        s_idle_pending = 1;
+        if (++s_off_redone <= 20 || s_off_redone % 100 == 0)
+            fprintf(stderr, "[APU] voice %u: the title's VOICE_OFF was undone"
+                            " before the next VP pass; cleared again (%lu)\n",
+                    (unsigned)v, s_off_redone);
+    }
+}
+
+/* VOICE_LOCK's bitmap. The caller holds d->lock: fe_method runs under it
+ * (mcpx_apu_vp_write takes it for the title's methods, the frame thread holds
+ * it for its own). */
+static void voice_lock_held(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    if (xbox_ProfOn()) {
-        long long t0 = xbox_ProfNowUs();
-        qemu_mutex_lock(&d->lock);
-        xbox_ProfWait(XBOX_PROF_WAIT_APULOCK, xbox_ProfNowUs() - t0);
-    } else {
-        qemu_mutex_lock(&d->lock);
-    }
-
     uint64_t mask = 1ULL << (v % 64);
     if (lock) {
         d->vp.voice_locked[v / 64] |= mask;
     } else {
         d->vp.voice_locked[v / 64] &= ~mask;
     }
-
     qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
@@ -225,7 +252,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     switch (method) {
     case NV1BA0_PIO_VOICE_LOCK:
-        voice_lock(d, (uint16_t)d->regs[NV_PAPU_FECV], argument & 1);
+        voice_lock_held(d, (uint16_t)d->regs[NV_PAPU_FECV], argument & 1);
         break;
 
     case NV1BA0_PIO_SET_ANTECEDENT_VOICE:
@@ -234,9 +261,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        if (selected_handle < MCPX_HW_MAX_VOICES)
+            s_off_pending[selected_handle] = 0;
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
-        if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
+        if (!locked) voice_lock_held(d, (uint16_t)selected_handle, true);
 
         list = GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST);
         if (list != NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT) {
@@ -313,7 +342,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
 
-        if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
+        if (!locked) voice_lock_held(d, (uint16_t)selected_handle, false);
         if (selected_handle < MCPX_HW_MAX_VOICES) {
             s_von_serial[selected_handle]++;
             if ((s_mix_on || apu_bus_enabled() || apu_level_active()) && s_mix_tag_fn)
@@ -330,7 +359,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
-        if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
+        if (!locked) voice_lock_held(d, (uint16_t)selected_handle, true);
 
         uint16_t rr;
         rr = (uint16_t)voice_get_mask(d, (uint16_t)selected_handle,
@@ -349,12 +378,17 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_PAR_STATE_EFCUR,
                        NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE);
 
-        if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
+        if (!locked) voice_lock_held(d, (uint16_t)selected_handle, false);
         break;
     }
 
     case NV1BA0_PIO_VOICE_OFF:
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
+        {
+            uint16_t h = (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE);
+            if (h < MCPX_HW_MAX_VOICES)
+                s_off_pending[h] = s_von_serial[h] + 1;
+        }
         if (s_mix_on) mix_trace_on_off(d, argument & NV1BA0_PIO_VOICE_OFF_HANDLE, 0);
         break;
 
@@ -627,18 +661,30 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
     MCPXAPUState *d = (MCPXAPUState *)opaque;
     (void)size;
 
-    /* Dispatch known methods through fe_method */
-    fe_method(d, (uint32_t)addr, (uint32_t)val);
-    /* A notification raised or a voice turned off: wake the frame thread
-     * out of its pacing wait to report it (throttle, apu_core.c). Under
-     * d->lock: this write does not hold it, and a signal sent between the
-     * frame thread's last look and its wait would be lost, leaving the
-     * voice to the next EP period after all. */
-    if (d->set_irq || s_idle_pending) {
+    /* The title's methods run under d->lock, as the frame thread's own work
+     * does. They write the same voice words the frame thread rewrites every
+     * VP frame (PAR_STATE: VOICE_ON, VOICE_OFF, VOICE_PAUSE, VOICE_RELEASE;
+     * PAR_OFFSET, the list links), with a plain load and store each. Unlocked,
+     * a VOICE_OFF landing inside the frame thread's read-modify-write of
+     * PAR_STATE was undone: the voice played on to its own end, and
+     * DirectSound's StopEx-and-wait (Burnout 3's 0x0020B590, Sleep(0) until
+     * the buffer stops) held guest-main that long, mid-race freezes of
+     * 0.35-1.6 s (BO-138). Held, a method lands between frames. The frame
+     * thread drops the lock in its pacing wait and once per frame, as
+     * voice_lock's callers always needed. A notification raised or a voice
+     * turned off wakes it out of that wait to report it (throttle,
+     * apu_core.c); signalled under the lock, so it is not lost. */
+    if (xbox_ProfOn()) {
+        long long t0 = xbox_ProfNowUs();
         qemu_mutex_lock(&d->lock);
-        qemu_cond_signal(&d->cond);
-        qemu_mutex_unlock(&d->lock);
+        xbox_ProfWait(XBOX_PROF_WAIT_APULOCK, xbox_ProfNowUs() - t0);
+    } else {
+        qemu_mutex_lock(&d->lock);
     }
+    fe_method(d, (uint32_t)addr, (uint32_t)val);
+    if (d->set_irq || s_idle_pending)
+        qemu_cond_signal(&d->cond);
+    qemu_mutex_unlock(&d->lock);
 }
 
 /* ============================================================
@@ -2208,6 +2254,7 @@ int mcpx_apu_vp_idle_scan(MCPXAPUState *d)
         uint32_t h = d->regs[voice_list_regs[list].top];
         for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
             uint16_t v = (uint16_t)h;
+            voice_off_sticky(d, v);
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
                 fe_method(d, SE2FE_IDLE_VOICE, v);
@@ -2258,6 +2305,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 
+            voice_off_sticky(d, v);
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
                 /* One trap at a time: once the front end is trapped, a second
