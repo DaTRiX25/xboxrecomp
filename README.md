@@ -13,6 +13,10 @@
 
 > Turn any Xbox game binary into a native Windows executable. No emulation. No interpreter. Just raw, recompiled C.
 
+This repository is a fork of [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp),
+through [apexJCL/xboxrecomp](https://github.com/apexJCL/xboxrecomp). Its `takedawn` branch
+is the toolkit of [Takedawn](https://github.com/xenophobentx/takedawn).
+
 **[Join the sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** — the
 community hub for sp00nznet's recomp projects, where ps3recomp development
 happens in the open. Good place to ask questions, show a port you are working
@@ -501,9 +505,10 @@ licence:
 |---|---|---|
 | the MCPX APU sources in `src/apu/` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
 | `src/nv2a/nv2a_regs.h` | LGPL-2.1-or-later | espes; Jannik Vogel |
+| `src/nv2a/nv2a_core.c`, `src/nv2a/nv2a_state.h` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
 | everything else | MIT | sp00nz and contributors |
 
-The APU and the NV2A register definitions were extracted from
+The APU, the NV2A register definitions and the NV2A register handlers come from
 [xemu](https://github.com/xemu-project/xemu) and are that project's work, not
 ours. LGPL-2.1 expressly permits linking them from MIT or proprietary code, so
 a recompiled game is unaffected; what it asks is that the notices stay, the

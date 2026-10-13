@@ -93,12 +93,12 @@ extern "C" {
     X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA (a host using recomp_save_dir: the whole save root, instead of the per-user directory)") \
     X(SAVE_BACKUPS,      CONFIG, "RECOMP_SAVE_BACKUPS",      NULL, "save backups kept in <save dir>/backup, one per start that found the saves changed (recomp_save_backup; default 5, 0 none)") \
     X(HANG_WATCHDOG,     CONFIG, "RECOMP_HANG_WATCHDOG",     NULL, "seconds without a flip before a hang report in <save dir>/crash (default 15, 0 off; 60 before the first flip)") \
-    X(MMIO_DIRECT,       CONFIG, "RECOMP_MMIO_DIRECT",       NULL, "constant-address device registers by call, not fault (BO-72); default on, 0: every access traps") \
+    X(MMIO_DIRECT,       CONFIG, "RECOMP_MMIO_DIRECT",       NULL, "constant-address device registers by call, not fault; default on, 0: every access traps") \
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt") \
     X(VBLANK_SYNC,       CONFIG, "RECOMP_VBLANK_SYNC",       NULL, "=display: the emulated vblank follows the display's refresh (reported by the present path) when within 5% of 60 Hz; default: its own 60.000 Hz timer") \
     X(PRESENT_DRAWABLES, CONFIG, "RECOMP_PRESENT_DRAWABLES", NULL, "Metal: CAMetalLayer maximumDrawableCount, 2 or 3 (default 2)") \
-    X(PRESENT_TIMING,    CONFIG, "RECOMP_PRESENT_TIMING",    NULL, "display.present_timing: legacy (present when ready; default) or auto (BO-115: each frame aimed at one refresh; the vblank locked to a fixed-rate display, timed presents under variable refresh); lock, timed force one (Metal)") \
+    X(PRESENT_TIMING,    CONFIG, "RECOMP_PRESENT_TIMING",    NULL, "display.present_timing: legacy (present when ready; default) or auto (each frame aimed at one refresh; the vblank locked to a fixed-rate display, timed presents under variable refresh); lock, timed force one (Metal)") \
     X(PRESENT_PHASE,     CONFIG, "RECOMP_PRESENT_PHASE",     NULL, "present timing, a locked display: ms the emulated vblank sits before a display refresh (default 5)") \
     X(PRESENT_LEAD,      CONFIG, "RECOMP_PRESENT_LEAD",      NULL, "present timing, a variable-refresh display: ms from the emulated vblank to the frame's present time (default 12)") \
     X(PRESENT_DEPTH,     CONFIG, "RECOMP_PRESENT_DEPTH",     NULL, "present timing, a locked display: refreshes from the vblank's refresh to the frame's, 0-3 (default 1; raised by itself when frames slip)") \
@@ -191,7 +191,7 @@ extern "C" {
     X(APU_TRACE,         TRACE, "apu",             "RECOMP_APU_TRACE",         "APU register and frame trace; [APU-IRQ] line every 5 s") \
     X(AUDIO_HOST,        TRACE, "audio_host",      NULL,                       "host audio playback vs wall clock; [AUDIO-HOST] starve lines (on with apu)") \
     X(AUDIO_CHANNELS,    TRACE, "audio_channels",  NULL,                       "level of every APU mixbin and output channel, once a second: [AUDIO-CH]") \
-    X(MIX_TRACE,         TRACE, "mix",             "RECOMP_MIX_TRACE",         "=file: per-voice mix study (BO-114): who turned each voice on, its bins, volumes, speaker shares and levels, once a second; output peaks before the clamp") \
+    X(MIX_TRACE,         TRACE, "mix",             "RECOMP_MIX_TRACE",         "=file: per-voice mix study: who turned each voice on, its bins, volumes, speaker shares and levels, once a second; output peaks before the clamp") \
     X(APU_RING,          TRACE, "apu_ring",        NULL,                       "looping APU buffers refilled by the title: [APU-RING] lead and stale-lap replays") \
     X(MMIO_TRACE,        TRACE, "mmio",            NULL,                       "trapped vs direct device-register accesses by device, register and host PC; [MMIO] block every 10 s") \
     X(USB_TRACE,         TRACE, "usb",             "RECOMP_USB_TRACE",         "OHCI trace") \
@@ -263,7 +263,7 @@ extern "C" {
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
     X(WINDOW_DISPLAY,    DEBUG, "window_display",  NULL,                       "=n: open the window centred on display n (0 = main)") \
     X(WINDOW_FLOAT,      DEBUG, "window_float",    NULL,                       "1: the window stays above other windows (macOS; a measured run needs it visible: an occluded window reports no on-glass times)") \
-    X(GLASS_MEASURE,     DEBUG, "glass_measure",   NULL,                       "=0: the Metal presenter installs no on-glass handler with display.present_timing = legacy (A/B of the measurement's own cost, BO-125); the graph's on-glass line then says not available") \
+    X(GLASS_MEASURE,     DEBUG, "glass_measure",   NULL,                       "=0: the Metal presenter installs no on-glass handler with display.present_timing = legacy (A/B of the measurement's own cost); the graph's on-glass line then says not available") \
     X(EARLY_COMMIT,      DEBUG, "early_commit",    NULL,                       "=0: submit a frame's GPU work after the vblank hold, not at FLIP_STALL (A/B)") \
     X(METAL_FRAMES,      DEBUG, "metal_frames",    NULL,                       "=1: Metal waits for each frame at its flip; default 2 frames in flight") \
     X(METAL_PRESENT,     DEBUG, "metal_present",   NULL,                       "=layer|readback: Metal window present, CAMetalLayer from GPU slots (default) or the old texture readback") \

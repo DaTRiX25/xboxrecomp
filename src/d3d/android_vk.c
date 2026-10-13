@@ -64,7 +64,7 @@ static void turnip_defaults(void)
     if (strncmp(model, "Adreno6", 7))
         return;
     setenv("TU_DEBUG", "nobin,noubwc", 0);
-    fprintf(stderr, "[vulkan] %s: TU_DEBUG=nobin,noubwc (no binning pass, no UBWC; BO-128)\n", model);
+    fprintf(stderr, "[vulkan] %s: TU_DEBUG=nobin,noubwc (no binning pass, no UBWC)\n", model);
 }
 
 static void open_loader(void)

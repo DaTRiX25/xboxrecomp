@@ -127,10 +127,14 @@ Every Xbox game has its own asset formats. If you reverse-engineer a texture for
 - Comments: explain *why*, not *what*. The code should be readable on its own.
 - Keep files focused. Each kernel source file covers one subsystem.
 
+Ids like BO-116 in docs, comments and commit messages are the Takedawn
+project's internal task numbers. They stay so that the history, the docs and
+the code agree.
+
 ## Testing
 
 The Python side of the toolchain has a test suite. Run it before opening a PR
-(on macOS or Linux, run [setup](#macos-and-linux) once first):
+(on macOS or Linux, run [setup](#macos) once first):
 
 ```
 py -3 -m pytest tools/       # unit tests
