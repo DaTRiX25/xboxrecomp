@@ -227,6 +227,7 @@ enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_SHADERS,                                          /* the Graphics page's shader build */
               A_MIXER,                                            /* the Mixer page (overlay_mixer.inc) */
               A_UPDATE_CHECK, A_UPDATE_OPEN,                      /* Check for updates (xbox_update.h) */
+              A_STEAM_ART,                                        /* xbox_OverlaySetSteamArt */
               A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_RESTORE, A_SAVE_CANCEL,  /* xbox_OverlaySetSaveIO */
               A_CHEAT0, A_CHEAT1, A_CHEAT2, A_CHEAT3,              /* xbox_OverlaySetCheats */
               A_CHEAT_KEEP, A_CHEAT_DISCARD,
@@ -702,6 +703,47 @@ static void update_open_page()
         snprintf(s_up_open_err, sizeof s_up_open_err, "Could not open the page: %.120s", SDL_GetError());
 }
 
+/* ── Add Steam library art (xbox_OverlaySetSteamArt) ───────────────── */
+
+/* The host's program runs on one thread when the row is pressed (it starts a
+ * process and waits for it); the overlay shows its line from the next frame. */
+static int (*s_sa_run)(char *line, unsigned n);
+static std::atomic<int> s_sa_state;      /* 0 nothing asked, 1 running, 2 answered */
+static char s_sa_line[240];              /* written by the thread before s_sa_state is 2 */
+
+void xbox_OverlaySetSteamArt(int (*run)(char *line, unsigned n))
+{
+    s_sa_run = run;
+}
+
+static int steam_art_thread(void *)
+{
+    s_sa_line[0] = 0;
+    s_sa_run(s_sa_line, sizeof s_sa_line);
+    fprintf(stderr, LOGP "steam art: %s\n", s_sa_line);
+    s_sa_state.store(2, std::memory_order_release);
+    return 0;
+}
+
+static void steam_art_start()
+{
+    int expect = 0;
+    if (!s_sa_run)
+        return;
+    if (!s_sa_state.compare_exchange_strong(expect, 1)) {
+        expect = 2;
+        if (!s_sa_state.compare_exchange_strong(expect, 1))
+            return;
+    }
+    SDL_Thread *t = SDL_CreateThread(steam_art_thread, "steam art", NULL);
+    if (!t) {
+        snprintf(s_sa_line, sizeof s_sa_line, "Could not start the program.");
+        s_sa_state.store(2, std::memory_order_release);
+        return;
+    }
+    SDL_DetachThread(t);
+}
+
 /* ── the shader pre-build (xbox_shader_build.h) ────────────────────── */
 
 static const xbox_shader_build_ops *s_sb;
@@ -936,6 +978,12 @@ static int page_rows(int page, Row *r)
                 for (int k = 0; k < s_up_res.note_count; k++)
                     INFO(s_up_res.notes[k]);
             }
+        }
+        if (s_sa_run) {
+            int st = s_sa_state.load(std::memory_order_acquire);
+            ACT(A_STEAM_ART, st == 1 ? "Adding Steam library art..." : "Add Steam library art");
+            if (st == 2)
+                INFO(s_sa_line);
         }
         SET(XS_ADVANCED_PERF);
 #if defined(__APPLE__)
@@ -1334,6 +1382,10 @@ static void activate(const Row &r)
     }
     if (r.kind == R_ACTION && r.action == A_UPDATE_OPEN) {
         update_open_page();
+        return;
+    }
+    if (r.kind == R_ACTION && r.action == A_STEAM_ART) {
+        steam_art_start();
         return;
     }
     if (r.kind == R_ACTION && r.action >= A_SAVE_EXPORT && r.action <= A_SAVE_CANCEL) {
@@ -3662,6 +3714,9 @@ static void build_pages_inner()
                  " request sent when you press this row.", s_up_repo);
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_UPDATE_OPEN) {
         snprintf(hint, sizeof hint, "Opens %s in your web browser.", s_up_res.url);
+    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_STEAM_ART) {
+        snprintf(hint, sizeof hint, "Adds Steam's library pictures to the Takedawn shortcut you already have, made from your own"
+                 " game files. Pictures you put there yourself are kept as backup copies. Steam can stay open.");
     } else if (rows[sel].kind == R_ACTION && rows[sel].action >= A_SAVE_EXPORT
                && rows[sel].action <= A_SAVE_CANCEL) {
         const char *what =
