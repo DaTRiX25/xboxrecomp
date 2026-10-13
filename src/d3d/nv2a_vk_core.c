@@ -767,10 +767,18 @@ void nvk_image_barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspec
     vkCmdPipelineBarrier2(cb, &di);
 }
 
+/* A barrier even when the layout stays: before a transfer write or GENERAL
+ * use, and before an attachment is drawn into again in a new pass. Two
+ * render passes on the same colour or depth image are not ordered by
+ * themselves; Turnip's sysmem mode (TU_DEBUG=sysmem) then lets the next
+ * pass's load or clear race the last one's stores (the cube-map faces share
+ * one depth buffer: car reflections that come and go on Adreno). */
 void nvk_image_to(VkCommandBuffer cb, struct nvk_image *im, VkImageLayout to)
 {
     if (im->layout == to && to != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-            && to != VK_IMAGE_LAYOUT_GENERAL)
+            && to != VK_IMAGE_LAYOUT_GENERAL
+            && to != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+            && to != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
         return;
     nvk_image_barrier(cb, im->img, im->aspect, im->layout, to);
     im->layout = to;
