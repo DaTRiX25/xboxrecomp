@@ -291,6 +291,17 @@ static int fail_cancelled(inst *in)
                     "install goes on from there.");
 }
 
+/* "3" for 3 GB, "2.5" for 2.5 GB, "25" for 25 GB: bytes as the words say them. */
+static const char *gb_text(uint64_t bytes, char out[16])
+{
+    double gb = (double)bytes / 1e9;
+
+    snprintf(out, 16, gb < 10 ? "%.1f" : "%.0f", gb);
+    if (gb < 10 && strlen(out) > 2 && !strcmp(out + strlen(out) - 2, ".0"))
+        out[strlen(out) - 2] = '\0';
+    return out;
+}
+
 /* A write that failed, by errno. */
 static int fail_write(inst *in, const char *path)
 {
@@ -851,6 +862,7 @@ static int run(inst *in)
     char path[PATH_N];
     uint8_t *have;
     uint64_t present = 0, avail = 0;
+    char a[16], b[16], c[16];
     unsigned i;
     int rc;
 
@@ -907,10 +919,10 @@ static int run(inst *in)
     }
     if (rc == XR_INSTALL_OK && o->free_needed > present && p_free(o->dest, &avail)
         && avail < o->free_needed - present)
-        rc = set_fail(in, XR_INSTALL_DISK_FULL, "Not enough free space in %s: the game's data "
-                      "needs %.1f GB more, and %.1f GB is free. Free some space or choose another "
-                      "folder.", o->dest, (double)(o->free_needed - present) / 1e9,
-                      (double)avail / 1e9);
+        rc = set_fail(in, XR_INSTALL_DISK_FULL, "Not enough free space in %s: Takedawn needs "
+                      "%s GB free (the game uses %s GB), and %s GB is free. Free up space on "
+                      "this disk.", o->dest, gb_text(o->free_needed - present, a),
+                      gb_text(in->total, b), gb_text(avail, c));
 
     for (i = 0; i < m->count && rc == XR_INSTALL_OK; i++) {
         const xr_manifest_file *mf = &m->files[i];

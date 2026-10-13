@@ -583,6 +583,10 @@ static void test_install(fx_disc *d)
 
     /* No room. */
     CHECK(install(ROOT "/disc.iso", ROOT "/g", &m, &r, 0, (uint64_t)1 << 60) == XR_INSTALL_DISK_FULL);
+    /* The words give the two numbers apart: what must be free, and what the game uses. */
+    CHECK(strstr(r.message, "needs ") && strstr(r.message, " GB free (the game uses ")
+          && strstr(r.message, " GB is free. Free up space on this disk.")
+          && !strstr(r.message, " more,") && !strstr(r.message, "another folder"));
     CHECK(!exists(ROOT "/g/.complete") && !exists(ROOT "/g/Game Files/default.xbe"));
 #if !defined(_WIN32)
     /* A folder that cannot be written (not as root: it can write anywhere). */
