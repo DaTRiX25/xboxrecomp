@@ -43,6 +43,9 @@
 
 #include <SDL.h>
 #include <SDL_vulkan.h>
+#if defined(__ANDROID__)
+#include <SDL_syswm.h>
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #include <SDL_syswm.h>
@@ -447,6 +450,18 @@ static VkSurfaceKHR make_surface(VkInstance inst, void *ctx)
         XR_ERROR( LOGP "SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
         return VK_NULL_HANDLE;
     }
+#if defined(__ANDROID__)
+    {
+        /* 60 fps asked of the system for this surface (android_perf.c): the
+         * first one and each one after the app comes back. */
+        extern void xbox_AndroidSetFrameRate(void *window, const char *why);
+        static int n;
+        SDL_SysWMinfo wi;
+        SDL_VERSION(&wi.version);
+        if (SDL_GetWindowWMInfo((SDL_Window *)ctx, &wi) && wi.subsystem == SDL_SYSWM_ANDROID)
+            xbox_AndroidSetFrameRate(wi.info.android.window, n++ ? "new" : "first");
+    }
+#endif
     return s;
 }
 

@@ -4136,10 +4136,38 @@ static void pcache_save(void)
     free(data);
 }
 
+static int s_pc_stop;                    /* the way out: pre-warm stops (atomic) */
+static int s_quiesced;                   /* nvk_backend_quiesce saved the cache */
+
 static void at_exit_save(void)
 {
-    if (C && !s_failed)
+    if (C && !s_failed && !s_quiesced)
         pcache_save();
+}
+
+/* The way out (nv2a_vk_core.h): the pre-warm thread stops at its next
+ * pipeline and the pipeline cache is written now, while the device is
+ * whole; atexit then has nothing more to do with it. */
+int nvk_backend_quiesce(int timeout_ms)
+{
+    int waited = 0;
+    __atomic_store_n(&s_pc_stop, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&s_pc_warming, __ATOMIC_ACQUIRE) && waited < timeout_ms) {
+        usleep(5000);
+        waited += 5;
+    }
+    if (__atomic_load_n(&s_pc_warming, __ATOMIC_ACQUIRE)) {
+        XR_NOTICE(LOGP "teardown: the pipeline pre-warm still runs after %d ms\n", waited);
+        return 0;
+    }
+    if (C && !s_failed && !s_quiesced) {
+        uint64_t t0 = now_ns();
+        pcache_save();
+        XR_NOTICE(LOGP "teardown: pipeline cache written (%.1f ms)\n",
+                (double)(now_ns() - t0) / 1e6);
+    }
+    s_quiesced = 1;
+    return 1;
 }
 
 static int s_pc_save;                    /* the pre-warm thread asks for a save (atomic) */
@@ -4279,10 +4307,10 @@ static void *pc_prewarm(void *arg)
                 nneed += 2;
             }
         }
-        for (pass = 0; parsed && pass < 3; pass++) {
+        for (pass = 0; parsed && pass < 3 && !__atomic_load_n(&s_pc_stop, __ATOMIC_ACQUIRE); pass++) {
             if (pass == 2)              /* the pipelines are in: nobody waits now */
                 __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
-            for (i = 0; i < n; i++) {
+            for (i = 0; i < n && !__atomic_load_n(&s_pc_stop, __ATOMIC_ACQUIRE); i++) {
                 const void *d;
                 uint32_t type, len;
                 size_t q;
@@ -4388,7 +4416,8 @@ static void *pc_prewarm(void *arg)
                 (unsigned long long)nb[PC_VS], (unsigned long long)nb[PC_FS],
                 (unsigned long long)nb[PC_PSO], listed[0], listed[1], listed[2],
                 (double)(now_ns() - t0) / 1e6, (double)(now_ns() - s_t0_ns) / 1e9);
-    } while (__atomic_load_n(&s_pc_rescan, __ATOMIC_ACQUIRE));
+    } while (__atomic_load_n(&s_pc_rescan, __ATOMIC_ACQUIRE)
+             && !__atomic_load_n(&s_pc_stop, __ATOMIC_ACQUIRE));
     free(parsed);
     __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
     nv2a_pcache_stat_warming(0);

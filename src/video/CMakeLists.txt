@@ -39,6 +39,8 @@ else()
             target_compile_options(xbox_video PRIVATE -include ${XR_ANDROID_VK_H})
             # The display's refresh times from the Choreographer.
             target_sources(xbox_video PRIVATE android_vsync.c)
+            # The 60 fps frame rate and the ADPF performance hints.
+            target_sources(xbox_video PRIVATE android_perf.c)
             target_link_libraries(xbox_video PUBLIC android)
         endif()
     endif()
