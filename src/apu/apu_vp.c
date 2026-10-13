@@ -45,6 +45,10 @@ static void mix_trace_on_off(MCPXAPUState *d, unsigned v, int on);
 static struct apu_bus_rt *s_bus_rt;
 static int s_bus_audition;              /* this frame: an audition clip loops */
 static unsigned s_von_serial[MCPX_HW_MAX_VOICES];
+/* A title VOICE_OFF still to be seen by the VP: 1 + the voice's VOICE_ON
+ * serial at the off, 0 once checked or turned on again (voice_off_sticky). */
+static unsigned s_off_pending[MCPX_HW_MAX_VOICES];
+static unsigned long s_off_redone;
 static uint32_t s_von_stack[MCPX_HW_MAX_VOICES][16];
 static uint8_t s_von_nstack[MCPX_HW_MAX_VOICES];
 static mcpx_apu_voice_tag_fn s_mix_tag_fn;
@@ -169,6 +173,38 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/* The VP's first look at a voice since the title turned it off (the walk and
+ * the idle scan, under d->lock). The hardware has no way from off back to on
+ * but VOICE_ON, so a voice found on again with no VOICE_ON since had its off
+ * undone behind the VP's back: soaks caught the ACTIVE bit back between the
+ * title's VOICE_OFF and the next pass, with every FE method under d->lock, so
+ * the store comes from outside the APU model (BO-138). The voice then played
+ * to its own end (for good, if it loops) while DirectSound's StopEx-and-wait
+ * (Burnout 3's 0x0020B590, Sleep(0) until the buffer stops) held guest-main:
+ * mid-race freezes of 0.35-1.6 s. The off stands: the bit is cleared again and
+ * the voice traps idle as it would have. The off already raised its
+ * notification. */
+static void voice_off_sticky(MCPXAPUState *d, uint16_t v)
+{
+    unsigned p;
+
+    if (v >= MCPX_HW_MAX_VOICES || !(p = s_off_pending[v]))
+        return;
+    s_off_pending[v] = 0;
+    if (p - 1 != s_von_serial[v])
+        return;
+    if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                       NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+        voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                       NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
+        s_idle_pending = 1;
+        if (++s_off_redone <= 20 || s_off_redone % 100 == 0)
+            fprintf(stderr, "[APU] voice %u: the title's VOICE_OFF was undone"
+                            " before the next VP pass; cleared again (%lu)\n",
+                    (unsigned)v, s_off_redone);
+    }
+}
+
 /* VOICE_LOCK's bitmap. The caller holds d->lock: fe_method runs under it
  * (mcpx_apu_vp_write takes it for the title's methods, the frame thread holds
  * it for its own). */
@@ -225,6 +261,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        if (selected_handle < MCPX_HW_MAX_VOICES)
+            s_off_pending[selected_handle] = 0;
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock_held(d, (uint16_t)selected_handle, true);
@@ -346,6 +384,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_OFF:
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
+        {
+            uint16_t h = (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE);
+            if (h < MCPX_HW_MAX_VOICES)
+                s_off_pending[h] = s_von_serial[h] + 1;
+        }
         if (s_mix_on) mix_trace_on_off(d, argument & NV1BA0_PIO_VOICE_OFF_HANDLE, 0);
         break;
 
@@ -2211,6 +2254,7 @@ int mcpx_apu_vp_idle_scan(MCPXAPUState *d)
         uint32_t h = d->regs[voice_list_regs[list].top];
         for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
             uint16_t v = (uint16_t)h;
+            voice_off_sticky(d, v);
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
                 fe_method(d, SE2FE_IDLE_VOICE, v);
@@ -2261,6 +2305,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 
+            voice_off_sticky(d, v);
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
                 /* One trap at a time: once the front end is trapped, a second
