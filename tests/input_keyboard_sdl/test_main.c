@@ -8,6 +8,7 @@
  */
 #include "keyboard.h"
 #include "keyboard_sdl.h"
+#include "overlay_keys.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -182,6 +183,29 @@ static void test_play(void)
     xbox_InputKeysClear();
 }
 
+static void test_page_keys(void)
+{
+    static const struct { SDL_Keycode k; Uint16 mod; int want; const char *what; } rows[] = {
+        { SDLK_PAGEUP, 0, -1, "Page Up" },   { SDLK_PAGEDOWN, 0, +1, "Page Down" },
+        { SDLK_LEFTBRACKET, 0, -1, "[" },    { SDLK_RIGHTBRACKET, 0, +1, "]" },
+        { SDLK_q, 0, -1, "Q" },              { SDLK_e, 0, +1, "E" },
+        { SDLK_q, KMOD_LSHIFT, -1, "Shift+Q" }, { SDLK_e, KMOD_CAPS, +1, "E, caps lock" },
+        { SDLK_TAB, 0, +1, "Tab" },          { SDLK_TAB, KMOD_LSHIFT, -1, "Shift+Tab" },
+        { SDLK_TAB, KMOD_RSHIFT, -1, "right Shift+Tab" },
+        /* The system's shortcuts are not page keys. */
+        { SDLK_q, KMOD_LGUI, 0, "Cmd+Q" },   { SDLK_e, KMOD_LCTRL, 0, "Ctrl+E" },
+        { SDLK_TAB, KMOD_LALT, 0, "Alt+Tab" }, { SDLK_TAB, KMOD_LGUI, 0, "Cmd+Tab" },
+        /* Other keys are not. */
+        { SDLK_w, 0, 0, "W" },               { SDLK_RETURN, 0, 0, "Enter" },
+        { SDLK_ESCAPE, 0, 0, "Esc" },        { SDLK_SPACE, 0, 0, "Space" },
+        { SDLK_BACKSPACE, 0, 0, "Backspace" }, { SDLK_UP, 0, 0, "Up" },
+    };
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++)
+        CHECK(xbox_overlay_page_key(rows[i].k, rows[i].mod) == rows[i].want,
+              "page key %s: %d, wanted %d", rows[i].what,
+              xbox_overlay_page_key(rows[i].k, rows[i].mod), rows[i].want);
+}
+
 int main(void)
 {
     /* The dummy video driver (set by ctest) is enough for SDL_StopTextInput. */
@@ -194,6 +218,7 @@ int main(void)
     test_keycodes();
     test_events();
     test_play();
+    test_page_keys();
     SDL_Quit();
     printf("input_keyboard_sdl: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
