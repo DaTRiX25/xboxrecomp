@@ -255,6 +255,8 @@ static struct nv2a_pb_gpu s_gpu;
  * them to decide whether its mirror is still needed; both run on the NV2A ack
  * thread, which is also the thread that drives this executor. */
 static uint32_t s_inline_overflow;      /* INLINE_ARRAY dwords past NV_MAX_INLINE */
+static uint32_t s_ff_imm_batches, s_ff_imm_culled, s_ff_other_batches, s_ff_inline_batches;
+static uint32_t s_imm_flushes, s_imm_dropped;
 static uint32_t s_idx_overflow;         /* batches that lost indices past NV_MAX_INDICES */
 static int      s_idx_cut;              /* the open batch has lost some */
 static uint32_t s_idx_max;              /* largest idx_count drawn */
@@ -1995,9 +1997,10 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
  * w beside it, which is everything the rasteriser needs.
  *
  * A batch takes this path when SET_TRANSFORM_EXECUTION_MODE says PROGRAM.
- * Fixed-function mode keeps the old screen-space path: this title never sends
- * a fixed-function matrix (no SET_MODEL_VIEW/COMPOSITE_MATRIX in its stream),
- * so there is nothing to synthesise yet, and the report says if that changes.
+ * Fixed-function mode keeps the screen-space path; for immediate-mode and
+ * INLINE_ARRAY batches ff_transform first puts the positions through the
+ * composite matrix (Burnout 3's particles and glow sprites), and the report
+ * counts the fixed-function batches it leaves alone.
  *
  * RECOMP_PB_VSH=0 turns the path off, which is the A/B switch for comparing
  * dumps against the old executor.
@@ -5408,6 +5411,11 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
+    /* Fixed-function batches from the title's own vertex arrays: not
+     * transformed (ff_transform covers immediate mode and INLINE_ARRAY), so
+     * drawn as screen space. Counted for the report; none seen in Burnout 3. */
+    if ((s_vsh.mode & 3u) == 0 && !s_gpu.imm_count && !s_gpu.inline_active)
+        s_ff_other_batches++;
     if (s_gpu.idx_count > s_idx_max)
         s_idx_max = s_gpu.idx_count;
     /* ~14 lines a second at 2.8k batches a frame, each a locked write to
@@ -5570,6 +5578,9 @@ static void draw_primitive(void)
  * float and D3DCOLOR formats every inline batch actually uses; a packed
  * sub-dword attribute would need the unpadded layout.
  */
+static void ff_transform(uint32_t *base, uint32_t stride, uint32_t n,
+                         uint32_t size);
+
 static void draw_inline_array(void)
 {
     VertexAttr saved[NV_VERTEX_ATTRS];
@@ -5605,6 +5616,17 @@ static void draw_inline_array(void)
         s_gpu.idx[i] = (uint16_t)i;
     s_gpu.idx_count = count;
 
+    /* Fixed-function mode: positions through the composite matrix, as for
+     * immediate mode (ff_transform). Burnout 3 draws its glow sprites this
+     * way, one QUADS batch of float3 position, D3DCOLOR and float2 texture
+     * coordinates each. */
+    if ((s_vsh.mode & 3u) == 0 && s_gpu.attr[0].size >= 3
+            && s_gpu.attr[0].type == NV2A_VTX_FLOAT) {
+        ff_transform(&s_gpu.inline_buf[s_gpu.attr[0].offset / 4], vsize / 4,
+                     count, s_gpu.attr[0].size);
+        s_ff_inline_batches++;
+    }
+
     s_gpu.inline_active = 1;
     draw_primitive();
     s_gpu.inline_active = 0;
@@ -5612,6 +5634,90 @@ static void draw_inline_array(void)
 out:
     memcpy(s_gpu.attr, saved, sizeof saved);
     s_gpu.idx_count = 0;
+}
+
+/* Fixed-function batches (immediate mode, INLINE_ARRAY): the position
+ * through the composite matrix, to the surface pixels the pass-through path
+ * takes.
+ *
+ * The backends (and the CPU rasteriser) draw a batch in fixed-function mode
+ * as already transformed: its position is read as x, y in surface pixels and
+ * z in depth units. That holds for what the title draws in screen space, but
+ * Burnout 3 also draws its additive effects in fixed-function mode, with
+ * XDK D3D's composite matrix (in context rows 0..3) doing the transform on
+ * the GPU: the particles (sub_000367C0: sparks and the like, QUADS of
+ * SET_VERTEX_DATA4UB colour, 2F texcoord, 4F position in view space, the
+ * composite being projection times viewport) and the glow sprites (boost
+ * exhaust flames, the sun's lens flare: INLINE_ARRAY QUADS of float3 world
+ * position, D3DCOLOR, float2 texcoord, the composite the whole
+ * world-view-projection-viewport). Read as pixels, every one of those quads
+ * landed in a few pixels at the top-left corner: no sparks, no boost
+ * flames.
+ *
+ * As the transform unit does in this mode (xemu vsh-ff: the position times
+ * the composite matrix, then the divide by w): out.j = dot(pos, CMAT row j),
+ * then x, y, z over w. A screen-space batch carries a composite that leaves
+ * it where it is (identity rows, w = 1), so it is unchanged. Nothing here
+ * clips at the near plane: a vertex between the eye and the plane is still
+ * divided, which stretches its primitive towards the edge of the screen
+ * (a spark flying past the camera draws as a long streak; the GPU would
+ * end it at the plane). A vertex at or behind the eye (w <= 0) cannot be
+ * divided: a primitive of a list (points, lines, triangles, quads) with one
+ * is collapsed to a point, drawing nothing; for the other primitives the
+ * vertex is pushed out to w = epsilon. Lighting, texgen and
+ * the texture matrices are not applied: the particles use none of them, and
+ * the colour and texture coordinates go through as the title gave them. */
+
+/* Positions of one batch: `n` vertices `stride` dwords apart from `base`,
+ * `size` floats each (3: w is 1). */
+static void ff_transform(uint32_t *base, uint32_t stride, uint32_t n,
+                         uint32_t size)
+{
+    const float (*m)[4] = s_vsh.c;          /* CMAT0..3: context rows 0..3 */
+    uint32_t i, k, per = 0;
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_POINTS:    per = 1; break;
+    case NV_PRIM_LINES:     per = 2; break;
+    case NV_PRIM_TRIANGLES: per = 3; break;
+    case NV_PRIM_QUADS:     per = 4; break;
+    default:                break;
+    }
+    for (i = 0; i < n; i++) {
+        float *p = (float *)&base[i * stride];
+        float in[4] = { p[0], p[1], p[2], size >= 4 ? p[3] : 1.0f };
+        float o[4];
+        for (k = 0; k < 4; k++)
+            o[k] = in[0] * m[k][0] + in[1] * m[k][1] + in[2] * m[k][2] + in[3] * m[k][3];
+        if (!(o[3] > 1e-6f)) {
+            if (per) {
+                /* Collapse the primitive: every vertex of it to one point
+                 * off the surface. */
+                uint32_t first = i - i % per, j;
+                for (j = first; j < first + per && j < n; j++) {
+                    float *q = (float *)&base[j * stride];
+                    q[0] = -1.0e6f; q[1] = -1.0e6f; q[2] = 0.0f;
+                    if (size >= 4)
+                        q[3] = 1.0f;
+                }
+                s_ff_imm_culled++;
+                i = first + per - 1;           /* the rest of it is done */
+                continue;
+            }
+            o[3] = 1e-6f;
+        }
+        p[0] = o[0] / o[3];
+        p[1] = o[1] / o[3];
+        p[2] = o[2] / o[3];
+        if (size >= 4)
+            p[3] = 1.0f / o[3];                /* rhw, as a screen-space vertex */
+    }
+}
+
+static void imm_ff_transform(void)
+{
+    s_ff_imm_batches++;
+    ff_transform(s_gpu.inline_buf, IMM_VERTEX_DWORDS, s_gpu.imm_count, 4);
 }
 
 /* Draw the vertices immediate mode completed.
@@ -5637,6 +5743,9 @@ static void draw_immediate(void)
 
     if (s_gpu.imm_count < 3)
         return;
+
+    if ((s_vsh.mode & 3u) == 0)
+        imm_ff_transform();
 
     memcpy(saved, s_gpu.attr, sizeof saved);
     memset(s_gpu.attr, 0, sizeof s_gpu.attr);
@@ -5669,12 +5778,86 @@ static void draw_immediate(void)
  * (s_vsh.inl, kept by vsh_inline_attr for every SET_VERTEX_DATA* form) in
  * the layout draw_immediate describes. An attribute the batch never set
  * carries its standing value, as on the GPU. */
+/* The batch has filled inline_buf: draw what it holds and carry on with an
+ * empty buffer, so a long batch is drawn in pieces instead of cut short.
+ * Burnout 3 draws all its additive particles (sparks, boost flames, glows)
+ * as one immediate-mode QUADS batch of up to a few thousand vertices; with
+ * every attribute a float4 the buffer holds 1024, and everything past them
+ * was dropped without a word, the sparks among it. What is kept for the next
+ * piece is what the primitive needs to go on: nothing for a list (the piece
+ * ends on a whole primitive), the last two vertices of a strip (the piece
+ * holds an even number, so the winding stays in step), the first and the
+ * last of a fan. A line loop cannot be split (its closing line needs the
+ * first vertex); its overflow is dropped, as before, and counted. Returns 1
+ * if there is room for another vertex. */
+static int imm_flush_full(void)
+{
+    uint32_t n = s_gpu.imm_count, per = 0, keep_first = 0, keep_last = 0, i;
+
+    switch (s_gpu.prim) {
+    case NV_PRIM_POINTS:         per = 1; break;
+    case NV_PRIM_LINES:          per = 2; break;
+    case NV_PRIM_TRIANGLES:      per = 3; break;
+    case NV_PRIM_QUADS:          per = 4; break;
+    case NV_PRIM_LINE_STRIP:     keep_last = 1; break;
+    case NV_PRIM_TRIANGLE_STRIP:
+    case NV_PRIM_QUAD_STRIP:     keep_last = 2; n &= ~1u; break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:        keep_first = 1; keep_last = 1; break;
+    default:                     return 0;            /* LINE_LOOP */
+    }
+    if (per)
+        n -= n % per;
+    if (n < 3 + keep_first)
+        return 0;
+
+    {
+        uint32_t tail[3 * IMM_VERTEX_DWORDS];
+        uint32_t nt = 0;
+        uint32_t first[IMM_VERTEX_DWORDS];
+
+        if (keep_first)
+            memcpy(first, &s_gpu.inline_buf[0], sizeof first);
+        /* The kept tail of the piece, then whatever followed it. */
+        for (i = n - keep_last; i < s_gpu.imm_count && nt < 3; i++, nt++)
+            memcpy(&tail[nt * IMM_VERTEX_DWORDS],
+                   &s_gpu.inline_buf[i * IMM_VERTEX_DWORDS],
+                   IMM_VERTEX_DWORDS * 4);
+        s_gpu.imm_count = n;
+        draw_immediate();
+        s_imm_flushes++;
+
+        s_gpu.imm_count = 0;
+        if (keep_first) {
+            memcpy(&s_gpu.inline_buf[0], first, sizeof first);
+            s_gpu.imm_count = 1;
+        }
+        for (i = 0; i < nt; i++) {
+            memcpy(&s_gpu.inline_buf[s_gpu.imm_count * IMM_VERTEX_DWORDS],
+                   &tail[i * IMM_VERTEX_DWORDS], IMM_VERTEX_DWORDS * 4);
+            s_gpu.imm_count++;
+        }
+    }
+    return (s_gpu.imm_count + 1) * IMM_VERTEX_DWORDS <= NV_MAX_INLINE;
+}
+
 static void imm_emit_vertex(void)
 {
     uint32_t at = s_gpu.imm_count * IMM_VERTEX_DWORDS;
 
-    if (!s_gpu.prim || at + IMM_VERTEX_DWORDS > NV_MAX_INLINE)
+    if (!s_gpu.prim)
         return;
+    if (at + IMM_VERTEX_DWORDS > NV_MAX_INLINE) {
+        if (!imm_flush_full()) {
+            if (!s_imm_dropped++)
+                fprintf(stderr, "  [GPU] immediate-mode batch (primitive %u)"
+                        " over %u vertices: the rest is dropped\n",
+                        (unsigned)s_gpu.prim,
+                        (unsigned)(NV_MAX_INLINE / IMM_VERTEX_DWORDS));
+            return;
+        }
+        at = s_gpu.imm_count * IMM_VERTEX_DWORDS;
+    }
     memcpy(&s_gpu.inline_buf[at], s_vsh.inl, sizeof s_vsh.inl);
     s_gpu.imm_count++;
 }
@@ -6802,6 +6985,12 @@ void nv2a_pb_exec_report(void)
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
     /* Whether a title ever needs a big batch, without a probe. */
+    fprintf(stderr, "[GPU] fixed-function batches: %u immediate and %u"
+                    " INLINE_ARRAY transformed (%u primitives behind the eye"
+                    " dropped), %u others drawn as screen space; immediate"
+                    " batches split %u, dropped %u\n",
+            s_ff_imm_batches, s_ff_inline_batches, s_ff_imm_culled,
+            s_ff_other_batches, s_imm_flushes, s_imm_dropped);
     fprintf(stderr, "[GPU] index batches: max %u, %u overflowed", s_idx_max,
             s_idx_overflow);
     if (s_idx_over_ffff)
