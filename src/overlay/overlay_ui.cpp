@@ -3716,7 +3716,7 @@ static void build_pages_inner()
         snprintf(hint, sizeof hint, "Opens %s in your web browser.", s_up_res.url);
     } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_STEAM_ART) {
         snprintf(hint, sizeof hint, "Adds Steam's library pictures to the Takedawn shortcut you already have, made from your own"
-                 " game files. Pictures you put there yourself are kept as .takedawn-backup files. Steam can stay open.");
+                 " game files. Pictures you put there yourself are kept as backup copies. Steam can stay open.");
     } else if (rows[sel].kind == R_ACTION && rows[sel].action >= A_SAVE_EXPORT
                && rows[sel].action <= A_SAVE_CANCEL) {
         const char *what =
