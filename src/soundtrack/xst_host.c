@@ -173,6 +173,7 @@ static void log_library(const xst_library *lib, const char *music_dir)
  * on the disk, the redirect on. NULL or an empty one: none in use, the
  * title's paths its own again. Returns the songs now offered. Takes `lib`. */
 static volatile int s_stopped;          /* the last scan stopped at the budget */
+static volatile int s_unreadable;       /* the last folder asked for could not be read */
 
 static int use_library(xst_library *lib, const char *music_dir)
 {
@@ -276,6 +277,11 @@ int xbox_SoundtrackScanStopped(void)
     return s_stopped;
 }
 
+int xbox_SoundtrackFolderUnreadable(void)
+{
+    return s_unreadable;
+}
+
 int xbox_SoundtrackLeftOutFile(int i, char *name, size_t cap, const char **why)
 {
     int ok = 0;
@@ -332,7 +338,9 @@ static DWORD WINAPI scan_thread(LPVOID arg)
             lib = xst_scan_progress(dir, &s_progress);
             if (!lib && !s_progress.cancel)
                 XR_ERROR( LOGP "%s: cannot read the folder; custom music is off\n", dir);
+            s_unreadable = !lib && !s_progress.cancel;
         } else {
+            s_unreadable = 0;
             fprintf(stderr, LOGP "custom music is off\n");
         }
 

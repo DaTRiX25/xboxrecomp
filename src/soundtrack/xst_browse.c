@@ -74,6 +74,21 @@ static int is_dir(const char *path)
 #endif
 }
 
+/* Whether the folder can be listed (opened for reading). */
+static int can_list(const char *path)
+{
+#if defined(_WIN32)
+    (void)path;
+    return 1;                             /* GetFileAttributesW said it is a folder */
+#else
+    DIR *d = opendir(path);
+    if (!d)
+        return 0;
+    closedir(d);
+    return 1;
+#endif
+}
+
 static int is_sep(char c) { return c == '/' || c == '\\'; }
 
 static const char *leaf(const char *path)
@@ -262,7 +277,9 @@ static void add_row(xsb_kind kind, const char *label, const char *path)
     if (s_n == XSB_MAX_ROWS)
         return;
     if (kind == XSB_PLACE) {
-        if (!is_dir(path))
+        /* A place that is not there (no Downloads, no card) or cannot be
+         * listed (no permission) is left out, not shown as a dead row. */
+        if (!is_dir(path) || !can_list(path))
             return;
         for (i = 0; i < s_n; i++)
             if (s_rows[i].kind == XSB_PLACE && same_path(s_rows[i].path, path))
@@ -426,6 +443,8 @@ static int list_folder(const char *dir)
     for (i = 0; i < dirs.n; i++) {
         int k = s_newest_first ? dirs.n - 1 - i : i;
         join(path, sizeof path, s_dir, dirs.v[k]);
+        if (!can_list(path))
+            continue;                     /* one that would not open: no dead row */
         add_row(XSB_DIR, dirs.v[k], path);
     }
     xst_names_free(&dirs);

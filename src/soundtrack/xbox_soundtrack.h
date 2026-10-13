@@ -242,6 +242,10 @@ int  xbox_SoundtrackLeftOut(int *unreadable, int *songs_past_limit, int *folders
 /* 1 when the folder in use was too big to read whole (XST_SCAN_BUDGET
  * entries): what was read is offered. */
 int  xbox_SoundtrackScanStopped(void);
+/* 1 when the last folder asked for could not be read at all (gone: a card
+ * taken out, the folder deleted or renamed, no permission): custom music is
+ * off and the title plays its own. */
+int  xbox_SoundtrackFolderUnreadable(void);
 /* Unreadable file i of those remembered (XST_LEFT_OUT_KEPT): its name
  * without the folder, and why. 0 when there is no such one. */
 int  xbox_SoundtrackLeftOutFile(int i, char *name, size_t cap, const char **why);
