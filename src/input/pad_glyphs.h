@@ -44,6 +44,7 @@ typedef enum {
     XBOX_PAD_FAMILY_STEAM,
     XBOX_PAD_FAMILY_PLAYSTATION5,  /* a DualSense / DualSense Edge */
     XBOX_PAD_FAMILY_NONE,          /* no pad has been used (the state before the first button): the title's own */
+    XBOX_PAD_FAMILY_KEYBOARD,      /* the keyboard (keyboard.c) was the last input device: not a pad, but the active "pad" for the prompts */
     XBOX_PAD_FAMILY_COUNT
 } xbox_pad_family;
 
@@ -137,7 +138,9 @@ xbox_pad_family xbox_PadFamilyFromIds(xbox_pad_family by_type, unsigned vendor,
  * known type or vendor, a handheld's built-in pad) is POSITIONAL: no letters
  * to be wrong (POSITIONAL_SWAPPED when face_nintendo says the pad is read by
  * letter). auto with no pad at all (FAMILY_NONE) is XBOX: the title's own
- * prompts, nothing replaced. */
+ * prompts, nothing replaced. auto with the keyboard as the last device
+ * (FAMILY_KEYBOARD) is XBOX_MODERN until the keyboard has a set of its own;
+ * the face layout does not change it. */
 xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family,
                                     int label_mapped, int face_nintendo);
 

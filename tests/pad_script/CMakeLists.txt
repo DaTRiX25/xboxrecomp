@@ -17,6 +17,7 @@ add_executable(pad_script_test
     ${INPUT_SRC}/input_map.c
     ${INPUT_SRC}/input_core.c
     ${INPUT_SRC}/rumble_curve.c
+    ${INPUT_SRC}/pad_glyphs.c
     ${INPUT_SRC}/keyboard.c)
 target_include_directories(pad_script_test PRIVATE ${INPUT_SRC} ${USB_SRC})
 target_link_libraries(pad_script_test PRIVATE platform)
@@ -24,7 +25,7 @@ if(NOT WIN32)
     target_link_libraries(pad_script_test PRIVATE m)
 endif()
 enable_testing()
-foreach(mode takeover headless keep stale)
+foreach(mode takeover headless keep stale keylive)
     add_test(NAME pad_script_${mode} COMMAND pad_script_test ${mode}
              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 endforeach()

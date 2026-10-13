@@ -21,6 +21,7 @@ static void listener(int set) { st_calls++; st_last = set; }
 #define DK XBOX_PAD_FAMILY_STEAM
 #define P5 XBOX_PAD_FAMILY_PLAYSTATION5
 #define NO XBOX_PAD_FAMILY_NONE
+#define KB XBOX_PAD_FAMILY_KEYBOARD
 
 int main(void)
 {
@@ -145,6 +146,12 @@ int main(void)
                 }
     }
 
+    /* The keyboard as the device in use: the modern Xbox set (until it has
+     * its own), whatever the face layout; a fixed choice still wins. */
+    CHECK(xbox_GlyphSetResolve(XBOX_GLYPHS_AUTO, KB, 0, 0) == XBOX_GLYPH_SET_XBOX_MODERN);
+    CHECK(xbox_GlyphSetResolve(XBOX_GLYPHS_AUTO, KB, 1, 1) == XBOX_GLYPH_SET_XBOX_MODERN);
+    CHECK(xbox_GlyphSetResolve(XBOX_GLYPHS_PLAYSTATION, KB, 0, 0) == XBOX_GLYPH_SET_PLAYSTATION);
+
     /* ── names ── */
     CHECK(xbox_GlyphModeFromName("auto") == XBOX_GLYPHS_AUTO);
     CHECK(xbox_GlyphModeFromName("PlayStation") == XBOX_GLYPHS_PLAYSTATION);
@@ -193,6 +200,15 @@ int main(void)
     st_face = 0;
     xbox_InputGlyphsRefresh();
     CHECK(st_calls == 10 && st_last == XBOX_GLYPH_SET_POSITIONAL);
+
+    /* A key after a pad, and a pad button after the keyboard. */
+    xbox_InputSetGlyphMode(XBOX_GLYPHS_AUTO);
+    xbox_InputSetActivePad(PS, 0);
+    CHECK(xbox_InputGlyphSet() == XBOX_GLYPH_SET_PLAYSTATION);
+    xbox_InputSetActivePad(KB, 0);
+    CHECK(xbox_InputGlyphSet() == XBOX_GLYPH_SET_XBOX_MODERN && xbox_InputActivePadFamily() == KB);
+    xbox_InputSetActivePad(PS, 0);
+    CHECK(xbox_InputGlyphSet() == XBOX_GLYPH_SET_PLAYSTATION && xbox_InputActivePadFamily() == PS);
 
     printf("pad_glyphs: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail != 0;

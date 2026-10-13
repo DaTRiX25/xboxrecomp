@@ -8,6 +8,7 @@
 #include "usb_gamepad.h"
 #include "input_backend.h"
 #include "recomp_env.h"
+#include "keyboard.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,7 @@ static DWORD f_set(DWORD port, const XBOX_VIBRATION *v) { (void)port; (void)v; r
 static uint64_t f_clock(void) { return (uint64_t)clock() * 1000u / CLOCKS_PER_SEC; }
 
 static const xbox_input_backend k_fake = { NULL, f_get, f_set, NULL, f_clock };
+static const xbox_input_backend k_kb = { NULL, f_get, f_set, xbox_InputKeyboardPoll, f_clock };
 const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f_clock };
 
 static uint8_t rep[4][20];
@@ -179,6 +181,44 @@ static void test_stale(void)
     remove(path);
 }
 
+/* RECOMP_KEY_LIVE: keys held from a file, through the real key table and
+ * map, with no pad connected on port 0 (the fake host pad is there, idle). */
+static void test_keylive(void)
+{
+    static const char path[] = "pad_script_keys.txt";
+    FILE *f = fopen(path, "wb");
+    int i;
+
+    CHECK(f != NULL, "cannot write %s", path);
+    if (!f)
+        return;
+    fclose(f);
+    xbox_InputSetBackend(&k_kb);
+    xbox_InputKeysClear();
+    set_env("RECOMP_KEY_LIVE", path);
+    read_pads();                            /* the file is read from here on */
+    f = fopen(path, "ab");
+    if (f) {
+        fputs("w+d:600000\nspace:400\nnotakey\n", f);
+        fclose(f);
+    }
+    for (i = 0; i < 4; i++) {
+        read_pads();
+        sleep_ms(60);
+    }
+    CHECK(rep[0][R_RT] == 255 && rep[0][R_A] == 255, "keys: rt %u a %u", rep[0][R_RT], rep[0][R_A]);
+    CHECK(rep[0][12] == 0xFF && rep[0][13] == 0x7F, "D: stick X %02X%02X", rep[0][13], rep[0][12]);
+    CHECK(rep[0][R_LT] == 0 && !(rep[0][2] & 0x1F), "nothing else: lt %u btn %02X", rep[0][R_LT], rep[0][2]);
+    CHECK(rep[1][R_RT] == 0, "pad 2 gets no keys: rt %u", rep[1][R_RT]);
+    for (i = 0; i < 6; i++) {
+        read_pads();
+        sleep_ms(60);
+    }
+    CHECK(rep[0][R_A] == 0 && rep[0][R_RT] == 255, "Space let go, W held: a %u rt %u", rep[0][R_A], rep[0][R_RT]);
+    xbox_InputKeysClear();
+    remove(path);
+}
+
 int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "";
@@ -187,13 +227,15 @@ int main(int argc, char **argv)
     set_env("RECOMP_DEBUG", NULL);
     set_env("RECOMP_PAD_SCRIPT", NULL);
     set_env("RECOMP_PAD_LIVE", NULL);
+    set_env("RECOMP_KEY_LIVE", NULL);
     set_env("RECOMP_INPUT_RUMBLE", "0");
     xbox_InputSetBackend(&k_fake);
     if (!strcmp(mode, "takeover"))      test_takeover();
     else if (!strcmp(mode, "headless")) test_headless();
     else if (!strcmp(mode, "keep"))     test_keep();
     else if (!strcmp(mode, "stale"))    test_stale();
-    else { printf("usage: pad_script_test takeover|headless|keep|stale\n"); return 2; }
+    else if (!strcmp(mode, "keylive"))  test_keylive();
+    else { printf("usage: pad_script_test takeover|headless|keep|stale|keylive\n"); return 2; }
     printf("pad_script %s: %d checks, %d failed\n", mode, g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

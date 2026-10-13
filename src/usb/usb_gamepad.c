@@ -664,6 +664,137 @@ static void pad_live_poll(unsigned long t)
     fclose(f);
 }
 
+/* RECOMP_KEY_LIVE=<file>: keyboard keys held for a headless run, one line
+ * appended to the file at a time: <key>[+<key>...][:<hold ms>] (default 150),
+ * keys named w a s d (any letter or digit), up down left right, enter esc
+ * space backspace shift ctrl. They go into the same key table the window's
+ * events do (keyboard.c), so the keyboard map, the merge with a pad and the
+ * overlay's block are what is tested. Unlike RECOMP_PAD_LIVE the lines are
+ * not spaced out: keys on separate lines are held together. Not read in a
+ * run with a pad script (those runs do not read the keyboard at all). */
+#define KEY_LIVE_MAX 64
+static struct { int vk[4]; int n; unsigned long at, hold; int down; } s_klive[KEY_LIVE_MAX];
+
+static int key_live_vk(const char *w, size_t n)
+{
+    static const struct { const char *name; int vk; } names[] = {
+        {"up", 0x26}, {"down", 0x28}, {"left", 0x25}, {"right", 0x27}, {"enter", 0x0D},
+        {"esc", 0x1B}, {"space", 0x20}, {"backspace", 0x08}, {"shift", 0x10}, {"ctrl", 0x11},
+    };
+    size_t i;
+    if (n == 1 && isalnum((unsigned char)w[0]))
+        return toupper((unsigned char)w[0]);
+    for (i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (strlen(names[i].name) == n && same_word(names[i].name, w, n))
+            return names[i].vk;
+    return 0;
+}
+
+static void key_live_line(const char *line, unsigned long t)
+{
+    size_t k;
+    int slot = -1;
+    unsigned long hold = 150;
+    const char *b = line, *colon = strchr(line, ':');
+
+    for (k = 0; k < KEY_LIVE_MAX; k++)
+        if (s_klive[k].n == 0) { slot = (int)k; break; }
+    if (slot < 0) {
+        fprintf(stderr, "  KEY: live \"%s\": too many keys in flight\n", line);
+        return;
+    }
+    if (colon)
+        hold = strtoul(colon + 1, NULL, 0);
+    s_klive[slot].n = 0;
+    for (;;) {
+        size_t n = strcspn(b, "+:");
+        int vk = key_live_vk(b, n);
+        if (!vk)
+            fprintf(stderr, "  KEY: unknown key \"%.*s\"\n", (int)n, b);
+        else if (s_klive[slot].n < 4)
+            s_klive[slot].vk[s_klive[slot].n++] = vk;
+        b += n;
+        if (*b != '+')
+            break;
+        b++;
+    }
+    s_klive[slot].at = t;
+    s_klive[slot].hold = hold;
+    s_klive[slot].down = 0;
+    fprintf(stderr, "  KEY: live \"%s\" at t=%lu ms for %lu ms\n", line, t, hold);
+    fflush(stderr);
+}
+
+static void key_live_poll(unsigned long t)
+{
+    static const char *path;
+    static int checked;
+    static long consumed;
+    static unsigned long last_poll;
+    static char pending[128];
+    static size_t npending;
+    FILE *f;
+    int c;
+    size_t k;
+
+    if (!checked) {
+        checked = 1;
+        path = recomp_env(RENV_KEY_LIVE);
+        if (path && *path)
+            fprintf(stderr, "  KEY: live input from %s\n", path);
+    }
+    if (!path || !*path)
+        return;
+    for (k = 0; k < KEY_LIVE_MAX; k++) {
+        int j;
+        if (!s_klive[k].n || t < s_klive[k].at)
+            continue;
+        if (!s_klive[k].down) {
+            s_klive[k].down = 1;
+            for (j = 0; j < s_klive[k].n; j++)
+                xbox_InputKeySet(s_klive[k].vk[j], 1);
+        } else if (t >= s_klive[k].at + s_klive[k].hold) {
+            for (j = 0; j < s_klive[k].n; j++)
+                xbox_InputKeySet(s_klive[k].vk[j], 0);
+            s_klive[k].n = 0;
+        }
+    }
+    if (t - last_poll < 50 && last_poll)
+        return;
+    last_poll = t;
+    f = fopen(path, "rb");
+    if (!f)
+        return;
+    if (fseek(f, consumed, SEEK_SET) != 0) {
+        fclose(f);
+        return;
+    }
+    while ((c = fgetc(f)) != EOF) {
+        consumed++;
+        if (c == '\n' || c == '\r') {
+            if (npending) {
+                pending[npending] = 0;
+                key_live_line(pending, t);
+                npending = 0;
+            }
+        } else if (npending < sizeof pending - 1) {
+            pending[npending++] = (char)c;
+        }
+    }
+    fclose(f);
+}
+
+static void key_live_report(void)
+{
+    static unsigned long t0;
+    unsigned long now = (unsigned long)GetTickCount() + (unsigned long)(xbox_GuestSkewNs() / 1000000u);
+
+    if (!t0)
+        t0 = now;
+    key_live_poll(now - t0);
+}
+
+
 /* Scripted input and a person's controller on the same pad (BO-96).
  *
  * A step sets its buttons in the report whatever the host pad says, so while
@@ -800,6 +931,9 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[0] = 0;
     out[1] = 20;
     rumble_refresh(pad & 3);
+
+    if (!pad_scripted())
+        key_live_report();
 
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */
