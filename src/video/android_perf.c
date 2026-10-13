@@ -265,7 +265,11 @@ void xbox_AndroidPerfFrame(void)
         h->last_cpu = cpu;
     }
     if (s_frames == 600) {
-        fprintf(stderr, LOGA "ADPF: reporting each frame's work (600 frames so far)\n");
+        int n = 0;
+        for (i = 0; i < NROLES; i++)
+            n += s_hot[i].session != NULL;
+        fprintf(stderr, LOGA "ADPF: %d session%s reporting each frame's work (600 frames so"
+                " far)\n", n, n == 1 ? "" : "s");
     }
 }
 
