@@ -513,6 +513,9 @@ void nvk_core_shutdown(void)
     struct timespec t0;
     VkResult r;
 
+    /* A GPU wait still going on another thread gives up at its next slice
+     * (the process ends with _exit on Android: the atexit hook never runs). */
+    nvk_wait_cancel();
     pthread_mutex_lock(&s_init_lock);
     if (s_state != 1) {
         pthread_mutex_unlock(&s_init_lock);

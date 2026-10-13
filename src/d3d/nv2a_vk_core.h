@@ -84,7 +84,8 @@ void nvk_set_lost_handler(void (*fn)(const char *why));
  * thread stops and its pipeline cache is written; 0 when that thread did
  * not stop within timeout_ms (the device must then be left alone). Then,
  * with the executor held (xbox_HostHoldForExit) and the window's swapchain
- * gone: nvk_core_shutdown takes the queue lock for good, waits for the
+ * gone: nvk_core_shutdown cancels the GPU waits still going
+ * (nvk_wait_cancel), takes the queue lock for good, waits for the
  * device to be idle and destroys the surface, the device and the instance,
  * each step in the log. Objects the backend still holds go with the device
  * (the process ends next). */
