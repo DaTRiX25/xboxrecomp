@@ -530,6 +530,11 @@ static void test_browse(void)
     mkdir(in_work("media/deck"), 0755);
     mkdir(in_work("media/deck/SDCARD"), 0755);
     mkdir(in_work("media/USB"), 0755);
+    /* A Downloads that cannot be listed (no permission, as Android's shared
+     * folders before the audio permission): left out like a missing one. */
+#if !defined(_WIN32)
+    mkdir(in_work("home/deck/Downloads"), 0000);
+#endif
     write_wav(in_work("home/deck/Music/loose.wav"), 8000, 1, 440, 10);
     write_wav(in_work("home/deck/Music/Album/1.wav"), 8000, 1, 440, 10);
     write_wav(in_work("home/deck/Music/Album/2.wav"), 8000, 1, 440, 10);
@@ -593,11 +598,23 @@ static void test_browse(void)
     xsb_close();
     CHECK("closed", !xsb_is_open() && xsb_rows() == 0);
 
+    /* The chosen folder is gone (a card taken out, deleted): no dead
+     * "Current folder" row, "turn off" stays, the places as before. */
+    xsb_open(in_work("gone/Album"));
+    CHECK("gone: turn off first", xsb_row_at(0, &r) && r.kind == XSB_OFF);
+    CHECK("gone: no current folder row", find_row("Current folder: Album") < 0
+                                          && xsb_row_at(1, &r) && !strcmp(r.label, "Music"));
+    CHECK("gone: the places", xsb_rows() == 5);
+    xsb_close();
+
     /* Nothing chosen yet: no "turn off", no current folder. */
     xsb_open("");
     CHECK("no current folder", xsb_rows() == 4 && xsb_row_at(0, &r) && !strcmp(r.label, "Music"));
     xsb_close();
     xsb_set_roots(NULL, NULL);
+#if !defined(_WIN32)
+    chmod(in_work("home/deck/Downloads"), 0755);
+#endif
 }
 
 /* A folder and files with letters outside ASCII and outside Latin-1, as

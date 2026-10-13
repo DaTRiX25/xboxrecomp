@@ -448,6 +448,55 @@ void xbox_OverlaySetMusicFolder(const xbox_music_folder_ops *ops)
     s_mf = ops;
 }
 
+/* The row's access hook (xbox_music_folder_ops.access), on its own thread:
+ * Android's permission dialog must not stop the overlay's frames. */
+static std::atomic<int> s_mf_acc_state;  /* 0 idle, 1 asking, 2 answered */
+static int s_mf_acc_ok;                   /* written by the thread before state 2 */
+static char s_mf_acc_line[400];           /* the hook's line, shown in the hint */
+static char s_mf_acc_tmp[400];
+
+static int music_access_thread(void *)
+{
+    s_mf_acc_tmp[0] = 0;
+    s_mf_acc_ok = s_mf->access(s_mf_acc_tmp, sizeof s_mf_acc_tmp);
+    s_mf_acc_state.store(2, std::memory_order_release);
+    return 0;
+}
+
+static void music_browser_open();
+
+/* The answer, once a frame: the browser opens when the hook said so. */
+static void music_access_poll()
+{
+    if (s_mf_acc_state.load(std::memory_order_acquire) != 2)
+        return;
+    snprintf(s_mf_acc_line, sizeof s_mf_acc_line, "%s", s_mf_acc_tmp);
+    s_mf_acc_state.store(0, std::memory_order_release);
+    fprintf(stderr, LOGP "music folder access: %s%s%s\n", s_mf_acc_ok ? "yes" : "no",
+            s_mf_acc_line[0] ? ": " : "", s_mf_acc_line);
+    if (s_mf_acc_ok && s_open)
+        music_browser_open();
+}
+
+/* The row is pressed: through the access hook when there is one. */
+static void music_access_start()
+{
+    int expect = 0;
+    if (!s_mf || !s_mf->access) {
+        music_browser_open();
+        return;
+    }
+    if (!s_mf_acc_state.compare_exchange_strong(expect, 1))
+        return;                           /* still waiting for the answer */
+    SDL_Thread *t = SDL_CreateThread(music_access_thread, "music access", NULL);
+    if (!t) {
+        s_mf_acc_state.store(0, std::memory_order_release);
+        music_browser_open();
+        return;
+    }
+    SDL_DetachThread(t);
+}
+
 static const char *path_leaf(const char *p)
 {
     const char *e = p + strlen(p), *b;
@@ -598,6 +647,17 @@ static void sio_action(int action)
     default:
         break;
     }
+}
+
+/* The music folder's browser, on the current folder when there is one
+ * ("turn off" is above it). */
+static void music_browser_open()
+{
+    const char *dir = xbox_SettingsText(MUSIC_KEY, NULL);
+    s_fb_purpose = FB_MUSIC;
+    xsb_open(dir);
+    s_fb_sel = dir[0] ? 1 : 0;
+    s_fb_scroll = true;
 }
 
 static void browser_count(const xsb_row &r, char *out, size_t n)
@@ -1390,14 +1450,9 @@ static void activate(const Row &r)
     }
     if (r.kind == R_FOLDER) {
         int locked = 0;
-        const char *dir = xbox_SettingsText(MUSIC_KEY, &locked);
-        if (!locked) {
-            s_fb_purpose = FB_MUSIC;
-            xsb_open(dir);
-            /* On the current folder when there is one ("turn off" is above it). */
-            s_fb_sel = dir[0] ? 1 : 0;
-            s_fb_scroll = true;
-        }
+        xbox_SettingsText(MUSIC_KEY, &locked);
+        if (!locked)
+            music_access_start();
         return;
     }
     if (r.kind == R_ACTION && r.action == A_UPDATE_CHECK) {
@@ -3635,6 +3690,7 @@ static void build_pages_inner()
     foot_set(NULL);
 
     draw_header(dl);
+    music_access_poll();
 
     if (xsb_is_open() || s_mx_open) {
         /* The folder browser and the Mixer page: in a body under the header,
@@ -3800,11 +3856,18 @@ static void build_pages_inner()
         if (locked)
             snprintf(hint, sizeof hint, "Set by the environment (RECOMP_AUDIO_MUSIC_DIR or --music-dir);"
                      " unset it to change it here.");
+        else if (s_mf_acc_state.load(std::memory_order_acquire) == 1)
+            snprintf(hint, sizeof hint, "Waiting for Android's answer: may the game read your music files?");
+        else if (s_mf && s_mf->access)
+            /* The hook asks for what the browser needs (Android's audio
+             * permission) and says how it went in its line. */
+            snprintf(hint, sizeof hint, "%s%sYour own music (mp3, flac, ogg, wav) for the game's music menu."
+                     " Pick a folder of songs, or a folder of folders for one soundtrack each."
+                     " A opens the folder list.", s_mf_acc_line, s_mf_acc_line[0] ? "  |  " : "");
         else
 #if defined(__ANDROID__)
-            /* The app does not ask for the audio permission yet (the game
-             * repository's docs/custom-music.md, "Android"): its own files
-             * folder is what it can read, and the browser lists it first. */
+            /* No access hook: the app reads only its own files folder,
+             * which the browser lists first. */
             snprintf(hint, sizeof hint, "Your own music (mp3, flac, ogg, wav) for the game's music menu."
                      " Pick a folder of songs, or a folder of folders for one soundtrack each. On Android,"
                      " copy music folders into Android/data/<this app>/files/Music (the app can read"
