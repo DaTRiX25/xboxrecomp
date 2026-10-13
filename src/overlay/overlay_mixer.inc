@@ -282,7 +282,10 @@ static int mx_items(apu_bus_config &c, MxItem *it, int max)
                 act(MA_AUD_SAVE, "Save this clip", "Saves the looping clip to mixer-audition.clip beside mixer.toml, so you can loop it again after a restart.");
         }
         for (int b = 0; b < nbus; b++) {
-            MxItem &m = add(MK_BUS, apu_bus_name(b), "Left / right: the bus gain, 0.5 dB a step (hold: faster). A: its route, sends, trims and LFE send. LB mutes, RB solos, Y resets the bus.");
+            static char bus_hint[32][220];      /* the item keeps the pointer; one per bus */
+            snprintf(bus_hint[b & 31], sizeof bus_hint[0], "Left / right: the bus gain, 0.5 dB a step (hold: faster). %s: its route, sends, trims and LFE send. LB mutes, RB solos, %s resets the bus.",
+                     act_name(0), act_name(3));
+            MxItem &m = add(MK_BUS, apu_bus_name(b), bus_hint[b & 31]);
             m.bus = b;
             m.f = &c.bus[b].gain_db;
             m.mn = -60.0f; m.mx = 12.0f; m.step = 0.5f; m.off_below = true;
@@ -908,15 +911,23 @@ static void build_mixer(float fs, ImDrawList *dl)
             dl->AddText(ImGui::GetFont(), hs, ImVec2(p.x, y), (s_mx_note[0] || fst[0]) && line != hint ? col(T->warn) : col(T->hint),
                         line, nullptr, wrap_w);
         if (s_mx_grab) {
-            foot_set(pad_hints()
-                ? "D-pad / stick  move the sound in the room      A or B  done"
-                : "Arrows  move the sound in the room      Enter or Esc  done", true);
+            static char grab[160];
+            snprintf(grab, sizeof grab, pad_hints() ? "D-pad / stick  move the sound in the room      %s or %s  done"
+                                                    : "Arrows  move the sound in the room      %s or %s  done",
+                     act_name(0), act_name(1));
+            foot_set(grab, true);
             return;
         }
-        foot_set(pad_hints()
-            ? (s_mx_view == MX_MAIN ? "D-pad  select / change   A  open   LB  mute   RB  solo   Y  reset   B  back   Back+Y  A/B"
-                                    : "D-pad  select / change    A  toggle    Y  default    B  back    Back+Y  A/B")
-            : (s_mx_view == MX_MAIN ? "Arrows  select / change   Enter  open   Q  mute   E  solo   Del  reset   Esc  back   F7  A/B"
-                                    : "Arrows  select / change    Enter  toggle    Del  default    Esc  back    F7  A/B"));
+        static char keys[240];
+        if (pad_hints())
+            snprintf(keys, sizeof keys, s_mx_view == MX_MAIN
+                         ? "D-pad  select / change   %s  open   LB  mute   RB  solo   %s  reset   %s  back   Back+Y  A/B"
+                         : "D-pad  select / change    %s  toggle    %s  default    %s  back    Back+Y  A/B",
+                     act_name(0), act_name(3), act_name(1));
+        else
+            snprintf(keys, sizeof keys, "%s", s_mx_view == MX_MAIN
+                         ? "Arrows  select / change   Enter  open   Q  mute   E  solo   Del  reset   Esc  back   F7  A/B"
+                         : "Arrows  select / change    Enter  toggle    Del  default    Esc  back    F7  A/B");
+        foot_set(keys);
     }
 }

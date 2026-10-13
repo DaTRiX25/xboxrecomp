@@ -10,6 +10,7 @@
  */
 #include "xbox_settings.h"
 #include "overlay_gameart.h"
+#include "pad_glyphs.h"
 #include "overlay_gamefont.h"
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -25,6 +26,8 @@
 
 #define SCALE 4        /* Super-xBR's factor */
 #define GUTTER 4       /* texels of an image's edge repeated around it in the atlas */
+
+static_assert(AP_SETS == XBOX_GLYPH_SET_COUNT, "one sheet per glyph set");
 
 namespace {
 

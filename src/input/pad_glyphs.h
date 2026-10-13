@@ -77,7 +77,15 @@ typedef enum {
  *   POSITIONAL          the title's A is the bottom button, B the right one,
  *                       X the left one, Y the top one
  *   POSITIONAL_SWAPPED  the pad is read by letter: A is the right button, B the
- *                       bottom one, X the top one, Y the left one */
+ *                       bottom one, X the top one, Y the left one
+ * and so is every other set that prints something on the face buttons. A
+ * *_SWAPPED set is the same pictures with the title's A and B, and X and Y,
+ * exchanged: the title's A is the right-hand button, which an Xbox or Valve
+ * pad prints B and a PlayStation pad draws as the circle:
+ *   XBOX_SWAPPED, XBOX_MODERN_SWAPPED, STEAM_SWAPPED     B A Y X
+ *   PLAYSTATION_SWAPPED, PLAYSTATION5_SWAPPED    circle cross triangle square
+ * (the order is the title's A B X Y; xbox_GlyphSetResolve has the whole table).
+ * The keyboard has no swapped set: its keys are named, not placed. */
 typedef enum {
     XBOX_GLYPH_SET_XBOX,
     XBOX_GLYPH_SET_PLAYSTATION,
@@ -89,6 +97,11 @@ typedef enum {
     XBOX_GLYPH_SET_POSITIONAL_SWAPPED,
     XBOX_GLYPH_SET_PLAYSTATION5,
     XBOX_GLYPH_SET_KEYBOARD,
+    XBOX_GLYPH_SET_XBOX_SWAPPED,
+    XBOX_GLYPH_SET_PLAYSTATION_SWAPPED,
+    XBOX_GLYPH_SET_PLAYSTATION5_SWAPPED,
+    XBOX_GLYPH_SET_STEAM_SWAPPED,
+    XBOX_GLYPH_SET_XBOX_MODERN_SWAPPED,
     XBOX_GLYPH_SET_COUNT
 } xbox_glyph_set;
 
@@ -122,33 +135,73 @@ xbox_pad_family xbox_PadFamilyFromIds(xbox_pad_family by_type, unsigned vendor,
 
 /* The set for a setting, the active pad and the face layout. Pure.
  *   label_mapped   the host already maps this pad's face buttons by their
- *                  printed letters (SDL does for a Nintendo pad, its
- *                  SDL_GAMECONTROLLER_USE_BUTTON_LABELS default)
+ *                  printed letters (SDL does for a Nintendo pad: see below)
  *   face_nintendo  input.face_layout = nintendo (A/B and X/Y change places
- *                  as the pad is read)
- * The rule: a prompt shows what is PRINTED on the button the player has to
- * press. On a pad printed the Nintendo way (A right, B below, X above, Y
- * left) the title's A is
- *   read by position, face layout xbox      the bottom button, printed B
- *   read by position, face layout nintendo  the right button, printed A
- *   read by letter,   face layout xbox      the right button, printed A
- *   read by letter,   face layout nintendo  the bottom button, printed B
- * so one of the two gives NINTENDO_LABEL, both or neither NINTENDO_POSITION,
- * and the same for B, X and Y (the footer's confirm and cancel with them).
- * The positional set asks the same question and answers with the place: the
- * button to press is the bottom one (POSITIONAL) or the right one
- * (POSITIONAL_SWAPPED) for the title's A. It works for any pad.
- * auto with an Xbox 360 / One / Series pad and face_nintendo on is
- * NINTENDO_LABEL: the player said the pad is printed the Nintendo way.
- * auto with a pad nothing is known about (FAMILY_XBOX: an SDL pad of no
- * known type or vendor, a handheld's built-in pad) is POSITIONAL: no letters
- * to be wrong (POSITIONAL_SWAPPED when face_nintendo says the pad is read by
- * letter). auto with no pad at all (FAMILY_NONE) is XBOX: the title's own
- * prompts, nothing replaced. auto with the keyboard as the last device
- * (FAMILY_KEYBOARD) is KEYBOARD, whatever the face layout: its keys are named,
- * not placed. The next button of a pad puts the pad's set back. */
+ *                  as the pad is read, input_map.c xbox_InputMirrorFace*)
+ *
+ * THE RULE: a prompt draws the physical button that really triggers its
+ * action, after the host's mapping and our face-layout swap, as the pad the
+ * set stands for prints that button.
+ *
+ * Which button is the title's A? Name the buttons S (bottom), E (right),
+ * W (left), N (top). SDL reports its A on S, B on E, X on W, Y on N, except
+ * for a pad it maps by printed letter (label_mapped), where its A is on E,
+ * B on S, X on N, Y on W. The Nintendo face layout then swaps A with B and
+ * X with Y. So the title's A, B, X, Y are
+ *   on S E W N   ("by position"): label_mapped and face_nintendo both off or both on
+ *   on E S N W   ("by letter"):   exactly one of them on
+ * (label_mapped only counts for a Nintendo pad; the keyboard's keys are
+ * mapped to the Xbox layout and never swapped.) What each set draws for the
+ * title's A B X Y:
+ *
+ *   set                      prints on S E W N       by position     by letter
+ *   XBOX, XBOX_MODERN, STEAM A  B  X  Y              A B X Y         B A Y X
+ *   PLAYSTATION, PS5         cross circle square tri cross circle    circle cross
+ *                                                    square tri      tri square
+ *   NINTENDO                 B  A  Y  X              B A Y X         A B X Y
+ *   POSITIONAL               a dot on S, E, W, N     S E W N         E S N W
+ *   KEYBOARD                 Space Back Shift Ctrl   the same keys whatever the layout
+ *
+ * The by-letter column is the *_SWAPPED sets (XBOX_SWAPPED,
+ * XBOX_MODERN_SWAPPED, STEAM_SWAPPED, PLAYSTATION_SWAPPED,
+ * PLAYSTATION5_SWAPPED, POSITIONAL_SWAPPED) and NINTENDO_LABEL; the
+ * by-position column is the unmarked set and NINTENDO_POSITION. A fixed
+ * choice (input.glyphs = ...) is the set it names, swapped or not by the
+ * rule. Example, a Retroid Pocket (built-in pad, A printed on the right)
+ * with Input > Face buttons = Nintendo: the title's A is on E; Positional
+ * fills the right dot, Nintendo draws "A", PlayStation the circle.
+ *
+ * auto: the pad's family picks the set and the same question swaps it
+ * (PlayStation, PS5, Steam, Nintendo; an unknown pad is POSITIONAL). Two
+ * cases follow the player's word instead of the pad: an Xbox 360 / One /
+ * Series pad, or no pad at all, with face_nintendo on is NINTENDO_LABEL (the
+ * player turned the Nintendo layout on because the pad is printed the Nintendo
+ * way, so the button on E is printed A). auto with a pad nothing is known
+ * about (FAMILY_XBOX: an SDL pad of no known type or vendor, a handheld's
+ * built-in pad) is POSITIONAL: no letters to be wrong. auto with no pad at all
+ * (FAMILY_NONE) is XBOX: the title's own prompts, nothing replaced. auto with
+ * the keyboard as the last device (FAMILY_KEYBOARD) is KEYBOARD, whatever
+ * the face layout. The next button of a pad puts the pad's set back.
+ *
+ * What SDL does in our version (sdl2-compat 2.32.74 over SDL 3, the SDL2 we
+ * build with on macOS, Windows and Linux; read in its sdl2_compat.c):
+ * SDL_GameControllerGetButton swaps A/B and X/Y for a pad whose SDL 3 label
+ * for the south button is B (Switch Pro, Joy-Cons, ...), while the hint
+ * SDL_GAMECONTROLLER_USE_BUTTON_LABELS is true (the default; looked at when
+ * the pad is opened and when the hint changes). SDL 2.0.12 and later does the
+ * same for its Nintendo types, with the same default. That is label_mapped:
+ * xinput_device.c sets it from the SDL controller type (the Nintendo ones) and
+ * the same hint, so a Switch pad on a desktop reads by letter and the
+ * built-in pad of a handheld, which SDL does not type Nintendo (the Retroid
+ * Pocket's is "unknown"), by position. The Windows XInput path has no labels. */
 xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family,
                                     int label_mapped, int face_nintendo);
+
+/* The title's A (0), B (1), X (2) or Y (3) as the words of a sentence, for a
+ * set, naming the button that does it by the same table (the overlay's
+ * hints): "A", "Cross", "bottom button"... The keyboard set names its keys
+ * (Space, Backspace, Shift, Ctrl). "" for an action or set out of range. */
+const char *xbox_GlyphButtonName(xbox_glyph_set set, int action);
 
 /* input.glyphs as text and back ("auto", "xbox", ...); -1: not one. */
 const char *xbox_GlyphModeName(xbox_glyph_mode m);
