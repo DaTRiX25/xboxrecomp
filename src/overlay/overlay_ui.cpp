@@ -18,6 +18,7 @@
  */
 #include "overlay.h"
 #include "overlay_internal.h"
+#include "overlay_keys.h"
 #include "xbox_settings.h"
 #include "nv2a_texscale.h"
 #include "xbox_shader_build.h"
@@ -1668,13 +1669,12 @@ int xbox_OverlayEvent(const SDL_Event *ev)
         case SDLK_KP_ENTER:
         case SDLK_SPACE: s_activate++; break;
         case SDLK_ESCAPE: s_back++; break;
-        case SDLK_PAGEUP:
-        case SDLK_LEFTBRACKET: s_page_delta--; break;
-        case SDLK_PAGEDOWN:
-        case SDLK_RIGHTBRACKET: s_page_delta++; break;
         case SDLK_DELETE:
         case SDLK_BACKSPACE: s_reset++; break;
-        default: break;
+        default:
+            /* Page Up and Down, [ and ], Q and E, Tab and Shift+Tab. */
+            s_page_delta += xbox_overlay_page_key(k, ev->key.keysym.mod);
+            break;
         }
         return 1;
     }
@@ -1784,13 +1784,14 @@ extern "C" void xbox_HostWindowShot(const char *path);     /* video_player.h */
  * real press (xbox_OverlayEvent and the input layer after it); a shot is the
  * window as presented; a state dump is the open page's rows, the selected
  * one marked, for a test to assert on. */
-static void test_key(SDL_Keycode sym)
+static void test_key(SDL_Keycode sym, Uint16 mod = 0)
 {
     SDL_Event ev;
     memset(&ev, 0, sizeof ev);
     ev.type = SDL_KEYDOWN;
     ev.key.state = SDL_PRESSED;
     ev.key.keysym.sym = sym;
+    ev.key.keysym.mod = mod;
     SDL_PushEvent(&ev);
     ev.type = SDL_KEYUP;
     ev.key.state = SDL_RELEASED;
@@ -1816,10 +1817,11 @@ static void test_poll()
     static bool checked;
     static long consumed;
     static uint32_t next;
-    static const struct { const char *name; SDL_Keycode sym; } keys[] = {
-        {"up", SDLK_UP}, {"down", SDLK_DOWN}, {"left", SDLK_LEFT}, {"right", SDLK_RIGHT},
-        {"enter", SDLK_RETURN}, {"esc", SDLK_ESCAPE}, {"f1", SDLK_F1},
-        {"pgup", SDLK_PAGEUP}, {"pgdn", SDLK_PAGEDOWN}, {"del", SDLK_DELETE},
+    static const struct { const char *name; SDL_Keycode sym; Uint16 mod; } keys[] = {
+        {"up", SDLK_UP, 0}, {"down", SDLK_DOWN, 0}, {"left", SDLK_LEFT, 0}, {"right", SDLK_RIGHT, 0},
+        {"enter", SDLK_RETURN, 0}, {"esc", SDLK_ESCAPE, 0}, {"f1", SDLK_F1, 0},
+        {"pgup", SDLK_PAGEUP, 0}, {"pgdn", SDLK_PAGEDOWN, 0}, {"del", SDLK_DELETE, 0},
+        {"q", SDLK_q, 0}, {"e", SDLK_e, 0}, {"tab", SDLK_TAB, 0}, {"shift+tab", SDLK_TAB, KMOD_LSHIFT},
     };
     static const struct { const char *name; int b; } pads[] = {
         {"a", SDL_CONTROLLER_BUTTON_A}, {"b", SDL_CONTROLLER_BUTTON_B},
@@ -1851,7 +1853,7 @@ static void test_poll()
         if (!strncmp(line, "key ", 4)) {
             for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++)
                 if (!strcmp(line + 4, keys[i].name))
-                    test_key(keys[i].sym);
+                    test_key(keys[i].sym, keys[i].mod);
         } else if (!strcmp(line, "pad back+start")) {
             test_pad(SDL_CONTROLLER_BUTTON_BACK, true);
             test_pad(SDL_CONTROLLER_BUTTON_START, true);
@@ -3442,12 +3444,12 @@ static void draw_header(ImDrawList *dl)
             }
         } else if (art_on()) {
             /* Keys of the keyboard. */
-            const float gap = LY.foot * 0.35f, w1 = key_width(LY.foot, "PgUp"), w2 = key_width(LY.foot, "PgDn");
+            const float gap = LY.foot * 0.35f, w1 = key_width(LY.foot, "Q"), w2 = key_width(LY.foot, "E");
             const ImU32 c = col(T->hint);
-            key_cap(dl, right - w1 - gap - w2, cy, LY.foot, "PgUp", c);
-            key_cap(dl, right - w2, cy, LY.foot, "PgDn", c);
+            key_cap(dl, right - w1 - gap - w2, cy, LY.foot, "Q", c);
+            key_cap(dl, right - w2, cy, LY.foot, "E", c);
         } else {
-            const char *hint = pad_hints() ? "LB / RB" : "PgUp / PgDn";
+            const char *hint = pad_hints() ? "LB / RB" : "Q / E";
             const float hw = tw(LY.foot, hint);
             txt(dl, LY.foot, ImVec2(right - hw, top_for(cy, LY.foot)), col(T->hint), hint);
         }

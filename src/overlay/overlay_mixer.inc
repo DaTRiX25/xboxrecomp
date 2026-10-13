@@ -916,7 +916,7 @@ static void build_mixer(float fs, ImDrawList *dl)
         foot_set(pad_hints()
             ? (s_mx_view == MX_MAIN ? "D-pad  select / change   A  open   LB  mute   RB  solo   Y  reset   B  back   Back+Y  A/B"
                                     : "D-pad  select / change    A  toggle    Y  default    B  back    Back+Y  A/B")
-            : (s_mx_view == MX_MAIN ? "Arrows  select / change   Enter  open   PgUp  mute   PgDn  solo   Del  reset   Esc  back   F7  A/B"
+            : (s_mx_view == MX_MAIN ? "Arrows  select / change   Enter  open   Q  mute   E  solo   Del  reset   Esc  back   F7  A/B"
                                     : "Arrows  select / change    Enter  toggle    Del  default    Esc  back    F7  A/B"));
     }
 }
