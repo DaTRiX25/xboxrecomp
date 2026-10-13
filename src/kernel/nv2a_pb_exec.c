@@ -620,7 +620,21 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  *    stale or later evicted; a mode set clears it, since buffers drawn
  *    before it say nothing about the new mode), a surface at twice it
  *    qualifies instead, with a warning the first time. The runtime does not interleave fields anywhere, so such a
- *    pick shows one field; it beats presenting the buffer about to be drawn. */
+ *    pick shows one field; it beats presenting the buffer about to be drawn.
+ *
+ * The extent shown is the display's, not the clip a frame happened to use.
+ * The display scans out every line of its mode whatever clip the title drew
+ * with. Burnout 3 draws its menus and loading screens through a 640x464
+ * header of the 640x480 back buffer (the picture in rows 16-463, black
+ * below), its races and its 3D menus at 640x480. Presenting the extent of
+ * the pick stretched 464 lines to the window's height once the 640x480 one
+ * went stale (PRESENT_STALE_FLIPS after the last full-height frame), so a
+ * menu or loading screen came up at the right height and grew about 3.4%
+ * two seconds later, with the bottom border gone (BO-151). So the largest
+ * extent at the display address since the last mode set, at the display's
+ * pitch, is latched (s_mode_w/h: surviving staleness and eviction), and a
+ * pick of that width and pitch but fewer lines is shown at the latched
+ * height. The rows below the clip are the buffer's own, as on the console. */
 /* Every (surface, extent) pair a frame draws has an entry. Burnout 3's
  * Crash mode uses 19 a frame: five extents of each back buffer (640x480,
  * 640x464, 640x463, 639x403, 159x344) and 14 off-screen targets. With 16
@@ -724,6 +738,7 @@ static void present_pick(void)
     static int warned_field;
     static uint32_t s_pitch_seen;        /* a display pitch some surface had */
     static uint32_t s_mode_gen, s_mode_flip;
+    static uint32_t s_mode_w, s_mode_h;  /* largest extent at the display since the mode set */
     uint32_t gen = xbox_DisplayModeGeneration();
     uint32_t disp_pitch = 0, disp = xbox_GetDisplayFramebuffer(&disp_pitch);
     uint32_t tw = 0, th = 0, want = disp_pitch;
@@ -737,6 +752,7 @@ static void present_pick(void)
         s_mode_gen = gen;
         s_mode_flip = s_gpu.flips;
         s_pitch_seen = 0;
+        s_mode_w = s_mode_h = 0;
     }
     for (i = 0; i < PRESENT_MAX && disp_pitch && s_pitch_seen != disp_pitch; i++)
         if (s_psurf[i].offset && s_psurf[i].pitch == disp_pitch
@@ -753,6 +769,11 @@ static void present_pick(void)
                 || (dma_resolve(s_psurf[i].offset) & 0x0FFFFFFFu)
                    != (disp & 0x0FFFFFFFu))
             continue;
+        if (s_psurf[i].pitch == disp_pitch && s_psurf[i].last_flip >= s_mode_flip
+                && a > (uint64_t)s_mode_w * s_mode_h) {
+            s_mode_w = s_psurf[i].w;
+            s_mode_h = s_psurf[i].h;
+        }
         if (present_fresh(i)) {
             if (a > area) {
                 area = a;
@@ -825,6 +846,10 @@ static void present_pick(void)
             s_psurf[best].offset, s_psurf[best].w, s_psurf[best].h,
             s_psurf[best].pitch, s_psurf[best].format,
         };
+        /* The display's lines, not the clip's (see the top). */
+        if (disp_pitch && pick.pitch == disp_pitch && pick.w == s_mode_w
+                && pick.h < s_mode_h)
+            pick.h = s_mode_h;
         s_present = pick;
     }
     s_psurf_flip_seq = s_psurf_seq;
