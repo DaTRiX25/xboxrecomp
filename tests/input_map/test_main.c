@@ -9,6 +9,8 @@
 #include "input_map.h"
 #include "input_backend.h"
 #include "recomp_env.h"
+#include "keyboard.h"
+#include "pad_glyphs.h"
 #include "recomp_exit_hook.h"
 
 #include <stdio.h>
@@ -299,12 +301,15 @@ static XBOX_VIBRATION f_last_vib[4];
 
 static void f_init(void) { f_init_calls++; }
 static int f_hold_start = 1, f_hold_back;
+static int f_pad_lt, f_pad_lx;      /* a pad's left trigger and stick X, for the keyboard merge */
 static DWORD f_get(DWORD p, XBOX_INPUT_STATE *s)
 {
     f_get_calls[p]++;
     if (!f_plugged[p]) return ERROR_DEVICE_NOT_CONNECTED;
     memset(s, 0, sizeof *s);
     s->Gamepad.wButtons = (f_hold_start ? XBOX_GAMEPAD_START : 0) | (f_hold_back ? XBOX_GAMEPAD_BACK : 0);
+    s->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = (BYTE)f_pad_lt;
+    s->Gamepad.sThumbLX = (SHORT)f_pad_lx;
     return ERROR_SUCCESS;
 }
 /* Every call that reaches the pad, in order: a motor write (port, levels,
@@ -469,6 +474,104 @@ static void test_block(void)
           "block: still neutral after the release");
     CHECK(xbox_InputSetState(0, &vib) == ERROR_SUCCESS && f_last_vib[0].wLeftMotorSpeed == 2000,
           "block: rumble stayed off after closing");
+    xbox_InputSetBackend(NULL);
+}
+
+/* The real key map behind input_core.c: the keys alone on port 0, merged
+ * with a pad by OR and max, silent while the overlay is open, and the
+ * prompts follow the device in use. */
+static const xbox_input_backend k_realkb = { f_init, f_get, f_set, xbox_InputKeyboardPoll, f_clock, f_shutdown };
+
+static void test_keyboard_play(void)
+{
+    XBOX_INPUT_STATE st;
+
+    f_now = 120000;
+    f_kb_on = 0;
+    f_hold_start = f_hold_back = 0;
+    f_pad_lt = f_pad_lx = 0;
+    recomp_env_set(RENV_KEYBOARD, NULL);
+    xbox_InputKeysClear();
+    xbox_InputSetBackend(&k_realkb);
+
+    /* No pad: the keys are port 0. */
+    f_plugged[0] = f_plugged[1] = f_plugged[2] = f_plugged[3] = 0;
+    xbox_InputKeySet('W', 1);
+    xbox_InputKeySet('D', 1);
+    xbox_InputKeySet(0x20, 1);
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS
+          && st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255
+          && st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255
+          && st.Gamepad.sThumbLX == 32767 && !st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER],
+          "keys alone: W D Space");
+    CHECK(xbox_InputSources(0) == XBOX_INPUT_SRC_KEYS, "keys alone: sources %u", xbox_InputSources(0));
+    CHECK(xbox_InputGetState(1, &st) == ERROR_DEVICE_NOT_CONNECTED, "the keyboard is port 0's only");
+
+    /* A pad on port 0 as well: buttons OR, triggers max, a held key sets
+     * its stick axis and a free axis keeps the pad's. */
+    f_plugged[0] = 1;
+    f_now += 5000;
+    f_hold_start = 1;
+    f_pad_lt = 90;
+    f_pad_lx = -20000;
+    xbox_InputKeySet('D', 0);
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS
+          && st.Gamepad.wButtons == XBOX_GAMEPAD_START
+          && st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255
+          && st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 90
+          && st.Gamepad.sThumbLX == -20000,
+          "pad and keys: START %04X LT %d LX %d", st.Gamepad.wButtons,
+          st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER], st.Gamepad.sThumbLX);
+    xbox_InputKeySet('S', 1);
+    xbox_InputKeySet('D', 1);
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS
+          && st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 255 && st.Gamepad.sThumbLX == 32767,
+          "pad and keys: a key is full deflection");
+    CHECK(xbox_InputSources(0) == (XBOX_INPUT_SRC_PAD | XBOX_INPUT_SRC_KEYS), "both: sources %u",
+          xbox_InputSources(0));
+    xbox_InputKeysClear();
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && st.Gamepad.wButtons == XBOX_GAMEPAD_START
+          && st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 90 && st.Gamepad.sThumbLX == -20000
+          && xbox_InputSources(0) == XBOX_INPUT_SRC_PAD, "keys let go: the pad alone");
+
+    /* The overlay open: no pad, held keys neutral, and still neutral after
+     * it closes until they are let go. */
+    f_plugged[0] = 0;
+    f_now += 5000;
+    f_hold_start = 0;
+    f_pad_lt = f_pad_lx = 0;
+    xbox_InputKeySet('W', 1);
+    xbox_InputKeySet('A', 1);
+    xbox_InputSetBlocked(1);
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && !st.Gamepad.wButtons && !st.Gamepad.sThumbLX
+          && !st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER], "overlay open: the title saw a key");
+    xbox_InputSetBlocked(0);
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && !st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER],
+          "overlay closed with W held: still neutral");
+    xbox_InputKeysClear();
+    xbox_InputGetState(0, &st);             /* nothing held: the latch ends here */
+    xbox_InputKeysClear();
+    xbox_InputKeySet('W', 1);
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS && st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255,
+          "overlay closed, keys let go, W again: not through");
+
+    /* The prompts follow the device: a key, then a pad button. */
+    xbox_InputKeysClear();
+    xbox_InputSetActivePad(XBOX_PAD_FAMILY_PLAYSTATION, 0);
+    xbox_InputKeySet('P', 1);
+    CHECK(xbox_InputActivePadFamily() == XBOX_PAD_FAMILY_PLAYSTATION, "an unmapped key took the prompts");
+    xbox_InputKeySet(0x0D, 1);
+    CHECK(xbox_InputActivePadFamily() == XBOX_PAD_FAMILY_KEYBOARD, "a mapped key did not take the prompts");
+    xbox_InputSetActivePad(XBOX_PAD_FAMILY_PLAYSTATION, 0);
+    CHECK(xbox_InputActivePadFamily() == XBOX_PAD_FAMILY_PLAYSTATION, "a pad button did not take them back");
+
+    /* Off: no keys at all. */
+    xbox_InputKeysClear();
+    recomp_env_set(RENV_KEYBOARD, "0");
+    xbox_InputKeySet('W', 1);
+    CHECK(xbox_InputGetState(0, &st) == ERROR_DEVICE_NOT_CONNECTED, "RECOMP_KEYBOARD=0: the keyboard answered");
+    recomp_env_set(RENV_KEYBOARD, NULL);
+    xbox_InputKeysClear();
     xbox_InputSetBackend(NULL);
 }
 
@@ -1258,6 +1361,7 @@ int main(int argc, char **argv)
     test_readme(argc > 1 ? argv[1] : "input_README.md");
     test_cache();
     test_block();
+    test_keyboard_play();
     test_rumble();
     test_quit();
     test_exit_hooks();

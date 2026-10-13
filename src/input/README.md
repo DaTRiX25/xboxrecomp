@@ -165,23 +165,33 @@ and fails if the table below and the code disagree. Regenerate it with
 
 ### Keyboard → Xbox mapping
 
-With `RECOMP_KEYBOARD=1` (and the host pad on) the keyboard is a pad on
-port 0, merged on top of a controller there: a real pad keeps working and
-the keys only add. One map in `keyboard.c` serves every host: the Win32
-windows (GDI and D3D11, under Proton too) record Windows virtual-key codes,
-and the SDL window on macOS and Linux turns SDL keycodes into the same codes
-(`keyboard_sdl.c`). `tests/input_keyboard` checks every row and fails if the
-table below and the code disagree; regenerate it with
-`INPUT_KEYBOARD_README_OUT=<file>` set when running the test.
+The keyboard is a pad on port 0, on by default (`RECOMP_KEYBOARD=0` turns it
+off), merged on top of a controller there: a real pad keeps working and the
+keys only add (buttons OR, triggers the larger, a held key sets its stick
+axis). The map is fixed; there is no remapping. One map in `keyboard.c`
+serves every host: the Win32 windows (GDI and D3D11, under Proton too) record
+Windows virtual-key codes, and the SDL window on macOS, Linux and Android
+turns SDL keycodes into the same codes (`keyboard_sdl.c`). `tests/input_keyboard`
+checks every row and fails if the table below and the code disagree;
+regenerate it with `INPUT_KEYBOARD_README_OUT=<file>` set when running the
+test.
 
+- The arrows are the d-pad (menus) and also steer, accelerate and brake like
+  A D W S: one press of an arrow is the d-pad and the stick (or trigger)
+  at once. F1 (and Cmd+, on a Mac) are the settings
+  overlay's, not the pad's. While the overlay is open the title reads a
+  neutral pad and no keys (`xbox_InputSetBlocked`), and after it closes the
+  keys held stay neutral until they are let go.
+- A key of the map going down makes the keyboard the device in use for the
+  button prompts (`XBOX_PAD_FAMILY_KEYBOARD`, `pad_glyphs.h`); the next
+  button of a pad takes the prompts back.
 - Keys are read only while the game's window has the focus. Losing the
   focus (and on SDL, hiding or minimising the window) releases every key.
-- Letters follow the keyboard layout (the key labelled Z), not the
-  physical position. The digits differ between hosts: on AZERTY the top-row
-  keys labelled 1 and 3 give SDL the keycodes for `&` and `"` (an SDL
-  keycode ignores Shift), so the 1 and 3 trigger keys do nothing in the
-  SDL window there, while Win32 reports the same keys as VK `1` and `3`. Auto-repeat is ignored, and on macOS Cmd+key is left to
-  the system (Cmd going down releases the held keys).
+- Letters follow the keyboard layout (the key labelled W), not the physical
+  position. Auto-repeat is ignored, and on macOS Cmd+key is left to the
+  system (Cmd going down releases the held keys). Shift and Ctrl are either
+  side's key. macOS keeps Ctrl+arrow for Mission Control, so Y with an arrow
+  steer is better done with A and D there.
 - Face buttons, shoulders and triggers read 255 held, 0 released; stick keys
   give full deflection, and opposite keys cancel.
 - `RECOMP_KEY_TRACE=1` logs the first 40 key-downs as `[KEY] down vk=0x..`.
@@ -194,25 +204,17 @@ table below and the code disagree; regenerate it with
 | Left arrow | D-pad left |
 | Right arrow | D-pad right |
 | Enter | START |
-| Backspace | BACK |
-| Shift | Left stick click |
-| Ctrl | Right stick click |
-| Z | A |
-| X | B |
-| C | X |
-| V | Y |
+| Esc | BACK |
+| Space | A |
+| Backspace | B |
+| Shift | X |
+| Ctrl | Y |
 | Q | White |
 | E | Black |
-| 1 | Left trigger |
-| 3 | Right trigger |
-| W or keypad 8 | Left stick up |
-| S or keypad 2 | Left stick down |
-| A or keypad 4 | Left stick left |
-| D or keypad 6 | Left stick right |
-| I | Right stick up |
-| K | Right stick down |
-| J | Right stick left |
-| L | Right stick right |
+| W or Up arrow | Right trigger |
+| S or Down arrow | Left trigger |
+| A or Left arrow | Left stick left |
+| D or Right arrow | Left stick right |
 <!-- keyboard_map:end -->
 
 ## A title's second control scheme

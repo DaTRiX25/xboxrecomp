@@ -320,6 +320,7 @@ extern "C" {
     X(USB_PADS,          CONFIG, "RECOMP_USB_PADS",          NULL, "emulated USB pads plugged in, 1..4 (default 1)") \
     X(PAD_SCRIPT,        DEBUG, "pad_script",      "RECOMP_PAD_SCRIPT",        "=ms:btn[+btn][:hold],... or =@file: timed pad presses") \
     X(PAD_LIVE,          DEBUG, "pad_live",        "RECOMP_PAD_LIVE",          "=file: press each line appended to it (btn[+btn][:hold])") \
+    X(KEY_LIVE,          DEBUG, "key_live",        "RECOMP_KEY_LIVE",          "=file: hold keys for each line appended to it (key[+key][:hold ms]), headless") \
     X(PAD_SCRIPT_ONLY,   DEBUG, "pad_script_only", NULL,                       "=1: a scripted run with a window does not read the host's controllers either, as a headless one (a test on a handheld, whose built-in pad is always there)") \
     X(PAD_SCRIPT_KEEP,   DEBUG, "pad_script_keep", NULL,                       "=1: a pad script keeps driving a pad after a controller is used on it (merged, the script's buttons on top), and a headless scripted run reads the controllers") \
     X(PAD_SCRIPT_NOTE,   DEBUG, "pad_script_note", NULL,                       "=0: no on-screen note while a pad script drives a pad") \

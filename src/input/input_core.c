@@ -573,19 +573,24 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
                 || kb.Gamepad.sThumbRX || kb.Gamepad.sThumbRY)
             src |= XBOX_INPUT_SRC_KEYS;
         if (rc != ERROR_SUCCESS) {
-            g_sources[dwPort] = src;
+            /* No pad here: the keys are the port's whole state, and go
+             * through the overlay's neutral below like a pad's. */
             *pState = kb;
-            return ERROR_SUCCESS;
+            rc = ERROR_SUCCESS;
+        } else {
+            /* Merged: a button is held if either holds it, a trigger is the
+             * larger of the two, and a held key sets its stick axis (a key
+             * is full deflection; with no key the pad's value stays). */
+            XBOX_GAMEPAD *g = &pState->Gamepad;
+            g->wButtons |= kb.Gamepad.wButtons;
+            for (int i = 0; i < 8; i++)
+                if (kb.Gamepad.bAnalogButtons[i] > g->bAnalogButtons[i])
+                    g->bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+            if (kb.Gamepad.sThumbLX) g->sThumbLX = kb.Gamepad.sThumbLX;
+            if (kb.Gamepad.sThumbLY) g->sThumbLY = kb.Gamepad.sThumbLY;
+            if (kb.Gamepad.sThumbRX) g->sThumbRX = kb.Gamepad.sThumbRX;
+            if (kb.Gamepad.sThumbRY) g->sThumbRY = kb.Gamepad.sThumbRY;
         }
-        XBOX_GAMEPAD *g = &pState->Gamepad;
-        g->wButtons |= kb.Gamepad.wButtons;
-        for (int i = 0; i < 8; i++)
-            if (kb.Gamepad.bAnalogButtons[i] > g->bAnalogButtons[i])
-                g->bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
-        if (kb.Gamepad.sThumbLX) g->sThumbLX = kb.Gamepad.sThumbLX;
-        if (kb.Gamepad.sThumbLY) g->sThumbLY = kb.Gamepad.sThumbLY;
-        if (kb.Gamepad.sThumbRX) g->sThumbRX = kb.Gamepad.sThumbRX;
-        if (kb.Gamepad.sThumbRY) g->sThumbRY = kb.Gamepad.sThumbRY;
         /* The title's input layer records edges, so an unchanged packet
          * number reads as the same state and a key press never happens. */
         pState->dwPacketNumber = kb.dwPacketNumber;

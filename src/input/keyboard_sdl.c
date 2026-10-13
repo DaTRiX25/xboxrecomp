@@ -19,8 +19,8 @@
  * relies on these. */
 _Static_assert(SDLK_a == 'a' && SDLK_z == 'z' && SDLK_0 == '0' && SDLK_9 == '9',
                "SDL letter and digit keycodes are their ASCII codes");
-_Static_assert(SDLK_RETURN == '\r' && SDLK_BACKSPACE == '\b',
-               "SDL Return and Backspace keycodes are their ASCII codes");
+_Static_assert(SDLK_RETURN == '\r' && SDLK_BACKSPACE == '\b' && SDLK_ESCAPE == 0x1B && SDLK_SPACE == ' ',
+               "SDL Return, Backspace, Escape and Space keycodes are their ASCII codes");
 
 int xbox_InputSdlKeyToVk(int key)
 {
@@ -40,10 +40,8 @@ int xbox_InputSdlKeyToVk(int key)
     case SDLK_DOWN:      return XBOX_VK_DOWN;
     case SDLK_LEFT:      return XBOX_VK_LEFT;
     case SDLK_RIGHT:     return XBOX_VK_RIGHT;
-    case SDLK_KP_2:      return XBOX_VK_NUMPAD2;
-    case SDLK_KP_4:      return XBOX_VK_NUMPAD4;
-    case SDLK_KP_6:      return XBOX_VK_NUMPAD6;
-    case SDLK_KP_8:      return XBOX_VK_NUMPAD8;
+    case SDLK_ESCAPE:    return XBOX_VK_ESCAPE;
+    case SDLK_SPACE:     return XBOX_VK_SPACE;
     }
     return 0;
 }

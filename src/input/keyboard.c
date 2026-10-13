@@ -6,10 +6,9 @@
  * The whole point of a recompilation is to be able to look at the thing
  * running, and a build nobody can press a button in cannot be looked at.
  *
- * Off by default, because a keyboard silently acting as player 1 is
- * surprising when a real pad is what you meant to use. RECOMP_KEYBOARD=1
- * turns it on. It only ever answers for port 0, and is merged on top of a
- * pad connected there (input_core.c), so a real controller keeps working.
+ * On by default, with a fixed map; RECOMP_KEYBOARD=0 turns it off. It only
+ * ever answers for port 0, and is merged on top of a pad connected there
+ * (input_core.c), so a real controller keeps working beside it.
  *
  * Keys come from the game's window, which only receives them while it has
  * the focus, so typing in another window does not drive the game. Losing
@@ -57,36 +56,32 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
-/* The one map, on every host. Z X C V for A B X Y is the usual emulator
- * row. The left thumb is W/S/A/D, because Mac laptops have no numeric
- * keypad and the game walks on the stick, not the d-pad; the keypad row of
- * the first map stays as a second one. Arrows stay the d-pad: as a stick
- * too they would feed the menus two sources for one press. */
+/* The one map, on every host, fixed (no remapping). Driving is on the
+ * letters and the arrows both: W and Up the accelerator (right trigger), S
+ * and Down the brake (left trigger), A D and Left Right the left stick. The
+ * arrows are also the d-pad, so they move through the menus; a menu takes
+ * the d-pad and the stick as one direction (checked on the game, BO3), and
+ * driving ignores the d-pad, so one press of an arrow is not two inputs
+ * anywhere. Space is A (boost, select), Backspace B (Crashbreaker, back),
+ * Shift X (look back), Ctrl Y (change view), Q and E the white and black
+ * buttons (E: the next track), Enter Start, Esc Back. */
 const xbox_key_row xbox_key_map[] = {
-    { "Up arrow",        { XBOX_VK_UP },     XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_UP,     0, "D-pad up" },
-    { "Down arrow",      { XBOX_VK_DOWN },   XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_DOWN,   0, "D-pad down" },
-    { "Left arrow",      { XBOX_VK_LEFT },   XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_LEFT,   0, "D-pad left" },
-    { "Right arrow",     { XBOX_VK_RIGHT },  XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_RIGHT,  0, "D-pad right" },
-    { "Enter",           { XBOX_VK_RETURN }, XBOX_KEY_BUTTON, XBOX_GAMEPAD_START,       0, "START" },
-    { "Backspace",       { XBOX_VK_BACK },   XBOX_KEY_BUTTON, XBOX_GAMEPAD_BACK,        0, "BACK" },
-    { "Shift",           { XBOX_VK_SHIFT },  XBOX_KEY_BUTTON, XBOX_GAMEPAD_LEFT_THUMB,  0, "Left stick click" },
-    { "Ctrl",            { XBOX_VK_CONTROL },XBOX_KEY_BUTTON, XBOX_GAMEPAD_RIGHT_THUMB, 0, "Right stick click" },
-    { "Z",               { 'Z' },            XBOX_KEY_ANALOG, XBOX_BUTTON_A,            0, "A" },
-    { "X",               { 'X' },            XBOX_KEY_ANALOG, XBOX_BUTTON_B,            0, "B" },
-    { "C",               { 'C' },            XBOX_KEY_ANALOG, XBOX_BUTTON_X,            0, "X" },
-    { "V",               { 'V' },            XBOX_KEY_ANALOG, XBOX_BUTTON_Y,            0, "Y" },
-    { "Q",               { 'Q' },            XBOX_KEY_ANALOG, XBOX_BUTTON_WHITE,        0, "White" },
-    { "E",               { 'E' },            XBOX_KEY_ANALOG, XBOX_BUTTON_BLACK,        0, "Black" },
-    { "1",               { '1' },            XBOX_KEY_ANALOG, XBOX_BUTTON_LTRIGGER,     0, "Left trigger" },
-    { "3",               { '3' },            XBOX_KEY_ANALOG, XBOX_BUTTON_RTRIGGER,     0, "Right trigger" },
-    { "W or keypad 8",   { 'W', XBOX_VK_NUMPAD8 }, XBOX_KEY_AXIS, XBOX_KEY_LY, +1, "Left stick up" },
-    { "S or keypad 2",   { 'S', XBOX_VK_NUMPAD2 }, XBOX_KEY_AXIS, XBOX_KEY_LY, -1, "Left stick down" },
-    { "A or keypad 4",   { 'A', XBOX_VK_NUMPAD4 }, XBOX_KEY_AXIS, XBOX_KEY_LX, -1, "Left stick left" },
-    { "D or keypad 6",   { 'D', XBOX_VK_NUMPAD6 }, XBOX_KEY_AXIS, XBOX_KEY_LX, +1, "Left stick right" },
-    { "I",               { 'I' },            XBOX_KEY_AXIS,   XBOX_KEY_RY,             +1, "Right stick up" },
-    { "K",               { 'K' },            XBOX_KEY_AXIS,   XBOX_KEY_RY,             -1, "Right stick down" },
-    { "J",               { 'J' },            XBOX_KEY_AXIS,   XBOX_KEY_RX,             -1, "Right stick left" },
-    { "L",               { 'L' },            XBOX_KEY_AXIS,   XBOX_KEY_RX,             +1, "Right stick right" },
+    { "Up arrow",    { XBOX_VK_UP },     XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_UP,    0, "D-pad up" },
+    { "Down arrow",  { XBOX_VK_DOWN },   XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_DOWN,  0, "D-pad down" },
+    { "Left arrow",  { XBOX_VK_LEFT },   XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_LEFT,  0, "D-pad left" },
+    { "Right arrow", { XBOX_VK_RIGHT },  XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_RIGHT, 0, "D-pad right" },
+    { "Enter",       { XBOX_VK_RETURN }, XBOX_KEY_BUTTON, XBOX_GAMEPAD_START,      0, "START" },
+    { "Esc",         { XBOX_VK_ESCAPE }, XBOX_KEY_BUTTON, XBOX_GAMEPAD_BACK,       0, "BACK" },
+    { "Space",       { XBOX_VK_SPACE },  XBOX_KEY_ANALOG, XBOX_BUTTON_A,           0, "A" },
+    { "Backspace",   { XBOX_VK_BACK },   XBOX_KEY_ANALOG, XBOX_BUTTON_B,           0, "B" },
+    { "Shift",       { XBOX_VK_SHIFT },  XBOX_KEY_ANALOG, XBOX_BUTTON_X,           0, "X" },
+    { "Ctrl",        { XBOX_VK_CONTROL },XBOX_KEY_ANALOG, XBOX_BUTTON_Y,           0, "Y" },
+    { "Q",           { 'Q' },            XBOX_KEY_ANALOG, XBOX_BUTTON_WHITE,       0, "White" },
+    { "E",           { 'E' },            XBOX_KEY_ANALOG, XBOX_BUTTON_BLACK,       0, "Black" },
+    { "W or Up arrow",    { 'W', XBOX_VK_UP },    XBOX_KEY_ANALOG, XBOX_BUTTON_RTRIGGER, 0, "Right trigger" },
+    { "S or Down arrow",  { 'S', XBOX_VK_DOWN },  XBOX_KEY_ANALOG, XBOX_BUTTON_LTRIGGER, 0, "Left trigger" },
+    { "A or Left arrow",  { 'A', XBOX_VK_LEFT },  XBOX_KEY_AXIS, XBOX_KEY_LX, -1, "Left stick left" },
+    { "D or Right arrow", { 'D', XBOX_VK_RIGHT }, XBOX_KEY_AXIS, XBOX_KEY_LX, +1, "Left stick right" },
 };
 const size_t xbox_key_map_count = sizeof xbox_key_map / sizeof xbox_key_map[0];
 

@@ -28,14 +28,12 @@ extern "C" {
 #define XBOX_VK_RETURN    0x0D
 #define XBOX_VK_SHIFT     0x10
 #define XBOX_VK_CONTROL   0x11
+#define XBOX_VK_ESCAPE    0x1B
+#define XBOX_VK_SPACE     0x20
 #define XBOX_VK_LEFT      0x25
 #define XBOX_VK_UP        0x26
 #define XBOX_VK_RIGHT     0x27
 #define XBOX_VK_DOWN      0x28
-#define XBOX_VK_NUMPAD2   0x62
-#define XBOX_VK_NUMPAD4   0x64
-#define XBOX_VK_NUMPAD6   0x66
-#define XBOX_VK_NUMPAD8   0x68
 /* Letters and digits are their uppercase ASCII codes, as in Win32. */
 
 /* Record a key as held (down != 0) or released. vk outside 0..255 is

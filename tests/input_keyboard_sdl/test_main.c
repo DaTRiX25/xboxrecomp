@@ -59,8 +59,9 @@ static void test_keycodes(void)
         { SDLK_LSHIFT, 0x10 }, { SDLK_RSHIFT, 0x10 },
         { SDLK_LCTRL, 0x11 },  { SDLK_RCTRL, 0x11 },
         { SDLK_LEFT, 0x25 }, { SDLK_UP, 0x26 }, { SDLK_RIGHT, 0x27 }, { SDLK_DOWN, 0x28 },
-        { SDLK_KP_2, 0x62 }, { SDLK_KP_4, 0x64 }, { SDLK_KP_6, 0x66 }, { SDLK_KP_8, 0x68 },
-        { SDLK_F1, 0 }, { SDLK_ESCAPE, 0 }, { SDLK_LGUI, 0 }, { SDLK_KP_5, 0 },
+        { SDLK_ESCAPE, 0x1B }, { SDLK_SPACE, 0x20 },
+        { SDLK_KP_2, 0 }, { SDLK_KP_8, 0 },    /* the keypad is not in the map any more */
+        { SDLK_F1, 0 }, { SDLK_F12, 0 }, { SDLK_LGUI, 0 }, { SDLK_KP_5, 0 }, { SDLK_TAB, 0 },
     };
     for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++)
         CHECK(xbox_InputSdlKeyToVk(rows[i].sym) == rows[i].vk,
@@ -115,7 +116,8 @@ static void test_events(void)
 
     /* Unmapped keys do nothing. */
     key(SDL_KEYDOWN, SDLK_F5, 0, 0);
-    key(SDL_KEYDOWN, SDLK_ESCAPE, 0, 0);
+    key(SDL_KEYDOWN, SDLK_F1, 0, 0);        /* the overlay's own */
+    key(SDL_KEYDOWN, SDLK_KP_8, 0, 0);
     CHECK(held_count() == 0, "unmapped key held");
 
     /* Focus lost, hidden, minimized each release everything. */
@@ -123,7 +125,7 @@ static void test_events(void)
                                    SDL_WINDOWEVENT_MINIMIZED };
     for (size_t i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
         key(SDL_KEYDOWN, SDLK_UP, 0, 0);
-        key(SDL_KEYDOWN, SDLK_KP_8, 0, 0);
+        key(SDL_KEYDOWN, SDLK_DOWN, 0, 0);
         CHECK(held_count() == 2, "setup for window event %d", kinds[i]);
         window(kinds[i]);
         CHECK(held_count() == 0, "window event %d left keys held", kinds[i]);
@@ -134,6 +136,49 @@ static void test_events(void)
     window(SDL_WINDOWEVENT_FOCUS_GAINED);
     window(SDL_WINDOWEVENT_EXPOSED);
     CHECK(xbox_FramebufferKeyDown(0x26), "focus gained / exposed released a key");
+    xbox_InputKeysClear();
+}
+
+static int g_hook;
+static void hook(void) { g_hook++; }
+
+/* The map end to end: SDL events in, the pad the title reads out. */
+static void test_play(void)
+{
+    XBOX_INPUT_STATE st;
+
+    xbox_InputKeysClear();
+    xbox_InputKeyboardSetActivityHook(hook);
+    key(SDL_KEYDOWN, SDLK_w, 0, 0);
+    key(SDL_KEYDOWN, SDLK_d, 0, 0);
+    key(SDL_KEYDOWN, SDLK_SPACE, 0, 0);
+    CHECK(g_hook == 3, "mapped keys told the prompts %d times", g_hook);
+    key(SDL_KEYDOWN, SDLK_w, 0, 1);         /* auto-repeat */
+    CHECK(g_hook == 3, "auto-repeat told the prompts");
+    key(SDL_KEYDOWN, SDLK_F1, 0, 0);
+    key(SDL_KEYDOWN, SDLK_p, 0, 0);
+    CHECK(g_hook == 3, "an unmapped key told the prompts");
+    xbox_InputKeyboardState(&st);
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255 && st.Gamepad.sThumbLX == 32767
+          && st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255 && !st.Gamepad.wButtons,
+          "W D Space: RT %d LX %d A %d", st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER],
+          st.Gamepad.sThumbLX, st.Gamepad.bAnalogButtons[XBOX_BUTTON_A]);
+    key(SDL_KEYUP, SDLK_w, 0, 0);
+    key(SDL_KEYUP, SDLK_d, 0, 0);
+    key(SDL_KEYUP, SDLK_SPACE, 0, 0);
+    xbox_InputKeyboardState(&st);
+    CHECK(!st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] && !st.Gamepad.sThumbLX
+          && !st.Gamepad.bAnalogButtons[XBOX_BUTTON_A], "keys let go: not at rest");
+
+    /* Menus: an arrow is the d-pad (and Enter Start, Esc Back). */
+    xbox_InputKeysClear();
+    key(SDL_KEYDOWN, SDLK_DOWN, 0, 0);
+    key(SDL_KEYDOWN, SDLK_RETURN, 0, 0);
+    key(SDL_KEYDOWN, SDLK_ESCAPE, 0, 0);
+    xbox_InputKeyboardState(&st);
+    CHECK(st.Gamepad.wButtons == (XBOX_GAMEPAD_DPAD_DOWN | XBOX_GAMEPAD_START | XBOX_GAMEPAD_BACK),
+          "Down+Enter+Esc: 0x%04X", st.Gamepad.wButtons);
+    xbox_InputKeyboardSetActivityHook(NULL);
     xbox_InputKeysClear();
 }
 
@@ -148,6 +193,7 @@ int main(void)
     CHECK(!SDL_IsTextInputActive(), "text input still active after init");
     test_keycodes();
     test_events();
+    test_play();
     SDL_Quit();
     printf("input_keyboard_sdl: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
