@@ -213,7 +213,7 @@ static void test_enable(void)
     xbox_InputKeysClear();
     xbox_InputKeySet(0x0D, 1);
     set_env("RECOMP_KEYBOARD", NULL);
-    CHECK(!xbox_InputKeyboardPoll(&st), "unset: poll answered");
+    CHECK(xbox_InputKeyboardPoll(&st), "unset: the keyboard is on by default");
     set_env("RECOMP_KEYBOARD", "0");
     CHECK(!xbox_InputKeyboardPoll(&st), "=0: poll answered");
     set_env("RECOMP_KEYBOARD", "1");

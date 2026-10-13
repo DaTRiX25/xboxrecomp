@@ -41,6 +41,11 @@ extern "C" {
 /* Record a key as held (down != 0) or released. vk outside 0..255 is
  * ignored. */
 void xbox_InputKeySet(int vk, int down);
+/* Called (from the thread that records the key) when a key the map uses goes
+ * down while the keyboard is on: the keyboard is the device in use, so the
+ * button prompts follow it (pad_glyphs.h, XBOX_PAD_FAMILY_KEYBOARD).
+ * input_core.c sets it. NULL: none. */
+void xbox_InputKeyboardSetActivityHook(void (*fn)(void));
 /* Release every key (focus lost). */
 void xbox_InputKeysClear(void);
 /* Non-zero while that virtual key is held in the game's window. Always zero

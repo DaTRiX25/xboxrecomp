@@ -112,6 +112,8 @@ xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family
         return by_letter ? XBOX_GLYPH_SET_NINTENDO_LABEL : XBOX_GLYPH_SET_NINTENDO_POSITION;
     case XBOX_PAD_FAMILY_XBOX_MODERN:
         return face_nintendo ? XBOX_GLYPH_SET_NINTENDO_LABEL : XBOX_GLYPH_SET_XBOX_MODERN;
+    case XBOX_PAD_FAMILY_KEYBOARD:  /* the keyboard was used last */
+        return XBOX_GLYPH_SET_XBOX_MODERN;
     case XBOX_PAD_FAMILY_XBOX:      /* a pad of no known family */
         return by_letter ? XBOX_GLYPH_SET_POSITIONAL_SWAPPED : XBOX_GLYPH_SET_POSITIONAL;
     default:                        /* no pad yet */

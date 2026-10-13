@@ -27,10 +27,22 @@
  * seen a poll late is indistinguishable from one made a poll later. */
 static volatile unsigned char s_key_down[256];
 
+static void (*volatile s_activity)(void);
+static int kb_on(void);
+static int vk_mapped(int vk);
+
+void xbox_InputKeyboardSetActivityHook(void (*fn)(void))
+{
+    s_activity = fn;
+}
+
 void xbox_InputKeySet(int vk, int down)
 {
-    if ((unsigned)vk < 256)
+    if ((unsigned)vk < 256) {
         s_key_down[vk] = down ? 1 : 0;
+        if (down && s_activity && vk_mapped(vk) && kb_on())
+            s_activity();
+    }
 }
 
 void xbox_InputKeysClear(void)
@@ -78,6 +90,14 @@ const xbox_key_row xbox_key_map[] = {
 };
 const size_t xbox_key_map_count = sizeof xbox_key_map / sizeof xbox_key_map[0];
 
+static int vk_mapped(int vk)
+{
+    for (size_t i = 0; i < xbox_key_map_count; i++)
+        if (xbox_key_map[i].vk[0] == vk || (xbox_key_map[i].vk[1] && xbox_key_map[i].vk[1] == vk))
+            return 1;
+    return 0;
+}
+
 static int row_held(const xbox_key_row *r)
 {
     return xbox_FramebufferKeyDown(r->vk[0])
@@ -123,9 +143,16 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
     out->dwPacketNumber = ++packet;
 }
 
+/* On unless RECOMP_KEYBOARD starts with 0. */
+static int kb_on(void)
+{
+    const char *v = recomp_env(RENV_KEYBOARD);
+    return !(v && *v == '0');
+}
+
 int xbox_InputKeyboardPoll(XBOX_INPUT_STATE *out)
 {
-    if (!recomp_env_on(RENV_KEYBOARD))
+    if (!kb_on())
         return 0;
     xbox_InputKeyboardState(out);
     return 1;

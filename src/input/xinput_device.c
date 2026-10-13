@@ -23,6 +23,8 @@
 /* ======================================================================== */
 
 #include <xinput.h>
+#include <string.h>
+#include "pad_glyphs.h"
 #pragma comment(lib, "xinput.lib")
 
 /* The keyboard on port 0 is shared with the SDL backend (keyboard.c); the
@@ -46,6 +48,12 @@ static DWORD xi_get_state(DWORD port, XBOX_INPUT_STATE *out)
     if (xbox_InputFaceLayoutNintendo())
         xbox_InputMirrorFaceXInput(&pad);
     xbox_InputMapXInput(&pad, &out->Gamepad);
+    /* XInput has no per-press event: a pad button held after the keyboard
+     * was last used makes the pad the device in use again (an XInput pad is
+     * an Xbox 360 / One / Series one). */
+    if (xbox_InputActivePadFamily() == XBOX_PAD_FAMILY_KEYBOARD
+            && (out->Gamepad.wButtons || memchr(out->Gamepad.bAnalogButtons, 0xFF, 8)))
+        xbox_InputSetActivePad(XBOX_PAD_FAMILY_XBOX_MODERN, 0);
     return ERROR_SUCCESS;
 }
 
@@ -209,7 +217,7 @@ static void pad_active(SDL_GameController *c)
                               SDL_GameControllerGetProduct(c), SDL_GameControllerName(c),
                               sd && sd[0] == '1');
     if (c != last || !said) {
-        static const char *const fam[] = { "unknown (xbox original)", "xbox modern", "playstation", "nintendo", "steam", "playstation 5 (DualSense)" };
+        static const char *const fam[] = { "unknown (xbox original)", "xbox modern", "playstation", "nintendo", "steam", "playstation 5 (DualSense)", "none", "keyboard" };
         char d[160];
         const char *name = SDL_GameControllerName(c);
         snprintf(d, sizeof d, "\"%s\" %04x:%04x", name ? name : "?",
