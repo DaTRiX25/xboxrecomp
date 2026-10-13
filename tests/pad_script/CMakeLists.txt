@@ -25,7 +25,7 @@ if(NOT WIN32)
     target_link_libraries(pad_script_test PRIVATE m)
 endif()
 enable_testing()
-foreach(mode takeover headless keep stale)
+foreach(mode takeover headless keep stale keylive)
     add_test(NAME pad_script_${mode} COMMAND pad_script_test ${mode}
              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 endforeach()

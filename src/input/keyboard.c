@@ -6,9 +6,10 @@
  * The whole point of a recompilation is to be able to look at the thing
  * running, and a build nobody can press a button in cannot be looked at.
  *
- * On by default, with a fixed map; RECOMP_KEYBOARD=0 turns it off. It only
- * ever answers for port 0, and is merged on top of a pad connected there
- * (input_core.c), so a real controller keeps working beside it.
+ * On by default (not on Android), with a fixed map; RECOMP_KEYBOARD=0 turns
+ * it off, =1 on. It only ever answers for port 0, and is merged on top of a
+ * pad connected there (input_core.c), so a real controller keeps working
+ * beside it.
  *
  * Keys come from the game's window, which only receives them while it has
  * the focus, so typing in another window does not drive the game. Losing
@@ -138,11 +139,17 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
     out->dwPacketNumber = ++packet;
 }
 
-/* On unless RECOMP_KEYBOARD starts with 0. */
+/* On unless RECOMP_KEYBOARD starts with 0. Not on Android unless it is set
+ * to 1: a handheld's own buttons can reach SDL as key events as well as pad
+ * buttons, and the keys would add a Start to every A. */
 static int kb_on(void)
 {
+#if defined(__ANDROID__)
+    return recomp_env_on(RENV_KEYBOARD);
+#else
     const char *v = recomp_env(RENV_KEYBOARD);
     return !(v && *v == '0');
+#endif
 }
 
 int xbox_InputKeyboardPoll(XBOX_INPUT_STATE *out)

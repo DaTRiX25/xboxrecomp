@@ -166,11 +166,12 @@ and fails if the table below and the code disagree. Regenerate it with
 ### Keyboard → Xbox mapping
 
 The keyboard is a pad on port 0, on by default (`RECOMP_KEYBOARD=0` turns it
-off), merged on top of a controller there: a real pad keeps working and the
+off; on Android it is off unless `RECOMP_KEYBOARD=1`, because a handheld's
+own buttons can arrive as key events too), merged on top of a controller there: a real pad keeps working and the
 keys only add (buttons OR, triggers the larger, a held key sets its stick
 axis). The map is fixed; there is no remapping. One map in `keyboard.c`
 serves every host: the Win32 windows (GDI and D3D11, under Proton too) record
-Windows virtual-key codes, and the SDL window on macOS, Linux and Android
+Windows virtual-key codes, and the SDL window on macOS and Linux
 turns SDL keycodes into the same codes (`keyboard_sdl.c`). `tests/input_keyboard`
 checks every row and fails if the table below and the code disagree;
 regenerate it with `INPUT_KEYBOARD_README_OUT=<file>` set when running the
