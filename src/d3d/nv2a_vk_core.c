@@ -523,16 +523,16 @@ void nvk_core_shutdown(void)
      * rather than reach a destroyed device. The process ends next. */
     pthread_mutex_lock(&s_queue_lock);
     r = vkDeviceWaitIdle(s_core.dev);
-    fprintf(stderr, "[vulkan] teardown: vkDeviceWaitIdle %s (%.1f ms)\n", nvk_result_str(r),
+    XR_NOTICE("[vulkan] teardown: vkDeviceWaitIdle %s (%.1f ms)\n", nvk_result_str(r),
             shut_ms(&t0));
     if (s_core.surface) {
         vkDestroySurfaceKHR(s_core.inst, s_core.surface, NULL);
-        fprintf(stderr, "[vulkan] teardown: surface destroyed (%.1f ms)\n", shut_ms(&t0));
+        XR_NOTICE("[vulkan] teardown: surface destroyed (%.1f ms)\n", shut_ms(&t0));
     }
     vkDestroyDevice(s_core.dev, NULL);
-    fprintf(stderr, "[vulkan] teardown: device destroyed (%.1f ms)\n", shut_ms(&t0));
+    XR_NOTICE("[vulkan] teardown: device destroyed (%.1f ms)\n", shut_ms(&t0));
     vkDestroyInstance(s_core.inst, NULL);
-    fprintf(stderr, "[vulkan] teardown: instance destroyed (%.1f ms)\n", shut_ms(&t0));
+    XR_NOTICE("[vulkan] teardown: instance destroyed (%.1f ms)\n", shut_ms(&t0));
     fflush(stderr);
     s_core.surface = VK_NULL_HANDLE;
     s_core.dev = VK_NULL_HANDLE;

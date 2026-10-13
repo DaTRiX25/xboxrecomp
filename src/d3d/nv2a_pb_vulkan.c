@@ -4157,13 +4157,13 @@ int nvk_backend_quiesce(int timeout_ms)
         waited += 5;
     }
     if (__atomic_load_n(&s_pc_warming, __ATOMIC_ACQUIRE)) {
-        fprintf(stderr, LOGP "teardown: the pipeline pre-warm still runs after %d ms\n", waited);
+        XR_NOTICE(LOGP "teardown: the pipeline pre-warm still runs after %d ms\n", waited);
         return 0;
     }
     if (C && !s_failed && !s_quiesced) {
         uint64_t t0 = now_ns();
         pcache_save();
-        fprintf(stderr, LOGP "teardown: pipeline cache written (%.1f ms)\n",
+        XR_NOTICE(LOGP "teardown: pipeline cache written (%.1f ms)\n",
                 (double)(now_ns() - t0) / 1e6);
     }
     s_quiesced = 1;
