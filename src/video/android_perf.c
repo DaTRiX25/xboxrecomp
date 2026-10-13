@@ -10,8 +10,9 @@
  *   frame rate   ANativeWindow_setFrameRate(60, FIXED_SOURCE) (API 30) on
  *                every window surface the presenter makes, the first and
  *                each one after the app comes back (fb_present_vulkan.c,
- *                make_surface). The display mode itself is asked for by the
- *                activity (GameActivity.requestDisplayMode).
+ *                make_surface): only with RECOMP_ANDROID_FRAMERATE=1 (see
+ *                xbox_AndroidSetFrameRate). The display mode is asked for by
+ *                the activity (GameActivity.requestDisplayMode).
  *
  *   ADPF         APerformanceHint (API 33): a session per hot thread
  *                (guest-main: the title; nv2a-ack: the pushbuffer executor;
@@ -36,8 +37,7 @@
  *                system's threads in the process are left alone. The
  *                threads are looked over at the first frame and every 5 s.
  *
- * RECOMP_ANDROID_ADPF=0 / RECOMP_ANDROID_FRAMERATE=0 / RECOMP_ANDROID_BIGCORES=0:
- * off, for A/B.
+ * RECOMP_ANDROID_ADPF=0 / RECOMP_ANDROID_BIGCORES=0: off, for A/B.
  */
 #if defined(__ANDROID__)
 
@@ -90,9 +90,20 @@ void xbox_AndroidSetFrameRate(void *window, const char *why)
 
     if (!window)
         return;
-    if (env_off("RECOMP_ANDROID_FRAMERATE")) {
-        XR_NOTICE(LOGA "frame rate: not asked for (RECOMP_ANDROID_FRAMERATE=0)\n");
-        return;
+    {
+        /* Off unless asked for: on a 120 Hz Galaxy S20 FE the system kept
+         * the panel at 120 Hz but held the app to a 60 Hz grid (a frame
+         * rate override for its uid), and a race that could not make 60
+         * fell to 26-29 fps (every late frame waited a whole 16.7 ms)
+         * where it ran 36-38 without the request. */
+        const char *e = getenv("RECOMP_ANDROID_FRAMERATE");
+        static int said;
+        if (!(e && e[0] == '1')) {
+            if (!said++)
+                XR_NOTICE(LOGA "frame rate: not asked for (RECOMP_ANDROID_FRAMERATE=1 asks"
+                          " for 60 fps)\n");
+            return;
+        }
     }
     if (!resolved) {
         resolved = 1;
