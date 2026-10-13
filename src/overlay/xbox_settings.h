@@ -294,6 +294,13 @@ typedef struct xbox_music_folder_ops {
     /* May be NULL. Further lines under the status, i = 0..3 (files a scan
      * left out, by name and reason): 1 and the text, or 0 for no more. */
     int  (*note)(int i, char *out, unsigned n);
+    /* May be NULL. Called when the row is pressed, before the browser
+     * opens, on a thread of its own: it may block while the system asks the
+     * player (Android's permission to read music files). 1 opens the
+     * browser, 0 does not. `line` ("" for none) is shown in the row's hint
+     * from then on, either way. While it runs the hint says the game is
+     * waiting for an answer and the row does nothing. */
+    int  (*access)(char *line, unsigned n);
 } xbox_music_folder_ops;
 void xbox_OverlaySetMusicFolder(const xbox_music_folder_ops *ops);
 
