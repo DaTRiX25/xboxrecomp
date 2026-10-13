@@ -5676,6 +5676,14 @@ static void ff_transform(uint32_t *base, uint32_t stride, uint32_t n,
     const float (*m)[4] = s_vsh.c;          /* CMAT0..3: context rows 0..3 */
     uint32_t i, k, per = 0;
 
+    /* A pretransformed (screen-space) batch has the identity composite:
+     * leave it exactly as it was, whatever its w. */
+    if (m[0][0] == 1.0f && m[0][1] == 0.0f && m[0][2] == 0.0f && m[0][3] == 0.0f &&
+        m[1][0] == 0.0f && m[1][1] == 1.0f && m[1][2] == 0.0f && m[1][3] == 0.0f &&
+        m[2][0] == 0.0f && m[2][1] == 0.0f && m[2][2] == 1.0f && m[2][3] == 0.0f &&
+        m[3][0] == 0.0f && m[3][1] == 0.0f && m[3][2] == 0.0f && m[3][3] == 1.0f)
+        return;
+
     switch (s_gpu.prim) {
     case NV_PRIM_POINTS:    per = 1; break;
     case NV_PRIM_LINES:     per = 2; break;
@@ -5689,7 +5697,11 @@ static void ff_transform(uint32_t *base, uint32_t stride, uint32_t n,
         float o[4];
         for (k = 0; k < 4; k++)
             o[k] = in[0] * m[k][0] + in[1] * m[k][1] + in[2] * m[k][2] + in[3] * m[k][3];
-        if (!(o[3] > 1e-6f)) {
+        /* Behind the eye (w), or in front of the near plane (z below 0
+         * once divided; the composite puts z in depth units). There is no
+         * clipping: projected, such a vertex turns a spark into a streak
+         * across the screen. */
+        if (!(o[3] > 1e-6f) || (per && o[2] < 0.0f)) {
             if (per) {
                 /* Collapse the primitive: every vertex of it to one point
                  * off the surface. */
@@ -5704,7 +5716,16 @@ static void ff_transform(uint32_t *base, uint32_t stride, uint32_t n,
                 i = first + per - 1;           /* the rest of it is done */
                 continue;
             }
-            o[3] = 1e-6f;
+            /* A strip or fan cannot lose one primitive: drop the batch,
+             * every vertex to one point off the surface. */
+            for (i = 0; i < n; i++) {
+                float *q = (float *)&base[i * stride];
+                q[0] = -1.0e6f; q[1] = -1.0e6f; q[2] = 0.0f;
+                if (size >= 4)
+                    q[3] = 1.0f;
+            }
+            s_ff_imm_culled++;
+            return;
         }
         p[0] = o[0] / o[3];
         p[1] = o[1] / o[3];
