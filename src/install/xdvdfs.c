@@ -155,7 +155,7 @@ static int walk(xdvdfs_image *img, uint32_t sector, uint32_t size, const char *p
                     "(the image is damaged)", prefix);
     if (at + size > img->size)
         return fail(err, err_size, XDVDFS_E_TRUNCATED, "the image ends before its directory \"%s\" "
-                    "(a truncated download or dump?)", prefix);
+                    "(a truncated download or copy?)", prefix);
     table = (uint8_t *)malloc(size);
     seen = (uint8_t *)calloc(slots + 1, 1);
     todo = (uint32_t *)malloc((slots + 1) * sizeof *todo);
@@ -194,7 +194,7 @@ static int walk(xdvdfs_image *img, uint32_t sector, uint32_t size, const char *p
             uint64_t fo = img->base + (uint64_t)start * XDVDFS_SECTOR;
             if (length && fo + length > img->size)
                 rc = fail(err, err_size, XDVDFS_E_TRUNCATED, "the image ends before the end of "
-                          "\"%s\" (a truncated download or dump?)", path);
+                          "\"%s\" (a truncated download or copy?)", path);
             else if (img->count >= FILES_MAX)
                 rc = fail(err, err_size, XDVDFS_E_CORRUPT, "the image lists too many files%s", "");
             else if (!add_file(img, path, fo, length))
