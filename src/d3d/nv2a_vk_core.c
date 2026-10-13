@@ -772,3 +772,224 @@ void nvk_image_to(VkCommandBuffer cb, struct nvk_image *im, VkImageLayout to)
     nvk_image_barrier(cb, im->img, im->aspect, im->layout, to);
     im->layout = to;
 }
+
+/* ---- bounded GPU waits (nv2a_vk_core.h) ------------------------------------ */
+
+#define WAIT_SLICE_NS 500000000ull       /* one vkWait* call; then the clock is asked */
+
+static const char *const s_wait_site[NVK_WAIT_SITES] = {
+    "serial", "frame", "upload", "present", "shot", "slot"
+};
+enum { FAULT_NONE, FAULT_RETRY, FAULT_TIMEOUT, FAULT_LOST };
+static const char *const s_fault_name[] = { "none", "retry", "timeout", "lost" };
+
+static pthread_once_t s_wait_once = PTHREAD_ONCE_INIT;
+static uint64_t s_wait_limit_ns = 10000000000ull;
+static int      s_wait_cancel;
+static int      s_fault_site = -1, s_fault_kind;
+static uint64_t s_fault_after = 300;
+static uint64_t s_fault_n[NVK_WAIT_SITES];   /* waits made at each site */
+
+static uint64_t wait_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+void nvk_wait_cancel(void)
+{
+    __atomic_store_n(&s_wait_cancel, 1, __ATOMIC_RELEASE);
+}
+
+int nvk_core_lost(void)
+{
+    return __atomic_load_n(&s_lost, __ATOMIC_ACQUIRE);
+}
+
+static void wait_config(void)
+{
+    const char *e = recomp_env(RENV_VK_WAIT_LIMIT);
+    if (e && *e && atol(e) > 0)
+        s_wait_limit_ns = (uint64_t)atol(e) * 1000000ull;
+    e = recomp_env(RENV_VK_WAIT_FAULT);
+    if (e && *e) {
+        const char *c = strchr(e, ':');
+        int i;
+        for (i = 0; c && i < NVK_WAIT_SITES; i++)
+            if ((size_t)(c - e) == strlen(s_wait_site[i]) && !strncmp(e, s_wait_site[i], (size_t)(c - e)))
+                s_fault_site = i;
+        if (c && !strncmp(c + 1, "retry", 5))
+            s_fault_kind = FAULT_RETRY;
+        else if (c && !strncmp(c + 1, "timeout", 7))
+            s_fault_kind = FAULT_TIMEOUT;
+        else if (c && !strncmp(c + 1, "lost", 4))
+            s_fault_kind = FAULT_LOST;
+        c = c ? strchr(c + 1, ':') : NULL;
+        if (c)
+            s_fault_after = (uint64_t)atoll(c + 1);
+        if (s_fault_site < 0 || !s_fault_kind) {
+            s_fault_site = -1;
+            fprintf(stderr, "[vulkan] vk_wait_fault=%s: not understood (site:kind[:n]; sites serial,"
+                    " frame, upload, present, shot, slot; kinds retry, timeout, lost)\n", e);
+        } else {
+            fprintf(stderr, "[vulkan] vk_wait_fault (test hook): %s wait #%llu at site %s\n",
+                    s_fault_name[s_fault_kind], (unsigned long long)s_fault_after + 1,
+                    s_wait_site[s_fault_site]);
+        }
+    }
+    /* The way out cancels a wait still going on another thread. */
+    atexit(nvk_wait_cancel);
+}
+
+/* The fault for this wait at `site`, once (a fatal one ends the run). */
+static int fault_take(int site)
+{
+    uint64_t n;
+    if (s_fault_site != site)
+        return FAULT_NONE;
+    n = __atomic_fetch_add(&s_fault_n[site], 1, __ATOMIC_RELAXED);
+    if (n != s_fault_after)
+        return FAULT_NONE;
+    fprintf(stderr, "[vulkan] vk_wait_fault: %s wait #%llu made to fail: %s\n", s_wait_site[site],
+            (unsigned long long)n + 1, s_fault_name[s_fault_kind]);
+    return s_fault_kind;
+}
+
+static void fault_sleep(uint64_t ns)
+{
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ns / 1000000000ull);
+    ts.tv_nsec = (long)(ns % 1000000000ull);
+    nanosleep(&ts, NULL);
+}
+
+typedef VkResult (*wait_fn)(const void *ctx, uint64_t timeout_ns);
+
+static int wait_bounded(int site, const char *what, wait_fn fn, const void *ctx, VkResult *res)
+{
+    static int said_retry, said_fail;
+    uint64_t t0, el = 0;
+    unsigned timeouts = 0;
+    int fault, out;
+    VkResult r;
+
+    pthread_once(&s_wait_once, wait_config);
+    if (site < 0 || site >= NVK_WAIT_SITES)
+        site = NVK_WAIT_SERIAL;
+    fault = fault_take(site);
+    t0 = wait_now();
+    for (;;) {
+        if (fault == FAULT_LOST) {
+            r = VK_ERROR_DEVICE_LOST;
+        } else if (fault == FAULT_TIMEOUT || (fault == FAULT_RETRY && timeouts < 2)) {
+            fault_sleep(WAIT_SLICE_NS);          /* as a slice that times out */
+            r = VK_TIMEOUT;
+        } else {
+            r = fn(ctx, WAIT_SLICE_NS);
+        }
+        if (r != VK_TIMEOUT)
+            break;
+        timeouts++;
+        el = wait_now() - t0;
+        if (__atomic_load_n(&s_wait_cancel, __ATOMIC_ACQUIRE) || nvk_core_lost()) {
+            fprintf(stderr, "[vulkan] GPU wait (%s, %s): cancelled after %.1f ms (%s)\n",
+                    s_wait_site[site], what, (double)el / 1e6,
+                    nvk_core_lost() ? "the device is lost" : "the run is ending");
+            if (res)
+                *res = r;
+            return NVK_WAIT_CANCELLED;
+        }
+        if (el >= s_wait_limit_ns) {
+            fprintf(stderr, "[vulkan] GPU wait (%s, %s): timed out for good, not done after %.1f ms"
+                    " (%u timeouts, limit %.1f s)\n", s_wait_site[site], what, (double)el / 1e6,
+                    timeouts, (double)s_wait_limit_ns / 1e9);
+            if (res)
+                *res = r;
+            return NVK_WAIT_TIMEOUT;
+        }
+        if (timeouts == 1 && said_retry < 16)
+            fprintf(stderr, "[vulkan] GPU wait (%s, %s): not done after %.1f ms, waiting on"
+                    " (limit %.1f s)\n", s_wait_site[site], what, (double)el / 1e6,
+                    (double)s_wait_limit_ns / 1e9);
+    }
+    if (res)
+        *res = r;
+    if (r == VK_SUCCESS) {
+        if (timeouts && said_retry++ < 16)
+            fprintf(stderr, "[vulkan] GPU wait (%s, %s): done after %u timeouts, %.1f ms\n",
+                    s_wait_site[site], what, timeouts, (double)(wait_now() - t0) / 1e6);
+        return NVK_WAIT_OK;
+    }
+    out = r == VK_ERROR_DEVICE_LOST ? NVK_WAIT_LOST : NVK_WAIT_ERROR;
+    if (said_fail++ < 16)
+        fprintf(stderr, "[vulkan] GPU wait (%s, %s): %s%s after %.1f ms\n", s_wait_site[site], what,
+                out == NVK_WAIT_LOST ? "device lost, " : "failed, ", nvk_result_str(r),
+                (double)(wait_now() - t0) / 1e6);
+    return out;
+}
+
+static VkResult fence_fn(const void *ctx, uint64_t timeout_ns)
+{
+    return vkWaitForFences(s_core.dev, 1, (const VkFence *)ctx, VK_TRUE, timeout_ns);
+}
+
+int nvk_wait_fence(int site, const char *what, VkFence fence, VkResult *res)
+{
+    return wait_bounded(site, what, fence_fn, &fence, res);
+}
+
+struct timeline_ctx { VkSemaphore sem; uint64_t value; };
+
+static VkResult timeline_fn(const void *ctx, uint64_t timeout_ns)
+{
+    const struct timeline_ctx *t = (const struct timeline_ctx *)ctx;
+    VkSemaphoreWaitInfo wi;
+    memset(&wi, 0, sizeof wi);
+    wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &t->sem;
+    wi.pValues = &t->value;
+    return vkWaitSemaphores(s_core.dev, &wi, timeout_ns);
+}
+
+int nvk_wait_timeline(int site, const char *what, VkSemaphore sem, uint64_t value, VkResult *res)
+{
+    struct timeline_ctx t;
+    t.sem = sem;
+    t.value = value;
+    return wait_bounded(site, what, timeline_fn, &t, res);
+}
+
+int nvk_wait_queue(int site, const char *what, VkFence fence, VkResult *res)
+{
+    VkResult r;
+    pthread_mutex_lock(&s_queue_lock);
+    r = vkResetFences(s_core.dev, 1, &fence);
+    if (r == VK_SUCCESS)
+        r = vkQueueSubmit(s_core.queue, 0, NULL, fence);
+    pthread_mutex_unlock(&s_queue_lock);
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "[vulkan] GPU wait (%s, %s): the queue's fence submit failed: %s\n",
+                s_wait_site[site >= 0 && site < NVK_WAIT_SITES ? site : 0], what,
+                nvk_result_str(r));
+        if (res)
+            *res = r;
+        return r == VK_ERROR_DEVICE_LOST ? NVK_WAIT_LOST : NVK_WAIT_ERROR;
+    }
+    return nvk_wait_fence(site, what, fence, res);
+}
+
+int nvk_wait_fatal(int outcome, VkResult res, const char *what)
+{
+    char why[160];
+    if (outcome == NVK_WAIT_OK || outcome == NVK_WAIT_CANCELLED)
+        return 0;
+    if (outcome == NVK_WAIT_TIMEOUT)
+        snprintf(why, sizeof why, "%s: the GPU did not finish within %.0f s", what,
+                 (double)s_wait_limit_ns / 1e9);
+    else
+        snprintf(why, sizeof why, "%s: %s", what, nvk_result_str(res));
+    nvk_device_lost(why);
+    return 1;
+}

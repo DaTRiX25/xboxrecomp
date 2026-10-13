@@ -482,6 +482,26 @@ static void destroy_swapchain(void)
     s_sc_n = 0;
 }
 
+/* A window wait that did not prove the GPU done (nv2a_vk_core.h): the
+ * window draws no more in this run, and unless the run is ending anyway the
+ * device is reported lost (the player is told, the run ends). */
+static int s_gpu_dead;
+
+static void gpu_wait_failed(int outcome, VkResult r, const char *what)
+{
+    if (!s_gpu_dead)
+        fprintf(stderr, LOGP "%s: the GPU wait failed (%s): the window draws no more\n", what,
+                outcome == NVK_WAIT_TIMEOUT ? "timed out for good"
+                : outcome == NVK_WAIT_CANCELLED ? "cancelled" : nvk_result_str(r));
+    s_gpu_dead = 1;
+    nvk_wait_fatal(outcome, r, what);
+}
+
+static int gpu_gone(void)
+{
+    return s_gpu_dead || nvk_core_lost();
+}
+
 static void queue_idle(void)
 {
     nvk_queue_lock();
@@ -872,8 +892,27 @@ void *fbv_slot(int k, uint32_t w, uint32_t h)
         return NULL;
     if (!s->img || s->w != w || s->h != h) {
         if (s->img) {
-            /* A present may still read it: rare (the frame size changed). */
-            queue_idle();
+            /* A present may still read it: rare (the frame size changed).
+             * Freed only once the queue is proven idle. */
+            static VkFence idle;
+            VkResult r = VK_SUCCESS;
+            int out;
+            if (gpu_gone())
+                return NULL;
+            if (!idle) {
+                VkFenceCreateInfo fi;
+                memset(&fi, 0, sizeof fi);
+                fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+                if (vkCreateFence(C->dev, &fi, NULL, &idle) != VK_SUCCESS)
+                    idle = VK_NULL_HANDLE;
+            }
+            if (!idle)
+                return NULL;
+            out = nvk_wait_queue(NVK_WAIT_SLOT, "window slot resize", idle, &r);
+            if (out != NVK_WAIT_OK) {
+                gpu_wait_failed(out, r, "window slot resize");
+                return NULL;
+            }
             nvk_image_free(s);
         }
         if (!nvk_image_new(s, VK_FORMAT_B8G8R8A8_UNORM, w, h, 1,
@@ -899,10 +938,17 @@ int fbv_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pitch
     uint32_t x, y;
     VkResult r;
 
-    if (!C)
+    if (!C || gpu_gone())
         return 0;
     if (s_up_pending) {
-        vkWaitForFences(C->dev, 1, &s_up_fence, VK_TRUE, UINT64_MAX);
+        /* The last upload still reads s_up_buf: not overwritten, and its
+         * fence not reset, before it is proven done. */
+        VkResult wr = VK_SUCCESS;
+        int out = nvk_wait_fence(NVK_WAIT_UPLOAD, "window upload", s_up_fence, &wr);
+        if (out != NVK_WAIT_OK) {
+            gpu_wait_failed(out, wr, "window upload");
+            return 0;
+        }
         s_up_pending = 0;
     }
     if (s_up_buf.size < need) {
@@ -1659,7 +1705,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     int dw = 0, dh = 0, shot;
     VkResult r, pr;
 
-    if (!C)
+    if (!C || gpu_gone())
         return 0;
     SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
     if (dw <= 0 || dh <= 0)
@@ -1681,7 +1727,16 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         if (!make_swapchain(win))
             return 0;
     }
-    vkWaitForFences(C->dev, 1, &s_fence[s_fi], VK_TRUE, UINT64_MAX);
+    {
+        /* The frame's last present: its command buffer, its acquire
+         * semaphore and the fence itself are reused only once it is done. */
+        VkResult wr = VK_SUCCESS;
+        int out = nvk_wait_fence(NVK_WAIT_PRESENT, "window present", s_fence[s_fi], &wr);
+        if (out != NVK_WAIT_OK) {
+            gpu_wait_failed(out, wr, "window present");
+            return 0;
+        }
+    }
     {
         uint64_t t_acq0 = xbox_LatOn() ? xbox_HostNowNs() : 0;
         r = acquire_hook();
@@ -1915,9 +1970,14 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     if (pr == VK_ERROR_SURFACE_LOST_KHR)
         s_surface_lost = 1;
     if (shot) {
-        vkWaitForFences(C->dev, 1, &s_fence[s_fi], VK_TRUE, UINT64_MAX);
-        save_shot((const uint8_t *)s_shot_buf.map, s_sc_ext.width, s_sc_ext.height,
-                  shot_path, flip);
+        /* Read only once the copy is proven done. */
+        VkResult wr = VK_SUCCESS;
+        int out = nvk_wait_fence(NVK_WAIT_SHOT, "window shot", s_fence[s_fi], &wr);
+        if (out == NVK_WAIT_OK)
+            save_shot((const uint8_t *)s_shot_buf.map, s_sc_ext.width, s_sc_ext.height,
+                      shot_path, flip);
+        else
+            gpu_wait_failed(out, wr, "window shot");
     } else if (shot_path) {
         fprintf(stderr, LOGP "window shot at flip %u: the swapchain cannot be read back\n",
                 flip);

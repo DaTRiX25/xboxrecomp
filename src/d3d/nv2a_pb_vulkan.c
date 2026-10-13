@@ -369,47 +369,77 @@ static uint64_t serial_done(void)
     return s_done_serial;
 }
 
-static void serial_wait(uint64_t v)
+/* A GPU wait that did not prove the work done: drawing stops for the run
+ * (vk_on_* return early once s_failed is set) and, unless the run is
+ * ending anyway (a cancelled wait), the device is reported lost, which tells
+ * the player and ends the run (nvk_device_lost). Whatever the wait was for
+ * is left as it is: not reset, reused, freed or read. */
+static void wait_failed(int outcome, VkResult r, const char *what)
 {
-    VkSemaphoreWaitInfo wi;
+    if (!s_failed)
+        fprintf(stderr, LOGP "%s: the GPU wait failed (%s): drawing stops\n", what,
+                outcome == NVK_WAIT_TIMEOUT ? "timed out for good"
+                : outcome == NVK_WAIT_CANCELLED ? "cancelled" : nvk_result_str(r));
+    s_failed = 1;
+    nvk_wait_fatal(outcome, r, what);
+}
+
+/* vk_poll=0: everything submitted so far is waited for through this fence,
+ * an empty submit's (nvk_wait_queue): vkQueueWaitIdle, but bounded. */
+static VkFence s_idle_fence;
+
+/* Wait until the GPU has finished serial v. 1 when it is proven done; 0
+ * when the wait failed (wait_failed has stopped drawing): the caller then
+ * leaves alone whatever v's submits use. */
+static int serial_wait(uint64_t v, int site)
+{
     uint64_t t0;
-    int ok;
+    VkResult r = VK_SUCCESS;
+    int out;
     if (!v || serial_done() >= v)
-        return;
+        return 1;
+    if (s_failed)
+        return 0;
     t0 = s_vf ? now_ns() : 0;
     if (!poll_ok()) {
         /* No semaphore to wait on (see poll_ok): everything submitted. A
          * readback or a full ring, not a frame's normal path. */
         uint64_t last = s_next_serial - 1;
-        nvk_queue_lock();
-        ok = vkQueueWaitIdle(C->queue) == VK_SUCCESS;
-        nvk_queue_unlock();
-        if (ok)
-            serial_known(last);
-        if (s_vf) {
-            s_vf->waits++;
-            s_vf->wait_ns += now_ns() - t0;
+        if (!s_idle_fence) {
+            VkFenceCreateInfo fci;
+            memset(&fci, 0, sizeof fci);
+            fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            if (vkCreateFence(s_dev, &fci, NULL, &s_idle_fence) != VK_SUCCESS)
+                s_idle_fence = VK_NULL_HANDLE;
         }
-        return;
-    }
-    memset(&wi, 0, sizeof wi);
-    wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-    wi.semaphoreCount = 1;
-    wi.pSemaphores = &s_timeline;
-    wi.pValues = &v;
-    ok = vkWaitSemaphores(s_dev, &wi, 5000000000ull) == VK_SUCCESS;
-    if (ok)
-        serial_known(v);
-    if (!ok) {
-        static int said;
-        if (said++ < 4)
-            fprintf(stderr, LOGP "GPU wait for serial %llu timed out\n", (unsigned long long)v);
+        if (s_idle_fence) {
+            out = nvk_wait_queue(site, "backend queue", s_idle_fence, &r);
+        } else {
+            nvk_queue_lock();
+            r = vkQueueWaitIdle(C->queue);
+            nvk_queue_unlock();
+            out = r == VK_SUCCESS ? NVK_WAIT_OK
+                  : r == VK_ERROR_DEVICE_LOST ? NVK_WAIT_LOST : NVK_WAIT_ERROR;
+        }
+        if (out == NVK_WAIT_OK)
+            serial_known(last);
+    } else {
+        out = nvk_wait_timeline(site, "backend serial", s_timeline, v, &r);
+        if (out == NVK_WAIT_OK)
+            serial_known(v);
     }
     if (s_vf) {
         s_vf->waits++;
         s_vf->wait_ns += now_ns() - t0;
     }
+    if (out != NVK_WAIT_OK) {
+        char what[96];
+        snprintf(what, sizeof what, "backend wait for serial %llu", (unsigned long long)v);
+        wait_failed(out, r, what);
+        return 0;
+    }
     serial_done();
+    return 1;
 }
 
 static void garbage_push(const struct nvk_image *im, VkImageView view2,
@@ -420,8 +450,10 @@ static void garbage_push(const struct nvk_image *im, VkImageView view2,
         size_t nc = s_garbage_cap ? s_garbage_cap * 2 : 64;
         Garbage *n = (Garbage *)realloc(s_garbage, nc * sizeof *n);
         if (!n) {
-            /* Out of memory: wait for the GPU and free now. */
-            serial_wait(s_next_serial - 1);
+            /* Out of memory: wait for the GPU and free now; when the
+             * wait fails, they are left (drawing has stopped). */
+            if (!serial_wait(s_next_serial - 1, NVK_WAIT_SERIAL))
+                return;
             if (im) { struct nvk_image t = *im; nvk_image_free(&t); }
             if (view2) vkDestroyImageView(s_dev, view2, NULL);
             if (buf) { struct nvk_buffer t = *buf; nvk_buffer_free(&t); }
@@ -565,7 +597,9 @@ static void rings_reset(void)
 
 /* End the open pass, submit what is recorded (uploads first) and, with
  * `wait`, block until the GPU is done with it. After a wait every ring is
- * free again. */
+ * free again. Returns 0 when drawing has stopped (a lost device, a failed
+ * wait): then nothing the GPU may still use was reset, and nothing it
+ * wrote is there to be read. */
 static int s_flush_fence;    /* the next submit signals the frame's fence */
 
 /* vk_batch: a frame's commands go to the GPU in parts, at the boundaries
@@ -594,7 +628,7 @@ static unsigned batch_draws(void)
     return (unsigned)n;
 }
 
-static void flush(int wait, int why)
+static int flush(int wait, int why)
 {
     VkCommandBuffer cbs[2];
     VkSubmitInfo si;
@@ -606,17 +640,30 @@ static void flush(int wait, int why)
     VkResult r;
 
     end_encoder();
+    if (!s_failed && nvk_core_lost()) {
+        /* Lost where the window found it (a wait or a present of its own). */
+        fprintf(stderr, LOGP "the device is reported lost: drawing stops\n");
+        s_failed = 1;
+    }
+    if (s_failed) {
+        /* The device is gone or a wait failed: nothing more is submitted. */
+        s_cmd = VK_NULL_HANDLE;
+        s_up = VK_NULL_HANDLE;
+        s_flush_fence = 0;
+        return 0;
+    }
     if (s_flush_fence && (s_cmd || s_up) && s_fr[s_fi].fence && !s_fr[s_fi].fence_serial)
         fence = s_fr[s_fi].fence;
     s_flush_fence = 0;
     if (!s_cmd && !s_up) {
         if (wait) {
-            serial_wait(s_next_serial - 1);
+            if (!serial_wait(s_next_serial - 1, NVK_WAIT_SERIAL))
+                return 0;
             rings_reset();
             s_flushes++;
             occ_after_wait();
         }
-        return;
+        return 1;
     }
     if (s_up) {
         vkEndCommandBuffer(s_up);
@@ -698,9 +745,16 @@ static void flush(int wait, int why)
             fprintf(stderr, LOGP "device lost: drawing stops\n");
             s_failed = 1;
             nvk_device_lost("vkQueueSubmit: VK_ERROR_DEVICE_LOST");
+        } else {
+            /* Out of memory: the batch did not go (the spec leaves its
+             * semaphores and fence as they were), so its serial is the next
+             * submit's; a wait for it would otherwise be on a value nothing
+             * signals. The frame's fence was not taken (fence_serial 0). */
+            s_next_serial = serial;
         }
     }
-    s_fr[s_fi].serial = serial;
+    if (r == VK_SUCCESS)
+        s_fr[s_fi].serial = serial;
     s_cmd = VK_NULL_HANDLE;
     s_up = VK_NULL_HANDLE;
     s_flushes++;
@@ -709,11 +763,16 @@ static void flush(int wait, int why)
         s_batch_draw0 = s_draws;
         s_batch_t0 = now_ns();
     }
+    if (s_failed)
+        return 0;
     if (wait) {
-        serial_wait(serial);
+        /* After a submit that did not go: what went before it. */
+        if (!serial_wait(r == VK_SUCCESS ? serial : serial - 1, NVK_WAIT_SERIAL))
+            return 0;
         rings_reset();
         occ_after_wait();
     }
+    return 1;
 }
 
 /* `bytes` from ring k, aligned; on overflow the frame so far is flushed
@@ -725,7 +784,8 @@ static void *ring_alloc(int k, VkDeviceSize bytes, VkDeviceSize align, VkDeviceS
     if (bytes > s_ring_size[k])
         return NULL;
     if (at + bytes > s_ring_size[k]) {
-        flush(1, FL_RING);   /* resets every ring */
+        if (!flush(1, FL_RING))   /* resets every ring */
+            return NULL;          /* or drawing has stopped */
         at = 0;
     }
     s_ring_pos[k] = at + bytes;
@@ -2760,7 +2820,11 @@ static VkSampler sampler(const Stage *t, unsigned scale)
         static unsigned next;
         i = (int)(next++ % SMP_MAX);
         /* A recorded draw may still use it. */
-        flush(1, FL_SAMPLER);
+        if (!flush(1, FL_SAMPLER)) {
+            /* Drawing has stopped: the old one stays, the new one is unused. */
+            vkDestroySampler(s_dev, st, NULL);
+            return s_smp[i].s;
+        }
         vkDestroySampler(s_dev, s_smp[i].s, NULL);
     }
     s_smp[i].key = key;
@@ -3577,7 +3641,8 @@ static const uint8_t *host_readback(RenderTarget *rt)
     int k;
 
     if (s_rb.size < need) {
-        flush(1, FL_READBACK);
+        if (!flush(1, FL_READBACK))
+            return NULL;
         nvk_buffer_free(&s_rb);
         if (!nvk_buffer_new(&s_rb, need, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -3613,7 +3678,8 @@ static const uint8_t *host_readback(RenderTarget *rt)
     }
     for (k = 0; k < RING_N; k++)
         pos[k] = s_ring_pos[k];
-    flush(1, FL_READBACK);
+    if (!flush(1, FL_READBACK))
+        return NULL;      /* the copy is not proven done: nothing to read */
     for (k = 0; k < RING_N; k++)
         s_ring_pos[k] = pos[k];
     return (const uint8_t *)s_rb.map;
@@ -4057,14 +4123,27 @@ static void frame_advance(void)
     uint32_t k;
     uint64_t t0;
 
+    if (s_failed)
+        return;
     s_fi = (s_fi + 1) % s_frames;
     f = &s_fr[s_fi];
     if (f->fence_serial) {
         /* vk_poll=0: the frame's fence, signalled long ago as a rule; the
-         * wait is the question and, when the GPU is behind, the answer. */
+         * wait is the question and, when the GPU is behind, the answer.
+         * Not done: the fence stays as it is (a pending fence must not be
+         * reset) and so does everything of the frame's. */
+        VkResult fr = VK_SUCCESS;
+        int out;
         t0 = now_ns();
-        if (vkWaitForFences(s_dev, 1, &f->fence, VK_TRUE, 5000000000ull) == VK_SUCCESS)
-            serial_known(f->fence_serial);
+        out = nvk_wait_fence(NVK_WAIT_FRAME, "backend frame fence", f->fence, &fr);
+        if (out != NVK_WAIT_OK) {
+            char what[96];
+            snprintf(what, sizeof what, "backend frame fence (serial %llu)",
+                     (unsigned long long)f->fence_serial);
+            wait_failed(out, fr, what);
+            return;
+        }
+        serial_known(f->fence_serial);
         vkResetFences(s_dev, 1, &f->fence);
         f->fence_serial = 0;
         t0 = now_ns() - t0;
@@ -4078,10 +4157,13 @@ static void frame_advance(void)
         }
     }
     if (f->serial && serial_done() < f->serial) {
+        int ok;
         t0 = now_ns();
-        serial_wait(f->serial);
+        ok = serial_wait(f->serial, NVK_WAIT_FRAME);
         s_frame_waits++;
         s_frame_wait_ns += now_ns() - t0;
+        if (!ok)
+            return;     /* its pools and rings may still be in use */
     }
     vkResetCommandPool(s_dev, f->pool, 0);
     f->used = 0;
