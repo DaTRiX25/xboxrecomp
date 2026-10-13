@@ -2859,6 +2859,115 @@ static float key_cap(ImDrawList *dl, float x, float cy, float size, const char *
     return w;
 }
 
+/* The arrow keys as one cluster, up over left, down and right, each a small
+ * cap with a triangle: as high as a key_cap. */
+static float arrows_gap(float size) { return fmaxf(1.0f, size * 0.78f * 0.07f); }
+static float arrows_cell(float size) { return (size * 0.78f * 1.55f - arrows_gap(size)) * 0.5f; }
+static float arrows_width(float size) { return 3.0f * arrows_cell(size) + 2.0f * arrows_gap(size); }
+
+/* Returns its width. */
+static float arrows_cap(ImDrawList *dl, float x, float cy, float size, ImU32 c)
+{
+    const float g = arrows_gap(size), s = arrows_cell(size);
+    const float y0 = cy - (2.0f * s + g) * 0.5f, r = s * 0.28f, t = s * 0.26f, th = fmaxf(1.0f, size * 0.78f * 0.07f);
+    auto one = [&](int col_i, int row_i, int dir) {     /* dir: 0 up, 1 left, 2 down, 3 right */
+        const float bx = x + col_i * (s + g), by = y0 + row_i * (s + g), mx = bx + s * 0.5f, my = by + s * 0.5f;
+        dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + s, by + s), col(T->box_fill, 0.85f), r);
+        dl->AddRect(ImVec2(bx, by), ImVec2(bx + s, by + s), c, r, 0, th);
+        const float a = t, b = t * 0.75f;
+        ImVec2 p0, p1, p2;
+        switch (dir) {
+        case 0:  p0 = ImVec2(mx, my - a); p1 = ImVec2(mx - a, my + b); p2 = ImVec2(mx + a, my + b); break;
+        case 1:  p0 = ImVec2(mx - a, my); p1 = ImVec2(mx + b, my - a); p2 = ImVec2(mx + b, my + a); break;
+        case 2:  p0 = ImVec2(mx, my + a); p1 = ImVec2(mx + a, my - b); p2 = ImVec2(mx - a, my - b); break;
+        default: p0 = ImVec2(mx + a, my); p1 = ImVec2(mx - b, my + a); p2 = ImVec2(mx - b, my - a); break;
+        }
+        dl->AddTriangleFilled(p0, p1, p2, c);
+    };
+    one(1, 0, 0);
+    one(0, 1, 1);
+    one(1, 1, 2);
+    one(2, 1, 3);
+    return arrows_width(size);
+}
+
+/* One key by its name: Arrows is the cluster, the others a labelled cap. */
+static float key_by_name(ImDrawList *dl, float x, float cy, float size, const char *name, ImU32 c)
+{
+    if (!strcmp(name, "Arrows"))
+        return arrows_cap(dl, x, cy, size, c);
+    return key_cap(dl, x, cy, size, name, c);
+}
+
+static float key_name_width(float size, const char *name)
+{
+    return !strcmp(name, "Arrows") ? arrows_width(size) : key_width(size, name);
+}
+
+/* The footer's key hints as caps. `keys` is groups of "Key  word" (two
+ * spaces) apart by three or more; a key may be "Enter or Esc". Draws it from
+ * x when it fits in w and returns true; else draws nothing and returns false
+ * (the caller writes the text). */
+static bool key_hints(ImDrawList *dl, float x, float cy, float size, ImU32 c, const char *keys, float w)
+{
+    struct Part { char key[48], word[96]; };
+    Part parts[10];
+    int n = 0;
+    const char *p = keys;
+    while (*p && n < 10) {
+        const char *e = p;
+        while (*e && !(e[0] == ' ' && e[1] == ' ' && e[2] == ' '))
+            e++;
+        const char *k = p;
+        while (k < e && !(k[0] == ' ' && k[1] == ' '))
+            k++;
+        if (k >= e || (size_t)(k - p) >= sizeof parts[n].key || (size_t)(e - k - 2) >= sizeof parts[n].word)
+            return false;
+        memcpy(parts[n].key, p, (size_t)(k - p));
+        parts[n].key[k - p] = 0;
+        memcpy(parts[n].word, k + 2, (size_t)(e - k - 2));
+        parts[n].word[e - k - 2] = 0;
+        n++;
+        while (*e == ' ')
+            e++;
+        p = e;
+    }
+    if (*p)
+        return false;
+    const float gap = size * 0.5f, sep = size * 1.4f;
+    for (int pass = 0; pass < 2; pass++) {
+        float cx = x;
+        for (int i = 0; i < n; i++) {
+            const char *k = parts[i].key;
+            for (;;) {
+                const char *o = strstr(k, " or ");
+                char one[48];
+                const size_t len = o ? (size_t)(o - k) : strlen(k);
+                memcpy(one, k, len);
+                one[len] = 0;
+                if (pass == 0)
+                    cx += key_name_width(size, one);
+                else
+                    cx += key_by_name(dl, cx, cy, size, one, c);
+                if (!o)
+                    break;
+                Face body(s_f_body, SHEAR);
+                if (pass == 1)
+                    txt(dl, size, ImVec2(cx + gap, top_for(cy, size)), c, "or");
+                cx += gap * 2.0f + tw(size, "or");
+                k = o + 4;
+            }
+            Face body(s_f_body, SHEAR);
+            if (pass == 1)
+                txt(dl, size, ImVec2(cx + gap, top_for(cy, size)), c, parts[i].word);
+            cx += gap + tw(size, parts[i].word) + sep;
+        }
+        if (pass == 0 && cx - sep - x > w)
+            return false;
+    }
+    return true;
+}
+
 /* A small tag after a label: RESTART in attention yellow where the value
  * has changed since the game started (a restart applies it), in the
  * disabled grey where the setting is only read at start. Returns its width. */
@@ -3082,7 +3191,7 @@ static void draw_prompts(ImDrawList *dl)
             dpad_glyph(dl, x + w * 0.5f, cy, sz * 1.25f, col({255, 255, 255}));
         } else {
             Face up(s_f_ui);
-            w = key_cap(dl, x, cy, sz, "Arrows", c);
+            w = arrows_cap(dl, x, cy, sz, c);
         }
         txt(dl, sz, ImVec2(x + w + gap, top_for(cy, sz)), c, "Change");
     }
@@ -3118,6 +3227,10 @@ static void draw_footer(ImDrawList *dl)
         return;
     Face body(s_f_body);
     const float cy = (LY.y_foot + LY.H) * 0.5f;
+    /* On the keyboard the keys are caps (Arrows is the cluster of four). */
+    if (!pad_hints() && key_hints(dl, LY.cx + 0.056f * LY.cw, cy, LY.foot, s_foot_attn ? col(T->attn) : col(T->hint),
+                                  s_foot_keys, 0.888f * LY.cw))
+        return;
     txt_fit(dl, LY.foot, ImVec2(LY.cx + 0.056f * LY.cw, top_for(cy, LY.foot)),
             s_foot_attn ? col(T->attn) : col(T->hint), s_foot_keys, 0.888f * LY.cw);
 }
