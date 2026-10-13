@@ -1034,15 +1034,16 @@ static void game_font_from_env(void)
  * OVERLAY_SHOT_GAME_ART="<file>;<size>;<sha256>;<off>,<w>,<h>,<dxt>;..." with one
  * <off>,<w>,<h>,<dxt> for each of the nine sprites of the enum, as a port
  * names them; OVERLAY_SHOT_GAME_ART_EXPECT=0 expects a refusal.
- * OVERLAY_SHOT_PAD_SHEETS=<dir> holds set1.argb ... set8.argb (128x64 words
- * A8R8G8B8, the port's drawings for glyph sets 1..8); set 5 replaces only the
+ * OVERLAY_SHOT_PAD_SHEETS=<dir> holds set1.argb ... set8.argb, and set9.argb when
+ * the port has a ninth (128x64 words A8R8G8B8, the port's drawings for glyph
+ * sets 1..9; the ninth is the keyboard's key caps); set 5 replaces only the
  * lower rectangles (the Xbox pads print A B X Y as the title does), the others
  * the whole sheet, as a port's table does. OVERLAY_SHOT_GLYPHS=<mode> sets
  * input.glyphs (xbox_modern, playstation ...). Nothing of a title is in this tool. */
-static uint32_t s_pad_img[8][128 * 64];
+static uint32_t s_pad_img[9][128 * 64];
 static const nv2a_texrep_rect k_pad_all[] = { { 0, 0, 128, 64 } };
 static const nv2a_texrep_rect k_pad_lower[] = { { 0, 30, 62, 34 }, { 62, 29, 18, 35 }, { 80, 29, 48, 35 } };
-static struct nv2a_texrep_variant s_pad_var[8];
+static struct nv2a_texrep_variant s_pad_var[9];
 static void game_art_from_env(void)
 {
     const char *g = getenv("OVERLAY_SHOT_GLYPHS");
@@ -1050,18 +1051,22 @@ static void game_art_from_env(void)
         xbox_InputSetGlyphMode(xbox_GlyphModeFromName(g));
     const char *dir = getenv("OVERLAY_SHOT_PAD_SHEETS");
     if (dir && dir[0]) {
-        for (int i = 0; i < 8; i++) {
+        int n = 0;
+        for (int i = 0; i < 9; i++) {
             char path[1100];
             snprintf(path, sizeof path, "%s/set%d.argb", dir, i + 1);
             FILE *f = fopen(path, "rb");
+            if (!f && i == 8)
+                break;                       /* sets 1..8 are all an older port had */
             const bool ok = f && fread(s_pad_img[i], sizeof s_pad_img[i], 1, f) == 1;
             if (f) fclose(f);
             CHECK(ok);
             s_pad_var[i].image = s_pad_img[i];
             s_pad_var[i].rects = i == 4 ? k_pad_lower : k_pad_all;
             s_pad_var[i].n_rects = i == 4 ? 3 : 1;
+            n++;
         }
-        xbox_OverlaySetPadSheets(s_pad_var, 8);
+        xbox_OverlaySetPadSheets(s_pad_var, n);
     }
     const char *e = getenv("OVERLAY_SHOT_GAME_ART");
     if (!e || !e[0])

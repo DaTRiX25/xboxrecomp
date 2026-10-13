@@ -11,12 +11,13 @@
 #include <string.h>
 
 static const char *const k_mode[XBOX_GLYPHS_MODE_COUNT] = {
-    "auto", "xbox", "xbox_modern", "playstation", "playstation5", "nintendo", "steam", "positional"
+    "auto", "xbox", "xbox_modern", "playstation", "playstation5", "nintendo", "steam", "positional", "keyboard"
 };
 static const char *const k_set[XBOX_GLYPH_SET_COUNT] = {
     "xbox (the title's own)", "playstation", "nintendo (by position)",
     "nintendo (by letter)", "steam", "xbox modern (LB RB LT RT)",
-    "positional", "positional (read by letter)", "playstation 5 (DualSense)"
+    "positional", "positional (read by letter)", "playstation 5 (DualSense)",
+    "keyboard"
 };
 
 static int ci_has(const char *s, const char *sub)
@@ -94,6 +95,8 @@ xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family
         return XBOX_GLYPH_SET_PLAYSTATION5;
     case XBOX_GLYPHS_STEAM:
         return XBOX_GLYPH_SET_STEAM;
+    case XBOX_GLYPHS_KEYBOARD:
+        return XBOX_GLYPH_SET_KEYBOARD;
     case XBOX_GLYPHS_POSITIONAL:
         return by_letter ? XBOX_GLYPH_SET_POSITIONAL_SWAPPED : XBOX_GLYPH_SET_POSITIONAL;
     case XBOX_GLYPHS_NINTENDO:
@@ -113,7 +116,7 @@ xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family
     case XBOX_PAD_FAMILY_XBOX_MODERN:
         return face_nintendo ? XBOX_GLYPH_SET_NINTENDO_LABEL : XBOX_GLYPH_SET_XBOX_MODERN;
     case XBOX_PAD_FAMILY_KEYBOARD:  /* the keyboard was used last */
-        return XBOX_GLYPH_SET_XBOX_MODERN;
+        return XBOX_GLYPH_SET_KEYBOARD;
     case XBOX_PAD_FAMILY_XBOX:      /* a pad of no known family */
         return by_letter ? XBOX_GLYPH_SET_POSITIONAL_SWAPPED : XBOX_GLYPH_SET_POSITIONAL;
     default:                        /* no pad yet */

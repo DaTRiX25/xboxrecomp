@@ -146,11 +146,22 @@ int main(void)
                 }
     }
 
-    /* The keyboard as the device in use: the modern Xbox set (until it has
-     * its own), whatever the face layout; a fixed choice still wins. */
-    CHECK(xbox_GlyphSetResolve(XBOX_GLYPHS_AUTO, KB, 0, 0) == XBOX_GLYPH_SET_XBOX_MODERN);
-    CHECK(xbox_GlyphSetResolve(XBOX_GLYPHS_AUTO, KB, 1, 1) == XBOX_GLYPH_SET_XBOX_MODERN);
+    /* The keyboard as the device in use: its own key caps, whatever the
+     * face layout; a fixed choice still wins. */
+    CHECK(xbox_GlyphSetResolve(XBOX_GLYPHS_AUTO, KB, 0, 0) == XBOX_GLYPH_SET_KEYBOARD);
+    CHECK(xbox_GlyphSetResolve(XBOX_GLYPHS_AUTO, KB, 1, 1) == XBOX_GLYPH_SET_KEYBOARD);
     CHECK(xbox_GlyphSetResolve(XBOX_GLYPHS_PLAYSTATION, KB, 0, 0) == XBOX_GLYPH_SET_PLAYSTATION);
+    /* The key caps by hand: any pad, either face layout, no pad at all. */
+    {
+        int f, l, n;
+        for (f = 0; f < XBOX_PAD_FAMILY_COUNT; f++)
+            for (l = 0; l < 2; l++)
+                for (n = 0; n < 2; n++) {
+                    CHECK(xbox_GlyphSetResolve(XBOX_GLYPHS_KEYBOARD, (xbox_pad_family)f, l, n) == XBOX_GLYPH_SET_KEYBOARD);
+                    /* and auto picks them for the keyboard and for nothing else */
+                    CHECK((xbox_GlyphSetResolve(XBOX_GLYPHS_AUTO, (xbox_pad_family)f, l, n) == XBOX_GLYPH_SET_KEYBOARD) == (f == (int)KB));
+                }
+    }
 
     /* ── names ── */
     CHECK(xbox_GlyphModeFromName("auto") == XBOX_GLYPHS_AUTO);
@@ -160,6 +171,14 @@ int main(void)
     CHECK(xbox_GlyphModeFromName("playstation5") == XBOX_GLYPHS_PLAYSTATION5 && xbox_GlyphModeFromName("playstation") == XBOX_GLYPHS_PLAYSTATION);
     CHECK(xbox_GlyphModeFromName("positional") == XBOX_GLYPHS_POSITIONAL && xbox_GlyphModeFromName("Positional") == XBOX_GLYPHS_POSITIONAL);
     CHECK(!strcmp(xbox_GlyphModeName(XBOX_GLYPHS_POSITIONAL), "positional"));
+    CHECK(xbox_GlyphModeFromName("keyboard") == XBOX_GLYPHS_KEYBOARD && xbox_GlyphModeFromName("Keyboard") == XBOX_GLYPHS_KEYBOARD);
+    CHECK(!strcmp(xbox_GlyphModeName(XBOX_GLYPHS_KEYBOARD), "keyboard"));
+    CHECK(XBOX_GLYPHS_KEYBOARD == XBOX_GLYPHS_MODE_COUNT - 1 && XBOX_GLYPH_SET_KEYBOARD == XBOX_GLYPH_SET_COUNT - 1);
+    {   /* every mode has its own name, in the order of the setting's choices */
+        int i;
+        for (i = 0; i < XBOX_GLYPHS_MODE_COUNT; i++)
+            CHECK(xbox_GlyphModeFromName(xbox_GlyphModeName((xbox_glyph_mode)i)) == i);
+    }
     CHECK(xbox_GlyphModeFromName("decks") == -1);
     CHECK(xbox_GlyphModeFromName("") == -1 && xbox_GlyphModeFromName(NULL) == -1);
 
@@ -206,9 +225,27 @@ int main(void)
     xbox_InputSetActivePad(PS, 0);
     CHECK(xbox_InputGlyphSet() == XBOX_GLYPH_SET_PLAYSTATION);
     xbox_InputSetActivePad(KB, 0);
-    CHECK(xbox_InputGlyphSet() == XBOX_GLYPH_SET_XBOX_MODERN && xbox_InputActivePadFamily() == KB);
-    xbox_InputSetActivePad(PS, 0);
+    CHECK(xbox_InputGlyphSet() == XBOX_GLYPH_SET_KEYBOARD && xbox_InputActivePadFamily() == KB);
+    CHECK(st_last == XBOX_GLYPH_SET_KEYBOARD);                     /* the title is told */
+    xbox_InputSetActivePad(KB, 0);                                 /* a second key: nothing changes */
+    {
+        int calls = st_calls;
+        xbox_InputSetActivePad(KB, 0);
+        CHECK(st_calls == calls);
+    }
+    xbox_InputSetActivePad(PS, 0);                                 /* the next pad button: the pad's set is back */
     CHECK(xbox_InputGlyphSet() == XBOX_GLYPH_SET_PLAYSTATION && xbox_InputActivePadFamily() == PS);
+    CHECK(st_last == XBOX_GLYPH_SET_PLAYSTATION);
+    xbox_InputSetActivePad(XM, 0);
+    xbox_InputSetActivePad(KB, 0);
+    xbox_InputSetActivePad(XM, 0);
+    CHECK(st_last == XBOX_GLYPH_SET_XBOX_MODERN);
+    xbox_InputSetGlyphMode(XBOX_GLYPHS_KEYBOARD);                  /* by hand: any pad leaves it */
+    CHECK(st_last == XBOX_GLYPH_SET_KEYBOARD);
+    xbox_InputSetActivePad(PS, 0);
+    CHECK(xbox_InputGlyphSet() == XBOX_GLYPH_SET_KEYBOARD);
+    xbox_InputSetGlyphMode(XBOX_GLYPHS_AUTO);
+    CHECK(xbox_InputGlyphSet() == XBOX_GLYPH_SET_PLAYSTATION);
 
     printf("pad_glyphs: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail != 0;
