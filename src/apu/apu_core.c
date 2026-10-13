@@ -1273,9 +1273,15 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+void xbox_log_thread_role(const char *role, uint32_t routine);
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    /* Named (the OS, the hang report; on Android the hot threads' ADPF
+     * session and the big cores, android_perf.c). Unnamed it carried the
+     * name of the thread that made it: "Thread-8" on a phone. */
+    xbox_log_thread_role("mcpx-apu", 0);
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
