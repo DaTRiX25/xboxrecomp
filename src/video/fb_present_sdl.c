@@ -903,6 +903,11 @@ static int android_teardown_begin(int vk)
     XR_NOTICE("[TEARDOWN] begin (%s)\n", vk ? "Vulkan" : "no Vulkan device");
     if (pthread_create(&th, NULL, td_watchdog, NULL) == 0)
         pthread_detach(th);
+    {
+        /* The ADPF sessions (android_perf.c), from the thread that reports. */
+        extern void xbox_AndroidPerfClose(void);
+        xbox_AndroidPerfClose();
+    }
 #if defined(XBOXRECOMP_HAVE_VULKAN)
     if (vk) {
         held = xbox_HostHoldForExit(1500);
@@ -1503,6 +1508,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 shoot = 0;
                 s_shot_req[0] = 0;
                 presents++;
+#if defined(__ANDROID__)
+                {
+                    /* The hot threads' work for this frame (android_perf.c). */
+                    extern void xbox_AndroidPerfFrame(void);
+                    xbox_AndroidPerfFrame();
+                }
+#endif
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
                 xbox_OverlayFramePresented();
 #endif
