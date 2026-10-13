@@ -43,7 +43,9 @@ static int s_failed;
  * the Retroid Pocket 5's Adreno 650: RBBM_STATUS 0x00E59005, the vertex
  * front end and the shader cores busy with no memory traffic, inside a
  * tile's draws; the family of Mesa issues #5220 and #4923). Without the
- * binning pass (TU_DEBUG=nobin) the tiles still render in GMEM. Asked before
+ * binning pass (TU_DEBUG=nobin) the tiles still render in GMEM. Without UBWC
+ * compression as well (noubwc) the RP5 ran 77 minutes in one process with no
+ * hang (2026-10-13), where nobin alone hung about every 40. Asked before
  * the driver is opened; a TU_DEBUG the player set (env.txt, even empty) is
  * left as it is. */
 static void turnip_defaults(void)
@@ -61,8 +63,8 @@ static void turnip_defaults(void)
     model[strcspn(model, "\r\n")] = 0;
     if (strncmp(model, "Adreno6", 7))
         return;
-    setenv("TU_DEBUG", "nobin", 0);
-    fprintf(stderr, "[vulkan] %s: TU_DEBUG=nobin (no binning pass; BO-128)\n", model);
+    setenv("TU_DEBUG", "nobin,noubwc", 0);
+    fprintf(stderr, "[vulkan] %s: TU_DEBUG=nobin,noubwc (no binning pass, no UBWC; BO-128)\n", model);
 }
 
 static void open_loader(void)
