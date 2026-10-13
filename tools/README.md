@@ -274,4 +274,4 @@ If you regenerate the recompiled code (after fixing the recompiler or re-running
 Recommended workflow:
 1. Keep manual overrides in a separate file (`recomp_manual.c`)
 2. Use `#if 0` / `#endif` to disable gen functions that have manual replacements
-3. Track gen patches in a document (see CLAUDE.md in the burnout3 repo for an example)
+3. Keep a log of the gen patches in your port's repository

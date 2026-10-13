@@ -27,6 +27,10 @@ LGPL-2.1-or-later — extracted from xemu
                           2019-2025 Matt Borgerson
     src/apu/apu_debug.h   (c) 2020-2021 Matt Borgerson
     src/apu/fpconv.h      (c) 2020-2025 Matt Borgerson
+    src/apu/apu.h         the APU code's public API; the file says
+                          "Extracted from xemu (LGPL v2+)" and names no
+                          copyright holder, so it is listed here with the
+                          files above
     src/nv2a/nv2a_regs.h  NV2A register definitions
                           (c) 2012 espes; 2015 Jannik Vogel
     src/nv2a/nv2a_core.c  NV2A register handlers, adapted from xemu's
@@ -155,6 +159,14 @@ Derived algorithms — credited, independently implemented
     Cube-map face selection and face stride. Cites xemu's
     hw/xbox/nv2a/pgraph texture code (texture.c) as the reference for the
     face order and the per-face layout.
+
+  src/d3d/nv2a_vk_glsl.c
+    GLSL to SPIR-V with glslang. The call sequence and input settings follow
+    xemu's pgraph_vk_compile_glsl_to_spv (hw/xbox/nv2a/pgraph/vk/glsl.c,
+    LGPL-2.1-or-later): preprocess, parse, link with the SPIR-V and Vulkan
+    rules, generate. Those are the steps glslang's C API asks for. The code
+    here is this project's own, with its own error handling, limits and
+    caching.
 
   Algorithms and hardware behaviour are not themselves copyrightable, and
   these are our own implementations. They are listed here because the debt is

@@ -1,8 +1,8 @@
 /**
  * GLSL -> SPIR-V with glslang, and the SPIR-V disk cache (see nv2a_vk_glsl.h).
  *
- * The glslang call sequence is xemu's pgraph_vk_compile_glsl_to_spv
- * (hw/xbox/nv2a/pgraph/vk/glsl.c, LGPL-2.1+): preprocess, parse, link with
+ * The glslang call sequence follows xemu's pgraph_vk_compile_glsl_to_spv
+ * (hw/xbox/nv2a/pgraph/vk/glsl.c; credited in NOTICE): preprocess, parse, link with
  * SPV and Vulkan rules, generate. Unlike xemu, a failure is returned (and
  * logged by the caller with the source) rather than asserted, and the
  * resource limits are glslang's defaults.
