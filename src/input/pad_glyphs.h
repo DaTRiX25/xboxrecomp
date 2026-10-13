@@ -22,6 +22,10 @@
  *                dots with the one to press filled (bottom, right, left,
  *                top); L1 R1 L2 R2, Menu. auto picks it for
  *                a pad of unknown family (a handheld's built-in pad)
+ *   keyboard     key caps for the keyboard's own keys (keyboard.h): Space for
+ *                A, Backspace B, Shift X, Ctrl Y, Q and E for the white and
+ *                black buttons, S and W for the triggers, Enter for Start.
+ *                auto picks it while the keyboard was the last device used
  *
  * This file is the choice, without SDL and without a renderer: the family of
  * a pad from what the host knows about it, and the glyph set that follows
@@ -58,6 +62,7 @@ typedef enum {
     XBOX_GLYPHS_NINTENDO,
     XBOX_GLYPHS_STEAM,
     XBOX_GLYPHS_POSITIONAL,
+    XBOX_GLYPHS_KEYBOARD,
     XBOX_GLYPHS_MODE_COUNT
 } xbox_glyph_mode;
 
@@ -83,6 +88,7 @@ typedef enum {
     XBOX_GLYPH_SET_POSITIONAL,
     XBOX_GLYPH_SET_POSITIONAL_SWAPPED,
     XBOX_GLYPH_SET_PLAYSTATION5,
+    XBOX_GLYPH_SET_KEYBOARD,
     XBOX_GLYPH_SET_COUNT
 } xbox_glyph_set;
 
@@ -139,8 +145,8 @@ xbox_pad_family xbox_PadFamilyFromIds(xbox_pad_family by_type, unsigned vendor,
  * to be wrong (POSITIONAL_SWAPPED when face_nintendo says the pad is read by
  * letter). auto with no pad at all (FAMILY_NONE) is XBOX: the title's own
  * prompts, nothing replaced. auto with the keyboard as the last device
- * (FAMILY_KEYBOARD) is XBOX_MODERN until the keyboard has a set of its own;
- * the face layout does not change it. */
+ * (FAMILY_KEYBOARD) is KEYBOARD, whatever the face layout: its keys are named,
+ * not placed. The next button of a pad puts the pad's set back. */
 xbox_glyph_set xbox_GlyphSetResolve(xbox_glyph_mode mode, xbox_pad_family family,
                                     int label_mapped, int face_nintendo);
 
