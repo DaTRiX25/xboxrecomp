@@ -105,8 +105,8 @@ static int window_end(XboxPowerAuto *a, uint64_t now)
                 a->level = up;
                 a->last_up_ns = now;
                 a->tot.ups++;
-                snprintf(a->why, sizeof a->why, "still %d near misses, %d late wakes",
-                         a->nears, a->late_wakes);
+                snprintf(a->why, sizeof a->why, "trouble %d -> %d after the last step: one more",
+                         a->probe_base, a->probe_score);
             } else {
                 a->level = a->probe_from;
                 a->ceiling = a->probe_from;
