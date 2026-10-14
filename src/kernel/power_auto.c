@@ -20,6 +20,7 @@
 #define CEIL_WAIT_NS       (60000 * MS)
 #define CEIL_WAIT_MAX_NS   (600000 * MS)
 #define HELD_DECAY_NS      (600000 * MS)
+#define RUNUP_NS           (20000 * MS)         /* a climb this soon before a stall: its run-up */
 #define MAX_LEVEL          (XBOX_POWER_AUTO_LEVELS - 1)
 
 static const uint32_t k_lead_us[XBOX_POWER_AUTO_LEVELS] = { 0, 2000, 4000, 8000, 12000, 17000 };
@@ -132,6 +133,13 @@ static int window_end(XboxPowerAuto *a, uint64_t now)
             if (to > a->level) {
                 if (a->last_down_ns && now - a->last_down_ns < OSC_NS)
                     a->down_need = a->down_need * 2 > DOWN_RUN_MAX ? DOWN_RUN_MAX : a->down_need * 2;
+                /* The start of a climb (not a step within one): where it
+                 * began and what was held, for a stall that may follow. */
+                if (!a->climb_ns || now - a->last_up_ns > WINDOW_NS * 3) {
+                    a->climb_from = a->level;
+                    a->climb_held = a->held;
+                    a->climb_ns = now;
+                }
                 a->probe_from = a->level;
                 a->probe_base = a->prev_bad_score + score;
                 a->probe_score = a->probe_windows = 0;
@@ -179,7 +187,21 @@ int xbox_PowerAutoFeed(XboxPowerAuto *a, const XboxPowerAutoSample *s)
         a->hitch++;
         a->tot.hitches++;
         if (now >= a->quiet_until_ns) {
-            int to = a->held < a->ceiling ? a->held : a->ceiling;
+            int to;
+            /* A climb that began shortly before this stall was the run-up
+             * to a load (the near misses of a loading screen, streaming
+             * beside the frames), not the scene's need: undo it, and what
+             * it taught. */
+            if (a->climb_ns && now - a->climb_ns < RUNUP_NS && a->level > a->climb_from) {
+                a->level = a->climb_from;
+                a->held = a->climb_held;
+                a->probe_from = -1;
+                a->tot.reverts++;
+                snprintf(a->why, sizeof a->why, "a stall followed: the climb was the run-up to a load");
+                changed = 1;
+            }
+            a->climb_ns = 0;
+            to = a->held < a->ceiling ? a->held : a->ceiling;
             if (to > a->level) {
                 a->level = to;
                 a->tot.restores++;

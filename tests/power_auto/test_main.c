@@ -147,6 +147,30 @@ static void test_loading_does_not_ratchet(void)
     CHECK(r.a.held < XBOX_POWER_AUTO_START);
 }
 
+/* 3b. The Deck's race load (BO-175, 2026-10-15): a loading screen whose
+ * frames miss heavily for 6 s (at any lead: streaming beside them), the
+ * climb finds them fewer and keeps its level, 8 s more, then the stall.
+ * The climb is undone with what it taught: after the load the level is
+ * the one held before, not the busy-wait. */
+static void test_race_load_runup(void)
+{
+    Run r;
+    run_init(&r);
+    steady(&r, 1, 30);
+    int before = xbox_PowerAutoLevel(&r.a), held = r.a.held;
+    for (int i = 0; i < 6 * 60; i++)
+        hold(&r, 1, rnd(&r) % 100 < 20 ? -3.0 : 2.0, 0.1, VBL_NS);
+    for (int i = 0; i < 8 * 60; i++)
+        hold(&r, 1, rnd(&r) % 100 < 2 ? -3.0 : 2.0, 0.1, VBL_NS);
+    CHECK(r.a.tot.ups >= 1);               /* it did climb */
+    hold(&r, 1, -120.0, -1, 130 * MS);     /* the stall */
+    CHECK(xbox_PowerAutoLevel(&r.a) <= (held > before ? held : before));
+    CHECK(r.a.held == held);
+    CHECK(r.a.tot.reverts >= 1);
+    steady(&r, 1, 60);                     /* the race, steady */
+    CHECK(xbox_PowerAutoLevel(&r.a) <= XBOX_POWER_AUTO_START);
+}
+
 /* 4. A heavy scene that misses at a short lead goes up until it stops, and
  * settles there without oscillating. */
 static void test_heavy_goes_up_and_settles(void)
@@ -216,6 +240,7 @@ int main(void)
     test_steady_goes_down();
     test_30hz_phase_is_not_a_miss();
     test_loading_does_not_ratchet();
+    test_race_load_runup();
     test_heavy_goes_up_and_settles();
     test_late_wakes_go_up();
     test_no_gain_comes_back();

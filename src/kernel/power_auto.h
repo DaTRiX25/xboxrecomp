@@ -42,8 +42,10 @@
  *           level last proven needed (held, decaying one step per 10 min
  *           since it was last proven), so a race after a light menu starts where
  *           the last race ended instead of stuttering its way up. A step up
- *           still on trial when a stall comes is void (the near misses
- *           were the run-up to a load).
+ *           still on trial when a stall comes is void, and so is a whole
+ *           climb that began less than 20 s before it, with the level it
+ *           taught (the near misses were the run-up to a load: a loading
+ *           screen, the track streaming in).
  *
  * Levels (ms of spin before the vblank): 0 (Battery saver), 2, 4, 8
  * (Balanced; the start), 12, 17 (the whole frame: the busy-wait).
@@ -85,6 +87,9 @@ typedef struct {
     uint64_t quiet_until_ns, last_down_ns, last_up_ns, down_ok_since_ns;
     /* after a step up: did it help? */
     int      probe_from, probe_windows, probe_base, probe_score;
+    /* the climb under way: where it began, what was held then */
+    int      climb_from, climb_held;
+    uint64_t climb_ns;
     uint64_t ceiling_wait_ns;
     char     why[96];
     XboxPowerAutoTotals tot;
