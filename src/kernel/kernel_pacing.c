@@ -18,6 +18,7 @@
  */
 #include "kernel.h"
 #include "kernel_pacing.h"
+#include "power_auto.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
 #include <stdio.h>
@@ -470,9 +471,68 @@ static volatile LONGLONG s_vbl_next_ns;
  * executor is handing to the host (xbox_PacingFrameVblank). */
 static volatile LONGLONG s_vbl_last_ns, s_frame_vbl_ns;
 
+/* Power mode Auto (power_auto.h): the lead picked from the holds. The
+ * controller runs on the executor's thread, in xbox_PacingHoldSample, the
+ * only writer of s_spin_lead_ns while it is on; the overlay reads the
+ * level and the reason. */
+static volatile int s_auto_on, s_auto_reset;
+static XboxPowerAuto s_auto;
+static volatile int s_auto_level = XBOX_POWER_AUTO_START;
+static char s_auto_why[96];
+/* When the timer thread raised the last vblank (host clock), and what the
+ * last vblank wait measured of its own lateness (-1: not measured). */
+static volatile LONGLONG s_vbl_raised_ns;
+static int64_t s_wait_wake_ns = -1;
+
 void xbox_PacingSetSpinLead(uint64_t ns)
 {
+    s_auto_on = 0;
     s_spin_lead_ns = ns;
+}
+
+void xbox_PacingSetSpinLeadAuto(void)
+{
+    if (!s_auto_on) {
+        s_auto_reset = 1;      /* the executor starts it afresh */
+        s_spin_lead_ns = xbox_PowerAutoLeadNs(XBOX_POWER_AUTO_START);
+        s_auto_level = XBOX_POWER_AUTO_START;
+        snprintf(s_auto_why, sizeof s_auto_why, "start (as Balanced)");
+        s_auto_on = 1;
+    }
+}
+
+int xbox_PacingAutoState(double *lead_ms, char *why, size_t n)
+{
+    if (lead_ms)
+        *lead_ms = (double)xbox_PowerAutoLeadNs(s_auto_level) / 1e6;
+    if (why && n)
+        snprintf(why, n, "%s", s_auto_why);
+    return s_auto_on;
+}
+
+void xbox_PacingHoldSample(uint32_t interval, uint64_t arrive_ns, uint64_t edge_ns)
+{
+    XboxPowerAutoSample smp;
+
+    if (!s_auto_on || !g_xbox_spin_sleep || xbox_TimeWarpOn())
+        return;
+    if (s_auto_reset) {
+        s_auto_reset = 0;
+        xbox_PowerAutoInit(&s_auto);
+    }
+    smp.now_ns = xbox_HostNowNs();
+    smp.interval = edge_ns ? interval : 0;
+    smp.slack_ns = (int64_t)edge_ns - (int64_t)arrive_ns;
+    smp.wake_ns = s_wait_wake_ns;
+    s_wait_wake_ns = -1;
+    if (xbox_PowerAutoFeed(&s_auto, &smp)) {
+        int lv = xbox_PowerAutoLevel(&s_auto);
+        s_spin_lead_ns = xbox_PowerAutoLeadNs(lv);
+        snprintf(s_auto_why, sizeof s_auto_why, "%s", s_auto.why);
+        s_auto_level = lv;
+        fprintf(stderr, "[PACING] power auto: spin lead %llu ms (%s)\n",
+                (unsigned long long)(s_spin_lead_ns / 1000000u), s_auto.why);
+    }
 }
 
 void xbox_VblankNextDue(uint64_t ns)
@@ -480,6 +540,7 @@ void xbox_VblankNextDue(uint64_t ns)
     /* The edge raised now is the one that was due next. */
     s_vbl_last_ns = s_vbl_next_ns;
     s_vbl_next_ns = (LONGLONG)ns;
+    s_vbl_raised_ns = (LONGLONG)xbox_HostNowNs();
 }
 
 uint64_t xbox_VblankLastDue(void)
@@ -573,7 +634,8 @@ static uint64_t cnt_freq(void)
 
 int xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms)
 {
-    uint64_t deadline = xbox_HostNowNs() + (uint64_t)timeout_ms * 1000000u;
+    uint64_t enter = xbox_HostNowNs();
+    uint64_t deadline = enter + (uint64_t)timeout_ms * 1000000u;
     int ok = 1;
 
     pacing_once();
@@ -637,6 +699,15 @@ int xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms)
         SleepConditionVariableCS(&s_vbl_cv, &s_vbl_lock, ms);
     }
     LeaveCriticalSection(&s_vbl_lock);
+    /* The wait's own lateness, for power mode Auto: from the raise of the
+     * vblank it waited for to the return, when it was there before the
+     * raise and no later vblank came meanwhile. */
+    s_wait_wake_ns = -1;
+    if (s_auto_on && ok && xbox_VblankCount() == target) {
+        uint64_t r = (uint64_t)s_vbl_raised_ns, back = xbox_HostNowNs();
+        if (r > enter && back >= r)
+            s_wait_wake_ns = (int64_t)(back - r);
+    }
     return ok;
 }
 
@@ -878,9 +949,18 @@ void xbox_PacingFlip(uint32_t flip, uint32_t batches)
                         " refresh; ", (double)s_disp_period / 1e6, pmin / 1000.0,
                         pmax / 1000.0);
         }
-        fprintf(stderr, "cpu process %.0f%%; mode %s\n",
+        fprintf(stderr, "cpu process %.0f%%; mode %s",
                 window_s > 0 ? (double)(cpu - win_cpu) / 1e9 / window_s * 100.0 : 0,
                 g_xbox_spin_sleep ? "sleep" : "spin");
+        if (s_auto_on)
+            fprintf(stderr, ", auto lead %.0f ms (holds %ld, near misses %ld, hitches %ld,"
+                    " late wakes %ld of %ld; up %ld down %ld back %ld restore %ld)",
+                    (double)s_spin_lead_ns / 1e6, s_auto.tot.holds, s_auto.tot.near_misses,
+                    s_auto.tot.hitches, s_auto.tot.late_wakes, s_auto.tot.waits,
+                    s_auto.tot.ups, s_auto.tot.downs, s_auto.tot.reverts, s_auto.tot.restores);
+        else
+            fprintf(stderr, ", lead %.0f ms", (double)s_spin_lead_ns / 1e6);
+        fputc('\n', stderr);
         for (i = 0; i <= SITE_SLOTS; i++) {
             SpinSite *st = &s_sites[i];
             if ((st->va || i == SITE_SLOTS) && st->waits)

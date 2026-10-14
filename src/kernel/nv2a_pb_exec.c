@@ -6008,6 +6008,9 @@ static uint32_t s_last_iv = 1;
 static int      s_last_late;
 static int      s_swap_pending;
 static uint32_t s_swap_target;        /* vblank the pending flip waits for */
+/* The vblank the title asked for (before a late swap is moved on) and its
+ * interval, for power mode Auto (xbox_PacingHoldSample). */
+static uint32_t s_swap_asked, s_swap_asked_iv;
 static uint32_t s_swap_last;          /* the handler's last target */
 
 static int flip_pacing_on(void)
@@ -6058,6 +6061,8 @@ static void flip_pacing_swap(uint32_t param)
         return;
     now = xbox_VblankCount();
     target = s_swap_last + (arg & 7);
+    s_swap_asked = target;
+    s_swap_asked_iv = arg & 7;
     if ((int32_t)(target - now) <= 0) {
         s_pace.late++;
         s_last_late = 1;
@@ -6084,10 +6089,14 @@ static void flip_pacing_stall(void)
     /* And in a run that does not wait for the clock (host_time.h): the
      * wait is what moves it to the vblank. */
     if (xbox_PacingMode() == XBOX_PACING_SLEEP || xbox_TimeWarpOn()) {
+        /* Where the frame stands against the vblank the title asked for:
+         * read before the wait, which moves the count. */
+        uint64_t asked_edge = xbox_VblankEdgeNs(s_swap_asked);
         if (!xbox_VblankWaitUntil(s_swap_target, 100))
             waited = 100000000ull;
         else
             timeouts = 0;
+        xbox_PacingHoldSample(waited ? 0 : s_swap_asked_iv, t0, asked_edge);
         if (waited && ++timeouts >= 3) {
             s_flip_pacing = 0;
             fprintf(stderr, "  [GPU] flip pacing off: no vblank arrived"

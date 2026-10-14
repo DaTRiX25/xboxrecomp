@@ -451,6 +451,9 @@ void xbox_PacingSetMode(int mode) { s_pacing_mode = mode; }
 static unsigned long long s_spin_lead_ns;
 void xbox_PacingSetSpinLead(unsigned long long ns);
 void xbox_PacingSetSpinLead(unsigned long long ns) { s_spin_lead_ns = ns; }
+static int s_spin_lead_auto;
+void xbox_PacingSetSpinLeadAuto(void);
+void xbox_PacingSetSpinLeadAuto(void) { s_spin_lead_auto = 1; }
 /* The kernel's video settings (kernel.h), stubbed as the pacing mode is. */
 static ULONG s_xc_video = 1, s_smc_mode = 1;
 void xbox_SetVideoSettings(ULONG xc_video, ULONG smc_video_mode);
@@ -543,6 +546,22 @@ static void test_enhance_init(void)
     recomp_env_set(RENV_PRESENT_PACING, "sleep");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
+    /* present.spin_lead = "auto" (BO-175), from the environment and the
+     * file; a number still is a number. */
+    s_spin_lead_auto = 0;
+    recomp_env_set(RENV_PRESENT_SPIN_LEAD, "auto");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_spin_lead_auto == 1);
+    s_spin_lead_auto = 0;
+    recomp_env_set(RENV_PRESENT_SPIN_LEAD, "8");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && !s_spin_lead_auto && s_spin_lead_ns == 8000000ull);
+    recomp_env_set(RENV_PRESENT_SPIN_LEAD, NULL);
+    write_file("ecfg_lead.toml", "[present]\nspin_lead = \"auto\"\n");
+    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_lead.toml");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_spin_lead_auto == 1);
+    s_spin_lead_auto = 0;
+    write_file("ecfg_lead.toml", "[present]\nspin_lead = 4\n");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && !s_spin_lead_auto && s_spin_lead_ns == 4000000ull);
+    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
 
     /* The dashboard video settings and the present aspect: stock is no
      * widescreen, no HDTV mode, SCART pack, the frame's own shape. */
