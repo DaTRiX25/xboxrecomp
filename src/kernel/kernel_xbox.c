@@ -242,15 +242,21 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
 /* ============================================================================
  * Network / PHY
  *
- * PhyGetLinkState reports Ethernet link status. Xbox had a built-in 100Mbit
- * NIC. For PC, we report link-up since we'll handle networking differently.
+ * PhyGetLinkState reports Ethernet link status: XNET_ETHERNET_LINK_ACTIVE
+ * (0x01) and the speed and duplex bits, or 0 for no cable.
+ *
+ * There is no NIC here, so the answer is "no cable", as on a console with
+ * nothing plugged in and in xemu with networking off (its default). Reporting
+ * a link sent XNet into DHCP on a NIC that never answers: Burnout 3 polls
+ * XNetGetTitleXnAddr on its boot loading screen until that gives up, and the
+ * bar sat near the end for seconds (BO-164). With no link XNet reports it at
+ * once and the title goes on.
  * ============================================================================ */
 
 ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
 {
     (void)Verify;
-    /* Return link up, 100 Mbps, full duplex */
-    return 0x01; /* XNET_ETHERNET_LINK_ACTIVE */
+    return 0; /* no link */
 }
 
 NTSTATUS __stdcall xbox_PhyInitialize(BOOLEAN ForceReset, PVOID Param2)
