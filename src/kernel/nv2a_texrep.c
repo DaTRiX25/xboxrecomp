@@ -73,14 +73,31 @@ void nv2a_texrep_stats(uint64_t *hashed, uint64_t *matched, uint64_t *replaced)
 static uint64_t s_seen[DUMP_SEEN];
 static unsigned s_n_seen;
 
-static void dump(uint64_t hash, uint32_t color, uint32_t w, uint32_t h,
+static void tga_write(const char *path, uint32_t w, uint32_t h, const uint32_t *texels)
+{
+    uint8_t hdr[18] = { 0 };
+    FILE *f = fopen(path, "wb");
+
+    if (!f)
+        return;
+    hdr[2] = 2;                        /* true colour */
+    hdr[12] = (uint8_t)w; hdr[13] = (uint8_t)(w >> 8);
+    hdr[14] = (uint8_t)h; hdr[15] = (uint8_t)(h >> 8);
+    hdr[16] = 32;
+    hdr[17] = 0x28;                    /* top-left origin, 8 alpha bits */
+    fwrite(hdr, 1, sizeof hdr, f);
+    fwrite(texels, 4, (size_t)w * h, f);   /* A8R8G8B8 words: B G R A bytes */
+    fclose(f);
+}
+
+static void dump(uint64_t hash, uint32_t color, uint32_t w, uint32_t h, uint32_t levels,
                  const uint32_t *texels)
 {
     static const char *dir;
-    static int init;
+    static int init, mips;
     char path[1200];
-    uint8_t hdr[18] = { 0 };
     unsigned i;
+    uint32_t l;
     FILE *f;
 
     if (!init) {
@@ -88,6 +105,7 @@ static void dump(uint64_t hash, uint32_t color, uint32_t w, uint32_t h,
         dir = recomp_env(RENV_TEXREP_DUMP);
         if (dir && !*dir)
             dir = NULL;
+        mips = recomp_env(RENV_TEXREP_DUMP_MIPS) != NULL;
         if (dir)
             fprintf(stderr, LOGP "dumping every uploaded texture to %s\n", dir);
     }
@@ -100,17 +118,15 @@ static void dump(uint64_t hash, uint32_t color, uint32_t w, uint32_t h,
         s_seen[s_n_seen++] = hash;
     snprintf(path, sizeof path, "%s/%016llx_%ux%u_f%02x.tga", dir,
              (unsigned long long)hash, w, h, color & 0xFFu);
-    f = fopen(path, "wb");
-    if (!f)
-        return;
-    hdr[2] = 2;                        /* true colour */
-    hdr[12] = (uint8_t)w; hdr[13] = (uint8_t)(w >> 8);
-    hdr[14] = (uint8_t)h; hdr[15] = (uint8_t)(h >> 8);
-    hdr[16] = 32;
-    hdr[17] = 0x28;                    /* top-left origin, 8 alpha bits */
-    fwrite(hdr, 1, sizeof hdr, f);
-    fwrite(texels, 4, (size_t)w * h, f);   /* A8R8G8B8 words: B G R A bytes */
-    fclose(f);
+    tga_write(path, w, h, texels);
+    /* texrep_dump_mips: the title's own levels below it too, as decoded
+     * (BO-171 compares them with levels made from level 0). */
+    for (l = 1; mips && l < levels; l++) {
+        texels += (size_t)nv2a_tex_level_dim(w, l - 1) * nv2a_tex_level_dim(h, l - 1);
+        snprintf(path, sizeof path, "%s/%016llx_%ux%u_f%02x_m%u.tga", dir,
+                 (unsigned long long)hash, w, h, color & 0xFFu, l);
+        tga_write(path, nv2a_tex_level_dim(w, l), nv2a_tex_level_dim(h, l), texels);
+    }
     snprintf(path, sizeof path, "%s/index.tsv", dir);
     f = fopen(path, "ab");
     if (f) {
@@ -182,7 +198,7 @@ uint32_t nv2a_texrep_apply(const uint8_t *guest, uint32_t color, uint32_t w,
         return 0;
     hash = nv2a_texrep_hash(guest, color, w, h, pitch);
     if (dump_on())
-        dump(hash, color, w, h, texels);
+        dump(hash, color, w, h, levels, texels);
     if (!cand || !hash)
         return 0;
     atomic_fetch_add_explicit(&s_hashed, 1, memory_order_relaxed);

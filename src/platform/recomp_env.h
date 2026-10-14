@@ -129,7 +129,7 @@ extern "C" {
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
     X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \
     X(OVERLAY_PERF_STEPS, CONFIG, "RECOMP_OVERLAY_PERF_STEPS", NULL, "1: the frame-time graph also marks frames in which the title ran more than one simulation step (default off)") \
-    X(OVERLAY_TEST,      CONFIG, "RECOMP_OVERLAY_TEST",      NULL, "=file: a test drives the overlay through it, one line each as appended: key <up|down|left|right|enter|esc|f1|pgup|pgdn|del>, pad <a|b|y|up|down|left|right|lb|rb|back+start> (SDL events pushed into the window's loop), shot <path> (the window as presented, BMP), state <path> (the open page's rows as text)") \
+    X(OVERLAY_TEST,      CONFIG, "RECOMP_OVERLAY_TEST",      NULL, "=file: a test drives the overlay through it, one line each as appended: key <up|down|left|right|enter|esc|f1|pgup|pgdn|del>, pad <a|b|y|up|down|left|right|lb|rb|back+start> (SDL events pushed into the window's loop), shot <path> (the window as presented, BMP), burst <n> <prefix> (the next n new frames as <prefix><flip>.bmp), state <path> (the open page's rows as text)") \
     X(SETTINGS_FILE,     CONFIG, "RECOMP_SETTINGS",          NULL, "the overlay's settings file: a path, or none (default: <save dir>/settings.toml)") \
     X(GFX_ANISO,         CONFIG, "RECOMP_GFX_ANISO",         NULL, "anisotropic filtering of mipmapped, linearly minified textures: off (default), 2, 4, 8, 16 (Metal, Vulkan; clamped to the device's limit)") \
     X(GFX_AA,            CONFIG, "RECOMP_GFX_AA",            NULL, "post-process anti-aliasing of the frame at the game's resolution, before the scale to the window: off (default), fxaa, smaa (Metal, Vulkan windows)") \
@@ -293,6 +293,7 @@ extern "C" {
     X(PAD_PRESS,         DEBUG, "pad_press",       "RECOMP_PAD_PRESS",         "=mask: pulse these buttons (USB pad)") \
     X(FB_DUMP,           DEBUG, "fb_dump",         "RECOMP_FB_DUMP",           "=prefix: frame dumps (CPU/Metal, window)") \
     X(TEXREP_DUMP,       DEBUG, "texrep_dump",     NULL,                       "=dir: every texture a GPU backend (Metal, Vulkan) uploads, once per content, as <hash>_<w>x<h>_f<format>.tga with an index.tsv (the hash is the one nv2a_texrep registers)") \
+    X(TEXREP_DUMP_MIPS,  DEBUG, "texrep_dump_mips", NULL,                      "with texrep_dump: a mipmapped texture's own levels 1.. as well, as <hash>_<w>x<h>_f<format>_m<level>.tga") \
     X(CHEATS,            DEBUG, "cheats",          NULL,                       "shows the Advanced page's cheat rows (xbox_OverlaySetCheats), a tester's tool: while one is on the title's saves go to a copy of the save") \
     X(UI_SCALE_ALGO,     DEBUG, "ui_scale_algo",   NULL,                       "=bicubic: graphics.ui_scale scales with a Catmull-Rom bicubic instead of Super-xBR (for comparison)") \
     X(UI_SCALE_HOLD,     DEBUG, "ui_scale_hold",   NULL,                       "graphics.ui_scale held off whatever the setting and the environment say: =1 on any platform (a way to rule the upscaling out when a GPU fault is chased); not held by default anywhere") \

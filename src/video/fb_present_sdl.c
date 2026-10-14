@@ -607,6 +607,15 @@ void xbox_HostWindowShot(const char *path)
     snprintf(s_shot_req, sizeof s_shot_req, "%s", path ? path : "");
 }
 
+static char     s_burst_prefix[480];
+static unsigned s_burst_n;
+
+void xbox_HostWindowShotBurst(const char *prefix, unsigned n)
+{
+    snprintf(s_burst_prefix, sizeof s_burst_prefix, "%s", prefix ? prefix : "");
+    s_burst_n = n;
+}
+
 /* Shots may be asked for while running: the presenters keep their images
  * readable (RECOMP_WINDOW_SHOT, or a test driving the overlay). */
 static int shots_wanted(void)
@@ -1182,7 +1191,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     int stats = recomp_env_on(RENV_PRESENT_STATS);
     int scale = recomp_env(RENV_WINDOW_SCALE) ? atoi(recomp_env(RENV_WINDOW_SCALE)) : 2;
     int win_w, win_pos, win_pw, win_ph;
-    int quit = 0, guest_done = 0, dirty = 0, shoot = 0, had_pads, new_frame = 0, retry_soon = 0;
+    int quit = 0, guest_done = 0, dirty = 0, shoot = 0, burst = 0, had_pads, new_frame = 0, retry_soon = 0;
     double quit_after = recomp_env(RENV_WINDOW_QUIT_AFTER)
                       ? atof(recomp_env(RENV_WINDOW_QUIT_AFTER)) : 0.0;
     uint32_t shown_flip = 0;
@@ -1553,6 +1562,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             /* A shot still pending (no drawable yet) is taken of this frame,
              * under its own flip number, as for a dropped flip. */
             shoot |= s_shot_n && shot_due(shown_flip);
+            burst = s_burst_n > 0 && !s_shot_req[0];
+            shoot |= burst;
             shown_seq = seq;
             dirty = 1;
         } else if (seq != shown_seq) {
@@ -1596,13 +1607,18 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             char path[512];
             if (shoot && s_shot_req[0])
                 snprintf(path, sizeof path, "%s", s_shot_req);
+            else if (shoot && burst)
+                snprintf(path, sizeof path, "%s%05u.bmp", s_burst_prefix, shown_flip);
             else if (shoot)
                 shot_path(path, sizeof path, shown_flip);
             if (fbv_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
                             filter, shoot ? path : NULL, shown_flip)) {
                 new_frame = 0;
                 dirty = 0;
+                if (shoot && burst && s_burst_n)
+                    s_burst_n--;
                 shoot = 0;
+                burst = 0;
                 s_shot_req[0] = 0;
                 presents++;
 #if defined(__ANDROID__)
@@ -1653,6 +1669,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             char path[512];
             if (shoot && s_shot_req[0])
                 snprintf(path, sizeof path, "%s", s_shot_req);
+            else if (shoot && burst)
+                snprintf(path, sizeof path, "%s%05u.bmp", s_burst_prefix, shown_flip);
             else if (shoot)
                 shot_path(path, sizeof path, shown_flip);
             /* A frame's own vblank goes with its first present only: a
@@ -1671,7 +1689,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     && ((s_last_present_ns = now_ns(CLOCK_MONOTONIC) - t0), 1)) {
                 new_frame = 0;
                 dirty = 0;
+                if (shoot && burst && s_burst_n)
+                    s_burst_n--;
                 shoot = 0;
+                burst = 0;
                 s_shot_req[0] = 0;
                 presents++;
 #if defined(XBOXRECOMP_HAVE_OVERLAY)

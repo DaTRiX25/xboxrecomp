@@ -1856,6 +1856,7 @@ static void collect_steps()
 /* ── RECOMP_OVERLAY_TEST: a test drives the overlay ────────────────── */
 
 extern "C" void xbox_HostWindowShot(const char *path);     /* video_player.h */
+extern "C" void xbox_HostWindowShotBurst(const char *prefix, unsigned n);
 
 /* Each line appended to the file is done once: keys and pad buttons go into
  * the window's event queue as SDL events, so they take the same road as a
@@ -1943,6 +1944,11 @@ static void test_poll()
                     test_pad(pads[i].b, true);
                     test_pad(pads[i].b, false);
                 }
+        } else if (!strncmp(line, "burst ", 6)) {   /* burst <n> <prefix> */
+            char *end;
+            unsigned long n = strtoul(line + 6, &end, 10);
+            if (*end == ' ')
+                xbox_HostWindowShotBurst(end + 1, (unsigned)n);
         } else if (!strncmp(line, "shot ", 5)) {
             xbox_HostWindowShot(line + 5);
         } else if (!strncmp(line, "state ", 6)) {

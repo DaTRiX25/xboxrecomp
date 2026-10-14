@@ -98,6 +98,10 @@ void xbox_FramebufferWindowSetRestart(void (*fn)(void));
  * The window's thread only (the overlay's test driver, RECOMP_OVERLAY_TEST);
  * the Metal and Vulkan presenters. */
 void xbox_HostWindowShot(const char *path);
+/* The next n new frames read back as <prefix><flip>.bmp (a sequence for a
+ * shimmer measure, BO-171); a frame the window drops is not shot. Same
+ * thread and presenters. */
+void xbox_HostWindowShotBurst(const char *prefix, unsigned n);
 
 /* The bug report's system.txt gets this host's displays, controllers and
  * GPUs (host_probe.c, xbox_report.h). may_init 0: a title runs, only what
