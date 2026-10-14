@@ -760,24 +760,27 @@ static void android_quit(void)
 static void android_exit_now(const char *why);
 
 /* The warning that no usable Vulkan driver was found, with the ways out on
- * it (BO-121, BO-153): without the Vulkan window there is no settings
- * overlay, so a player whose driver cannot run the game could not choose
- * another from inside it. The port's activity says whether there is a
- * driver to go back to and does the going (int resetGraphicsDriver(int):
- * 0 asks, 1 chooses the driver in the app and starts the app again), and
- * opens its driver page on the file picker (int pickDriverPackage(): the
- * package picked is chosen and the app starts again on it; that is also
- * the only way out when the driver in the app is the one that cannot run
- * the game, as Turnip on an Adreno A6xx "gen1 low" with Vulkan 1.0). An
- * activity with neither method gets the plain warning. Returns 1 when the
- * window with the choices was shown. */
+ * it (BO-121, BO-153, BO-163): without the Vulkan window there is no
+ * settings overlay, so a player whose driver cannot run the game could not
+ * choose another from inside it. The port's activity says what there is to
+ * offer and does the going (int resetGraphicsDriver(int): 0 asks, as bits:
+ * 1 the driver in the app to go back to, 2 a driver package is worth
+ * picking (an Adreno GPU, which Turnip drives), 4 this start was on the
+ * driver in the app; 1 goes back to it and starts the app again), and opens
+ * its driver page on the file picker (int pickDriverPackage(): the package
+ * picked is chosen and the app starts again on it; that is also the only
+ * way out when the driver in the app is the one that cannot run the game,
+ * as Turnip on an Adreno A6xx "gen1 low" with Vulkan 1.0). The text is for
+ * a player; the reason is in the log. An activity with neither method, or
+ * a GPU with nothing to offer, gets the plain warning (msg). Returns 1 when
+ * the window with the choices was shown. */
 static int android_offer_driver_reset(const char *msg)
 {
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
     jobject act = env ? (jobject)SDL_AndroidGetActivity() : NULL;
     jclass cls;
     jmethodID m, pick;
-    int shown = 0, reset;
+    int shown = 0, reset, ways = 2;
 
     if (!act)
         return 0;
@@ -792,11 +795,16 @@ static int android_offer_driver_reset(const char *msg)
         (*env)->ExceptionClear(env);
         pick = NULL;
     }
-    reset = m && (*env)->CallIntMethod(env, act, m, (jint)0) == 1;
-    if ((*env)->ExceptionCheck(env)) {
-        (*env)->ExceptionClear(env);
-        reset = 0;
+    if (m) {
+        ways = (*env)->CallIntMethod(env, act, m, (jint)0);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+            ways = 0;
+        }
     }
+    reset = (ways & 1) != 0;
+    if (!(ways & 2))
+        pick = NULL;
     if (reset || pick) {
         SDL_MessageBoxButtonData b[3];
         char text[1200];
@@ -806,11 +814,11 @@ static int android_offer_driver_reset(const char *msg)
         memset(b, 0, sizeof b);
         if (reset) {
             b[n].buttonid = 1;
-            b[n++].text = "Use Turnip";
+            b[n++].text = "Use built-in";
         }
         if (pick) {
             b[n].buttonid = 2;
-            b[n++].text = "Driver package\xE2\x80\xA6";
+            b[n++].text = "Driver file\xE2\x80\xA6";
         }
         b[0].flags |= SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
         b[n].flags = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
@@ -818,16 +826,22 @@ static int android_offer_driver_reset(const char *msg)
         /* SDL's Android box puts the buttons in one row at the box's
          * width: three short labels, or the third one is a column of
          * letters (seen on a 1240x1080 Retroid Pocket Classic). */
-        b[n].text = n == 2 ? "Continue" : "Continue on the CPU";
+        b[n].text = n == 2 ? "Continue" : "Continue (slow)";
         n++;
-        snprintf(text, sizeof text, "%s\n\nThe settings menu (Select+Start) is not available"
-                 " on this driver either.%s%s%s", msg,
-                 reset ? " \"Use Turnip\" chooses the Mesa Turnip driver that"
-                         " comes in the app and starts the game again." : "",
-                 pick ? " \"Driver package\xE2\x80\xA6\" opens the file picker for a Turnip"
-                        " driver package (.zip) for this GPU; the game starts again on it,"
-                        " and if it does not show frames there, the next start goes back." : "",
-                 n == 3 ? " \"Continue\" goes on on the CPU." : "");
+        if (reset)
+            snprintf(text, sizeof text, "%s\n\n\"Use built-in\" restarts the game on the"
+                     " Turnip driver that comes with Takedawn.%s \"Continue\" keeps going on"
+                     " the processor.", msg,
+                     pick ? " \"Driver file\xE2\x80\xA6\" lets you pick a Turnip driver"
+                            " (.zip)." : "");
+        else
+            /* The driver in the app is the one that failed: what a driver
+             * file is, and where players get one. */
+            snprintf(text, sizeof text, "%s\n\nThe Turnip driver built into Takedawn can't"
+                     " run the game on this GPU. A driver file is a Turnip build for Adreno"
+                     " GPUs, packed as a .zip. Android emulator users share them for many"
+                     " devices. \"Driver file\xE2\x80\xA6\" lets you pick one. The Android"
+                     " section of the README has more.", msg);
         memset(&d, 0, sizeof d);
         d.flags = SDL_MESSAGEBOX_WARNING;
         d.title = "Graphics driver";
@@ -836,7 +850,7 @@ static int android_offer_driver_reset(const char *msg)
         d.buttons = b;
         shown = SDL_ShowMessageBox(&d, &hit) == 0;
         if (shown && hit == 1) {
-            fprintf(stderr, "[PRESENT] the warning's \"Use Turnip\": the app starts"
+            fprintf(stderr, "[PRESENT] the warning's \"Use built-in\": the app starts"
                     " again on the driver in the app\n");
             (*env)->CallIntMethod(env, act, m, (jint)1);
             if ((*env)->ExceptionCheck(env))
@@ -850,7 +864,7 @@ static int android_offer_driver_reset(const char *msg)
              * the CPU behind it: a package picked there restarts the app
              * (the activity's way, as the overlay's restart), Back or a
              * cancelled picker leaves the game as it is. */
-            fprintf(stderr, "[PRESENT] the warning's \"Driver package\": the driver page"
+            fprintf(stderr, "[PRESENT] the warning's \"Driver file\": the driver page"
                     " opens on the file picker\n");
             (*env)->CallIntMethod(env, act, pick);
             if ((*env)->ExceptionCheck(env))
@@ -1049,6 +1063,40 @@ static void gfx_restart(void)
 #endif
 }
 
+/* A driver the player picked (a package, an Adreno's own driver) that
+ * loses the device is dropped as a failed trial is (the activity's int
+ * graphicsDriverLost(): the choice goes back to Automatic, 1 when it did),
+ * so it does not come back at every start (BO-163). 0 elsewhere. */
+static int gfx_lost_dropped(void)
+{
+    int r = 0;
+#if defined(__ANDROID__)
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    jobject act = env ? (jobject)SDL_AndroidGetActivity() : NULL;
+    if (act) {
+        jclass cls = (*env)->GetObjectClass(env, act);
+        jmethodID m = (*env)->GetMethodID(env, cls, "graphicsDriverLost", "()I");
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+            m = NULL;
+        }
+        if (m) {
+            r = (*env)->CallIntMethod(env, act, m) == 1;
+            if ((*env)->ExceptionCheck(env)) {
+                (*env)->ExceptionClear(env);
+                r = 0;
+            }
+        }
+        (*env)->DeleteLocalRef(env, cls);
+        (*env)->DeleteLocalRef(env, act);
+    }
+    if (r)
+        fprintf(stderr, "[PRESENT] the driver the player picked is dropped: the next start"
+                " is on Automatic\n");
+#endif
+    return r;
+}
+
 /* The box; returns after the player's answer. The window's thread. */
 static void gfx_lost_say(void)
 {
@@ -1059,7 +1107,11 @@ static void gfx_lost_say(void)
 
     snprintf(text, sizeof text, "The graphics driver stopped working (%s), so the game cannot"
              " draw any more in this run.\n\nThe game is closed now. Your progress up to the"
-             " game's last save is kept.", s_gfx_lost_why);
+             " game's last save is kept.%s", s_gfx_lost_why,
+             gfx_lost_dropped()
+                 ? "\n\nThis start used a driver you picked, so the next start goes back to"
+                   " Automatic. You can pick it again under \"Takedawn: graphics driver\"."
+                 : "");
     memset(b, 0, sizeof b);
     if (gfx_can_restart()) {
         b[n].flags = SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
@@ -1264,15 +1316,16 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                  * the driver page's file picker for a package. */
                 if (!getenv("RECOMP_NO_GPU_NOTE") && !getenv("RECOMP_ANDROID_NO_GPU_NOTE")) {
                     char msg[640];
+#if defined(__ANDROID__)
+                    /* For a player: the reason is in the log (above). */
+                    snprintf(msg, sizeof msg,
+                             "This device's graphics driver can't run the game. The game"
+                             " will run on the processor, which is far too slow to play.");
+                    if (!android_offer_driver_reset(msg))
+#else
                     snprintf(msg, sizeof msg,
                              "No usable Vulkan 1.3 graphics driver:\n%s\n\n"
                              "The game will draw on the CPU, which is very slow. "
-#if defined(__ANDROID__)
-                             "On an Adreno GPU a Mesa Turnip driver is needed; the "
-                             "log in the app's folder says which driver was "
-                             "tried.", why);
-                    if (!android_offer_driver_reset(msg))
-#else
                              "Update the graphics driver (Vulkan 1.3 is needed); the "
                              "game's log says which device was tried.", why);
 #endif

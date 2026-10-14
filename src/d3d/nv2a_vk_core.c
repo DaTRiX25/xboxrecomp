@@ -57,9 +57,11 @@ static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
     return 0;
 }
 
+/* fmt takes two strings: a, and r's name (none for VK_SUCCESS: a reason
+ * that is not a failed call). */
 static int fail(const char *fmt, const char *a, VkResult r)
 {
-    snprintf(s_err, sizeof s_err, fmt, a ? a : "", nvk_result_str(r));
+    snprintf(s_err, sizeof s_err, fmt, a ? a : "", r == VK_SUCCESS ? "" : nvk_result_str(r));
     return 0;
 }
 
