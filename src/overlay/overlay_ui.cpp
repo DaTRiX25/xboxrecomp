@@ -3657,6 +3657,145 @@ static void build_browser(float fs, ImDrawList *dl)
 #include "overlay_mixer.inc"
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
+/* A row's hint, the text under the rows when it is selected; true when it
+ * is a warning or a locked setting (drawn in the attention colour). */
+static bool row_hint(const Row &r, char *hint, size_t n)
+{
+    bool locked_out = false;
+    hint[0] = 0;
+    if (r.kind == R_SETTING) {
+        const xs_setting *s = xbox_SettingGet(r.id);
+        locked_out = s->locked;
+        if (s->locked) {
+            if (s->env == RENV_COUNT)
+                snprintf(hint, n, "Set by the environment (RECOMP_PRESENT_PACING / RECOMP_PRESENT_SPIN_LEAD); unset it to change it here.");
+            else
+                snprintf(hint, n, "Set by the environment (%s); unset it to change it here.", recomp_env_name(s->env));
+        } else {
+            if (r.id == XS_POWER_MODE && xbox_PowerStockHidden(xbox_SettingsHost()))
+                snprintf(hint, n, "Balanced sleeps, then spins for the last 8 ms of each frame (steady 60,"
+                         " recommended). Battery saver only sleeps (coolest, with an occasional small dip)."
+                         " Busy-waiting is not offered here: it was no steadier and used more power"
+                         " (for diagnosis: RECOMP_PRESENT_PACING=spin).");
+            else
+                snprintf(hint, n, "%s", k_meta[r.id].hint);
+            if (r.id == XS_GRAPHICS_UI_SCALE) {
+                /* The scaled pictures are made in the background and kept on
+                 * disk: say so while that is going on. */
+                unsigned done = 0, total = 0;
+                nv2a_texscale_progress(&done, &total);
+                if (xbox_SettingValue(XS_GRAPHICS_UI_SCALE) != 0 && done < total) {
+                    char whole[1800];
+                    snprintf(whole, sizeof whole, "Preparing sharper menus and HUD... %u of %u. %s",
+                             done, total, hint);
+                    snprintf(hint, n, "%s", whole);
+                }
+            }
+            /* The table's flag: this one is read when the game starts. */
+            if (s->flags & XS_RESTART) {
+                size_t at = strlen(hint);
+                snprintf(hint + at, n - at, "%sNeeds a restart.", at ? " " : "");
+            }
+        }
+    } else if (r.kind == R_ACTION && r.action == A_UPDATE_CHECK) {
+        snprintf(hint, n, "Asks GitHub whether a newer release of %s is out, with one anonymous"
+                 " request sent when you press this row.", s_up_repo);
+    } else if (r.kind == R_ACTION && r.action == A_UPDATE_OPEN) {
+        snprintf(hint, n, "Opens %s in your web browser.", s_up_res.url);
+    } else if (r.kind == R_ACTION && r.action == A_STEAM_ART) {
+        snprintf(hint, n, "Adds Steam's library pictures to the Takedawn shortcut you already have, made from your own"
+                 " game files. Pictures you put there yourself are kept as backup copies. Steam can stay open.");
+    } else if (r.kind == R_ACTION && r.action >= A_SAVE_EXPORT
+               && r.action <= A_SAVE_CANCEL) {
+        const char *what =
+            r.action == A_SAVE_EXPORT
+            ? "Copies your save to a dated folder in"
+            : r.action == A_SAVE_IMPORT
+            ? "Imports the newest exported save from"
+            : r.action == A_SAVE_BROWSE
+            ? "Pick an exported save's dated folder, on a drive or card too. The usual place is"
+            : r.action == A_SAVE_RESTORE
+            ? "Your save as it was before each game save, newest first: the latest 20, then one a"
+              " day for a week and one a week for a month. Kept in"
+            : "Cancels the waiting import. The exported folder stays in";
+        const char *then =
+            r.action == A_SAVE_EXPORT
+            ? "To move the save to another machine, copy that folder into the same-named folder there."
+            : r.action == A_SAVE_CANCEL ? ""
+            : "It replaces your save at the next start, after the current one is copied aside."
+              " The running game is not affected.";
+        char hist[1024];
+        recomp_save_history_dir(s_sio_dir, hist, sizeof hist);
+        snprintf(hint, n, "%s%s%s %s. %s", s_sio_msg, s_sio_msg[0] ? "  |  " : "", what,
+                 r.action == A_SAVE_RESTORE ? hist : s_sio_dest, then);
+    } else if (r.kind == R_ACTION && r.action == A_RESTART_PIN) {
+        char why[400];
+        restart_reason(why, sizeof why);
+        snprintf(hint, n, "%s%s%s%sCloses the game and starts it again with the same options."
+                 " Anything the game hasn't saved is lost, as when quitting.",
+                 r.action == A_RESTART_PIN && s_confirm == A_RESTART_PIN ? confirm_text(A_RESTART_PIN) : "",
+                 r.action == A_RESTART_PIN && s_confirm == A_RESTART_PIN ? ".  " : "",
+                 why, why[0] ? " " : "");
+    } else if (r.kind == R_ACTION && r.action >= A_CHEAT0 && r.action <= A_CHEAT3) {
+        int i = r.action - A_CHEAT0;
+        locked_out = true;                   /* the warning, in the attention colour */
+        snprintf(hint, n, "%s%s%s", s_confirm == r.action ? confirm_text(r.action) : "",
+                 s_confirm == r.action ? ".  " : "",
+                 i < s_cheat_n && s_cheats[i].warning ? s_cheats[i].warning : "");
+    } else if (r.kind == R_ACTION && r.action == A_CHEAT_KEEP) {
+        snprintf(hint, n, "Puts what the game saved during the cheats into your save and returns to normal"
+                 " saving. Your current save goes into the save history first.");
+    } else if (r.kind == R_ACTION && r.action == A_CHEAT_DISCARD) {
+        snprintf(hint, n, "Your save stays as it was before the cheats. The game still holds that progress,"
+                 " so nothing you play is saved until you restart. A Restart row appears at the bottom.");
+    } else if (r.kind == R_ACTION && r.action == A_QUIT) {
+        snprintf(hint, n, "%s%sSame as closing the window: your settings are saved and the game ends."
+                 " Anything the game hasn't saved is lost.",
+                 s_confirm == A_QUIT ? confirm_text(A_QUIT) : "", s_confirm == A_QUIT ? ".  " : "");
+    } else if (r.kind == R_SPEAKERS) {
+        spk_hint(r.action, hint, n);
+    } else if (r.kind == R_FOLDER) {
+        int env = 0;
+        xbox_SettingsText(MUSIC_KEY, &env);
+        locked_out = env != 0;
+        if (env)
+            snprintf(hint, n, "Set by the environment (RECOMP_AUDIO_MUSIC_DIR or --music-dir);"
+                     " unset it to change it here.");
+        else if (s_mf_acc_state.load(std::memory_order_acquire) == 1)
+            snprintf(hint, n, "Waiting for Android's answer: may the game read your music files?");
+        else if (s_mf && s_mf->access)
+            /* The hook asks for what the browser needs (Android's audio
+             * permission) and says how it went in its line. */
+            snprintf(hint, n, "%s%sYour own music (mp3, flac, ogg, wav) for the game's music menu."
+                     " Pick a folder of songs, or a folder of folders for one soundtrack each."
+                     " A opens the folder list.", s_mf_acc_line, s_mf_acc_line[0] ? "  |  " : "");
+        else
+#if defined(__ANDROID__)
+            /* No access hook: the app reads only its own files folder,
+             * which the browser lists first. */
+            snprintf(hint, n, "Your own music (mp3, flac, ogg, wav) for the game's music menu."
+                     " Pick a folder of songs, or a folder of folders for one soundtrack each. On Android,"
+                     " copy music folders into Android/data/<this app>/files/Music (the app can read"
+                     " only its own folder), then press %s and choose \"This app's Music folder\".", act_name(0));
+#else
+            snprintf(hint, n, "Your own music (mp3, flac, ogg, wav) for the game's music menu."
+                     " Pick a folder of songs, or a folder of folders for one soundtrack each."
+                     " %s opens the folder list.", act_name(0, true));
+#endif
+    } else if (r.kind == R_ACTION
+               && (r.action == A_REPORT || r.action == A_REPORT_SHOT)) {
+        snprintf(hint, n, "%s%sA zip in the reports folder beside the settings, with the logs of"
+                 " this run and the last ones, crash reports, your settings and a system summary%s."
+                 " It has no saves or game data, and your home folder shows as ~. Attach it to an issue.",
+                 s_rep_done, s_rep_done[0] ? ". " : "",
+                 r.action == A_REPORT_SHOT ? ", plus the frame behind this menu" : "");
+    } else if (r.kind == R_ACTION && r.action == A_SHADERS && s_sb && s_sb->cost) {
+        snprintf(hint, n, "%s The game is paused while it runs. Closing the settings stops it;"
+                 " the next run picks up where it left off.", s_sb->cost);
+    }
+    return locked_out;
+}
+
 static void build_pages_inner()
 {
     ImGuiIO &io = ImGui::GetIO();
@@ -3756,138 +3895,8 @@ static void build_pages_inner()
         }
     s_reset = 0;
     /* The footer: the selected row's hint (wrapped), a restart note, the keys. */
-    char hint[1800] = "";
-    bool hint_locked = false;
-    if (rows[sel].kind == R_SETTING) {
-        const xs_setting *s = xbox_SettingGet(rows[sel].id);
-        hint_locked = s->locked;
-        if (s->locked) {
-            if (s->env == RENV_COUNT)
-                snprintf(hint, sizeof hint, "Set by the environment (RECOMP_PRESENT_PACING / RECOMP_PRESENT_SPIN_LEAD); unset it to change it here.");
-            else
-                snprintf(hint, sizeof hint, "Set by the environment (%s); unset it to change it here.", recomp_env_name(s->env));
-        } else {
-            if (rows[sel].id == XS_POWER_MODE && xbox_PowerStockHidden(xbox_SettingsHost()))
-                snprintf(hint, sizeof hint, "Balanced sleeps, then spins for the last 8 ms of each frame (steady 60,"
-                         " recommended). Battery saver only sleeps (coolest, with an occasional small dip)."
-                         " Busy-waiting is not offered here: it was no steadier and used more power"
-                         " (for diagnosis: RECOMP_PRESENT_PACING=spin).");
-            else
-                snprintf(hint, sizeof hint, "%s", k_meta[rows[sel].id].hint);
-            if (rows[sel].id == XS_GRAPHICS_UI_SCALE) {
-                /* The scaled pictures are made in the background and kept on
-                 * disk: say so while that is going on. */
-                unsigned done = 0, total = 0;
-                nv2a_texscale_progress(&done, &total);
-                if (xbox_SettingValue(XS_GRAPHICS_UI_SCALE) != 0 && done < total) {
-                    char whole[sizeof hint];
-                    snprintf(whole, sizeof whole, "Preparing sharper menus and HUD... %u of %u. %s",
-                             done, total, hint);
-                    snprintf(hint, sizeof hint, "%s", whole);
-                }
-            }
-            /* The table's flag: this one is read when the game starts. */
-            if (s->flags & XS_RESTART) {
-                size_t at = strlen(hint);
-                snprintf(hint + at, sizeof hint - at, "%sNeeds a restart.", at ? " " : "");
-            }
-        }
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_UPDATE_CHECK) {
-        snprintf(hint, sizeof hint, "Asks GitHub whether a newer release of %s is out, with one anonymous"
-                 " request sent when you press this row.", s_up_repo);
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_UPDATE_OPEN) {
-        snprintf(hint, sizeof hint, "Opens %s in your web browser.", s_up_res.url);
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_STEAM_ART) {
-        snprintf(hint, sizeof hint, "Adds Steam's library pictures to the Takedawn shortcut you already have, made from your own"
-                 " game files. Pictures you put there yourself are kept as backup copies. Steam can stay open.");
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action >= A_SAVE_EXPORT
-               && rows[sel].action <= A_SAVE_CANCEL) {
-        const char *what =
-            rows[sel].action == A_SAVE_EXPORT
-            ? "Copies your save to a dated folder in"
-            : rows[sel].action == A_SAVE_IMPORT
-            ? "Imports the newest exported save from"
-            : rows[sel].action == A_SAVE_BROWSE
-            ? "Pick an exported save's dated folder, on a drive or card too. The usual place is"
-            : rows[sel].action == A_SAVE_RESTORE
-            ? "Your save as it was before each game save, newest first: the latest 20, then one a"
-              " day for a week and one a week for a month. Kept in"
-            : "Cancels the waiting import. The exported folder stays in";
-        const char *then =
-            rows[sel].action == A_SAVE_EXPORT
-            ? "To move the save to another machine, copy that folder into the same-named folder there."
-            : rows[sel].action == A_SAVE_CANCEL ? ""
-            : "It replaces your save at the next start, after the current one is copied aside."
-              " The running game is not affected.";
-        char hist[1024];
-        recomp_save_history_dir(s_sio_dir, hist, sizeof hist);
-        snprintf(hint, sizeof hint, "%s%s%s %s. %s", s_sio_msg, s_sio_msg[0] ? "  |  " : "", what,
-                 rows[sel].action == A_SAVE_RESTORE ? hist : s_sio_dest, then);
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_RESTART_PIN) {
-        char why[400];
-        restart_reason(why, sizeof why);
-        snprintf(hint, sizeof hint, "%s%s%s%sCloses the game and starts it again with the same options."
-                 " Anything the game hasn't saved is lost, as when quitting.",
-                 rows[sel].action == A_RESTART_PIN && s_confirm == A_RESTART_PIN ? confirm_text(A_RESTART_PIN) : "",
-                 rows[sel].action == A_RESTART_PIN && s_confirm == A_RESTART_PIN ? ".  " : "",
-                 why, why[0] ? " " : "");
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action >= A_CHEAT0 && rows[sel].action <= A_CHEAT3) {
-        int i = rows[sel].action - A_CHEAT0;
-        hint_locked = true;                   /* the warning, in the attention colour */
-        snprintf(hint, sizeof hint, "%s%s%s", s_confirm == rows[sel].action ? confirm_text(rows[sel].action) : "",
-                 s_confirm == rows[sel].action ? ".  " : "",
-                 i < s_cheat_n && s_cheats[i].warning ? s_cheats[i].warning : "");
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_CHEAT_KEEP) {
-        snprintf(hint, sizeof hint, "Puts what the game saved during the cheats into your save and returns to normal"
-                 " saving. Your current save goes into the save history first.");
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_CHEAT_DISCARD) {
-        snprintf(hint, sizeof hint, "Your save stays as it was before the cheats. The game still holds that progress,"
-                 " so nothing you play is saved until you restart. A Restart row appears at the bottom.");
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_QUIT) {
-        snprintf(hint, sizeof hint, "%s%sSame as closing the window: your settings are saved and the game ends."
-                 " Anything the game hasn't saved is lost.",
-                 s_confirm == A_QUIT ? confirm_text(A_QUIT) : "", s_confirm == A_QUIT ? ".  " : "");
-    } else if (rows[sel].kind == R_SPEAKERS) {
-        spk_hint(rows[sel].action, hint, sizeof hint);
-    } else if (rows[sel].kind == R_FOLDER) {
-        int locked = 0;
-        xbox_SettingsText(MUSIC_KEY, &locked);
-        hint_locked = locked != 0;
-        if (locked)
-            snprintf(hint, sizeof hint, "Set by the environment (RECOMP_AUDIO_MUSIC_DIR or --music-dir);"
-                     " unset it to change it here.");
-        else if (s_mf_acc_state.load(std::memory_order_acquire) == 1)
-            snprintf(hint, sizeof hint, "Waiting for Android's answer: may the game read your music files?");
-        else if (s_mf && s_mf->access)
-            /* The hook asks for what the browser needs (Android's audio
-             * permission) and says how it went in its line. */
-            snprintf(hint, sizeof hint, "%s%sYour own music (mp3, flac, ogg, wav) for the game's music menu."
-                     " Pick a folder of songs, or a folder of folders for one soundtrack each."
-                     " A opens the folder list.", s_mf_acc_line, s_mf_acc_line[0] ? "  |  " : "");
-        else
-#if defined(__ANDROID__)
-            /* No access hook: the app reads only its own files folder,
-             * which the browser lists first. */
-            snprintf(hint, sizeof hint, "Your own music (mp3, flac, ogg, wav) for the game's music menu."
-                     " Pick a folder of songs, or a folder of folders for one soundtrack each. On Android,"
-                     " copy music folders into Android/data/<this app>/files/Music (the app can read"
-                     " only its own folder), then press %s and choose \"This app's Music folder\".", act_name(0));
-#else
-            snprintf(hint, sizeof hint, "Your own music (mp3, flac, ogg, wav) for the game's music menu."
-                     " Pick a folder of songs, or a folder of folders for one soundtrack each."
-                     " %s opens the folder list.", act_name(0, true));
-#endif
-    } else if (rows[sel].kind == R_ACTION
-               && (rows[sel].action == A_REPORT || rows[sel].action == A_REPORT_SHOT)) {
-        snprintf(hint, sizeof hint, "%s%sA zip in the reports folder beside the settings, with the logs of"
-                 " this run and the last ones, crash reports, your settings and a system summary%s."
-                 " It has no saves or game data, and your home folder shows as ~. Attach it to an issue.",
-                 s_rep_done, s_rep_done[0] ? ". " : "",
-                 rows[sel].action == A_REPORT_SHOT ? ", plus the frame behind this menu" : "");
-    } else if (rows[sel].kind == R_ACTION && rows[sel].action == A_SHADERS && s_sb && s_sb->cost) {
-        snprintf(hint, sizeof hint, "%s The game is paused while it runs. Closing the settings stops it;"
-                 " the next run picks up where it left off.", s_sb->cost);
-    }
+    char hint[1800];
+    const bool hint_locked = row_hint(rows[sel], hint, sizeof hint);
     /* The foot of the page, bottom up: the footer bar, the selected row's
      * hint, the pinned rows (Quit game, and Restart while one is pending),
      * and the scrolling rows in what is left above. */
@@ -3896,14 +3905,50 @@ static void build_pages_inner()
     const float pitch = LY.pitch, gap = 0.009f * LY.H;
     const float hx = LY.cx + 0.06f * LY.cw, hw = 0.88f * LY.cw;
     const float pins_h = pins * pitch + (note_only ? pitch * 0.75f : 0.0f) + (pins || note_only ? gap : 0.0f);
+    /* The hint's band is as tall as the page's longest hint, so the rows
+     * above it stay where they are while the selection moves (BO-167). It
+     * only grows while the page is shown (a confirm or a message can make
+     * a hint longer), so it never jumps back either. */
+    char longest[sizeof hint];
+    float longest_h = 0.0f;
+    longest[0] = 0;
+    for (int i = 0; i < n; i++) {
+        char t[sizeof hint];
+        if (!selectable(rows[i]))
+            continue;
+        if (i == sel)
+            snprintf(t, sizeof t, "%s", hint);
+        else
+            row_hint(rows[i], t, sizeof t);
+        const float h = t[0] ? ImGui::GetFont()->CalcTextSizeA(LY.hint, FLT_MAX, hw, t).y : 0.0f;
+        if (h > longest_h) {
+            longest_h = h;
+            memcpy(longest, t, sizeof t);
+        }
+    }
     float hs = LY.hint, hint_h = 0.0f;
-    for (int k = 0; hint[0] && k < 10; k++) {
+    for (int k = 0; longest[0] && k < 10; k++) {
         /* A long hint shrinks (to 62%) before it takes the rows' room. */
-        hint_h = ImGui::GetFont()->CalcTextSizeA(hs, FLT_MAX, hw, hint).y;
+        hint_h = ImGui::GetFont()->CalcTextSizeA(hs, FLT_MAX, hw, longest).y;
         const float rows_h = LY.y_foot - gap - hint_h - gap - pins_h - LY.y_rows;
         if ((hint_h <= 0.13f * LY.H && rows_h >= pitch * 3.0f) || hs <= LY.hint * 0.62f)
             break;
         hs *= 0.92f;
+    }
+    {
+        static int band_page = -1;
+        static float band_w, band_hgt, band_h, band_hs;
+        if (band_page != s_page || band_w != LY.W || band_hgt != LY.H || !s_open) {
+            band_page = s_open ? s_page : -1;
+            band_w = LY.W;
+            band_hgt = LY.H;
+            band_h = 0.0f;
+            band_hs = hs;
+        }
+        band_h = fmaxf(band_h, hint_h);
+        band_hs = fminf(band_hs, hs);
+        hint_h = band_h;
+        hs = band_hs;
     }
     const float y_hint = LY.y_foot - gap - hint_h;
     const float y_pins = y_hint - gap - pins_h;
