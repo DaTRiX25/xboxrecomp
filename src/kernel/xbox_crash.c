@@ -994,6 +994,24 @@ static void dump_guest_ram(void)
 
 static int s_hang_mem;   /* report_threads: the register windows too */
 
+static xbox_crash_note_fn s_notes[8];
+static volatile LONG s_n_notes;
+
+void xbox_crash_add_note(xbox_crash_note_fn fn)
+{
+    LONG i = InterlockedIncrement(&s_n_notes) - 1;
+    if (i < 8)
+        s_notes[i] = fn;
+}
+
+static void print_notes(void)
+{
+    LONG i, n = s_n_notes < 8 ? s_n_notes : 8;
+    for (i = 0; i < n; i++)
+        if (s_notes[i])
+            s_notes[i]();
+}
+
 static void print_icalls(void)
 {
     uint32_t k;
@@ -1355,6 +1373,7 @@ static void hang_report(unsigned stalled_s)
     if (!xbox_crash_begin("hang", head))
         return;
     print_icalls();
+    print_notes();
     s_hang_mem = 1;
     report_threads();
     s_hang_mem = 0;

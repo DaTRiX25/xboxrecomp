@@ -88,6 +88,113 @@ void xbox_HostSleepNs(uint64_t ns)
 #endif
 }
 
+/* ── The wakeable sleep (one sleeper) ────────────────────── */
+
+#ifdef _WIN32
+static HANDLE s_wake_ev;
+static INIT_ONCE s_wake_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK wake_ev_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    s_wake_ev = CreateEventW(NULL, FALSE, FALSE, NULL);   /* auto-reset */
+    return TRUE;
+}
+
+void xbox_HostSleepWakeableNs(uint64_t ns)
+{
+    static HOST_THREAD_LOCAL HANDLE timer;
+    static HOST_THREAD_LOCAL int timer_failed;
+
+    InitOnceExecuteOnce(&s_wake_once, wake_ev_init, NULL, NULL);
+    if (!s_wake_ev) {
+        xbox_HostSleepNs(ns);
+        return;
+    }
+    if (!ns) {
+        WaitForSingleObject(s_wake_ev, 0);      /* take a pending wake */
+        return;
+    }
+    if (!timer && !timer_failed) {
+        timer = CreateWaitableTimerExW(NULL, NULL,
+                                       CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+        timer_failed = !timer;
+    }
+    if (timer) {
+        LARGE_INTEGER due;
+        HANDLE h[2];
+        due.QuadPart = -(LONGLONG)((ns + 99u) / 100u);
+        h[0] = s_wake_ev;
+        h[1] = timer;
+        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+            if (WaitForMultipleObjects(2, h, FALSE, INFINITE) == WAIT_OBJECT_0)
+                CancelWaitableTimer(timer);
+            return;
+        }
+    }
+    WaitForSingleObject(s_wake_ev, (DWORD)((ns + 999999u) / 1000000u));
+}
+
+void xbox_HostSleepWake(void)
+{
+    InitOnceExecuteOnce(&s_wake_once, wake_ev_init, NULL, NULL);
+    if (s_wake_ev)
+        SetEvent(s_wake_ev);
+}
+#else
+static pthread_mutex_t s_wake_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_wake_cv;
+static pthread_once_t s_wake_once = PTHREAD_ONCE_INIT;
+static int s_wake_set;
+
+static void wake_cv_init(void)
+{
+    pthread_condattr_t a;
+
+    pthread_condattr_init(&a);
+#ifndef __APPLE__
+    pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+#endif
+    pthread_cond_init(&s_wake_cv, &a);
+    pthread_condattr_destroy(&a);
+}
+
+void xbox_HostSleepWakeableNs(uint64_t ns)
+{
+    pthread_once(&s_wake_once, wake_cv_init);
+    pthread_mutex_lock(&s_wake_mu);
+    if (!s_wake_set && ns) {
+#ifdef __APPLE__
+        struct timespec rel = { (time_t)(ns / 1000000000u),
+                                (long)(ns % 1000000000u) };
+        pthread_cond_timedwait_relative_np(&s_wake_cv, &s_wake_mu, &rel);
+#else
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        ts.tv_sec += (time_t)(ns / 1000000000u);
+        ts.tv_nsec += (long)(ns % 1000000000u);
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&s_wake_cv, &s_wake_mu, &ts);
+#endif
+    }
+    s_wake_set = 0;
+    pthread_mutex_unlock(&s_wake_mu);
+}
+
+void xbox_HostSleepWake(void)
+{
+    pthread_once(&s_wake_once, wake_cv_init);
+    pthread_mutex_lock(&s_wake_mu);
+    s_wake_set = 1;
+    pthread_cond_signal(&s_wake_cv);
+    pthread_mutex_unlock(&s_wake_mu);
+}
+#endif
+
 void xbox_HostTimerThreadInit(void)
 {
 #ifdef __APPLE__

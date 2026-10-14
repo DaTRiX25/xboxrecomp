@@ -120,6 +120,12 @@ extern volatile uint32_t g_xbox_flip_count;
 typedef void (*xbox_crash_sampler_fn)(void);
 void xbox_crash_set_sampler(xbox_crash_sampler_fn fn);
 
+/* A few lines of a subsystem's own counters in every hang report (up to
+ * 8 functions; each prints with xbox_crash_printf). Runs on the watchdog
+ * thread while the others are stuck: read, never lock. */
+typedef void (*xbox_crash_note_fn)(void);
+void xbox_crash_add_note(xbox_crash_note_fn fn);
+
 /* Start the hang watchdog (RECOMP_HANG_WATCHDOG; see above) and arm
  * RECOMP_DEBUG=crash_test. Call once the guest is about to start. */
 void xbox_crash_watchdog_start(void);

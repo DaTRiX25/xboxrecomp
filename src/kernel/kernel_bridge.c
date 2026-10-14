@@ -2482,9 +2482,79 @@ static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
  * DPC ordering beyond "after the ISR".
  */
 #define XBOX_MAX_PENDING_DPC 64
-typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
+typedef struct { uint32_t dpc, arg1, arg2; uint64_t t_ns; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
+
+/* RECOMP_DEBUG=dpc_stats: queue-to-run latency, and where DPCs ran. A
+ * histogram, 1 us buckets to 1 ms, then 100 us to ~100 ms; read with the
+ * [IRQ] summary and at exit. */
+#define DPC_HIST_FINE 1000
+#define DPC_HIST_N    (DPC_HIST_FINE + 990)
+static int s_dpc_stats = -1;
+static volatile LONG s_dpc_hist[DPC_HIST_N];
+static volatile LONG s_dpc_max_us, s_dpc_kicks;
+/* Set on the timer thread: it drains on its own pass, and its releases
+ * (the vblank's delivery) wake nobody. */
+static XBOX_THREAD_LOCAL int t_dpc_timer_thread;
+
+static void kernel_dpc_report(void);
+
+static int dpc_stats_on(void)
+{
+    if (s_dpc_stats < 0) {
+        s_dpc_stats = recomp_env_on(RENV_DPC_STATS);
+        if (s_dpc_stats)
+            atexit(kernel_dpc_report);
+    }
+    return s_dpc_stats;
+}
+
+static void dpc_stats_ran(uint64_t t_ns)
+{
+    uint64_t us = (xbox_HostNowNs() - t_ns) / 1000u;
+    LONG cur;
+    long b = us < DPC_HIST_FINE ? (long)us
+           : DPC_HIST_FINE + (long)((us - DPC_HIST_FINE) / 100u);
+
+    if (b >= DPC_HIST_N)
+        b = DPC_HIST_N - 1;
+    InterlockedIncrement(&s_dpc_hist[b]);
+    while ((LONG)us > (cur = s_dpc_max_us))
+        if (InterlockedCompareExchange(&s_dpc_max_us, (LONG)us, cur) == cur)
+            break;
+}
+
+static long dpc_hist_us(long b)
+{
+    return b < DPC_HIST_FINE ? b : DPC_HIST_FINE + (b - DPC_HIST_FINE) * 100;
+}
+
+/* Cumulative over the run. */
+static void kernel_dpc_report(void)
+{
+    long long n = 0, acc = 0;
+    long p50 = -1, p99 = -1, p999 = -1, b;
+
+    if (s_dpc_stats <= 0)
+        return;
+    for (b = 0; b < DPC_HIST_N; b++)
+        n += s_dpc_hist[b];
+    if (!n)
+        return;
+    for (b = 0; b < DPC_HIST_N; b++) {
+        acc += s_dpc_hist[b];
+        if (p50 < 0 && acc * 2 >= n) p50 = dpc_hist_us(b);
+        if (p99 < 0 && acc * 100 >= n * 99) p99 = dpc_hist_us(b);
+        if (p999 < 0 && acc * 1000 >= n * 999) p999 = dpc_hist_us(b);
+    }
+    fprintf(stderr, "  [DPC] %lld run, queue to run p50 %ld us, p99 %ld us,"
+            " p99.9 %ld us, max %ld us; timer-thread wakes %ld (%s)\n",
+            n, p50, p99, p999,
+            (long)s_dpc_max_us, (long)s_dpc_kicks,
+            xbox_DpcPromptOn() ? "dpc_prompt" : "dpc_prompt=0");
+    fflush(stderr);
+}
 
 /* The queue is fed from several host threads at once -- the USB and APU
  * controller threads raise interrupts whose ISRs queue DPCs, and the title
@@ -2513,6 +2583,42 @@ static void dpc_lock(void)
     EnterCriticalSection(&g_dpc_lock);
 }
 
+static int kernel_dpc_pending(void);
+static void kernel_dpc_kick(void);
+
+/* The hang report's line: what waits in the queue, and for how long when
+ * dpc_stats is on. A DPC that waits here with the gate free is one no point
+ * reached. Read without the lock: the other threads may be stuck in it. */
+static void kernel_dpc_note(void)
+{
+    LONG h = g_dpc_head, t = g_dpc_tail, i;
+    uint64_t now = xbox_HostNowNs();
+
+    xbox_crash_printf("  DPC queue: %ld waiting",
+                      (long)((t - h + XBOX_MAX_PENDING_DPC) % XBOX_MAX_PENDING_DPC));
+    for (i = h; i != t; i = (i + 1) % XBOX_MAX_PENDING_DPC) {
+        uint32_t d = g_dpc_queue[i].dpc;
+        xbox_crash_printf(" %08X", d ? BRIDGE_MEM32(d + 12) : 0);
+        if (g_dpc_queue[i].t_ns)
+            xbox_crash_printf("(%.1f ms)",
+                              (double)(now - g_dpc_queue[i].t_ns) / 1e6);
+    }
+    xbox_crash_printf("; gate holder tid %lu\n", xbox_DispatchGateOwner());
+}
+
+static void kernel_dpc_hooks_once(void)
+{
+    static volatile LONG done;
+    static const XboxDpcHooks hooks = {
+        kernel_dpc_pending, kernel_dpc_kick
+    };
+
+    if (!done && !InterlockedExchange(&done, 1)) {
+        xbox_DpcSetHooks(&hooks);
+        xbox_crash_add_note(kernel_dpc_note);
+    }
+}
+
 static void bridge_KeInsertQueueDpc(void)
 {
     uint32_t dpc  = STACK_ARG(0);
@@ -2522,6 +2628,7 @@ static void bridge_KeInsertQueueDpc(void)
 
     if (!dpc) { g_eax = 0; return; }
 
+    kernel_dpc_hooks_once();
     dpc_lock();
     if (BRIDGE_MEM8(dpc + 2)) {                 /* already queued */
         LeaveCriticalSection(&g_dpc_lock);
@@ -2540,10 +2647,27 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_queue[tail].dpc  = dpc;
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
+    g_dpc_queue[tail].t_ns = dpc_stats_on() ? xbox_HostNowNs() : 0;
     BRIDGE_MEM8(dpc + 2) = 1;
     g_dpc_tail = next;
     LeaveCriticalSection(&g_dpc_lock);
+    /* The console runs it once the processor is below DISPATCH: the timer
+     * thread is woken now, or at the gate's release (kernel_hal.c). */
+    xbox_DpcQueued();
     g_eax = 1;
+}
+
+/* The hooks kernel_hal.c wakes the timer thread with (xbox_DpcSetHooks). */
+static int kernel_dpc_pending(void)
+{
+    return !t_dpc_timer_thread && g_dpc_head != g_dpc_tail;
+}
+
+static void kernel_dpc_kick(void)
+{
+    if (s_dpc_stats > 0)
+        InterlockedIncrement(&s_dpc_kicks);
+    xbox_HostSleepWake();
 }
 
 /* Cancel a queued DPC: take it out of the queue if it is still there. */
@@ -2894,6 +3018,7 @@ static void kernel_vblank_count(long long now)
                 (long)InterlockedExchange(&g_vbl_declined, 0));
         fflush(stderr);
         xbox_IrqReport();
+        kernel_dpc_report();
         if (xbox_ProfOn())
             xbox_ProfReport();
         gap_min = 1e9;
@@ -3114,6 +3239,8 @@ static int kernel_drain_dpcs(int *ran)
         if (d.dpc)
             BRIDGE_MEM8(d.dpc + 2) = 0;
         LeaveCriticalSection(&g_dpc_lock);
+        if (d.dpc && d.t_ns)
+            dpc_stats_ran(d.t_ns);
         if (d.dpc && kernel_run_dpc(d.dpc, d.arg1, d.arg2, XBOX_PROF_DPC_QUEUE))
             (*ran)++;
         xbox_DispatchGateLeave();
@@ -3460,12 +3587,13 @@ static void kernel_timer_loop_ns(void)
                 xbox_HostSleepNs(wait);
         } else if (xbox_ProfOn()) {
             long long t0 = xbox_ProfNowUs();
-            xbox_HostSleepNs(wait);
+            xbox_HostSleepWakeableNs(wait);
             xbox_ProfCount(XBOX_PROF_SLEEP_OVER, xbox_ProfNowUs() - t0
                            - (long long)(wait / 1000u));
             xbox_ProfCount(XBOX_PROF_N_LOOPS, 1);
         } else {
-            xbox_HostSleepNs(wait);
+            /* Ended early by a device model's DPC (kernel_dpc_kick). */
+            xbox_HostSleepWakeableNs(wait);
         }
         xbox_HostWakeTick();              /* a sleep or a stop behind us? */
         raised = kernel_vblank_tick_ns(xbox_GuestNowNs(), &vbl_next);
@@ -3505,6 +3633,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
     (void)unused;
     xbox_log_thread_role("kernel-timer", 0);
+    t_dpc_timer_thread = 1;
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
                         "timer DPCs will not run\n");
