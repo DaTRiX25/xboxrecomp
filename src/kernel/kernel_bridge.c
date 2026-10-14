@@ -3066,7 +3066,22 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
  * a busy gate with DPCs still queued; *ran counts the DPCs it ran. */
 static int kernel_drain_dpcs(int *ran)
 {
+    /* RECOMP_DEBUG=dpc_lag=ms, a test: a DPC waits for the timer thread's
+     * next pass here, where on the console it runs as soon as the ISR that
+     * queued it returns. The wait is a window in which a thread can take
+     * the gate and act on state the DPC has not processed yet (BO-173,
+     * DirectSound's done list); the lag widens it so that shows in minutes. */
+    static long lag_ms = -1;
+    static uint64_t last_ns;
     *ran = 0;
+    if (lag_ms < 0)
+        lag_ms = recomp_env(RENV_DPC_LAG) ? recomp_env_int(RENV_DPC_LAG, 0) : 0;
+    if (lag_ms > 0) {
+        uint64_t now = xbox_HostNowNs();
+        if (now - last_ns < (uint64_t)lag_ms * 1000000ull)
+            return g_dpc_head != g_dpc_tail;
+        last_ns = now;
+    }
     for (;;) {
         PendingDpc d;
         /* A DPC runs only while the one-CPU gate is free (no thread at
