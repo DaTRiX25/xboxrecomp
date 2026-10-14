@@ -264,6 +264,24 @@ int main(void)
         e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
         CHECK(!e || !*e || !strcmp(e, "original"));
     }
+    {
+        /* The score board (a host hook, BO-165): original untouched, a
+         * choice reaches the environment at once and goes back. */
+        const char *e = recomp_env(RENV_GFX_SCORE_BOARD);
+        CHECK(xbox_SettingValue(XS_DISPLAY_SCORE_BOARD) == 0 && !xbox_SettingGet(XS_DISPLAY_SCORE_BOARD)->user);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+        CHECK(!strcmp(xbox_SettingGet(XS_DISPLAY_SCORE_BOARD)->key, "display.score_board"));
+        xbox_SettingSet(XS_DISPLAY_SCORE_BOARD, 1);
+        e = recomp_env(RENV_GFX_SCORE_BOARD);
+        CHECK(e && !strcmp(e, "smooth"));
+        xbox_SettingSet(XS_DISPLAY_SCORE_BOARD, 2);
+        e = recomp_env(RENV_GFX_SCORE_BOARD);
+        CHECK(e && !strcmp(e, "off"));
+        CHECK(!xbox_SettingsNeedRestart());          /* live */
+        xbox_SettingReset(XS_DISPLAY_SCORE_BOARD);
+        e = recomp_env(RENV_GFX_SCORE_BOARD);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+    }
     xbox_SettingSet(XS_GRAPHICS_MOTION_BLUR, 0);
     CHECK(recomp_env(RENV_GFX_MOTION_BLUR) && !strcmp(recomp_env(RENV_GFX_MOTION_BLUR), "0"));
     CHECK(!xbox_SettingsNeedRestart());              /* live */
