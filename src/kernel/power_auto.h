@@ -40,8 +40,10 @@
  *   hitch   a window with a hitch, and the 3 s after one, decide nothing.
  *           A hitch is usually a scene change, and the level returns to the
  *           level last proven needed (held, decaying one step per 10 min
- *           without a step up), so a race after a light menu starts where
- *           the last race ended instead of stuttering its way up.
+ *           since it was last proven), so a race after a light menu starts where
+ *           the last race ended instead of stuttering its way up. A step up
+ *           still on trial when a stall comes is void (the near misses
+ *           were the run-up to a load).
  *
  * Levels (ms of spin before the vblank): 0 (Battery saver), 2, 4, 8
  * (Balanced; the start), 12, 17 (the whole frame: the busy-wait).

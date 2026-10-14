@@ -68,8 +68,7 @@ static int window_end(XboxPowerAuto *a, uint64_t now)
     /* What has run out. */
     if (a->ceiling < MAX_LEVEL && now >= a->ceiling_until_ns)
         a->ceiling = MAX_LEVEL;
-    if (a->held > 0 && now - (a->held_at_ns > a->last_up_ns ? a->held_at_ns : a->last_up_ns)
-                       > HELD_DECAY_NS) {
+    if (a->held > 0 && now - a->held_at_ns > HELD_DECAY_NS) {
         a->held--;
         a->held_at_ns = now;
     }
@@ -77,6 +76,15 @@ static int window_end(XboxPowerAuto *a, uint64_t now)
         a->down_need = DOWN_RUN;
 
     if (disturbed) {
+        /* A stall while a step up is on trial: the trouble that caused it
+         * was the run-up to a load, not the wait (what follows is another
+         * scene). The step is void. */
+        if (a->probe_from >= 0) {
+            a->level = a->probe_from;
+            a->probe_from = -1;
+            a->tot.reverts++;
+            snprintf(a->why, sizeof a->why, "a stall came: the step up is void");
+        }
         a->bad_run = a->clean_run = 0;
     } else if (a->probe_from >= 0) {
         /* The two windows after a step up: did the climb help yet? A third
@@ -159,7 +167,7 @@ int xbox_PowerAutoFeed(XboxPowerAuto *a, const XboxPowerAutoSample *s)
 
     a->last_ns = now;
     if (!a->win_start_ns)
-        a->win_start_ns = now;
+        a->win_start_ns = a->held_at_ns = now;
     if (!s->interval || s->interval > 4)
         return 0;
     a->n++;
