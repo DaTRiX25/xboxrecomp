@@ -13,6 +13,9 @@
  *                 xbox_crash_set_settings and every RECOMP_* value the
  *                 runtime's table holds
  *   minidump.dmp  Windows only, written by the host
+ *   guestram.bin  hang reports only: guest RAM from address 0, raw (64 MB
+ *                 on a retail layout); report.txt then also has 256 bytes
+ *                 around every guest register that points into it
  *
  * Beside the reports, <save dir>/logs keeps the log of this run and of the
  * three before it (see xbox_crash_set_run_log).
