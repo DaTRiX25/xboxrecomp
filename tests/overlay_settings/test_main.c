@@ -274,9 +274,8 @@ int main(void)
         xbox_SettingSet(XS_DISPLAY_SCORE_BOARD, 1);
         e = recomp_env(RENV_GFX_SCORE_BOARD);
         CHECK(e && !strcmp(e, "smooth"));
-        xbox_SettingSet(XS_DISPLAY_SCORE_BOARD, 2);
-        e = recomp_env(RENV_GFX_SCORE_BOARD);
-        CHECK(e && !strcmp(e, "off"));
+        xbox_SettingSet(XS_DISPLAY_SCORE_BOARD, 2);          /* past the last: smooth */
+        CHECK(xbox_SettingValue(XS_DISPLAY_SCORE_BOARD) == 1);
         CHECK(!xbox_SettingsNeedRestart());          /* live */
         xbox_SettingReset(XS_DISPLAY_SCORE_BOARD);
         e = recomp_env(RENV_GFX_SCORE_BOARD);
