@@ -35,6 +35,14 @@ extern "C" {
 void xbox_HostPause(int on);
 int  xbox_HostPaused(void);
 
+/* The way out (a quit or a restart that tears the GPU device down first):
+ * the title is paused for good (a later xbox_HostPause(0) is ignored, the
+ * hold runs no hold or idle work and never returns) and this waits up to
+ * timeout_ms for the executor to be in the hold. 1: it is, so it uses the
+ * GPU no more; 0: it did not get there in time (a load that does not flip,
+ * a wait on a lost device). Any thread but the executor's; once. */
+int  xbox_HostHoldForExit(int timeout_ms);
+
 /* The executor, at the end of FLIP_STALL: notes the flip's time
  * (xbox_HostFlipTimes), then returns at once unless paused, otherwise blocks
  * until resumed. Counts as a flip for the hang watchdog while it waits (a

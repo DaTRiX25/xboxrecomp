@@ -560,6 +560,13 @@ void xbox_log_thread_role(const char *role, uint32_t routine)
         thread_set_os_name(os);
     /* Known to the hang report, by this name. */
     xbox_crash_thread_register(os);
+#if defined(__ANDROID__)
+    {
+        /* The hot threads get an ADPF performance hint session (android_perf.c). */
+        extern void xbox_AndroidPerfThread(const char *role);
+        xbox_AndroidPerfThread(role);
+    }
+#endif
     if (routine)
         fprintf(stderr, "[THREAD] tid=%lu role=%s routine=0x%08X\n",
                 (unsigned long)GetCurrentThreadId(), role, routine);

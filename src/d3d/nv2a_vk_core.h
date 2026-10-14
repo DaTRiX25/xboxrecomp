@@ -79,6 +79,19 @@ int nvk_core_is_software(void);
 void nvk_device_lost(const char *why);
 void nvk_set_lost_handler(void (*fn)(const char *why));
 
+/* The way out (Android: every quit and restart, before the process ends;
+ * fb_present_sdl.c). nvk_backend_quiesce first: the backend's pre-warm
+ * thread stops and its pipeline cache is written; 0 when that thread did
+ * not stop within timeout_ms (the device must then be left alone). Then,
+ * with the executor held (xbox_HostHoldForExit) and the window's swapchain
+ * gone: nvk_core_shutdown cancels the GPU waits still going
+ * (nvk_wait_cancel), takes the queue lock for good, waits for the
+ * device to be idle and destroys the surface, the device and the instance,
+ * each step in the log. Objects the backend still holds go with the device
+ * (the process ends next). */
+int  nvk_backend_quiesce(int timeout_ms);
+void nvk_core_shutdown(void);
+
 void nvk_queue_lock(void);
 void nvk_queue_unlock(void);
 
@@ -91,6 +104,59 @@ void nvk_queue_unlock(void);
  * in 'gpu fault ctx N ... ts T' (both count from the device's creation).
  * nvk_device_lost prints the kept ones. */
 uint64_t nvk_submit_note(const char *what);
+
+/* Bounded GPU waits. A fence or timeline wait is made in slices; a slice
+ * that times out (VK_TIMEOUT) is waited on again until a total limit, on
+ * the monotonic clock (RECOMP_DEBUG=vk_wait_limit=<ms>, default 10 s), or
+ * until the wait is cancelled (nvk_wait_cancel, a lost device reported from
+ * any thread, the process's exit). The first slice is the whole cost of a
+ * wait that succeeds: nothing else is waited for. Each kind of failure is
+ * logged on its own: done after timeouts (with the time taken), timed out
+ * for good, device lost, another VkResult, cancelled.
+ *
+ * Only NVK_WAIT_OK proves the GPU is done: on anything else the caller does
+ * not reset, reuse, free or read what the wait was for, and passes the
+ * outcome to nvk_wait_fatal, which ends drawing for the run through
+ * nvk_device_lost (a cancelled wait is not reported: the run is ending).
+ *
+ * Sites (RECOMP_DEBUG=vk_wait_fault=<site>:<kind>[:<n>], test hook): the
+ * waits at a site count; the one after n of them (default 300) is made to
+ * fail as asked: retry (two slices time out, then the real wait), timeout
+ * (every slice times out: the limit is reached), lost (VK_ERROR_DEVICE_LOST). */
+enum nvk_wait_site {
+    NVK_WAIT_SERIAL,      /* backend: a submit's serial (flush, ring, readback) */
+    NVK_WAIT_FRAME,       /* backend: a frame's slot, reused two flips on */
+    NVK_WAIT_UPLOAD,      /* window: the CPU frame's upload */
+    NVK_WAIT_PRESENT,     /* window: the present's frame fence */
+    NVK_WAIT_SHOT,        /* window: a window shot's readback */
+    NVK_WAIT_SLOT,        /* window: a slot that changes size */
+    NVK_WAIT_SITES
+};
+enum nvk_wait_outcome {
+    NVK_WAIT_OK = 0,
+    NVK_WAIT_TIMEOUT,     /* still not done at the limit */
+    NVK_WAIT_LOST,        /* VK_ERROR_DEVICE_LOST */
+    NVK_WAIT_ERROR,       /* another VkResult */
+    NVK_WAIT_CANCELLED
+};
+/* Every fence in `fence`, as vkWaitForFences(waitAll). *res (may be NULL):
+ * the last VkResult. */
+int  nvk_wait_fence(int site, const char *what, VkFence fence, VkResult *res);
+/* The timeline semaphore at `value` or past it. */
+int  nvk_wait_timeline(int site, const char *what, VkSemaphore sem, uint64_t value,
+                       VkResult *res);
+/* Everything submitted to the queue so far, as vkQueueWaitIdle but bounded:
+ * an empty submit that signals `fence` (the caller's, not pending; reset
+ * here, under the queue lock), then nvk_wait_fence. A submit that fails is
+ * NVK_WAIT_LOST or NVK_WAIT_ERROR and leaves the fence unsignalled with
+ * nothing pending on it. */
+int  nvk_wait_queue(int site, const char *what, VkFence fence, VkResult *res);
+/* An outcome other than OK or CANCELLED: the device is reported lost
+ * (nvk_device_lost) with what and why. Returns 1 for those, 0 otherwise. */
+int  nvk_wait_fatal(int outcome, VkResult res, const char *what);
+void nvk_wait_cancel(void);
+/* 1 once nvk_device_lost has been called. */
+int  nvk_core_lost(void);
 
 /* A memory type index for `bits` with all of `want`, preferring one that
  * also has `prefer`; -1 if none. */

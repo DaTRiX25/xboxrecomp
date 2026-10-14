@@ -697,14 +697,6 @@ void fbv_android_surface_gone(void);
 #include <jni.h>
 #include <SDL_system.h>
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
-/* The warning that no usable Vulkan driver was found, with the way back on
- * it (BO-121): without the Vulkan window there is no settings overlay, so a
- * player who chose a driver that cannot run the game could not choose
- * another from inside it. The port's activity says whether there is a
- * driver to go back to and does the going (int resetGraphicsDriver(int):
- * 0 asks, 1 chooses the driver in the app and starts the app again); an
- * activity without that method gets the plain warning. Returns 1 when the
- * window with the choice was shown. */
 /* recomp_restart.h on Android: the activity starts the app again (int
  * restartGame(): the same path as its driver reset, a page in another
  * process that starts the game once this process is gone). An activity
@@ -765,13 +757,27 @@ static void android_quit(void)
     (*env)->DeleteLocalRef(env, act);
 }
 
+static void android_exit_now(const char *why);
+
+/* The warning that no usable Vulkan driver was found, with the ways out on
+ * it (BO-121, BO-153): without the Vulkan window there is no settings
+ * overlay, so a player whose driver cannot run the game could not choose
+ * another from inside it. The port's activity says whether there is a
+ * driver to go back to and does the going (int resetGraphicsDriver(int):
+ * 0 asks, 1 chooses the driver in the app and starts the app again), and
+ * opens its driver page on the file picker (int pickDriverPackage(): the
+ * package picked is chosen and the app starts again on it; that is also
+ * the only way out when the driver in the app is the one that cannot run
+ * the game, as Turnip on an Adreno A6xx "gen1 low" with Vulkan 1.0). An
+ * activity with neither method gets the plain warning. Returns 1 when the
+ * window with the choices was shown. */
 static int android_offer_driver_reset(const char *msg)
 {
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
     jobject act = env ? (jobject)SDL_AndroidGetActivity() : NULL;
     jclass cls;
-    jmethodID m;
-    int shown = 0;
+    jmethodID m, pick;
+    int shown = 0, reset;
 
     if (!act)
         return 0;
@@ -781,39 +787,199 @@ static int android_offer_driver_reset(const char *msg)
         (*env)->ExceptionClear(env);
         m = NULL;
     }
-    if (m && (*env)->CallIntMethod(env, act, m, (jint)0) == 1) {
-        static const SDL_MessageBoxButtonData b[2] = {
-            { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Reset back to Turnip" },
-            { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Continue on the CPU" },
-        };
-        char text[900];
+    pick = (*env)->GetMethodID(env, cls, "pickDriverPackage", "()I");
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        pick = NULL;
+    }
+    reset = m && (*env)->CallIntMethod(env, act, m, (jint)0) == 1;
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        reset = 0;
+    }
+    if (reset || pick) {
+        SDL_MessageBoxButtonData b[3];
+        char text[1200];
         SDL_MessageBoxData d;
-        int hit = 0;
+        int n = 0, hit = 0;
 
+        memset(b, 0, sizeof b);
+        if (reset) {
+            b[n].buttonid = 1;
+            b[n++].text = "Use Turnip";
+        }
+        if (pick) {
+            b[n].buttonid = 2;
+            b[n++].text = "Driver package\xE2\x80\xA6";
+        }
+        b[0].flags |= SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
+        b[n].flags = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+        b[n].buttonid = 0;
+        /* SDL's Android box puts the buttons in one row at the box's
+         * width: three short labels, or the third one is a column of
+         * letters (seen on a 1240x1080 Retroid Pocket Classic). */
+        b[n].text = n == 2 ? "Continue" : "Continue on the CPU";
+        n++;
         snprintf(text, sizeof text, "%s\n\nThe settings menu (Select+Start) is not available"
-                 " on this driver either. \"Reset back to Turnip\" chooses the Mesa Turnip"
-                 " driver that comes in the app and starts the game again.", msg);
+                 " on this driver either.%s%s%s", msg,
+                 reset ? " \"Use Turnip\" chooses the Mesa Turnip driver that"
+                         " comes in the app and starts the game again." : "",
+                 pick ? " \"Driver package\xE2\x80\xA6\" opens the file picker for a Turnip"
+                        " driver package (.zip) for this GPU; the game starts again on it,"
+                        " and if it does not show frames there, the next start goes back." : "",
+                 n == 3 ? " \"Continue\" goes on on the CPU." : "");
         memset(&d, 0, sizeof d);
         d.flags = SDL_MESSAGEBOX_WARNING;
         d.title = "Graphics driver";
         d.message = text;
-        d.numbuttons = 2;
+        d.numbuttons = n;
         d.buttons = b;
         shown = SDL_ShowMessageBox(&d, &hit) == 0;
         if (shown && hit == 1) {
-            fprintf(stderr, "[PRESENT] the warning's \"Reset back to Turnip\": the app starts"
+            fprintf(stderr, "[PRESENT] the warning's \"Use Turnip\": the app starts"
                     " again on the driver in the app\n");
             (*env)->CallIntMethod(env, act, m, (jint)1);
             if ((*env)->ExceptionCheck(env))
                 (*env)->ExceptionClear(env);
-            /* The activity ends this process in a moment; nothing more is
-             * started here meanwhile. */
-            SDL_Delay(5000);
+            /* The restart page is started and waits for this process to
+             * be gone; the game never drew on this driver (that is why
+             * the box is up), so there is no GPU work to wait for. */
+            android_exit_now("driver reset");
+        } else if (shown && hit == 2) {
+            /* The driver page comes up over the game, which goes on on
+             * the CPU behind it: a package picked there restarts the app
+             * (the activity's way, as the overlay's restart), Back or a
+             * cancelled picker leaves the game as it is. */
+            fprintf(stderr, "[PRESENT] the warning's \"Driver package\": the driver page"
+                    " opens on the file picker\n");
+            (*env)->CallIntMethod(env, act, pick);
+            if ((*env)->ExceptionCheck(env))
+                (*env)->ExceptionClear(env);
         }
     }
     (*env)->DeleteLocalRef(env, cls);
     (*env)->DeleteLocalRef(env, act);
     return shown;
+}
+
+/* ── the way out on Android: the GPU torn down before the process ends ──
+ *
+ * Every way the game ends on Android comes through the window loop's end
+ * (Quit game, Restart game, a driver change, Back or the system finishing
+ * the activity, the box after a lost device): the activity is finished, SDL
+ * sends SDL_QUIT, the loop ends. Before exit(0) the Vulkan side goes in
+ * order, as the emulators do at their own stop: the executor held (it
+ * submits no more), the pre-warm thread stopped and the pipeline cache
+ * written, the swapchain, then vkDeviceWaitIdle and the surface, the device
+ * and the instance (nvk_core_shutdown). The kernel driver (kgsl) then has
+ * nothing of this process's left when the next one opens the GPU: the app
+ * restarts only once this process is gone (RestartActivity waits for it).
+ * A step that cannot be done safely (the executor not held in time) leaves
+ * the device to the process's end, and says so. A watchdog ends the process
+ * if the teardown itself hangs (a wedged GPU). Each step is in the log with
+ * the time since the teardown began. */
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+int  xbox_HostHoldForExit(int timeout_ms);
+int  nvk_backend_quiesce(int timeout_ms);
+void nvk_core_shutdown(void);
+#endif
+#include <unistd.h>
+void xbox_crash_log_flush(unsigned max_ms);   /* kernel/xbox_crash.h */
+
+static struct timespec s_td_t0;
+static volatile int s_td_done;
+
+static double td_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)(t.tv_sec - s_td_t0.tv_sec) * 1e3
+         + (double)(t.tv_nsec - s_td_t0.tv_nsec) / 1e6;
+}
+
+static void *td_watchdog(void *arg)
+{
+    (void)arg;
+    sleep(4);
+    if (!s_td_done) {
+        XR_NOTICE("[TEARDOWN] not done after %.0f ms: the process ends now (_exit)\n",
+                td_ms());
+        fflush(stderr);
+        xbox_crash_log_flush(300);
+        _exit(0);
+    }
+    return NULL;
+}
+
+/* The process's end on Android. Not exit(): its C++ static destructors
+ * (the system's EGL and Adreno GLES libraries among them) run while the
+ * activity's window still draws on HWUI's RenderThread, which then crashed
+ * in eglQuerySurface (SIGSEGV at 0, Galaxy S20 FE, 2026-10-13: after a
+ * clean teardown, and with diagnostic logging off too). So, as the Win32
+ * windows do before ExitProcess: the runtime's exit hooks (a save still
+ * being written reaches the disk, the pads' motors off, the missing-file
+ * summary), the log passed on to its file, then _exit, which runs no
+ * destructors. The pipeline cache was written by nvk_backend_quiesce. */
+#include "../platform/recomp_exit_hook.h"
+
+static void android_exit_now(const char *why)
+{
+    if (!s_td_t0.tv_sec && !s_td_t0.tv_nsec)
+        clock_gettime(CLOCK_MONOTONIC, &s_td_t0);
+    XR_NOTICE("[TEARDOWN] %s: exit hooks (%.1f ms)\n", why, td_ms());
+    recomp_exit_hook_run("android");
+    XR_NOTICE("[TEARDOWN] %s: _exit(0) (%.1f ms)\n", why, td_ms());
+    s_td_done = 1;
+    fflush(stdout);
+    fflush(stderr);
+    xbox_crash_log_flush(500);
+    _exit(0);
+}
+
+/* Before the swapchain goes. Returns 1 when the device may be destroyed. */
+static int android_teardown_begin(int vk)
+{
+    pthread_t th;
+    int held = 0, quiet = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &s_td_t0);
+    XR_NOTICE("[TEARDOWN] begin (%s)\n", vk ? "Vulkan" : "no Vulkan device");
+    if (pthread_create(&th, NULL, td_watchdog, NULL) == 0)
+        pthread_detach(th);
+    {
+        /* The ADPF sessions (android_perf.c), from the thread that reports. */
+        extern void xbox_AndroidPerfClose(void);
+        xbox_AndroidPerfClose();
+    }
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (vk) {
+        held = xbox_HostHoldForExit(1500);
+        XR_NOTICE("[TEARDOWN] the title's executor %s (%.1f ms)\n",
+                held ? "is held" : "was not held in time", td_ms());
+        quiet = nvk_backend_quiesce(1000);
+        XR_NOTICE("[TEARDOWN] backend %s (%.1f ms)\n",
+                quiet ? "quiet" : "not quiet", td_ms());
+    }
+#endif
+    fflush(stderr);
+    return held && quiet;
+}
+
+/* After the swapchain is gone (close_present). */
+static void android_teardown_end(int vk, int destroy)
+{
+    XR_NOTICE("[TEARDOWN] swapchain destroyed (%.1f ms)\n", td_ms());
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+    if (vk && destroy)
+        nvk_core_shutdown();
+    else if (vk)
+        XR_NOTICE("[TEARDOWN] the device is left to the process's end (not safe to"
+                " destroy now)\n");
+#endif
+    (void)destroy;
+    XR_NOTICE("[TEARDOWN] GPU done (%.1f ms)\n", td_ms());
+    fflush(stderr);
+    s_td_done = 1;
 }
 
 #endif /* __ANDROID__ (reopened below) */
@@ -873,7 +1039,7 @@ static void gfx_restart(void)
             (*env)->CallVoidMethod(env, act, m);
         if ((*env)->ExceptionCheck(env))
             (*env)->ExceptionClear(env);
-        SDL_Delay(1500);        /* the activity ends this process */
+        /* The restart page is started; the caller ends this process. */
     }
 #else
     if (s_restart_fn)
@@ -1094,7 +1260,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                  * follows is the CPU rasteriser at a few frames a second:
                  * say so on the screen (RECOMP_NO_GPU_NOTE=1 or, as before,
                  * RECOMP_ANDROID_NO_GPU_NOTE=1: not). On Android the box
-                 * also offers the way back to the driver in the app. */
+                 * also offers the way back to the driver in the app and
+                 * the driver page's file picker for a package. */
                 if (!getenv("RECOMP_NO_GPU_NOTE") && !getenv("RECOMP_ANDROID_NO_GPU_NOTE")) {
                     char msg[640];
                     snprintf(msg, sizeof msg,
@@ -1385,6 +1552,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 shoot = 0;
                 s_shot_req[0] = 0;
                 presents++;
+#if defined(__ANDROID__)
+                {
+                    /* The hot threads' work for this frame (android_perf.c). */
+                    extern void xbox_AndroidPerfFrame(void);
+                    xbox_AndroidPerfFrame();
+                }
+#endif
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
                 xbox_OverlayFramePresented();
 #endif
@@ -1579,9 +1753,17 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * Window and renderer go first, on this thread as AppKit wants. SDL_Quit
      * is only safe once nothing else uses SDL: a run that had a controller
      * open keeps SDL up, as before, and exit() reclaims it. */
+#if defined(__ANDROID__)
+    {
+        int vk = s_vk, destroy = android_teardown_begin(vk);
+#endif
     if (tex)
         SDL_DestroyTexture(tex);
     close_present(ren);
+#if defined(__ANDROID__)
+        android_teardown_end(vk, destroy);
+    }
+#endif
     SDL_DestroyWindow(win);
     /* The main pump flag stays set: guest and OHCI threads keep running
      * until exit(), and must not start calling SDL_GameControllerUpdate
@@ -1592,6 +1774,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
     if (s_gfx_restart)
         gfx_restart();
+#if defined(__ANDROID__)
+    /* Every way out ends the process here (a guest that returned too): the
+     * next start, or the restart page, waits for this process to be gone. */
+    android_exit_now(s_gfx_restart ? "restart after a lost device" : "quit");
+#endif
     if (quit)
         exit(0);
     return s_guest_rc;
