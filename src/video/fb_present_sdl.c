@@ -697,14 +697,6 @@ void fbv_android_surface_gone(void);
 #include <jni.h>
 #include <SDL_system.h>
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
-/* The warning that no usable Vulkan driver was found, with the way back on
- * it (BO-121): without the Vulkan window there is no settings overlay, so a
- * player who chose a driver that cannot run the game could not choose
- * another from inside it. The port's activity says whether there is a
- * driver to go back to and does the going (int resetGraphicsDriver(int):
- * 0 asks, 1 chooses the driver in the app and starts the app again); an
- * activity without that method gets the plain warning. Returns 1 when the
- * window with the choice was shown. */
 /* recomp_restart.h on Android: the activity starts the app again (int
  * restartGame(): the same path as its driver reset, a page in another
  * process that starts the game once this process is gone). An activity
@@ -767,13 +759,25 @@ static void android_quit(void)
 
 static void android_exit_now(const char *why);
 
+/* The warning that no usable Vulkan driver was found, with the ways out on
+ * it (BO-121, BO-153): without the Vulkan window there is no settings
+ * overlay, so a player whose driver cannot run the game could not choose
+ * another from inside it. The port's activity says whether there is a
+ * driver to go back to and does the going (int resetGraphicsDriver(int):
+ * 0 asks, 1 chooses the driver in the app and starts the app again), and
+ * opens its driver page on the file picker (int pickDriverPackage(): the
+ * package picked is chosen and the app starts again on it; that is also
+ * the only way out when the driver in the app is the one that cannot run
+ * the game, as Turnip on an Adreno A6xx "gen1 low" with Vulkan 1.0). An
+ * activity with neither method gets the plain warning. Returns 1 when the
+ * window with the choices was shown. */
 static int android_offer_driver_reset(const char *msg)
 {
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
     jobject act = env ? (jobject)SDL_AndroidGetActivity() : NULL;
     jclass cls;
-    jmethodID m;
-    int shown = 0;
+    jmethodID m, pick;
+    int shown = 0, reset;
 
     if (!act)
         return 0;
@@ -783,27 +787,56 @@ static int android_offer_driver_reset(const char *msg)
         (*env)->ExceptionClear(env);
         m = NULL;
     }
-    if (m && (*env)->CallIntMethod(env, act, m, (jint)0) == 1) {
-        static const SDL_MessageBoxButtonData b[2] = {
-            { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Reset back to Turnip" },
-            { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Continue on the CPU" },
-        };
-        char text[900];
+    pick = (*env)->GetMethodID(env, cls, "pickDriverPackage", "()I");
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        pick = NULL;
+    }
+    reset = m && (*env)->CallIntMethod(env, act, m, (jint)0) == 1;
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        reset = 0;
+    }
+    if (reset || pick) {
+        SDL_MessageBoxButtonData b[3];
+        char text[1200];
         SDL_MessageBoxData d;
-        int hit = 0;
+        int n = 0, hit = 0;
 
+        memset(b, 0, sizeof b);
+        if (reset) {
+            b[n].buttonid = 1;
+            b[n++].text = "Use Turnip";
+        }
+        if (pick) {
+            b[n].buttonid = 2;
+            b[n++].text = "Driver package\xE2\x80\xA6";
+        }
+        b[0].flags |= SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
+        b[n].flags = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+        b[n].buttonid = 0;
+        /* SDL's Android box puts the buttons in one row at the box's
+         * width: three short labels, or the third one is a column of
+         * letters (seen on a 1240x1080 Retroid Pocket Classic). */
+        b[n].text = n == 2 ? "Continue" : "Continue on the CPU";
+        n++;
         snprintf(text, sizeof text, "%s\n\nThe settings menu (Select+Start) is not available"
-                 " on this driver either. \"Reset back to Turnip\" chooses the Mesa Turnip"
-                 " driver that comes in the app and starts the game again.", msg);
+                 " on this driver either.%s%s%s", msg,
+                 reset ? " \"Use Turnip\" chooses the Mesa Turnip driver that"
+                         " comes in the app and starts the game again." : "",
+                 pick ? " \"Driver package\xE2\x80\xA6\" opens the file picker for a Turnip"
+                        " driver package (.zip) for this GPU; the game starts again on it,"
+                        " and if it does not show frames there, the next start goes back." : "",
+                 n == 3 ? " \"Continue\" goes on on the CPU." : "");
         memset(&d, 0, sizeof d);
         d.flags = SDL_MESSAGEBOX_WARNING;
         d.title = "Graphics driver";
         d.message = text;
-        d.numbuttons = 2;
+        d.numbuttons = n;
         d.buttons = b;
         shown = SDL_ShowMessageBox(&d, &hit) == 0;
         if (shown && hit == 1) {
-            fprintf(stderr, "[PRESENT] the warning's \"Reset back to Turnip\": the app starts"
+            fprintf(stderr, "[PRESENT] the warning's \"Use Turnip\": the app starts"
                     " again on the driver in the app\n");
             (*env)->CallIntMethod(env, act, m, (jint)1);
             if ((*env)->ExceptionCheck(env))
@@ -812,6 +845,16 @@ static int android_offer_driver_reset(const char *msg)
              * be gone; the game never drew on this driver (that is why
              * the box is up), so there is no GPU work to wait for. */
             android_exit_now("driver reset");
+        } else if (shown && hit == 2) {
+            /* The driver page comes up over the game, which goes on on
+             * the CPU behind it: a package picked there restarts the app
+             * (the activity's way, as the overlay's restart), Back or a
+             * cancelled picker leaves the game as it is. */
+            fprintf(stderr, "[PRESENT] the warning's \"Driver package\": the driver page"
+                    " opens on the file picker\n");
+            (*env)->CallIntMethod(env, act, pick);
+            if ((*env)->ExceptionCheck(env))
+                (*env)->ExceptionClear(env);
         }
     }
     (*env)->DeleteLocalRef(env, cls);
@@ -1217,7 +1260,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                  * follows is the CPU rasteriser at a few frames a second:
                  * say so on the screen (RECOMP_NO_GPU_NOTE=1 or, as before,
                  * RECOMP_ANDROID_NO_GPU_NOTE=1: not). On Android the box
-                 * also offers the way back to the driver in the app. */
+                 * also offers the way back to the driver in the app and
+                 * the driver page's file picker for a package. */
                 if (!getenv("RECOMP_NO_GPU_NOTE") && !getenv("RECOMP_ANDROID_NO_GPU_NOTE")) {
                     char msg[640];
                     snprintf(msg, sizeof msg,
