@@ -53,15 +53,15 @@ void xbox_PowerAutoInit(XboxPowerAuto *a)
 static void window_reset(XboxPowerAuto *a, uint64_t now)
 {
     a->win_start_ns = now;
-    a->n = a->ontime = a->tight = a->waited = a->late_wakes = a->near = a->hitch = 0;
+    a->n = a->ontime = a->tight = a->waited = a->late_wakes = a->nears = a->hitch = 0;
 }
 
 /* The end of a 2 s window: the decisions. Returns 1 when the level moved. */
 static int window_end(XboxPowerAuto *a, uint64_t now)
 {
-    int score = a->near + a->late_wakes;
+    int score = a->nears + a->late_wakes;
     int disturbed = a->hitch || now < a->quiet_until_ns;
-    int bad = !disturbed && (a->near >= 2
+    int bad = !disturbed && (a->nears >= 2
                              || (a->waited >= 20 && a->late_wakes * 20 >= a->waited));
     int before = a->level;
 
@@ -106,7 +106,7 @@ static int window_end(XboxPowerAuto *a, uint64_t now)
                 a->last_up_ns = now;
                 a->tot.ups++;
                 snprintf(a->why, sizeof a->why, "still %d near misses, %d late wakes",
-                         a->near, a->late_wakes);
+                         a->nears, a->late_wakes);
             } else {
                 a->level = a->probe_from;
                 a->ceiling = a->probe_from;
@@ -124,10 +124,10 @@ static int window_end(XboxPowerAuto *a, uint64_t now)
     } else if (bad) {
         a->clean_run = 0;
         if (a->bad_run++ == 0) {
-            a->prev_near = a->near * 10 >= a->n;
+            a->prev_heavy = a->nears * 10 >= a->n;
             a->prev_bad_score = score;
         } else {
-            int step = a->prev_near && a->near * 10 >= a->n ? 2 : 1;
+            int step = a->prev_heavy && a->nears * 10 >= a->n ? 2 : 1;
             int to = a->level + step > a->ceiling ? a->ceiling : a->level + step;
             if (to > a->level) {
                 if (a->last_down_ns && now - a->last_down_ns < OSC_NS)
@@ -139,7 +139,7 @@ static int window_end(XboxPowerAuto *a, uint64_t now)
                 a->last_up_ns = now;
                 a->tot.ups++;
                 snprintf(a->why, sizeof a->why, "%d near misses, %d late wakes of %d waits",
-                         a->near, a->late_wakes, a->waited);
+                         a->nears, a->late_wakes, a->waited);
             }
             a->bad_run = 0;
         }
@@ -190,7 +190,7 @@ int xbox_PowerAutoFeed(XboxPowerAuto *a, const XboxPowerAutoSample *s)
         }
         a->quiet_until_ns = now + QUIET_NS;
     } else if (s->slack_ns < 0) {
-        a->near++;
+        a->nears++;
         a->tot.near_misses++;
     } else {
         a->ontime++;

@@ -78,10 +78,10 @@ typedef struct {
     uint64_t ceiling_until_ns, held_at_ns;
     /* the window being filled */
     uint64_t win_start_ns, last_ns;
-    int      n, ontime, tight, waited, late_wakes, near, hitch;
+    int      n, ontime, tight, waited, late_wakes, nears, hitch;
     /* the run of windows */
     int      bad_run, clean_run, down_need;
-    int      prev_near, prev_bad_score;
+    int      prev_heavy, prev_bad_score;
     uint64_t quiet_until_ns, last_down_ns, last_up_ns, down_ok_since_ns;
     /* after a step up: did it help? */
     int      probe_from, probe_windows, probe_base, probe_score;
