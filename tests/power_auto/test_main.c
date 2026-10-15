@@ -19,6 +19,7 @@ typedef struct {
     XboxPowerAuto a;
     uint64_t t;           /* the trace's clock: the last hold's return */
     int changes, min_level, max_level;
+    long top_holds, holds;
     unsigned rng;
 } Run;
 
@@ -27,6 +28,7 @@ static void run_init(Run *r)
     xbox_PowerAutoInit(&r->a);
     r->t = 1000 * MS;
     r->changes = 0;
+    r->top_holds = r->holds = 0;
     r->min_level = r->max_level = xbox_PowerAutoLevel(&r->a);
     r->rng = 12345;
 }
@@ -52,14 +54,17 @@ static void hold(Run *r, uint32_t iv, double slack_ms, double wake_ms, int64_t g
     lv = xbox_PowerAutoLevel(&r->a);
     if (lv < r->min_level) r->min_level = lv;
     if (lv > r->max_level) r->max_level = lv;
+    r->holds++;
+    r->top_holds += lv == XBOX_POWER_AUTO_LEVELS - 1;
 }
 
-/* Steady frames at an interval: slack 6-9 ms, wakes 0.05-0.3 ms. */
+/* Steady light frames (a menu, or a fast machine) at an interval: slack
+ * 11-14 ms of each vblank, wakes 0.05-0.3 ms. */
 static void steady(Run *r, uint32_t iv, double seconds)
 {
     long n = (long)(seconds * 60.0 / iv);
     for (long i = 0; i < n; i++)
-        hold(r, iv, 6.0 + (rnd(r) % 300) / 100.0, 0.05 + (rnd(r) % 25) / 100.0,
+        hold(r, iv, (iv - 1) * 16.667 + 11.0 + (rnd(r) % 300) / 100.0, 0.05 + (rnd(r) % 25) / 100.0,
              (int64_t)iv * VBL_NS);
 }
 
@@ -171,6 +176,36 @@ static void test_race_load_runup(void)
     CHECK(xbox_PowerAutoLevel(&r.a) <= XBOX_POWER_AUTO_START);
 }
 
+/* 3c. Drifting through bends on the Deck (the owner, 0.1.1-rc1): 15 s of
+ * steady play with little to spare, then a 4 s bend whose frames miss at a
+ * short lead (the CPU clock drops), again and again. At most one bad
+ * window per bend; the floor keeps play at 4 ms or more. */
+static void test_drift_bends(void)
+{
+    Run r;
+    run_init(&r);
+    steady(&r, 1, 60);                     /* menus: down to 0 */
+    CHECK(xbox_PowerAutoLevel(&r.a) == 0);
+    for (int k = 0; k < 20; k++) {
+        /* play: 4-7 ms to spare (less than half the frame) */
+        for (int i = 0; i < 15 * 60; i++)
+            hold(&r, 1, 4.0 + (rnd(&r) % 300) / 100.0, 0.1, VBL_NS);
+        CHECK(xbox_PowerAutoLevel(&r.a) >= 2);
+        /* the bend: misses at 6 % of frames below 8 ms of spin */
+        long b0 = r.a.tot.bad_windows;
+        for (int i = 0; i < 4 * 60; i++) {
+            int miss = xbox_PowerAutoLevel(&r.a) < 3 && rnd(&r) % 100 < 6;
+            hold(&r, 1, miss ? -3.0 : 1.0 + (rnd(&r) % 200) / 100.0, 0.1, miss ? 2 * VBL_NS : VBL_NS);
+        }
+        /* the window that ends after the bend counts too */
+        for (int i = 0; i < 2 * 60; i++)
+            hold(&r, 1, 4.0 + (rnd(&r) % 300) / 100.0, 0.1, VBL_NS);
+        int bad_windows = (int)(r.a.tot.bad_windows - b0);
+        CHECK(bad_windows <= 1);
+    }
+    CHECK(r.a.play);
+}
+
 /* 4. A heavy scene that misses at a short lead goes up until it stops, and
  * settles there without oscillating. */
 static void test_heavy_goes_up_and_settles(void)
@@ -220,7 +255,7 @@ static void test_no_gain_comes_back(void)
             hold(&r, 1, 0.5, 0.1, VBL_NS);
     }
     CHECK(r.a.tot.reverts >= 1);
-    CHECK(xbox_PowerAutoLevel(&r.a) <= 1);
+    CHECK(r.top_holds * 4 < r.holds);       /* mostly not at the busy-wait */
     /* Five minutes: the climbs to the top are few (the ceiling's backoff). */
     CHECK(r.a.tot.reverts <= 3);
 }
@@ -241,6 +276,7 @@ int main(void)
     test_30hz_phase_is_not_a_miss();
     test_loading_does_not_ratchet();
     test_race_load_runup();
+    test_drift_bends();
     test_heavy_goes_up_and_settles();
     test_late_wakes_go_up();
     test_no_gain_comes_back();
