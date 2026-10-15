@@ -158,6 +158,7 @@ static_assert(sizeof n_glyphs / sizeof n_glyphs[0] == XBOX_GLYPHS_MODE_COUNT + 1
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_vehicle_detail[] = { "Original", "Far (2x)", "Farthest (4x)", NULL };
+static const char *const n_scenery_detail[] = { "Original", "Far", NULL };
 static const char *const n_score_board[] = { "Original", "Smooth", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", "Auto (adapts)", NULL };
 /* Off the Steam Deck the watts are somebody else's: the names alone. */
@@ -206,6 +207,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_GRAPHICS_LOD_BIAS */  { "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto uses -0.5 at 2x and -1.0 at 4x.", 1, FMT_PLAIN, n_lod, 0 },
     /* XS_GRAPHICS_DITHER */    { "Dither", "Faint noise added when scaling to the window, to hide banding in smooth gradients such as the sky. Metal only for now. Text and HUD at their exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_VEHICLE_DETAIL */ { "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Far doubles the console's distance, Farthest quadruples it. Costs GPU time with many vehicles on screen. Scenery, the track and where traffic appears stay the same.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
+    /* XS_GRAPHICS_SCENERY_DETAIL */ { "Scenery detail", "How far away trees and other roadside objects keep their detailed models before the game swaps in simpler ones. Original is the console's distance; Far moves the swap further out, so trees no longer change shape as you come round a bend. Costs a little GPU time. Changes at once.", 1, FMT_PLAIN, n_scenery_detail, 0 },
     /* XS_INPUT_GLYPHS */       { "Button prompts", "The button icons in the game's menus and hints. Auto follows the controller you used last. Xbox (original) is the game's own art. Positional works with any pad: a diamond of four dots, with the button to press filled. Keyboard shows key caps. Auto picks it while you play on the keyboard. The game's text and videos still name Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
     /* XS_AUDIO_LFE_LOWPASS */  { "Subwoofer low-pass (LFE)", "120 Hz matches the console's Dolby Digital encoder. Off sends the full-range LFE feed.", 1, FMT_PLAIN, n_lfe_lowpass, 0 },
     /* XS_DISPLAY_PRESENT_TIMING */ { "Frame presentation", "When a finished frame goes to the display. Legacy: as soon as it is ready. Auto: each frame is aimed at one refresh, so frames stay on screen equally long and appear sooner after they are drawn. On a fixed 60, 120 or 240 Hz display the game's clock follows the display; on variable refresh (VRR, ProMotion) frames go out at even intervals. The performance overlay's on-glass line shows the result.", 1, FMT_PLAIN, n_timing, 0 },
@@ -930,6 +932,8 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_SPLIT_60FPS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))
             SET(XS_GRAPHICS_VEHICLE_DETAIL);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SCENERY_DETAIL)->key))
+            SET(XS_GRAPHICS_SCENERY_DETAIL);
 #if defined(__ANDROID__)
         {
             /* Which driver draws: chosen before the game starts, in the app's

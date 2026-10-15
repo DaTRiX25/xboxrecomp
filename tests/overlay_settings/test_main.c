@@ -169,6 +169,7 @@ int main(void)
     set_env("RECOMP_AUDIO_SPLIT_MUSIC", NULL);
     set_env("RECOMP_AUDIO_CUSTOM_LEVEL", NULL);
     set_env("RECOMP_GFX_VEHICLE_DETAIL", NULL);
+    set_env("RECOMP_GFX_SCENERY_DETAIL", NULL);
 
     xbox_SettingsInit("Test");
     CHECK(!strcmp(xbox_SettingsPath(), path));
@@ -267,6 +268,19 @@ int main(void)
         CHECK(!xbox_SettingsNeedRestart());          /* live */
         xbox_SettingReset(XS_GRAPHICS_VEHICLE_DETAIL);
         e = recomp_env(RENV_GFX_VEHICLE_DETAIL);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+    }
+    {
+        /* The scenery detail (a guest patch at "far"): the same. */
+        const char *e = recomp_env(RENV_GFX_SCENERY_DETAIL);
+        CHECK(xbox_SettingValue(XS_GRAPHICS_SCENERY_DETAIL) == 0 && !xbox_SettingGet(XS_GRAPHICS_SCENERY_DETAIL)->user);
+        CHECK(!e || !*e || !strcmp(e, "original"));
+        xbox_SettingSet(XS_GRAPHICS_SCENERY_DETAIL, 1);
+        e = recomp_env(RENV_GFX_SCENERY_DETAIL);
+        CHECK(e && !strcmp(e, "far"));
+        CHECK(!xbox_SettingsNeedRestart());          /* live */
+        xbox_SettingReset(XS_GRAPHICS_SCENERY_DETAIL);
+        e = recomp_env(RENV_GFX_SCENERY_DETAIL);
         CHECK(!e || !*e || !strcmp(e, "original"));
     }
     {
