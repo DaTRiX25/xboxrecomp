@@ -165,6 +165,11 @@ if(NOT WIN32)
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_tex_cache)
 endif()
 
+# The cut-out textures' levels (src/kernel/nv2a_texmip.c, BO-171) are the
+# backends' alone, so they go in this library: a static xbox_kernel comes
+# after it on the link line, and GNU ld would not go back for them.
+target_sources(xbox_d3d8 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../kernel/nv2a_texmip.c)
+
 # Regions of a title's textures replaced at upload (src/kernel/nv2a_texrep.c:
 # the button prompts for the pad in use), against synthetic textures (every
 # host, no GPU).
@@ -176,6 +181,12 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texrep
 # (every host, no GPU).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texscale
                  ${CMAKE_CURRENT_BINARY_DIR}/nv2a_texscale)
+
+# The lower levels of alpha-tested textures made again with their alpha
+# coverage (src/kernel/nv2a_texmip.c, BO-171), against synthetic textures
+# (every host, no GPU).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texmip
+                 ${CMAKE_CURRENT_BINARY_DIR}/nv2a_texmip)
 
 # The HLSL the parse -> generate pipeline emits, against recorded hashes
 # (every host: the emitters are API-free).

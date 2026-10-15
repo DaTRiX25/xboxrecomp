@@ -68,6 +68,7 @@
 #include "d3d8_swizzle.h"
 #include "nv2a_texrep.h"
 #include "nv2a_texscale.h"
+#include "nv2a_texmip.h"
 #include "kernel_pause.h"
 static void scale_prepare_loaded(void);
 static int ui_scale_log(void);
@@ -2223,6 +2224,7 @@ typedef struct {
     uint8_t          up_scale;      /* the factor the image has (0 where the scaler refused) */
     uint8_t          use;           /* RECOMP_DEBUG=ui_scale_log: the kinds of draw seen */
     uint8_t          pend;          /* its scaled picture is being made (nv2a_texscale_get) */
+    uint32_t         cut;           /* the alpha test its levels were made for (nv2a_texmip_cut_ref); 0: the title's */
     uint32_t         pal_len, pgen; /* P8 entries; the flip pend was last asked at */
     uint64_t         skey;          /* nv2a_texscale_key of the texels uploaded */
     int              live;
@@ -2394,7 +2396,8 @@ static int tex_upload_scaled(const Stage *t, unsigned f, int algo, struct nvk_im
     return 0;
 }
 
-static int tex_upload(const Stage *t, unsigned scale, int algo, struct nvk_image *out)
+static int tex_upload(const Stage *t, unsigned scale, int algo, uint32_t cut,
+                      struct nvk_image *out)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
@@ -2418,6 +2421,10 @@ static int tex_upload(const Stage *t, unsigned scale, int algo, struct nvk_image
      * nv2a_texrep.h): rectangles of a registered texture replaced here. */
     s_tex_rep = nv2a_texrep_apply(mem + t->offset, t->color, t->width, t->height,
                                   t->pitch, t->levels, s_texels);
+    /* An alpha-tested draw binds it: levels 1.. made again with level 0's
+     * alpha coverage (nv2a_texmip.h). */
+    (void)nv2a_texmip_apply(mem + t->offset, t->color, t->width, t->height, t->pitch,
+                            t->levels, cut, s_texels);
     if (stage_signed(t)) {
         uint32_t x = nv2a_tex_signed_xor(stage_signed(t));
         size_t i;
@@ -2588,6 +2595,7 @@ static VkImageView tex_bind(const Stage *t)
     uint32_t bytes = 0, i;
     TexEntry *e = NULL, *victim = &s_tc[0];
     unsigned want;
+    uint32_t cut;
     int algo;
 
     s_bind_scale = 0;
@@ -2648,11 +2656,21 @@ static VkImageView tex_bind(const Stage *t)
                   && nv2a_texscale_tex_ok(nv2a_tex_size_from_format(t->color), t->width,
                                           t->height, t->levels)))
         want = 0;
+    /* BO-171: a mipmapped texture an alpha-tested draw binds gets levels
+     * made for that test, once (as Metal). */
+    cut = 0;
+    if (nv2a_texmip_mode() & NV2A_TEXMIP_LEVELS) {
+        const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+        if (t->levels > 1 && nv2a_tex_filter_mip(t->filter) && !stage_signed(t))
+            cut = nv2a_texmip_cut_ref(v->atest_enable, v->atest_func, v->atest_ref);
+        if (e && e->cut)
+            cut = e->cut;
+    }
     if (e) {
         /* A replaced texture whose variant changed is uploaded again; so is
          * one whose scale is not the one wanted now. */
         int stale = (e->rep && e->rep != nv2a_texrep_generation())
-                 || e->scale != want || (want && e->salgo != algo);
+                 || e->scale != want || (want && e->salgo != algo) || e->cut != cut;
         if (s_draw_2d)
             e->ui = 1;
         if (e->gen != g->flips || stale) {
@@ -2663,10 +2681,11 @@ static VkImageView tex_bind(const Stage *t)
                 struct nvk_image ni;
                 e->hash = h;
                 s_tex_changed++;
-                if (!tex_upload(t, want, algo, &ni))
+                if (!tex_upload(t, want, algo, cut, &ni))
                     return s_black.view;
                 garbage_push(&e->im, VK_NULL_HANDLE, NULL);
                 e->rep = s_tex_rep;
+                e->cut = cut;
                 e->im = ni;
                 e->scale = (uint8_t)want;
                 e->salgo = (uint8_t)algo;
@@ -2684,7 +2703,7 @@ static VkImageView tex_bind(const Stage *t)
             garbage_push(&e->im, VK_NULL_HANDLE, NULL);
         memset(&e->im, 0, sizeof e->im);
         e->live = 0;
-        if (!tex_upload(t, want, algo, &ni))
+        if (!tex_upload(t, want, algo, cut, &ni))
             return s_black.view;
         e->ui = (uint8_t)(s_draw_2d != 0);
         e->scale = (uint8_t)want;
@@ -2695,6 +2714,7 @@ static VkImageView tex_bind(const Stage *t)
         e->pgen = g->flips;
         e->pal_len = t->pal_len;
         e->use = 0;
+        e->cut = cut;
         e->offset = t->offset;
         e->color = t->color;
         e->width = t->width;
@@ -3336,7 +3356,13 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     }
     build_stages();
     nv2a_ps_consts_fill(v, s_stage, &pc.b);
-    const float host_bias = nv2a_host_lod_bias();   /* RECOMP_GFX_LOD_BIAS; 0 by default */
+    float host_bias = nv2a_host_lod_bias();   /* RECOMP_GFX_LOD_BIAS; 0 by default */
+    /* BO-171: a cut-out draw (alpha test) takes no negative host bias: a
+     * finer level than the pixel's own makes its edge shimmer, and the
+     * levels nv2a_texmip makes keep the leaves without it. */
+    if (host_bias < 0.0f && (nv2a_texmip_mode() & NV2A_TEXMIP_BIAS)
+            && nv2a_texmip_cut_ref(v->atest_enable, v->atest_func, v->atest_ref))
+        host_bias = 0.0f;
     for (k = 0; k < 4; k++) {
         const Stage *t = &s_stage[k];
         float b = t->levels > 1 && nv2a_tex_filter_mip(t->filter)

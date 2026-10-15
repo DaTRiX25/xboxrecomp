@@ -106,7 +106,30 @@ gets none. `off` (default) adds exactly 0.0: the picture is the one it was.
 `auto` is -log2(render scale) / 2: -0.5 at 2x, -1.0 at 4x (about -0.29 at
 1.5x), 0 at 1x; `-0.5`, `-1`, `-1.5` are explicit. The environment takes any
 number: `RECOMP_GFX_LOD_BIAS=-0.75`. Metal and Vulkan share the code
-(`nv2a_host_lod_bias`); the Vulkan side has not been run.
+(`nv2a_host_lod_bias`).
+
+Not on a cut-out (BO-171): a draw with the alpha test on (trees, bushes,
+fences, road markings; Burnout 3 tests alpha > 64) takes no negative host
+bias, only the title's own. The render scale already picks levels
+log2(scale) finer, and a still finer level gives a leaf's edge more texels
+than pixels, so it shimmers. A positive value still applies. Such a draw's
+texture also gets its levels 1.. made again from level 0 when it is first
+bound (`src/kernel/nv2a_texmip.c`): the alpha of each level is box-filtered
+and then scaled so that as many texels pass the test as on level 0 (Castano's
+coverage-preserving mipmaps), colour averaged by alpha, no gamma. The title's
+own levels are a plain box, which at a reference of 64 lets a chain-link
+fence fill in solid and a railing of thin bars vanish a few levels down; the
+remade levels keep both as they look up close. Level 0, opaque textures and
+every texture no alpha-tested draw binds stay as the title made them; the
+levels are BGRA8 as before, so no memory is added (0.06 ms for a 128x128,
+0.2 ms for a 256x256 on an M-series CPU, once per texture).
+`RECOMP_DEBUG=alpha_mips=0` gives the old picture (`=mips` or `=bias` one
+half only), `alpha_mips_ab=<n>` swaps both every n flips for comparisons, and
+`alpha_mips_log` prints each texture's coverage per level before and after.
+
+Many of the title's world textures (the road among them) have one level only
+although their filter asks for mips; no bias reaches those, which is why
+`auto` changes little on the road at a distance.
 
 ## 2D art upscaling (`graphics.ui_scale`, off by default)
 
