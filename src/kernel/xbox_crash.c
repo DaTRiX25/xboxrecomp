@@ -891,6 +891,127 @@ static void print_regs(const uint32_t r[9])
                       r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]);
 }
 
+/* ── hang only: guest memory ───────────────────────────────────────
+ *
+ * A hang report names where a thread is, not what it is looking at: the
+ * BO-173 freeze sat in a DirectSound DPC walking a list, and the report
+ * could not show the list. So a hang report also keeps guest RAM and a
+ * window of memory around every register that points into it. Hang only:
+ * a crash may have the memory itself in question, and the watchdog's
+ * thread is not a fault handler, so it can take its time. */
+
+/* The guest RAM address a register value stands for: RAM and its mirrors
+ * (the contiguous 0x80000000 view among them) wrap at the mapped size. */
+static int guest_ram_addr(uint32_t v, uint32_t *pa)
+{
+    uint64_t size = xbox_GetMappedSize();
+    if (!g_xbox_mem_offset || !size || v >= 0xF0000000u)
+        return 0;                       /* MMIO, the BIOS, the kernel's */
+    if ((size & (size - 1)) == 0)
+        v &= (uint32_t)(size - 1);
+    else if (v >= size)
+        return 0;
+    if (v < XBOX_BASE_ADDRESS)
+        return 0;                       /* small numbers, not pointers */
+    *pa = v;
+    return 1;
+}
+
+/* 256 bytes around each register that points into guest RAM, 16 a line. */
+static void reg_windows(const uint32_t r[9])
+{
+    static const char *const names[9] = { "eax", "ecx", "edx", "ebx", "esp",
+                                          "ebp", "esi", "edi", "seh_ebp" };
+    uint64_t size = xbox_GetMappedSize();
+    int k;
+
+    for (k = 0; k < 9; k++) {
+        uint32_t pa, lo, a;
+        int j;
+        if (!r[k] || !guest_ram_addr(r[k], &pa))
+            continue;
+        lo = (pa & ~15u) >= 0x80 ? (pa & ~15u) - 0x80 : 0;
+        if ((uint64_t)lo + 256 > size)
+            lo = (uint32_t)(size - 256);
+        xbox_crash_printf("  mem %s=%08X (ram %08X):\n", names[k], r[k], pa);
+        for (a = lo; a < lo + 256; a += 16) {
+            const uint8_t *b = guest_ptr(a);
+            char line[96];
+            int n = snprintf(line, sizeof line, "    %08X", a);
+            for (j = 0; j < 16; j += 4)
+                n += snprintf(line + n, sizeof line - (size_t)n, " %08X",
+                              *(const uint32_t *)(b + j));
+            xbox_crash_printf("%s%s\n", line, a == (pa & ~15u) ? "  <" : "");
+        }
+    }
+}
+
+/* guestram.bin: guest RAM from address 0, raw, as many bytes as are mapped
+ * (64 MB on a retail layout). write() fails rather than faults on a page
+ * that cannot be read; such a block is written as zeros. */
+static void dump_guest_ram(void)
+{
+    static const char zeros[65536];
+    char path[1200];
+    uint64_t size = xbox_GetMappedSize(), off;
+    unsigned bad = 0;
+    int fd;
+
+    if (!g_xbox_mem_offset || !size || !s_dir[0])
+        return;
+    snprintf(path, sizeof path, "%s/guestram.bin", s_dir);
+    fd = cr_open_new(path);
+    if (fd < 0) {
+        xbox_crash_printf("  guestram.bin: cannot be written\n");
+        return;
+    }
+    for (off = 0; off < size; off += sizeof zeros) {
+        size_t n = (size_t)(size - off < sizeof zeros ? size - off : sizeof zeros);
+        const char *p = (const char *)guest_ptr((uint32_t)off);
+        size_t done = 0;
+        while (done < n) {
+            int w = cr_write(fd, p + done, n - done);
+            if (w <= 0) {
+#if !defined(_WIN32)
+                if (w < 0 && errno == EINTR)
+                    continue;
+#endif
+                break;
+            }
+            done += (size_t)w;
+        }
+        if (done < n) {
+            bad++;
+            write_all(fd, zeros, n - done);
+        }
+    }
+    cr_close(fd);
+    xbox_crash_printf("  guestram.bin: guest RAM 0x00000000-0x%08llX, raw%s"
+                      " (tools/dsound_done_list.py reads it)\n",
+                      (unsigned long long)size - 1,
+                      bad ? ", unreadable blocks as zeros" : "");
+}
+
+static int s_hang_mem;   /* report_threads: the register windows too */
+
+static xbox_crash_note_fn s_notes[8];
+static volatile LONG s_n_notes;
+
+void xbox_crash_add_note(xbox_crash_note_fn fn)
+{
+    LONG i = InterlockedIncrement(&s_n_notes) - 1;
+    if (i < 8)
+        s_notes[i] = fn;
+}
+
+static void print_notes(void)
+{
+    LONG i, n = s_n_notes < 8 ? s_n_notes : 8;
+    for (i = 0; i < n; i++)
+        if (s_notes[i])
+            s_notes[i]();
+}
+
 static void print_icalls(void)
 {
     uint32_t k;
@@ -1213,6 +1334,8 @@ static void report_threads(void)
 #endif
         if (r[4]) {
             print_regs(r);
+            if (s_hang_mem)
+                reg_windows(r);
             guest_walk(r[4], 24, !strcmp(t->role, "guest-main") ? 256 : 0);
         }
     }
@@ -1250,7 +1373,11 @@ static void hang_report(unsigned stalled_s)
     if (!xbox_crash_begin("hang", head))
         return;
     print_icalls();
+    print_notes();
+    s_hang_mem = 1;
     report_threads();
+    s_hang_mem = 0;
+    dump_guest_ram();
     xbox_crash_end();
 }
 

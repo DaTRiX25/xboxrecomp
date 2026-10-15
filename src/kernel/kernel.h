@@ -884,6 +884,20 @@ unsigned long xbox_DispatchGateOwner(void);
  * per line), and a count in the [IRQ] summary. */
 void    xbox_IrqNoteUngated(int line);
 
+/* Queued DPCs (kernel_hal.c, BO-173). The console runs one as soon as the
+ * processor drops below DISPATCH_LEVEL; here the timer thread runs them, and
+ * is woken at those points instead of finding them on its next pass. */
+typedef struct {
+    int  (*pending)(void);  /* lockless: something is queued */
+    void (*kick)(void);     /* wake the timer thread to drain now */
+} XboxDpcHooks;
+void    xbox_DpcSetHooks(const XboxDpcHooks *hooks);
+/* 0 under RECOMP_DEBUG=dpc_prompt=0: no wakes, the next pass as before. */
+int     xbox_DpcPromptOn(void);
+/* KeInsertQueueDpc's tail: wake the timer thread now when this thread is
+ * below DISPATCH without the gate; else the gate's release does. */
+void    xbox_DpcQueued(void);
+
 typedef struct {
     long posted[XBOX_IRQ_LINES];       /* posts that found the gate held */
     long on_holder[XBOX_IRQ_LINES];    /* run by the holder at a safe point */

@@ -346,6 +346,9 @@ extern "C" {
     X(IRQ_SAFE_POINTS,   DEBUG, "irq_safe_points", NULL,                       "=0: device interrupts run beside the one-CPU gate holder after a hold-off, as before (default: posted, run by the holder at its next kernel call, spin-wait yield or gate release)") \
     X(IRQ_SAFE_MS,       DEBUG, "irq_safe_ms",     NULL,                       "=ms: how long a posted interrupt waits for the holder's safe point before the [IRQ] wait log (default 250; again every second)") \
     X(IRQ_SAFE_FORCE,    DEBUG, "irq_safe_force",  NULL,                       "=1: past irq_safe_ms, deliver beside the holder (A/B; reinstates the race)") \
+    X(DPC_LAG,           DEBUG, "dpc_lag",         NULL,                       "=ms: the timer thread drains queued DPCs at most once per that many ms (a test: widens the window between an ISR and its DPC)") \
+    X(DPC_PROMPT,        DEBUG, "dpc_prompt",      NULL,                       "=0: queued DPCs wait for the timer thread's next pass, as before (A/B; default: the timer thread is woken where the console would run them: a queue below DISPATCH_LEVEL, the one-CPU gate's release)") \
+    X(DPC_STATS,         DEBUG, "dpc_stats",       NULL,                       "[DPC] queue-to-run latency p50/p99/max and the timer-thread wakes, with the [IRQ] summary and at exit") \
     /* ── the enhancements layer's keys (RECOMP_ENV_ENHANCE_KEYS, below) ── */ \
     RECOMP_ENV_ENHANCE_KEYS(X) \
     /* ── the game's own keys (RECOMP_ENV_GAME_KEYS, below) ──────────────── */ \

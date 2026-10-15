@@ -28,6 +28,12 @@ uint64_t xbox_HostNowNs(void);
 /* Sleep about `ns` nanoseconds; 0 returns at once. */
 void xbox_HostSleepNs(uint64_t ns);
 
+/* xbox_HostSleepNs for the one thread that sleeps here (the kernel's timer
+ * thread), ended early by xbox_HostSleepWake from any thread. A wake that
+ * comes while it is not asleep ends its next sleep at once. */
+void xbox_HostSleepWakeableNs(uint64_t ns);
+void xbox_HostSleepWake(void);
+
 /* For a thread that keeps a clock with xbox_HostSleepNs (the kernel's timer
  * thread): ask the host to wake it on time. macOS wakes an ordinary thread's
  * nanosleep 3.7 ms late on average (8 ms at worst) even on an idle machine,

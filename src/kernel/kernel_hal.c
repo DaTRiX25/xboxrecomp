@@ -366,9 +366,12 @@ static void irq_config(void)
     }
 }
 
+static int s_dpc_prompt = -1;           /* dpc_prompt, read on first use */
+
 void xbox_IrqReloadConfig(void)
 {
     irq_config();
+    s_dpc_prompt = -1;
 }
 
 int xbox_IrqSafePointsOn(void)
@@ -542,14 +545,91 @@ void xbox_IrqSafePoint(void)
  * thread: an ISR here never had a guest-scheduled TIB, and no XDK ISR reads
  * thread-local state. The holder rule is what matters, and this thread holds
  * the gate while the routine runs. */
+static void dpc_release_point(void);
+
 static void irq_release_point(void)
 {
-    if (!s_irq_pending || t_in_isr || g_current_irql > DISPATCH_LEVEL)
+    if (t_in_isr || g_current_irql > DISPATCH_LEVEL)
         return;
-    if (!gate_try())
-        return;                         /* the new holder has it now */
-    irq_run_pending();
-    gate_leave_raw();
+    if (s_irq_pending && gate_try()) {  /* else the new holder has it now */
+        irq_run_pending();
+        gate_leave_raw();
+    }
+    dpc_release_point();
+}
+
+/* ============================================================================
+ * Queued DPCs: the timer thread is woken for them (BO-173)
+ *
+ * The console runs a queued DPC as soon as the processor drops below
+ * DISPATCH_LEVEL: an ISR that queues one returns into the DPC, and a thread
+ * at DISPATCH that lowers runs it inside the lower. Code at PASSIVE never
+ * sees the state between an ISR and its DPC. Here DPCs run on the timer
+ * thread, and they waited for its next pass (up to 10 ms, 1 ms retries
+ * while the gate was busy). Titles do see that state: the XDK's DirectSound
+ * marks a finished voice stopped in the APU interrupt and queues it on the
+ * core's done list for its DPC; in the gap the title restarted the voice,
+ * the interrupt finished it again, the entry went onto the list a second
+ * time and pointed at itself, and the DPC looped on it at DISPATCH forever
+ * (the Steam Deck freeze, Burnout 3).
+ *
+ * So the timer thread is woken at the points where the console would run
+ * the DPC: KeInsertQueueDpc below DISPATCH without the gate, and the
+ * release of the gate (or the lower that gives it back) with DPCs queued.
+ * It takes the gate and drains within microseconds instead of milliseconds.
+ *
+ * ponytail: they are not run on the thread that reaches the point, as NT
+ * would. Tried (BO-173): the XDK's D3D vblank DPC acks PCRTC and spins on
+ * PMC_INTR_0 until the vblank-ack thread clears it, which it does only once
+ * the timer thread has finished the vblank's tick; run on a title thread,
+ * it held the gate the timer thread was waiting for, and the race froze.
+ * The vblank's ack model assumes the timer thread runs its DPC.
+ * ============================================================================ */
+
+static XboxDpcHooks s_dpc;
+static volatile LONG s_dpc_published;
+
+void xbox_DpcSetHooks(const XboxDpcHooks *hooks)
+{
+    s_dpc.kick = hooks->kick;
+    InterlockedExchange(&s_dpc_published, 1);   /* a full barrier */
+    s_dpc.pending = hooks->pending;             /* tested first */
+}
+
+int xbox_DpcPromptOn(void)
+{
+    if (s_dpc_prompt < 0) {
+        s_dpc_prompt = recomp_env(RENV_DPC_PROMPT)
+                       ? (int)recomp_env_int(RENV_DPC_PROMPT, 1) != 0 : 1;
+        if (!s_dpc_prompt) {
+            fprintf(stderr, "  [DPC] dpc_prompt=0: DPCs wait for the timer "
+                    "thread's next pass\n");
+            fflush(stderr);
+        }
+    }
+    return s_dpc_prompt;
+}
+
+static int dpc_pending(void)
+{
+    return s_dpc.pending && s_dpc.pending() && xbox_DpcPromptOn();
+}
+
+/* Below DISPATCH, the gate let go. */
+static void dpc_release_point(void)
+{
+    if (t_gate_depth || t_in_isr || g_current_irql >= DISPATCH_LEVEL
+        || !dpc_pending())
+        return;
+    s_dpc.kick();
+}
+
+void xbox_DpcQueued(void)
+{
+    /* Inside an ISR or at DISPATCH (the gate held), the release wakes it;
+     * beside the gate (irq_safe_force) there is no release, so now. */
+    if (!t_gate_depth && xbox_DpcPromptOn() && s_dpc.kick)
+        s_dpc.kick();
 }
 
 static void irql_release_due(void)

@@ -13,6 +13,9 @@
  *                 xbox_crash_set_settings and every RECOMP_* value the
  *                 runtime's table holds
  *   minidump.dmp  Windows only, written by the host
+ *   guestram.bin  hang reports only: guest RAM from address 0, raw (64 MB
+ *                 on a retail layout); report.txt then also has 256 bytes
+ *                 around every guest register that points into it
  *
  * Beside the reports, <save dir>/logs keeps the log of this run and of the
  * three before it (see xbox_crash_set_run_log).
@@ -116,6 +119,12 @@ extern volatile uint32_t g_xbox_flip_count;
  * the registered threads are sampled by a signal. */
 typedef void (*xbox_crash_sampler_fn)(void);
 void xbox_crash_set_sampler(xbox_crash_sampler_fn fn);
+
+/* A few lines of a subsystem's own counters in every hang report (up to
+ * 8 functions; each prints with xbox_crash_printf). Runs on the watchdog
+ * thread while the others are stuck: read, never lock. */
+typedef void (*xbox_crash_note_fn)(void);
+void xbox_crash_add_note(xbox_crash_note_fn fn);
 
 /* Start the hang watchdog (RECOMP_HANG_WATCHDOG; see above) and arm
  * RECOMP_DEBUG=crash_test. Call once the guest is about to start. */

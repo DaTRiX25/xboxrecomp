@@ -23,6 +23,12 @@
  *  - a holder that reaches no safe point: logged at irq_safe_ms, never run;
  *    with irq_safe_force=1 delivered beside it after irq_safe_ms;
  *  - 100k rounds of edits and random posts leave the list intact.
+ *
+ * And queued DPCs (xbox_DpcSetHooks, BO-173), with a fake queue: the timer
+ * thread is woken where the console would run them -- the lower that lets
+ * the gate go, a queue at PASSIVE, the release after an ISR -- and not
+ * while the gate is held; dpc_prompt=0 wakes nothing; the wake ends the
+ * timer thread's sleep.
  */
 #include "kernel.h"
 #include "recomp_env.h"
@@ -586,6 +592,106 @@ static void stress(void)
     printf("    (%ld routine runs)\n", (long)s_runs);
 }
 
+/* ── Queued DPCs: the timer thread woken at the console's points ──── */
+
+static volatile LONG s_dq, s_d_kicks, s_r_before;
+
+static int dq_pending(void) { return s_dq != 0; }
+static void dq_kick(void) { InterlockedIncrement(&s_d_kicks); }
+
+typedef void (*dq_case_fn)(void);
+
+static DWORD WINAPI dq_thread(LPVOID p)
+{
+    g_fs_base = 0;
+    ((dq_case_fn)p)();
+    return 0;
+}
+
+static void dq_on_thread(dq_case_fn fn)
+{
+    HANDLE t;
+    s_dq = s_d_kicks = s_r_before = 0;
+    t = CreateThread(NULL, 0, dq_thread, (LPVOID)fn, 0, NULL);
+    WaitForSingleObject(t, 10000);
+    CloseHandle(t);
+}
+
+static void dq_lower(void)
+{
+    KIRQL old = xbox_KfRaiseIrql(DISPATCH_LEVEL);
+    s_dq = 1;                   /* queued at DISPATCH */
+    xbox_DpcQueued();
+    s_r_before = s_d_kicks;
+    xbox_KfLowerIrql(old);
+}
+
+static void dq_passive(void)
+{
+    s_dq = 1;
+    xbox_DpcQueued();
+}
+
+static void dq_isr(void)
+{
+    int irql;
+    xbox_DispatchGateEnter();   /* a gated delivery */
+    irql = xbox_IrqlEnterInterrupt(16);
+    s_dq = 1;
+    xbox_DpcQueued();
+    xbox_IrqlLeaveInterrupt(irql);
+    s_r_before = s_d_kicks;     /* still holding the gate */
+    xbox_DispatchGateLeave();
+}
+
+static volatile LONG s_wake_ms;
+
+static DWORD WINAPI dq_sleeper(LPVOID p)
+{
+    uint64_t t0 = xbox_HostNowNs();
+    (void)p;
+    xbox_HostSleepWakeableNs(2000 * MS);
+    s_wake_ms = (LONG)((xbox_HostNowNs() - t0) / MS);
+    return 0;
+}
+
+static void dpc_points(void)
+{
+    static const XboxDpcHooks hooks = { dq_pending, dq_kick };
+    HANDLE t;
+
+    xbox_DpcSetHooks(&hooks);
+    check(xbox_DpcPromptOn(), "dpc: prompt wakes are the default");
+
+    dq_on_thread(dq_lower);
+    check(s_r_before == 0, "dpc at DISPATCH: no wake while the gate is held");
+    check(s_d_kicks == 1, "dpc at DISPATCH: the lower wakes the timer once");
+
+    dq_on_thread(dq_passive);
+    check(s_d_kicks == 1, "dpc queued at PASSIVE: woken at once");
+
+    dq_on_thread(dq_isr);
+    check(s_r_before == 0, "dpc in an ISR: no wake inside it");
+    check(s_d_kicks == 1, "dpc in an ISR: woken at the gate's release");
+
+    recomp_env_set(RENV_DPC_PROMPT, "0");
+    xbox_IrqReloadConfig();
+    dq_on_thread(dq_lower);
+    check(s_d_kicks == 0, "dpc_prompt=0: no wakes");
+    recomp_env_set(RENV_DPC_PROMPT, "1");
+    xbox_IrqReloadConfig();
+    s_dq = 0;
+
+    s_wake_ms = -1;
+    t = CreateThread(NULL, 0, dq_sleeper, NULL, 0, NULL);
+    Sleep(50);
+    xbox_HostSleepWake();
+    WaitForSingleObject(t, 5000);
+    CloseHandle(t);
+    check(s_wake_ms >= 0 && s_wake_ms < 500, "wake: ends the timer thread's sleep");
+    printf("    (woke after %ld ms)\n", (long)s_wake_ms);
+}
+
 int main(void)
 {
     g_fs_base = 0;
@@ -613,6 +719,7 @@ int main(void)
     lower_window();
     wait_and_log();
     stress();
+    dpc_points();
     printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;
 }
