@@ -143,6 +143,27 @@ int main(void)
     nv2a_texrep_register(NULL, 0);
     CHECK(nv2a_texrep_apply(g_dxt, FMT_DXT5, W, H, 0, 1, texels) == 0);
 
+    /* BO-176: depth offsets, by hash, format and size. */
+    {
+        static struct nv2a_texrep_zbias zb[2];
+        zb[0].name = "decal";
+        zb[0].hash = nv2a_texrep_hash(g_dxt, FMT_DXT5, W, H, 0);
+        zb[0].color = FMT_DXT5; zb[0].width = W; zb[0].height = H;
+        zb[0].bias = -512.0f;
+        zb[1] = zb[0];
+        zb[1].hash ^= 1u;                   /* a texture that is not there */
+        zb[1].bias = 99.0f;
+        CHECK(nv2a_texrep_zbias(g_dxt, FMT_DXT5, W, H, 0) == 0.0f);   /* none registered */
+        nv2a_texrep_register_zbias(zb, 2);
+        CHECK(nv2a_texrep_zbias(g_dxt, FMT_DXT5, W, H, 0) == -512.0f);
+        CHECK(nv2a_texrep_zbias(g_other, FMT_DXT5, W, H, 0) == 0.0f);
+        CHECK(nv2a_texrep_zbias(g_dxt, FMT_DXT5, W, H * 2, 0) == 0.0f);
+        CHECK(nv2a_texrep_zbias(g_dxt, 0x0Cu, W, H, 0) == 0.0f);
+        CHECK(nv2a_texrep_zbias_on(0) == 1);                           /* default: on */
+        nv2a_texrep_register_zbias(NULL, 0);
+        CHECK(nv2a_texrep_zbias(g_dxt, FMT_DXT5, W, H, 0) == 0.0f);
+    }
+
     printf("nv2a_texrep: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail != 0;
 }

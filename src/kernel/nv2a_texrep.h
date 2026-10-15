@@ -91,6 +91,35 @@ uint32_t nv2a_texrep_apply(const uint8_t *guest, uint32_t color, uint32_t w,
  * textures a variant changed. */
 void nv2a_texrep_stats(uint64_t *hashed, uint64_t *matched, uint64_t *replaced);
 
+/* BO-176: textures whose draws take a constant depth offset, as if the
+ * title had set SET_POLYGON_OFFSET_BIAS for them. For a decal the title
+ * draws a few centimetres in front of the surface it sits on, which the
+ * original hardware keeps apart with its w-buffer (SET_CONTROL0 bit 16) and
+ * the host's z-buffer, computed from the title's own screen-space z, does
+ * not always: that z carries float32 noise of tens of depth units at a
+ * distance (world coordinates in the thousands), more than the decal's lead.
+ * bias is in depth units of the zeta format (0..zmax), negative toward the
+ * eye; a title's own polygon offset on the draw adds to it.
+ *
+ * The title registers once, at start (static table, kept by pointer); the
+ * backends ask nv2a_texrep_zbias() when they upload a texture (a few
+ * integer compares for any other format or size, a hash for a candidate)
+ * and keep the answer with their cache entry. */
+struct nv2a_texrep_zbias {
+    const char *name;                 /* for the log */
+    uint64_t    hash;                 /* nv2a_texrep_hash of the title's bytes */
+    uint32_t    color, width, height;
+    float       bias;
+};
+
+void  nv2a_texrep_register_zbias(const struct nv2a_texrep_zbias *tex, unsigned n);
+/* Whether the backends apply the offsets now: RECOMP_DEBUG=zbias=0 never,
+ * zbias_ab=n on for n flips and off for n (comparisons); else always. */
+int   nv2a_texrep_zbias_on(uint32_t flip);   /* flip: the executor's flip count */
+/* The bias of a registered texture, 0 for any other. */
+float nv2a_texrep_zbias(const uint8_t *guest, uint32_t color, uint32_t w,
+                        uint32_t h, uint32_t pitch);
+
 /* RECOMP_DEBUG=texrep_dump=<dir> (read by apply): every texture a backend
  * uploads, once per content, as <dir>/<hash>_<w>x<h>_f<color>.tga (level 0,
  * A8R8G8B8 as decoded, before any replacement), with one line per file in
