@@ -23,29 +23,34 @@
  *          this thread can make it raise sooner.
  *
  * Decisions, in windows of 2 s of holds:
- *   up      two windows in a row with >= 2 near misses, or late wakes
- *           (> 1 ms) in >= 5 % of the waits: one level more spin (two when
- *           both windows had near misses in >= 10 % of their holds).
- *   check   every two windows after a step up: a third less trouble than
- *           before the climb started ends the climb there; otherwise one
- *           more step. No help even at the top: spinning is not the cure
- *           (the GPU is the limit, or the timer): back to where the climb
+ *   up      the first window with >= 2 near misses, or late wakes (> 1 ms)
+ *           in >= 5 % of the waits: one level more spin, two when near
+ *           misses were >= 2 % of the holds (a bend on the Deck: help
+ *           within 2 s, enough to lift the CPU clock).
+ *   check   the window after a step up: no longer bad ends the climb
+ *           there; otherwise one or two more steps. No help even at the top: spinning is not the cure (the
+ *           GPU is the limit, or the timer): back to where the climb
  *           started, which is the ceiling for 60 s (doubling on each
  *           repeat, up to 10 min).
- *   down    after a run of clean windows (10 s at first) with headroom
- *           (90 % of the on-time frames arrived with at least a quarter of
- *           their interval to spare): one level less. A step up within 30 s
- *           of a step down doubles the run needed (up to 5 min), so a level
- *           that is needed is not left again and again.
- *   hitch   a window with a hitch, and the 3 s after one, decide nothing.
- *           A hitch is usually a scene change, and the level returns to the
- *           level last proven needed (held, decaying one step per 10 min
- *           since it was last proven), so a race after a light menu starts where
- *           the last race ended instead of stuttering its way up. A step up
- *           still on trial when a stall comes is void, and so is a whole
- *           climb that began less than 20 s before it, with the level it
- *           taught (the near misses were the run-up to a load: a loading
- *           screen, the track streaming in).
+ *   play    a window whose interval-1 frames have half their interval or
+ *           less to spare in a quarter of them is play (a race on a
+ *           handheld; a menu has nearly all of it to spare). In play the
+ *           level never goes below 2 (4 ms: the clock stays up for the next
+ *           bend) and a step down needs 30 s of clean windows; elsewhere
+ *           10 s, and 0 (sleep only) is allowed.
+ *   down    after that run of clean windows with headroom (90 % of the
+ *           on-time frames arrived with at least a quarter of their
+ *           interval to spare): one level less. A step up within 30 s of a
+ *           step down doubles the run needed (up to 5 min).
+ *   hitch   a frame one to six vblanks late (a shader compile, a file read)
+ *           skips that window's decision, nothing more.
+ *   stall   a frame more than 100 ms late, or 250 ms without a hold (a
+ *           load): the 3 s after it decide nothing; a climb that began
+ *           less than 20 s before it is undone with the level it taught
+ *           (the near misses of a loading screen were its run-up); and the
+ *           level returns to the one last proven needed (held, decaying one
+ *           step per 10 min since it was last proven), so a race after a
+ *           light menu starts where the last race ended.
  *
  * Levels (ms of spin before the vblank): 0 (Battery saver), 2, 4, 8
  * (Balanced; the start), 12, 17 (the whole frame: the busy-wait).
@@ -73,6 +78,7 @@ typedef struct {
 typedef struct {
     long holds, near_misses, hitches, late_wakes, waits;
     long ups, downs, reverts, restores;
+    long bad_windows;
 } XboxPowerAutoTotals;
 
 typedef struct {
@@ -81,12 +87,13 @@ typedef struct {
     /* the window being filled */
     uint64_t win_start_ns, last_ns;
     int      n, ontime, tight, waited, late_wakes, nears, hitch;
+    int      ontime1, busy;         /* on-time holds at interval 1, those with < half to spare */
+    int      play;                  /* the last window looked like play (the overlay, tests) */
     /* the run of windows */
-    int      bad_run, clean_run, down_need;
-    int      prev_heavy, prev_bad_score;
+    int      clean_run, down_need;
     uint64_t quiet_until_ns, last_down_ns, last_up_ns, down_ok_since_ns;
     /* after a step up: did it help? */
-    int      probe_from, probe_windows, probe_base, probe_score;
+    int      probe_from, probe_base;
     /* the climb under way: where it began, what was held then */
     int      climb_from, climb_held;
     uint64_t climb_ns;

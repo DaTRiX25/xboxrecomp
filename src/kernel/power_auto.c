@@ -11,9 +11,12 @@
 #define PERIOD_NS          16666667ll           /* one emulated vblank */
 #define WINDOW_NS          (2000 * MS)
 #define HITCH_GAP_NS       (250 * MS)           /* no hold for this long: a stall */
-#define QUIET_NS           (3000 * MS)          /* after a hitch, decide nothing */
+#define QUIET_NS           (3000 * MS)          /* after a stall, decide nothing */
+#define STALL_NS           (100 * MS)           /* a frame this late: a stall (a load), not a hitch */
 #define LATE_WAKE_NS       (1 * MS)
-#define DOWN_RUN           5                    /* clean windows before a step down */
+#define DOWN_RUN           5                    /* clean windows before a step down (menus) */
+#define DOWN_RUN_PLAY      15                   /* the same in play: 30 s */
+#define PLAY_FLOOR         2                    /* in play never below this level (4 ms) */
 #define DOWN_RUN_MAX       150                  /* 5 min */
 #define OSC_NS             (30000 * MS)         /* up this soon after a down: oscillation */
 #define DOWN_RESET_NS      (600000 * MS)        /* no step up for this long: back to DOWN_RUN */
@@ -55,17 +58,28 @@ static void window_reset(XboxPowerAuto *a, uint64_t now)
 {
     a->win_start_ns = now;
     a->n = a->ontime = a->tight = a->waited = a->late_wakes = a->nears = a->hitch = 0;
+    a->ontime1 = a->busy = 0;
 }
 
 /* The end of a 2 s window: the decisions. Returns 1 when the level moved. */
 static int window_end(XboxPowerAuto *a, uint64_t now)
 {
     int score = a->nears + a->late_wakes;
+    /* A hitch (a frame one to six vblanks late: a shader compile, a file
+     * read) skips this window's decision and nothing else; a stall (a
+     * load) also quiets the next 3 s. */
     int disturbed = a->hitch || now < a->quiet_until_ns;
     int bad = !disturbed && (a->nears >= 2
                              || (a->waited >= 20 && a->late_wakes * 20 >= a->waited));
+    /* In play: frames that take a good part of their interval (the race on
+     * a handheld: half the frame or less to spare in a quarter of them; a
+     * menu has nearly all of it). The CPU clock matters there: a floor of
+     * spin, and slower steps down. */
+    int play = a->ontime1 >= 30 && a->busy * 4 >= a->ontime1;
+    int need = play && a->down_need < DOWN_RUN_PLAY ? DOWN_RUN_PLAY : a->down_need;
     int before = a->level;
 
+    a->tot.bad_windows += bad;
     /* What has run out. */
     if (a->ceiling < MAX_LEVEL && now >= a->ceiling_until_ns)
         a->ceiling = MAX_LEVEL;
@@ -75,93 +89,83 @@ static int window_end(XboxPowerAuto *a, uint64_t now)
     }
     if (a->down_need > DOWN_RUN && now - a->last_up_ns > DOWN_RESET_NS)
         a->down_need = DOWN_RUN;
+    a->play = play;
 
     if (disturbed) {
-        /* A stall while a step up is on trial: the trouble that caused it
-         * was the run-up to a load, not the wait (what follows is another
-         * scene). The step is void. */
-        if (a->probe_from >= 0) {
-            a->level = a->probe_from;
-            a->probe_from = -1;
-            a->tot.reverts++;
-            snprintf(a->why, sizeof a->why, "a stall came: the step up is void");
-        }
-        a->bad_run = a->clean_run = 0;
+        /* nothing decided */
     } else if (a->probe_from >= 0) {
-        /* The two windows after a step up: did the climb help yet? A third
-         * less trouble than before it started: yes, and this level is the
-         * one needed. Not yet: one more step, up to the top; no help even
-         * there: back to where the climb started (the GPU or the timer is
-         * the limit, not the wait). */
-        a->probe_score += score;
-        if (++a->probe_windows >= 2) {
-            int up = a->level + 1 > a->ceiling ? a->ceiling : a->level + 1;
-            if (a->probe_score * 3 <= a->probe_base * 2) {
-                if (a->level > a->held) {
-                    a->held = a->level;
-                    a->held_at_ns = now;
-                }
-                a->probe_from = -1;
-            } else if (up > a->level) {
-                a->level = up;
-                a->last_up_ns = now;
-                a->tot.ups++;
-                snprintf(a->why, sizeof a->why, "trouble %d -> %d after the last step: one more",
-                         a->probe_base, a->probe_score);
-            } else {
-                a->level = a->probe_from;
-                a->ceiling = a->probe_from;
-                a->ceiling_until_ns = now + a->ceiling_wait_ns;
-                a->ceiling_wait_ns = a->ceiling_wait_ns * 2 > CEIL_WAIT_MAX_NS
-                                   ? CEIL_WAIT_MAX_NS : a->ceiling_wait_ns * 2;
-                a->tot.reverts++;
-                snprintf(a->why, sizeof a->why, "more spin did not help (%d -> %d): back",
-                         a->probe_base, a->probe_score);
-                a->probe_from = -1;
+        /* The window after a step up: is the trouble gone? Yes: this level
+         * is the one needed. Not yet: one or two more steps, up to the
+         * top; still there at the top: spinning is not the cure (the GPU
+         * or the timer is the limit): back to where the climb started.
+         * (Less trouble is not enough: misses that spinning does not cure
+         * come and go at random, and one quiet window would keep the
+         * busy-wait.) */
+        if (!bad) {
+            if (a->level > a->held) {
+                a->held = a->level;
+                a->held_at_ns = now;
             }
-            a->probe_score = a->probe_windows = 0;
-            a->bad_run = a->clean_run = 0;
-        }
-    } else if (bad) {
-        a->clean_run = 0;
-        if (a->bad_run++ == 0) {
-            a->prev_heavy = a->nears * 10 >= a->n;
-            a->prev_bad_score = score;
+            a->probe_from = -1;
+        } else if (a->level < a->ceiling) {
+            int step = a->nears * 50 >= a->n ? 2 : 1;
+            a->level = a->level + step > a->ceiling ? a->ceiling : a->level + step;
+            a->last_up_ns = now;
+            a->tot.ups++;
+            snprintf(a->why, sizeof a->why, "trouble %d -> %d after the last step: more",
+                     a->probe_base, score);
         } else {
-            int step = a->prev_heavy && a->nears * 10 >= a->n ? 2 : 1;
-            int to = a->level + step > a->ceiling ? a->ceiling : a->level + step;
-            if (to > a->level) {
-                if (a->last_down_ns && now - a->last_down_ns < OSC_NS)
-                    a->down_need = a->down_need * 2 > DOWN_RUN_MAX ? DOWN_RUN_MAX : a->down_need * 2;
-                /* The start of a climb (not a step within one): where it
-                 * began and what was held, for a stall that may follow. */
-                if (!a->climb_ns || now - a->last_up_ns > WINDOW_NS * 3) {
-                    a->climb_from = a->level;
-                    a->climb_held = a->held;
-                    a->climb_ns = now;
-                }
-                a->probe_from = a->level;
-                a->probe_base = a->prev_bad_score + score;
-                a->probe_score = a->probe_windows = 0;
-                a->level = to;
-                a->last_up_ns = now;
-                a->tot.ups++;
-                snprintf(a->why, sizeof a->why, "%d near misses, %d late wakes of %d waits",
-                         a->nears, a->late_wakes, a->waited);
+            a->level = a->probe_from;
+            a->ceiling = a->probe_from;
+            a->ceiling_until_ns = now + a->ceiling_wait_ns;
+            a->ceiling_wait_ns = a->ceiling_wait_ns * 2 > CEIL_WAIT_MAX_NS
+                               ? CEIL_WAIT_MAX_NS : a->ceiling_wait_ns * 2;
+            a->tot.reverts++;
+            snprintf(a->why, sizeof a->why, "more spin did not help (%d -> %d): back",
+                     a->probe_base, score);
+            a->probe_from = -1;
+        }
+        a->clean_run = 0;
+    } else if (bad) {
+        /* At once, on the first bad window: a bend that misses for 4 s has
+         * help within 2. Two levels when 2 % of the holds missed. */
+        int step = a->nears * 50 >= a->n ? 2 : 1;
+        int to = a->level + step > a->ceiling ? a->ceiling : a->level + step;
+        a->clean_run = 0;
+        if (to > a->level) {
+            if (a->last_down_ns && now - a->last_down_ns < OSC_NS)
+                a->down_need = a->down_need * 2 > DOWN_RUN_MAX ? DOWN_RUN_MAX : a->down_need * 2;
+            /* The start of a climb (not a step within one): where it began
+             * and what was held, for a stall that may follow. */
+            if (!a->climb_ns || now - a->climb_ns > RUNUP_NS) {
+                a->climb_from = a->level;
+                a->climb_held = a->held;
+                a->climb_ns = now;
             }
-            a->bad_run = 0;
+            a->probe_from = a->level;
+            a->probe_base = score;
+            a->level = to;
+            a->last_up_ns = now;
+            a->tot.ups++;
+            snprintf(a->why, sizeof a->why, "%d near misses, %d late wakes of %d waits",
+                     a->nears, a->late_wakes, a->waited);
         }
     } else {
-        a->bad_run = 0;
-        if (++a->clean_run >= a->down_need && a->level > 0
+        if (++a->clean_run >= need && a->level > (play ? PLAY_FLOOR : 0)
                 && a->ontime >= 30 && a->tight * 10 <= a->ontime) {
             a->level--;
             a->last_down_ns = now;
             a->clean_run = 0;
             a->tot.downs++;
             snprintf(a->why, sizeof a->why, "steady with headroom for %d s",
-                     a->down_need * (int)(WINDOW_NS / (1000 * MS)));
+                     need * (int)(WINDOW_NS / (1000 * MS)));
         }
+    }
+    /* The floor in play, whatever the window decided. */
+    if (play && a->level < PLAY_FLOOR) {
+        a->level = PLAY_FLOOR;
+        snprintf(a->why, sizeof a->why, "in play: at least %llu ms",
+                 (unsigned long long)(xbox_PowerAutoLeadNs(PLAY_FLOOR) / 1000000u));
     }
     window_reset(a, now);
     return a->level != before;
@@ -181,36 +185,34 @@ int xbox_PowerAutoFeed(XboxPowerAuto *a, const XboxPowerAutoSample *s)
     a->n++;
     a->tot.holds++;
     if (gap || s->slack_ns < -PERIOD_NS) {
-        /* Loading, file IO, a shader compile: not the wait's to cure. The
-         * first of a cluster takes the level back to the one last proven
-         * needed (a scene change). */
+        int stall = gap || s->slack_ns < -(int64_t)STALL_NS;
         a->hitch++;
         a->tot.hitches++;
-        if (now >= a->quiet_until_ns) {
+        /* A stall (a load): the first of a cluster undoes a climb that was
+         * its run-up, and takes the level back to the one last proven
+         * needed (a scene change). A shorter hitch (a shader compile in a
+         * bend) only skips the window's decision. */
+        if (stall && now >= a->quiet_until_ns) {
             int to;
-            /* A climb that began shortly before this stall was the run-up
-             * to a load (the near misses of a loading screen, streaming
-             * beside the frames), not the scene's need: undo it, and what
-             * it taught. */
             if (a->climb_ns && now - a->climb_ns < RUNUP_NS && a->level > a->climb_from) {
                 a->level = a->climb_from;
                 a->held = a->climb_held;
-                a->probe_from = -1;
                 a->tot.reverts++;
                 snprintf(a->why, sizeof a->why, "a stall followed: the climb was the run-up to a load");
                 changed = 1;
             }
+            a->probe_from = -1;
             a->climb_ns = 0;
             to = a->held < a->ceiling ? a->held : a->ceiling;
             if (to > a->level) {
                 a->level = to;
                 a->tot.restores++;
-                a->probe_from = -1;
                 snprintf(a->why, sizeof a->why, "a stall (scene change?): back to the level last needed");
                 changed = 1;
             }
         }
-        a->quiet_until_ns = now + QUIET_NS;
+        if (stall)
+            a->quiet_until_ns = now + QUIET_NS;
     } else if (s->slack_ns < 0) {
         a->nears++;
         a->tot.near_misses++;
@@ -218,6 +220,11 @@ int xbox_PowerAutoFeed(XboxPowerAuto *a, const XboxPowerAutoSample *s)
         a->ontime++;
         if (s->slack_ns < (int64_t)s->interval * PERIOD_NS / 4)
             a->tight++;
+        if (s->interval == 1) {
+            a->ontime1++;
+            if (s->slack_ns < PERIOD_NS / 2)
+                a->busy++;
+        }
     }
     if (s->wake_ns >= 0) {
         a->waited++;
