@@ -256,7 +256,7 @@ title's defaults when those change. Keys it does not know are kept.
 | `input.deadzone`, `input.trigger_deadzone` | `RECOMP_PAD_DEADZONE`, `RECOMP_PAD_TRIGGER_DEADZONE` | yes |
 | `input.rumble` (strength, 0 to 3 in steps of 0.25; 1 the original, 0 off; motor = (speed / peak) ^ (1 / strength), see src/input/README.md) | `RECOMP_INPUT_RUMBLE_GAIN` | yes |
 | `input.glyphs` (`auto`, `xbox`, `xbox_modern`, `playstation`, `playstation5`, `nintendo`, `steam`, `positional`, `keyboard`) | `RECOMP_INPUT_GLYPHS` | live: the title's button prompts drawn for the pad in use (`src/input/pad_glyphs.h`). `auto` follows the pad that last pressed a button (the keyboard counts, and shows key caps); `xbox` is the title's own picture, nothing replaced; `positional` is for any pad (no letters: a diamond of four dots, the one to press filled; `auto` picks it for a pad of unknown family, and the title's own picture while no pad has been used). Only a title that registers its prompt textures and brings pictures for them has anything to change (`src/kernel/nv2a_texrep.h`; Metal and Vulkan backends) |
-| `power.mode` (`stock`, `performance`, `battery`) | `RECOMP_PRESENT_PACING` + `RECOMP_PRESENT_SPIN_LEAD` | yes |
+| `power.mode` (`stock`, `performance`, `battery`, `auto`) | `RECOMP_PRESENT_PACING` + `RECOMP_PRESENT_SPIN_LEAD` (`auto`: `sleep` + `auto`) | yes |
 | `advanced.perf_overlay` | `RECOMP_OVERLAY_PERF` | yes |
 | `advanced.diagnostic_log` (bool; default on, off in a release build) | `RECOMP_LOG_DIAG` | yes; the print gate (`logging.md`). The row shows where the log is and what set it when the environment did |
 | `advanced.perf_steps` (bool) | `RECOMP_OVERLAY_PERF_STEPS` | yes; the graph marks frames of more than one simulation step, when the port reports them (`xbox_PresentCadenceSteps`) |
@@ -265,6 +265,22 @@ title's defaults when those change. Keys it does not know are kept.
 Power modes: *stock* is the busy-wait; *performance* sleeps and spins the
 last 8 ms before each frame (steady frame time, about 10 W on the Deck);
 *battery* sleeps throughout (about 8 W, small dips).
+*auto* (BO-175) sleeps and picks the spin lead as it runs
+(`src/kernel/power_auto.h`): 0, 2, 4, 8, 12 or 17 ms (all of the wait),
+starting at 8. Every held flip is measured against the vblank the title asked
+for, its own swap interval, so the title's 30 fps phases (crash cameras,
+split screen) are on time, not misses. Two 2-second windows in a row with
+near misses (a frame late by less than a vblank) or late wake-ups (> 1 ms
+after the vblank was raised, in 5 % of waits) step it up; if two windows
+later the trouble has not dropped by a third it climbs on, and if even the
+top does not help it goes back and stays there for a while (the GPU or the
+timer is the limit). Steady windows with headroom step it down, more slowly
+after each step down that had to be undone. A frame more than a vblank late,
+or 250 ms without a flip (loading, file reads, a shader compile), decides
+nothing for 3 s and takes the lead back to the level last needed. It
+changes only how the hold waits: the flip leaves at the same vblank. The
+Advanced page shows the lead it holds and why it last moved;
+`RECOMP_TRACE=pacing` prints its counts and each change.
 
 The host's default is Balanced on every platform; the Burnout 3 port's macOS
 default became Balanced too (BO-75, measured: as steady as Stock at about half

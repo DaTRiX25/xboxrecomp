@@ -65,7 +65,7 @@ static const char *const k_vibration[] = { "auto", "controller", "device", "off"
 static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
 static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
 static const char *const k_score_board[] = { "original", "smooth", NULL };
-static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
+static const char *const k_power[]    = { "stock", "performance", "battery", "auto", NULL };
 static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
 static const char *const k_timing[]   = { "legacy", "auto", NULL };
 static const char *const k_custom_level[] = { "off", "quieter", "match", "louder", NULL };
@@ -277,7 +277,7 @@ static void power_env(double mode, const char **pacing, const char **lead)
 {
     int m = (int)mode;
     *pacing = m == 0 ? "spin" : "sleep";
-    *lead = m == 1 ? "8" : "0";
+    *lead = m == 1 ? "8" : m == 3 ? "auto" : "0";
 }
 
 /* Where Maximum ("stock") is not offered (BO-75, a stand-in decision to be
@@ -320,6 +320,8 @@ static double power_from(const char *pacing, const char *lead)
     double l = lead && *lead ? atof(lead) : 0.0;
     if (!pacing || strcmp(pacing, "sleep"))
         return 0;
+    if (lead && !strcmp(lead, "auto"))
+        return 3;
     return l > 0.0 ? 1 : 2;
 }
 
@@ -439,7 +441,10 @@ static void apply(xs_id id)
         recomp_env_set(RENV_PRESENT_PACING, p);
         recomp_env_set(RENV_PRESENT_SPIN_LEAD, l);
         xbox_PacingSetMode(v == 0 ? XBOX_PACING_SPIN : XBOX_PACING_SLEEP);
-        xbox_PacingSetSpinLead(v == 1 ? (uint64_t)(POWER_LEAD_MS * 1e6) : 0);
+        if (v == 3)
+            xbox_PacingSetSpinLeadAuto();   /* BO-175: picked at run time */
+        else
+            xbox_PacingSetSpinLead(v == 1 ? (uint64_t)(POWER_LEAD_MS * 1e6) : 0);
         break;
     }
     default:

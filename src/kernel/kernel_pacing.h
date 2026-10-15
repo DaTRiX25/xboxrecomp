@@ -16,6 +16,7 @@
 #ifndef XBOX_KERNEL_PACING_H
 #define XBOX_KERNEL_PACING_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -83,6 +84,16 @@ void xbox_VblankSignal(void);
  * thread tells it when the next vblank is due, before counting the one it
  * raises. */
 void xbox_PacingSetSpinLead(uint64_t ns);
+/* Power mode Auto (BO-175, power_auto.h): the lead is picked at run time
+ * from the holds; xbox_PacingSetSpinLead turns it off again. Only how the
+ * hold waits changes, never which vblank the flip leaves at. */
+void xbox_PacingSetSpinLeadAuto(void);
+/* 1 while Auto is on; the lead it holds now and why it moved last. */
+int  xbox_PacingAutoState(double *lead_ms, char *why, size_t n);
+/* The executor, after a flip's hold: the swap interval the title asked for
+ * (vblanks), when the frame reached the hold and the edge of the vblank it
+ * asked for (0: unknown). Feeds Auto; nothing when it is off. */
+void xbox_PacingHoldSample(uint32_t interval, uint64_t arrive_ns, uint64_t edge_ns);
 void xbox_VblankNextDue(uint64_t ns);
 /* The grid time of the last vblank raised, and of vblank number `count`
  * (one already raised, or one still to come); 0 before the first. */

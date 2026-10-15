@@ -39,6 +39,9 @@ void xbox_InputSetGlyphMode(int mode) { st_glyphs = mode; }
 void xbox_InputGlyphsRefresh(void) { st_glyph_refresh++; }
 void xbox_PacingSetMode(int m) { st_pacing = m; }
 void xbox_PacingSetSpinLead(uint64_t ns) { st_lead = ns; }
+static int st_auto;
+void xbox_PacingSetSpinLeadAuto(void) { st_auto++; st_lead = 77; }
+int xbox_PacingAutoState(double *l, char *w, size_t n) { (void)l; (void)w; (void)n; return 0; }
 void nv2a_present_set_overscan(int c) { st_overscan = c; }
 void nv2a_present_set_fit(int f) { st_fit = f; }
 void nv2a_host_opts_set(const struct nv2a_host_opts *o) { st_opts = *o; }
@@ -234,6 +237,8 @@ int main(void)
         CHECK(xbox_PowerModeAtLoad(XS_HOST_MACOS, 0) == 0);
         CHECK(xbox_PowerModeAtLoad(XS_HOST_MACOS, 1) == 1);
         CHECK(xbox_PowerModeAtLoad(XS_HOST_MACOS, 2) == 2);
+        CHECK(xbox_PowerModeAtLoad(XS_HOST_MACOS, 3) == 3);
+        CHECK(xbox_PowerModeAtLoad(XS_HOST_LINUX, 3) == 3);
 #if defined(__APPLE__)
         CHECK(xbox_SettingsHost() == XS_HOST_MACOS);
 #endif
@@ -343,6 +348,13 @@ int main(void)
     }
 
     /* A live change reaches the runtime, the cached environment and the file. */
+    /* Auto (BO-175): sleep pacing, the lead picked at run time, "auto" in
+     * the environment; and back to a fixed lead. */
+    xbox_SettingSet(XS_POWER_MODE, 3);
+    CHECK(st_pacing == 1 && st_auto == 1 && st_lead == 77);
+    CHECK(recomp_env(RENV_PRESENT_SPIN_LEAD) && !strcmp(recomp_env(RENV_PRESENT_SPIN_LEAD), "auto"));
+    CHECK(recomp_env(RENV_PRESENT_PACING) && !strcmp(recomp_env(RENV_PRESENT_PACING), "sleep"));
+    CHECK(!strcmp(xbox_SettingGet(XS_POWER_MODE)->choices[3], "auto"));
     xbox_SettingSet(XS_POWER_MODE, 1);
     CHECK(st_pacing == 1 && st_lead == 8000000ull);
     CHECK(recomp_env(RENV_PRESENT_SPIN_LEAD) && !strcmp(recomp_env(RENV_PRESENT_SPIN_LEAD), "8"));

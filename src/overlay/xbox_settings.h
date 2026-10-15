@@ -161,7 +161,7 @@ typedef enum { XS_HOST_MACOS, XS_HOST_WINDOWS, XS_HOST_ANDROID, XS_HOST_LINUX } 
 xs_host xbox_SettingsHost(void);               /* the host this was built for */
 void    xbox_SettingsSetHost(xs_host h);       /* tests */
 int     xbox_PowerStockHidden(xs_host h);
-/* The power mode (0 stock, 1 performance, 2 battery) a stored value means on h. */
+/* The power mode (0 stock, 1 performance, 2 battery, 3 auto) a stored value means on h. */
 double  xbox_PowerModeAtLoad(xs_host h, double stored);
 
 /* The window is in the background: audio.mute_background silences it. */

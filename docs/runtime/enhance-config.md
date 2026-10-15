@@ -116,7 +116,7 @@ the stock settings.
 | `present.aspect` | string | the window's frame shape: `"auto"`, `"frame"`, `"4:3"`, `"16:9"` | `"auto"` | `RECOMP_PRESENT_ASPECT` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
-| `present.spin_lead` | float | milliseconds before the vblank that a held flip spins instead of sleeping, at `sleep` pacing | `0` | `RECOMP_PRESENT_SPIN_LEAD` |
+| `present.spin_lead` | float or `"auto"` | milliseconds before the vblank that a held flip spins instead of sleeping, at `sleep` pacing; `"auto"` picks it at run time (power mode Auto) | `0` | `RECOMP_PRESENT_SPIN_LEAD` |
 | `render.shader_cache` | string | the shader cache's directory (`"~/..."` is under `$HOME`), or `"none"` for no disk cache: the key list the Metal and Vulkan backends pre-warm from, and on Vulkan the SPIR-V and the driver's pipeline cache. The key list is kept across rebuilds of the toolkit (its version names the key format, not the commit); a test or an installer's smoke run sets `RECOMP_RENDER_SHADER_CACHE` to a directory of its own so it does not write the player's | the per-user cache directory: macOS `~/Library/Caches/<executable>`, Linux `$XDG_CACHE_HOME/<executable>`, Windows `%LOCALAPPDATA%\<executable>\cache` | `RECOMP_RENDER_SHADER_CACHE` |
 | `fps.mode` | string | `"lock30"` (stock), `"lock60"`, `"free"` | `"lock30"` | the game's `RECOMP_FPS_MODE` |
 | `fx.glow` | string | `"on"` (stock), `"off"` (BLiNX 2: its post-mode-3 glow pass) | `"on"` | the game's `RECOMP_GLOW` |
@@ -226,6 +226,8 @@ is stock. One line shows the values in force:
   at the cost of the spin's watts. The flip is released when the vblank
   count moves, as before, so the latency does not grow. `0` sleeps the
   whole hold; a lead of a frame or more spins all of it.
+  `"auto"` lets the runtime pick it from what the holds measure
+  (`src/kernel/power_auto.h`, the power mode Auto in `overlay.md`).
 
 ### Naming rule
 

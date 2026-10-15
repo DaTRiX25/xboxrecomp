@@ -36,6 +36,7 @@
 #include "input_map.h"
 #include "kernel_pause.h"
 #include "present_cadence.h"    /* what reached the glass, for the graph */
+#include "kernel_pacing.h"     /* power mode Auto's state (BO-175) */
 extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include "apu.h"                /* the speaker test */
 #include "apu_bus.h"            /* the Mixer page */
@@ -158,9 +159,9 @@ static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_vehicle_detail[] = { "Original", "Far (2x)", "Farthest (4x)", NULL };
 static const char *const n_score_board[] = { "Original", "Smooth", NULL };
-static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", NULL };
+static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", "Auto (adapts)", NULL };
 /* Off the Steam Deck the watts are somebody else's: the names alone. */
-static const char *const n_power_plain[] = { "Maximum", "Balanced (recommended)", "Battery saver", NULL };
+static const char *const n_power_plain[] = { "Maximum", "Balanced (recommended)", "Battery saver", "Auto (adapts)", NULL };
 static bool on_steam_deck()
 {
     const char *sd = getenv("SteamDeck");
@@ -192,7 +193,7 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_INPUT_RUMBLE */       { "Rumble strength", "1.0 is the original Xbox rumble. Higher strengthens the weaker rumbles; the strongest stays at full. 0 turns rumble off.", 0.25, FMT_GAIN, NULL, 0 },
     /* XS_INPUT_FACE_LAYOUT */  { "Face buttons", "Nintendo layout is for pads with A on the right and B below. It swaps A with B and X with Y, in the game and here.", 1, FMT_PLAIN, n_face, 0 },
     /* XS_INPUT_CONTROL_SCHEME */ { "Driving controls", "PS2 layout uses the PlayStation 2 version's driving controls: accelerate on the bottom face button, brake on the left one, boost on the right shoulder, look back on the left shoulder. Applies only while driving.", 1, FMT_PLAIN, n_scheme, 0 },
-    /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits throughout (steadiest, hottest). Balanced sleeps, then spins for the last 8 ms of each frame (steady 60). Battery saver only sleeps (coolest, with an occasional small dip).", 1, FMT_PLAIN, n_power, 0 },
+    /* XS_POWER_MODE */         { "Power mode", "Maximum busy-waits throughout (steadiest, hottest). Balanced sleeps, then spins for the last 8 ms of each frame (steady 60). Battery saver only sleeps (coolest, with an occasional small dip). Auto picks the spin as it goes: less while frames are steady, more when they come late.", 1, FMT_PLAIN, n_power, 0 },
     /* XS_ADVANCED_PERF */      { "Performance overlay", "FPS and frame-time graph in the corner. Greetings to the DF team!", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speed and distance in km/h and metres instead of mph and miles, using the game's own metric display. Applies from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
     /* XS_DISPLAY_HUD_FIX */    { "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On keeps the HUD at its 4:3 proportions, pinned to the screen edges. Applies from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
@@ -1051,6 +1052,21 @@ static int page_rows(int page, Row *r)
                 INFO(s_sa_line);
         }
         SET(XS_ADVANCED_PERF);
+        {
+            /* What Auto holds now (BO-175): one line, only while it is on. */
+            static char au[160];
+            double lead;
+            char why[96];
+            if (xbox_PacingAutoState(&lead, why, sizeof why)) {
+                if (lead <= 0.0)
+                    snprintf(au, sizeof au, "Auto now: sleeping through each wait (as Battery saver). Last change: %s.", why);
+                else if (lead >= 16.0)
+                    snprintf(au, sizeof au, "Auto now: spinning through each wait (busy-wait). Last change: %s.", why);
+                else
+                    snprintf(au, sizeof au, "Auto now: spinning the last %.0f ms of each frame. Last change: %s.", lead, why);
+                INFO(au);
+            }
+        }
 #if defined(__APPLE__)
         /* The Metal presenter's (BO-115); the other presenters do not
          * record when frames reach the glass, and their pages are as they
@@ -3679,6 +3695,7 @@ static bool row_hint(const Row &r, char *hint, size_t n)
             if (r.id == XS_POWER_MODE && xbox_PowerStockHidden(xbox_SettingsHost()))
                 snprintf(hint, n, "Balanced sleeps, then spins for the last 8 ms of each frame (steady 60,"
                          " recommended). Battery saver only sleeps (coolest, with an occasional small dip)."
+                         " Auto picks the spin as it goes: less while frames are steady, more when they come late."
                          " Busy-waiting is not offered here: it was no steadier and used more power"
                          " (for diagnosis: RECOMP_PRESENT_PACING=spin).");
             else
