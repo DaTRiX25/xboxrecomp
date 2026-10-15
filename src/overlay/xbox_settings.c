@@ -64,6 +64,7 @@ static const char *const k_vibration[] = { "auto", "controller", "device", "off"
 #endif
 static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
 static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
+static const char *const k_scenery_detail[] = { "original", "far", NULL };
 static const char *const k_score_board[] = { "original", "smooth", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", "auto", NULL };
 static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
@@ -127,6 +128,9 @@ static xs_setting s_set[XS_COUNT] = {
     /* The title's vehicle level-of-detail distances: the patch is anything
      * but "original". */
     [XS_GRAPHICS_VEHICLE_DETAIL] = SETTING("graphics.vehicle_detail", XS_CHOICE, 0, RENV_GFX_VEHICLE_DETAIL, k_vehicle_detail, NULL, 0, 0, 0),
+    /* The same for the title's scenery objects (trees, signs): the patch is
+     * "far". */
+    [XS_GRAPHICS_SCENERY_DETAIL] = SETTING("graphics.scenery_detail", XS_CHOICE, 0, RENV_GFX_SCENERY_DETAIL, k_scenery_detail, NULL, 0, 0, 0),
     /* The title's button prompts for the pad in use (pad_glyphs.h). */
     [XS_INPUT_GLYPHS]       = SETTING("input.glyphs", XS_CHOICE, 0, RENV_INPUT_GLYPHS, k_glyphs, NULL, 0, 0, 0),
     /* The LFE feed's low-pass where the title's effects image is modelled

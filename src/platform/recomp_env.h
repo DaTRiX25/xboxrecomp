@@ -126,6 +126,7 @@ extern "C" {
     X(GFX_SPLIT_60FPS,   CONFIG, "RECOMP_GFX_SPLIT_60FPS",   NULL, "1: the title's 30 Hz split screen runs at 60, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
     X(AUDIO_SPLIT_MUSIC, CONFIG, "RECOMP_AUDIO_SPLIT_MUSIC", NULL, "1: the title's music plays in split screen too, for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped (no music there)") \
     X(GFX_VEHICLE_DETAIL, CONFIG, "RECOMP_GFX_VEHICLE_DETAIL", NULL, "how far from the camera the title's vehicles keep their detailed models, for a title whose build has its level-of-detail distances behind a patch (--patches, recomp_patch.h): original (default, as shipped), far, farthest") \
+    X(GFX_SCENERY_DETAIL, CONFIG, "RECOMP_GFX_SCENERY_DETAIL", NULL, "how far from the camera the title's scenery objects keep their detailed models, for a title whose build has that distance behind a patch (--patches, recomp_patch.h): original (default, as shipped), far") \
     X(GFX_SCORE_BOARD,   CONFIG, "RECOMP_GFX_SCORE_BOARD",   NULL, "the title's score board in a race's HUD, for a title whose build has a hook for them: original (default, as shipped), smooth (the board fades as one)") \
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
     X(OVERLAY_PERF,      CONFIG, "RECOMP_OVERLAY_PERF",      NULL, "1: the overlay's FPS and frame-time graph is shown (default off)") \
