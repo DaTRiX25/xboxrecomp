@@ -64,6 +64,7 @@ static const char *const k_vibration[] = { "auto", "controller", "device", "off"
 #endif
 static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
 static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
+static const char *const k_score_board[] = { "original", "smooth", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", NULL };
 static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
 static const char *const k_timing[]   = { "legacy", "auto", NULL };
@@ -149,6 +150,9 @@ static xs_setting s_set[XS_COUNT] = {
      * (apu_level.h, BO-132); off is the title's sends as they are, bit for
      * bit. Match as shipped. Live. */
     [XS_AUDIO_CUSTOM_LEVEL] = SETTING("audio.custom_music_level", XS_CHOICE, 0, RENV_AUDIO_CUSTOM_LEVEL, k_custom_level, NULL, 0, 0, 2),
+    /* The title's score board (a host hook, BO-165):
+     * original as shipped, nothing touched. Live. */
+    [XS_DISPLAY_SCORE_BOARD] = SETTING("display.score_board", XS_CHOICE, 0, RENV_GFX_SCORE_BOARD, k_score_board, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
 #endif

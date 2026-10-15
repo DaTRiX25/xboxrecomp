@@ -87,6 +87,7 @@ typedef enum {
     XS_GRAPHICS_UI_SCALE,    /* the title's 2D art scaled before upload: off, 2x, 4x (nv2a_texscale.h) */
     XS_INTERFACE_MENU_ENTRY, /* the overlay's entry in the title's own Settings menu, on by default */
     XS_AUDIO_CUSTOM_LEVEL,   /* the user's own music against the title's: off / quieter / match / louder (apu_level.h) */
+    XS_DISPLAY_SCORE_BOARD,  /* a title hook: the HUD's score board as shipped or smooth */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
 #endif
