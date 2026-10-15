@@ -2225,6 +2225,7 @@ typedef struct {
     uint8_t          use;           /* RECOMP_DEBUG=ui_scale_log: the kinds of draw seen */
     uint8_t          pend;          /* its scaled picture is being made (nv2a_texscale_get) */
     uint32_t         cut;           /* the alpha test its levels were made for (nv2a_texmip_cut_ref); 0: the title's */
+    float            zbias;         /* nv2a_texrep_zbias of its bytes (BO-176); 0: none */
     uint32_t         pal_len, pgen; /* P8 entries; the flip pend was last asked at */
     uint64_t         skey;          /* nv2a_texscale_key of the texels uploaded */
     int              live;
@@ -2302,6 +2303,9 @@ static uint32_t s_tex_rep;    /* the last tex_upload's nv2a_texrep_apply */
  * a 2D one, and the factor the texture tex_bind last returned has. */
 static int       s_draw_2d;
 static unsigned  s_bind_scale;
+/* The depth offset the texture tex_bind returned asks for (nv2a_texrep_zbias,
+ * BO-176), as Metal. */
+static float     s_bind_zbias;
 static uint32_t *s_scaled;
 static size_t    s_scaled_cap;
 
@@ -2599,6 +2603,7 @@ static VkImageView tex_bind(const Stage *t)
     int algo;
 
     s_bind_scale = 0;
+    s_bind_zbias = 0.0f;
 
     if (t->valid && (uint64_t)t->width * t->height <= TEX_MAX_TEXELS)
         bytes = nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
@@ -2686,6 +2691,8 @@ static VkImageView tex_bind(const Stage *t)
                 garbage_push(&e->im, VK_NULL_HANDLE, NULL);
                 e->rep = s_tex_rep;
                 e->cut = cut;
+                e->zbias = nv2a_texrep_zbias(mem + t->offset, t->color, t->width,
+                                             t->height, t->pitch);
                 e->im = ni;
                 e->scale = (uint8_t)want;
                 e->salgo = (uint8_t)algo;
@@ -2726,6 +2733,8 @@ static VkImageView tex_bind(const Stage *t)
         e->gen = g->flips;
         e->hash = tex_hash_pal(mem, t, bytes);
         e->rep = s_tex_rep;
+        e->zbias = nv2a_texrep_zbias(mem + t->offset, t->color, t->width, t->height,
+                                     t->pitch);
         e->im = ni;
         e->live = 1;
     }
@@ -2764,6 +2773,7 @@ static VkImageView tex_bind(const Stage *t)
     }
     e->used = ++s_tc_clock;
     s_bind_scale = e->up_scale;
+    s_bind_zbias = e->zbias;
     s_sn.scaled += e->up_scale != 0;
     if (ui_scale_log())
         ui_scale_use(e, t, mem);
@@ -3318,6 +3328,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     float *vf;
     void *ip;
     int cull = 0, cull_all = 0, tries;
+    float zbias = 0.0f;
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
     VkImageView sview[4];
@@ -3454,11 +3465,17 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                 sview[k] = tex_bind(t);
                 if (s_bind_scale)
                     ssmp[k] = sampler(t, s_bind_scale);
+                if (zbias == 0.0f)
+                    zbias = s_bind_zbias;
             }
         }
         if (textured)
             s_draws_tex++;
     }
+    /* BO-176: a registered decal's depth offset, added to the constant part
+     * of the title's own polygon offset (vp_scale.w), as Metal. */
+    if (zbias != 0.0f && use_z && nv2a_texrep_zbias_on(g->flips))
+        vc.c[3] += zbias / nv2a_zmax(g->format);
 
     /* Rings: an overflow flushes (ending the pass and resetting every
      * ring), so on a flush the placement starts over. */

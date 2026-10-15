@@ -8,6 +8,7 @@
 
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define LOGP "[TEXREP] "
@@ -65,6 +66,61 @@ void nv2a_texrep_stats(uint64_t *hashed, uint64_t *matched, uint64_t *replaced)
         *matched = atomic_load_explicit(&s_matched, memory_order_relaxed);
     if (replaced)
         *replaced = atomic_load_explicit(&s_replaced, memory_order_relaxed);
+}
+
+/* ── depth offsets (BO-176) ───────────────────────────────────────────── */
+
+static const struct nv2a_texrep_zbias *s_zb;
+static unsigned                        s_zb_n;
+
+void nv2a_texrep_register_zbias(const struct nv2a_texrep_zbias *tex, unsigned n)
+{
+    s_zb = n ? tex : NULL;
+    s_zb_n = tex ? n : 0;
+}
+
+int nv2a_texrep_zbias_on(uint32_t flip)
+{
+    static int mode = -1;               /* -1 not read, 0 off, 1 on */
+    static uint32_t ab;
+    if (mode < 0) {
+        const char *e = recomp_env(RENV_ZBIAS), *a = recomp_env(RENV_ZBIAS_AB);
+        ab = a ? (uint32_t)strtoul(a, NULL, 0) : 0;
+        mode = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+    }
+    if (mode && ab) {
+        static uint32_t said = 0xFFFFFFFFu;
+        uint32_t f = flip, half = (f / ab) & 1u;
+        if (half != said) {
+            said = half;
+            fprintf(stderr, LOGP "zbias ab: %s from flip %u\n", half ? "off" : "on", f);
+        }
+        return !half;
+    }
+    return mode;
+}
+
+float nv2a_texrep_zbias(const uint8_t *guest, uint32_t color, uint32_t w,
+                        uint32_t h, uint32_t pitch)
+{
+    uint64_t hash = 0;
+    unsigned i;
+
+    for (i = 0; i < s_zb_n; i++) {
+        const struct nv2a_texrep_zbias *z = &s_zb[i];
+        if (z->color != color || z->width != w || z->height != h)
+            continue;
+        if (!hash)
+            hash = nv2a_texrep_hash(guest, color, w, h, pitch);
+        if (hash == z->hash) {
+            static _Atomic int said;
+            if (!atomic_exchange_explicit(&said, 1, memory_order_relaxed))
+                fprintf(stderr, LOGP "depth offset %g for %s\n", (double)z->bias,
+                        z->name ? z->name : "?");
+            return z->bias;
+        }
+    }
+    return 0.0f;
 }
 
 /* ── the dump ─────────────────────────────────────────────────────────── */
