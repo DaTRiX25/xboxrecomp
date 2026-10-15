@@ -268,15 +268,19 @@ last 8 ms before each frame (steady frame time, about 10 W on the Deck);
 (`src/kernel/power_auto.h`): 0, 2, 4, 8, 12 or 17 ms (all of the wait),
 starting at 8. Every held flip is measured against the vblank the title asked
 for, its own swap interval, so the title's 30 fps phases (crash cameras,
-split screen) are on time, not misses. Two 2-second windows in a row with
-near misses (a frame late by less than a vblank) or late wake-ups (> 1 ms
-after the vblank was raised, in 5 % of waits) step it up; if two windows
-later the trouble has not dropped by a third it climbs on, and if even the
-top does not help it goes back and stays there for a while (the GPU or the
-timer is the limit). Steady windows with headroom step it down, more slowly
-after each step down that had to be undone. A frame more than a vblank late,
-or 250 ms without a flip (loading, file reads, a shader compile), decides
-nothing for 3 s and takes the lead back to the level last needed. It
+split screen) are on time, not misses. A 2-second window with near misses
+(a frame late by less than a vblank) or late wake-ups (> 1 ms after the
+vblank was raised, in 5 % of waits) steps it up at once, two levels when 2 %
+of the frames missed; if the next window is still bad it climbs on, and if
+even the top does not help it goes back and stays there for a while (the
+GPU or the timer is the limit). In play (frames with half their interval or
+less to spare, as in a race on a handheld) it never goes below 4 ms, which
+keeps an APU's CPU clock up for the next bend, and steps down only after
+30 s of clean windows; in menus after 10 s, down to sleep only. A frame one
+to six vblanks late (a shader compile) skips that window's decision; a
+stall (100 ms late, or 250 ms without a flip: a load) decides nothing for
+3 s, undoes a climb that began less than 20 s before it, and takes the lead
+back to the level last needed. It
 changes only how the hold waits: the flip leaves at the same vblank. The
 Advanced page shows the lead it holds and why it last moved;
 `RECOMP_TRACE=pacing` prints its counts and each change.
