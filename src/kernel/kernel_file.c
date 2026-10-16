@@ -355,8 +355,12 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
-            flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+        /* FILE_NO_INTERMEDIATE_BUFFERING is not passed on as
+         * FILE_FLAG_NO_BUFFERING. The title sizes unbuffered reads for the
+         * console (2048-byte DVD sectors); on a host volume with 4096-byte
+         * sectors (4Kn drives) Windows rejects such a read, it returns 0 bytes
+         * and the game reports a dirty disc. Buffered host I/O returns the same
+         * data on any volume. */
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
         DWORD access = xbox_access_to_win32(DesiredAccess);
