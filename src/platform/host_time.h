@@ -33,6 +33,10 @@ void xbox_HostSleepNs(uint64_t ns);
  * comes while it is not asleep ends its next sleep at once. */
 void xbox_HostSleepWakeableNs(uint64_t ns);
 void xbox_HostSleepWake(void);
+/* 1 when a xbox_HostSleepWake came that no wakeable sleep has taken yet:
+ * for the sleeper's busy-waits (take it with xbox_HostSleepWakeableNs(0)).
+ * One load; may be a moment behind the wake. */
+int  xbox_HostSleepWakePending(void);
 
 /* For a thread that keeps a clock with xbox_HostSleepNs (the kernel's timer
  * thread): ask the host to wake it on time. macOS wakes an ordinary thread's

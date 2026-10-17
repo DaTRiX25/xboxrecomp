@@ -26,6 +26,7 @@
  */
 
 #include "kernel.h"
+#include "kernel_console_keys.h"
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
 #include "recomp_env.h"
@@ -330,6 +331,31 @@ static void kernel_data_init(void)
 
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
+
+    /* An opted-in console key (kernel_console_keys.h): the console's HDD key
+     * and the signature key the kernel derives from the XBE certificate, so
+     * a save signed by an original console verifies. Both stay zero without
+     * one, which is what every save the port made so far is signed with. */
+    {
+        uint8_t hd[16];
+        if (xbox_ConsoleKeyLoad(hd)) {
+            uint8_t sig[16];
+            uint32_t cert = 0;
+            if (BRIDGE_MEM32(XBOX_BASE_ADDRESS) == 0x48454258u /* "XBEH" */)
+                cert = BRIDGE_MEM32(XBOX_BASE_ADDRESS + 0x118);
+            if (cert >= XBOX_BASE_ADDRESS && cert < 0x00800000u) {
+                xbox_ConsoleKeyDeriveSignature(
+                    (const uint8_t *)((uintptr_t)(cert + 0xC0) + g_xbox_mem_offset), sig);
+                memcpy(xbox_HDKey, hd, 16);
+                memcpy(xbox_SignatureKey, sig, 16);
+                memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset), hd, 16);
+                memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), sig, 16);
+                fprintf(stderr, "[KERNEL] %s\n", xbox_ConsoleKeyStatus());
+            } else {
+                fprintf(stderr, "[KERNEL] console key not used: no XBE certificate found\n");
+            }
+        }
+    }
 
     /* XboxLANKey (ordinals 326, 355) - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), 0, 16);
@@ -3189,8 +3215,38 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. Returns 1 when it stopped on
  * a busy gate with DPCs still queued; *ran counts the DPCs it ran. */
+/* How close before a vblank edge the timer thread starts no queued DPC
+ * (RECOMP_DEBUG=dpc_vblank_guard_us). The DPC runs guest code on this thread,
+ * the thread that raises the vblank: one begun just before the edge (the
+ * audio's, about a millisecond) held the raise until it returned, and the
+ * title's frame took 17.7 ms and the next 15.7 -- a yellow bar in the graph,
+ * about thirty a minute on the Steam Deck. On the console the vblank's
+ * interrupt preempts a DPC; here the DPC waits for the next pass instead, at
+ * most this long, and runs right after the raise. */
+static uint64_t dpc_vblank_guard_ns(void)
+{
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = recomp_env(RENV_DPC_VBLANK_GUARD);
+        v = e && *e ? (int64_t)strtoll(e, NULL, 10) * 1000 : 1200000;
+        if (v < 0) v = 0;
+        if (v > 4000000) v = 4000000;
+    }
+    return (uint64_t)v;
+}
+
+static int kernel_drain_dpcs_before(int *ran, uint64_t vbl_due);
+
 static int kernel_drain_dpcs(int *ran)
 {
+    return kernel_drain_dpcs_before(ran, 0);
+}
+
+/* As kernel_drain_dpcs, but none is started within the guard of vbl_due (a
+ * guest-clock time; 0: no edge to keep). Returns 1 when DPCs stay queued. */
+static int kernel_drain_dpcs_before(int *ran, uint64_t vbl_due)
+{
+    const uint64_t guard = vbl_due ? dpc_vblank_guard_ns() : 0;
     /* RECOMP_DEBUG=dpc_lag=ms, a test: a DPC waits for the timer thread's
      * next pass here, where on the console it runs as soon as the ISR that
      * queued it returns. The wait is a window in which a thread can take
@@ -3209,6 +3265,11 @@ static int kernel_drain_dpcs(int *ran)
     }
     for (;;) {
         PendingDpc d;
+        if (guard && g_dpc_head != g_dpc_tail) {
+            uint64_t now = xbox_GuestNowNs();
+            if (now < vbl_due && now + guard >= vbl_due)
+                return 1;          /* after the raise (see dpc_vblank_guard_ns) */
+        }
         /* A DPC runs only while the one-CPU gate is free (no thread at
          * DISPATCH_LEVEL, no ISR or KeSynchronizeExecution routine), and
          * never waits for it: this thread is also the vblank and timer
@@ -3566,13 +3627,46 @@ static void kernel_timer_loop_ms(void)
  * vblank or the 10 ms tick, and the title's vblank callback, which runs in
  * such a DPC, came up to 10 ms late -- the flip landed late with it. Now the
  * next pass comes within 1 ms while DPCs wait on the gate. */
+/* The vblank edge's own lateness: the timer thread's sleep ends after the
+ * edge by the scheduler's wake-up delay (up to a millisecond or more on a
+ * busy 4-core machine), and the title's frame, its flip and the hold all
+ * follow that raise: a 17.7 ms flip interval and a 15.7 one after it, a
+ * yellow bar in the overlay's graph. The last stretch before a vblank edge
+ * is spun (RECOMP_DEBUG=timer_spin_us; default 600 on Linux, 0 elsewhere:
+ * sleep to the edge, as before), and RECOMP_TRACE=pacing prints how late
+ * the raises were (Deck: 0 of 600 more than 0.5 ms late, max 0.38 ms). */
+static uint64_t timer_spin_ns(void)
+{
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = recomp_env(RENV_TIMER_SPIN);
+        /* Default on Linux (the Steam Deck: no real-time policy for this
+         * thread); macOS gives it a time-constraint policy, and Windows and
+         * Android are unmeasured: as before there unless asked for. */
+#if defined(__linux__) && !defined(__ANDROID__)
+        const int64_t def = 600000;
+#else
+        const int64_t def = 0;
+#endif
+        v = e && *e ? (int64_t)strtoll(e, NULL, 10) * 1000 : def;
+        if (v < 0) v = 0;
+        if (v > 3000000) v = 3000000;
+    }
+    return (uint64_t)v;
+}
+
+static struct { uint64_t n, late250, late500, late1000, max_ns; } s_vbl_late;
+
 static void kernel_timer_loop_ns(void)
 {
     const uint64_t ms = 1000000u;
     uint64_t wait = 10 * ms, wake = 0;
+    int wake_vbl = 0;           /* the wake is a vblank edge */
     /* A run that does not wait for the clock (host_time.h): the sleeps end
      * when the guest clock is moved to what they wait for. */
     const int warp = xbox_TimeWarpOn();
+    const uint64_t spin = warp ? 0 : timer_spin_ns();
+    const int trace = recomp_env(RENV_PACING_TRACE) != NULL;
 
     xbox_HostTimerThreadInit();
     for (;;) {
@@ -3580,7 +3674,22 @@ static void kernel_timer_loop_ns(void)
         long long now_ms, timer_due;
         int raised, ran, busy, fired;
 
-        if (warp) {
+        if (!warp && wake_vbl && spin && wait > 0) {
+            /* Sleep to the spin's start, then spin to the edge. A DPC kick
+             * (kernel_dpc_kick) ends either early: the sleep returns, the
+             * spin sees the wake pending and takes it, and the loop goes
+             * round to drain the DPC, as it does without the spin. */
+            if (wait > spin)
+                xbox_HostSleepWakeableNs(wait - spin);
+            if (xbox_GuestNowNs() + spin >= wake)
+                while (xbox_GuestNowNs() < wake) {
+                    if (xbox_HostSleepWakePending()) {
+                        xbox_HostSleepWakeableNs(0);
+                        break;
+                    }
+                    xbox_CpuRelax();
+                }
+        } else if (warp) {
             if (wake)
                 xbox_GuestSleepUntilNs(wake);
             else
@@ -3596,8 +3705,27 @@ static void kernel_timer_loop_ns(void)
             xbox_HostSleepWakeableNs(wait);
         }
         xbox_HostWakeTick();              /* a sleep or a stop behind us? */
-        raised = kernel_vblank_tick_ns(xbox_GuestNowNs(), &vbl_next);
-        busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
+        now = xbox_GuestNowNs();
+        raised = kernel_vblank_tick_ns(now, &vbl_next);
+        if (raised && wake_vbl && !warp && now >= wake) {
+            uint64_t l = now - wake;
+            s_vbl_late.n++;
+            if (l > 250000u) s_vbl_late.late250++;
+            if (l > 500000u) s_vbl_late.late500++;
+            if (l > 1000000u) s_vbl_late.late1000++;
+            if (l > s_vbl_late.max_ns) s_vbl_late.max_ns = l;
+            if (trace && s_vbl_late.n % 600u == 0) {
+                fprintf(stderr, "[PACING] vblank raises (spin %llu us): of the last 600, "
+                        "%llu more than 0.25 ms late, %llu more than 0.5 ms, %llu more than 1 ms;"
+                        " max %.2f ms\n", (unsigned long long)(spin / 1000u),
+                        (unsigned long long)s_vbl_late.late250, (unsigned long long)s_vbl_late.late500,
+                        (unsigned long long)s_vbl_late.late1000, (double)s_vbl_late.max_ns / 1e6);
+                memset(&s_vbl_late, 0, sizeof s_vbl_late);
+            }
+        }
+        /* Deferred work, before due timers; none started right before the
+         * next vblank edge (not in a run that does not wait for the clock). */
+        busy = kernel_drain_dpcs_before(&ran, warp ? 0 : vbl_next);
         now_ms = kernel_clock_ms();
         fired = kernel_fire_timers(now_ms, &timer_due);
         /* A declined or not-callable vblank ran no DPC, but its PCRTC bits
@@ -3624,6 +3752,7 @@ static void kernel_timer_loop_ns(void)
             target = now + ms;
         wait = target > now ? target - now : 0;
         wake = target;
+        wake_vbl = vbl_next && target == vbl_next && vbl_next > now;
     }
 }
 

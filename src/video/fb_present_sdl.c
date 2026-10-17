@@ -116,6 +116,7 @@
 #endif
 
 extern uint64_t xbox_PacingFrameVblankNs(void);   /* src/kernel/kernel_pacing.c */
+extern void xbox_PacingSetVisible(int visible);   /* src/kernel/kernel_pacing.c */
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
@@ -396,6 +397,21 @@ void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h)
     (void)h;
     return NULL;
 #endif
+}
+
+/* BO-110: the back slot's scene snapshot texture at w x h (Metal), between
+ * BackTexture and PublishTexture; valid 0 says this frame has none (all of
+ * it is UI). NULL when there is no such slot. */
+void *xbox_FramebufferWindowBackScene(uint32_t w, uint32_t h, int valid)
+{
+#if defined(__APPLE__)
+    if (!s_vk)
+        return fbm_scene_slot(s_back, w, h, valid);
+#endif
+    (void)w;
+    (void)h;
+    (void)valid;
+    return NULL;
 }
 
 /* The back slot's blit is committed: publish it. */
@@ -1656,6 +1672,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                             fl & SDL_WINDOW_INPUT_FOCUS ? ", has the keyboard"
                                                         : ", without the keyboard");
                 last = fl;
+                /* The pacing watchdog decides nothing while it is not seen
+                 * (BO-211). */
+                xbox_PacingSetVisible(!(fl & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN
+                                              | 0x80000000u)));
             }
         }
 #if defined(__APPLE__)

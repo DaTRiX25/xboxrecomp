@@ -530,7 +530,9 @@ manager has one for its blur, on since the constructor and with no menu
 entry: `graphics.motion_blur`, `RECOMP_GFX_MOTION_BLUR=0`; `graphics.bloom`
 is a `load_u32` of the value its bloom call is gated by). These two settings
 default to on, so the patch is their `"when": "0"`; their rows are on the
-overlay's Graphics page.
+overlay's Graphics page. They are strengths from 0 to 1 (BO-212): the sites
+that read a weight or an opacity (`load_f32`, also on an x87 `fld dword ptr
+[mem]`) are scaled by it while the setting is anything but `1`.
 
 `"kind": "cmp_u8"` is for a byte flag the title does not load but compares
 where it lies, `cmp byte ptr [mem], r8|imm8`. The lifter snapshots a
@@ -558,6 +560,12 @@ load and compare kinds it writes the guest's memory, as `store_f32` does
 (Burnout 3's two-player stage asks for its half frame rate with one store at
 set-up: `graphics.split_60fps`; the game repository's
 `docs/split-screen.md`).
+`"kind": "store_u32"` is the same for a 32-bit value, `mov dword ptr
+[mem], imm32|r32`, followed by
+`MEM32(addr) = RECOMP_PATCH_U32(key, when, value, MEM32(addr));` (Burnout
+3's one-player stage start stores its simulation stepper's mode, 0, one step
+a frame whatever the time; stored again as 1, the mode the title itself
+switches to after the first crash camera: `game.race_clock`; the game repository's `docs/race-clock.md`).
 
 A float goes by `"kind": "load_f32"` (after `movss xmm, [mem]`, or a 32-bit
 `mov reg, [mem]` that carries a float as bits) or `"store_f32"` (after

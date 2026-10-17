@@ -80,7 +80,9 @@ void xbox_HostPause(int on)
 
 #define FLIP_RING 512
 static volatile uint64_t s_flip_ns[FLIP_RING];
+static volatile uint8_t s_flip_iv[FLIP_RING];  /* the swap interval each flip asked for */
 static volatile uint32_t s_flip_n;       /* written by the executor only */
+static volatile uint32_t s_next_iv = 1;  /* xbox_HostFlipInterval, for the next note */
 
 /* The session's histogram: quarter-millisecond slots up to 200 ms, the last
  * slot everything longer. Written by the executor only; a reader may be one
@@ -97,6 +99,7 @@ static void flip_note(uint64_t ns)
 {
     uint32_t n = s_flip_n;
     s_flip_ns[n % FLIP_RING] = ns;
+    s_flip_iv[n % FLIP_RING] = (uint8_t)(ns ? s_next_iv : 0);
     s_flip_n = n + 1;
     if (!ns) {
         s_prev_ns = 0;          /* a pause: the next flip starts a new run */
@@ -189,6 +192,31 @@ static void (*volatile s_hold_fn)(void);
 void xbox_HostPauseHoldFn(void (*fn)(void)) { s_hold_fn = fn; }
 static void (*volatile s_idle_fn)(void);
 void xbox_HostPauseIdleFn(void (*fn)(void)) { s_idle_fn = fn; }
+
+void xbox_HostFlipInterval(uint32_t iv)
+{
+    s_next_iv = iv ? (iv > 255u ? 255u : iv) : 1u;
+}
+
+uint32_t xbox_HostFlipIntervalAsked(void)
+{
+    return s_next_iv;
+}
+
+int xbox_HostFlipTimesIv(uint64_t *ns, uint8_t *iv, int max)
+{
+    uint32_t n = s_flip_n, have = n < FLIP_RING ? n : FLIP_RING, i, from;
+    if (max <= 0)
+        return 0;
+    if (have > (uint32_t)max)
+        have = (uint32_t)max;
+    from = n - have;
+    for (i = 0; i < have; i++) {
+        ns[i] = s_flip_ns[(from + i) % FLIP_RING];
+        iv[i] = s_flip_iv[(from + i) % FLIP_RING];
+    }
+    return (int)have;
+}
 
 int xbox_HostFlipTimes(uint64_t *ns, int max)
 {

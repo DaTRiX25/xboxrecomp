@@ -25,6 +25,9 @@ int   fbm_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pit
  * 1 presented, 0 no drawable (try again), 2 the frame was skipped: two
  * earlier presents had not reached the glass yet (display.present_timing =
  * auto never waits for a drawable). */
+/* BO-110: slot k's scene snapshot texture (half float) at w x h, and
+ * whether the frame in slot k has one (valid 0: no texture, all UI). */
+void *fbm_scene_slot(int k, uint32_t w, uint32_t h, int valid);
 int   fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                   const char *shot_path, uint32_t flip, uint64_t vblank_ns);
 

@@ -84,6 +84,11 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
  */
 int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                                 char *buf, int bufsize);
+/** BO-110: the same with the HDR bound (PsConsts gains float4 hdr after
+ * bump_lum; pc.hdr.x is the upper bound of a colour value, 1.0 as the
+ * hardware, larger to keep light past 1.0 in a half-float target). */
+int d3d8_combiners_generate_msl_hdr(const NV2ACombinerState *state,
+                                    char *buf, int bufsize);
 
 #ifdef __cplusplus
 }

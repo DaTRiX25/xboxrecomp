@@ -32,6 +32,12 @@ enum {
     AS_EDGE32,
     AS_GRID,            /* a line along the top and the left, white; tiles */
     AS_BIGCURVE,        /* the arc, in its own colours */
+    /* From xbox_OverlaySetGameArtMore; each may be missing on its own. */
+    AS_VOL_FULL,        /* a full cell of the volume bar (5 x 15 and its shadow, 6 x 16), white */
+    AS_VOL_EMPTY,       /* an empty one: a blue outline, the same box */
+    AS_CHECK,           /* the tick in its blue disc, in its own colours */
+    AS_RING,            /* a white ring */
+    AS_PADLOCK,         /* the padlock, in its own colours */
     AS_COUNT
 };
 
@@ -56,7 +62,7 @@ int gameart_state();
  * once. True when the pictures can be drawn. */
 bool gameart_attach();
 
-const ArtRect *gameart_sprite(int sprite);                    /* NULL until attached */
+const ArtRect *gameart_sprite(int sprite);                    /* NULL until attached, or when missing */
 ImTextureRef gameart_tex();
 /* The cell of `set` (xbox_glyph_set), false when there is no such picture. */
 bool gameart_pad_cell(int set, int cell, ArtRect *out);

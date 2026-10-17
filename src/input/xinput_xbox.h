@@ -136,10 +136,13 @@ unsigned xbox_InputScriptedPads(void);
 
 /* What the last xbox_InputGetState of a port was made of: a host controller
  * that answered, and keyboard keys held at that read (port 0, when the
- * keyboard is on). For a title's host code that treats a controller's state
+ * keyboard is on), on-screen controls held (port 0, touch on). For a title's host code that treats a controller's state
  * differently from the keys' (a control scheme for the pad, BO-106). */
 #define XBOX_INPUT_SRC_PAD  1u
 #define XBOX_INPUT_SRC_KEYS 2u
+/* The on-screen controls (touch_pad.h), port 0: held, or the device in use
+ * (a finger since the last controller input). Xbox layout like the keys. */
+#define XBOX_INPUT_SRC_TOUCH 4u
 unsigned xbox_InputSources(DWORD dwPort);
 
 #ifdef __cplusplus

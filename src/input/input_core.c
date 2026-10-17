@@ -22,6 +22,7 @@
 #include "keyboard.h"
 #include "pad_glyphs.h"
 #include "rumble_curve.h"
+#include "touch_pad.h"
 #include "recomp_env.h"
 
 #include <errno.h>
@@ -338,6 +339,9 @@ static void rumble_silence(void)
 void xbox_InputSetBlocked(int on)
 {
     on = on != 0;
+    /* The fingers are the overlay's while it is open. */
+    if (on != g_blocked)
+        xbox_InputTouchSetBlocked(on);
     RUMBLE_LOCK();
     if (g_blocked != on) {
         if (!on)
@@ -505,6 +509,13 @@ static void keyboard_active(void)
     xbox_InputSetActivePad(XBOX_PAD_FAMILY_KEYBOARD, 0);
 }
 
+/* A finger went down on an on-screen control: the prompts are the title's
+ * own, which the controls' A B X Y match. */
+static void touch_active(void)
+{
+    xbox_InputSetActivePad(XBOX_PAD_FAMILY_NONE, 0);
+}
+
 void xbox_InputInit(void)
 {
     static int atexit_done;
@@ -514,6 +525,7 @@ void xbox_InputInit(void)
         return;
     g_inited = 1;
     xbox_InputKeyboardSetActivityHook(keyboard_active);
+    xbox_InputTouchSetActivityHook(touch_active);
     if (g_be->init)
         g_be->init();
     for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++)
@@ -549,7 +561,7 @@ void xbox_InputSetBackend(const xbox_input_backend *b)
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
-    XBOX_INPUT_STATE kb;
+    XBOX_INPUT_STATE kb, tp;
     DWORD rc;
     unsigned src;
 
@@ -594,6 +606,30 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         /* The title's input layer records edges, so an unchanged packet
          * number reads as the same state and a key press never happens. */
         pState->dwPacketNumber = kb.dwPacketNumber;
+    }
+    /* The on-screen controls answer for port 0 while touch is on, merged
+     * like the keys; a phone with no pad has a player 1 in them. */
+    if (dwPort == 0 && xbox_InputTouchState(&tp)) {
+        /* While the touch is the device in use, not only while a finger is
+         * down: a title's layout choice must not flip at every press. */
+        if (any_held(&tp.Gamepad) || tp.Gamepad.sThumbLX || tp.Gamepad.sThumbLY
+                || xbox_InputTouchInUse())
+            src |= XBOX_INPUT_SRC_TOUCH;
+        if (rc != ERROR_SUCCESS) {
+            *pState = tp;
+            rc = ERROR_SUCCESS;
+        } else {
+            XBOX_GAMEPAD *g = &pState->Gamepad;
+            g->wButtons |= tp.Gamepad.wButtons;
+            for (int i = 0; i < 8; i++)
+                if (tp.Gamepad.bAnalogButtons[i] > g->bAnalogButtons[i])
+                    g->bAnalogButtons[i] = tp.Gamepad.bAnalogButtons[i];
+            if (tp.Gamepad.sThumbLX) g->sThumbLX = tp.Gamepad.sThumbLX;
+            if (tp.Gamepad.sThumbLY) g->sThumbLY = tp.Gamepad.sThumbLY;
+            /* Either one moving moves the number: the sum of the two
+             * counters, both of which only go up. */
+            pState->dwPacketNumber += tp.dwPacketNumber;
+        }
     }
     g_sources[dwPort] = src;
     if (rc == ERROR_SUCCESS && (g_blocked || (g_latched & (1u << dwPort)))) {

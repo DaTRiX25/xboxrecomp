@@ -14,12 +14,14 @@ set(XR_SRC ${CMAKE_CURRENT_LIST_DIR}/../../src)
 add_executable(bug_report_test EXCLUDE_FROM_ALL
     test_main.c
     ${XR_SRC}/kernel/xbox_report.c
-    ${XR_SRC}/platform/recomp_env.c)
+    ${XR_SRC}/platform/recomp_env.c
+    ${XR_SRC}/platform/xr_log.c)
 target_include_directories(bug_report_test PRIVATE ${XR_SRC}/kernel ${XR_SRC}/platform ${XR_SRC})
 # The archive code alone: no flip statistics, no frame capture of a runtime.
 target_compile_definitions(bug_report_test PRIVATE XBOX_REPORT_STANDALONE)
 if(NOT MSVC)
-    target_compile_options(bug_report_test PRIVATE -Wall -Wextra)
+    # The print gate is force-included as in the toolkit's own build (BO-125).
+    target_compile_options(bug_report_test PRIVATE -Wall -Wextra "SHELL:-include ${XR_SRC}/platform/xr_log.h")
 endif()
 if(WIN32)
     target_link_libraries(bug_report_test PRIVATE advapi32)

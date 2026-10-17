@@ -2816,7 +2816,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     ID3D11RasterizerState *rs;
     int cull_all;
     uint8_t fmts[16];
-    uint32_t lo = 0xFFFF, hi = 0, count, nidx, i, k;
+    uint32_t lo = 0xFFFF, hi = 0, count, nidx, i;
     void *p;
 
     if (!init())
@@ -2827,10 +2827,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         s_draws_skipped++;
         return;
     }
-    for (i = 0; i < d->idx_count; i++) {
-        if (d->idx[i] < lo) lo = d->idx[i];
-        if (d->idx[i] > hi) hi = d->idx[i];
-    }
+    nv2a_idx_range(d->idx, d->idx_count, &lo, &hi);
     count = hi - lo + 1;
     if (d->idx_count * 3u > idx_cap) {
         uint32_t *grown = (uint32_t *)realloc(idx, (size_t)d->idx_count * 12u);
@@ -2934,10 +2931,9 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         }
         offs[i] = at;
         if (on) {
-            for (k = 0; k < count; k++) {
-                if (!fetch(d, a, lo + k, f + 4 * k))
-                    memcpy(f + 4 * k, v->inl[i], 16);
-            }
+            int one = i;
+            nv2a_vtx_gather(d, &one, 1, lo, count, v->inl,
+                            (const uint8_t *)xbox_GetMemoryOffset(), f);
             strides[i] = 16;
         } else {
             memcpy(f, v->inl[i], 16);

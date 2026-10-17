@@ -634,6 +634,59 @@ void mcpx_apu_speaker_test(int speaker, int via_map)
     qemu_mutex_unlock(&d->lock);
 }
 
+/* The overlay's menu sounds (mcpx_apu_ui_cue): one at a time, mixed after
+ * the DSP stage like the test tone. While the title is paused (host_paused)
+ * a cue keeps the frame thread going on the lightweight branch, which hands
+ * the device the cue alone: no VP or GP frame runs, so the title's voices
+ * stay where the pause left them. Fields under d->lock. */
+static struct {
+    volatile int active;
+    const int16_t *pcm;
+    uint32_t n, pos;
+    float gain;
+} g_cue;
+#define CUE_PAUSED(d) (g_cue.active && (d)->host_paused)
+
+void mcpx_apu_ui_cue(const int16_t *pcm, uint32_t n, float gain)
+{
+    MCPXAPUState *d = g_state;
+
+    if (!d)
+        return;
+    qemu_mutex_lock(&d->lock);
+    g_cue.pcm = pcm;
+    g_cue.n = pcm ? n : 0;
+    g_cue.pos = 0;
+    g_cue.gain = gain;
+    g_cue.active = pcm && n && gain > 0.0f;
+    qemu_cond_broadcast(&d->cond);
+    qemu_mutex_unlock(&d->lock);
+}
+
+/* The cue into one period of the stereo scratch (clamped). */
+static void cue_render(int16_t frame_buf[][2], int num_samples)
+{
+    if (!g_cue.active)
+        return;
+    for (int i = 0; i < num_samples && g_cue.pos < g_cue.n; i++, g_cue.pos++) {
+        const int32_t x = (int32_t)((float)g_cue.pcm[g_cue.pos] * g_cue.gain);
+        for (int c = 0; c < 2; c++) {
+            const int32_t v = frame_buf[i][c] + x;
+            frame_buf[i][c] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+        }
+    }
+    if (g_cue.pos >= g_cue.n)
+        g_cue.active = 0;
+}
+
+/* Muted: the cue runs out all the same (a paused title's frame thread
+ * idles again when it has). */
+static void cue_skip(int num_samples)
+{
+    if (g_cue.active && (g_cue.pos += (uint32_t)num_samples) >= g_cue.n)
+        g_cue.active = 0;
+}
+
 int mcpx_apu_speaker_test_playing(int *via_map)
 {
     int sp = g_spk.active ? g_spk.speaker : -1;
@@ -1036,6 +1089,7 @@ static void monitor_frame_51(MCPXAPUState *d)
     memset(d->monitor.frame_buf6, 0, sizeof(d->monitor.frame_buf6));
     if (g_audio_muted) {
         memset(period, 0, sizeof(period));
+        cue_skip(MIXER_FRAME_SAMPLES);
     } else {
         memset(extra, 0, sizeof(extra));
         if (g_test_tone.active) {
@@ -1049,6 +1103,7 @@ static void monitor_frame_51(MCPXAPUState *d)
             }
         }
         mixer_render(extra, MIXER_FRAME_SAMPLES);
+        cue_render(extra, MIXER_FRAME_SAMPLES);
         for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
             for (int c = 0; c < 2; c++) {
                 int32_t v = (int32_t)period[i][c] + extra[i][c];
@@ -1094,6 +1149,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
     if (g_audio_muted) {
         memset(period, 0, sizeof(period));
+        cue_skip(MIXER_FRAME_SAMPLES);
     } else {
         memset(extra, 0, sizeof(extra));
         if (g_test_tone.active) {
@@ -1107,6 +1163,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             }
         }
         mixer_render(extra, MIXER_FRAME_SAMPLES);
+        cue_render(extra, MIXER_FRAME_SAMPLES);
         mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
     }
 
@@ -1192,7 +1249,7 @@ static void throttle(MCPXAPUState *d)
 {
     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
-    while ((!d->pause_requested && !d->host_paused) || g_spk.active) {
+    while ((!d->pause_requested && !d->host_paused) || g_spk.active || g_cue.active) {
         int64_t wait_us = mcpx_apu_pace_step(d, guest_clock_us());
         if (wait_us <= 0)
             break;
@@ -1213,7 +1270,7 @@ static void throttle(MCPXAPUState *d)
             if (GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                          NV_PAPU_SECTL_XCNTMODE) != NV_PAPU_SECTL_XCNTMODE_OFF
                 && !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED)
-                && !g_test_tone.active && !g_spk.active)
+                && !g_test_tone.active && !g_spk.active && !CUE_PAUSED(d))
                 mcpx_apu_vp_idle_scan(d);
         }
         if (d->set_irq) {
@@ -1285,7 +1342,7 @@ static void *mcpx_apu_frame_thread(void *arg)
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
-        if (!g_spk.active && (d->host_paused
+        if (!g_spk.active && !g_cue.active && (d->host_paused
             || (d->pause_requested && !g_test_tone.active && !g_mixer_active_count))) {
             d->is_idle = true;
             if (dev_paces())
@@ -1318,12 +1375,16 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         bool fe_trapped = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                           (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !g_test_tone.active && !g_spk.active;
+                          !g_test_tone.active && !g_spk.active && !CUE_PAUSED(d);
 
         hs_trap(fe_trapped);
 
         if (g_spk.active) {
             spk_test_frame(d);
+        } else if (CUE_PAUSED(d)) {
+            /* A menu sound while the title is paused: the cue alone. */
+            mcpx_apu_monitor_frame(d);
+            d->ep_frame_div++;
         } else if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             if (xbox_ProfOn()) {

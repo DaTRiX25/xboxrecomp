@@ -8,6 +8,7 @@
 #include "input_backend.h"
 #include "input_map.h"
 #include "pad_glyphs.h"
+#include "touch_pad.h"
 #include "kernel_pacing.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_texscale.h"
@@ -61,6 +62,7 @@ static const char *const k_glyphs[]   = { "auto", "xbox", "xbox_modern", "playst
 _Static_assert(sizeof k_glyphs / sizeof k_glyphs[0] == XBOX_GLYPHS_MODE_COUNT + 1, "one choice per glyph mode, in pad_glyphs.h order");
 #if defined(__ANDROID__)
 static const char *const k_vibration[] = { "auto", "controller", "device", "off", NULL };
+static const char *const k_touch[]     = { "auto", "always", "off", NULL };
 #endif
 static const char *const k_ultrawide[] = { "off", "21:9", "32:9", "window", NULL };
 static const char *const k_vehicle_detail[] = { "original", "far", "farthest", NULL };
@@ -69,7 +71,9 @@ static const char *const k_score_board[] = { "original", "smooth", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", "auto", NULL };
 static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
 static const char *const k_timing[]   = { "legacy", "auto", NULL };
+static const char *const k_frame_pacing[] = { "auto", "low_latency", "smooth", NULL };
 static const char *const k_custom_level[] = { "off", "quieter", "match", "louder", NULL };
+static const char *const k_hdr_decode[] = { "2.2", "srgb", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
 #define SETTING(k, t, f, e, c, ev, mn, mx, b) \
@@ -112,9 +116,11 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_GAME_SPEED_UNITS]   = SETTING("game.speed_units", XS_CHOICE, 0, RENV_SPEED_UNITS, k_units, NULL, 0, 0, 0),
     [XS_DISPLAY_HUD_FIX]    = SETTING("display.hud_fix", XS_BOOL, 0, RENV_GFX_HUD_FIX, NULL, NULL, 0, 0, 0),
     [XS_DISPLAY_ULTRAWIDE]  = SETTING("display.ultrawide", XS_CHOICE, 0, RENV_DISPLAY_ULTRAWIDE, k_ultrawide, NULL, 0, 0, 0),
-    /* The title's own effects, on as shipped: the patch is the "0". */
-    [XS_GRAPHICS_BLOOM]     = SETTING("graphics.bloom", XS_BOOL, 0, RENV_GFX_BLOOM, NULL, NULL, 0, 0, 1),
-    [XS_GRAPHICS_MOTION_BLUR] = SETTING("graphics.motion_blur", XS_BOOL, 0, RENV_GFX_MOTION_BLUR, NULL, NULL, 0, 0, 1),
+    /* The title's own effects, full strength as shipped (BO-101, BO-212):
+     * 0..1 in tenths, 1 the original, 0 not drawn. They were switches: a
+     * file's or variable's true / false still reads as 1 / 0. */
+    [XS_GRAPHICS_BLOOM]     = SETTING_STEP("graphics.bloom", XS_FLOAT, XS_FROM_BOOL, RENV_GFX_BLOOM, 0, 1, 1, 0.1),
+    [XS_GRAPHICS_MOTION_BLUR] = SETTING_STEP("graphics.motion_blur", XS_FLOAT, XS_FROM_BOOL, RENV_GFX_MOTION_BLUR, 0, 1, 1, 0.1),
     /* The title's crash and takedown cameras at 60 instead of its own 30: the
      * patch is the "1". */
     [XS_GRAPHICS_CRASH_60FPS] = SETTING("graphics.crash_60fps", XS_BOOL, 0, RENV_GFX_CRASH_60FPS, NULL, NULL, 0, 0, 0),
@@ -157,13 +163,35 @@ static xs_setting s_set[XS_COUNT] = {
     /* The title's score board (a host hook, BO-165):
      * original as shipped, nothing touched. Live. */
     [XS_DISPLAY_SCORE_BOARD] = SETTING("display.score_board", XS_CHOICE, 0, RENV_GFX_SCORE_BOARD, k_score_board, NULL, 0, 0, 0),
+    /* The title's own menu sounds in the overlay (BO-190): on as shipped
+     * when the port names them. Live. */
+    [XS_AUDIO_MENU_SOUNDS]  = SETTING("audio.menu_sounds", XS_BOOL, 0, RENV_AUDIO_MENU_SOUNDS, NULL, NULL, 0, 0, 1),
+    [XS_GRAPHICS_HDR]       = SETTING("graphics.hdr", XS_BOOL, 0, RENV_GFX_HDR, NULL, NULL, 0, 0, 0),
+    [XS_GRAPHICS_HDR_PEAK]  = SETTING_STEP("graphics.hdr_peak", XS_FLOAT, 0, RENV_GFX_HDR_PEAK, 0, 10000, 0, 1),
+    [XS_GRAPHICS_HDR_PAPER] = SETTING_STEP("graphics.hdr_paper_white", XS_FLOAT, 0, RENV_GFX_HDR_PAPER, 80, 500, NV2A_HDR_PAPER_DEFAULT, 1),
+    [XS_GRAPHICS_HDR_HUD]   = SETTING_STEP("graphics.hdr_hud", XS_FLOAT, 0, RENV_GFX_HDR_HUD, 0, 500, 0, 1),
+    [XS_GRAPHICS_HDR_SHADOWS] = SETTING_STEP("graphics.hdr_shadows", XS_FLOAT, 0, RENV_GFX_HDR_SHADOWS, 1, 1.5, 1, 0.05),
+    [XS_GRAPHICS_HDR_HIGHLIGHTS] = SETTING_STEP("graphics.hdr_highlights", XS_FLOAT, 0, RENV_GFX_HDR_HIGHLIGHTS, 0.5, 3, 1, 0.1),
+    [XS_GRAPHICS_HDR_DECODE] = SETTING("graphics.hdr_decode", XS_CHOICE, 0, RENV_GFX_HDR_DECODE, k_hdr_decode, NULL, 0, 0, 0),
+    [XS_DISPLAY_FRAME_PACING] = SETTING("display.frame_pacing", XS_CHOICE, 0, RENV_FRAME_PACING, k_frame_pacing, NULL, 0, 0, 0),
+    /* The title's wall-clock stepping from a race's start instead of from
+     * its first crash camera: the patch is the "1". Off as shipped. */
+    [XS_GAME_RACE_CLOCK]    = SETTING("game.race_clock", XS_BOOL, 0, RENV_GAME_RACE_CLOCK, NULL, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
+    /* The on-screen controls (touch_pad.h, BO-189). Live. */
+    [XS_INPUT_TOUCH]        = SETTING("input.touch_controls", XS_CHOICE, 0, RENV_TOUCH_CONTROLS, k_touch, NULL, 0, 0, 0),
+    [XS_INPUT_TOUCH_OPACITY] = SETTING_STEP("input.touch_opacity", XS_FLOAT, 0, RENV_TOUCH_OPACITY, 0.1, 1.0, 0.5, 0.1),
+    [XS_INPUT_TOUCH_SCALE]  = SETTING_STEP("input.touch_scale", XS_FLOAT, 0, RENV_TOUCH_SCALE, 0.6, 1.6, 1.0, 0.1),
+    [XS_INPUT_TOUCH_AUTO_GAS] = SETTING("input.touch_auto_gas", XS_BOOL, 0, RENV_TOUCH_AUTO_GAS, NULL, NULL, 0, 0, 0),
 #endif
 };
 
-/* The power mode is two knobs. */
+/* The power mode is two knobs. Balanced's spin lead is 8 ms on every host.
+ * 2 ms on Linux saved ~2 W on the Steam Deck but ran the executor at
+ * 2.4 GHz instead of 3.5 and doubled its late flips (BO-110 A/B, arm C). */
 #define POWER_LEAD_MS 8.0
+#define POWER_LEAD_STR "8"
 static int s_power_locked_pacing, s_power_locked_lead;
 static char s_game_pacing[16], s_game_lead[16];
 
@@ -186,6 +214,9 @@ static struct {
     int user, locked;
 } s_text[] = {
     { "audio.custom_music_dir", RENV_AUDIO_MUSIC_DIR, "", 0, 0 },
+    { "display.present_mode", RENV_PRESENT_MODE, "", 0, 0 },
+    { "console.hdd_key", RENV_CONSOLE_HDKEY, "", 0, 0 },
+    { "console.eeprom", RENV_CONSOLE_EEPROM, "", 0, 0 },
 };
 #define TEXT_COUNT ((int)(sizeof s_text / sizeof s_text[0]))
 
@@ -260,8 +291,13 @@ static int parse_env(const xs_setting *s, const char *v, double *out)
     case XS_INT:
     case XS_FLOAT:
         d = strtod(v, &end);
-        if (end == v || *end)
+        if (end == v || *end) {
+            if ((s->flags & XS_FROM_BOOL) && parse_bool(v, &b)) {
+                *out = b;
+                return 1;
+            }
             return 0;
+        }
         *out = clampd(s, d);
         return 1;
     default:
@@ -281,7 +317,7 @@ static void power_env(double mode, const char **pacing, const char **lead)
 {
     int m = (int)mode;
     *pacing = m == 0 ? "spin" : "sleep";
-    *lead = m == 1 ? "8" : m == 3 ? "auto" : "0";
+    *lead = m == 1 ? POWER_LEAD_STR : m == 3 ? "auto" : "0";
 }
 
 /* Where Maximum ("stock") is not offered (BO-75, a stand-in decision to be
@@ -340,6 +376,16 @@ static void apply_audio(void)
     xa2_set_gain(g);
 }
 
+#if defined(__ANDROID__)
+static void apply_touch(void)
+{
+    xbox_InputTouchSetMode((int)s_set[XS_INPUT_TOUCH].value);
+    xbox_InputTouchSetOpacity((float)s_set[XS_INPUT_TOUCH_OPACITY].value);
+    xbox_InputTouchSetScale((float)s_set[XS_INPUT_TOUCH_SCALE].value);
+    xbox_InputTouchSetAutoGas(s_set[XS_INPUT_TOUCH_AUTO_GAS].value != 0.0);
+}
+#endif
+
 /* Into the runtime, where it can take the value while running. */
 static void apply(xs_id id)
 {
@@ -385,6 +431,27 @@ static void apply(xs_id id)
     }
     case XS_GRAPHICS_DITHER:
         nv2a_host_set_dither(v != 0.0);
+        break;
+    case XS_GRAPHICS_HDR:
+        nv2a_host_set_hdr(v != 0.0);
+        break;
+    case XS_GRAPHICS_HDR_PEAK:
+        nv2a_host_set_hdr_levels(0, (float)v, -1.0f, -1.0f);
+        break;
+    case XS_GRAPHICS_HDR_PAPER:
+        nv2a_host_set_hdr_levels(1, -1.0f, (float)v, -1.0f);
+        break;
+    case XS_GRAPHICS_HDR_HUD:
+        nv2a_host_set_hdr_levels(2, -1.0f, -1.0f, (float)v);
+        break;
+    case XS_GRAPHICS_HDR_SHADOWS:
+        nv2a_host_set_hdr_tone(0, (float)v);
+        break;
+    case XS_GRAPHICS_HDR_HIGHLIGHTS:
+        nv2a_host_set_hdr_tone(1, (float)v);
+        break;
+    case XS_GRAPHICS_HDR_DECODE:
+        nv2a_host_set_hdr_tone(2, (float)v);
         break;
     case XS_GRAPHICS_UI_SCALE:
         /* Held off (Android for now): a value stored in the file stays in
@@ -439,6 +506,14 @@ static void apply(xs_id id)
     case XS_INPUT_CONTROL_SCHEME:
         xbox_InputSetControlScheme((int)v);
         break;
+#if defined(__ANDROID__)
+    case XS_INPUT_TOUCH:
+    case XS_INPUT_TOUCH_OPACITY:
+    case XS_INPUT_TOUCH_SCALE:
+    case XS_INPUT_TOUCH_AUTO_GAS:
+        apply_touch();
+        break;
+#endif
     case XS_POWER_MODE: {
         const char *p, *l;
         power_env(v, &p, &l);
@@ -449,8 +524,14 @@ static void apply(xs_id id)
             xbox_PacingSetSpinLeadAuto();   /* BO-175: picked at run time */
         else
             xbox_PacingSetSpinLead(v == 1 ? (uint64_t)(POWER_LEAD_MS * 1e6) : 0);
+        xbox_PacingWatchReset("power mode changed");   /* BO-211 */
         break;
     }
+    case XS_DISPLAY_FRAME_PACING:
+        /* The presenter reads the setting itself (keep_poll); the state its
+         * keeper and the display lock learned starts over (BO-211). */
+        xbox_PacingWatchReset("frame pacing changed");
+        break;
     default:
         break;
     }
@@ -656,6 +737,17 @@ static void load_file(void)
         XR_ERROR( LOGP "%s (file ignored, the next change replaces it)\n", err);
         return;
     }
+    /* The print gate first (BO-193): the file's value is applied to it before
+     * anything below prints, so the lines of this very load (a key it could
+     * not read, an unknown key) follow the saved choice, and the host's
+     * start-up line and the kernel log (opened at its init) see the real
+     * state. xr_log_set_diag leaves it alone while the environment decides
+     * (RECOMP_LOG_DIAG, a developer switch); a variable of a spelling the
+     * overlay cannot show locks the row, and the file does not touch it
+     * either. Live changes go through apply() as before. */
+    if (!s_set[XS_ADVANCED_DIAG_LOG].locked
+            && recomp_cfg_type_of(c, s_set[XS_ADVANCED_DIAG_LOG].key) == RCFG_BOOL)
+        xr_log_set_diag(recomp_cfg_bool(c, s_set[XS_ADVANCED_DIAG_LOG].key, 0));
     for (i = 0; i < XS_COUNT; i++) {
         xs_setting *s = &s_set[i];
         recomp_cfg_type t = recomp_cfg_type_of(c, s->key);
@@ -671,7 +763,9 @@ static void load_file(void)
             if (t == RCFG_INT) v = (double)recomp_cfg_int(c, s->key, 0); else want = "an integer";
             break;
         case XS_FLOAT:
-            if (t == RCFG_FLOAT || t == RCFG_INT) v = recomp_cfg_float(c, s->key, 0); else want = "a number";
+            if (t == RCFG_FLOAT || t == RCFG_INT) v = recomp_cfg_float(c, s->key, 0);
+            else if (t == RCFG_BOOL && (s->flags & XS_FROM_BOOL)) v = recomp_cfg_bool(c, s->key, 0);
+            else want = "a number";
             break;
         default: {
             int ch = t == RCFG_STRING ? recomp_cfg_choice(c, s->key, s->choices, -1) : -1;
@@ -843,6 +937,9 @@ void xbox_SettingsFinish(void)
     xbox_InputSetFaceLayoutNintendo(s_set[XS_INPUT_FACE_LAYOUT].value != 0.0);
     xbox_InputSetControlScheme((int)s_set[XS_INPUT_CONTROL_SCHEME].value);
     xbox_InputSetGlyphMode((int)s_set[XS_INPUT_GLYPHS].value);
+#if defined(__ANDROID__)
+    apply_touch();
+#endif
 }
 
 /* ── access ────────────────────────────────────────────────────────── */

@@ -277,7 +277,8 @@ int nvk_glsl_spirv(enum nvk_stage stage, const char *src, const uint32_t **words
      * per call), so one thread's compile does not hold up another's lookup:
      * the ack thread's draw against the pre-warm thread's key list. */
     pthread_mutex_unlock(&s_lock);
-    w = compile(stage == NVK_STAGE_VERTEX ? GLSLANG_STAGE_VERTEX : GLSLANG_STAGE_FRAGMENT,
+    w = compile(stage == NVK_STAGE_VERTEX ? GLSLANG_STAGE_VERTEX
+                : stage == NVK_STAGE_COMPUTE ? GLSLANG_STAGE_COMPUTE : GLSLANG_STAGE_FRAGMENT,
                 src, &nw, err, errn);
     if (!w)
         return 0;

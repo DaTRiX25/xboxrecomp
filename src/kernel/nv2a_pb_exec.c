@@ -6013,8 +6013,32 @@ static uint32_t s_swap_target;        /* vblank the pending flip waits for */
 static uint32_t s_swap_asked, s_swap_asked_iv;
 static uint32_t s_swap_last;          /* the handler's last target */
 
+/* Flip pacing turned itself off (three 100 ms waits with no vblank): the
+ * vblank count then, and its time. When vblanks come again it is turned
+ * back on (BO-210): a stalled timer thread or a debugger stop no longer
+ * leaves the rest of the session unpaced. */
+static int      s_flip_pacing_gaveup;
+static uint32_t s_flip_pacing_gaveup_count;
+
+static void flip_pacing_give_up(void)
+{
+    s_flip_pacing = 0;
+    s_flip_pacing_gaveup = 1;
+    s_flip_pacing_gaveup_count = xbox_VblankCount();
+    XR_NOTICE("  [GPU] flip pacing off: no vblank arrived in 100 ms three times"
+              " (is RECOMP_VBLANK set?); back on when vblanks come again\n");
+}
+
 static int flip_pacing_on(void)
 {
+    if (s_flip_pacing_gaveup && !s_flip_pacing
+            && xbox_VblankCount() - s_flip_pacing_gaveup_count >= 6) {
+        /* Six vblanks since: 100 ms of them. */
+        s_flip_pacing = 1;
+        s_flip_pacing_gaveup = 0;
+        s_swap_last = xbox_VblankCount();
+        XR_NOTICE("  [GPU] flip pacing back on: vblanks arrive again\n");
+    }
     if (s_flip_pacing < 0) {
         const char *e = recomp_env(RENV_FLIP_PACING);
         s_flip_pacing = e && !strcmp(e, "vblank");
@@ -6098,18 +6122,16 @@ static void flip_pacing_stall(void)
             timeouts = 0;
         xbox_PacingHoldSample(waited ? 0 : s_swap_asked_iv, t0, asked_edge);
         if (waited && ++timeouts >= 3) {
-            s_flip_pacing = 0;
-            fprintf(stderr, "  [GPU] flip pacing off: no vblank arrived"
-                    " in 100 ms three times (is RECOMP_VBLANK set?)\n");
+            timeouts = 0;
+            flip_pacing_give_up();
         }
         goto done;
     }
     while ((int32_t)(xbox_VblankCount() - s_swap_target) < 0) {
         if (waited >= 100000000ull) {        /* 100 ms: six vblanks */
             if (++timeouts >= 3) {
-                s_flip_pacing = 0;
-                fprintf(stderr, "  [GPU] flip pacing off: no vblank arrived"
-                        " in 100 ms three times (is RECOMP_VBLANK set?)\n");
+                timeouts = 0;
+                flip_pacing_give_up();
             }
             break;
         }
@@ -6251,6 +6273,37 @@ static void pace_report(uint32_t flips)
     memset(&s_pace, 0, sizeof s_pace);
 }
 
+/* The two methods that make up most of a frame's words (ARRAY_ELEMENT16 was
+ * 53 % and INLINE_ARRAY 5 % of a Silver Lake race's method words): their
+ * handlers, called from the switch below and, for subchannel 0, straight
+ * from the top of nv2a_pb_exec_method, past the per-method checks (the
+ * surface traces, vsh_method's chain of ranges) that never match them. */
+static inline void array_element16(uint32_t param)
+{
+    /* Two 16-bit indices per parameter word. DRAW_ARRAYS and
+     * ARRAY_ELEMENT32 can leave the count odd, so with one slot left the
+     * first half still goes in. */
+    if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
+        s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
+        s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+    } else if (s_gpu.prim) {
+        if (s_gpu.idx_count < NV_MAX_INDICES)
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
+        note_idx_overflow();
+    }
+}
+
+static inline void inline_array(uint32_t param)
+{
+    /* Vertex data, not a pointer to it. Buffered rather than decoded here
+     * because the format is only fully known at END. */
+    if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
+        s_gpu.inline_buf[s_gpu.inline_count++] = param;
+    else if (s_gpu.prim && !s_inline_overflow++)
+        fprintf(stderr, "  [GPU] INLINE_ARRAY batch over %u dwords:"
+                        " the rest is dropped\n", (unsigned)NV_MAX_INLINE);
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -6326,6 +6379,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     nv2a_host_render_scale());
     }
     s_perf.methods++;
+    if (subch == 0) {
+        if (method == NV097_ARRAY_ELEMENT16) {
+            array_element16(param);
+            return;
+        }
+        if (method == NV097_INLINE_ARRAY) {
+            inline_array(param);
+            return;
+        }
+    }
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. Read once: this runs for every method. */
@@ -6467,13 +6530,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case NV097_INLINE_ARRAY:
-        /* Vertex data, not a pointer to it. Buffered rather than decoded here
-         * because the format is only fully known at END. */
-        if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
-            s_gpu.inline_buf[s_gpu.inline_count++] = param;
-        else if (s_gpu.prim && !s_inline_overflow++)
-            fprintf(stderr, "  [GPU] INLINE_ARRAY batch over %u dwords:"
-                            " the rest is dropped\n", (unsigned)NV_MAX_INLINE);
+        inline_array(param);
         break;
 
     case NV097_DRAW_ARRAYS: {
@@ -6503,17 +6560,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 
     case NV097_ARRAY_ELEMENT16:
-        /* Two 16-bit indices per parameter word. DRAW_ARRAYS and
-         * ARRAY_ELEMENT32 can leave the count odd, so with one slot left the
-         * first half still goes in. */
-        if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
-        } else if (s_gpu.prim) {
-            if (s_gpu.idx_count < NV_MAX_INDICES)
-                s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            note_idx_overflow();
-        }
+        array_element16(param);
         break;
     case NV097_ARRAY_ELEMENT32:
         /* One index per word: the XDK sends the last index of an odd-count
@@ -6659,6 +6706,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FrametimeFlip(s_gpu.flips, s_last_iv, s_last_late, s_hold_all,
                                s_perf.scan_all + (rt_now() - s_perf.scan_t0),
                                s_perf.draw_all, s_perf.flip_all);
+            if (flip_pacing_on())
+                xbox_PacingFlipCadence(s_last_iv, s_last_late, s_hold_all,
+                                       s_perf.scan_all + (rt_now() - s_perf.scan_t0));
             prev = b;
         }
         if (!early)
@@ -6792,7 +6842,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         nv2a_pb_slow_end("FLIP_STALL after the hold (counters, traces, the present)", slow_t0);
         /* The in-game overlay's pause (kernel_pause.h): the GPU stalls here,
          * after the frame is presented, and the title's fence and pushbuffer
-         * waits hold it a frame or two behind. */
+         * waits hold it a frame or two behind. The overlay's graph colours
+         * each interval against the one this flip asked for. */
+        xbox_HostFlipInterval(s_last_iv);
         xbox_HostPauseHold();
         return;
     }

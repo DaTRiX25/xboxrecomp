@@ -1524,6 +1524,8 @@ static const char k_readme[] =
     "  stats.txt               frame times of the session, shader compile counts\n"
     "  logs/                   this run's log and the runs before it\n"
     "  crash/                  the newest crash and hang reports\n"
+    "  gaps.bin                the pipeline keys the game had to build while drawing\n"
+    "                          (keys only, no compiled code), when there is one\n"
     "  frame.bmp               the last frame (only when asked for)\n"
     "\n"
     "Never in it: save files, disc data, shader or pipeline cache contents (sizes\n"

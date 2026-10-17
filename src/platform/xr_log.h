@@ -37,7 +37,9 @@
  * The stream argument is evaluated twice when the call goes through.
  *
  * The switch: xr_log_init() at the start of main, then xr_log_set_diag()
- * from the settings (advanced.diagnostic_log). Precedence, first that says
+ * from the settings (advanced.diagnostic_log), which xbox_SettingsInit does
+ * as soon as it has read the file, and again on every change in the overlay.
+ * xr_log_announce() says the result once, after that. Precedence, first that says
  * anything: RECOMP_LOG_DIAG=0|1; a developer switch that implies wanting the
  * log (RECOMP_TRACE, RECOMP_DEBUG, RECOMP_STDIO_LOG, RECOMP_FLIP_MARK,
  * RECOMP_HEADLESS or --headless); the setting; the build's default (quiet
@@ -84,6 +86,10 @@ int  xr_log_forced(void);
 /* What decided, in words, for the report: "RECOMP_LOG_DIAG", "RECOMP_TRACE",
  * "--headless", "setting", "build default". */
 const char *xr_log_source(void);
+/* The one start-up line (XR_NOTICE) with the state in force and what decided
+ * it. Call it after the settings are read (xbox_SettingsInit), not before:
+ * until then the setting has not been applied (BO-193). */
+void xr_log_announce(void);
 
 #ifdef __cplusplus
 }

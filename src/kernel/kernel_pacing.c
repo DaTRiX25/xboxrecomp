@@ -19,6 +19,8 @@
 #include "kernel.h"
 #include "kernel_pacing.h"
 #include "power_auto.h"
+#include "pacing_watch.h"
+#include "kernel_pause.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
 #include <stdio.h>
@@ -83,9 +85,27 @@ static int s_disp_lock = -1;               /* RECOMP_VBLANK_SYNC=display */
 static uint64_t s_disp_cand;               /* a shorter period the steps show */
 static int s_disp_cand_n;                  /* steps that showed it */
 static int s_disp_off;                     /* steps in a row on no period */
+/* Steps off the period's grid in a row, each one guest vblank long: three
+ * of them and the display now refreshes once per guest vblank, which is the
+ * new period. (Other steps off the grid -- a frame that missed a refresh now
+ * and then -- fold into a shorter period with the current one, below.) The
+ * Steam Deck starts the game at 90 Hz and switches to the player's 60 once
+ * it has a window: the steps went 11.1 then 16.7, folded into the one period
+ * that fits both, 5.55 ms, and that stayed: the vblank then snapped to any
+ * third of a refresh, a phase picked by chance, and a frame was shown 16 or
+ * 31 ms after its present depending on the run. */
+static int s_disp_offrun, s_disp_onrun;
+static uint64_t s_disp_offsum, s_disp_onsum;
 /* Steps off the period's grid: 240 each (two seconds of steps at 120 Hz),
  * less one per step on it, up to a minute's worth. */
 static int s_disp_jitter;
+/* Set by the cadence diagnosis on a pacing fault (BO-210): the reporting
+ * thread drops what the lock learned at its next report, and the vblank
+ * keeps its own grid until fresh reports lock it again. */
+static volatile int s_disp_relearn;
+/* The lock saw the display change its rate: the watchdog's window then
+ * decides nothing (pacing_watch.h). */
+static volatile int s_disp_rate_changed;
 
 static int display_lock_on(void)
 {
@@ -137,6 +157,17 @@ void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns)
 
     if (!display_lock_on() || !when_ns)
         return;
+    if (s_disp_relearn) {
+        s_disp_relearn = 0;
+        s_disp_ns = 0;
+        s_disp_period = 0;
+        s_disp_cand = 0;
+        s_disp_cand_n = s_disp_off = 0;
+        s_disp_offrun = s_disp_onrun = 0;
+        s_disp_offsum = s_disp_onsum = 0;
+        s_disp_jitter = 0;
+        prev = cur = 0;
+    }
     /* A report may be of a refresh still to come (CVDisplayLink's output
      * time): any point on the display's grid will do. */
     if (period_ns) {
@@ -146,6 +177,7 @@ void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns)
     } else if (prev && when_ns > prev && when_ns - prev <= 100000000u) {
         /* Measured: a step of one or more refreshes, jittered by the
          * reporting thread's wake-up. */
+        const uint64_t nominal = 1000000000ull / XBOX_VBLANK_HZ;
         uint64_t d = when_ns - prev, g;
         if (!cur) {
             if (d >= 2000000u && d <= 50000000u)
@@ -163,7 +195,51 @@ void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns)
                 /* On the period's grid: n periods, smoothed in. */
                 uint64_t n = (d + cur / 2) / cur;
                 s_disp_period = (LONGLONG)((cur * 15u + d / n) / 16u);
-            } else {
+                s_disp_offrun = 0;
+                /* Two seconds of steps of one guest vblank each, on a period
+                 * of a half or a third of it: the period was folded from two
+                 * rates (as above, when the fold came first); the display
+                 * refreshes once per guest vblank now. */
+                if (n >= 2 && d + nominal / 8 >= nominal && d <= nominal + nominal / 8) {
+                    s_disp_onsum += d;
+                    if (++s_disp_onrun >= 120) {
+                        uint64_t np = s_disp_onsum / (uint64_t)s_disp_onrun;
+                        fprintf(stderr, "[PACING] display refresh: steps of %.3f ms for two"
+                                " seconds on a %.3f ms period: the display changed its"
+                                " rate\n", np / 1e6, cur / 1e6);
+                        s_disp_rate_changed = 1;
+                        s_disp_period = (LONGLONG)np;
+                        s_disp_onrun = 0;
+                        s_disp_onsum = 0;
+                    }
+                } else if (n >= 2 && (d + nominal / 8) / nominal >= 2
+                           && (d + nominal / 8) / nominal <= 3
+                           && (d + nominal / 8) % nominal <= nominal / 4) {
+                    /* Two or three guest vblanks: a frame that missed its
+                     * refresh, or the title's 30 fps stretch. Neither for
+                     * nor against (BO-210: a session that missed now and
+                     * then never had two clean seconds, and the vblank
+                     * stayed on a third of a refresh). */
+                } else {
+                    s_disp_onrun = 0;
+                    s_disp_onsum = 0;
+                }
+            } else if (d + nominal / 8 >= nominal && d <= nominal + nominal / 8
+                       && (s_disp_offsum = (s_disp_offrun ? s_disp_offsum : 0) + d,
+                           ++s_disp_offrun >= 3)) {
+                /* Three guest vblanks in a row off the grid: a new rate. */
+                uint64_t np = s_disp_offsum / (uint64_t)s_disp_offrun;
+                fprintf(stderr, "[PACING] display refresh: steps of %.3f ms in a row, off the"
+                        " %.3f ms period: the display changed its rate\n", np / 1e6, cur / 1e6);
+                s_disp_rate_changed = 1;
+                s_disp_period = (LONGLONG)np;
+                s_disp_offrun = 0;
+                s_disp_cand = 0;
+                s_disp_cand_n = 0;
+            } else if (!(d + nominal / 8 >= nominal && d <= nominal + nominal / 8)) {
+                /* Any other step off the grid: a shorter period that fits it
+                 * and the current one, taken once three agree. */
+                s_disp_offrun = 0;
                 if (s_disp_cand && g + s_disp_cand / 8 >= s_disp_cand
                         && g <= s_disp_cand + s_disp_cand / 8)
                     s_disp_cand_n++;
@@ -202,7 +278,36 @@ void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns)
             s_disp_jitter--;
         }
     }
+    /* The grid's anchor. A measured report is the refresh plus the reporting
+     * thread's wake-up, never before it: on the Steam Deck present_wait's
+     * waiter woke up to a millisecond late now and then, the vblank's next
+     * edge followed it, and the title's frame took 17.7 ms and the next 15.7
+     * (a yellow bar). So a report later than the grid predicts moves the
+     * anchor an eighth of the way (the display's own drift is far slower),
+     * an earlier one sets it. A stated period (a display link's own times)
+     * is taken as it comes. */
+    cur = (uint64_t)s_disp_period;
+    if (!period_ns && cur && prev && when_ns > prev && when_ns - prev <= 100000000u) {
+        uint64_t k = (when_ns - prev + cur / 2) / cur, pred = prev + k * cur;
+        if (k && when_ns > pred && when_ns - pred < cur / 4) {
+            s_disp_ns = (LONGLONG)(pred + (when_ns - pred) / 8);
+            return;
+        }
+    }
     s_disp_ns = (LONGLONG)when_ns;
+}
+
+void xbox_VblankDisplayRelearn(void)
+{
+    s_disp_relearn = 1;
+}
+
+int xbox_VblankDisplayRateChanged(void)
+{
+    if (!s_disp_rate_changed)
+        return 0;
+    s_disp_rate_changed = 0;
+    return 1;
 }
 
 /* The display grid the vblank follows now: a refresh time and the guest
@@ -217,7 +322,7 @@ static int display_grid(uint64_t now_ns, uint64_t *ref_ns, uint64_t *period_ns)
     ref = (uint64_t)s_disp_ns;
     pd = (uint64_t)s_disp_period;
     if (!ref || !pd || (now_ns > ref && now_ns - ref > DISPLAY_STALE_NS)
-            || s_disp_jitter)
+            || s_disp_jitter || s_disp_relearn)
         return 0;
     m = (nominal + pd / 2) / pd;           /* refreshes per guest vblank */
     if (!m)
@@ -483,6 +588,14 @@ static char s_auto_why[96];
  * last vblank wait measured of its own lateness (-1: not measured). */
 static volatile LONGLONG s_vbl_raised_ns;
 static int64_t s_wait_wake_ns = -1;
+/* The executor's last hold: how long after the edge of the vblank it waited
+ * for it was let go (-1: not measured), for the cadence diagnosis's budget
+ * (pacing_diag.h, BO-211). */
+static int64_t s_hold_wake_ns = -1;
+/* The executor's last hold, for the cadence diagnosis (BO-210): it found
+ * the published edge already more than SPIN_LATE_NS past (the timer thread
+ * is behind), or it spun longer than the lead allows. */
+static int s_hold_stale, s_hold_overspin;
 
 void xbox_PacingSetSpinLead(uint64_t ns)
 {
@@ -535,6 +648,127 @@ void xbox_PacingHoldSample(uint32_t interval, uint64_t arrive_ns, uint64_t edge_
     }
 }
 
+/* The cadence diagnosis (pacing_diag.h, BO-210) and the watchdog on it
+ * (pacing_watch.h, BO-211), on the executor at each flip, in every pacing
+ * mode: running totals of the executor's hold and scan time (ns, any one
+ * clock), and whether the swap's vblank had passed. Says in one line,
+ * always, when the frame rate drops and why; two pacing-fault windows in a
+ * row reset the frame-queue keeper and the display lock together (with a
+ * holdoff), as do a settings change and a wake gap. */
+static XboxPacingWatch s_watch;
+static int s_diag_off = -1;
+#define RESET_HOOKS 4
+static void (*s_reset_hook[RESET_HOOKS])(void);
+static volatile LONG s_reset_hooks;
+/* Asked from another thread, done at the executor's next flip. */
+static volatile LONG s_reset_req;
+static char s_reset_why[96];
+static volatile LONGLONG s_wake_gap_ns;
+static volatile int s_visible = 1;
+
+void xbox_PacingResetHook(void (*fn)(void))
+{
+    int n = s_reset_hooks;
+    if (!fn || n >= RESET_HOOKS)
+        return;
+    s_reset_hook[n] = fn;
+    /* A full barrier: the pointer is there before the count says so. */
+    InterlockedExchange(&s_reset_hooks, n + 1);
+}
+
+void xbox_PacingWatchReset(const char *why)
+{
+    snprintf(s_reset_why, sizeof s_reset_why, "%s", why ? why : "asked");
+    InterlockedExchange(&s_reset_req, 1);
+}
+
+void xbox_PacingSetVisible(int visible)
+{
+    s_visible = visible != 0;
+}
+
+/* The timer thread, after a gap of a second or more (host_time.h). */
+static void pacing_woke(uint64_t gap_ns)
+{
+    s_wake_gap_ns = (LONGLONG)(gap_ns ? gap_ns : 1);
+}
+
+static void pacing_reset_all(void)
+{
+    int i, n = s_reset_hooks;
+    if (display_lock_on())
+        xbox_VblankDisplayRelearn();
+    for (i = 0; i < n; i++)
+        if (s_reset_hook[i])
+            s_reset_hook[i]();
+}
+
+void xbox_PacingFlipCadence(uint32_t interval, int late, uint64_t hold_total,
+                            uint64_t scan_total)
+{
+    static uint64_t p_hold, p_scan, p_now;
+    static int64_t p_wake = -1;
+    uint64_t now = xbox_HostNowNs(), hold, scan, frame, gap;
+    char line[400];
+    int k, stale = s_hold_stale, over = s_hold_overspin;
+    /* This frame began at the previous hold's release: its lateness. */
+    int64_t wake = p_wake;
+
+    p_wake = s_hold_wake_ns;
+    s_hold_wake_ns = -1;
+    s_hold_stale = s_hold_overspin = 0;
+    if (s_diag_off < 0) {
+        const char *e = recomp_env(RENV_CADENCE_DIAG);
+        s_diag_off = e && *e == '0';
+        pwatch_init(&s_watch);
+        xbox_HostWakeListener("the pacing state", pacing_woke);
+    }
+    /* Forced resets first: a wake gap, a settings change. */
+    if ((gap = (uint64_t)s_wake_gap_ns) != 0) {
+        s_wake_gap_ns = 0;
+        InterlockedExchange(&s_reset_req, 0);
+        pwatch_force(&s_watch, now);
+        pacing_reset_all();
+        XR_NOTICE("[PACING] after a %.0f s gap: the frame-queue keeper and the display lock"
+                  " start over\n", gap / 1e9);
+    } else if (s_reset_req && InterlockedExchange(&s_reset_req, 0)) {
+        pwatch_force(&s_watch, now);
+        pacing_reset_all();
+        XR_NOTICE("[PACING] %s: the frame-queue keeper and the display lock start over\n",
+                  s_reset_why);
+    }
+    if (s_diag_off || xbox_TimeWarpOn())
+        return;
+    if (xbox_HostPaused())
+        pwatch_void(&s_watch, PWATCH_V_PAUSED);
+    if (!s_visible)
+        pwatch_void(&s_watch, PWATCH_V_HIDDEN);
+    if (xbox_VblankDisplayRateChanged())
+        pwatch_void(&s_watch, PWATCH_V_RATE);
+    if (!p_now) {
+        p_now = now;
+        p_hold = hold_total;
+        p_scan = scan_total;
+        return;
+    }
+    hold = hold_total - p_hold;
+    scan = scan_total - p_scan;
+    frame = now - p_now;
+    p_now = now;
+    p_hold = hold_total;
+    p_scan = scan_total;
+    if (hold > scan)
+        hold = scan;
+    k = pwatch_flip(&s_watch, now, interval, late, scan - hold,
+                    frame > scan ? frame - scan : 0, hold, wake, stale, over, line, sizeof line);
+    if (k & PWATCH_LINE)
+        XR_NOTICE("[PACING] %s\n", line);
+    if (k & PWATCH_RESET) {
+        pacing_reset_all();
+        XR_NOTICE("[PACING] %s\n", s_watch.why);
+    }
+}
+
 void xbox_VblankNextDue(uint64_t ns)
 {
     /* The edge raised now is the one that was due next. */
@@ -573,7 +807,7 @@ uint64_t xbox_PacingFrameVblankNs(void)
     return (uint64_t)s_frame_vbl_ns;
 }
 
-static void cpu_relax(void)
+void xbox_CpuRelax(void)
 {
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
     _mm_pause();
@@ -636,7 +870,7 @@ int xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms)
 {
     uint64_t enter = xbox_HostNowNs();
     uint64_t deadline = enter + (uint64_t)timeout_ms * 1000000u;
-    int ok = 1;
+    int ok = 1, spun = 0;
 
     pacing_once();
     EnterCriticalSection(&s_vbl_lock);
@@ -671,29 +905,45 @@ int xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms)
          * behind, or has not published one) falls back to the condition
          * variable. */
         if (s_spin_lead_ns && xbox_VblankCount() + 1 == target) {
-            uint64_t due = (uint64_t)s_vbl_next_ns;
+            uint64_t due = (uint64_t)s_vbl_next_ns, lead = s_spin_lead_ns;
             if (due + SPIN_LATE_NS > now) {
                 LeaveCriticalSection(&s_vbl_lock);
-                if (due > now + s_spin_lead_ns) {
-                    uint64_t d = due - s_spin_lead_ns - now;
+                if (due > now + lead) {
+                    uint64_t d = due - lead - now;
                     xbox_HostSleepNs(d < deadline - now ? d : deadline - now);
-                } else {
+                } else if (!spun) {
+                    /* One spin per wait, at most the lead plus SPIN_LATE_NS
+                     * from where it starts, whatever `due` says; the rest of
+                     * the wait sleeps on the condition variable (BO-210). */
+                    uint64_t lim = due + SPIN_LATE_NS, s0 = now, cap = now + lead + SPIN_LATE_NS;
+                    if (lim > cap)
+                        lim = cap;
+                    spun = 1;
 #if defined(__ANDROID__) && defined(__aarch64__)
                     uint64_t f = cnt_freq();
                     if (f) {
-                        /* The same deadline, due + SPIN_LATE_NS, in ticks. */
-                        uint64_t lim = cnt_read() + (due + SPIN_LATE_NS - now) * f / 1000000000ull;
-                        while ((int32_t)(xbox_VblankCount() - target) < 0 && cnt_read() < lim)
-                            cpu_relax();
+                        /* The same deadline, in ticks. */
+                        uint64_t clim = cnt_read() + (lim - now) * f / 1000000000ull;
+                        while ((int32_t)(xbox_VblankCount() - target) < 0 && cnt_read() < clim)
+                            xbox_CpuRelax();
                     } else
 #endif
                     while ((int32_t)(xbox_VblankCount() - target) < 0
-                           && xbox_HostNowNs() < due + SPIN_LATE_NS)
-                        cpu_relax();
+                           && xbox_HostNowNs() < lim)
+                        xbox_CpuRelax();
+                    if (xbox_HostNowNs() - s0 > lead + SPIN_LATE_NS + 1000000u)
+                        s_hold_overspin = 1;
                 }
                 EnterCriticalSection(&s_vbl_lock);
+                if (spun && (int32_t)(xbox_VblankCount() - target) < 0
+                        && xbox_HostNowNs() < deadline) {
+                    now = xbox_HostNowNs();
+                    ms = (DWORD)((deadline - now + 999999u) / 1000000u);
+                    SleepConditionVariableCS(&s_vbl_cv, &s_vbl_lock, ms);
+                }
                 continue;
             }
+            s_hold_stale = 1;    /* the edge it waits for is long past */
         }
         ms = (DWORD)((deadline - now + 999999u) / 1000000u);
         SleepConditionVariableCS(&s_vbl_cv, &s_vbl_lock, ms);
@@ -703,10 +953,18 @@ int xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms)
      * vblank it waited for to the return, when it was there before the
      * raise and no later vblank came meanwhile. */
     s_wait_wake_ns = -1;
-    if (s_auto_on && ok && xbox_VblankCount() == target) {
-        uint64_t r = (uint64_t)s_vbl_raised_ns, back = xbox_HostNowNs();
-        if (r > enter && back >= r)
-            s_wait_wake_ns = (int64_t)(back - r);
+    s_hold_wake_ns = -1;
+    if (ok && !xbox_TimeWarpOn()) {
+        uint64_t back = xbox_HostNowNs(), edge = xbox_VblankEdgeNs(target);
+        if (s_auto_on && xbox_VblankCount() == target) {
+            uint64_t r = (uint64_t)s_vbl_raised_ns;
+            if (r > enter && back >= r)
+                s_wait_wake_ns = (int64_t)(back - r);
+        }
+        /* From the edge (the grid's time, not the raise): the timer
+         * thread's lateness counts too. */
+        if (edge && back >= edge && back - edge < 50000000u)
+            s_hold_wake_ns = (int64_t)(back - edge);
     }
     return ok;
 }
@@ -960,6 +1218,10 @@ void xbox_PacingFlip(uint32_t flip, uint32_t batches)
                     s_auto.tot.ups, s_auto.tot.downs, s_auto.tot.reverts, s_auto.tot.restores);
         else
             fprintf(stderr, ", lead %.0f ms", (double)s_spin_lead_ns / 1e6);
+        /* The watchdog (BO-211): its windows so far, how many were void,
+         * and its resets (decided, forced). */
+        fprintf(stderr, "; watchdog windows %u (void %u, fault %u), resets %u + %u forced",
+                s_watch.windows, s_watch.voids, s_watch.faults, s_watch.resets, s_watch.forced);
         fputc('\n', stderr);
         for (i = 0; i <= SITE_SLOTS; i++) {
             SpinSite *st = &s_sites[i];

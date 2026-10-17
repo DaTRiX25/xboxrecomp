@@ -132,6 +132,77 @@ int main(int argc, char **argv)
               && s_scan_slots == 3, "one vertex program is found in an image, a malformed one is not");
     }
 
+
+    /* The shipped manifest (BO-208): vertex programs by hash, found in the
+     * player's executable as the XDK's blob and as a bare run of slots;
+     * combiner states and pipeline keys as they are. */
+    {
+        char mpath[1100], xpath[1100], dpath[1100];
+        uint32_t w3[12] = {0, 1, 2, 0,  0, 3, 4, 0,  0, 5, 6, 1};          /* header + 3 slots */
+        uint32_t run[8] = {0, 7, 8, 0,  0, 9, 10, 1};                       /* a bare run */
+        unsigned char img[256];
+        uint64_t h1, h2, hbad = 0x1234567890abcdefull;
+        unsigned char *mb;
+        long msz;
+        nv2a_pcache *mc, *dc;
+        nv2a_pcache_manifest_stat st;
+        uint32_t state[4] = {42, 43, 44, 45};
+
+        snprintf(mpath, sizeof mpath, "%s/m.manifest", dir);
+        snprintf(xpath, sizeof xpath, "%s/x.xbe", dir);
+        snprintf(dpath, sizeof dpath, "%s/dst.bin", dir);
+        remove(mpath); remove(xpath); remove(dpath);
+        memset(img, 0x11, sizeof img);
+        img[0] = 0x78; img[1] = 0x20; img[2] = 3; img[3] = 0;
+        memcpy(img + 4, w3, sizeof w3);
+        memcpy(img + 112, run, sizeof run);                                 /* 16-aligned, no header */
+        f = fopen(xpath, "wb");
+        fwrite(img, 1, sizeof img, f);
+        fclose(f);
+        h1 = nv2a_fnv64(w3, sizeof w3, NV2A_FNV64_INIT);
+        h2 = nv2a_fnv64(run, sizeof run, NV2A_FNV64_INIT);
+        mc = nv2a_pcache_open(mpath, "v1; manifest r1", msg, sizeof msg);
+        CHECK(mc != NULL, "a manifest file is written");
+        nv2a_pcache_put(mc, NV2A_PC_MANIFEST_VS, &h1, 8);
+        nv2a_pcache_put(mc, NV2A_PC_MANIFEST_VS, &h2, 8);
+        nv2a_pcache_put(mc, NV2A_PC_MANIFEST_VS, &hbad, 8);
+        nv2a_pcache_put(mc, 1, state, sizeof state);
+        nv2a_pcache_put(mc, 2, a, sizeof a);
+        nv2a_pcache_close(mc);
+        {
+            FILE *mf = fopen(mpath, "rb");
+            fseek(mf, 0, SEEK_END);
+            msz = ftell(mf);
+            fseek(mf, 0, SEEK_SET);
+            mb = (unsigned char *)malloc((size_t)msz);
+            CHECK(fread(mb, 1, (size_t)msz, mf) == (size_t)msz, "the manifest is read back");
+            fclose(mf);
+        }
+        nv2a_pcache_set_manifest("t", mb, (size_t)msz);
+        nv2a_pcache_set_xbe(xpath);
+        dc = nv2a_pcache_open(dpath, "v1", msg, sizeof msg);
+        CHECK(nv2a_pcache_manifest_apply(dc, "t", "v1", &st) == 4 && st.found
+              && !strcmp(st.revision, "r1") && st.vs_listed == 3 && st.vs_resolved == 2
+              && st.records == 5, "the manifest is applied: 2 of 3 programs found by hash, 4 keys new");
+        CHECK(nv2a_pcache_manifest_apply(dc, "t", "v1", &st) == 0 && st.vs_resolved == 2,
+              "a second application adds nothing");
+        nv2a_pcache_close(dc);
+        dc = nv2a_pcache_open(dpath, "v1", msg, sizeof msg);
+        CHECK(nv2a_pcache_count(dc) == 4, "the keys are in the list on disk");
+        CHECK(nv2a_pcache_get(dc, 0, &type, &d, &len) && type == 0 && len % 16 == 0,
+              "a vertex program comes in as its slots");
+        nv2a_pcache_close(dc);
+        remove(dpath);
+        dc = nv2a_pcache_open(dpath, "v2", msg, sizeof msg);
+        CHECK(nv2a_pcache_manifest_apply(dc, "t", "v2", &st) == 0 && !st.found,
+              "a manifest of another key format is ignored");
+        nv2a_pcache_close(dc);
+        free(mb);
+        nv2a_pcache_set_manifest("t", "", 0);
+        nv2a_pcache_set_xbe(NULL);
+        remove(mpath); remove(xpath); remove(dpath);
+    }
+
     /* Not a cache file at all. */
     f = fopen(path, "wb");
     fputs("hello", f);

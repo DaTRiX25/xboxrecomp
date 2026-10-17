@@ -31,7 +31,17 @@ static_assert(AP_SETS == XBOX_GLYPH_SET_COUNT, "one sheet per glyph set");
 
 namespace {
 
-enum { AI_ARROW, AI_DPAD, AI_GRID, AI_BIG, AI_E32, AI_F32, AI_E16, AI_F16, AI_COUNT };
+enum { AI_ARROW, AI_DPAD, AI_GRID, AI_BIG, AI_E32, AI_F32, AI_E16, AI_F16,
+       AI_VOLF, AI_VOLE, AI_CHECK, AI_RING, AI_LOCK, AI_COUNT };
+
+/* A picture of xbox_OverlaySetGameArtMore, its file named with it. */
+struct More {
+    bool on;
+    char path[1024];
+    uint64_t size;
+    char sha[65];
+    uint32_t off, w, h, fmt;
+};
 
 struct Job {
     char path[1024];
@@ -40,6 +50,7 @@ struct Job {
     xbox_overlay_sprite spr[XBOX_OVERLAY_ART_COUNT];
     struct nv2a_texrep_variant pads[AP_SETS];
     unsigned n_pads;
+    More more[XBOX_OVERLAY_ART2_COUNT];
 };
 
 struct Atlas {
@@ -61,6 +72,11 @@ const Sub k_sub[AS_COUNT] = {
     /* AS_EDGE32      */ { AI_E32, 0, 0, 32, 32 },
     /* AS_GRID        */ { AI_GRID, 0, 0, 16, 16 },
     /* AS_BIGCURVE    */ { AI_BIG, 0, 0, 128, 128 },
+    /* AS_VOL_FULL    */ { AI_VOLF, 0, 0, 6, 16 },
+    /* AS_VOL_EMPTY   */ { AI_VOLE, 0, 0, 6, 16 },
+    /* AS_CHECK       */ { AI_CHECK, 0, 0, 64, 64 },
+    /* AS_RING        */ { AI_RING, 0, 0, 32, 32 },
+    /* AS_PADLOCK     */ { AI_LOCK, 0, 0, 32, 32 },
 };
 
 /* The prompt sheet (128 x 64): the rectangles of its cells. The discs sit
@@ -80,8 +96,11 @@ const Cell k_cell_trigger_r = { 62, 46, 18, 18 };
 const int k_expect[XBOX_OVERLAY_ART_COUNT][2] = {
     { 64, 32 }, { 128, 64 }, { 32, 16 }, { 16, 16 }, { 128, 128 }, { 32, 32 }, { 32, 32 }, { 16, 16 }, { 16, 16 },
 };
+const int k_expect_more[XBOX_OVERLAY_ART2_COUNT][2] = { { 128, 32 }, { 64, 64 }, { 32, 32 }, { 32, 32 } };
 
 Job s_job;
+More s_more[XBOX_OVERLAY_ART2_COUNT];      /* named before xbox_OverlaySetGameArt */
+bool s_have[AS_COUNT];
 std::atomic<int> s_state{-1};              /* -1 none, 0 loading, 1 made */
 SDL_Thread *s_thread;
 Atlas s_sprites, s_pads;
@@ -133,6 +152,97 @@ void dxt1_decode(const uint8_t *src, int w, int h, uint32_t *dst)
 }
 
 typedef std::vector<uint32_t> Img;       /* A8R8G8B8 */
+
+/* An 8-bit palette image, the Xbox's swizzle (the bits of x and y
+ * interleaved from the lowest while each still has some), to A8R8G8B8. The
+ * palette's resource header (0x40 bytes) and its 256 B, G, R, A colours
+ * follow the pixels. */
+bool p8_decode(const uint8_t *file, uint64_t size, uint32_t off, int w, int h, uint32_t *dst)
+{
+    const uint64_t head = (uint64_t)off + (uint64_t)w * h, pal = head + 0x40;
+    if (pal + 1024 > size)
+        return false;
+    const uint32_t ph = (uint32_t)file[head] | (uint32_t)file[head + 1] << 8 | (uint32_t)file[head + 2] << 16;
+    if (ph != 0x030001u)                     /* a palette resource, of 256 colours */
+        return false;
+    uint32_t xs[256], ys[256], xbit[8], ybit[8];
+    int nx = 0, ny = 0;
+    uint32_t bit = 1;
+    for (int mx = 1, my = 1; mx < w || my < h;) {
+        if (mx < w) { xbit[nx++] = bit; bit <<= 1; mx <<= 1; }
+        if (my < h) { ybit[ny++] = bit; bit <<= 1; my <<= 1; }
+    }
+    for (int x = 0; x < w; x++) {
+        xs[x] = 0;
+        for (int i = 0; i < nx; i++)
+            if (x >> i & 1) xs[x] |= xbit[i];
+    }
+    for (int y = 0; y < h; y++) {
+        ys[y] = 0;
+        for (int i = 0; i < ny; i++)
+            if (y >> i & 1) ys[y] |= ybit[i];
+    }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            const uint8_t *c = file + pal + 4 * file[off + xs[x] + ys[y]];
+            dst[y * w + x] = (uint32_t)c[3] << 24 | (uint32_t)c[2] << 16 | (uint32_t)c[1] << 8 | c[0];
+        }
+    return true;
+}
+
+/* The `w` x `h` texels of `src` (sw wide) from (x, y). */
+Img crop(const Img &src, int sw, int x, int y, int w, int h)
+{
+    Img out((size_t)w * h);
+    for (int j = 0; j < h; j++)
+        memcpy(&out[(size_t)j * w], &src[(size_t)(y + j) * sw + x], w * sizeof(uint32_t));
+    return out;
+}
+
+/* The pictures of xbox_OverlaySetGameArtMore: each file read and checked
+ * once; one that fails costs its own pictures only. */
+void more_load(Img raw[XBOX_OVERLAY_ART2_COUNT])
+{
+    for (int i = 0; i < XBOX_OVERLAY_ART2_COUNT; i++) {
+        const More &m = s_job.more[i];
+        if (!m.on || !raw[i].empty())
+            continue;
+        const char *why = NULL;
+        uint8_t *file = gf_read_verified(m.path, m.size, m.sha, &why);
+        /* Every picture of this file, from the one read. */
+        for (int j = i; j < XBOX_OVERLAY_ART2_COUNT; j++) {
+            const More &d = s_job.more[j];
+            if (!d.on || strcmp(d.path, m.path) || d.size != m.size || strcmp(d.sha, m.sha))
+                continue;
+            const char *bad = why;
+            if (!bad && ((int)d.w != k_expect_more[j][0] || (int)d.h != k_expect_more[j][1]))
+                bad = "another size of picture";
+            Img img((size_t)d.w * d.h);
+            if (!bad) {
+                const uint64_t bytes = (uint64_t)d.w * d.h / (d.fmt == 1 ? 2 : 1);
+                if ((d.fmt != 1 && d.fmt != 5 && d.fmt != 8) || (uint64_t)d.off + bytes > m.size)
+                    bad = "a picture is not where it was said to be";
+                else if (d.fmt == 8) {
+                    if (!p8_decode(file, m.size, d.off, (int)d.w, (int)d.h, img.data()))
+                        bad = "a picture is not where it was said to be";
+                } else if (d.fmt == 5)
+                    gf_dxt5_decode(file + d.off, (int)d.w, (int)d.h, img.data());
+                else
+                    dxt1_decode(file + d.off, (int)d.w, (int)d.h, img.data());
+            }
+            if (bad) {
+                fprintf(stderr, "[overlay] a picture of the game's is not used (%d): %s: %s\n", j, d.path, bad);
+                raw[j].clear();
+            } else
+                raw[j] = img;
+            if (j != i && raw[j].empty())
+                s_job.more[j].on = false;      /* not again */
+        }
+        if (raw[i].empty())
+            s_job.more[i].on = false;
+        free(file);
+    }
+}
 
 uint32_t abgr_of(uint32_t p)
 {
@@ -221,6 +331,26 @@ bool make(const uint8_t *file, uint64_t size)
     take(AI_F32, XBOX_OVERLAY_ART_BOX_CURVE_B);
     take(AI_E16, XBOX_OVERLAY_ART_CURVE16);
     take(AI_F16, XBOX_OVERLAY_ART_CURVE16_B);
+    {
+        /* The volume bar's first cells, full and empty, cut apart: the
+         * scaler blends neighbours, and the two halves touch. */
+        Img more[XBOX_OVERLAY_ART2_COUNT];
+        more_load(more);
+        auto take_more = [&](int ai, int a2, int x, int y, int w, int h) {
+            if (more[a2].empty())
+                return;
+            im[ai] = crop(more[a2], k_expect_more[a2][0], x, y, w, h);
+            iw[ai] = w;
+            ih[ai] = h;
+        };
+        for (int ai = AI_VOLF; ai < AI_COUNT; ai++)
+            iw[ai] = ih[ai] = 0;
+        take_more(AI_VOLF, XBOX_OVERLAY_ART2_VOLUMEBAR, 0, 0, 6, 16);
+        take_more(AI_VOLE, XBOX_OVERLAY_ART2_VOLUMEBAR, 0, 16, 6, 16);
+        take_more(AI_CHECK, XBOX_OVERLAY_ART2_TICK, 0, 0, 64, 64);
+        take_more(AI_RING, XBOX_OVERLAY_ART2_CIRCLE, 0, 0, 32, 32);
+        take_more(AI_LOCK, XBOX_OVERLAY_ART2_PADLOCK, 0, 0, 32, 32);
+    }
     for (int ai : { AI_E32, AI_E16 })
         for (uint32_t &p : im[ai]) {
             /* White outline, and a shade of 50% black inside: the outline is
@@ -247,6 +377,8 @@ bool make(const uint8_t *file, uint64_t size)
     Img big[AI_COUNT];
     int x = 0, y = 0, rowh = 0, width = 0;
     for (int ai = 0; ai < AI_COUNT; ai++) {
+        if (!iw[ai])
+            continue;                            /* a picture of the more that is missing */
         big[ai] = scaled(im[ai], iw[ai], ih[ai]);
         if (big[ai].empty())
             return false;
@@ -266,10 +398,14 @@ bool make(const uint8_t *file, uint64_t size)
     s_sprites.h = y + rowh;
     s_sprites.abgr.assign((size_t)s_sprites.w * s_sprites.h, 0);
     for (int ai = 0; ai < AI_COUNT; ai++)
-        blit(s_sprites, px[ai], py[ai], big[ai], iw[ai] * SCALE, ih[ai] * SCALE, ai == AI_GRID);
+        if (iw[ai])
+            blit(s_sprites, px[ai], py[ai], big[ai], iw[ai] * SCALE, ih[ai] * SCALE, ai == AI_GRID);
     for (int s = 0; s < AS_COUNT; s++) {
         const Sub &u = k_sub[s];
         ArtRect &r = s_rect[s];
+        s_have[s] = iw[u.image] != 0;
+        if (!s_have[s])
+            continue;
         r.u0 = (float)(px[u.image] + u.x * SCALE) / s_sprites.w;
         r.v0 = (float)(py[u.image] + u.y * SCALE) / s_sprites.h;
         r.u1 = (float)(px[u.image] + (u.x + u.w) * SCALE) / s_sprites.w;
@@ -350,6 +486,27 @@ extern "C" void xbox_OverlaySetPadSheets(const struct nv2a_texrep_variant *varia
         s_pad_variants[i] = variants[i];
 }
 
+extern "C" void xbox_OverlaySetGameArtMore(const xbox_overlay_sprite_file *sprites)
+{
+    if (s_thread || !sprites)
+        return;
+    for (int i = 0; i < XBOX_OVERLAY_ART2_COUNT; i++) {
+        const xbox_overlay_sprite_file &f = sprites[i];
+        More &m = s_more[i];
+        m.on = f.path && f.path[0] && f.sha256_hex && strlen(f.sha256_hex) == 64;
+        if (!m.on)
+            continue;
+        snprintf(m.path, sizeof m.path, "%s", f.path);
+        m.size = f.size;
+        for (int k = 0; k < 65; k++)
+            m.sha[k] = (char)((f.sha256_hex[k] >= 'A' && f.sha256_hex[k] <= 'F') ? f.sha256_hex[k] + 32 : f.sha256_hex[k]);
+        m.off = f.off;
+        m.w = f.w;
+        m.h = f.h;
+        m.fmt = f.fmt;
+    }
+}
+
 extern "C" void xbox_OverlaySetGameArt(const char *path, uint64_t size, const char *sha256_hex,
                                        const xbox_overlay_sprite *sprites)
 {
@@ -362,6 +519,7 @@ extern "C" void xbox_OverlaySetGameArt(const char *path, uint64_t size, const ch
     for (int i = 0; i < 65; i++)
         s_job.sha[i] = (char)((sha256_hex[i] >= 'A' && sha256_hex[i] <= 'F') ? sha256_hex[i] + 32 : sha256_hex[i]);
     memcpy(s_job.spr, sprites, sizeof s_job.spr);
+    memcpy(s_job.more, s_more, sizeof s_job.more);
     s_job.n_pads = s_n_pad_variants;
     memcpy(s_job.pads, s_pad_variants, sizeof s_job.pads);
     s_state.store(0);
@@ -396,7 +554,7 @@ bool gameart_attach()
 
 const ArtRect *gameart_sprite(int sprite)
 {
-    return s_attached && sprite >= 0 && sprite < AS_COUNT ? &s_rect[sprite] : nullptr;
+    return s_attached && sprite >= 0 && sprite < AS_COUNT && s_have[sprite] ? &s_rect[sprite] : nullptr;
 }
 
 ImTextureRef gameart_tex() { return s_tex_sprites->GetTexRef(); }

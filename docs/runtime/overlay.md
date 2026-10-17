@@ -23,7 +23,9 @@ the last frame.
 ## Look and sizes
 
 The overlay uses the whole window (it pauses the game anyway), over the
-frame dimmed to 22%. Every size is a fraction of the window, the game's own
+frame dimmed to 50%, with a dark plate (the header band's colour at 72%)
+behind the rows and the hint, as the title's own pause menu keeps its frame
+bright and puts its text on dark plates (BO-190; no blur). Every size is a fraction of the window, the game's own
 proportions measured on its 640x464 menu frame: label 3.7% of the height,
 row pitch 6.25%, hint 2.6%, footer text 2.8%, header 4.7%; labels start at
 14% of the width, values are right-aligned in a column from 56% to 94%, with
@@ -38,6 +40,15 @@ hint, arrows, rule, footer bar, attention yellow: `k_theme_game`). The font
 is still the monospace one. The Mixer page and the folder browser use the
 same sizes and colours in a body under the header, their layout as before
 (the Mixer's rows a little denser).
+
+The rows come in the way the title's menus bring theirs (BO-190, timed from
+per-flip captures of Burnout 3 at 60 Hz): each row slides in from 12% of the
+width to the left and fades up in 2 frames (33 ms), the next one 3 frames
+(50 ms) later after a page change, 4 frames (67 ms) later when the overlay
+opens; rows below the sixth in view come in with it. It is drawing only:
+the rows' vertices are moved and faded after they are made, so input works
+on the rows where they end up from the first frame and nothing waits for it.
+The header, footer and dim fade in over 0.14 s as before.
 
 ## What it does to the title
 
@@ -264,16 +275,20 @@ title's defaults when those change. Keys it does not know are kept.
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |
 | `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins, where they play dry. Not used (and not shown) for a title whose GP effects image is modelled (`src/apu/apu_gp.h`) |
 | `audio.lfe_lowpass` (`off`, `80`, `100`, `120`; default `120`) | `RECOMP_AUDIO_LFE_LOWPASS` | not on the page (the settings file or the variable only; a change in a running game fades over 21 ms). For a title whose GP effects image is modelled: the low-pass on the LFE (subwoofer) feed, 24 dB an octave. 120 Hz is what the console's Dolby Digital encoder did after the effects stage and is the stock behaviour; off is that stage's own full-range feed. For tuning by ear use the mixer's own `lfe_lowpass_hz`, which comes after this one: with both on the feed passes both |
+| `audio.menu_sounds` (default on) | `RECOMP_AUDIO_MENU_SOUNDS` | live; the title's own menu sounds in the overlay (above, "The title's own menu sounds"). Audio page, only for a port that named them |
 | `audio.mixer` (default off) | `RECOMP_AUDIO_MIXER` | yes; the host mixer (`src/apu/apu_bus.h`): buses over the title's voices, on the Audio page's Mixer page. Its mix is not in settings.toml but in `mixer.toml` beside it (`RECOMP_AUDIO_MIXER_FILE`), read again when it changes. Off, and on with the neutral preset, the output is the same as before |
 | `audio.custom_music_dir` (a folder, default empty) | `RECOMP_AUDIO_MUSIC_DIR` | a text setting (`xbox_SettingsText`). The Audio page's first row, "Custom music folder", with a folder browser (its status line and notes right under it, the page's settings after them), when the port asked for it (`xbox_OverlaySetMusicFolder`); live if the port can (`soundtrack.md`) |
+| `display.frame_pacing` (`auto`, `low_latency`, `smooth`; default `auto`) | `RECOMP_FRAME_PACING` | live (read twice a second); Display page, "Frame pacing", on Linux with the Vulkan presenter. `smooth` keeps one finished frame queued: each frame's present-to-display time (present_wait) gives the queue depth, and three frames in a row at the title's 60 with none queued present the frame once more, three with two queued skip one present (each logged as `[PACING] smooth:`, counted in the `[PRESENT]` exit line). The title's 30 fps stretches and redraws are not measured. +1 refresh of latency against an empty queue; a present up to ~29 ms late still makes its refresh. `low_latency` is FIFO without it (each frame at the first refresh it can make, the depth wherever the last hiccup left it). `auto` is `smooth` under gamescope (Steam Deck Game Mode, Bazzite), `low_latency` elsewhere. Needs FIFO and present_wait, and off gamescope three swapchain images; otherwise it is `low_latency`. Metal (`display.present_timing`), D3D11 and Android: no effect yet (BO-110) |
+| `display.present_mode` (`auto`, `fifo`, `mailbox`) | `RECOMP_PRESENT_MODE` | a text setting, no row in the overlay; after a restart. Vulkan with vsync: `auto` and `fifo` are FIFO, `mailbox` is MAILBOX where the surface offers it. Never picked by itself: under gamescope MAILBOX turned every late present into a repeated frame and replaced early ones (BO-110). The queue under FIFO is `display.frame_pacing` |
 | `audio.custom_music_level` (`off`, `quieter`, `match`, `louder`; default `match`) | `RECOMP_AUDIO_CUSTOM_LEVEL` | live; the level of a title's custom soundtrack against its own music (`src/apu/apu_level.h`): a slow gain on the custom-soundtrack voices only (3 s envelope, -15 to +6 dB, 0.3 s down and 4 s up, frozen in silence), with `quieter` and `louder` at -4 and +4 dB on the target and `off` no processing at all (bit for bit the title's sends). Audio page, under "Custom music folder", only for a title that registered the folder row. Needs the port to name its custom-soundtrack voices (`apu_level_set_classifier`); a title that does not is not touched. `RECOMP_AUDIO_LEVEL_LOG=1` logs the envelope and gain once a second. Separately, always on: a no-look-ahead peak limiter at -0.5 dBFS in front of the 16-bit clamp (`src/apu/apu_limit.h`), 50 ms release, which changes nothing while the mix stays under the ceiling (`RECOMP_AUDIO_SAFETY_LIMITER=0` switches it off, for comparison) |
 | `game.speed_units` (`mph`, `kmh`) | `RECOMP_SPEED_UNITS` | live; Display page, only when the title enabled a guest patch for it (`recomp_patch_enable`, lifting: Guest patches) |
 | `display.ultrawide` (`off`, `21:9`, `32:9`, `window`) | `RECOMP_DISPLAY_ULTRAWIDE` | live, from the title's next 3D set-up; Display page, only when the title enabled a guest patch for it |
 | `display.hud_fix` (bool) | `RECOMP_GFX_HUD_FIX` | live, shown whole from the title's next HUD set-up; Display page, only when the title enabled a guest patch for it |
 | `display.score_board` (`original`, `smooth`) | `RECOMP_GFX_SCORE_BOARD` | live, from the next frame; a title hook on its HUD (Burnout 3: the SCORE board; the port's `src/game/scoreboard.c`): `original` touches nothing, `smooth` fades the board's plate with its text and fades the board in after a camera; Display page, only when the title enabled it (`recomp_patch_enable`) |
-| `graphics.bloom`, `graphics.motion_blur` (bool, default on) | `RECOMP_GFX_BLOOM`, `RECOMP_GFX_MOTION_BLUR` | live, from the next frame; the title's own effects, which a guest patch skips at `0`; Graphics page, only when the title enabled a guest patch for them |
+| `graphics.bloom`, `graphics.motion_blur` (0 to 1 in tenths, default 1, a slider in percent; a file's or variable's `false` / `true` reads as 0 / 1) | `RECOMP_GFX_BLOOM`, `RECOMP_GFX_MOTION_BLUR` | live, from the next frame; the title's own effects: a guest patch skips them at `0` and scales their weight in between (BO-212); Graphics page, only when the title enabled a guest patch for them |
 | `graphics.crash_60fps` (bool, default off) | `RECOMP_GFX_CRASH_60FPS` | live, from the title's next frame; the title's own 30 Hz phases (Burnout 3: crash and takedown cameras) at 60, by a guest patch on the title's own rate choice at `1`; Graphics page, only when the title enabled a guest patch for it; for strong machines: a host that cannot hold 60 runs the game itself slower while it is on (the title steps once a frame), so the row says to leave it off on a Steam Deck and other handhelds |
 | `graphics.split_60fps` (bool, default off) | `RECOMP_GFX_SPLIT_60FPS` | from the title's next two-player stage; the title's 30 Hz split screen at 60, by a guest patch at `1`; Graphics page, only when the title enabled a guest patch for it; for strong machines: a host that cannot hold 60 runs the game itself slower while it is on (the title steps once a frame), so the row says to leave it off on a Steam Deck and other handhelds |
+| `game.race_clock` (bool, default off) | `RECOMP_GAME_RACE_CLOCK` | from the title's next race; on a host that cannot hold 60, a race keeps real time from its start: the title's own catch-up stepping, which it otherwise starts only at the end of the first crash camera, by a guest patch at `1`; no change at a steady 60; Graphics page, row "Potato mode", only when the title enabled a guest patch for it |
 | `audio.split_music` (bool, default off) | `RECOMP_AUDIO_SPLIT_MUSIC` | live; the title's music in split screen, where it plays none, by a guest patch at `1`; Audio page, only when the title enabled a guest patch for it |
 | `graphics.vehicle_detail` (`original`, `far`, `farthest`) | `RECOMP_GFX_VEHICLE_DETAIL` | live, from the next frame; the distances at which the title swaps its vehicle models for simpler ones, scaled by a guest patch (2x, 4x); Graphics page, only when the title enabled a guest patch for it |
 | `graphics.scenery_detail` (`original`, `far`) | `RECOMP_GFX_SCENERY_DETAIL` | live, from the next frame; the distance at which the title swaps a scenery object's detailed model for its simple one (Burnout 3: trees, signs and the other track props with two models), scaled by a guest patch at `far` (the factor is the title's: 4x in Burnout 3); Graphics page, row "Scenery detail", only when the title enabled a guest patch for it |
@@ -508,6 +523,51 @@ shoulder prompts sit beside the page names. The Mixer page and the folder
 browser keep their text footer. No file or another file: the overlay draws
 its own shapes and text as before (a log line, nothing on screen).
 `RECOMP_OVERLAY_GAME_ART=0` forces that look.
+
+More pictures come with `xbox_OverlaySetGameArtMore` (BO-190), each named
+with its own file, size and SHA-256, and also in the 8-bit palette format
+(Xbox swizzled, the palette after the pixels). Burnout 3 names `Volumebar`,
+`Tick` and `circle` of `Data/Global.txd` and `Padlock` of
+`Data/Frontend.txd`. A slider row draws the title's volume bar (full cells
+white on the selected row, pale blue on the others, empty cells as blue
+outlines) instead of the tick bar; a switch has the tick in its blue disc
+(on) or a ring (off) at the left of its value box; a setting the
+environment fixes has the padlock where its left arrow would be. Each file
+is read once and checked on its own: one that fails costs only its own
+pictures, and those rows keep the look above.
+
+### The title's own menu sounds
+
+A port can name the title's menu sounds the same way
+(`xbox_OverlaySetMenuSounds`, `xbox_settings.h`): for a cursor move, a value
+change, a confirm, a back, the menu opening and closing and a page turned,
+a stretch of raw mono 16-bit PCM in a file of the player's install (offset,
+length, rate, the level to play it at; the file's size and SHA-256), and the
+host mixer bus whose gain applies. A thread (`overlay_sounds.cpp`) reads and
+checks each file once, cuts the waves out and makes them 48 kHz; nothing is
+written anywhere. A sound is a one-shot on the APU's output after the mix
+(`mcpx_apu_ui_cue`, `src/apu/apu_core.c`), mixed into front left and right
+like the test tone, so it goes out through whichever device backend is open
+(SDL2 or XAudio2) with the master volume and mute. While the title is
+paused the frame thread runs for the sound alone, as for the speaker test,
+on the branch that hands the device the extra sound without a VP or GP
+frame, so the title's voices stay where the pause left them; it idles again
+when the sound is out. A new sound replaces the one playing. With the host
+mixer on, the named bus's gain, mute and solo apply. `audio.menu_sounds`
+switches them off (the row shows only when a port named sounds);
+`RECOMP_OVERLAY_MENU_SOUNDS=0` names none.
+
+Burnout 3 names three waves (`sound/Fe.awd` Vertical and Back,
+`sound/Generic.awd` Select), mapped from a `RECOMP_MIX_TRACE` of its menus:
+Vertical for a cursor move, a value change, a page turned and the menu
+opening (the title plays it as each new page comes in, the pause menu
+included), Select for A, Back for B and for the menu closing (the title's
+pause menu plays Back as it closes); at the levels the front end plays them
+(-15.5, -16.8 and -22.8 dB). When the title's own TAKEDAWN SETTINGS row opens
+the overlay, the title has just played its Select: the overlay plays no
+opening sound over it, and the pause waits 0.7 s so that Select is not cut
+off and finished when the overlay closes (the title's input is held at
+once).
 
 ### The title's own fonts
 

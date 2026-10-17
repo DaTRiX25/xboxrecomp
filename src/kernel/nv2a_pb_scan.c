@@ -339,6 +339,53 @@ static void slow_run_end(uint32_t subch)
 }
 
 
+/* Stream marks (nv2a_pb_state.h): a ring the guest's thread writes and the
+ * walker reads. Addresses compare within the 64 MB window, so the cached and
+ * the write-combined views of the same word are one place. */
+#define SM_N 256u
+#define SM_MASK 0x03FFFFFCu
+static struct { uint32_t va, tag; } s_sm[SM_N];
+static volatile uint32_t s_sm_w, s_sm_r;
+static volatile uint32_t s_sm_tag;
+static uint64_t s_sm_hit, s_sm_lost;
+
+void nv2a_pb_stream_mark(uint32_t va, uint32_t tag)
+{
+    uint32_t w = __atomic_load_n(&s_sm_w, __ATOMIC_RELAXED);
+    if (w - __atomic_load_n(&s_sm_r, __ATOMIC_ACQUIRE) >= SM_N) {
+        s_sm_lost++;
+        return;
+    }
+    s_sm[w % SM_N].va = va & SM_MASK;
+    s_sm[w % SM_N].tag = tag;
+    __atomic_store_n(&s_sm_w, w + 1, __ATOMIC_RELEASE);
+}
+uint32_t nv2a_pb_stream_tag(void) { return s_sm_tag; }
+void nv2a_pb_stream_tag_set(uint32_t tag) { s_sm_tag = tag; }
+
+/* The marks queued at `va`, applied; called with every word's address. */
+static inline void sm_reach(uint32_t va)
+{
+    uint32_t r = s_sm_r;
+    while (r != __atomic_load_n(&s_sm_w, __ATOMIC_ACQUIRE)
+           && s_sm[r % SM_N].va == (va & SM_MASK)) {
+        s_sm_tag = s_sm[r % SM_N].tag;
+        r++;
+        s_sm_hit++;
+    }
+    __atomic_store_n(&s_sm_r, r, __ATOMIC_RELEASE);
+}
+
+/* A walk that stopped: what is queued can no longer be placed. */
+static void sm_drop(void)
+{
+    uint32_t w = __atomic_load_n(&s_sm_w, __ATOMIC_ACQUIRE);
+    if (w != s_sm_r) {
+        s_sm_lost += w - s_sm_r;
+        __atomic_store_n(&s_sm_r, w, __ATOMIC_RELEASE);
+    }
+}
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -378,6 +425,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
         at = va;
         w = 0;
+        if (s_sm_r != s_sm_w)
+            sm_reach(va);
         if (words >= 0x100000u) { why = "word limit"; break; }
         if (!pb_in_window(va)) { why = "outside the contiguous window"; break; }
         w = *(const uint32_t *)(mem + va);
@@ -443,6 +492,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (why) {
         static unsigned said;
         s_left = 0;                 /* out of step: drop the method in progress */
+        sm_drop();
         uint32_t v = 0;
         const char *fence = stop_salvage(mem, at, end_va, &v);
         s_tot_stops++;

@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-enum nvk_stage { NVK_STAGE_VERTEX = 0, NVK_STAGE_FRAGMENT = 1 };
+enum nvk_stage { NVK_STAGE_VERTEX = 0, NVK_STAGE_FRAGMENT = 1, NVK_STAGE_COMPUTE = 2 };
 
 /* SPIR-V for `src`: *words and *n point into the cache (valid for the life of
  * the process). Returns 1, or 0 with the compiler's log in err. Compiles

@@ -60,6 +60,15 @@ void mcpx_apu_set_speaker_map(const int8_t map[32]);
 void mcpx_apu_speaker_test(int speaker, int via_map);
 int mcpx_apu_speaker_test_playing(int *via_map);
 
+/* The settings overlay's menu sounds (BO-190): a one-shot of mono 16-bit
+ * samples at 48 kHz, at `gain`, added to the front left and right of the
+ * output after the mix. It plays while the title is paused too (the frame
+ * thread runs for it alone then, as for the speaker test; the title's
+ * voices stay still) and over the title's sound when it is not. A new call
+ * replaces the one playing; pcm NULL stops it. The samples must stay valid
+ * while it plays (the caller's static tables). */
+void mcpx_apu_ui_cue(const int16_t *pcm, uint32_t n, float gain);
+
 /* 5.1: the bins (a mask, bit = bin) the title's wiring names as effect
  * sends, and their level, 0..1 (RECOMP_AUDIO_FX_LEVEL, audio.fx_level,
  * default 0.25; live). No effect runs here, so a send reaches its speaker

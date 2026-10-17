@@ -11,6 +11,7 @@
  */
 #include "keyboard_sdl.h"
 #include "keyboard.h"
+#include "touch_pad.h"
 #include "recomp_env.h"
 
 #include <stdio.h>
@@ -65,9 +66,14 @@ static void trace_down(int vk)
     }
 }
 
+void xbox_InputTouchSdlEvent(const SDL_Event *ev);   /* touch_pad_sdl.c */
+
 void xbox_InputSdlEvent(const SDL_Event *ev)
 {
     int vk;
+
+    /* The on-screen controls' fingers, and what hides them (off: nothing). */
+    xbox_InputTouchSdlEvent(ev);
 
     switch (ev->type) {
     case SDL_KEYDOWN:

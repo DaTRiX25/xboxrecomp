@@ -90,6 +90,15 @@ void xbox_HostSleepNs(uint64_t ns)
 
 /* ── The wakeable sleep (one sleeper) ────────────────────── */
 
+/* A wake not yet taken, for xbox_HostSleepWakePending: set before the wake
+ * is posted, cleared by the sleep that takes it. */
+static volatile int s_wake_pending;
+
+int xbox_HostSleepWakePending(void)
+{
+    return s_wake_pending;
+}
+
 #ifdef _WIN32
 static HANDLE s_wake_ev;
 static INIT_ONCE s_wake_once = INIT_ONCE_STATIC_INIT;
@@ -111,6 +120,7 @@ void xbox_HostSleepWakeableNs(uint64_t ns)
         xbox_HostSleepNs(ns);
         return;
     }
+    s_wake_pending = 0;
     if (!ns) {
         WaitForSingleObject(s_wake_ev, 0);      /* take a pending wake */
         return;
@@ -139,6 +149,7 @@ void xbox_HostSleepWakeableNs(uint64_t ns)
 void xbox_HostSleepWake(void)
 {
     InitOnceExecuteOnce(&s_wake_once, wake_ev_init, NULL, NULL);
+    s_wake_pending = 1;
     if (s_wake_ev)
         SetEvent(s_wake_ev);
 }
@@ -182,6 +193,7 @@ void xbox_HostSleepWakeableNs(uint64_t ns)
 #endif
     }
     s_wake_set = 0;
+    s_wake_pending = 0;
     pthread_mutex_unlock(&s_wake_mu);
 }
 
@@ -190,6 +202,7 @@ void xbox_HostSleepWake(void)
     pthread_once(&s_wake_once, wake_cv_init);
     pthread_mutex_lock(&s_wake_mu);
     s_wake_set = 1;
+    s_wake_pending = 1;
     pthread_cond_signal(&s_wake_cv);
     pthread_mutex_unlock(&s_wake_mu);
 }

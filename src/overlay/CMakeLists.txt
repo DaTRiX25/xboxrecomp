@@ -3,6 +3,7 @@
 #   overlay_ui.cpp    hotkeys, pause, input routing, the pages, the graph
 #   overlay_gamefont.cpp the title's bitmap fonts from the player's executable
 #   overlay_gameart.cpp  the title's menu sprites and button prompts, from the player's data
+#   overlay_sounds.cpp   the title's menu sounds, from the player's data
 #   overlay_metal.mm  the Metal renderer glue (macOS)
 #   overlay_vulkan.cpp the Vulkan renderer glue
 # Dear ImGui is vendored in third_party/imgui (see VENDORED.txt): the core and
@@ -19,6 +20,7 @@ add_library(xbox_overlay STATIC
     overlay_ui.cpp
     overlay_gamefont.cpp
     overlay_gameart.cpp
+    overlay_sounds.cpp
     xbox_update.c
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp

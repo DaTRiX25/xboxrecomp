@@ -1343,3 +1343,16 @@ int recomp_home_dir(char *out, unsigned size)
     snprintf(out, size, "%s", h);
     return 1;
 }
+
+
+/* ── file helpers for the Xbox save importer (kernel_save_import.c) ──── */
+
+int recomp_fs_is_dir(const char *path) { return path && is_dir(path); }
+void recomp_fs_mkdir_p(const char *path) { mkdir_p(path); }
+void recomp_fs_rm_tree(const char *path) { if (path && is_dir(path)) rm_tree(path); }
+int recomp_fs_copy_tree(const char *from, const char *to) { return copy_tree(from, to, 0); }
+int recomp_fs_each(const char *dir, int (*fn)(const char *dir, const char *name, int dir_entry, void *ctx),
+                   void *ctx)
+{
+    return for_each(dir, fn, ctx);
+}

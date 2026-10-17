@@ -14,7 +14,8 @@ add_executable(input_map_test
     ${INPUT_SRC}/input_core.c
     ${INPUT_SRC}/rumble_curve.c
     ${INPUT_SRC}/pad_glyphs.c
-    ${INPUT_SRC}/keyboard.c)
+    ${INPUT_SRC}/keyboard.c
+    ${INPUT_SRC}/touch_pad.c)
 target_include_directories(input_map_test PRIVATE ${INPUT_SRC})
 target_link_libraries(input_map_test PRIVATE platform)
 if(NOT WIN32)

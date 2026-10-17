@@ -65,7 +65,23 @@ extern "C" void xbox_OverlayVulkanDraw(const struct nvk_core *core, VkCommandBuf
         s_init = true;
         fprintf(stderr, "[OVERLAY] Dear ImGui %s, Vulkan renderer\n", IMGUI_VERSION);
     }
+    if (fmt != s_fmt) {
+        /* BO-110: the target's format changed (HDR's half-float compose
+         * image or the swapchain again): the pipeline is made again, once
+         * nothing in flight uses the old one. */
+        ImGui_ImplVulkan_PipelineInfo pi{};
+        pi.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        pi.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+        pi.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+        s_fmt = fmt;
+        pi.PipelineRenderingCreateInfo.pColorAttachmentFormats = &s_fmt;
+        nvk_queue_lock();
+        vkQueueWaitIdle(core->queue);
+        ImGui_ImplVulkan_CreateMainPipeline(&pi);
+        nvk_queue_unlock();
+    }
     ImGui_ImplVulkan_NewFrame();
+    overlay_set_target(w, h);
     if (!overlay_begin_frame())
         return;
     ImDrawData *dd = overlay_end_frame();

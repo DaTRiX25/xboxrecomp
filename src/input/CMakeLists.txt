@@ -6,6 +6,8 @@
 #   xinput_device.c host backends (XInput on Windows, SDL2 elsewhere)
 #   keyboard.c      the key table and the one key map (every host)
 #   keyboard_sdl.c  the SDL window's key events into that table (POSIX)
+#   touch_pad.c     the on-screen controls as a port-0 pad (Android; pure)
+#   touch_pad_sdl.c the SDL window's fingers into them
 
 add_library(xbox_input STATIC
     input_map.c
@@ -14,6 +16,7 @@ add_library(xbox_input STATIC
     rumble_curve.c
     xinput_device.c
     keyboard.c
+    touch_pad.c
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -22,7 +25,7 @@ if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
     target_link_libraries(xbox_input PUBLIC platform xinput)
 else()
     find_package(SDL2 REQUIRED)
-    target_sources(xbox_input PRIVATE keyboard_sdl.c)
+    target_sources(xbox_input PRIVATE keyboard_sdl.c touch_pad_sdl.c)
     if(ANDROID)
         # The title's rumble on the device's own vibrator (JNI).
         target_sources(xbox_input PRIVATE android_vibration.c)
@@ -47,6 +50,9 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pad_glyphs
 # (every host, pure arithmetic).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_rumble
                  ${CMAKE_CURRENT_BINARY_DIR}/input_rumble)
+# The on-screen controls and their merge into port 0 (every host, pure).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_touch
+                 ${CMAKE_CURRENT_BINARY_DIR}/input_touch)
 # The key map and its README table (every host, no SDL), and the SDL key
 # and focus rules against synthetic events (POSIX).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard

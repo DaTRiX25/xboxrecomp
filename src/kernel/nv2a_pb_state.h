@@ -273,6 +273,18 @@ const struct nv2a_pb_present *nv2a_pb_present_state(void);
  * the frame itself, as <prefix>flip_NNNNN.bmp. */
 int nv2a_pb_dump_at_listed(uint32_t flip);
 
+/* Stream marks (BO-110): a place in the title's push buffer that a host
+ * names from the guest's thread, as the title builds the stream. `va` is
+ * where the title's next command will go (Xbox D3D: the device's m_pPut);
+ * when the walker reaches that word it makes `tag` the stream tag, in order
+ * with the methods around it, although the executor runs behind the guest.
+ * The tag stays until the next mark or nv2a_pb_stream_tag_set. A mark the
+ * walker never reaches (a walk that stops) is dropped with everything
+ * queued after it. Any thread may queue; one producer at a time. */
+void nv2a_pb_stream_mark(uint32_t va, uint32_t tag);
+uint32_t nv2a_pb_stream_tag(void);
+void nv2a_pb_stream_tag_set(uint32_t tag);
+
 /* A host's own work at every flip (a title's debug monitor: Burnout 3's
  * BO3_HUD_MON walks its 2D scenes): `fn` is called on the thread that
  * executes the flip, the guest's, after the frame was presented and the

@@ -9,9 +9,11 @@ find_package(SDL2 REQUIRED)
 add_executable(input_keyboard_sdl_test
     test_main.c
     ${INPUT_SRC}/keyboard.c
-    ${INPUT_SRC}/keyboard_sdl.c)
+    ${INPUT_SRC}/keyboard_sdl.c
+    ${INPUT_SRC}/touch_pad.c
+    ${INPUT_SRC}/touch_pad_sdl.c)
 target_include_directories(input_keyboard_sdl_test PRIVATE ${INPUT_SRC} ${CMAKE_CURRENT_LIST_DIR}/../../src/overlay)
-target_link_libraries(input_keyboard_sdl_test PRIVATE platform SDL2::SDL2)
+target_link_libraries(input_keyboard_sdl_test PRIVATE platform SDL2::SDL2 m)
 enable_testing()
 add_test(NAME input_keyboard_sdl COMMAND input_keyboard_sdl_test)
 set_tests_properties(input_keyboard_sdl PROPERTIES

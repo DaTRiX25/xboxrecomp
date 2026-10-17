@@ -27,6 +27,8 @@ set(KERNEL_SOURCES
     kernel_ob.c
     kernel_io.c
     kernel_crypto.c
+    kernel_console_keys.c
+    kernel_save_import.c
     kernel_thunks.c
     kernel_bridge.c
     xbox_memory_layout.c

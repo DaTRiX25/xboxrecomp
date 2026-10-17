@@ -14,6 +14,8 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 | `xinput_device.c` | Host backends: XInput (Windows, Proton) and SDL2 GameController |
 | `keyboard.c` | The key table and the one key map, every host |
 | `keyboard_sdl.c` | The SDL window's key and focus events into that table (POSIX) |
+| `touch_pad.h`, `touch_pad.c` | The on-screen controls (Android): two layouts, fingers, auto-hide, port 0's touch state. Pure |
+| `touch_pad_sdl.c` | The SDL window's fingers into them, and the controller and key events that hide them |
 
 ## Quick Start
 
@@ -346,6 +348,26 @@ On Android SDL2 cannot rumble a pad (2.32's joystick driver has no rumble):
 the first pad's rumble goes to the device's own vibrator when that pad is the
 device's built-in one (`android_vibration.c`, `RECOMP_ANDROID_VIBRATION`),
 and an external pad does not rumble.
+
+## Touch controls (Android)
+
+`touch_pad.c` draws nothing itself: the overlay asks it for the controls
+(`xbox_InputTouchDrawList`) and draws them over the game while it is
+closed. It answers port 0 like the keyboard (`XBOX_INPUT_SRC_TOUCH`):
+merged on top of a pad, and the whole state when there is none, so a phone
+has a player 1. The layout follows the title through a hook
+(`xbox_InputTouchSetDrivingHook`): Burnout 3 gives a race layout (a floating
+stick on the left half, GAS, BRAKE, BOOST, BREAKER, LOOK, VIEW) and a menu
+layout (d-pad, A B X Y, LT RT); pause and the settings menu sit at the top, left of centre, in
+both. Each finger keeps the control it went down on; a finger on a button
+slides onto a neighbour (BOOST holds the accelerator too). The settings are
+`input.touch_controls` (auto: hidden while a controller is used, back at the
+next touch; always; off), `input.touch_opacity`, `input.touch_scale` and
+`input.touch_auto_gas`, on the Input page; only the Android table has them,
+so on the other hosts touch stays off. The Android activity passes the
+display cutout's safe insets in `RECOMP_TOUCH_INSETS`; the layout keeps out
+of them. `tests/input_touch` covers the layouts, glide, the stick,
+auto-hide, auto-gas and the merge.
 
 ## Ports
 

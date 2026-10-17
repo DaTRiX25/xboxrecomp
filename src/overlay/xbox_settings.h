@@ -42,7 +42,9 @@ typedef enum { XS_BOOL, XS_INT, XS_FLOAT, XS_CHOICE } xs_type;
 
 enum {
     XS_RESTART = 1,       /* read at start: a change shows after a restart */
-    XS_VIRTUAL = 2        /* several knobs (the Power page's mode) */
+    XS_VIRTUAL = 2,       /* several knobs (the Power page's mode) */
+    XS_FROM_BOOL = 4      /* was a switch: a file's or variable's true / false
+                           * still reads, as the float's 1 / 0 (BO-212) */
 };
 
 typedef enum {
@@ -89,8 +91,22 @@ typedef enum {
     XS_INTERFACE_MENU_ENTRY, /* the overlay's entry in the title's own Settings menu, on by default */
     XS_AUDIO_CUSTOM_LEVEL,   /* the user's own music against the title's: off / quieter / match / louder (apu_level.h) */
     XS_DISPLAY_SCORE_BOARD,  /* a title hook: the HUD's score board as shipped or smooth */
+    XS_AUDIO_MENU_SOUNDS,    /* the title's own menu sounds in the overlay, on by default */
+    XS_GRAPHICS_HDR,         /* BO-110: HDR output (EDR on macOS), off = the SDR path */
+    XS_GRAPHICS_HDR_PEAK,    /* the display's peak, nits; 0: what the display reports */
+    XS_GRAPHICS_HDR_PAPER,   /* the scene's paper white, nits */
+    XS_GRAPHICS_HDR_HUD,     /* the HUD's and menus' white, nits; 0: the paper white */
+    XS_GRAPHICS_HDR_SHADOWS, /* Vulkan: the power on luminance below mid grey, 1 = the art */
+    XS_GRAPHICS_HDR_HIGHLIGHTS, /* Vulkan: the gain on light past paper white, 1 = as stacked */
+    XS_GRAPHICS_HDR_DECODE,  /* Vulkan: 2.2 / srgb, how 8-bit values become light (no row) */
+    XS_DISPLAY_FRAME_PACING, /* auto / low_latency / smooth: the present queue (fb_present_vulkan.c, BO-110) */
+    XS_GAME_RACE_CLOCK,      /* an opt-in guest patch: a race keeps real time on a slow host from its start, off as shipped */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
+    XS_INPUT_TOUCH,          /* the on-screen controls: auto / always / off (touch_pad.h) */
+    XS_INPUT_TOUCH_OPACITY,
+    XS_INPUT_TOUCH_SCALE,
+    XS_INPUT_TOUCH_AUTO_GAS,
 #endif
     XS_COUNT
 } xs_id;
@@ -236,6 +252,67 @@ void xbox_OverlaySetGameArt(const char *path, uint64_t size, const char *sha256_
 /* 1 the pictures are in use, -1 they are not (none named, another file), 0
  * still being prepared: waits up to wait_ms for an answer. */
 int xbox_OverlayGameArtState(unsigned wait_ms);
+
+/* More of the title's menu pictures (BO-190), each named with its own file
+ * (Burnout 3: Data/Global.txd and Data/Frontend.txd), read with the ones
+ * above and checked the same way (`size` bytes with this SHA-256; each file
+ * is read once). A file that cannot be used costs only its own pictures: the
+ * rows they belong to keep their drawn look. `fmt` is 1 (DXT1), 5 (DXT5) or
+ * 8 (8-bit palette, Xbox swizzled, the palette's 0x40-byte header and 256
+ * B, G, R, A colours right after the pixels). An entry with path NULL is not
+ * used. `sprites` has XBOX_OVERLAY_ART2_COUNT entries, in the order of the
+ * enum; it is copied. Call before xbox_OverlaySetGameArt. */
+enum {
+    XBOX_OVERLAY_ART2_VOLUMEBAR,   /* 128x32 (P8): the audio volume bar, twenty cells
+                                    * of 6 texels, full above (16 high) and empty below */
+    XBOX_OVERLAY_ART2_TICK,        /* 64x64: a blue disc with a white tick (on) */
+    XBOX_OVERLAY_ART2_CIRCLE,      /* 32x32: a white ring (off) */
+    XBOX_OVERLAY_ART2_PADLOCK,     /* 32x32 (P8): a padlock (a setting fixed elsewhere) */
+    XBOX_OVERLAY_ART2_COUNT
+};
+typedef struct {
+    const char *path;
+    uint64_t size;
+    const char *sha256_hex;
+    uint32_t off, w, h, fmt;
+} xbox_overlay_sprite_file;
+void xbox_OverlaySetGameArtMore(const xbox_overlay_sprite_file *sprites);
+
+/* The title's own menu sounds for the overlay (BO-190): a cursor move, a
+ * value change, a confirm, a back, the menu opening and closing, a page
+ * turned. Each is a stretch of raw mono signed 16-bit PCM inside a file of
+ * the player's install (Burnout 3: sound/Fe.awd and sound/Generic.awd),
+ * read at run time like the pictures (nothing of it is in this repository
+ * or written to disk): `bytes` from `off`, at `rate` Hz, played at `gain_db`
+ * (the level the title plays it at). The file must be `size` bytes with this
+ * SHA-256; else, or when it cannot be read, that sound is silent, quietly. A
+ * cue with path NULL has no sound. They play on the host's output after the
+ * mix (mcpx_apu_ui_cue), while the title is paused too, at the gain of the
+ * host mixer's bus `bus_key` (apu_bus_find) when the mixer is on, and only
+ * with audio.menu_sounds on. `cues` has XBOX_OVERLAY_SND_COUNT entries, in
+ * the order of the enum; it is copied. Call once, before or after the
+ * window. RECOMP_OVERLAY_MENU_SOUNDS=0 keeps the overlay silent. */
+enum {
+    XBOX_OVERLAY_SND_MOVE,         /* the cursor up or down */
+    XBOX_OVERLAY_SND_CHANGE,       /* a value left or right */
+    XBOX_OVERLAY_SND_SELECT,       /* A on a row */
+    XBOX_OVERLAY_SND_BACK,         /* B out of a page within the menu */
+    XBOX_OVERLAY_SND_OPEN,         /* the menu shows */
+    XBOX_OVERLAY_SND_CLOSE,        /* the menu goes */
+    XBOX_OVERLAY_SND_PAGE,         /* another page (LB / RB) */
+    XBOX_OVERLAY_SND_COUNT
+};
+typedef struct {
+    const char *path;
+    uint64_t size;
+    const char *sha256_hex;
+    uint32_t off, bytes, rate;
+    float gain_db;
+} xbox_overlay_sound;
+void xbox_OverlaySetMenuSounds(const xbox_overlay_sound *cues, const char *bus_key);
+/* 1 the sounds are ready (some may be silent), -1 there are none, 0 still
+ * being read: waits up to wait_ms for an answer. */
+int xbox_OverlayMenuSoundsState(unsigned wait_ms);
 
 /* The button prompts the title draws for each pad (nv2a_texrep.h; the
  * title's Buttons sheet with the port's own drawings over it): variants[v - 1]

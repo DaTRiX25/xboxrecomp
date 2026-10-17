@@ -78,6 +78,9 @@ void xbox_SpinWake(void);
  * waits for its vsync worker (Xerenge rexglue/src/plume_renderer/
  * plume_graphics_system.cpp, PaceSwapToVblank), rather than a sleep-poll. */
 int  xbox_VblankWaitUntil(uint32_t target, uint32_t timeout_ms);
+/* One pass of a busy-wait: the CPU's pause hint (x86 PAUSE, arm64 YIELD;
+ * nothing elsewhere). For the vblank spins here and the timer thread's. */
+void xbox_CpuRelax(void);
 void xbox_VblankSignal(void);
 /* Mode sleep: spin through the last ns before the target vblank instead of
  * sleeping (present.spin_lead; 0, the default, sleeps to it). The timer
@@ -94,6 +97,23 @@ int  xbox_PacingAutoState(double *lead_ms, char *why, size_t n);
  * (vblanks), when the frame reached the hold and the edge of the vblank it
  * asked for (0: unknown). Feeds Auto; nothing when it is off. */
 void xbox_PacingHoldSample(uint32_t interval, uint64_t arrive_ns, uint64_t edge_ns);
+/* The executor at each flip, in every mode: the interval asked, whether its
+ * vblank had passed, and running totals of its hold and scan time (ns). An
+ * always-printed [PACING] line when the frame rate drops says whether the
+ * executor, the title or the pacing is the cause (pacing_diag.h, BO-210). */
+void xbox_PacingFlipCadence(uint32_t interval, int late, uint64_t hold_total,
+                            uint64_t scan_total);
+/* The pacing watchdog (pacing_watch.h, BO-211). A presenter's hook that
+ * makes its frame-queue keeper start over: called on the executor's thread
+ * at a reset, it sets flags and returns. At most 4. */
+void xbox_PacingResetHook(void (*fn)(void));
+/* Reset the pacing state now (a settings change: Frame pacing, Power mode):
+ * the keeper hooks and the display lock, at the executor's next flip. Any
+ * thread. One always-printed line, "<why>: ... start over". */
+void xbox_PacingWatchReset(const char *why);
+/* The window can be seen (not minimised or hidden): while it cannot, the
+ * watchdog decides nothing. Any thread. */
+void xbox_PacingSetVisible(int visible);
 void xbox_VblankNextDue(uint64_t ns);
 /* The grid time of the last vblank raised, and of vblank number `count`
  * (one already raised, or one still to come); 0 before the first. */
@@ -129,6 +149,13 @@ void xbox_PacingFlip(uint32_t flip, uint32_t batches);
  * vblank timer's grid follows the display's (xbox_VblankSchedule). */
 void xbox_VblankDisplayRefresh(uint64_t when_ns, uint64_t period_ns);
 int  xbox_VblankDisplayLockOn(void);
+/* Drop what the lock learned (period, anchor, candidates); the vblank keeps
+ * its own grid until fresh reports lock it again. Any thread; taken at the
+ * next report. */
+void xbox_VblankDisplayRelearn(void);
+/* 1 once after the lock saw the display change its rate (then 0 until it
+ * sees another): the watchdog's window then decides nothing. */
+int  xbox_VblankDisplayRateChanged(void);
 /* A presenter turns the lock on or off itself (display.present_timing =
  * auto); a RECOMP_VBLANK_SYNC that is set keeps its meaning. */
 void xbox_VblankDisplayLockAuto(int on);

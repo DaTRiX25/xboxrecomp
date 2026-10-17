@@ -37,6 +37,7 @@
 #include <SDL_metal.h>
 #include <SDL_syswm.h>
 #include <mach/mach_time.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +68,19 @@
 #endif
 
 static id<MTLDevice>               s_dev;
+/* BO-110 (RECOMP_DEBUG=hdr): an EDR layer, RGBA16Float in extended sRGB, so
+ * the game's values pass 1.0 as they are (gamma-encoded, as the title blends
+ * them); the slots and the post passes are half float too. Everything at or
+ * below 1.0 is written as it is: SDR content keeps its look at the system's
+ * paper white. fs_hdr_comp puts the scene's light (the frame where it
+ * equals the backend's scene snapshot) through a shoulder towards the peak
+ * and the HUD at its own white, live from the settings. */
+static int                         s_hdr_win;    /* the layer is EDR now */
+static id<MTLRenderPipelineState>  s_hp_blit, s_hp_fxaa, s_hp_cas, s_hp_comp;   /* half-float variants */
+static id<MTLTexture>              s_scene[3];   /* per slot: the scene snapshot (nv2a_pb_metal.m) */
+static int                         s_scene_ok[3];
+static id<MTLTexture>              s_hp_c;       /* the composite, frame size */
+#define PP_FMT (s_hdr_win ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm)
 static id<MTLCommandQueue>         s_queue;
 static id<MTLRenderPipelineState>  s_pso;
 static id<MTLRenderPipelineState>  s_pso_fxaa, s_pso_cas;   /* post passes */
@@ -188,6 +202,7 @@ void fbm_vblank_link(SDL_Window *win)
  * Every drawable's presentedTime is recorded in both modes: the overlay's
  * graph and RECOMP_TRACE=glass show what reached the glass. */
 static pc_pacer        s_pacer;
+void xbox_PacingResetHook(void (*fn)(void));
 static pc_display      s_disp;
 static int             s_strategy = -1;         /* PC_*; -1 before the first look */
 static os_unfair_lock  s_pc_lock = OS_UNFAIR_LOCK_INIT;
@@ -296,10 +311,24 @@ static void timing_status(void)
     xbox_PresentCadenceStatus(&st);
 }
 
+/* The pacing watchdog's reset (BO-211), on the executor: the depth and the
+ * lead back to the setting's, the grid relearnt. */
+static void timing_pacing_reset(void)
+{
+    os_unfair_lock_lock(&s_pc_lock);
+    pc_pacer_relearn(&s_pacer);
+    os_unfair_lock_unlock(&s_pc_lock);
+}
+
 /* Twice a second, on the main thread: the display, the setting, the
  * strategy; what follows from a change. */
 static void timing_poll(SDL_Window *win)
 {
+    static int hooked;
+    if (!hooked) {
+        hooked = 1;
+        xbox_PacingResetHook(timing_pacing_reset);
+    }
     pc_display d;
     char name[sizeof s_disp_name];
     int fs = 0, strategy, changed;
@@ -432,10 +461,15 @@ static void glass_note(uint32_t flip, uint64_t vblank_ns, uint64_t commit_ns,
     os_unfair_lock_unlock(&s_pc_lock);
     if (report)
         xbox_VblankDisplayRefresh(report, period);
-    if (raised)
+    if (raised > 0)
         fprintf(stderr, "[PRESENT] timing: frames reached the glass late; now %s\n",
                 strategy == PC_LOCK ? "one refresh more between a frame's vblank and its refresh"
                                     : "2 ms more between a frame's vblank and its present");
+    else if (raised < 0)
+        fprintf(stderr, "[PRESENT] timing: %d s of frames on time; now %s\n",
+                PC_DECAY_FRAMES / 60,
+                strategy == PC_LOCK ? "one refresh less between a frame's vblank and its refresh"
+                                    : "2 ms less between a frame's vblank and its present");
     if ((f = glass_file()) != NULL)
         fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,%d,%d,%u,%d,%d,%.3f,%d\n", flip,
                 (unsigned long long)vblank_ns, (unsigned long long)commit_ns,
@@ -469,6 +503,55 @@ static const char s_blit_msl[] =
     "    }\n"
     "    return float4(c, 1);\n"
     "}\n"
+    /* BO-110: the same scale into an extended-sRGB EDR layer. hr.x is the
+     * peak in paper whites (the display's headroom, or the user's peak if
+     * lower). Values at or below 1.0 pass as they are; above, the brightest
+     * channel in linear light goes through a shoulder with slope 1 at 1.0
+     * that approaches the peak, and the others keep their ratio to it (hue
+     * kept), then back to extended sRGB. */
+    "float3 hdr_lin(float3 c) {\n"
+    "    return select(c / 12.92, pow((max(c, 0.0) + 0.055) / 1.055, 2.4), c > 0.04045);\n"
+    "}\n"
+    "float3 hdr_enc(float3 l) {\n"
+    "    return select(l * 12.92, 1.055 * pow(max(l, 0.0), 1.0 / 2.4) - 0.055, l > 0.0031308);\n"
+    "}\n"
+    /* The composite, at the frame's size: f the frame, g the scene
+     * snapshot (hp.w 1 when there is one). A pixel where the frame is the
+     * snapshot is scene: linear, a shoulder on its brightest channel (slope
+     * 1 at paper white, towards the peak; hue kept), times paper white. One
+     * that differs was drawn over by the HUD or a menu: clamped to 1.0, times
+     * the HUD's white. hp: paper, HUD and peak in EDR units (1.0 = the
+     * system's SDR white), has scene. Out: extended sRGB. */
+    "fragment float4 fs_hdr_comp(VO vo [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+    "                            texture2d<float> sc [[texture(1)]], sampler s [[sampler(0)]],\n"
+    "                            constant float4 *hq [[buffer(0)]]) {\n"
+    /* hq[1]: x the shoulder's softness, y the black level in EDR units (BO-195) */
+    "    float4 hp = hq[0], hb = hq[1];\n"
+    "    float3 f = t.sample(s, vo.t).rgb, l;\n"
+    "    bool scene = false;\n"
+    "    if (hp.w > 0.5) {\n"
+    "        float3 g = sc.sample(s, vo.t).rgb, d = abs(f - g);\n"
+    "        scene = max(d.r, max(d.g, d.b)) < 0.002;\n"
+    "    }\n"
+    "    if (!scene) {\n"
+    "        l = hdr_lin(saturate(f)) * hp.y;\n"
+    "    } else {\n"
+    "        l = hdr_lin(max(f, 0.0));\n"
+    "        float mx = max(l.r, max(l.g, l.b)), m = max(hp.z / hp.x, 1.0);\n"
+    "        if (mx > 1.0) {\n"
+    "            float y = 1.0;\n"
+    "            if (m > 1.0001) {\n"
+    "                float k = m - 1.0, e = 1.0 + k * (1.0 - exp(-(mx - 1.0) / k));\n"
+    "                float r = 1.0 + k * (mx - 1.0) / ((mx - 1.0) + k);\n"
+    "                y = mix(e, r, hb.x * clamp(k - 0.5, 0.0, 1.0) * smoothstep(2.5, 4.0, mx));\n"
+    "            }\n"
+    "            l *= y / mx;\n"
+    "        }\n"
+    "        l *= hp.x;\n"
+    "    }\n"
+    "    l = hb.y + (1.0 - hb.y / hp.z) * l;\n"
+    "    return float4(hdr_enc(l), 1);\n"
+    "}\n"
     /* The post passes (post_shaders.h): the frame at its own size, one pixel
      * to one texel, so a bilinear fetch at an offset of whole texels is that
      * texel. */
@@ -486,6 +569,91 @@ static const char s_blit_msl[] =
     "    float2 rcp = 1.0 / float2(t.get_width(), t.get_height());\n"
     POST_CAS_BODY
     "}\n";
+
+/* BO-110: the window's display, for the HDR settings: how far past its SDR
+ * white it can go at most and now (EDR headroom; 1.0 none). */
+static void hdr_display(SDL_Window *win)
+{
+    NSScreen *scr = [NSScreen mainScreen];
+    SDL_SysWMinfo wm;
+    float pot = 1.0f, now = 1.0f;
+    SDL_VERSION(&wm.version);
+    if (win && SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_COCOA
+            && wm.info.cocoa.window.screen)
+        scr = wm.info.cocoa.window.screen;
+    if (@available(macOS 10.15, *)) {
+        pot = (float)scr.maximumPotentialExtendedDynamicRangeColorComponentValue;
+        now = (float)scr.maximumExtendedDynamicRangeColorComponentValue;
+    }
+    nv2a_host_hdr_display(pot, now);
+}
+
+/* BO-110: the layer EDR (RGBA16Float, extended sRGB: the encoding the
+ * game's values and the overlay's are in, 1.0 the system's SDR white, past
+ * 1.0 brighter) or as before. Live: the slots and the post targets follow
+ * the format at their next use. */
+static void hdr_layer(int on)
+{
+    CGColorSpaceRef cs;
+    if (on && (!s_hp_blit || !s_hp_comp))
+        on = 0;
+    if (on == s_hdr_win)
+        return;
+    s_hdr_win = on;
+    cs = CGColorSpaceCreateWithName(on ? kCGColorSpaceExtendedSRGB : kCGColorSpaceSRGB);
+    s_layer.pixelFormat = on ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+    s_layer.wantsExtendedDynamicRangeContent = on ? YES : NO;
+    s_layer.colorspace = cs;
+    CGColorSpaceRelease(cs);
+    /* SMAA's last pass writes the frame's format: made again. */
+    for (int k = 0; k < 3; k++) {
+        [s_pso_sm[k] release];
+        s_pso_sm[k] = nil;
+    }
+    s_smaa_state = 0;
+    fprintf(stderr, "[PRESENT] HDR %s: %s layer\n", on ? "on" : "off",
+            on ? "EDR (RGBA16Float, extended sRGB)" : "SDR (BGRA8, sRGB)");
+}
+
+/* BO-110: the peak calibration patch for the overlay (nv2a_host_hdr_patch):
+ * a sun-like disc at symbol_nits on a background far past any display's
+ * peak, so the disc disappears once it reaches what the display can show.
+ * Extended sRGB values, as the overlay draws into the EDR layer. */
+static id<MTLTexture> s_patch;
+static float          s_patch_nits = -1.0f;
+static void *hdr_patch(float nits)
+{
+    enum { PW = 128, PH = 64 };
+    if (!s_hdr_win)
+        return NULL;
+    if (!s_patch) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                         width:PW height:PH mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        s_patch = [s_dev newTextureWithDescriptor:td];
+        if (!s_patch)
+            return NULL;
+    }
+    if (nits != s_patch_nits) {
+        static __fp16 px[PH][PW][4];
+        float bg = 1.055f * powf(100.0f, 1.0f / 2.4f) - 0.055f;          /* EDR 100: clipped by any display */
+        float l = nits / 100.0f;
+        float fg = l > 0.0031308f ? 1.055f * powf(l, 1.0f / 2.4f) - 0.055f : l * 12.92f;
+        for (int y = 0; y < PH; y++)
+            for (int x = 0; x < PW; x++) {
+                float dx = x - PW * 0.5f + 0.5f, dy = y - PH * 0.5f + 0.5f;
+                float d = sqrtf(dx * dx + dy * dy);
+                float v = d < PH * 0.22f ? fg : bg;
+                px[y][x][0] = px[y][x][1] = px[y][x][2] = (__fp16)v;
+                px[y][x][3] = (__fp16)1.0f;
+            }
+        [s_patch replaceRegion:MTLRegionMake2D(0, 0, PW, PH) mipmapLevel:0 withBytes:px
+                   bytesPerRow:PW * 8];
+        s_patch_nits = nits;
+    }
+    return (void *)s_patch;
+}
 
 static int fail(char *err, size_t n, const char *what)
 {
@@ -522,6 +690,19 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             return fail(err, errn, "present shader failed to compile");
         pd = [[MTLRenderPipelineDescriptor alloc] init];
         pd.vertexFunction = [[lib newFunctionWithName:@"vs_blit"] autorelease];
+        /* BO-110: the half-float set first (an EDR layer, its passes). */
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_blit"] autorelease];
+        s_hp_blit = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_hdr_comp"] autorelease];
+        s_hp_comp = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_fxaa"] autorelease];
+        s_hp_fxaa = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_cas"] autorelease];
+        s_hp_cas = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!s_hp_blit || !s_hp_comp)
+            XR_ERROR( "[PRESENT] HDR passes unavailable: %s\n",
+                    e ? [[e localizedDescription] UTF8String] : "?");
         pd.fragmentFunction = [[lib newFunctionWithName:@"fs_blit"] autorelease];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         s_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
@@ -567,6 +748,9 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
             s_layer.colorspace = cs;
             CGColorSpaceRelease(cs);
         }
+        hdr_display(win);           /* BO-110: what the display can show */
+        nv2a_host_set_hdr_patch_fn(hdr_patch);
+        hdr_layer(nv2a_host_hdr_active());
         s_layer.framebufferOnly = shots ? NO : YES;
         s_layer.displaySyncEnabled = vsync ? YES : NO;
         /* Two drawables: at most one frame queued ahead of the display
@@ -664,9 +848,10 @@ void fbm_get(void **device, void **queue)
 void *fbm_slot(int k, uint32_t w, uint32_t h)
 {
     @autoreleasepool {
-        if (!s_slot[k] || [s_slot[k] width] != w || [s_slot[k] height] != h) {
+        if (!s_slot[k] || [s_slot[k] width] != w || [s_slot[k] height] != h
+                || [s_slot[k] pixelFormat] != PP_FMT) {
             MTLTextureDescriptor *td = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                texture2DDescriptorWithPixelFormat:PP_FMT
                                              width:w height:h mipmapped:NO];
             td.usage = MTLTextureUsageShaderRead;
             /* Shared: an upload needs replaceRegion, which a private texture
@@ -681,6 +866,31 @@ void *fbm_slot(int k, uint32_t w, uint32_t h)
         }
     }
     return (void *)s_slot[k];
+}
+
+/* BO-110: slot k's scene snapshot at w x h (half float), and whether this
+ * frame has one. */
+void *fbm_scene_slot(int k, uint32_t w, uint32_t h, int valid)
+{
+    s_scene_ok[k] = 0;
+    if (!valid || !s_hdr_win)
+        return NULL;
+    @autoreleasepool {
+        if (!s_scene[k] || [s_scene[k] width] != w || [s_scene[k] height] != h) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                             width:w height:h mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            td.storageMode = s_unified ? MTLStorageModeShared : MTLStorageModeManaged;
+#pragma clang diagnostic pop
+            [s_scene[k] release];
+            s_scene[k] = [s_dev newTextureWithDescriptor:td];
+        }
+    }
+    s_scene_ok[k] = s_scene[k] != nil;
+    return (void *)s_scene[k];
 }
 
 /* A guest-bytes frame (bpp 4 = X8R8G8B8, which is BGRA8's byte order;
@@ -700,6 +910,34 @@ int fbm_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pitch
         t = (id<MTLTexture>)fbm_slot(k, w, h);
         if (!t)
             return 0;
+        s_scene_ok[k] = 0;
+        if (s_hdr_win) {
+            /* BO-110: a half-float slot; the guest's bytes converted. */
+            uint16_t *row = (uint16_t *)malloc((size_t)w * 8u);
+            for (y = 0; row && y < h; y++) {
+                for (x = 0; x < w; x++) {
+                    uint32_t v;
+                    __fp16 c[4];
+                    if (bpp == 4) {
+                        memcpy(&v, src + (size_t)y * pitch + x * 4u, 4);
+                    } else {
+                        uint16_t q;
+                        memcpy(&q, src + (size_t)y * pitch + x * 2u, 2);
+                        v = 0xFF000000u | ((uint32_t)((q >> 11) & 0x1F) << 19)
+                          | ((uint32_t)((q >> 5) & 0x3F) << 10) | ((uint32_t)(q & 0x1F) << 3);
+                    }
+                    c[0] = (__fp16)(((v >> 16) & 0xFF) / 255.0f);
+                    c[1] = (__fp16)(((v >> 8) & 0xFF) / 255.0f);
+                    c[2] = (__fp16)((v & 0xFF) / 255.0f);
+                    c[3] = (__fp16)1.0f;
+                    memcpy(row + x * 4u, c, 8);
+                }
+                [t replaceRegion:MTLRegionMake2D(0, y, w, 1) mipmapLevel:0 withBytes:row
+                     bytesPerRow:w * 8u];
+            }
+            free(row);
+            return row != NULL;
+        }
         if (bpp == 4) {
             [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:src
                  bytesPerRow:pitch];
@@ -758,7 +996,7 @@ static void save_shot(id<MTLBuffer> buf, uint32_t w, uint32_t h, const char *pat
 static id<MTLTexture> target_texture(id<MTLTexture> *slot, MTLPixelFormat fmt, NSUInteger w,
                                      NSUInteger h)
 {
-    if (!*slot || [*slot width] != w || [*slot height] != h) {
+    if (!*slot || [*slot width] != w || [*slot height] != h || [*slot pixelFormat] != fmt) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
         td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
@@ -845,8 +1083,7 @@ static void post_pass(id<MTLCommandBuffer> *cbp, int what, id<MTLRenderPipelineS
 /* SMAA's pipelines and lookup textures, at the first use. 1 when it can run. */
 static int smaa_init(void)
 {
-    static const MTLPixelFormat fmt[3] = { MTLPixelFormatRG8Unorm, MTLPixelFormatRGBA8Unorm,
-                                           MTLPixelFormatBGRA8Unorm };
+    const MTLPixelFormat fmt[3] = { MTLPixelFormatRG8Unorm, MTLPixelFormatRGBA8Unorm, PP_FMT };
     static const char *const fn[3] = { "fs_smaa_edges", "fs_smaa_weights", "fs_smaa_blend" };
     NSError *e = nil;
     char *src;
@@ -932,9 +1169,18 @@ static id<MTLTexture> post_chain(id<MTLCommandBuffer> *cbp, id<MTLTexture> src)
     int aa = nv2a_host_post_aa();
     float sharp = nv2a_host_sharpen();
     NSUInteger sw = [src width], sh = [src height];
-    int fx = aa == NV2A_AA_FXAA && s_pso_fxaa;
+    static int warmed;
+    if (!warmed) {
+        /* BO-208: SMAA's pipelines are built at the first present, not at
+         * the moment the player picks SMAA (FXAA and CAS are made at start). */
+        warmed = 1;
+        (void)smaa_init();
+    }
+    id<MTLRenderPipelineState> pfx = s_hdr_win ? s_hp_fxaa : s_pso_fxaa;
+    id<MTLRenderPipelineState> pcas = s_hdr_win ? s_hp_cas : s_pso_cas;
+    int fx = aa == NV2A_AA_FXAA && pfx;
     int sm = aa == NV2A_AA_SMAA && smaa_init() && smaa_textures(sw, sh);
-    int cas = sharp > 0.001f && s_pso_cas;
+    int cas = sharp > 0.001f && pcas;
     float metrics[4] = { 1.0f / (float)sw, 1.0f / (float)sh, (float)sw, (float)sh };
     static int last_aa = -1;
     static float last_sharp = -1.0f;
@@ -957,13 +1203,13 @@ static id<MTLTexture> post_chain(id<MTLCommandBuffer> *cbp, id<MTLTexture> src)
         s_pp[1] = nil;
     }
     if (fx) {
-        id<MTLTexture> dst = target_texture(&s_pp[0], MTLPixelFormatBGRA8Unorm, sw, sh);
+        id<MTLTexture> dst = target_texture(&s_pp[0], PP_FMT, sw, sh);
         if (dst) {
-            post_pass(cbp, PT_FXAA, s_pso_fxaa, dst, 0, &src, 1, NULL, 0);
+            post_pass(cbp, PT_FXAA, pfx, dst, 0, &src, 1, NULL, 0);
             src = dst;
         }
     } else if (sm) {
-        id<MTLTexture> dst = target_texture(&s_pp[0], MTLPixelFormatBGRA8Unorm, sw, sh);
+        id<MTLTexture> dst = target_texture(&s_pp[0], PP_FMT, sw, sh);
         if (dst) {
             id<MTLTexture> in2[3];
             in2[0] = src;
@@ -979,9 +1225,9 @@ static id<MTLTexture> post_chain(id<MTLCommandBuffer> *cbp, id<MTLTexture> src)
         }
     }
     if (cas) {
-        id<MTLTexture> dst = target_texture(&s_pp[1], MTLPixelFormatBGRA8Unorm, sw, sh);
+        id<MTLTexture> dst = target_texture(&s_pp[1], PP_FMT, sw, sh);
         if (dst) {
-            post_pass(cbp, PT_CAS, s_pso_cas, dst, 0, &src, 1, &sharp, sizeof sharp);
+            post_pass(cbp, PT_CAS, pcas, dst, 0, &src, 1, &sharp, sizeof sharp);
             src = dst;
         }
     }
@@ -1058,7 +1304,32 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         /* The post passes (post_shaders.h), at the frame's own size and
          * before the scale to the window; the overlay below is drawn after
          * them, so it is not filtered. */
+        /* BO-110: HDR follows the setting live; the display's headroom is
+         * read every present (macOS changes it with the brightness). */
+        hdr_display(win);
+        hdr_layer(nv2a_host_hdr_active());
+        if (s_hdr_win && s_slot[k] && [s_slot[k] pixelFormat] != MTLPixelFormatRGBA16Float)
+            fw = fh = 0;               /* a slot from before the switch: black once */
         src = s_slot[k];
+        if (s_hdr_win && src && fw && fh) {
+            /* The composite at the frame's size, then the post passes on it. */
+            float pk, pw, hw;
+            id<MTLTexture> in2[2];
+            id<MTLTexture> dst = target_texture(&s_hp_c, MTLPixelFormatRGBA16Float,
+                                                [src width], [src height]);
+            nv2a_host_hdr_levels(&pk, &pw, &hw);
+            float sf, bl;
+            nv2a_host_hdr_shape(&sf, &bl);
+            float hp[8] = { pw / 100.0f, hw / 100.0f, pk / 100.0f,
+                            s_scene_ok[k] && s_scene[k] ? 1.0f : 0.0f,
+                            sf, bl / 100.0f, 0.0f, 0.0f };
+            if (dst) {
+                in2[0] = src;
+                in2[1] = hp[3] > 0.5f ? s_scene[k] : src;
+                post_pass(&cb, PT_SCALE, s_hp_comp, dst, 0, in2, 2, hp, sizeof hp);
+                src = dst;
+            }
+        }
         if (src && fw && fh)
             src = post_chain(&cb, src);
         rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1077,12 +1348,14 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 MTLViewport vp = { r.x, r.y, r.w, r.h, 0.0, 1.0 };
                 int lin = filter == NV2A_PRESENT_LINEAR
                           || (filter == NV2A_PRESENT_INTEGER && !whole);
-                [enc setRenderPipelineState:s_pso];
+                [enc setRenderPipelineState:s_hdr_win ? s_hp_blit : s_pso];
                 [enc setViewport:vp];
                 [enc setFragmentTexture:src atIndex:0];
                 [enc setFragmentSamplerState:s_smp[lin] atIndex:0];
                 float dither = nv2a_host_dither() ? 1.0f : 0.0f;
                 [enc setFragmentBytes:uv length:sizeof uv atIndex:0];
+                if (s_hdr_win)
+                    dither = 0.0f;      /* BO-110: the half-float layer needs none */
                 [enc setFragmentBytes:&dither length:sizeof dither atIndex:1];
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             }
@@ -1094,7 +1367,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             xbox_OverlayMetalDraw((void *)s_dev, (void *)cb, (void *)rp, (void *)enc);
 #endif
         [enc endEncoding];
-        if (shot_path) {
+        if (shot_path && !s_hdr_win) {
             shot = [s_dev newBufferWithLength:(NSUInteger)dw * dh * 4
                                       options:MTLResourceStorageModeShared];
             if (shot) {

@@ -158,6 +158,39 @@ int main(void)
     setenv("RECOMP_TRACE", "pacing", 1);
     xr_log_init(0, 1);
     check(g_xr_log_diag == 0 && xr_log_forced(), "RECOMP_LOG_DIAG=0 wins over a developer switch");
+    /* The saved setting at start (BO-193): applied after init, it decides
+     * when nothing in the environment does, and the environment still wins. */
+    env_clear();
+    xr_log_init(1, 0);
+    check(g_xr_log_diag == 0 && !strcmp(xr_log_source(), "build default"), "release, before the file: off");
+    check(xr_log_set_diag(1) == 1 && !xr_log_forced() && !strcmp(xr_log_source(), "setting"),
+          "a saved diagnostic_log = true turns it on, source setting");
+    capture_begin();
+    xr_log_announce();
+    capture_end(out, err, sizeof out);
+    check(strstr(err, "diagnostic logging is on (setting)") != NULL, "the start-up line says on (setting)");
+    xr_log_init(1, 0);
+    xr_log_set_diag(0);
+    capture_begin();
+    xr_log_announce();
+    capture_end(out, err, sizeof out);
+    check(strstr(err, "diagnostic logging is off") && strstr(err, "(setting)"), "saved false: off (setting)");
+    xr_log_init(0, 0);
+    check(xr_log_set_diag(0) == 0, "a developer build with a saved false is quiet");
+    setenv("RECOMP_LOG_DIAG", "0", 1);
+    xr_log_init(1, 0);
+    check(xr_log_set_diag(1) == 0 && xr_log_forced() && !strcmp(xr_log_source(), "RECOMP_LOG_DIAG"),
+          "RECOMP_LOG_DIAG=0 beats a saved true");
+    setenv("RECOMP_LOG_DIAG", "1", 1);
+    xr_log_init(1, 0);
+    check(xr_log_set_diag(0) == 1 && !strcmp(xr_log_source(), "RECOMP_LOG_DIAG"),
+          "RECOMP_LOG_DIAG=1 beats a saved false");
+    setenv("RECOMP_LOG_DIAG", "1", 1);
+    xr_log_init(1, 0);
+    capture_begin();
+    xr_log_announce();
+    capture_end(out, err, sizeof out);
+    check(strstr(err, "diagnostic logging is on (RECOMP_LOG_DIAG)") != NULL, "the line names the variable");
     env_clear();
     xr_log_init(1, 1);
     check(g_xr_log_diag == 1 && !strcmp(xr_log_source(), "--headless"), "--headless forces it on");

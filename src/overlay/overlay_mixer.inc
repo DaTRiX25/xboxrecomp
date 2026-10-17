@@ -794,6 +794,7 @@ static void build_mixer(float fs, ImDrawList *dl)
     const float list_h = avail.y - footer;
     const float list_w = pan_view ? avail.x * 0.56f : avail.x;
     ImGui::BeginChild("mixer", ImVec2(list_w, list_h), ImGuiChildFlags_None, ImGuiWindowFlags_NoNav);
+    gesture_scroll();
     ImDrawList *cdl = ImGui::GetWindowDrawList();
     const float rw = ImGui::GetContentRegionAvail().x - fs * 0.5f;
     int clicked = -1, cdir = 0;
@@ -802,12 +803,12 @@ static void build_mixer(float fs, ImDrawList *dl)
         ImVec2 p = ImGui::GetCursorScreenPos();
         bool isel = i == sel;
         ImGui::PushID(i);
-        ImGui::InvisibleButton("##mx", ImVec2(rw, rh));
+        const bool tap = ImGui::InvisibleButton("##mx", ImVec2(rw, rh)) && gesture_tap();
         if (ImGui::IsItemHovered() && mx_selectable(m) && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
             sel = i;
             s_last_input_pad = false;
         }
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && mx_selectable(m)) {
+        if (tap && mx_selectable(m)) {
             clicked = i;
             /* The right fifth steps up, the fifth before it down; the rest
              * of the row is A. */

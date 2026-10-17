@@ -29,7 +29,7 @@ and XMV tooling, and the recompilation pipeline that ties them together.
 The fork of xboxrecomp this branch comes from: the Metal backend and the first
 macOS host.
 
-### Kornél Felföldi
+### xenophobentx
 The `takedawn` branch, the toolkit of the
 [Takedawn](https://github.com/xenophobentx/takedawn) port: the Vulkan backend,
 the Linux and Android hosts, the settings overlay, frame pacing and the port's

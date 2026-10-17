@@ -59,9 +59,66 @@ static const char s_rc_helpers[] =
     "    return vec3(rc_op(x.r, op), rc_op(x.g, op), rc_op(x.b, op));\n"
     "}\n";
 
+/* BO-110, HDR variant (as s_rc_helpers_hdr in d3d8_combiners_msl.c): the
+ * upper bound of a value is a parameter (pc.hdr.x, per draw); the lower
+ * bounds and every [0, 1] clamp that feeds a complement or a selector stay. */
+static const char s_rc_helpers_hdr[] =
+    "float rc_map(float x, int m) {\n"
+    "    if (m == 0) return max(x, 0.0);\n"
+    "    if (m == 1) return 1.0 - saturate(x);\n"
+    "    if (m == 2) return 2.0 * saturate(x) - 1.0;\n"
+    "    if (m == 3) return 1.0 - 2.0 * saturate(x);\n"
+    "    if (m == 4) return saturate(x) - 0.5;\n"
+    "    if (m == 5) return 0.5 - saturate(x);\n"
+    "    if (m == 6) return x;\n"
+    "    return -x;\n"
+    "}\n"
+    "vec3 rc_map3(vec3 x, int m) {\n"
+    "    return vec3(rc_map(x.r, m), rc_map(x.g, m), rc_map(x.b, m));\n"
+    "}\n"
+    "float rc_op(float x, int op, float hi) {\n"
+    "    if (op == 1) x -= 0.5;\n"
+    "    else if (op == 2) x *= 2.0;\n"
+    "    else if (op == 3) x = (x - 0.5) * 2.0;\n"
+    "    else if (op == 4) x *= 4.0;\n"
+    "    else if (op == 6) x *= 0.5;\n"
+    "    return clamp(x, -1.0, hi);\n"
+    "}\n"
+    "float rc_sign8(float x) {\n"
+    "    x *= 255.0;\n"
+    "    return x >= 128.0 ? (x - 256.0) / 127.0 : x / 127.0;\n"
+    "}\n"
+    "vec3 rc_op3(vec3 x, int op, float hi) {\n"
+    "    return vec3(rc_op(x.r, op, hi), rc_op(x.g, op, hi), rc_op(x.b, op, hi));\n"
+    "}\n";
+
+/* The constants with the HDR member at the end (VkPsConsts). */
+#define D3D8_GLSL_PSCONSTS_HDR \
+    "layout(set = 0, binding = 2, std140) uniform PsConsts {\n" \
+    "    vec4 c0[8]; vec4 c1[8]; vec4 fc0; vec4 fc1; vec4 fog_color;\n" \
+    "    uvec4 atest; uvec4 alpha_only; vec4 tex_scale[4]; uvec4 tex_mode;\n" \
+    "    vec4 tex_bias;\n" \
+    "    vec4 bump_mat[4]; vec4 bump_lum[4];\n" \
+    "    vec4 hdr;\n" \
+    "} pc;\n"
+
+static int generate(const NV2ACombinerState *state, char *buf, int bufsize, int hdr);
+
 int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
                                  char *buf, int bufsize)
 {
+    return generate(state, buf, bufsize, 0);
+}
+
+int d3d8_combiners_generate_glsl_hdr(const NV2ACombinerState *state,
+                                     char *buf, int bufsize)
+{
+    return generate(state, buf, bufsize, 1);
+}
+
+static int generate(const NV2ACombinerState *state, char *buf, int bufsize, int hdr)
+{
+    const char *OPHI = hdr ? ", hi" : "", *OPHA = hdr ? ", 1.0" : "";
     static const char *const in_name[4] = { "A", "B", "C", "D" };
     char src[32];
     int off = 0;
@@ -70,7 +127,7 @@ int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
     EMIT("#version 450\n"
          "/* Auto-generated NV2A register combiners (GLSL, Vulkan) */\n");
     EMIT("%s", D3D8_GLSL_SATURATE);
-    EMIT("%s", D3D8_GLSL_PSCONSTS);
+    EMIT("%s", hdr ? D3D8_GLSL_PSCONSTS_HDR : D3D8_GLSL_PSCONSTS);
     EMIT("%s", D3D8_GLSL_FS_IN);
     EMIT("layout(location = 0) out vec4 o_color;\n");
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
@@ -82,9 +139,12 @@ int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
              m == NV2A_TEXMODE_3D ? "sampler3D" :
              m == NV2A_TEXMODE_CUBEMAP ? "samplerCube" : "sampler2D", i);
     }
-    EMIT("%s", s_rc_helpers);
+    EMIT("%s", hdr ? s_rc_helpers_hdr : s_rc_helpers);
 
     EMIT("void main() {\n");
+    if (hdr)
+        EMIT("    float hi = pc.hdr.x;\n"
+             "    float hlod = 1.0;\n");   /* BO-195: how much of a draw's gain its texture's mip keeps */
     for (k = 0; k < 16; k++)
         EMIT("    vec4 x%d = vec4(0.0);\n", k);
     if (state->fog_input)
@@ -154,6 +214,12 @@ int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
                      " uv /= i_t%d.w;\n", i, i, i, i);
             EMIT("        x%d = texture(tex%d, uv * pc.tex_scale[%d].xy, pc.tex_bias[%d]);\n",
                  8 + i, i, i, i);
+            if (hdr && i == 0 && m == NV2A_TEXMODE_2D)
+                /* BO-195 P3: pc.hdr.w is the span in mip levels over which a gained draw's
+                 * gain fades out (0: no fade); the unclamped LOD, the texture may have one level */
+                EMIT("        if (pc.hdr.w > 0.0)\n"
+                     "            hlod = clamp(1.0 - max(textureQueryLod(tex0, uv * pc.tex_scale[0].xy).y, 0.0)"
+                     " / pc.hdr.w, 0.0, 1.0);\n");
             EMIT("    }\n");
         }
         if (state->tex_signed[i]) {
@@ -196,18 +262,20 @@ int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
         EMIT("        vec3 ab = %s;\n", ro->ab_dot ? "vec3(dot(A, B))" : "A * B");
         EMIT("        vec3 cd = %s;\n", ro->cd_dot ? "vec3(dot(C, D))" : "C * D");
         EMIT("        vec3 sum = %s;\n", ro->mux_sum ? "sel ? cd : ab" : "ab + cd");
-        EMIT("        ab = rc_op3(ab, %d); cd = rc_op3(cd, %d); sum = rc_op3(sum, %d);\n",
-             (int)ro->output_map, (int)ro->output_map, (int)ro->output_map);
+        EMIT("        ab = rc_op3(ab, %d%s); cd = rc_op3(cd, %d%s); sum = rc_op3(sum, %d%s);\n",
+             (int)ro->output_map, OPHI, (int)ro->output_map, OPHI, (int)ro->output_map, OPHI);
         EMIT("        float aab = aA * aB, acd = aC * aD;\n");
         EMIT("        float asum = %s;\n", ao->mux_sum ? "sel ? acd : aab" : "aab + acd");
         if (ro->ab_dst)  EMIT("        x%d.rgb = ab;\n",  (int)ro->ab_dst);
         if (ro->cd_dst)  EMIT("        x%d.rgb = cd;\n",  (int)ro->cd_dst);
         if (ro->sum_dst) EMIT("        x%d.rgb = sum;\n", (int)ro->sum_dst);
-        if (ao->ab_dst)  EMIT("        x%d.a = rc_op(aab, %d);\n",  (int)ao->ab_dst,  (int)ao->output_map);
-        if (ao->cd_dst)  EMIT("        x%d.a = rc_op(acd, %d);\n",  (int)ao->cd_dst,  (int)ao->output_map);
-        if (ao->sum_dst) EMIT("        x%d.a = rc_op(asum, %d);\n", (int)ao->sum_dst, (int)ao->output_map);
-        if (ro->ab_blue_to_alpha && ro->ab_dst) EMIT("        x%d.a = ab.b;\n", (int)ro->ab_dst);
-        if (ro->cd_blue_to_alpha && ro->cd_dst) EMIT("        x%d.a = cd.b;\n", (int)ro->cd_dst);
+        if (ao->ab_dst)  EMIT("        x%d.a = rc_op(aab, %d%s);\n",  (int)ao->ab_dst,  (int)ao->output_map, OPHA);
+        if (ao->cd_dst)  EMIT("        x%d.a = rc_op(acd, %d%s);\n",  (int)ao->cd_dst,  (int)ao->output_map, OPHA);
+        if (ao->sum_dst) EMIT("        x%d.a = rc_op(asum, %d%s);\n", (int)ao->sum_dst, (int)ao->output_map, OPHA);
+        if (ro->ab_blue_to_alpha && ro->ab_dst)
+            EMIT(hdr ? "        x%d.a = min(ab.b, 1.0);\n" : "        x%d.a = ab.b;\n", (int)ro->ab_dst);
+        if (ro->cd_blue_to_alpha && ro->cd_dst)
+            EMIT(hdr ? "        x%d.a = min(cd.b, 1.0);\n" : "        x%d.a = cd.b;\n", (int)ro->cd_dst);
         EMIT("    }\n");
     }
 
@@ -225,25 +293,40 @@ int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
             k = order[i];
             if (k < 0) {
                 /* COMPLEMENT_V1 0x40, COMPLEMENT_R0 0x20 (xemu psh_regs.h). */
+                if (!hdr) {
                 EMIT("        vec3 fv1 = %ssaturate(x5.rgb);\n",
                      (state->final_flags & 0x40) ? "1.0 - " : "");
                 EMIT("        vec3 fr0 = %ssaturate(x12.rgb);\n",
                      (state->final_flags & 0x20) ? "1.0 - " : "");
                 EMIT("        x14 = vec4(%s(fv1 + fr0), 0.0);\n",
                      (state->final_flags & 0x80) ? "saturate" : "");
+                } else {
+                EMIT("        vec3 fv1 = %s;\n", (state->final_flags & 0x40)
+                     ? "1.0 - saturate(x5.rgb)" : "clamp(x5.rgb, 0.0, hi)");
+                EMIT("        vec3 fr0 = %s;\n", (state->final_flags & 0x20)
+                     ? "1.0 - saturate(x12.rgb)" : "clamp(x12.rgb, 0.0, hi)");
+                EMIT("        x14 = vec4(%s, 0.0);\n", (state->final_flags & 0x80)
+                     ? "clamp(fv1 + fr0, 0.0, hi)" : "(fv1 + fr0)");
+                }
                 EMIT("        x15 = vec4(E * F, 0.0);\n");
                 continue;
             }
             in = &state->final_input[k];
             input_src(in, 0, src, sizeof src);
-            EMIT("        vec3 %s = %ssaturate(%s);\n", fname[k],
-                 ((int)in->mapping & 1) ? "1.0 - " : "", src);
+            if (!hdr || ((int)in->mapping & 1))
+                EMIT("        vec3 %s = %ssaturate(%s);\n", fname[k],
+                     ((int)in->mapping & 1) ? "1.0 - " : "", src);
+            else
+                EMIT("        vec3 %s = clamp(%s, 0.0, hi);\n", fname[k], src);
         }
         input_src(&state->final_input[6], 1, src, sizeof src);
         EMIT("        float G = %ssaturate(%s);\n",
              ((int)state->final_input[6].mapping & 1) ? "1.0 - " : "", src);
     }
-    EMIT("        res = vec4(saturate(A * B + (1.0 - A) * C + D), G);\n");
+    if (!hdr)
+        EMIT("        res = vec4(saturate(A * B + (1.0 - A) * C + D), G);\n");
+    else
+        EMIT("        res = vec4(clamp(A * B + (1.0 - saturate(A)) * C + D, 0.0, hi), G);\n");
     EMIT("    }\n");
 
     /* ---- Alpha test: D3DCMP numbering on 8-bit values ---- */
@@ -261,6 +344,16 @@ int d3d8_combiners_generate_glsl(const NV2ACombinerState *state,
          "        else if (f == 7u) ok = a >= r;\n"
          "        if (!ok) discard;\n"
          "    }\n");
+    if (hdr)    /* BO-110: the draw's factor (the HUD's white over paper white for UI draws) */
+        EMIT(/* a gained draw's gain fades with the mip (BO-195 P3) */
+             "    float hgy = pc.hdr.w > 0.0 ? 1.0 + (pc.hdr.y - 1.0) * hlod : pc.hdr.y;\n"
+             "    float hgz = pc.hdr.w > 0.0 ? 1.0 + (pc.hdr.z - 1.0) * hlod : pc.hdr.z;\n"
+             "    res.rgb *= hgy;\n"
+             /* a light texture's highlight-only gain (nv2a_texrep_register_hdr_gain) */
+             "    if (hgz != 1.0) {\n"
+             "        float hs = smoothstep(0.6, 1.0, max(res.r, max(res.g, res.b)));\n"
+             "        res.rgb *= 1.0 + (hgz - 1.0) * hs * hs;\n"
+             "    }\n");
     EMIT("    o_color = res;\n");
     EMIT("}\n");
     return off;

@@ -162,6 +162,15 @@ int recomp_save_history_count(const char *dir, const char *title_id);
  * permission). Not created. */
 int recomp_home_dir(char *out, unsigned size);
 
+/* Small file helpers, for code that cannot reach this file's own (the Xbox
+ * save importer). Paths UTF-8, '/' accepted everywhere. fn returns 0 to stop. */
+int recomp_fs_is_dir(const char *path);
+void recomp_fs_mkdir_p(const char *path);
+void recomp_fs_rm_tree(const char *path);
+int recomp_fs_copy_tree(const char *from, const char *to);
+int recomp_fs_each(const char *dir, int (*fn)(const char *dir, const char *name, int dir_entry, void *ctx),
+                   void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

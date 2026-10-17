@@ -213,6 +213,30 @@ def test_store_u8_stores_the_value_again():
     assert "RECOMP_PATCH_U32" not in code and report.finish()
 
 
+# mov [DATA], ebx ; ret
+STORE_D_EBX = f"891d{D32}c3"
+
+
+def test_store_u32_stores_the_value_again():
+    for hexcode in (STORE_D_IMM, STORE, STORE_D_EBX):
+        code, report = _translate(hexcode, patch=True, kind="store_u32", value=1)
+        want = ('MEM32(0x20000) = RECOMP_PATCH_U32("game.speed_units", '
+                '"kmh", 0x1u, MEM32(0x20000));')
+        assert want in code, code
+        assert code.index("MEM32(0x20000) = ") < code.index(want)
+        assert report.finish() == []
+        plain, _ = _translate(hexcode)
+        assert [l for l in code.splitlines() if "RECOMP_PATCH" not in l] \
+            == plain.splitlines()
+    for hexcode in (STORE_B_IMM, STORE_B_BL, LOAD_EAX, CMP_MEM32_IMM):
+        code, report = _translate(hexcode, patch=True, kind="store_u32", value=1)
+        assert "RECOMP_PATCH_U32" not in code, hexcode
+        assert any("is not a 32-bit `mov dword" in e for e in report.finish()), hexcode
+    code, report = _translate(STORE_D_IMM, patch=True, kind="store_u32", value=1,
+                              latch="set")
+    assert "RECOMP_PATCH_U32" not in code and report.finish()
+
+
 def test_file_round_trip_and_bad_keys():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "patches.json")
@@ -234,6 +258,13 @@ def test_file_round_trip_and_bad_keys():
                                     "setting": "graphics.crash_60fps",
                                     "when": "1", "value": 0}]}, f)
         assert PatchConfig.load(path).patches[0x10000].kind == "cmp_u8"
+        with open(path, "w") as f:
+            json.dump({"patches": [{"va": "0x00010000", "kind": "store_u32",
+                                    "setting": "game.race_clock",
+                                    "when": "1", "value": 1}]}, f)
+        cfg = PatchConfig.load(path)
+        assert cfg.patches[0x10000].kind == "store_u32"
+        assert cfg.patches[0x10000].value == 1
         for bad in ({"va": "0x1", "setting": "Speed", "when": "kmh", "value": 2},
                     {"va": "0x1", "setting": "a.b", "when": "k mh", "value": 2},
                     {"va": "0x1", "setting": "a.b", "when": "k", "value": -1},
@@ -251,6 +282,12 @@ def test_file_round_trip_and_bad_keys():
                      "kind": "store_u8"},
                     {"va": "0x1", "setting": "a.b", "when": "k", "value": 0,
                      "kind": "store_u8", "latch": "use"},
+                    {"va": "0x1", "setting": "a.b", "when": "k", "value": 1,
+                     "kind": "store_u32", "latch": "set"},
+                    {"va": "0x1", "setting": "a.b", "when": "k", "expr": "1",
+                     "kind": "store_u32"},
+                    {"va": "0x1", "setting": "a.b", "when": "k",
+                     "value": 0x100000000, "kind": "store_u32"},
                     {"va": "0x1", "setting": "a.b", "when": "k", "value": 1,
                      "kind": "cmp_u32", "latch": "set"}):
             with open(path, "w") as f:
@@ -297,6 +334,22 @@ def test_float_load_into_xmm():
     assert want in code, code
     assert code.index("XMM_SCALAR(MEMF(0x20000))") < code.index(want)
     assert report.finish() == []
+
+
+def test_float_load_x87_fld():
+    # fld dword ptr [DATA] ; ret: the pushed value is the top of the stack
+    fld = f"d905{D32}c3"
+    code, report = _translate_f(fld, "load_f32", "loaded * 0.5")
+    want = ('fp_top() = RECOMP_PATCH_F32("display.hud_fix", "1", 0, '
+            "((double)(fp_top()) * 0.5), fp_top());")
+    assert want in code, code
+    assert code.index("fp_push(MEMF(0x20000))") < code.index(want)
+    assert report.finish() == []
+    # fld qword (8 bytes) is not a float load
+    fld8 = f"dd05{D32}c3"
+    code, report = _translate_f(fld8, "load_f32", "loaded")
+    assert "RECOMP_PATCH_F32" not in code
+    assert any("is not a" in e for e in report.finish())
 
 
 def test_float_load_as_bits_with_guard_and_latch():

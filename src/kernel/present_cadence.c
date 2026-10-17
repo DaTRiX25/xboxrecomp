@@ -88,6 +88,21 @@ void pc_pacer_init(pc_pacer *p, int strategy, const pc_display *d,
            && phase_ns + (uint64_t)(p->depth_max + 1) * p->period_ns <= PC_LATENCY_MAX_NS)
         p->depth_max++;
     p->grace = PC_GRACE_FRAMES;
+    p->depth0 = p->depth;
+    p->lead0_ns = p->lead_ns;
+    p->decay_frames = PC_DECAY_FRAMES;
+    p->since_back = 1 << 30;
+}
+
+void pc_pacer_relearn(pc_pacer *p)
+{
+    p->depth = p->depth0;
+    p->lead_ns = p->lead0_ns;
+    p->grace = PC_GRACE_FRAMES;
+    p->decay_frames = PC_DECAY_FRAMES;
+    p->since_back = 1 << 30;
+    p->frames = p->slips = p->lates = 0;
+    p->calm = 0;
 }
 
 /* The point of the grid (g + k * period, any whole k) nearest t. */
@@ -168,25 +183,51 @@ int pc_pacer_glass(pc_pacer *p, const pc_aim *aim, uint64_t glass_ns)
         if (p->strategy == PC_LOCK && glass_ns > aim->target_ns + p->period_ns / 2) {
             p->slips++;
             p->slips_all++;
+            p->calm = 0;
         } else if (p->strategy == PC_TIMED && glass_ns > aim->target_ns + PC_LATE_NS) {
             p->lates++;
             p->lates_all++;
+            p->calm = 0;
         }
     }
     p->frames++;
+    if (p->since_back < (1 << 30))
+        p->since_back++;
+    /* Calm long enough: one step back toward the setting's (BO-211). */
+    if (++p->calm >= p->decay_frames) {
+        p->calm = 0;
+        if (p->strategy == PC_LOCK && p->depth > p->depth0) {
+            p->depth--;
+            p->lowered++;
+            p->since_back = 0;
+            raised = -1;
+        } else if (p->strategy == PC_TIMED && p->lead_ns > p->lead0_ns) {
+            p->lead_ns = p->lead_ns - p->lead0_ns >= PC_LEAD_STEP_NS
+                       ? p->lead_ns - PC_LEAD_STEP_NS : p->lead0_ns;
+            p->lowered++;
+            p->since_back = 0;
+            raised = -1;
+        }
+    }
     if (p->strategy == PC_LOCK && p->slips >= PC_SLIPS_RAISE) {
         if (p->depth < p->depth_max) {
             p->depth++;
             p->raised++;
             raised = 1;
+            if (p->since_back <= 2 * PC_SLIP_WINDOW && p->decay_frames < PC_DECAY_MAX)
+                p->decay_frames *= 2;
         }
+        p->calm = 0;
         p->frames = p->slips = 0;
     } else if (p->strategy == PC_TIMED && p->lates >= PC_LATES_RAISE) {
         if (p->lead_ns + PC_LEAD_STEP_NS <= PC_LEAD_MAX_NS) {
             p->lead_ns += PC_LEAD_STEP_NS;
             p->raised++;
             raised = 1;
+            if (p->since_back <= 2 * PC_SLIP_WINDOW && p->decay_frames < PC_DECAY_MAX)
+                p->decay_frames *= 2;
         }
+        p->calm = 0;
         p->frames = p->lates = 0;
     }
     if (p->frames >= PC_SLIP_WINDOW)

@@ -8,6 +8,7 @@
 #include "nv2a_backend_common.h"
 #include "recomp_env.h"
 #include "recomp_cfg.h"
+#include "xr_log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,7 +17,7 @@
 static int s_fail, s_checks;
 
 #define CHECK(c) do { s_checks++; if (!(c)) { s_fail++; \
-    fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
+    (fprintf)(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 /* ── the runtime, stubbed ──────────────────────────────────────────── */
 
@@ -41,6 +42,8 @@ void xbox_PacingSetMode(int m) { st_pacing = m; }
 void xbox_PacingSetSpinLead(uint64_t ns) { st_lead = ns; }
 static int st_auto;
 void xbox_PacingSetSpinLeadAuto(void) { st_auto++; st_lead = 77; }
+static int st_watch_resets;
+void xbox_PacingWatchReset(const char *why) { (void)why; st_watch_resets++; }
 int xbox_PacingAutoState(double *l, char *w, size_t n) { (void)l; (void)w; (void)n; return 0; }
 void nv2a_present_set_overscan(int c) { st_overscan = c; }
 void nv2a_present_set_fit(int f) { st_fit = f; }
@@ -64,6 +67,9 @@ static int st_lod_mode = -2, st_dither = -2;
 static float st_lod_val = -2;
 void nv2a_host_set_lod_bias(int m, float v) { st_lod_mode = m; st_lod_val = v; }
 void nv2a_host_set_dither(int on) { st_dither = on; }
+void nv2a_host_set_hdr(int on) { (void)on; }                                  /* BO-110 */
+void nv2a_host_set_hdr_levels(int w, float a, float b, float c) { (void)w; (void)a; (void)b; (void)c; }
+void nv2a_host_set_hdr_tone(int which, float v) { (void)which; (void)v; }        /* BO-110 */
 static unsigned st_ui_scale = 99;
 void nv2a_texscale_set_factor(unsigned f) { st_ui_scale = f; }
 #if !defined(_WIN32)
@@ -88,7 +94,7 @@ static void set_env(const char *k, const char *v)
 static void write_file(const char *path, const char *text)
 {
     FILE *f = fopen(path, "wb");
-    if (!f) { fprintf(stderr, "cannot write %s\n", path); exit(2); }
+    if (!f) { (fprintf)(stderr, "cannot write %s\n", path); exit(2); }
     fputs(text, f);
     fclose(f);
 }
@@ -120,7 +126,7 @@ static void test_restart_flags(void)
         want = want || i == XS_INPUT_VIBRATION;
 #endif
         if (!!(s->flags & XS_RESTART) != want) {
-            printf("FAIL restart flag of %s: %d, expected %d\n", s->key, !!(s->flags & XS_RESTART), want);
+            (printf)("FAIL restart flag of %s: %d, expected %d\n", s->key, !!(s->flags & XS_RESTART), want);
             s_fail++;
         }
         flagged += !!(s->flags & XS_RESTART);
@@ -152,7 +158,9 @@ int main(void)
         "[display]\n"                 /* an older writer's split section */
         "hud_fix = false\n"
         "[graphics]\n"
-        "bloom = false\n");            /* a title's effect, on by default: switched off */
+        "bloom = false\n"             /* a title's effect, on by default: switched off */
+        "[advanced]\n"
+        "diagnostic_log = true\n");   /* BO-193: applied at start, not only on a change */
     set_env("RECOMP_SETTINGS", path);
     set_env("RECOMP_AUDIO_VOLUME", "0.25");          /* the user's own */
     set_env("RECOMP_AUDIO_MUTE", NULL);
@@ -168,11 +176,25 @@ int main(void)
     set_env("RECOMP_GFX_SPLIT_60FPS", NULL);
     set_env("RECOMP_AUDIO_SPLIT_MUSIC", NULL);
     set_env("RECOMP_AUDIO_CUSTOM_LEVEL", NULL);
+    set_env("RECOMP_AUDIO_MENU_SOUNDS", NULL);
     set_env("RECOMP_GFX_VEHICLE_DETAIL", NULL);
     set_env("RECOMP_GFX_SCENERY_DETAIL", NULL);
+    set_env("RECOMP_GAME_RACE_CLOCK", NULL);
+
+    /* A release build, nothing in the environment: quiet until the file says. */
+    set_env("RECOMP_LOG_DIAG", NULL);
+    set_env("RECOMP_TRACE", NULL);
+    set_env("RECOMP_DEBUG", NULL);
+    set_env("RECOMP_STDIO_LOG", NULL);
+    set_env("RECOMP_FLIP_MARK", NULL);
+    set_env("RECOMP_HEADLESS", NULL);
+    xr_log_init(1, 0);
+    CHECK(g_xr_log_diag == 0);
 
     xbox_SettingsInit("Test");
     CHECK(!strcmp(xbox_SettingsPath(), path));
+    /* The saved diagnostic_log = true is in force at start, by "setting". */
+    CHECK(g_xr_log_diag == 1 && !xr_log_forced() && !strcmp(xr_log_source(), "setting"));
     test_restart_flags();
     /* A text setting: into its variable, readable, not "unknown". */
     CHECK(getenv("RECOMP_AUDIO_MUSIC_DIR")
@@ -300,11 +322,41 @@ int main(void)
         e = recomp_env(RENV_GFX_SCORE_BOARD);
         CHECK(!e || !*e || !strcmp(e, "original"));
     }
+    {
+        /* The overlay's menu sounds (BO-190): on as shipped, off reaches the
+         * environment at once, live, and goes back. */
+        const char *e = recomp_env(RENV_AUDIO_MENU_SOUNDS);
+        CHECK(!strcmp(xbox_SettingGet(XS_AUDIO_MENU_SOUNDS)->key, "audio.menu_sounds"));
+        CHECK(xbox_SettingValue(XS_AUDIO_MENU_SOUNDS) == 1 && !xbox_SettingGet(XS_AUDIO_MENU_SOUNDS)->user);
+        CHECK(xbox_SettingGet(XS_AUDIO_MENU_SOUNDS)->type == XS_BOOL);
+        CHECK(!e || strcmp(e, "0") != 0);
+        xbox_SettingSet(XS_AUDIO_MENU_SOUNDS, 0);
+        e = recomp_env(RENV_AUDIO_MENU_SOUNDS);
+        CHECK(e && !strcmp(e, "0"));
+        CHECK(xbox_SettingValue(XS_AUDIO_MENU_SOUNDS) == 0);
+        CHECK(!xbox_SettingsNeedRestart());          /* live */
+        xbox_SettingReset(XS_AUDIO_MENU_SOUNDS);
+        CHECK(xbox_SettingValue(XS_AUDIO_MENU_SOUNDS) == 1);
+    }
     xbox_SettingSet(XS_GRAPHICS_MOTION_BLUR, 0);
     CHECK(recomp_env(RENV_GFX_MOTION_BLUR) && !strcmp(recomp_env(RENV_GFX_MOTION_BLUR), "0"));
     CHECK(!xbox_SettingsNeedRestart());              /* live */
     xbox_SettingSet(XS_GRAPHICS_BLOOM, 1);
     CHECK(recomp_env(RENV_GFX_BLOOM) && !strcmp(recomp_env(RENV_GFX_BLOOM), "1"));
+    /* BO-212: strengths in tenths. 0 is the old "off", 1 the original; a value
+     * between is the nearest tenth, and the variable carries it. */
+    CHECK(xbox_SettingGet(XS_GRAPHICS_BLOOM)->type == XS_FLOAT);
+    xbox_SettingSet(XS_GRAPHICS_BLOOM, 0.5);
+    CHECK(xbox_SettingValue(XS_GRAPHICS_BLOOM) == 0.5);
+    CHECK(recomp_env(RENV_GFX_BLOOM) && !strcmp(recomp_env(RENV_GFX_BLOOM), "0.5"));
+    xbox_SettingSet(XS_GRAPHICS_BLOOM, 0.34);
+    CHECK(recomp_env(RENV_GFX_BLOOM) && !strcmp(recomp_env(RENV_GFX_BLOOM), "0.3"));
+    xbox_SettingSet(XS_GRAPHICS_BLOOM, 7);
+    CHECK(xbox_SettingValue(XS_GRAPHICS_BLOOM) == 1);
+    CHECK(recomp_env(RENV_GFX_BLOOM) && !strcmp(recomp_env(RENV_GFX_BLOOM), "1"));
+    xbox_SettingSet(XS_GRAPHICS_MOTION_BLUR, 0.7);
+    CHECK(recomp_env(RENV_GFX_MOTION_BLUR) && !strcmp(recomp_env(RENV_GFX_MOTION_BLUR), "0.7"));
+    xbox_SettingSet(XS_GRAPHICS_MOTION_BLUR, 0);
     xbox_SettingSet(XS_GRAPHICS_BLOOM, 0);
     /* The title's 30 Hz phases at 60 (a guest patch on the "1"): off as
      * shipped, and untouched the variable never reads "1". */
@@ -323,8 +375,9 @@ int main(void)
         static const struct { xs_id id; recomp_env_id env; const char *key; } k[] = {
             { XS_GRAPHICS_SPLIT_60FPS, RENV_GFX_SPLIT_60FPS, "graphics.split_60fps" },
             { XS_AUDIO_SPLIT_MUSIC, RENV_AUDIO_SPLIT_MUSIC, "audio.split_music" },
+            { XS_GAME_RACE_CLOCK, RENV_GAME_RACE_CLOCK, "game.race_clock" },
         };
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 3; i++) {
             const char *e = recomp_env(k[i].env);
             CHECK(!strcmp(xbox_SettingGet(k[i].id)->key, k[i].key));
             CHECK(xbox_SettingValue(k[i].id) == 0 && !xbox_SettingGet(k[i].id)->user);
@@ -372,6 +425,14 @@ int main(void)
     xbox_SettingSet(XS_POWER_MODE, 1);
     CHECK(st_pacing == 1 && st_lead == 8000000ull);
     CHECK(recomp_env(RENV_PRESENT_SPIN_LEAD) && !strcmp(recomp_env(RENV_PRESENT_SPIN_LEAD), "8"));
+    /* BO-211: a change of power mode or frame pacing resets the pacing state. */
+    {
+        int before = st_watch_resets;
+        xbox_SettingSet(XS_DISPLAY_FRAME_PACING, 2);
+        CHECK(st_watch_resets == before + 1);
+        CHECK(st_watch_resets >= 3);
+        xbox_SettingSet(XS_DISPLAY_FRAME_PACING, 0);
+    }
     xbox_SettingSet(XS_INPUT_DEADZONE, 6554);
     CHECK(st_deadzone == 6554);
     xbox_SettingSet(XS_INPUT_TRIGGER_DEADZONE, 20);
@@ -461,10 +522,14 @@ int main(void)
     CHECK(xbox_SettingValue(XS_INPUT_RUMBLE) == 2.0);
 
     xbox_SettingSet(XS_DISPLAY_HUD_FIX, 1);          /* late in the enum, section display */
+    xbox_SettingSet(XS_AUDIO_MENU_SOUNDS, 0);        /* later still, section audio */
     xbox_SettingsFlush();
     text = read_file(path);
     CHECK(text != NULL);
     if (text) {
+        const char *ms = strstr(text, "menu_sounds = false");
+        const char *au = strstr(text, "[audio]");
+        CHECK(ms && au && ms > au);
         /* Each section once, its keys together (hud_fix after the other
          * display keys, before the next section), and the strict reader
          * takes the file back. */
@@ -504,8 +569,8 @@ int main(void)
         {
             /* The effects' "off" is stored, in the one [graphics] table. */
             const char *g = strstr(text, "[graphics]");
-            const char *b = strstr(text, "bloom = false");
-            const char *m = strstr(text, "motion_blur = false");
+            const char *b = strstr(text, "bloom = 0");
+            const char *m = strstr(text, "motion_blur = 0");
             CHECK(g && !strstr(g + 1, "[graphics]"));
             CHECK(g && b && m && b > g && m > g);
             /* And the 60 fps crash cameras' "on", in the same table. */
@@ -522,7 +587,7 @@ int main(void)
     CHECK(recomp_env(RENV_GFX_MOTION_BLUR) && !strcmp(recomp_env(RENV_GFX_MOTION_BLUR), "1"));
     xbox_SettingsFlush();
     text = read_file(path);
-    CHECK(text && !strstr(text, "motion_blur") && strstr(text, "bloom = false"));
+    CHECK(text && !strstr(text, "motion_blur") && strstr(text, "bloom = 0"));
     /* Off again: the default, as shipped, and the file forgets it. */
     xbox_SettingReset(XS_GRAPHICS_CRASH_60FPS);
     CHECK(xbox_SettingValue(XS_GRAPHICS_CRASH_60FPS) == 0 && !xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->user);
@@ -661,6 +726,6 @@ int main(void)
     CHECK(st_ui_scale == 0);
 
     remove(path);
-    fprintf(stderr, "overlay_settings: %d checks, %d failed\n", s_checks, s_fail);
+    (fprintf)(stderr, "overlay_settings: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;
 }

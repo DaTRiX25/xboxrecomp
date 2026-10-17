@@ -54,6 +54,16 @@ void xbox_HostPauseHold(void);
  * entry is a gap (the title was paused there). Returns how many. Any
  * thread; a read racing the executor may see one stale entry. */
 int  xbox_HostFlipTimes(uint64_t *ns, int max);
+/* The same, with the swap interval (vblanks) each of those flips asked for
+ * beside its time: 1 at 60 fps, 2 where the title runs at 30 (Burnout 3's
+ * crash camera), 0 at a gap. */
+int  xbox_HostFlipTimesIv(uint64_t *ns, uint8_t *iv, int max);
+/* The executor, before xbox_HostPauseHold: the interval the flip it is
+ * about to note asked for (0 counts as 1). */
+void xbox_HostFlipInterval(uint32_t iv);
+/* The interval the last noted flip asked for (1 at 60 fps, 2 at 30): the
+ * presenter's frame pacing leaves the title's own 30 fps stretches alone. */
+uint32_t xbox_HostFlipIntervalAsked(void);
 
 /* The session's frame times, flip to flip, counted at every flip (a pause is
  * a gap, not a frame). Cheap enough to be always on: one histogram slot a

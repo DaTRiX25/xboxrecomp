@@ -74,9 +74,69 @@ static const char s_rc_helpers[] =
     "    return float3(rc_op(x.r, op), rc_op(x.g, op), rc_op(x.b, op));\n"
     "}\n";
 
+/* BO-110, HDR variant: the same helpers with the upper bound of a value a
+ * parameter (pc.hdr.x, per draw): 1.0 is the hardware's clamp, a larger one
+ * keeps light that stacks past 1.0 in a half-float target. The lower bounds
+ * and every [0, 1] clamp that feeds a complement or a selector stay. */
+static const char s_rc_helpers_hdr[] =
+    "float rc_map(float x, int m) {\n"
+    "    if (m == 0) return max(x, 0.0);\n"
+    "    if (m == 1) return 1.0 - saturate(x);\n"
+    "    if (m == 2) return 2.0 * saturate(x) - 1.0;\n"
+    "    if (m == 3) return 1.0 - 2.0 * saturate(x);\n"
+    "    if (m == 4) return saturate(x) - 0.5;\n"
+    "    if (m == 5) return 0.5 - saturate(x);\n"
+    "    if (m == 6) return x;\n"
+    "    return -x;\n"
+    "}\n"
+    "float3 rc_map3(float3 x, int m) {\n"
+    "    return float3(rc_map(x.r, m), rc_map(x.g, m), rc_map(x.b, m));\n"
+    "}\n"
+    "float rc_op(float x, int op, float hi) {\n"
+    "    if (op == 1) x -= 0.5;\n"
+    "    else if (op == 2) x *= 2.0;\n"
+    "    else if (op == 3) x = (x - 0.5) * 2.0;\n"
+    "    else if (op == 4) x *= 4.0;\n"
+    "    else if (op == 6) x *= 0.5;\n"
+    "    return clamp(x, -1.0, hi);\n"
+    "}\n"
+    "float rc_sign8(float x) {\n"
+    "    x *= 255.0;\n"
+    "    return x >= 128.0 ? (x - 256.0) / 127.0 : x / 127.0;\n"
+    "}\n"
+    "float3 rc_op3(float3 x, int op, float hi) {\n"
+    "    return float3(rc_op(x.r, op, hi), rc_op(x.g, op, hi), rc_op(x.b, op, hi));\n"
+    "}\n";
+
+/* The constants with the HDR member after Metal's own tail (MsPsConsts). */
+#define D3D8_MSL_PSCONSTS_HDR \
+    "struct PsConsts {\n" \
+    "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n" \
+    "    uint4 atest; uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n" \
+    "    float4 tex_bias;\n" \
+    "    float4 bump_mat[4]; float4 bump_lum[4];\n" \
+    "    float4 hdr;\n" \
+    "};\n"
+
+static int generate(const NV2ACombinerState *state, char *buf, int bufsize, int hdr);
+
 int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                                 char *buf, int bufsize)
 {
+    return generate(state, buf, bufsize, 0);
+}
+
+int d3d8_combiners_generate_msl_hdr(const NV2ACombinerState *state,
+                                    char *buf, int bufsize)
+{
+    return generate(state, buf, bufsize, 1);
+}
+
+static int generate(const NV2ACombinerState *state, char *buf, int bufsize, int hdr)
+{
+    /* hdr: rc_op's bound, the per-draw one for colour and 1.0 for alpha
+     * (an alpha past 1.0 would turn a blend's (1 - alpha) negative). */
+    const char *OPHI = hdr ? ", hi" : "", *OPHA = hdr ? ", 1.0" : "";
     static const char *const in_name[4] = { "A", "B", "C", "D" };
     char src[32];
     int off = 0;
@@ -85,9 +145,9 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     EMIT("/* Auto-generated NV2A register combiners (MSL) */\n"
          "#include <metal_stdlib>\n"
          "using namespace metal;\n");
-    EMIT("%s", D3D8_MSL_PSCONSTS);
+    EMIT("%s", hdr ? D3D8_MSL_PSCONSTS_HDR : D3D8_MSL_PSCONSTS);
     EMIT("%s", D3D8_MSL_VOUT);
-    EMIT("%s", s_rc_helpers);
+    EMIT("%s", hdr ? s_rc_helpers_hdr : s_rc_helpers);
 
     EMIT("fragment float4 fs_main(VOut i [[stage_in]],\n"
          "                        constant PsConsts &pc [[buffer(0)]]");
@@ -102,6 +162,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
              i, i, i, i);
     }
     EMIT(") {\n");
+    if (hdr)
+        EMIT("    float hi = pc.hdr.x;\n");
     for (k = 0; k < 16; k++)
         EMIT("    float4 x%d = float4(0.0);\n", k);
     if (state->fog_input)
@@ -220,18 +282,20 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
         EMIT("        float3 ab = %s;\n", ro->ab_dot ? "float3(dot(A, B))" : "A * B");
         EMIT("        float3 cd = %s;\n", ro->cd_dot ? "float3(dot(C, D))" : "C * D");
         EMIT("        float3 sum = %s;\n", ro->mux_sum ? "sel ? cd : ab" : "ab + cd");
-        EMIT("        ab = rc_op3(ab, %d); cd = rc_op3(cd, %d); sum = rc_op3(sum, %d);\n",
-             (int)ro->output_map, (int)ro->output_map, (int)ro->output_map);
+        EMIT("        ab = rc_op3(ab, %d%s); cd = rc_op3(cd, %d%s); sum = rc_op3(sum, %d%s);\n",
+             (int)ro->output_map, OPHI, (int)ro->output_map, OPHI, (int)ro->output_map, OPHI);
         EMIT("        float aab = aA * aB, acd = aC * aD;\n");
         EMIT("        float asum = %s;\n", ao->mux_sum ? "sel ? acd : aab" : "aab + acd");
         if (ro->ab_dst)  EMIT("        x%d.rgb = ab;\n",  (int)ro->ab_dst);
         if (ro->cd_dst)  EMIT("        x%d.rgb = cd;\n",  (int)ro->cd_dst);
         if (ro->sum_dst) EMIT("        x%d.rgb = sum;\n", (int)ro->sum_dst);
-        if (ao->ab_dst)  EMIT("        x%d.a = rc_op(aab, %d);\n",  (int)ao->ab_dst,  (int)ao->output_map);
-        if (ao->cd_dst)  EMIT("        x%d.a = rc_op(acd, %d);\n",  (int)ao->cd_dst,  (int)ao->output_map);
-        if (ao->sum_dst) EMIT("        x%d.a = rc_op(asum, %d);\n", (int)ao->sum_dst, (int)ao->output_map);
-        if (ro->ab_blue_to_alpha && ro->ab_dst) EMIT("        x%d.a = ab.b;\n", (int)ro->ab_dst);
-        if (ro->cd_blue_to_alpha && ro->cd_dst) EMIT("        x%d.a = cd.b;\n", (int)ro->cd_dst);
+        if (ao->ab_dst)  EMIT("        x%d.a = rc_op(aab, %d%s);\n",  (int)ao->ab_dst,  (int)ao->output_map, OPHA);
+        if (ao->cd_dst)  EMIT("        x%d.a = rc_op(acd, %d%s);\n",  (int)ao->cd_dst,  (int)ao->output_map, OPHA);
+        if (ao->sum_dst) EMIT("        x%d.a = rc_op(asum, %d%s);\n", (int)ao->sum_dst, (int)ao->output_map, OPHA);
+        if (ro->ab_blue_to_alpha && ro->ab_dst)
+            EMIT(hdr ? "        x%d.a = min(ab.b, 1.0);\n" : "        x%d.a = ab.b;\n", (int)ro->ab_dst);
+        if (ro->cd_blue_to_alpha && ro->cd_dst)
+            EMIT(hdr ? "        x%d.a = min(cd.b, 1.0);\n" : "        x%d.a = cd.b;\n", (int)ro->cd_dst);
         EMIT("    }\n");
     }
 
@@ -249,25 +313,40 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
             k = order[i];
             if (k < 0) {
                 /* COMPLEMENT_V1 0x40, COMPLEMENT_R0 0x20 (xemu psh_regs.h). */
+                if (!hdr) {
                 EMIT("        float3 fv1 = %ssaturate(x5.rgb);\n",
                      (state->final_flags & 0x40) ? "1.0 - " : "");
                 EMIT("        float3 fr0 = %ssaturate(x12.rgb);\n",
                      (state->final_flags & 0x20) ? "1.0 - " : "");
                 EMIT("        x14 = float4(%s(fv1 + fr0), 0.0);\n",
                      (state->final_flags & 0x80) ? "saturate" : "");
+                } else {
+                EMIT("        float3 fv1 = %s;\n", (state->final_flags & 0x40)
+                     ? "1.0 - saturate(x5.rgb)" : "clamp(x5.rgb, 0.0, hi)");
+                EMIT("        float3 fr0 = %s;\n", (state->final_flags & 0x20)
+                     ? "1.0 - saturate(x12.rgb)" : "clamp(x12.rgb, 0.0, hi)");
+                EMIT("        x14 = float4(%s, 0.0);\n", (state->final_flags & 0x80)
+                     ? "clamp(fv1 + fr0, 0.0, hi)" : "(fv1 + fr0)");
+                }
                 EMIT("        x15 = float4(E * F, 0.0);\n");
                 continue;
             }
             in = &state->final_input[k];
             input_src(in, 0, src, sizeof src);
-            EMIT("        float3 %s = %ssaturate(%s);\n", fname[k],
-                 ((int)in->mapping & 1) ? "1.0 - " : "", src);
+            if (!hdr || ((int)in->mapping & 1))
+                EMIT("        float3 %s = %ssaturate(%s);\n", fname[k],
+                     ((int)in->mapping & 1) ? "1.0 - " : "", src);
+            else
+                EMIT("        float3 %s = clamp(%s, 0.0, hi);\n", fname[k], src);
         }
         input_src(&state->final_input[6], 1, src, sizeof src);
         EMIT("        float G = %ssaturate(%s);\n",
              ((int)state->final_input[6].mapping & 1) ? "1.0 - " : "", src);
     }
-    EMIT("        res = float4(saturate(A * B + (1.0 - A) * C + D), G);\n");
+    if (!hdr)
+        EMIT("        res = float4(saturate(A * B + (1.0 - A) * C + D), G);\n");
+    else
+        EMIT("        res = float4(clamp(A * B + (1.0 - saturate(A)) * C + D, 0.0, hi), G);\n");
     EMIT("    }\n");
 
     /* ---- Alpha test: D3DCMP numbering on 8-bit values ---- */

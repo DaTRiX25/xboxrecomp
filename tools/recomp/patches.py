@@ -72,6 +72,13 @@ does: every later reader sees the value.
     MEM8(0x4D538D) = 1;
     MEM8(0x4D538D) = (uint8_t)RECOMP_PATCH_U32("graphics.split_60fps", "1", 0x0u, MEM8(0x4D538D)); /* patch 0x... */
 
+kind "store_u32": the same for a 32-bit value, `mov dword ptr [mem],
+imm32|r32` (Burnout 3's stage start stores its simulation stepper's mode, 0,
+one step a frame; stored again as 1, the title's own wall-clock mode):
+
+    MEM32(0x4D5390) = 0x0u;
+    MEM32(0x4D5390) = RECOMP_PATCH_U32("game.race_clock", "1", 0x1u, MEM32(0x4D5390)); /* patch 0x... */
+
 kind "load_f32" and "store_f32": the value is a float, and it is not a
 constant but an expression ("expr" instead of "value"), because a layout
 value depends on the picture's shape:
@@ -90,8 +97,9 @@ with recomp_patch_set_var ("aspect": the picture's width over its height).
 `f32[esp + 0x30]` reads another guest float at the site (a width squeezed
 about an anchor needs the anchor). It is evaluated in double and only while
 the setting reads `when`.
-"load_f32" takes `movss xmm, [mem]` and the 32-bit `mov reg, [mem]` (a float
-moved as bits); "store_f32" takes `movss [mem], xmm` and `mov [mem], reg`
+"load_f32" takes `movss xmm, [mem]`, the x87 `fld dword ptr [mem]` (the
+value pushed, `fp_top()`, is the one replaced; Burnout 3's blur opacity is
+read so) and the 32-bit `mov reg, [mem]` (a float moved as bits); "store_f32" takes `movss [mem], xmm` and `mov [mem], reg`
 and rewrites the stored float, for a value that shares its register with
 other uses.
 
@@ -115,10 +123,11 @@ import json
 import re
 
 _KINDS = frozenset({"load_u32", "load_u8", "cmp_u8", "cmp_u32", "store_u8",
-                    "load_f32", "store_f32", "mark"})
-_INT_KINDS = frozenset({"load_u32", "load_u8", "cmp_u8", "cmp_u32", "store_u8"})
+                    "store_u32", "load_f32", "store_f32", "mark"})
+_INT_KINDS = frozenset({"load_u32", "load_u8", "cmp_u8", "cmp_u32", "store_u8",
+                        "store_u32"})
 _BYTE_KINDS = frozenset({"load_u8", "cmp_u8", "store_u8"})
-_NO_LATCH = frozenset({"cmp_u8", "cmp_u32", "store_u8"})
+_NO_LATCH = frozenset({"cmp_u8", "cmp_u32", "store_u8", "store_u32"})
 _REG8 = {"al": "eax", "bl": "ebx", "cl": "ecx", "dl": "edx"}
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _XMM = frozenset(f"xmm{i}" for i in range(8))
@@ -344,6 +353,8 @@ class PatchReport:
                 out = self._cmp(p, insn, needs_cf)
             elif p.kind == "store_u8":
                 out = self._store_u8(p, insn)
+            elif p.kind == "store_u32":
+                out = self._store_u32(p, insn)
             else:
                 out = self._float(p, insn)
             if out is None:
@@ -432,6 +443,24 @@ class PatchReport:
         return [f'{where} = (uint8_t)RECOMP_PATCH_U32("{p.setting}", '
                 f'"{p.when}", 0x{p.value:X}u, {where});']
 
+    def _store_u32(self, p, insn):
+        """`mov dword ptr [mem], imm32|r32`: the stored value is stored
+        again as the value while the setting says so."""
+        from .lifter import _fmt_mem
+        ops = insn.operands
+        if (insn.mnemonic != "mov" or len(ops) != 2 or ops[0].type != "mem"
+                or ops[0].mem_size != 4
+                or not (ops[1].type == "imm"
+                        or (ops[1].type == "reg" and ops[1].reg in _REG32))
+                or p.latch):
+            self._err(
+                f"patch 0x{p.va:08X}: {insn.mnemonic} is not a 32-bit "
+                f"`mov dword ptr [mem], imm32|r32` store")
+            return None
+        where = f"MEM32({_fmt_mem(ops[0])})"
+        return [f'{where} = RECOMP_PATCH_U32("{p.setting}", '
+                f'"{p.when}", 0x{p.value:X}u, {where});']
+
     def _float(self, p, insn):
         """load_f32 / store_f32: the moved float, as an lvalue of the right
         type, becomes the expression while the setting says so."""
@@ -445,13 +474,19 @@ class PatchReport:
                 where, bits = f"{dst.reg}.f[0]", False
             elif m == "mov" and dst.type == "reg" and dst.reg in _REG32:
                 where, bits = dst.reg, True
+        elif (p.kind == "load_f32" and len(ops) == 1 and m == "fld"
+                and ops[0].type == "mem" and ops[0].mem_size == 4):
+            # x87 `fld dword ptr [mem]`: the float just pushed is the top of
+            # the stack (a double there).
+            where, bits = "fp_top()", False
         elif p.kind == "store_f32" and ok and dst.type == "mem" and dst.mem_size == 4:
             if m == "movss" and src.type == "reg" and src.reg in _XMM:
                 where, bits = f"MEMF({_fmt_mem(dst)})", False
             elif m == "mov" and src.type == "reg" and src.reg in _REG32:
                 where, bits = f"MEM32({_fmt_mem(dst)})", True
         if where is None:
-            want = ("`movss xmm, [mem]` or 32-bit `mov reg, [mem]`"
+            want = ("`movss xmm, [mem]`, `fld dword ptr [mem]` or 32-bit "
+                    "`mov reg, [mem]`"
                     if p.kind == "load_f32" else
                     "`movss [mem], xmm` or 32-bit `mov [mem], reg`")
             self._err(f"patch 0x{p.va:08X}: {m} is not a {want}")

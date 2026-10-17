@@ -104,13 +104,22 @@ typedef struct nv2a_pcache_stat {
     uint32_t ack[3];          /* built by the render thread: the list lacked them */
     uint32_t ack_max_us;      /* the longest of those */
     uint64_t ack_ns;          /* and their sum */
+    uint32_t hold_done, hold_total;   /* BO-208: the build the title is held for ("Preparing graphics N/M") */
+    uint32_t warm_ms;         /* how long the first pre-warm took (0: not done yet) */
+    int      cold;            /* that build is a first one (manifest keys new, or the driver's cache empty) */
+    int      hdr_round;       /* BO-110: the pre-warm running builds the HDR
+                               * variants after a switch to HDR (the window
+                               * says so while it runs) */
     char     dir[512];        /* the cache directory, "" when off */
 } nv2a_pcache_stat;
 void nv2a_pcache_stat_get(nv2a_pcache_stat *out);
 /* The backend's side. */
 void nv2a_pcache_stat_open(const char *dir, const uint32_t listed[3]);
-void nv2a_pcache_stat_warming(int on);
+void nv2a_pcache_stat_warming(int on);   /* off also ends an HDR round */
+void nv2a_pcache_stat_hdr(int on);
 void nv2a_pcache_stat_waiting(int on);
+void nv2a_pcache_stat_hold(uint32_t done, uint32_t total, int cold);
+void nv2a_pcache_stat_warm_ms(uint32_t ms);
 void nv2a_pcache_stat_built(int prewarm, int kind, uint64_t ns);
 
 /* Asks the running backend to read its key list again and build what it
@@ -158,6 +167,49 @@ size_t nv2a_pcache_scan_vsh(const void *image, size_t size,
 size_t nv2a_pcache_scan_psdef(const void *image, size_t size,
                               void (*fn)(void *ctx, const void *state, uint32_t len),
                               void *ctx);
+
+
+/* ---- the shipped coverage manifest (BO-208) ----------------------------------
+ *
+ * A list of what to compile, made on the developer side by a sweep of the
+ * title (every mode, track, car and camera) and shipped as data, so that a
+ * first start can build everything before the title draws, instead of
+ * learning it one hitch at a time. It holds no title code: a vertex program
+ * is named by the 64-bit hash of its slots (record type NV2A_PC_MANIFEST_VS,
+ * 8 bytes) and its body is found on the player's machine, in the executable
+ * scan (nv2a_pcache_scan_vsh) of the player's own copy. Combiner states and
+ * pipeline keys are register values and fixed state, the backend's own
+ * records as in the key list.
+ *
+ * File: the key list's format, its version string the backend's key-format
+ * version followed by "; manifest <revision>". A manifest of another key
+ * format is ignored (logged). Applying it appends what the local key list
+ * lacks, so the pre-warm builds it; a key already there is written once. */
+#define NV2A_PC_MANIFEST_VS 16u
+
+typedef struct nv2a_pcache_manifest_stat {
+    int      found;           /* a manifest was read */
+    char     revision[64];
+    uint32_t records;         /* in the file */
+    uint32_t vs_listed, vs_resolved;   /* vertex programs by hash, and found in the executable */
+    uint32_t added;           /* records new to the local list */
+} nv2a_pcache_manifest_stat;
+
+/* The manifest for `backend` ("vulkan", "metal"), as bytes (compiled into the
+ * program, so it is the same on every platform, an APK included; copied), and
+ * where the player's executable is. Call before the backend starts.
+ * RECOMP_PCACHE_MANIFEST=<file> reads that file instead; "none" is no manifest
+ * (a sweep that records what the title needs, not what is known). */
+void nv2a_pcache_set_manifest(const char *backend, const void *data, size_t size);
+void nv2a_pcache_set_xbe(const char *xbe_path);
+/* Appends `backend`'s manifest keys to `dst` (its open key list, of key-format
+ * `version`). Returns the number of records added (also in st). */
+uint32_t nv2a_pcache_manifest_apply(nv2a_pcache *dst, const char *backend,
+                                    const char *version, nv2a_pcache_manifest_stat *st);
+/* Lowers the calling thread's priority (a background pre-warm). */
+void nv2a_pcache_lower_priority(void);
+/* Online CPUs (at least 1). */
+int  nv2a_pcache_cpu_count(void);
 
 #ifdef __cplusplus
 }

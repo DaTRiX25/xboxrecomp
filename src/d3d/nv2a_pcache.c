@@ -397,11 +397,30 @@ void nv2a_pcache_stat_open(const char *dir, const uint32_t listed[3])
 void nv2a_pcache_stat_warming(int on)
 {
     s_stat.warming = on;
+    if (!on)
+        s_stat.hdr_round = 0;
+}
+
+void nv2a_pcache_stat_hdr(int on)
+{
+    s_stat.hdr_round = on;
 }
 
 void nv2a_pcache_stat_waiting(int on)
 {
     s_stat.waiting = on;
+}
+
+void nv2a_pcache_stat_warm_ms(uint32_t ms)
+{
+    s_stat.warm_ms = ms ? ms : 1;
+}
+
+void nv2a_pcache_stat_hold(uint32_t done, uint32_t total, int cold)
+{
+    s_stat.hold_done = done;
+    s_stat.hold_total = total;
+    s_stat.cold = cold;
 }
 
 void nv2a_pcache_stat_built(int prewarm, int kind, uint64_t ns)
@@ -476,4 +495,252 @@ size_t nv2a_pcache_scan_vsh(const void *image, size_t size,
         i += 3 + (size_t)n * 16u;
     }
     return found;
+}
+
+/* ---- the shipped manifest ------------------------------------------------------- */
+
+static char s_man_xbe[1100];
+static struct { char backend[16]; unsigned char *data; size_t size; } s_man[4];
+
+void nv2a_pcache_set_manifest(const char *backend, const void *data, size_t size)
+{
+    int i;
+    for (i = 0; i < 4 && s_man[i].data && strcmp(s_man[i].backend, backend); i++)
+        ;
+    if (i == 4 || !(s_man[i].data = (unsigned char *)realloc(s_man[i].data, size ? size : 1)))
+        return;
+    memcpy(s_man[i].data, data, size);
+    s_man[i].size = size;
+    snprintf(s_man[i].backend, sizeof s_man[i].backend, "%s", backend);
+}
+
+void nv2a_pcache_set_xbe(const char *xbe_path)
+{
+    snprintf(s_man_xbe, sizeof s_man_xbe, "%s", xbe_path ? xbe_path : "");
+}
+
+struct man_vs { uint64_t hash; uint32_t n; uint32_t *slots; };
+struct man_scan { struct man_vs *v; size_t n, cap; };
+
+static void man_vs_add(void *ctx, const uint32_t *slots, uint32_t n)
+{
+    struct man_scan *s = (struct man_scan *)ctx;
+    if (s->n == s->cap) {
+        struct man_vs *v = (struct man_vs *)realloc(s->v, (s->cap ? s->cap * 2 : 64) * sizeof *v);
+        if (!v)
+            return;
+        s->v = v;
+        s->cap = s->cap ? s->cap * 2 : 64;
+    }
+    s->v[s->n].slots = (uint32_t *)malloc((size_t)n * 16u);
+    if (!s->v[s->n].slots)
+        return;
+    memcpy(s->v[s->n].slots, slots, (size_t)n * 16u);
+    s->v[s->n].n = n;
+    s->v[s->n].hash = nv2a_fnv64(slots, (size_t)n * 16u, NV2A_FNV64_INIT);
+    s->n++;
+}
+
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* Programs the executable holds as bare runs of slots, without the 0x2078
+ * header the XDK assembler writes (the ones D3D's own code uploads, such as the
+ * fixed-function program the title draws its overlays with): a run of 1..136
+ * slots whose first word is 0, whose later words are not all 0, and of which only
+ * the last has FINAL (bit 0 of the fourth word). Only those whose hash the
+ * manifest lists (`man`, its records from `from`) and the header scan has not
+ * found are kept. */
+static void man_scan_raw(const unsigned char *man, size_t man_size, size_t from,
+                         const unsigned char *image, size_t size, struct man_scan *scan)
+{
+    uint64_t *want = NULL, *seen = NULL;
+    size_t nw = 0, cap = 0, off, i;
+
+    for (off = from; off + 16 <= man_size; ) {
+        uint32_t type = get32(man + off), len = get32(man + off + 4);
+        if (len > NV2A_PCACHE_MAX_LEN || man_size - off - 16 < len)
+            break;
+        if (type == NV2A_PC_MANIFEST_VS && len == 8) {
+            uint64_t h = get64(man + off + 16);
+            int have = 0;
+            for (i = 0; i < scan->n && !have; i++)
+                have = scan->v[i].hash == h;
+            if (!have) {
+                if (nw == cap) {
+                    uint64_t *w = (uint64_t *)realloc(want, (cap ? cap * 2 : 32) * sizeof *w);
+                    if (!w)
+                        break;
+                    want = w;
+                    cap = cap ? cap * 2 : 32;
+                }
+                want[nw++] = h;
+            }
+        }
+        off += 16 + (size_t)len;
+    }
+    if (nw) {
+        qsort(want, nw, sizeof *want, cmp_u64);
+        seen = (uint64_t *)calloc(nw, sizeof *seen);
+        for (off = 0; seen && off + 16 <= size; off += 4) {
+            const unsigned char *p = image + off;
+            uint32_t n = 0;
+            for (;;) {
+                const unsigned char *s = p + (size_t)n * 16u;
+                uint32_t w1, w2, w3;
+                if ((size_t)(s - image) + 16 > size || get32(s) != 0)
+                    break;
+                w1 = get32(s + 4); w2 = get32(s + 8); w3 = get32(s + 12);
+                if (!(w1 | w2 | w3))
+                    break;
+                n++;
+                if (w3 & 1u)
+                    break;
+                if (n >= 136) {
+                    n = 0;
+                    break;
+                }
+            }
+            if (n && (get32(p + (size_t)(n - 1) * 16u + 12) & 1u)) {
+                uint64_t h = nv2a_fnv64(p, (size_t)n * 16u, NV2A_FNV64_INIT);
+                uint64_t *hit = (uint64_t *)bsearch(&h, want, nw, sizeof *want, cmp_u64);
+                if (hit && !seen[hit - want]) {
+                    seen[hit - want] = 1;
+                    man_vs_add(scan, (const uint32_t *)(const void *)p, n);   /* memcpy'd there */
+                }
+            }
+        }
+    }
+    free(seen);
+    free(want);
+}
+
+uint32_t nv2a_pcache_manifest_apply(nv2a_pcache *dst, const char *backend,
+                                    const char *version, nv2a_pcache_manifest_stat *st)
+{
+    nv2a_pcache_manifest_stat z;
+    unsigned char *b, *xbe = NULL;
+    size_t size = 0, xsize = 0, off, vl, n, i;
+    struct man_scan scan;
+    static const char tag[] = "; manifest ";
+
+    if (!st)
+        st = &z;
+    memset(st, 0, sizeof *st);
+    memset(&scan, 0, sizeof scan);
+    const char *over = getenv("RECOMP_PCACHE_MANIFEST"), *label = "(built in)";
+    int mi;
+
+    if (!dst || (over && !strcmp(over, "none")))
+        return 0;
+    if (over && *over) {
+        label = over;
+        b = slurp(over, &size);
+    } else {
+        for (mi = 0; mi < 4 && (!s_man[mi].data || strcmp(s_man[mi].backend, backend)); mi++)
+            ;
+        if (mi == 4 || !s_man[mi].size)
+            return 0;
+        size = s_man[mi].size;
+        b = (unsigned char *)malloc(size);
+        if (b)
+            memcpy(b, s_man[mi].data, size);
+    }
+    if (!b)
+        return 0;
+    vl = strlen(version);
+    n = size >= 16 ? get32(b + 12) : 0;
+    if (size < 16 || memcmp(b, MAGIC, 8) != 0 || get32(b + 8) != FORMAT || n > VERSION_MAX
+            || size - 16 < n || n < vl + sizeof tag - 1 || memcmp(b + 16, version, vl) != 0
+            || memcmp(b + 16 + vl, tag, sizeof tag - 1) != 0) {
+        fprintf(stderr, "[pcache] manifest %s is of another key format: ignored\n", label);
+        free(b);
+        return 0;
+    }
+    st->found = 1;
+    {
+        size_t rl = n - vl - (sizeof tag - 1);
+        if (rl >= sizeof st->revision)
+            rl = sizeof st->revision - 1;
+        memcpy(st->revision, b + 16 + vl + sizeof tag - 1, rl);
+        st->revision[rl] = 0;
+    }
+    if (s_man_xbe[0] && (xbe = slurp(s_man_xbe, &xsize)) != NULL) {
+        nv2a_pcache_scan_vsh(xbe, xsize, man_vs_add, &scan);
+        man_scan_raw(b, size, 16 + n, xbe, xsize, &scan);
+    }
+    for (off = 16 + n; off < size; ) {
+        uint32_t type, len;
+        uint64_t sum;
+        if (size - off < 16)
+            break;
+        type = get32(b + off);
+        len = get32(b + off + 4);
+        sum = get64(b + off + 8);
+        if (len > NV2A_PCACHE_MAX_LEN || size - off - 16 < len
+                || rec_sum(type, b + off + 16, len) != sum)
+            break;
+        st->records++;
+        if (type == NV2A_PC_MANIFEST_VS && len == 8) {
+            uint64_t h = get64(b + off + 16);
+            st->vs_listed++;
+            for (i = 0; i < scan.n; i++)
+                if (scan.v[i].hash == h) {
+                    st->vs_resolved++;
+                    if (nv2a_pcache_put(dst, 0, scan.v[i].slots, scan.v[i].n * 16u) > 0)
+                        st->added++;
+                    break;
+                }
+        } else if (type != NV2A_PC_MANIFEST_VS) {
+            if (nv2a_pcache_put(dst, type, b + off + 16, len) > 0)
+                st->added++;
+        }
+        off += 16 + (size_t)len;
+    }
+    for (i = 0; i < scan.n; i++)
+        free(scan.v[i].slots);
+    free(scan.v);
+    free(xbe);
+    free(b);
+    fprintf(stderr, "[pcache] manifest %s rev %s: %u records, %u of %u vertex programs found in"
+            " the executable, %u new to the key list\n", label, st->revision, st->records,
+            st->vs_resolved, st->vs_listed, st->added);
+    return st->added;
+}
+
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
+
+void nv2a_pcache_lower_priority(void)
+{
+#if defined(__linux__) || defined(__ANDROID__)
+    (void)setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
+#elif defined(__APPLE__)
+    (void)pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#elif defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+}
+
+int nv2a_pcache_cpu_count(void)
+{
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors ? (int)si.dwNumberOfProcessors : 1;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+#endif
 }

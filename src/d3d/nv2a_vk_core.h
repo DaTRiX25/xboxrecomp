@@ -42,7 +42,11 @@ struct nvk_core {
     VkFormat                         depth_format;   /* D32S8, else D24S8 */
     int                              portability;    /* MoltenVK */
     int                              validation;     /* layers on */
-    int                              present_wait;   /* VK_KHR_present_id + _wait on */
+    int                              present_wait;   /* VK_KHR_present_id + _wait on, or the pair below */
+    int                              present_wait2;  /* VK_KHR_present_id2 + _wait2 instead (Windows, BO-207) */
+    int                              surface_caps2;  /* VK_KHR_get_surface_capabilities2 on (BO-207) */
+    int                              colorspace_ext; /* VK_EXT_swapchain_colorspace on (BO-110) */
+    int                              hdr_metadata;   /* VK_EXT_hdr_metadata on (BO-110) */
     int                              demote;         /* shaderDemoteToHelperInvocation on: SPIR-V 1.6's discard */
     float                            max_aniso;      /* samplerAnisotropy on: the limit; else 0 */
     char                             name[256];

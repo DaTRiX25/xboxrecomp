@@ -95,6 +95,7 @@
 #include "nv2a_pb_state.h"
 #include "xbox_memory_layout.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_texrep.h"
 #include "recomp_env.h"
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
@@ -931,6 +932,19 @@ static int swizzled_case(const struct nv2a_pb_backend *b)
     return diff != 0;
 }
 
+/* The composite (context rows 0..3) of a screen-space title: identity.
+ * Fixed-function immediate batches go through it since 154c6418 (BO-198); a
+ * zero composite, which nothing here had loaded, divides by w = 0 and drops
+ * the batch. */
+static void identity_composite(void)
+{
+    uint32_t i;
+
+    M(0x1EA4, 0);                          /* CONSTANT_LOAD: row 0 */
+    for (i = 0; i < 16; i++)
+        M(0x0B80 + 4 * i, f2u((i % 5) == 0 ? 1.0f : 0.0f));
+}
+
 static int poly_offset_case(const struct nv2a_pb_backend *b)
 {
     static const uint32_t col[2] = {0xFFFF0000u, 0xFF0000FFu};
@@ -939,6 +953,7 @@ static int poly_offset_case(const struct nv2a_pb_backend *b)
 
     nv2a_pb_set_backend(b);
     surf_clip(BUF0, 0, 0, W, H);
+    identity_composite();
     M(0x1D8C, 0xFFFFFF00u);
     M(0x1D90, 0xFF000000u);
     M(0x1D94, 0xF3);
@@ -1244,6 +1259,93 @@ static int guard_case(const struct nv2a_pb_backend *b, const uint32_t *ref)
 }
 #endif
 
+#ifdef HAVE_GPU
+/* BO-207: a live HDR switch (hdr=1, hdr_ab=2: the targets change format
+ * every 2 flips). The present surface is made 640x480 by a full clear; after
+ * that only a 640x448+16 clip is drawn, as on Burnout 3's menus and loading
+ * screens. Every switch must leave the shown target 640x480: one made again
+ * at the next draw's clip (640x464) is never taken for the 640x480 frame,
+ * and every flip went out as guest bytes. Returns the failures. */
+/* BO-203: a texture with an HDR picture (nv2a_texrep_register_hdr_image)
+ * follows the switch in both directions. The checker texture of the other
+ * scenes is registered with a solid picture, and a scene using it is drawn
+ * after each of 12 flips (the targets change format every 2). The backend
+ * must upload the texture again at each change of state, whatever state it
+ * was drawn in before (nv2a_texrep_apply matches it: stats), and replace its
+ * texels only while HDR is on. (The presented pixels are not read: in HDR
+ * the host target is half float; the HDR look is checked in the game.)
+ * Returns the failures. */
+static int hdr_texrep_loop(const struct nv2a_pb_backend *b)
+{
+    static uint32_t pic[64 * 64];
+    static const struct nv2a_texrep_rect all = {0, 0, 64, 64};
+    static const struct nv2a_texrep_variant var = {pic, &all, 1};
+    static struct nv2a_texrep_tex tex;
+    uint32_t i, on = 0, off = 0;
+    int f = 0, prev = -1;
+
+    (void)b;
+    for (i = 0; i < 64 * 64; i++)
+        pic[i] = 0xFF00FF00u;
+    tex.name = "smoke checker";
+    tex.hash = nv2a_texrep_hash(guest(TEX_GUEST), 0x06u, 64, 64, 0);
+    tex.color = 0x06u; tex.width = 64; tex.height = 64;
+    tex.variants = &var; tex.n_variants = 1;
+    nv2a_texrep_register_hdr_image(&tex, 1);
+    f += check(tex.hash != 0, "texrep: the checker has a hash");
+    for (i = 0; i < 12; i++) {
+        uint64_t m0, r0, m1, r1;
+        int hdr = nv2a_texrep_hdr(), again = hdr != prev;
+        nv2a_texrep_stats(NULL, &m0, &r0);
+        scene(SC_CHECKER, BUF0, BUF1);
+        nv2a_texrep_stats(NULL, &m1, &r1);
+        f += check(m1 - m0 == (again ? 1u : 0u),
+                   hdr ? "texrep, HDR on: the texture uploaded again after a switch, not otherwise"
+                       : "texrep, HDR off: the texture uploaded again after a switch, not otherwise");
+        f += check(r1 - r0 == (again && hdr ? 1u : 0u),
+                   "texrep: the picture replaces the texels in HDR, and only then");
+        if (hdr) on++; else off++;
+        prev = hdr;
+        M(0x012C, 0);                      /* FLIP_INCREMENT_WRITE: the next state */
+    }
+    f += check(on >= 4 && off >= 4, "texrep: both states were drawn");
+    nv2a_texrep_register_hdr_image(NULL, 0);
+    surf_clip(BUF0, 0, 0, W, H);
+    return f;
+}
+
+static int hdr_switch_case(const struct nv2a_pb_backend *b)
+{
+    uint32_t tw = 0, th = 0, sw = 0, sh = 0, flip;
+    int i, f = 0;
+
+    nv2a_pb_set_backend(b);
+    surf_clip(BUF0, 0, 0, W, H);
+    clear_to(0xFF000000u);
+    M(0x012C, 0);                       /* FLIP_INCREMENT_WRITE */
+    M(0x0130, 0);                       /* FLIP_STALL */
+    for (i = 0; i < 10; i++) {
+        surf_clip(BUF0, 0, 16, W, 448);
+        clear_to(0xFF203040u + (uint32_t)i);
+        M(0x012C, 0);
+        M(0x0130, 0);
+        flip = nv2a_pb_gpu_state()->flips;
+        tw = th = 0;
+        if (!nv2a_pb_metal_shown(BUF0, &tw, &th, &sw, &sh) || tw != W || th != H) {
+            fprintf(stderr, "[backend-smoke] hdr switch: flip %u: target %ux%u (want %ux%u)"
+                    " FAIL\n", flip, tw, th, W, H);
+            f++;
+        }
+    }
+    fprintf(stderr, "[backend-smoke] hdr switch: 10 flips, a switch every 2: %s\n",
+            f ? "FAIL" : "PASS");
+    surf_clip(BUF0, 0, 0, W, H);
+    f += hdr_texrep_loop(b);
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+#endif
+
 static void build_xbe(uint8_t *xbe, size_t n)
 {
     uint32_t v;
@@ -1346,6 +1448,7 @@ int main(int argc, char **argv)
     int sc, k = 0, failures = 0;
     int guard = argc > 1 && !strcmp(argv[1], "guard");
     int noalias = argc > 1 && !strcmp(argv[1], "noalias");
+    int hdrsw = argc > 1 && !strcmp(argv[1], "hdrswitch");
 
     setvbuf(stderr, NULL, _IONBF, 0);
     {
@@ -1369,6 +1472,12 @@ int main(int argc, char **argv)
     }
     /* The index limit is the walker's alone (CPU path), so it runs before
      * the backend check: a host without a GPU backend still checks it. */
+    if (hdrsw) {
+        /* Read once, when the backend starts. */
+        recomp_env_set(RENV_HDR, "1");
+        recomp_env_set(RENV_HDR_AB, "2");
+        guard = noalias = 1;            /* none of the walker's own cases */
+    }
     if (!guard && !noalias && overflow_case()) {
         fprintf(stderr, "[backend-smoke] FAIL: index limit\n");
         failures++;
@@ -1414,6 +1523,10 @@ int main(int argc, char **argv)
         return 1;
     make_textures();
 #ifdef HAVE_GPU
+    if (hdrsw) {
+        failures = hdr_switch_case(gpu);
+        return failures ? 1 : 0;
+    }
     if (guard && !G.metal) {
         fprintf(stderr, "[backend-smoke] fb_guard is Metal's: skipped\n");
         return 77;

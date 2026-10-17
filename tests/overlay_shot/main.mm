@@ -772,6 +772,31 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     CHECK(!xbox_OverlayTestHasRow("Cancel the import") && xbox_OverlayTestHasRow("Import cancelled"));
     CHECK(!xbox_OverlayTestHasRow("Restart now"));
 
+    /* The cursor keeps its index when the rows change under it. With the
+     * cursor on "Import Xbox save..." (the fourth save row) an import gets
+     * staged, as the Xbox flow does after its folder browser: the save rows
+     * collapse to "Cancel the import" and the index now falls on "Reset all
+     * settings to the defaults". One more Enter there must not wipe the
+     * settings (settings.toml was rewritten to defaults on a test machine);
+     * a reset asks once more first. */
+    CHECK(xbox_OverlayTestSelectRow("Import Xbox save"));
+    run(2);
+    {
+        char err[1400] = "";
+        CHECK(recomp_save_import_stage(save, found, "4541005b", err, sizeof err));
+    }
+    run(3);
+    CHECK(xbox_OverlayTestRowIndex("Reset all settings") == xbox_OverlayTestRowIndex("Cancel the import") + 2);
+    xbox_SettingSet(XS_GRAPHICS_RENDER_SCALE, 2);
+    run(2);
+    press_a();
+    CHECK(xbox_SettingGet(XS_GRAPHICS_RENDER_SCALE)->user && xbox_SettingValue(XS_GRAPHICS_RENDER_SCALE) == 2);
+    press_a();                                                  /* asked once more: now it does */
+    CHECK(!xbox_SettingGet(XS_GRAPHICS_RENDER_SCALE)->user);
+    recomp_save_import_cancel(save);
+    run(3);
+    CHECK(!xbox_OverlayTestHasRow("Cancel the import"));
+
     /* Another folder: the browser, on the exported saves. */
     CHECK(xbox_OverlayTestSelectRow("Import save from another folder"));
     press_a();
@@ -872,6 +897,16 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     xbox_SettingSet(XS_DISPLAY_ASPECT, 0);
     run(2);
     CHECK(!xbox_OverlayTestHasRow("Restart now"));
+    CHECK(!recomp_restart_requested());
+
+    /* "Reset this page" asks once more as well. */
+    xbox_SettingSet(XS_DISPLAY_ASPECT, 1);
+    CHECK(xbox_OverlayTestSelectRow("Reset this page"));
+    run(2);
+    press_a();
+    CHECK(xbox_SettingGet(XS_DISPLAY_ASPECT)->user && xbox_SettingValue(XS_DISPLAY_ASPECT) == 1);
+    press_a();
+    CHECK(!xbox_SettingGet(XS_DISPLAY_ASPECT)->user);
     CHECK(!recomp_restart_requested());
 
     /* Restart now and Quit game: on every page while a change waits, each

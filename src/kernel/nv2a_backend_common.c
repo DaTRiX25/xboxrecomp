@@ -6,6 +6,7 @@
 #include "recomp_env.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -37,6 +38,69 @@ uint32_t nv2a_tex_face_stride(uint32_t fmt, uint32_t w, uint32_t h,
                ? nv2a_tex_extent(fmt, w, h, pitch, levels ? levels : 1u)
                : pitch * h;
     return (n + 127u) & ~127u;
+}
+
+void nv2a_vtx_gather(const struct nv2a_pb_draw *d, const int *slot, int nf4,
+                     uint32_t lo, uint32_t count, const float (*inl)[4],
+                     const uint8_t *mem, float *out)
+{
+    struct {
+        const uint8_t *p;       /* the element of the vertex being written */
+        size_t         stride;
+        uint32_t       type, size;
+        const float   *dflt;    /* SET_VERTEX_DATA value */
+    } s[NV_VERTEX_ATTRS];
+    const int inl_data = d->inline_data;
+    uint32_t i;
+    int k;
+
+    if (nf4 > NV_VERTEX_ATTRS)
+        nf4 = NV_VERTEX_ATTRS;
+    for (k = 0; k < nf4; k++) {
+        const VertexAttr *a = &d->attr[slot[k]];
+        s[k].dflt = inl[slot[k]];
+        s[k].stride = a->stride;
+        s[k].type = a->type;
+        s[k].size = a->size;
+        s[k].p = NULL;
+        if (!a->size || !a->stride)
+            continue;
+        if (inl_data)
+            s[k].p = (const uint8_t *)d->inline_buf + a->offset + (size_t)lo * a->stride;
+        else if (a->offset)
+            s[k].p = mem + a->offset + (size_t)lo * a->stride;
+    }
+    for (i = 0; i < count; i++) {
+        for (k = 0; k < nf4; k++, out += 4) {
+            const uint8_t *p = s[k].p;
+            if (p) {
+                s[k].p = p + s[k].stride;
+                if (inl_data && (size_t)(p - (const uint8_t *)d->inline_buf) + 4 > d->inline_bytes)
+                    p = NULL;
+            }
+            if (!p) {
+                memcpy(out, s[k].dflt, 16);
+                continue;
+            }
+            if (s[k].type == NV2A_VTX_FLOAT) {
+                /* Loaded into registers and stored once each: a partial
+                 * store read back whole stalls the store forwarding. */
+                float x = 0.0f, y = 0.0f, z = 0.0f, w = 1.0f;
+                switch (s[k].size) {
+                default: memcpy(&w, p + 12, 4); /* fall through */
+                case 3:  memcpy(&z, p + 8, 4);  /* fall through */
+                case 2:  memcpy(&y, p + 4, 4);  /* fall through */
+                case 1:  memcpy(&x, p, 4);      break;
+                }
+                out[0] = x;
+                out[1] = y;
+                out[2] = z;
+                out[3] = w;
+            } else if (!nv2a_vtx_decode(s[k].type, s[k].size, p, out)) {
+                memcpy(out, s[k].dflt, 16);
+            }
+        }
+    }
 }
 
 uint64_t nv2a_tex_hash(const uint8_t *p, uint32_t n, uint64_t h)
@@ -721,6 +785,153 @@ void nv2a_host_set_lod_bias(int mode, float value)
     s_lod_value = value < -4.0f ? -4.0f : value > 4.0f ? 4.0f : value;
     s_lod_mode = mode == NV2A_LOD_AUTO ? NV2A_LOD_AUTO
                : mode == NV2A_LOD_VALUE ? NV2A_LOD_VALUE : NV2A_LOD_OFF;
+}
+
+/* ---- HDR (BO-110) ---- */
+static volatile int   s_hdr_on = -1;          /* -1: not read yet */
+static volatile float s_hdr_peak = -1.0f, s_hdr_paper = -1.0f, s_hdr_hud = -1.0f;
+static volatile float s_hdr_pot, s_hdr_now;
+static void *(*s_hdr_patch_fn)(float);
+
+static float env_f(recomp_env_id id, float def)
+{
+    const char *e = recomp_env(id);
+    return e && *e ? (float)atof(e) : def;
+}
+
+static int hdr_debug(void)
+{
+    const char *e = recomp_env(RENV_HDR);
+    return e && *e && strcmp(e, "0") != 0;
+}
+
+int nv2a_host_hdr(void)
+{
+    if (s_hdr_on < 0) {
+        const char *e = recomp_env(RENV_GFX_HDR);
+        s_hdr_on = (e && *e && strcmp(e, "0") && strcmp(e, "off")) || hdr_debug() ? 1 : 0;
+    }
+    return s_hdr_on;
+}
+
+int nv2a_host_hdr_active(void)
+{
+    static int dbg = -1;
+    if (dbg < 0)
+        dbg = hdr_debug();
+    return nv2a_host_hdr() && (dbg || s_hdr_pot > 1.0f);
+}
+
+void nv2a_host_set_hdr(int on) { s_hdr_on = on ? 1 : 0; }
+
+void nv2a_host_set_hdr_levels(int which, float peak, float paper, float hud)
+{
+    (void)which;
+    if (peak >= 0.0f) s_hdr_peak = peak;
+    if (paper >= 0.0f) s_hdr_paper = paper;
+    if (hud >= 0.0f) s_hdr_hud = hud;
+}
+
+void nv2a_host_hdr_levels(float *peak_nits, float *paper_nits, float *hud_nits)
+{
+    float pk, pw, hw;
+    if (s_hdr_peak < 0.0f) s_hdr_peak = env_f(RENV_GFX_HDR_PEAK, 0.0f);
+    if (s_hdr_paper < 0.0f) s_hdr_paper = env_f(RENV_GFX_HDR_PAPER, (float)NV2A_HDR_PAPER_DEFAULT);
+    if (s_hdr_hud < 0.0f) s_hdr_hud = env_f(RENV_GFX_HDR_HUD, 0.0f);
+    pw = s_hdr_paper >= 10.0f ? s_hdr_paper : (float)NV2A_HDR_PAPER_DEFAULT;
+    hw = s_hdr_hud >= 10.0f ? s_hdr_hud : pw;
+    pk = s_hdr_peak;
+    if (pk < 10.0f) {
+        /* The display's: on macOS its EDR headroom now, x 100 nits; on
+         * Vulkan the peak its EDID reports / 100 (fb_present_vulkan.c); with
+         * no display known (headless) 1000. */
+        pk = s_hdr_now > 1.0f ? s_hdr_now * 100.0f : 1000.0f;
+    }
+#if defined(__APPLE__)
+    else if (s_hdr_now > 1.0f && pk > s_hdr_now * 100.0f) {
+        pk = s_hdr_now * 100.0f;     /* never past what the display shows now (EDR headroom) */
+    }
+#endif
+    if (pk < pw) pk = pw;
+    if (pk < hw) pk = hw;
+    *peak_nits = pk;
+    *paper_nits = pw;
+    *hud_nits = hw;
+}
+
+/* B1/B2/B5 of the HDR review: the decode curve, the shadows' power below
+ * mid grey, the gain on light past paper white. */
+static volatile float s_hdr_shadows = -1.0f, s_hdr_hl = -1.0f;
+static volatile int   s_hdr_dec = -1;
+
+void nv2a_host_set_hdr_tone(int which, float v)
+{
+    if (which == 0) s_hdr_shadows = v;
+    else if (which == 1) s_hdr_hl = v;
+    else s_hdr_dec = v != 0.0f;
+}
+
+void nv2a_host_hdr_tone(float *shadows, float *highlights, int *srgb)
+{
+    if (s_hdr_shadows < 0.0f) s_hdr_shadows = env_f(RENV_GFX_HDR_SHADOWS, 1.0f);
+    if (s_hdr_hl < 0.0f) s_hdr_hl = env_f(RENV_GFX_HDR_HIGHLIGHTS, 1.0f);
+    if (s_hdr_dec < 0) {
+        const char *e = recomp_env(RENV_GFX_HDR_DECODE);
+        s_hdr_dec = e && !strcmp(e, "srgb");
+    }
+    *shadows = s_hdr_shadows < 0.5f ? 0.5f : s_hdr_shadows > 2.0f ? 2.0f : s_hdr_shadows;
+    *highlights = s_hdr_hl < 0.25f ? 0.25f : s_hdr_hl > 4.0f ? 4.0f : s_hdr_hl;
+    *srgb = s_hdr_dec;
+}
+
+void nv2a_host_hdr_shape(float *shoulder, float *black_nits)
+{
+    static float sh = -1.0f, bl = -1.0f;
+    if (sh < 0.0f) {
+        sh = env_f(RENV_GFX_HDR_SHOULDER, 0.35f);
+        sh = sh < 0.0f ? 0.0f : sh > 1.0f ? 1.0f : sh;
+        bl = env_f(RENV_GFX_HDR_BLACK, 0.0f);
+        bl = bl < 0.0f ? 0.0f : bl > 5.0f ? 5.0f : bl;
+    }
+    *shoulder = sh;
+    *black_nits = bl;
+}
+
+void nv2a_host_hdr_display(float potential, float now)
+{
+    s_hdr_pot = potential;
+    s_hdr_now = now;
+}
+
+float nv2a_host_hdr_potential(void) { return s_hdr_pot; }
+
+void nv2a_host_set_hdr_patch_fn(void *(*fn)(float)) { s_hdr_patch_fn = fn; }
+void *nv2a_host_hdr_patch(float nits) { return s_hdr_patch_fn ? s_hdr_patch_fn(nits) : NULL; }
+
+/* The overlay's request for a pattern this frame (a presenter that cannot
+ * draw past the overlay's own white takes it after the overlay and draws it
+ * itself: Vulkan's HDR10 path). */
+static struct { int on, kind; float r[4], a, b; } s_hdr_pat;
+
+void nv2a_host_hdr_pattern(int kind, float x0, float y0, float x1, float y1, float a, float b)
+{
+    s_hdr_pat.kind = kind;
+    s_hdr_pat.r[0] = x0; s_hdr_pat.r[1] = y0; s_hdr_pat.r[2] = x1; s_hdr_pat.r[3] = y1;
+    s_hdr_pat.a = a;
+    s_hdr_pat.b = b;
+    s_hdr_pat.on = 1;
+}
+
+int nv2a_host_hdr_pattern_take(int *kind, float r[4], float *a, float *b)
+{
+    if (!s_hdr_pat.on)
+        return 0;
+    s_hdr_pat.on = 0;
+    *kind = s_hdr_pat.kind;
+    memcpy(r, s_hdr_pat.r, sizeof s_hdr_pat.r);
+    *a = s_hdr_pat.a;
+    *b = s_hdr_pat.b;
+    return 1;
 }
 
 static volatile int s_dither = -1;          /* -1: not read yet */

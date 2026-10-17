@@ -3980,6 +3980,23 @@ class Lifter:
             return [f"fp_push(0.0); /* fldz */"]
         if m == "fld1":
             return [f"fp_push(1.0); /* fld1 */"]
+        # TOP moves; the tag word is not modelled, so ffree is a no-op and
+        # ffreep a plain pop. MSVC's tanf is `fptan; ffree st(0); fincstp;
+        # fstp`: FPTAN pushes 1.0 above the tangent, ffree empties that
+        # slot and fincstp steps TOP onto the tangent. Left as comments, the
+        # fstp stored the 1.0, so a camera's view window was extent * 1
+        # instead of extent * tan(fov / 2): in Burnout 3 the Crash Nav
+        # globe (a 15-degree half angle) came out 3.7 times too small and
+        # the garage too wide. Its race camera did not change with the fix
+        # (BO-215).
+        if m == "fincstp":
+            return ["g_fp_top = (g_fp_top + 1u) & 7u; /* fincstp */"]
+        if m == "fdecstp":
+            return ["g_fp_top = (g_fp_top + 7u) & 7u; /* fdecstp */"]
+        if m == "ffree":
+            return [f"/* ffree {insn.op_str}: tags are not modelled */"]
+        if m == "ffreep":
+            return [f"fp_pop(); /* ffreep {insn.op_str} */"]
 
         return [f"/* FPU: {m} {insn.op_str} */"]
 

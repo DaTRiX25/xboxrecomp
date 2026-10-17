@@ -101,6 +101,20 @@ static int make_instance(const char *const *inst_exts, unsigned n)
         exts[ne++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
         ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     }
+    /* BO-110: HDR colour spaces of a window's surface (HDR10 ST 2084 under
+     * gamescope's WSI layer, a Wayland compositor with colour management). */
+    if (n && has_ext(avail, navail, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+        exts[ne++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
+        s_core.colorspace_ext = 1;
+    }
+#if defined(_WIN32) && defined(VK_KHR_present_wait2)
+    /* BO-207: whether a surface takes VK_KHR_present_wait2 (its swapchain
+     * flags need the surface's word for it). */
+    if (n && has_ext(avail, navail, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+        exts[ne++] = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
+        s_core.surface_caps2 = 1;
+    }
+#endif
     if (recomp_env(RENV_VK_VALIDATION)) {
         uint32_t nlp = 0;
         VkLayerProperties *lp;
@@ -166,10 +180,15 @@ static int make_device(void)
     uint32_t npd = 8, i, best_q = 0, navail = 0, ne = 0;
     int best = -1;
     VkExtensionProperties *avail;
-    const char *exts[6];
+    const char *exts[10];
     VkPhysicalDevicePresentIdFeaturesKHR pid, have_pid;
     VkPhysicalDevicePresentWaitFeaturesKHR pw, have_pw;
     int want_pw = 0;
+#if defined(_WIN32) && defined(VK_KHR_present_wait2)
+    VkPhysicalDevicePresentId2FeaturesKHR pid2, have_pid2;
+    VkPhysicalDevicePresentWait2FeaturesKHR pw2, have_pw2;
+    int want_pw2 = 0;
+#endif
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci;
     VkPhysicalDeviceFeatures2 f2;
@@ -216,8 +235,20 @@ static int make_device(void)
     }
     /* When each frame reached the display (vkWaitForPresentKHR): the
      * presenter's present-to-present statistics. */
+    /* BO-110: the HDR mastering metadata of a swapchain (vkSetHdrMetadataEXT). */
+    if (s_core.surface && has_ext(avail, navail, VK_EXT_HDR_METADATA_EXTENSION_NAME)) {
+        exts[ne++] = VK_EXT_HDR_METADATA_EXTENSION_NAME;
+        s_core.hdr_metadata = 1;
+    }
     want_pw = s_core.surface && has_ext(avail, navail, VK_KHR_PRESENT_ID_EXTENSION_NAME)
               && has_ext(avail, navail, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+#if defined(_WIN32) && defined(VK_KHR_present_wait2)
+    /* BO-207: AMD's Windows driver (RX 9060 XT, 2026) has only the second
+     * pair, present_id2 + present_wait2: the same per-frame display times. */
+    want_pw2 = !want_pw && s_core.surface && s_core.surface_caps2
+               && has_ext(avail, navail, VK_KHR_PRESENT_ID_2_EXTENSION_NAME)
+               && has_ext(avail, navail, VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME);
+#endif
     free(avail);
 
     memset(&have13, 0, sizeof have13);
@@ -231,6 +262,15 @@ static int make_device(void)
     have_pid.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
     have_pid.pNext = &have_pw;
     have13.pNext = want_pw ? &have_pid : NULL;
+#if defined(_WIN32) && defined(VK_KHR_present_wait2)
+    memset(&have_pw2, 0, sizeof have_pw2);
+    have_pw2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR;
+    memset(&have_pid2, 0, sizeof have_pid2);
+    have_pid2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR;
+    have_pid2.pNext = &have_pw2;
+    if (want_pw2)
+        have13.pNext = &have_pid2;
+#endif
     memset(&have2, 0, sizeof have2);
     have2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     have2.pNext = &have12;
@@ -254,6 +294,24 @@ static int make_device(void)
         exts[ne++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
         s_core.present_wait = 1;
     }
+#if defined(_WIN32) && defined(VK_KHR_present_wait2)
+    if (want_pw2 && have_pid2.presentId2 && have_pw2.presentWait2) {
+        memset(&pw2, 0, sizeof pw2);
+        pw2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR;
+        pw2.presentWait2 = VK_TRUE;
+        memset(&pid2, 0, sizeof pid2);
+        pid2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR;
+        pid2.presentId2 = VK_TRUE;
+        pid2.pNext = &pw2;
+        f13.pNext = &pid2;
+        exts[ne++] = VK_KHR_PRESENT_ID_2_EXTENSION_NAME;
+        exts[ne++] = VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME;
+        s_core.present_wait = 1;
+        s_core.present_wait2 = 1;
+        fprintf(stderr, "[vulkan] %s: VK_KHR_present_wait2 (no VK_KHR_present_wait): the"
+                " presenter times each frame on the display with it\n", s_core.name);
+    }
+#endif
     if (s_core.surface && !s_core.present_wait)
         fprintf(stderr, "[vulkan] no VK_KHR_present_wait on %s (extensions %s, features %d/%d):"
                 " the presenter cannot time each frame on the display\n", s_core.name,

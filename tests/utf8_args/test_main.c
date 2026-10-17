@@ -21,10 +21,10 @@ int main(int argc, char **argv)
                                        0x43C, 0x443, 0x437, 0x44B, 0x43A, 0x430, 0 };
     static const char folder_utf8[] = "Zen\xC3\xA9k \xC5\x91\xC5\xB1 "
                                       "\xD0\xBC\xD1\x83\xD0\xB7\xD1\x8B\xD0\xBA\xD0\xB0";
-    /* C:\Users\Kornél\AppData, a CJK name, U+1F3B5 as a surrogate pair. */
-    static const uint16_t path[] = { 'C', ':', '\\', 'U', 's', 'e', 'r', 's', '\\', 'K', 'o', 'r', 'n',
-                                     0xE9, 'l', '\\', 0x65E5, 0x672C, ' ', 0xD83C, 0xDFB5, 0 };
-    static const char path_utf8[] = "C:\\Users\\Korn\xC3\xA9l\\\xE6\x97\xA5\xE6\x9C\xAC \xF0\x9F\x8E\xB5";
+    /* C:\Users\Zoé\AppData, a CJK name, U+1F3B5 as a surrogate pair. */
+    static const uint16_t path[] = { 'C', ':', '\\', 'U', 's', 'e', 'r', 's', '\\', 'Z', 'o',
+                                     0xE9, '\\', 0x65E5, 0x672C, ' ', 0xD83C, 0xDFB5, 0 };
+    static const char path_utf8[] = "C:\\Users\\Zo\xC3\xA9\\\xE6\x97\xA5\xE6\x9C\xAC \xF0\x9F\x8E\xB5";
     static const uint16_t lone[] = { 'a', 0xD83C, 'b', 0xDFB5, 'c', 0 };
     static const uint16_t empty[] = { 0 };
     static const uint16_t plain[] = { '-', '-', 'm', 'u', 's', 'i', 'c', '-', 'd', 'i', 'r', 0 };

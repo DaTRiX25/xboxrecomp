@@ -249,5 +249,61 @@ class SahfCompiledTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
 
 
+# MSVC's tanf: `fptan; ffree st(0); fincstp; fstp [mem]`. FPTAN leaves 1.0
+# above the tangent; fincstp steps TOP back onto the tangent. When ffree and
+# fincstp were dropped, the store took the 1.0 (Burnout 3's camera view
+# windows, BO-215).
+_TANF_SOURCE = r"""
+#define RECOMP_GENERATED_CODE 1
+#include "recomp_types.h"
+#include <math.h>
+RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
+RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS int g_fp_cmp;
+RECOMP_TLS uint16_t g_fp_cc;
+@MACROS@
+int main(void) {
+    double x = 0.2617993950843811, stored;
+    g_fp_top = 0; fp_push(x);
+@TANF@
+    stored = fp_top(); fp_pop();
+    if (stored != tan(x)) return 10;
+    if (g_fp_top != 0) return 11;
+    g_fp_top = 3;
+@STEP@
+    if (g_fp_top != 3) return 12;
+    return 0;
+}
+"""
+
+
+class TanfIdiomTest(unittest.TestCase):
+    def test_fincstp_and_fdecstp_move_top(self):
+        self.assertIn("g_fp_top = (g_fp_top + 1u) & 7u;", _lift("fincstp"))
+        self.assertIn("g_fp_top = (g_fp_top + 7u) & 7u;", _lift("fdecstp"))
+        self.assertIn("fp_pop();", _lift("ffreep"))
+
+    def test_tanf_stores_the_tangent(self):
+        cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+        if not cc:
+            raise unittest.SkipTest("C compiler unavailable")
+        tanf = _block([_insn(0, 2, "fptan"), _insn(2, 2, "ffree", "st(0)"),
+                       _insn(4, 2, "fincstp")])
+        step = _block([_insn(0, 2, "fdecstp"), _insn(2, 2, "fincstp")])
+        source = (_TANF_SOURCE.replace("@MACROS@", "\n".join(FP_STACK_MACROS))
+                  .replace("@TANF@", tanf).replace("@STEP@", step))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tanf.c"
+            path.write_text(source)
+            exe = Path(tmp) / "tanf.exe"
+            command = [cc, "-w", str(path), "-o", str(exe),
+                       "-I", str(_ROOT / "templates" / "runtime"), "-I", str(_ROOT / "src")]
+            if os.name != "nt":
+                command.append("-lm")
+            built = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(built.returncode, 0, built.stderr[-2000:])
+            result = subprocess.run([str(exe)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

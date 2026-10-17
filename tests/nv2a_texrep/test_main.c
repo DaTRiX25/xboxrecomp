@@ -143,6 +143,79 @@ int main(void)
     nv2a_texrep_register(NULL, 0);
     CHECK(nv2a_texrep_apply(g_dxt, FMT_DXT5, W, H, 0, 1, texels) == 0);
 
+    /* BO-203: a picture that replaces the whole texture with HDR on, and
+     * only then. Registered apart from the variants; matched in SDR too (the
+     * cache keeps a generation, so a switch uploads it again), untouched
+     * there; replaced and re-mipped with HDR on; the generation moves with
+     * the switch in both directions, not when it stays. */
+    {
+        static struct nv2a_texrep_variant hv;
+        static struct nv2a_texrep_tex ht;
+        uint64_t m0, r0, m1, r1_, m2, r2_;
+        uint32_t g0, g1, g2;
+
+        for (i = 0; i < W * H; i++)
+            g_img2[i] = 0x80FFFFFFu;
+        hv.image = g_img2; hv.rects = r2; hv.n_rects = 1;
+        ht = tex[0];
+        ht.name = "hdr picture"; ht.variants = &hv; ht.n_variants = 1;
+        nv2a_texrep_set_variant(0);
+        nv2a_texrep_set_hdr(0);
+        nv2a_texrep_register_hdr_image(&ht, 1);
+        g0 = nv2a_texrep_generation();
+        CHECK(g0 != 0 && !nv2a_texrep_hdr());
+        memcpy(texels, ref, sizeof ref);
+        nv2a_texrep_stats(NULL, &m0, &r0);
+        CHECK(nv2a_texrep_apply(g_dxt, FMT_DXT5, W, H, 0, 1, texels) == g0);   /* SDR: matched */
+        CHECK(!memcmp(texels, ref, sizeof ref));                               /* ... untouched */
+        nv2a_texrep_stats(NULL, &m1, &r1_);
+        CHECK(m1 == m0 + 1 && r1_ == r0);
+        /* Another texture of the same size: nothing. */
+        CHECK(nv2a_texrep_apply(g_other, FMT_DXT5, W, H, 0, 1, texels) == 0);
+        nv2a_texrep_set_hdr(0);                                                /* no change */
+        CHECK(nv2a_texrep_generation() == g0);
+        nv2a_texrep_set_hdr(1);                                                /* HDR on */
+        g1 = nv2a_texrep_generation();
+        CHECK(g1 != g0 && g1 != 0 && nv2a_texrep_hdr());
+        CHECK(nv2a_texrep_apply(g_dxt, FMT_DXT5, W, H, 0, 3, texels) == g1);
+        CHECK(!memcmp(texels, g_img2, sizeof g_img2));
+        CHECK(texels[W * H] == 0x80FFFFFFu);                                   /* level 1 */
+        nv2a_texrep_stats(NULL, &m2, &r2_);
+        CHECK(m2 == m1 + 1 && r2_ == r1_ + 1);
+        nv2a_texrep_set_hdr(0);                                                /* and off again */
+        g2 = nv2a_texrep_generation();
+        CHECK(g2 != g1 && g2 != 0);
+        memcpy(texels, ref, sizeof ref);
+        CHECK(nv2a_texrep_apply(g_dxt, FMT_DXT5, W, H, 0, 1, texels) == g2);
+        CHECK(!memcmp(texels, ref, sizeof ref));
+        /* A colour-only picture (keep_alpha): the title's alpha stays, in
+         * every level; the colours are the picture's, the levels below made
+         * from them. */
+        hv.keep_alpha = 1;
+        for (i = 0; i < W * H; i++)
+            g_img2[i] = 0x00102030u + (uint32_t)(i & 7) * 0x00010101u;     /* alpha 0 in the picture */
+        nv2a_texrep_register_hdr_image(&ht, 1);
+        nv2a_texrep_set_hdr(1);
+        for (i = 0; i < W * H + (W / 2) * (H / 2) + (W / 4) * (H / 4); i++)
+            texels[i] = 0xC0000000u | (uint32_t)(i & 0xFFFF);               /* the title's levels */
+        memcpy(ref, texels, sizeof ref);
+        {
+            uint32_t alpha0[W * H + (W / 2) * (H / 2) + (W / 4) * (H / 4)];
+            memcpy(alpha0, texels, sizeof alpha0);
+            CHECK(nv2a_texrep_apply(g_dxt, FMT_DXT5, W, H, 0, 3, texels) != 0);
+            for (i = 0; i < W * H + (W / 2) * (H / 2) + (W / 4) * (H / 4); i++)
+                CHECK((texels[i] >> 24) == (alpha0[i] >> 24));              /* alpha kept, all levels */
+            for (i = 0; i < W * H; i++)
+                CHECK((texels[i] & 0x00FFFFFFu) == (g_img2[i] & 0x00FFFFFFu));
+            CHECK((texels[W * H] & 0x00FFFFFFu) == 0x00112131u);            /* level 1: the box of the colours */
+        }
+        /* Forgotten: not a candidate any more. */
+        nv2a_texrep_register_hdr_image(NULL, 0);
+        nv2a_texrep_set_hdr(1);
+        CHECK(nv2a_texrep_apply(g_dxt, FMT_DXT5, W, H, 0, 1, texels) == 0);
+        nv2a_texrep_set_hdr(0);
+    }
+
     /* BO-176: depth offsets, by hash, format and size. */
     {
         static struct nv2a_texrep_zbias zb[2];

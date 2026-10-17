@@ -155,6 +155,53 @@ static void lock(void)
     }
     check(raised == 2 && p.depth == 3 && p.depth_max == 3,
           "120 Hz: four slips raise the depth (not during the first 120 frames)");
+    /* BO-211: the depth comes back, one refresh per 600 frames on time. */
+    {
+        int lowered = 0, k;
+        uint64_t v0 = v;
+        for (k = 1; k <= 2 * PC_DECAY_FRAMES + 10; k++) {
+            int r;
+            v = v0 + (uint64_t)k * 2 * R;
+            pc_pacer_aim(&p, v, v + 300000, &a);
+            r = pc_pacer_glass(&p, &a, a.target_ns);
+            lowered += r < 0;
+            if (k == PC_DECAY_FRAMES + 1 && p.depth != 2)
+                lowered = -100;
+        }
+        check(lowered == 2 && p.depth == 1, "120 Hz: 1200 frames on time take the depth back to 1");
+        pc_pacer_relearn(&p);
+        check(p.depth == 1 && p.grid_ns && p.grace == PC_GRACE_FRAMES,
+              "relearn: the setting's depth, the grid kept, the grace anew");
+    }
+    /* BO-211 review: slips that come back right after each step back. The
+     * calm a step back needs doubles each time (600, 1200, 2400 ... 4800
+     * frames): the depth no longer swings every 12 s. */
+    {
+        int k, lowered = 0, raised2 = 0, last_low = 0, gap_max = 0;
+        uint64_t v0;
+        d = disp(120, 0, 0);
+        pc_pacer_init(&p, PC_LOCK, &d, 5 * MS, 0, 1);
+        R = p.period_ns;
+        p.grid_ns = 1000 * MS;
+        v0 = 1000 * MS;
+        for (k = 1; k <= 60 * 60 * 6; k++) {
+            int r, slip;
+            /* At depth 1 a slip every 10th frame; at 2 or more none. */
+            slip = k > PC_GRACE_FRAMES && p.depth == 1 && k % 10 == 0;
+            v = v0 + (uint64_t)k * 2 * R - 5 * MS;
+            pc_pacer_aim(&p, v, v + 300000, &a);
+            r = pc_pacer_glass(&p, &a, a.target_ns + (slip ? R : 0));
+            raised2 += r > 0;
+            if (r < 0) {
+                if (last_low && k - last_low > gap_max)
+                    gap_max = k - last_low;
+                last_low = k;
+                lowered++;
+            }
+        }
+        check(p.decay_frames == PC_DECAY_MAX && lowered <= 9 && gap_max >= PC_DECAY_MAX,
+              "slips back after every step back: the step back waits up to 80 s");
+    }
     d = disp(60, 0, 0);
     pc_pacer_init(&p, PC_LOCK, &d, 5 * MS, 0, 1);
     R = p.period_ns;
@@ -205,12 +252,23 @@ static void timed(void)
         raised += pc_pacer_glass(&p, &a, a.target_ns + 3 * MS);
     }
     check(raised == 1 && p.lead_ns == 14 * MS, "six frames 3 ms late: the lead grows 2 ms");
-    for (i = 0; i < 600; i++) {
-        v += PC_FRAME_NS;
-        pc_pacer_aim(&p, v, v + 300000, &a);
-        raised += pc_pacer_glass(&p, &a, a.target_ns + 400000);
+    {
+        int lowered = 0, at599 = 0;
+        for (i = 0; i < PC_DECAY_FRAMES; i++) {
+            int r;
+            v += PC_FRAME_NS;
+            pc_pacer_aim(&p, v, v + 300000, &a);
+            r = pc_pacer_glass(&p, &a, a.target_ns + 400000);
+            raised += r > 0;
+            lowered += r < 0;
+            if (i == PC_DECAY_FRAMES - 2)
+                at599 = (int)(p.lead_ns / MS);
+        }
+        check(raised == 1, "0.4 ms after the target is on time");
+        /* BO-211: ten seconds on time take the raise back. */
+        check(lowered == 1 && at599 == 14 && p.lead_ns == 12 * MS,
+              "600 frames on time: the lead back to 12 ms");
     }
-    check(raised == 1, "0.4 ms after the target is on time");
     d = disp(144, 0, 0);
     pc_pacer_init(&p, PC_TIMED_ODD, &d, 5 * MS, 12 * MS, 1);
     pc_pacer_aim(&p, v, v, &a);

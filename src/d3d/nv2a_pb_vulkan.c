@@ -51,6 +51,7 @@
  *
  * Opt-in: RECOMP_PB_BACKEND=vulkan (nv2a_pb_vulkan_register_from_env).
  */
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -72,6 +73,9 @@
 #include "kernel_pause.h"
 static void scale_prepare_loaded(void);
 static int ui_scale_log(void);
+#include <dirent.h>
+#include <sys/stat.h>
+#include <time.h>
 #include "nv2a_pcache.h"
 #include "recomp_env.h"
 #include <pthread.h>
@@ -107,9 +111,11 @@ typedef struct {
     float tex_bias[4];
     float bump_mat[4][4];   /* per stage: SET_TEXTURE_SET_BUMP_ENV_MAT 00 01 10 11 */
     float bump_lum[4][4];   /* per stage: x bump-env luminance scale, y offset */
+    float hdr[4];           /* BO-110: x the colour bound of the HDR combiners (unread by SDR ones) */
 } VkPsConsts;
 _Static_assert(offsetof(VkPsConsts, tex_bias) == 416 && offsetof(VkPsConsts, bump_mat) == 432
-               && offsetof(VkPsConsts, bump_lum) == 496 && sizeof(VkPsConsts) == 560,
+               && offsetof(VkPsConsts, bump_lum) == 496 && offsetof(VkPsConsts, hdr) == 560
+               && sizeof(VkPsConsts) == 576,
                "VkPsConsts tail moved (D3D8_GLSL_PSCONSTS)");
 
 #define VS_C_BYTES  (NV2A_VS_MAX_CONSTANTS * 16)
@@ -180,6 +186,34 @@ static const char s_fs_basic_glsl[] =
 
 #define FRAMES_MAX 2
 #define RT_FORMAT  VK_FORMAT_B8G8R8A8_UNORM   /* X8R8G8B8's bytes */
+
+/* ---- HDR (BO-110), the Metal design (nv2a_pb_metal.m) ------------------------
+ *
+ * With HDR on, colour render targets are R16G16B16A16_SFLOAT: blending into
+ * them does not clamp, so the title's additive light (lamps, sparks, brake
+ * lights, streaks, the bloom's add) passes 1.0 by itself. The HDR variant of
+ * the combiner shader (d3d8_combiners_glsl.c) takes its colour bound from
+ * pc.hdr.x: s_hdr_hi between the title's scene marks (the 3D of a view,
+ * nv2a_pb_stream_tag() == HDR_TAG_SCENE), 1.0 elsewhere (HUD, menus, front
+ * end: paper white).
+ *
+ * The HUD apart, cheaper than Metal's snapshot + compare: when the first UI
+ * draw follows a view's 3D (or the flip comes), a compute pass maps the
+ * scene in place, only pixels past 1.0 written (or all when the HUD white
+ * differs from paper white): a hue-kept shoulder on the brightest channel in
+ * linear light, slope 1 at paper white, towards the peak, in units of the
+ * HUD's white. The HUD and menus then draw over it at <= 1.0. The presenter
+ * takes the frame as extended sRGB with 1.0 = the HUD's white and encodes it
+ * for the display (HDR10 PQ). With HDR off nothing here runs: formats,
+ * shaders, pipelines and usage flags are the SDR ones. */
+#define RT_FORMAT_HDR VK_FORMAT_R16G16B16A16_SFLOAT
+#define HDR_TAG_SCENE 1u
+static int   s_hdr;               /* the colour targets are half float now */
+static int   s_hdr_ab;            /* RECOMP_DEBUG=hdr_ab=n */
+static float s_hdr_hi = 64.0f;
+static uint64_t s_hdr_draws[2], s_hdr_maps;
+#define RT_FMT (s_hdr ? RT_FORMAT_HDR : RT_FORMAT)
+static uint16_t s_h8[256];        /* byte / 255 as a half float */
 
 static const struct nvk_core *C;
 static VkDevice               s_dev;
@@ -1037,16 +1071,66 @@ static void begin_encoder(RenderTarget *rt, int clear, const float c[4])
 /* Bytes into image `im` (level `level`, w x h, tightly packed BGRA8) through
  * the staging ring, on the upload command buffer: im must be new this
  * batch (nothing in s_cmd uses it yet). Leaves it in `final`. */
+/* BO-110: BGRA8 bytes as RGBA half floats (n pixels). */
+static void hdr_bgra_to_half(uint16_t *o, const uint8_t *p, size_t n)
+{
+    if (!s_h8[255]) {
+        int i;
+        for (i = 0; i < 256; i++) {
+            /* byte / 255 in [0, 1] as an IEEE half, rounded to nearest. */
+            float f = (float)i / 255.0f;
+            uint32_t b;
+            memcpy(&b, &f, 4);
+            if (!i) { s_h8[i] = 0; continue; }
+            {
+                int e = (int)((b >> 23) & 0xFF) - 127 + 15;
+                uint32_t m = b & 0x7FFFFFu;
+                if (e <= 0) {           /* subnormal half */
+                    m |= 0x800000u;
+                    s_h8[i] = (uint16_t)((m >> (14 - e)) + ((m >> (13 - e)) & 1u));
+                } else {
+                    uint32_t h = ((uint32_t)e << 10) | (m >> 13);
+                    if ((m >> 12) & 1u) h++;
+                    s_h8[i] = (uint16_t)h;
+                }
+            }
+        }
+    }
+    while (n--) {
+        o[0] = s_h8[p[2]];
+        o[1] = s_h8[p[1]];
+        o[2] = s_h8[p[0]];
+        o[3] = s_h8[p[3]];
+        o += 4;
+        p += 4;
+    }
+}
+
+static float hdr_h2f(uint16_t h)
+{
+    uint32_t e = (h >> 10) & 0x1F, m = h & 0x3FFu, b;
+    float f;
+    if (!e) return (float)m * (1.0f / 16777216.0f) * ((h & 0x8000u) ? -1.0f : 1.0f);
+    if (e == 31) return (h & 0x8000u) ? -65504.0f : 65504.0f;
+    b = ((uint32_t)(h & 0x8000u) << 16) | ((e - 15 + 127) << 23) | (m << 13);
+    memcpy(&f, &b, 4);
+    return f;
+}
+
 static int upload_layer(struct nvk_image *im, uint32_t layer, uint32_t level, uint32_t w,
                         uint32_t h, const void *px, VkImageLayout final, int last)
 {
     VkDeviceSize off;
     VkBufferImageCopy bc;
-    void *dst = ring_alloc(RING_UP, (VkDeviceSize)w * h * 4u, 16, &off);
+    int half = im->format == RT_FORMAT_HDR;
+    void *dst = ring_alloc(RING_UP, (VkDeviceSize)w * h * (half ? 8u : 4u), 16, &off);
 
     if (!dst)
         return 0;
-    memcpy(dst, px, (size_t)w * h * 4u);
+    if (half)
+        hdr_bgra_to_half((uint16_t *)dst, (const uint8_t *)px, (size_t)w * h);
+    else
+        memcpy(dst, px, (size_t)w * h * 4u);
     ensure_up();
     if (im->layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
         nvk_image_to(s_up, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -1072,9 +1156,36 @@ static int upload_level(struct nvk_image *im, uint32_t level, uint32_t w, uint32
     return upload_layer(im, 0, level, w, h, px, final, last);
 }
 
-static int rt_image_new(struct nvk_image *im, uint32_t hw, uint32_t hh)
+/* BO-110: the format of a colour target of w x h guest pixels with HDR on.
+ * Half float where the scene's light is kept: a view (640 wide or more) and
+ * the reflections' square faces; the title's small 2D targets (its bloom
+ * levels, the radial blur's copy, HUD and front-end pieces) stay BGRA8: they
+ * hold what they hold in SDR, at half the bytes, so the bloom adds back what
+ * it adds in SDR instead of a low-resolution copy of the scene's light past
+ * paper white (blocky round blobs around lamps and sign lights).
+ * RECOMP_DEBUG=hdr_rt8=0: every target half float (as before). */
+static VkFormat rt_format(uint32_t w, uint32_t h)
 {
-    return nvk_image_new(im, RT_FORMAT, hw, hh, 1,
+    static int small8 = -1;
+    if (!s_hdr)
+        return RT_FORMAT;
+    if (small8 < 0) {
+        const char *e = recomp_env(RENV_HDR_RT8);
+        small8 = !(e && *e == '0');
+    }
+    {
+        VkFormat f = !small8 || w >= 640 || w == h ? RT_FORMAT_HDR : RT_FORMAT;
+        static int said;
+        if (said++ < 12)
+            fprintf(stderr, LOGP "HDR: colour target %ux%u %s\n", w, h,
+                    f == RT_FORMAT_HDR ? "half float" : "BGRA8");
+        return f;
+    }
+}
+
+static int rt_image_new(struct nvk_image *im, uint32_t hw, uint32_t hh, uint32_t w, uint32_t h)
+{
+    return nvk_image_new(im, rt_format(w, h), hw, hh, 1,
                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
                          | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1124,6 +1235,41 @@ static void rt_seed(struct nvk_image *im, uint32_t addr, uint32_t pitch, uint32_
         }
     }
 
+    if (pitch >= w * 4u && im->format == RT_FORMAT_HDR) {
+        /* BO-110: a half-float target, seeded through a BGRA8 copy. */
+        uint8_t *tmp = (uint8_t *)malloc((size_t)hw * hh * 4u);
+        uint16_t *hp = tmp ? (uint16_t *)ring_alloc(RING_UP, (VkDeviceSize)hw * hh * 8u, 16, &off)
+                           : NULL;
+        if (hp) {
+            VkBufferImageCopy bc;
+            uint32_t y;
+            if (hw == w) {
+                for (y = 0; y < h; y++)
+                    memcpy(tmp + (size_t)y * w * 4u, src + (size_t)y * pitch, (size_t)w * 4u);
+            } else if (hw % w == 0 && hh == h * (hw / w)) {
+                nv2a_upscale_nearest32(src, pitch, w, h, hw / w, tmp, hw * 4u);
+            } else {
+                nv2a_resample_nearest32(src, pitch, w, h, tmp, hw * 4u, hw, hh);
+            }
+            hdr_bgra_to_half(hp, tmp, (size_t)hw * hh);
+            free(tmp);
+            ensure_up();
+            nvk_image_to(s_up, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            memset(&bc, 0, sizeof bc);
+            bc.bufferOffset = off;
+            bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            bc.imageSubresource.layerCount = 1;
+            bc.imageExtent.width = hw;
+            bc.imageExtent.height = hh;
+            bc.imageExtent.depth = 1;
+            vkCmdCopyBufferToImage(s_up, s_ring[RING_UP].buf, im->img,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+            nvk_image_to(s_up, im, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            return;
+        }
+        free(tmp);
+        pitch = 0;          /* cleared below */
+    }
     if (pitch >= w * 4u
             && (dst = (uint8_t *)ring_alloc(RING_UP, (VkDeviceSize)hw * hh * 4u, 16, &off))) {
         VkBufferImageCopy bc;
@@ -1183,7 +1329,7 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     if (!keep)
         rt_sync(rt, rt->pitch);
     end_encoder();
-    if (!rt_image_new(&im, hw, hh))
+    if (!rt_image_new(&im, hw, hh, w, h))
         return 0;
     rt_seed(&im, rt->addr, rt->pitch, w, h, hw, hh, rt->swz);
     if (keep) {
@@ -1217,6 +1363,35 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     return 1;
 }
 
+/* rt (free) made as the target for the surface at offset, w x h guest,
+ * seeded from the guest's bytes there. */
+static int rt_make(RenderTarget *rt, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
+                   int swz)
+{
+    uint32_t hw, hh;
+
+    nv2a_host_size_x2(w, h, nv2a_host_render_scale_x2(), s_max_dim, &hw, &hh);
+    if (!rt_image_new(&rt->im, hw, hh, w, h))
+        return 0;
+    rt->offset = offset;
+    rt->addr = nv2a_pb_dma_resolve(offset);
+    rt->w = w;
+    rt->h = h;
+    rt->hw = hw;
+    rt->hh = hh;
+    rt->pitch = pitch;
+    rt->swz = swz;
+    rt->last_use = s_tick;
+    rt_own_reset(rt);
+    rt_seed(&rt->im, rt->addr, pitch, w, h, hw, hh, rt->swz);
+    if (hw != w)
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
+                offset, w, h, hw, hh);
+    else
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target\n", offset, w, h);
+    return 1;
+}
+
 /* The render target for the surface at color_offset: Metal's surface(),
  * rule for rule (see the comments there). */
 static RenderTarget *surface(void)
@@ -1224,7 +1399,6 @@ static RenderTarget *surface(void)
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     uint32_t w = g->clip_x + g->clip_w, h = g->clip_y + g->clip_h;
     RenderTarget *free_rt = NULL, *lru = &s_rt[0];
-    uint32_t hw, hh;
     int i, swz = ((g->format >> 8) & 0xF) == 2;   /* the layout guest memory holds it in */
 
     if (!g->color_offset || !w || !h || w > 4096 || h > 4096)
@@ -1286,27 +1460,7 @@ static RenderTarget *surface(void)
         if (free_rt->im.img)
             rt_free(free_rt);
     }
-    nv2a_host_size_x2(w, h, nv2a_host_render_scale_x2(), s_max_dim, &hw, &hh);
-    if (!rt_image_new(&free_rt->im, hw, hh))
-        return NULL;
-    free_rt->offset = g->color_offset;
-    free_rt->addr = nv2a_pb_dma_resolve(g->color_offset);
-    free_rt->w = w;
-    free_rt->h = h;
-    free_rt->hw = hw;
-    free_rt->hh = hh;
-    free_rt->pitch = g->pitch;
-    free_rt->swz = swz;
-    free_rt->last_use = s_tick;
-    rt_own_reset(free_rt);
-    rt_seed(&free_rt->im, free_rt->addr, g->pitch, w, h, hw, hh, free_rt->swz);
-    if (hw != w)
-        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
-                g->color_offset, w, h, hw, hh);
-    else
-        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target\n",
-                g->color_offset, w, h);
-    return free_rt;
+    return rt_make(free_rt, g->color_offset, w, h, g->pitch, swz) ? free_rt : NULL;
 }
 
 /* ---- visibility tests (declared early: clears pause the count) --------------- */
@@ -1470,29 +1624,6 @@ static void vk_on_zclear(uint32_t param)
                v->zclear & 0xFFu);
 }
 
-/* ---- vertices ---------------------------------------------------------------- */
-
-static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
-                 uint32_t index, float out[4])
-{
-    const uint8_t *p;
-
-    out[0] = out[1] = out[2] = 0.0f;
-    out[3] = 1.0f;
-    if (d->inline_data) {
-        size_t at = (size_t)a->offset + (size_t)index * a->stride;
-        if (at + 4 > d->inline_bytes)
-            return 0;
-        p = (const uint8_t *)d->inline_buf + at;
-    } else {
-        if (!a->offset)
-            return 0;
-        p = (const uint8_t *)xbox_GetMemoryOffset() + a->offset
-          + (size_t)index * a->stride;
-    }
-    return nv2a_vtx_decode(a->type, a->size, p, out);
-}
-
 /* ---- shaders -------------------------------------------------------------------- */
 
 static uint64_t s_compile_errors, s_vs_compiled, s_fs_compiled, s_glsl_compiles;
@@ -1508,7 +1639,8 @@ static uint64_t s_compile_errors, s_vs_compiled, s_fs_compiled, s_glsl_compiles;
  * without the lock. Every build is counted by thread and kind
  * (RECOMP_TRACE=pcache logs each, =<file> adds one CSV line a flip). */
 static pthread_mutex_t s_pc_mu = PTHREAD_MUTEX_INITIALIZER;
-enum { PC_VS = 0, PC_FS = 1, PC_PSO = 2 };
+enum { PC_VS = 0, PC_FS = 1, PC_PSO = 2,
+       PC_FS_HDR = 3 };   /* BO-110: a combiner state's HDR variant (a build without HDR skips the type) */
 static const char *const s_pc_kind[3] = { "vs", "fs", "pso" };
 static struct {
     uint64_t n[2][3], ns[2][3];          /* [ack thread, pre-warm][kind] */
@@ -1567,10 +1699,24 @@ static int      s_pc_warm_urgent;       /* the first one is on the pipelines' pa
 static uint64_t s_pc_wait_until;        /* the ack thread's waits end here */
 static uint64_t s_pc_waits, s_pc_wait_ns;
 #define PC_WARMING() __atomic_load_n(&s_pc_warm_urgent, __ATOMIC_ACQUIRE)
+static uint64_t s_pc_cap_ns = 180000000000ull;  /* BO-208: the most the title is held, in all */
+static uint64_t s_pc_hold_t0;                    /* when the first pre-warm began */
 static int pc_wait_more(void)
 {
-    if (!PC_WARMING() || now_ns() >= __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE))
+    uint64_t now;
+    if (!PC_WARMING())
         return 0;
+    now = now_ns();
+    if (now >= __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE)) {
+        /* BO-208: past the first 3 s, still holding while the pre-warm is doing
+         * real compiling (a driver, OS or shader-generator change that the
+         * lists could not tell beforehand): a build with the caches warm is
+         * lookups and has spent far less than this by now. */
+        uint64_t busy = s_cs.ns[1][0] + s_cs.ns[1][1] + s_cs.ns[1][2];
+        if (now >= s_pc_hold_t0 + s_pc_cap_ns || busy < 400000000ull)
+            return 0;
+        __atomic_store_n(&s_pc_wait_until, now + 1000000000ull, __ATOMIC_RELEASE);
+    }
     nv2a_pcache_stat_waiting(1);        /* the window shows a line meanwhile */
     usleep(500);
     return 1;
@@ -1635,6 +1781,7 @@ static VsEntry s_vs[VS_MAX];
 #define PC_FS_BASIC 2ull
 static nv2a_pcache *s_pcf;
 static void pc_put(uint32_t type, const void *data, uint32_t len);
+static void pc_warm_begin(int first);
 
 /* The module for `n` slots of program (up to its FINAL), or VK_NULL_HANDLE;
  * its inputs in *inputs. Any thread: `parsed` and `glsl` (65536) are the
@@ -1739,8 +1886,10 @@ static VsEntry *vs_cache(void)
         pthread_mutex_unlock(&s_pc_mu);
         if (!e)
             return NULL;                /* the table is full */
-        if (mod)
+        if (mod) {
             pc_put(PC_VS, slots, len * 16u);
+            pc_warm_begin(0);           /* BO-208: the manifest's pipelines for a program only the title assembles */
+        }
     }
     memo.valid = 1;
     memo.dwords = v->prog_dwords;
@@ -1753,6 +1902,7 @@ static VsEntry *vs_cache(void)
 typedef struct {
     uint32_t          hash;
     int               bad;
+    int               hdr;      /* BO-110: the HDR variant */
     uint64_t          kid;
     NV2ACombinerState st;
     VkShaderModule    mod;
@@ -1763,14 +1913,15 @@ static int      s_fs_n;
 /* The module for combiner state `st`, or VK_NULL_HANDLE. Any thread: `glsl`
  * (65536) is the caller's. */
 static VkShaderModule fs_build(const NV2ACombinerState *st, uint32_t hash, char *glsl,
-                               int prewarm)
+                               int prewarm, int hdr)
 {
     VkShaderModule m = VK_NULL_HANDLE;
     uint64_t t = now_ns();
     char what[32];
 
     snprintf(what, sizeof what, "combiners %08X", hash);
-    if (d3d8_combiners_generate_glsl(st, glsl, 65536) <= 0) {
+    if ((hdr ? d3d8_combiners_generate_glsl_hdr(st, glsl, 65536)
+             : d3d8_combiners_generate_glsl(st, glsl, 65536)) <= 0) {
         COUNT(s_compile_errors);
         fprintf(stderr, LOGP "%s: no GLSL\n", what);
     } else if ((m = module_from_glsl(NVK_STAGE_FRAGMENT, glsl, what)) != VK_NULL_HANDLE) {
@@ -1781,17 +1932,34 @@ static VkShaderModule fs_build(const NV2ACombinerState *st, uint32_t hash, char 
 }
 
 /* s_pc_mu held. */
-static FsEntry *fs_find(uint32_t hash, const NV2ACombinerState *st)
+static FsEntry *fs_find(uint32_t hash, const NV2ACombinerState *st, int hdr)
 {
     int n;
     for (n = 0; n < s_fs_n; n++)
-        if (s_fs[n].hash == hash && !memcmp(&s_fs[n].st, st, sizeof *st))
+        if (s_fs[n].hash == hash && s_fs[n].hdr == hdr && !memcmp(&s_fs[n].st, st, sizeof *st))
             return &s_fs[n];
     return NULL;
 }
 
+/* The id of a combiner state's key (its HDR variant's apart: the pipelines'
+ * records name the one they use). */
+static uint64_t fs_kid(const void *st, size_t bytes, int hdr)
+{
+    uint64_t kid = nv2a_fnv64(st, bytes, NV2A_FNV64_INIT);
+    if (hdr)
+        kid ^= 0x4844520000000000ull;
+    return kid <= PC_FS_BASIC ? kid + 3 : kid;
+}
+
+/* The HDR variant's id from the SDR one's (fs_kid; its guard aside). */
+static uint64_t fs_kid_hdr_of(uint64_t sdr_kid)
+{
+    uint64_t kid = sdr_kid ^ 0x4844520000000000ull;
+    return kid <= PC_FS_BASIC ? kid + 3 : kid;
+}
+
 /* s_pc_mu held. The next entry taken for `st`, or NULL when the table is full. */
-static FsEntry *fs_take(uint32_t hash, const NV2ACombinerState *st, VkShaderModule mod)
+static FsEntry *fs_take(uint32_t hash, const NV2ACombinerState *st, VkShaderModule mod, int hdr)
 {
     FsEntry *e;
     if (s_fs_n == FS_MAX)
@@ -1800,10 +1968,9 @@ static FsEntry *fs_take(uint32_t hash, const NV2ACombinerState *st, VkShaderModu
     e->hash = hash;
     e->st = *st;
     e->mod = mod;
+    e->hdr = hdr;
     e->bad = mod ? 0 : 1;
-    e->kid = nv2a_fnv64(st, sizeof *st, NV2A_FNV64_INIT);
-    if (e->kid <= PC_FS_BASIC)
-        e->kid += 3;
+    e->kid = fs_kid(st, sizeof *st, hdr);
     s_fs_n++;               /* last: fs_find reads up to it */
     return e;
 }
@@ -1827,9 +1994,13 @@ static Stage s_stage[4];
 static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
 {
     static char glsl[65536];
-    static struct { int valid; uint32_t r[39]; VkShaderModule m; } memo;
+    /* The registers a module was chosen for, 64 of them by a hash of the
+     * key: a race frame switches between a few dozen combiner setups, and a
+     * single remembered one sent most draws to the state's decode, a byte-wise
+     * hash of it and the table's linear search. */
+    static struct { int valid; uint32_t r[40]; VkShaderModule m; } memo[64];
     NV2ACombinerState st;
-    uint32_t key[39], modes = 0, signs = 0, hash;
+    uint32_t key[40], modes = 0, signs = 0, hash, kh = 2166136261u;
     FsEntry *e;
     int n;
 
@@ -1859,8 +2030,12 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     key[36] = signs;
     key[37] = v->shader_ctl & 0x00FF0000u;  /* stage 2 and 3 input stages */
     key[38] = v->clip_plane_mode;
-    if (memo.valid && !memcmp(memo.r, key, sizeof key))
-        return memo.m;
+    key[39] = (uint32_t)s_hdr;
+    for (n = 0; n < 40; n++)
+        kh = (kh ^ key[n]) * 16777619u;
+    kh = (kh ^ (kh >> 15)) & 63u;
+    if (memo[kh].valid && !memcmp(memo[kh].r, key, sizeof key))
+        return memo[kh].m;
 
     memset(&st, 0, sizeof st);
     d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw,
@@ -1873,38 +2048,40 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     st.input_tex[2] = (uint8_t)((v->shader_ctl >> 16) & 0xFu);
     st.input_tex[3] = (uint8_t)((v->shader_ctl >> 20) & 0xFu);
     hash = fnv(&st, sizeof st);
+    if (s_hdr)
+        hash ^= 0x48445200u;            /* BO-110: the HDR variant, its own entry */
     pthread_mutex_lock(&s_pc_mu);
-    e = fs_find(hash, &st);
+    e = fs_find(hash, &st, s_hdr);
     pthread_mutex_unlock(&s_pc_mu);
     if (!e && PC_WARMING()) {
         uint64_t t0 = now_ns();
         do {
             pthread_mutex_lock(&s_pc_mu);
-            e = fs_find(hash, &st);
+            e = fs_find(hash, &st, s_hdr);
             pthread_mutex_unlock(&s_pc_mu);
         } while (!e && pc_wait_more());
         pc_waited(t0, "fragment shader");
     }
     if (!e) {
-        VkShaderModule mod = fs_build(&st, hash, glsl, 0);
+        VkShaderModule mod = fs_build(&st, hash, glsl, 0, s_hdr);
         pthread_mutex_lock(&s_pc_mu);
-        if ((e = fs_find(hash, &st)) != NULL) {
+        if ((e = fs_find(hash, &st, s_hdr)) != NULL) {
             if (mod)                    /* the pre-warm thread was first */
                 vkDestroyShaderModule(s_dev, mod, NULL);
             mod = VK_NULL_HANDLE;
         } else {
-            e = fs_take(hash, &st, mod);
+            e = fs_take(hash, &st, mod, s_hdr);
         }
         pthread_mutex_unlock(&s_pc_mu);
         if (!e)
             return s_fs_basic;          /* the table is full */
         if (mod)
-            pc_put(PC_FS, &st, sizeof st);
+            pc_put(s_hdr ? PC_FS_HDR : PC_FS, &st, sizeof st);
     }
-    memcpy(memo.r, key, sizeof key);
-    memo.valid = 1;
-    memo.m = e->bad ? s_fs_basic : e->mod;
-    return memo.m;
+    memcpy(memo[kh].r, key, sizeof key);
+    memo[kh].valid = 1;
+    memo[kh].m = e->bad ? s_fs_basic : e->mod;
+    return memo[kh].m;
 }
 
 /* ---- pipelines -------------------------------------------------------------------- */
@@ -1971,7 +2148,7 @@ static VkPipeline pipeline_new(const PsoKey *k, int prewarm)
     VkPipelineDynamicStateCreateInfo dy;
     VkPipelineRenderingCreateInfo pr;
     VkGraphicsPipelineCreateInfo gp;
-    VkFormat cf = RT_FORMAT;
+    VkFormat cf = (k->depth & 2u) ? RT_FORMAT_HDR : RT_FORMAT;
     VkPipeline p = VK_NULL_HANDLE;
     static const VkDynamicState dyn[] = {
         VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
@@ -2054,8 +2231,8 @@ static VkPipeline pipeline_new(const PsoKey *k, int prewarm)
     pr.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     pr.colorAttachmentCount = 1;
     pr.pColorAttachmentFormats = &cf;
-    pr.depthAttachmentFormat = k->depth ? C->depth_format : VK_FORMAT_UNDEFINED;
-    pr.stencilAttachmentFormat = k->depth ? C->depth_format : VK_FORMAT_UNDEFINED;
+    pr.depthAttachmentFormat = (k->depth & 1u) ? C->depth_format : VK_FORMAT_UNDEFINED;
+    pr.stencilAttachmentFormat = (k->depth & 1u) ? C->depth_format : VK_FORMAT_UNDEFINED;
     memset(&gp, 0, sizeof gp);
     gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     gp.pNext = &pr;
@@ -2142,10 +2319,21 @@ static void pso_disk(const PsoKey *k, PsoDisk *d)
 static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
                            enum nv2a_topology topo)
 {
-    static uint32_t last = 0xFFFFFFFFu;
+    /* The slots of the last keys, 32 of them by a hash of the key (as
+     * fs_select's memo): the table's own lookup hashes the key byte by byte
+     * under the lock. */
+    static uint32_t last[32] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     PsoKey k;
-    uint32_t i;
+    uint32_t i, mh = 2166136261u, w[sizeof(PsoKey) / 4];
+    unsigned q;
     int found, full;
 
     memset(&k, 0, sizeof k);
@@ -2153,14 +2341,20 @@ static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
     k.fs = (uint64_t)(uintptr_t)fs;
     k.nf4 = nf4;
     k.topo = (uint32_t)topo;
-    k.depth = s_enc_dt ? 1 : 0;
+    /* BO-110: bit 1, a half-float target */
+    k.depth = (s_enc_dt ? 1u : 0u)
+              | (s_enc_rt && s_enc_rt->im.format == RT_FORMAT_HDR ? 2u : 0u);
     k.wmask = g->color_keep;
     k.blend[0] = g->blend_enable ? 1 : 0;
     k.blend[1] = k.blend[0] ? g->blend_sfactor : 0;
     k.blend[2] = k.blend[0] ? g->blend_dfactor : 0;
     k.blend[3] = k.blend[0] ? (uint32_t)blend_op(g->blend_equation) : 0;
-    if (last < PSO_CAP && s_pso[last].used && !memcmp(&s_pso[last].k, &k, sizeof k))
-        return s_pso[last].p;
+    memcpy(w, &k, sizeof w);
+    for (q = 0; q < sizeof w / 4; q++)
+        mh = (mh ^ w[q]) * 16777619u;
+    mh = (mh ^ (mh >> 15)) & 31u;
+    if (last[mh] < PSO_CAP && s_pso[last[mh]].used && !memcmp(&s_pso[last[mh]].k, &k, sizeof k))
+        return s_pso[last[mh]].p;
     pthread_mutex_lock(&s_pc_mu);
     i = pso_slot(&k, &found);
     pthread_mutex_unlock(&s_pc_mu);
@@ -2204,7 +2398,7 @@ static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
                         k.blend[2], k.blend[3], k.wmask, k.depth, k.topo, k.nf4);
         }
     }
-    last = i;
+    last[mh] = i;
     return s_pso[i].p;
 }
 
@@ -2226,6 +2420,8 @@ typedef struct {
     uint8_t          pend;          /* its scaled picture is being made (nv2a_texscale_get) */
     uint32_t         cut;           /* the alpha test its levels were made for (nv2a_texmip_cut_ref); 0: the title's */
     float            zbias;         /* nv2a_texrep_zbias of its bytes (BO-176); 0: none */
+    uint64_t         rhash;         /* nv2a_texrep_hash, with zbias_probe/ztint only (BO-204) */
+    const struct nv2a_texrep_hdr_gain *hgain;   /* BO-110: a registered light texture's; NULL: none */
     uint32_t         pal_len, pgen; /* P8 entries; the flip pend was last asked at */
     uint64_t         skey;          /* nv2a_texscale_key of the texels uploaded */
     int              live;
@@ -2306,6 +2502,8 @@ static unsigned  s_bind_scale;
 /* The depth offset the texture tex_bind returned asks for (nv2a_texrep_zbias,
  * BO-176), as Metal. */
 static float     s_bind_zbias;
+static uint64_t  s_bind_rhash, s_up_rhash;   /* BO-204 debug: texrep hash of the bind/upload */
+static const struct nv2a_texrep_hdr_gain *s_bind_hgain;   /* BO-110, as the depth offset */
 static uint32_t *s_scaled;
 static size_t    s_scaled_cap;
 
@@ -2327,6 +2525,15 @@ static void scale_store_init(void)
         return;
     done = 1;
     if (nvk_cache_dir(dir, sizeof dir)) {
+#if defined(__ANDROID__)
+        /* BO-208: the key lists and driver caches are in the app's files
+         * (they are the build, they must stay); the scaled art may be wiped
+         * by the system and is made again, so it stays in the cache folder. */
+        const char *xc = getenv("XDG_CACHE_HOME");
+        if (xc && *xc)
+            snprintf(sub, sizeof sub, "%s/%s/ui_scale", xc, nv2a_pcache_app());
+        else
+#endif
         snprintf(sub, sizeof sub, "%s/ui_scale", dir);
         nv2a_texscale_cache_dir(sub);
     }
@@ -2425,6 +2632,9 @@ static int tex_upload(const Stage *t, unsigned scale, int algo, uint32_t cut,
      * nv2a_texrep.h): rectangles of a registered texture replaced here. */
     s_tex_rep = nv2a_texrep_apply(mem + t->offset, t->color, t->width, t->height,
                                   t->pitch, t->levels, s_texels);
+    /* BO-204 debug: the texture's texrep hash; a ztint one goes magenta. */
+    s_up_rhash = nv2a_texrep_ztint_apply(mem + t->offset, t->color, t->width, t->height,
+                                         t->pitch, s_texels, n);
     /* An alpha-tested draw binds it: levels 1.. made again with level 0's
      * alpha coverage (nv2a_texmip.h). */
     (void)nv2a_texmip_apply(mem + t->offset, t->color, t->width, t->height, t->pitch,
@@ -2604,6 +2814,7 @@ static VkImageView tex_bind(const Stage *t)
 
     s_bind_scale = 0;
     s_bind_zbias = 0.0f;
+    s_bind_hgain = NULL;
 
     if (t->valid && (uint64_t)t->width * t->height <= TEX_MAX_TEXELS)
         bytes = nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
@@ -2693,6 +2904,9 @@ static VkImageView tex_bind(const Stage *t)
                 e->cut = cut;
                 e->zbias = nv2a_texrep_zbias(mem + t->offset, t->color, t->width,
                                              t->height, t->pitch);
+                e->rhash = s_up_rhash;
+                e->hgain = nv2a_texrep_hdr_gain(mem + t->offset, t->color, t->width,
+                                                t->height, t->pitch);
                 e->im = ni;
                 e->scale = (uint8_t)want;
                 e->salgo = (uint8_t)algo;
@@ -2735,6 +2949,9 @@ static VkImageView tex_bind(const Stage *t)
         e->rep = s_tex_rep;
         e->zbias = nv2a_texrep_zbias(mem + t->offset, t->color, t->width, t->height,
                                      t->pitch);
+        e->rhash = s_up_rhash;
+        e->hgain = nv2a_texrep_hdr_gain(mem + t->offset, t->color, t->width, t->height,
+                                        t->pitch);
         e->im = ni;
         e->live = 1;
     }
@@ -2774,6 +2991,8 @@ static VkImageView tex_bind(const Stage *t)
     e->used = ++s_tc_clock;
     s_bind_scale = e->up_scale;
     s_bind_zbias = e->zbias;
+    s_bind_rhash = e->rhash;
+    s_bind_hgain = e->hgain;
     s_sn.scaled += e->up_scale != 0;
     if (ui_scale_log())
         ui_scale_use(e, t, mem);
@@ -2880,7 +3099,7 @@ static VkImageView rt_opaque(RenderTarget *rt)
         vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         vi.image = rt->im.img;
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format = RT_FORMAT;
+        vi.format = rt->im.format;
         vi.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
         vi.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
         vi.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
@@ -2948,10 +3167,10 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur, VkImageView *
     if (!self)
         return NULL;
     if (!s_self.img || s_self_w != self->w || s_self_h != self->h
-            || s_self.w != self->hw || s_self.h != self->hh) {
+            || s_self.w != self->hw || s_self.h != self->hh || s_self.format != self->im.format) {
         if (s_self.img)
             garbage_push(&s_self, VK_NULL_HANDLE, NULL);
-        if (!nvk_image_new(&s_self, RT_FORMAT, self->hw, self->hh, 1,
+        if (!nvk_image_new(&s_self, self->im.format, self->hw, self->hh, 1,
                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT)) {
             memset(&s_self, 0, sizeof s_self);
@@ -3090,7 +3309,7 @@ static VkImageView cube_bind(const Stage *t)
         e->levels = levels;
         fresh = 1;
     }
-    if (e->side != side)
+    if (e->side != side || (e->im.img && e->im.format != (any ? RT_FMT : RT_FORMAT)))
         fresh = 1;
     if (!all && (fresh || e->gen != g->flips)) {
         uint64_t h = NV2A_TEX_HASH_SEED;
@@ -3113,7 +3332,7 @@ static VkImageView cube_bind(const Stage *t)
         memset(&e->im, 0, sizeof e->im);
         e->side = side;
         memset(e->face_gen, 0, sizeof e->face_gen);
-        if (!nvk_image_new_cube(&e->im, RT_FORMAT, side, levels,
+        if (!nvk_image_new_cube(&e->im, any ? RT_FMT : RT_FORMAT, side, levels,
                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
             return black_cube();
         if (n > s_texels_cap) {
@@ -3309,6 +3528,508 @@ static int draw_scissor(const struct nv2a_pb_gpu *g, const RenderTarget *rt, VkR
     return 1;
 }
 
+/* ---- HDR (BO-110): the frame mapped for the display at the flip ------------
+ *
+ * The view's target holds the title's encoding past 1.0 where its light
+ * stacked (the scene) and the HUD and menus at or below 1.0 (drawn after the
+ * scene, x the HUD's white over paper white in the combiners). At the flip
+ * one full-screen draw reads it and writes the window's slot, 10-bit, as the
+ * display takes it: decoded (gamma 2.2 or sRGB), the shadows' power below
+ * mid grey, the highlight gain and the hue-kept shoulder past paper white to
+ * the peak (identity up to paper white, so the HUD passes as it is), x paper
+ * white in nits, BT.709 to BT.2020, ST 2084. The presenter's AA, sharpening
+ * and scale then work on 32-bit pixels and the scale writes the swapchain
+ * as it is. */
+static const char s_hf_vs_glsl[] =
+    "#version 450\n"
+    "void main() {\n"
+    "    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+    "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+static const char s_hf_fs_glsl[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+    /* a: x the peak in paper whites, y paper white / 10,000 nits, z the
+     * highlight gain, w 1 = the sRGB curve; b: x the shadows' power, y the
+     * shoulder's softness, z the black level / 10,000 nits. */
+    "layout(push_constant) uniform PC { vec4 a; vec4 b; } pc;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "void main() {\n"
+    "    vec3 c = max(texelFetch(src, ivec2(gl_FragCoord.xy), 0).rgb, vec3(0.0));\n"
+    "    vec3 l = pc.a.w < 0.5 ? pow(c, vec3(2.2))\n"
+    "             : mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));\n"
+    "    float y = dot(l, vec3(0.2126, 0.7152, 0.0722));\n"
+    "    if (y > 0.0 && y < 0.18 && pc.b.x != 1.0) l *= 0.18 * pow(y / 0.18, pc.b.x) / y;\n"
+    "    float mx = max(l.r, max(l.g, l.b)), m = max(pc.a.x, 1.0);\n"
+    "    if (mx > 1.0) {\n"
+    "        float x = 1.0 + pc.a.z * (mx - 1.0);\n"
+    "        float v = 1.0;\n"
+    "        if (m > 1.0001) {\n"
+    "            float k = m - 1.0, e = 1.0 + k * (1.0 - exp(-(x - 1.0) / k));\n"
+    /* BO-195 P2: past 2.5x a blend towards a slower rational curve (the
+     * same slope at 1, the same peak), so a 4-6x core keeps a gradient. */
+    "            float r = 1.0 + k * (x - 1.0) / ((x - 1.0) + k);\n"
+    "            v = mix(e, r, pc.b.y * clamp(k - 0.5, 0.0, 1.0) * smoothstep(2.5, 4.0, x));\n"
+    "        }\n"
+    "        l *= v / mx;\n"
+    "    }\n"
+    /* BO-195 P7: black level, nits' = black + (1 - black / peak) x nits */
+    "    l *= pc.a.y;\n"
+    "    l = pc.b.z + (1.0 - pc.b.z / (pc.a.x * pc.a.y)) * l;\n"
+    "    l = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956) * l;\n"
+    "    vec3 q = pow(clamp(l, 0.0, 1.0), vec3(0.1593017578125));\n"
+    "    o = vec4(pow((0.8359375 + 18.8515625 * q) / (1.0 + 18.6875 * q), vec3(78.84375)), 1.0);\n"
+    "}\n";
+
+#define HDR_SLOT_FORMAT VK_FORMAT_A2B10G10R10_UNORM_PACK32
+static VkDescriptorSetLayout s_hf_dsl;
+static VkPipelineLayout      s_hf_pl;
+static VkPipeline            s_hf_pso;
+static VkSampler             s_hf_smp;
+static VkDescriptorPool      s_hf_pool[FRAMES_MAX];
+static int                   s_hf_tried;
+
+static VkShaderModule hf_module(enum nvk_stage stage, const char *src)
+{
+    VkShaderModuleCreateInfo mi;
+    VkShaderModule m = VK_NULL_HANDLE;
+    const uint32_t *w;
+    size_t n;
+    int compiled;
+    char err[1024];
+    if (!nvk_glsl_spirv(stage, src, &w, &n, &compiled, err, sizeof err)) {
+        XR_ERROR(LOGP "HDR flip pass: GLSL compile failed: %s\n", err);
+        return VK_NULL_HANDLE;
+    }
+    memset(&mi, 0, sizeof mi);
+    mi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    mi.codeSize = n * 4;
+    mi.pCode = w;
+    if (vkCreateShaderModule(s_dev, &mi, NULL, &m) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    return m;
+}
+
+static int hf_init(void)
+{
+    VkDescriptorSetLayoutBinding lb;
+    VkDescriptorSetLayoutCreateInfo li;
+    VkPushConstantRange pcr;
+    VkPipelineLayoutCreateInfo pli;
+    VkSamplerCreateInfo si;
+    VkShaderModule vs, fs;
+    VkPipelineShaderStageCreateInfo ss[2];
+    VkPipelineVertexInputStateCreateInfo vi;
+    VkPipelineInputAssemblyStateCreateInfo ia;
+    VkPipelineViewportStateCreateInfo vp;
+    VkPipelineRasterizationStateCreateInfo rs;
+    VkPipelineMultisampleStateCreateInfo ms;
+    VkPipelineColorBlendAttachmentState cba;
+    VkPipelineColorBlendStateCreateInfo cb;
+    VkPipelineDynamicStateCreateInfo dy;
+    VkPipelineRenderingCreateInfo pr;
+    VkGraphicsPipelineCreateInfo gp;
+    static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkFormat cf = HDR_SLOT_FORMAT;
+    int k;
+
+    if (s_hf_tried)
+        return s_hf_pso != VK_NULL_HANDLE;
+    s_hf_tried = 1;
+    memset(&lb, 0, sizeof lb);
+    lb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    lb.descriptorCount = 1;
+    lb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    memset(&li, 0, sizeof li);
+    li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    li.bindingCount = 1;
+    li.pBindings = &lb;
+    memset(&pcr, 0, sizeof pcr);
+    pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.size = 32;
+    memset(&pli, 0, sizeof pli);
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &s_hf_dsl;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pcr;
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateDescriptorSetLayout(s_dev, &li, NULL, &s_hf_dsl) != VK_SUCCESS
+            || vkCreatePipelineLayout(s_dev, &pli, NULL, &s_hf_pl) != VK_SUCCESS
+            || vkCreateSampler(s_dev, &si, NULL, &s_hf_smp) != VK_SUCCESS)
+        goto fail;
+    for (k = 0; k < FRAMES_MAX; k++) {
+        VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 };
+        VkDescriptorPoolCreateInfo pi;
+        memset(&pi, 0, sizeof pi);
+        pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pi.maxSets = 8;
+        pi.poolSizeCount = 1;
+        pi.pPoolSizes = &ps;
+        if (vkCreateDescriptorPool(s_dev, &pi, NULL, &s_hf_pool[k]) != VK_SUCCESS)
+            goto fail;
+    }
+    vs = hf_module(NVK_STAGE_VERTEX, s_hf_vs_glsl);
+    fs = hf_module(NVK_STAGE_FRAGMENT, s_hf_fs_glsl);
+    if (vs && fs) {
+        memset(ss, 0, sizeof ss);
+        ss[0].sType = ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        ss[0].module = vs;
+        ss[0].pName = ss[1].pName = "main";
+        ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        ss[1].module = fs;
+        memset(&vi, 0, sizeof vi);
+        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        memset(&ia, 0, sizeof ia);
+        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        memset(&vp, 0, sizeof vp);
+        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vp.viewportCount = vp.scissorCount = 1;
+        memset(&rs, 0, sizeof rs);
+        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.lineWidth = 1.0f;
+        memset(&ms, 0, sizeof ms);
+        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        memset(&cba, 0, sizeof cba);
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                           | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        memset(&cb, 0, sizeof cb);
+        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cb.attachmentCount = 1;
+        cb.pAttachments = &cba;
+        memset(&dy, 0, sizeof dy);
+        dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dy.dynamicStateCount = 2;
+        dy.pDynamicStates = dyn;
+        memset(&pr, 0, sizeof pr);
+        pr.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        pr.colorAttachmentCount = 1;
+        pr.pColorAttachmentFormats = &cf;
+        memset(&gp, 0, sizeof gp);
+        gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gp.pNext = &pr;
+        gp.stageCount = 2;
+        gp.pStages = ss;
+        gp.pVertexInputState = &vi;
+        gp.pInputAssemblyState = &ia;
+        gp.pViewportState = &vp;
+        gp.pRasterizationState = &rs;
+        gp.pMultisampleState = &ms;
+        gp.pColorBlendState = &cb;
+        gp.pDynamicState = &dy;
+        gp.layout = s_hf_pl;
+        if (vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &gp, NULL, &s_hf_pso) != VK_SUCCESS)
+            s_hf_pso = VK_NULL_HANDLE;
+    }
+    if (vs)
+        vkDestroyShaderModule(s_dev, vs, NULL);
+    if (fs)
+        vkDestroyShaderModule(s_dev, fs, NULL);
+    if (!s_hf_pso)
+        goto fail;
+    return 1;
+fail:
+    XR_ERROR(LOGP "HDR flip pass unavailable: no HDR frame is shown\n");
+    return 0;
+}
+
+/* rt (hcw x hch from its corner) mapped into the window's slot (see above),
+ * on s_cmd; the slot is left in GENERAL, as the copy leaves it. 0: not done. */
+static int hdr_flip_pass(RenderTarget *rt, struct nvk_image *slot, uint32_t hcw, uint32_t hch)
+{
+    VkDescriptorSetAllocateInfo ai;
+    VkDescriptorImageInfo ii;
+    VkWriteDescriptorSet wr;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkRenderingAttachmentInfo att;
+    VkRenderingInfo ri;
+    VkViewport vp;
+    VkRect2D sc;
+    float pk, pw, hw, sh, hl, sf, bl;
+    int srgb;
+    float pc[8];
+
+    if (!hf_init() || !slot->view)
+        return 0;
+    memset(&ai, 0, sizeof ai);
+    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = s_hf_pool[s_fi];
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &s_hf_dsl;
+    if (vkAllocateDescriptorSets(s_dev, &ai, &set) != VK_SUCCESS)
+        return 0;
+    memset(&ii, 0, sizeof ii);
+    ii.sampler = s_hf_smp;
+    ii.imageView = rt->im.view;
+    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    memset(&wr, 0, sizeof wr);
+    wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr.dstSet = set;
+    wr.descriptorCount = 1;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr.pImageInfo = &ii;
+    vkUpdateDescriptorSets(s_dev, 1, &wr, 0, NULL);
+    nv2a_host_hdr_levels(&pk, &pw, &hw);
+    nv2a_host_hdr_tone(&sh, &hl, &srgb);
+    nv2a_host_hdr_shape(&sf, &bl);
+    pc[0] = pk / pw;
+    pc[1] = pw / 10000.0f;
+    pc[2] = hl;
+    pc[3] = srgb ? 1.0f : 0.0f;
+    pc[4] = sh;
+    pc[5] = sf;
+    pc[6] = bl / 10000.0f;
+    pc[7] = 0.0f;
+
+    end_encoder();
+    ensure_cmd();
+    nvk_image_to(s_cmd, &rt->im, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    /* GENERAL to GENERAL: after the last present that read it. */
+    nvk_image_barrier(s_cmd, slot->img, VK_IMAGE_ASPECT_COLOR_BIT,
+                      slot->layout == VK_IMAGE_LAYOUT_UNDEFINED
+                      ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+                      VK_IMAGE_LAYOUT_GENERAL);
+    slot->layout = VK_IMAGE_LAYOUT_GENERAL;
+    memset(&att, 0, sizeof att);
+    att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    att.imageView = slot->view;
+    att.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    memset(&ri, 0, sizeof ri);
+    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    ri.renderArea.extent.width = hcw;
+    ri.renderArea.extent.height = hch;
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &att;
+    vkCmdBeginRendering(s_cmd, &ri);
+    memset(&vp, 0, sizeof vp);
+    vp.width = (float)hcw;
+    vp.height = (float)hch;
+    vp.maxDepth = 1.0f;
+    memset(&sc, 0, sizeof sc);
+    sc.extent.width = hcw;
+    sc.extent.height = hch;
+    vkCmdSetViewport(s_cmd, 0, 1, &vp);
+    vkCmdSetScissor(s_cmd, 0, 1, &sc);
+    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_hf_pso);
+    vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_hf_pl, 0, 1, &set, 0, NULL);
+    vkCmdPushConstants(s_cmd, s_hf_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+    vkCmdDraw(s_cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(s_cmd);
+    /* For the presenter's read on the queue after this submit. */
+    nvk_image_barrier(s_cmd, slot->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_IMAGE_LAYOUT_GENERAL);
+    s_dyn_valid = 0;
+    s_tset_last = VK_NULL_HANDLE;
+    s_hdr_maps++;
+    return 1;
+}
+
+/* At a draw: its colour bound (x) and the factor on its colour (y), in the
+ * title's encoding: scene draws keep light past 1.0; UI draws (the HUD,
+ * menus, everything outside a view's 3D) are bound to 1.0, and those into
+ * the target the last flip showed are scaled to the HUD's white over paper
+ * white (a UI draw into another target is drawn into the frame later). */
+static RenderTarget *s_hdr_prt[2];  /* the targets the last two flips showed (double buffering) */
+static uint64_t      s_hdr_gain_draws;
+
+/* RECOMP_DEBUG=hdr_gains=0: the title's per-texture gains are not applied;
+ * =only:<hash>[+<hash>...] (BO-195): only those entries are. */
+static uint64_t s_hg_only[16];
+static int      s_hg_only_n;
+static int hdr_gains_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_HDR_GAINS);
+        on = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+        if (on && e && !strncmp(e, "only:", 5)) {
+            e += 5;
+            while (*e && s_hg_only_n < 16) {
+                char *end;
+                uint64_t v = strtoull(e, &end, 16);
+                if (end == e)
+                    break;
+                s_hg_only[s_hg_only_n++] = v;
+                e = *end ? end + 1 : end;
+            }
+            fprintf(stderr, LOGP "HDR gains: only %d of the title's entries\n", s_hg_only_n);
+        }
+    }
+    return on;
+}
+
+/* BO-195, measuring one light class: RECOMP_DEBUG=hdr_gains_ab=n makes every
+ * other block of n flips differ, so neighbouring flips of one run are about
+ * the same moment with and without: with hdr_gains_probe those flips mark
+ * one probe texture (its scene draws x4 in linear light: the one drawn in
+ * the flip before with the fewest dumped marks so far), without it the gains are
+ * off in them. s_hg_ab is the state of the frame being drawn (set at the
+ * flip that starts it), s_hg_probe the probe it marks (-1 none); hdr_dump
+ * writes both. Without hdr_gains_ab every probe is marked on every flip. */
+static uint32_t s_hg_abn;
+static int      s_hg_ab, s_hg_probe = -1;
+static uint8_t  s_hg_seen[64];
+static uint32_t s_hg_marks[64];
+
+static float hdr_lodfade_span(void)
+{
+    static float span = -1.0f;
+    if (span < 0.0f) {
+        const char *e = recomp_env(RENV_HDR_LODFADE);
+        span = e && *e ? (float)atof(e) : 2.0f;
+        if (span < 0.0f || span > 8.0f)
+            span = 2.0f;
+    }
+    return span;
+}
+
+static float hdr_gain_for(const struct nv2a_texrep_hdr_gain *e, int *mode)
+{
+    int p = nv2a_texrep_hdr_probes() ? nv2a_texrep_hdr_probe_index(e->hash) : -1, i;
+    *mode = e->mode;
+    if (p >= 0 && p < 64) {
+        if (!s_hg_abn || (s_hg_ab && p == s_hg_probe)) {
+            *mode = NV2A_HDR_GAIN_MUL;
+            return 4.0f;
+        }
+        if (!s_hg_ab)
+            s_hg_seen[p] = 1;
+    }
+    if (!hdr_gains_on() || (s_hg_abn && s_hg_ab && !nv2a_texrep_hdr_probes()))
+        return 1.0f;
+    if (s_hg_only_n) {
+        for (i = 0; i < s_hg_only_n && s_hg_only[i] != e->hash; i++)
+            ;
+        if (i == s_hg_only_n)
+            return 1.0f;
+    }
+    return e->gain > 0.0f ? e->gain : 1.0f;
+}
+
+/* At a flip: the state of the frame that starts (its draws see flips). */
+static void hdr_gains_flip(uint32_t flip)
+{
+    static int read;
+    int n = nv2a_texrep_hdr_probes(), i;
+    if (!read) {
+        const char *a = recomp_env(RENV_HDR_GAINS_AB);
+        read = 1;
+        s_hg_abn = a ? (uint32_t)strtoul(a, NULL, 0) : 0;
+    }
+    if (!s_hg_abn)
+        return;
+    s_hg_ab = (int)((flip / s_hg_abn) & 1u);
+    s_hg_probe = -1;
+    if (s_hg_ab && n) {
+        for (i = 0; i < n && i < 64; i++)
+            if (s_hg_seen[i] && (s_hg_probe < 0 || s_hg_marks[i] < s_hg_marks[s_hg_probe]))
+                s_hg_probe = i;
+        /* counted only on a frame hdr_dump writes (flip + 1 when shown),
+         * so the dumped flips go round the probes in view */
+        if (s_hg_probe >= 0 && nv2a_pb_dump_at_listed(flip + 1u))
+            s_hg_marks[s_hg_probe]++;
+    }
+    if (!s_hg_ab)
+        memset(s_hg_seen, 0, sizeof s_hg_seen);
+}
+
+/* RECOMP_DEBUG=hdr_texlog (as Metal): what the title draws with which blend,
+ * by texrep_dump's hash of stage 0's texture, once per combination (id n);
+ * every 1800 flips (BO-195) an [HDRTEXN] line per combination with its draws
+ * and the number of flips it was drawn in so far. */
+static void hdr_texlog(const struct nv2a_pb_gpu *g)
+{
+    static int on = -1, nseen;
+    static uint64_t seen[4096], last_sum;
+    static uint32_t ndraw[4096], nflip[4096], lflip[4096];
+    static FILE *out;
+    const Stage *t = &s_stage[0];
+    const uint8_t *mem;
+    uint64_t h, k;
+    int i;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_HDR_TEXLOG);
+        on = e != NULL;
+        /* =<file>: appended there (a pre-build scene's log is deleted) */
+        out = e && strchr(e, '/') ? fopen(e, "a") : NULL;
+        if (!out)
+            out = stderr;
+    }
+    if (!on || !t->offset || !t->width || !t->valid || nseen >= 4096)
+        return;
+    mem = (const uint8_t *)xbox_GetMemoryOffset();
+    h = nv2a_texrep_hash(mem + t->offset, t->color, t->width, t->height, t->pitch);
+    k = h ^ ((uint64_t)(g->blend_enable ? g->blend_sfactor : 0xFFFF) << 32)
+          ^ ((uint64_t)(g->blend_enable ? g->blend_dfactor : 0xFFFF) << 16)
+          ^ nv2a_pb_stream_tag();
+    if (s_presents / 1800u != last_sum / 1800u) {
+        last_sum = s_presents;
+        for (i = 0; i < nseen; i++)
+            fprintf(out, "[HDRTEXN] id %d draws %u flips %u at %llu\n", i, ndraw[i],
+                    nflip[i], (unsigned long long)s_presents);
+        if (out != stderr)
+            fflush(out);
+    }
+    for (i = 0; i < nseen; i++)
+        if (seen[i] == k)
+            break;
+    if (i < nseen) {
+        ndraw[i]++;
+        if (lflip[i] != (uint32_t)s_presents + 1u) {
+            lflip[i] = (uint32_t)s_presents + 1u;
+            nflip[i]++;
+        }
+        return;
+    }
+    ndraw[nseen] = nflip[nseen] = 1;
+    lflip[nseen] = (uint32_t)s_presents + 1u;
+    {
+        const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+        fprintf(out, "[HDRTEX] tex %016llx fmt 0x%02x %ux%u blend %d sf 0x%x df 0x%x tag %u flip %llu"
+                " id %d atest %d func 0x%x ref %u\n", (unsigned long long)h, t->color, t->width,
+                t->height, g->blend_enable, g->blend_sfactor, g->blend_dfactor,
+                nv2a_pb_stream_tag(), (unsigned long long)s_presents, nseen,
+                v->atest_enable, v->atest_func, v->atest_ref);
+    }
+    seen[nseen++] = k;
+    if (out != stderr)
+        fflush(out);
+}
+static void hdr_draw(const RenderTarget *rt, float hdr[4])
+{
+    int scene;
+    hdr[0] = hdr[1] = hdr[2] = 1.0f;
+    hdr[3] = 0.0f;
+    if (!s_hdr)
+        return;
+    scene = nv2a_pb_stream_tag() == HDR_TAG_SCENE;
+    s_hdr_draws[scene]++;
+    if (scene) {
+        hdr[0] = s_hdr_hi;
+    } else if (rt && (rt == s_hdr_prt[0] || rt == s_hdr_prt[1])) {
+        static float last_hw = -1.0f, last_pw, k = 1.0f;
+        float pk, pw, hw;
+        nv2a_host_hdr_levels(&pk, &pw, &hw);
+        if (hw != last_hw || pw != last_pw) {
+            last_hw = hw;
+            last_pw = pw;
+            k = powf(hw / pw, 1.0f / 2.2f);
+        }
+        hdr[1] = k;
+    }
+}
+
 static void vk_on_draw(const struct nv2a_pb_draw *d)
 {
     static uint32_t *idx;
@@ -3329,6 +4050,9 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     void *ip;
     int cull = 0, cull_all = 0, tries;
     float zbias = 0.0f;
+    uint64_t rhash = 0;               /* BO-204 debug */
+    const Stage *rstage = NULL;
+    const struct nv2a_texrep_hdr_gain *hgain = NULL;
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
     VkImageView sview[4];
@@ -3390,12 +4114,11 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
             pc.bump_lum[k][2] = pc.bump_lum[k][3] = 0.0f;
         }
     }
+    /* BO-110: the colour bound of the HDR combiners (unread by SDR ones). */
+    hdr_draw(rt, pc.hdr);
     fmod = fs_select(v);
     s_signed_on = fmod != s_fs_basic;   /* fs_basic has no signed channels */
-    for (i = 0; i < d->idx_count; i++) {
-        if (d->idx[i] < lo) lo = d->idx[i];
-        if (d->idx[i] > hi) hi = d->idx[i];
-    }
+    nv2a_idx_range(d->idx, d->idx_count, &lo, &hi);
     count = hi - lo + 1;
     if (d->idx_count * 3u > idx_cap) {
         uint32_t *grown = (uint32_t *)realloc(idx, (size_t)d->idx_count * 12u);
@@ -3467,15 +4190,45 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                     ssmp[k] = sampler(t, s_bind_scale);
                 if (zbias == 0.0f)
                     zbias = s_bind_zbias;
+                if (!rhash) {
+                    rhash = s_bind_rhash;
+                    rstage = t;
+                }
+                if (!hgain)
+                    hgain = s_bind_hgain;
             }
         }
         if (textured)
             s_draws_tex++;
     }
+    /* BO-110: a registered light texture's gain, on its scene draws. */
+    if (hgain && s_hdr && pc.hdr[0] > 1.0f) {
+        int mode;
+        float gain = hdr_gain_for(hgain, &mode);
+        if (gain != 1.0f) {
+            float k = powf(gain, 1.0f / 2.2f);
+            if (mode == NV2A_HDR_GAIN_HI)
+                pc.hdr[2] = k;
+            else
+                pc.hdr[1] = k;
+            /* BO-195 P3: a lift fades with the texture's mip (a cut never does; not for
+             * measuring probes). The fade queries stage 0's LOD whichever stage supplied the
+             * gain: fine while every entry is a stage-0 sprite, a trap for P1 entries. */
+            if (gain > 1.0f && !nv2a_texrep_hdr_probes())
+                pc.hdr[3] = hdr_lodfade_span();
+            s_hdr_gain_draws++;
+        }
+    }
+    if (s_hdr)
+        hdr_texlog(g);
     /* BO-176: a registered decal's depth offset, added to the constant part
      * of the title's own polygon offset (vp_scale.w), as Metal. */
     if (zbias != 0.0f && use_z && nv2a_texrep_zbias_on(g->flips))
         vc.c[3] += zbias / nv2a_zmax(g->format);
+    /* BO-204 debug: zbias_probe pushes one texture's draws back a flip. */
+    if (rhash && v->depth_enable)
+        vc.c[3] += nv2a_texrep_zprobe(g->flips, rhash, rstage->color, rstage->width,
+                                      rstage->height) / nv2a_zmax(g->format);
 
     /* Rings: an overflow flushes (ending the pass and resetting every
      * ring), so on a flush the placement starts over. */
@@ -3501,15 +4254,8 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     }
     if (!d->program)
         uo[0] = s_umemo.valid[0] ? s_umemo.off[0] : 0;
-    for (k = 0; k < nf4; k++) {
-        const VertexAttr *a = &d->attr[slot[k]];
-        int on = a->size && a->stride;
-        for (i = 0; i < count; i++) {
-            float *o = vf + ((size_t)i * nf4 + k) * 4;
-            if (!on || !fetch(d, a, lo + i, o))
-                memcpy(o, v->inl[slot[k]], 16);
-        }
-    }
+    nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
+                    (const uint8_t *)xbox_GetMemoryOffset(), vf);
     memcpy(ip, idx, (size_t)nidx * 4u);
     tset = texture_set(sview, ssmp);
     if (!tset) {
@@ -3676,9 +4422,14 @@ static uint32_t s_shown_w, s_shown_h;
  * vertices already (tex_bind runs inside on_draw). */
 static struct nvk_buffer s_rb;
 
-static const uint8_t *host_readback(RenderTarget *rt)
+static uint8_t *s_rb_conv;     /* BO-110: a half-float target's pixels as BGRA8 */
+static size_t   s_rb_conv_cap;
+
+/* An image's level 0 (w x h, bpp bytes a texel) in s_rb.map, after a submit
+ * and a wait; NULL when that failed. */
+static const uint8_t *readback_raw(struct nvk_image *im, uint32_t w, uint32_t h, uint32_t bpp)
 {
-    VkDeviceSize need = (VkDeviceSize)rt->hw * rt->hh * 4u;
+    VkDeviceSize need = (VkDeviceSize)w * h * bpp;
     VkDeviceSize pos[RING_N];
     VkBufferImageCopy bc;
     int k;
@@ -3694,14 +4445,14 @@ static const uint8_t *host_readback(RenderTarget *rt)
     }
     end_encoder();
     ensure_cmd();
-    nvk_image_to(s_cmd, &rt->im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    nvk_image_to(s_cmd, im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     memset(&bc, 0, sizeof bc);
     bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     bc.imageSubresource.layerCount = 1;
-    bc.imageExtent.width = rt->hw;
-    bc.imageExtent.height = rt->hh;
+    bc.imageExtent.width = w;
+    bc.imageExtent.height = h;
     bc.imageExtent.depth = 1;
-    vkCmdCopyImageToBuffer(s_cmd, rt->im.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    vkCmdCopyImageToBuffer(s_cmd, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            s_rb.buf, 1, &bc);
     {
         /* The copy's writes visible to the host. */
@@ -3725,6 +4476,139 @@ static const uint8_t *host_readback(RenderTarget *rt)
         return NULL;      /* the copy is not proven done: nothing to read */
     for (k = 0; k < RING_N; k++)
         s_ring_pos[k] = pos[k];
+    return (const uint8_t *)s_rb.map;
+}
+
+/* BO-110: RECOMP_DEBUG=hdr_dump=<prefix>: at each fb_dump_at flip, the
+ * presented target (w x h host pixels from its corner) as
+ * <prefix>flip_NNNNN.rgbaf (as Metal: a 16-byte header "HDR1", w, h, 1 when
+ * half float, then 32-bit float RGBA), and with HDR on the flip pass run
+ * into an image of its own as <prefix>flip_NNNNN.pq10 ("PQ10", w, h, 0,
+ * then A2B10G10R10 words: what the window's slot gets, before AA,
+ * sharpening, the scale and the overlay) with <prefix>flip_NNNNN.json (the
+ * levels the pass was given). Headless or not. */
+static struct nvk_image s_hd_img;
+static void hdr_dump(RenderTarget *rt, uint32_t w, uint32_t h)
+{
+    const char *prefix = recomp_env(RENV_HDR_DUMP);
+    uint32_t flip = nv2a_pb_gpu_state()->flips, hdr[4], y, x;
+    int half = rt->im.format == RT_FORMAT_HDR;
+    const uint8_t *px;
+    char path[1100];
+    FILE *f;
+
+    if (!prefix || !*prefix || !w || !h || w > rt->hw || h > rt->hh
+            || !nv2a_pb_dump_at_listed(flip))
+        return;
+    px = readback_raw(&rt->im, rt->hw, rt->hh, half ? 8u : 4u);
+    if (!px)
+        return;
+    snprintf(path, sizeof path, "%sflip_%05u.rgbaf", prefix, flip);
+    if ((f = fopen(path, "wb")) != NULL) {
+        float *out = (float *)malloc((size_t)w * 16u);
+        memcpy(&hdr[0], "HDR1", 4);
+        hdr[1] = w;
+        hdr[2] = h;
+        hdr[3] = (uint32_t)half;
+        fwrite(hdr, 4, 4, f);
+        for (y = 0; out && y < h; y++) {
+            for (x = 0; x < w; x++) {
+                size_t i = (size_t)y * rt->hw + x;
+                if (half) {
+                    const uint16_t *q = (const uint16_t *)px + i * 4u;
+                    out[x * 4 + 0] = hdr_h2f(q[0]);
+                    out[x * 4 + 1] = hdr_h2f(q[1]);
+                    out[x * 4 + 2] = hdr_h2f(q[2]);
+                    out[x * 4 + 3] = hdr_h2f(q[3]);
+                } else {
+                    const uint8_t *q = px + i * 4u;
+                    out[x * 4 + 0] = q[2] / 255.0f;
+                    out[x * 4 + 1] = q[1] / 255.0f;
+                    out[x * 4 + 2] = q[0] / 255.0f;
+                    out[x * 4 + 3] = q[3] / 255.0f;
+                }
+            }
+            fwrite(out, 16, w, f);
+        }
+        free(out);
+        fclose(f);
+        fprintf(stderr, LOGP "hdr_dump: flip %u %ux%u %s -> %s\n", flip, w, h,
+                half ? "half" : "bgra8", path);
+    }
+    if (!s_hdr)
+        return;
+    if (s_hd_img.img && (s_hd_img.w != w || s_hd_img.h != h)) {
+        garbage_push(&s_hd_img, VK_NULL_HANDLE, NULL);
+        memset(&s_hd_img, 0, sizeof s_hd_img);
+    }
+    if (!s_hd_img.img && !nvk_image_new(&s_hd_img, HDR_SLOT_FORMAT, w, h, 1,
+                                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                                        | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                        VK_IMAGE_ASPECT_COLOR_BIT)) {
+        memset(&s_hd_img, 0, sizeof s_hd_img);
+        return;
+    }
+    if (!hdr_flip_pass(rt, &s_hd_img, w, h)
+            || !(px = readback_raw(&s_hd_img, w, h, 4u)))
+        return;
+    snprintf(path, sizeof path, "%sflip_%05u.pq10", prefix, flip);
+    if ((f = fopen(path, "wb")) != NULL) {
+        memcpy(&hdr[0], "PQ10", 4);
+        hdr[1] = w;
+        hdr[2] = h;
+        hdr[3] = 0;
+        fwrite(hdr, 4, 4, f);
+        fwrite(px, 4, (size_t)w * h, f);
+        fclose(f);
+    }
+    snprintf(path, sizeof path, "%sflip_%05u.json", prefix, flip);
+    if ((f = fopen(path, "w")) != NULL) {
+        float pk, pw, hw, sh, hl;
+        int srgb;
+        nv2a_host_hdr_levels(&pk, &pw, &hw);
+        nv2a_host_hdr_tone(&sh, &hl, &srgb);
+        fprintf(f, "{\"flip\": %u, \"w\": %u, \"h\": %u, \"peak\": %.1f, \"paper\": %.1f,"
+                " \"hud\": %.1f, \"shadows\": %.3f, \"highlights\": %.3f, \"decode\": \"%s\","
+                " \"gains\": %d", flip, w, h, pk, pw, hw, sh, hl, srgb ? "srgb" : "2.2",
+                hdr_gains_on());
+        /* BO-195: hdr_gains_ab's state of this frame and the probe it marks */
+        if (s_hg_abn)
+            fprintf(f, ", \"gains_ab\": %u, \"ab\": %d, \"probe\": \"%016llx\"", s_hg_abn,
+                    s_hg_ab, (unsigned long long)nv2a_texrep_hdr_probe_hash(s_hg_probe));
+        if (s_hg_only_n)
+            fprintf(f, ", \"only\": %d", s_hg_only_n);
+        fprintf(f, "}\n");
+        fclose(f);
+    }
+}
+
+static const uint8_t *host_readback(RenderTarget *rt)
+{
+    int half = rt->im.format == RT_FORMAT_HDR;
+    if (!readback_raw(&rt->im, rt->hw, rt->hh, half ? 8u : 4u))
+        return NULL;
+    if (half) {
+        /* As a BGRA8 target would hold it: clamped to [0, 1], rounded. */
+        size_t n = (size_t)rt->hw * rt->hh, i;
+        const uint16_t *q = (const uint16_t *)s_rb.map;
+        if (s_rb_conv_cap < n * 4u) {
+            uint8_t *nb = (uint8_t *)realloc(s_rb_conv, n * 4u);
+            if (!nb)
+                return NULL;
+            s_rb_conv = nb;
+            s_rb_conv_cap = n * 4u;
+        }
+        for (i = 0; i < n; i++, q += 4) {
+            uint8_t *o = s_rb_conv + i * 4u;
+            int c;
+            for (c = 0; c < 4; c++) {
+                float f = hdr_h2f(q[c]);
+                uint8_t b = !(f > 0.0f) ? 0 : f >= 1.0f ? 255 : (uint8_t)(f * 255.0f + 0.5f);
+                o[c == 3 ? 3 : 2 - c] = b;
+            }
+        }
+        return s_rb_conv;
+    }
     return (const uint8_t *)s_rb.map;
 }
 
@@ -4212,6 +5096,8 @@ static void frame_advance(void)
     f->used = 0;
     for (k = 0; k < f->ndps; k++)
         vkResetDescriptorPool(s_dev, f->dps[k], 0);
+    if (s_hf_pool[s_fi])
+        vkResetDescriptorPool(s_dev, s_hf_pool[s_fi], 0);
     f->dp_cur = 0;
     s_tset_last = VK_NULL_HANDLE;
     rings_reset();
@@ -4221,12 +5107,85 @@ static void frame_advance(void)
 
 /* ---- caches on disk ------------------------------------------------------------- */
 
+/* BO-208. The driver's VkPipelineCache on disk, one file per driver:
+ * vk_pipeline_<vendor>_<device>_<first 4 bytes of pipelineCacheUUID>[_t<hash of
+ * TU_DEBUG>].bin. The bundled Turnip, a system driver and a custom package of
+ * the same GPU report one vendor and device id and differ in the UUID; and
+ * TU_DEBUG flags (android_vk.c: sysmem, nobin, noubwc) change what Turnip
+ * compiles. Each keeps its own file, so switching drivers back and forth
+ * throws nothing away. The file is our 32-byte header and the driver's data:
+ * the driver checks its own header, this one catches what the driver would
+ * only silently ignore, a truncated or bit-flipped file (CRC), and a file
+ * of another driver build under the same name. */
+#define PCB_MAGIC "XRVKPC02"
+struct pcb_hdr {
+    char     magic[8];
+    uint32_t vendor, device, driver, len, crc, uuid;
+};
+
+static uint32_t crc32_buf(const void *p, size_t n)
+{
+    static uint32_t tab[256];
+    const uint8_t *b = (const uint8_t *)p;
+    uint32_t c = 0xFFFFFFFFu;
+    size_t i;
+    if (!tab[1]) {
+        uint32_t k, j;
+        for (k = 0; k < 256; k++) {
+            uint32_t v = k;
+            for (j = 0; j < 8; j++)
+                v = (v & 1) ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+            tab[k] = v;
+        }
+    }
+    for (i = 0; i < n; i++)
+        c = tab[(c ^ b[i]) & 0xFF] ^ (c >> 8);
+    return ~c;
+}
+
+static uint32_t pcb_uuid4(void)
+{
+    uint32_t u;
+    memcpy(&u, C->props.pipelineCacheUUID, 4);
+    return u;
+}
+
 static void pcache_path(char *p, size_t n, int *ok)
 {
-    char dir[1024];
+    char dir[1024], tu[24] = "";
+    const char *t = getenv("TU_DEBUG");
+    if (t && *t)
+        snprintf(tu, sizeof tu, "_t%08x",
+                 (unsigned)nv2a_fnv64(t, strlen(t), NV2A_FNV64_INIT));
     *ok = nvk_cache_dir(dir, sizeof dir)
-          && snprintf(p, n, "%s/vk_pipeline_%04X_%04X.bin", dir, C->props.vendorID,
-                      C->props.deviceID) < (int)n;
+          && snprintf(p, n, "%s/vk_pipeline_%04X_%04X_%08x%s.bin", dir, C->props.vendorID,
+                      C->props.deviceID, pcb_uuid4(), tu) < (int)n;
+}
+
+/* Blobs of drivers not used for 90 days, and the unheadered one of before
+ * BO-208 (vk_pipeline_<vendor>_<device>.bin), are removed. */
+static void pcache_prune(const char *keep)
+{
+    char dir[1024], p[1200];
+    DIR *d;
+    struct dirent *e;
+    time_t now = time(NULL);
+    if (!nvk_cache_dir(dir, sizeof dir) || !(d = opendir(dir)))
+        return;
+    while ((e = readdir(d)) != NULL) {
+        struct stat st;
+        size_t l = strlen(e->d_name);
+        if (strncmp(e->d_name, "vk_pipeline_", 12) || l < 16 || strcmp(e->d_name + l - 4, ".bin")
+                || snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= (int)sizeof p
+                || !strcmp(p, keep) || stat(p, &st) != 0)
+            continue;
+        if (l == 12 + 9 + 4 || now - st.st_mtime > 90 * 24 * 3600) {
+            remove(p);
+            fprintf(stderr, LOGP "pipeline cache: removed %s (%s)\n", e->d_name,
+                    l == 12 + 9 + 4 ? "the format before BO-208" : "not used for 90 days");
+        }
+    }
+    closedir(d);
 }
 
 static void pcache_save(void)
@@ -4246,9 +5205,18 @@ static void pcache_save(void)
     if (!data)
         return;
     if (vkGetPipelineCacheData(s_dev, s_pcache, &n, data) == VK_SUCCESS) {
+        struct pcb_hdr h;
+        memset(&h, 0, sizeof h);
+        memcpy(h.magic, PCB_MAGIC, 8);
+        h.vendor = C->props.vendorID;
+        h.device = C->props.deviceID;
+        h.driver = C->props.driverVersion;
+        h.len = (uint32_t)n;
+        h.crc = crc32_buf(data, n);
+        h.uuid = pcb_uuid4();
         snprintf(tmp, sizeof tmp, "%s.tmp", path);
         if ((f = fopen(tmp, "wb")) != NULL) {
-            int good = fwrite(data, 1, n, f) == n;
+            int good = fwrite(&h, 1, sizeof h, f) == sizeof h && fwrite(data, 1, n, f) == n;
             if (fclose(f) == 0 && good && rename(tmp, path) == 0) {
                 s_pso_since_save = 0;
                 if (vk_trace())
@@ -4261,6 +5229,8 @@ static void pcache_save(void)
     free(data);
 }
 
+static int s_blob_cold;                  /* pcache_load: the driver kept nothing */
+static int s_pc_save;                    /* the pre-warm thread asks for a save (atomic) */
 static int s_pc_stop;                    /* the way out: pre-warm stops (atomic) */
 static int s_quiesced;                   /* nvk_backend_quiesce saved the cache */
 
@@ -4295,15 +5265,15 @@ int nvk_backend_quiesce(int timeout_ms)
     return 1;
 }
 
-static int s_pc_save;                    /* the pre-warm thread asks for a save (atomic) */
 
 static VkPipelineCache pcache_load(void)
 {
     char path[1100];
     VkPipelineCacheCreateInfo ci;
     VkPipelineCache pc = VK_NULL_HANDLE;
-    void *data = NULL;
-    size_t n = 0;
+    void *data = NULL, *payload = NULL;
+    size_t n = 0, fsz = 0;
+    const char *why = NULL;
     FILE *f;
     int ok;
 
@@ -4312,18 +5282,46 @@ static VkPipelineCache pcache_load(void)
         if (fseek(f, 0, SEEK_END) == 0) {
             long sz = ftell(f);
             if (sz > 0 && fseek(f, 0, SEEK_SET) == 0 && (data = malloc((size_t)sz)) != NULL) {
-                n = fread(data, 1, (size_t)sz, f);
-                if (n != (size_t)sz)
-                    n = 0;
+                fsz = fread(data, 1, (size_t)sz, f);
+                if (fsz != (size_t)sz) {
+                    free(data);
+                    data = NULL;
+                    why = "unreadable";
+                }
             }
         }
         fclose(f);
+        if (data) {
+            struct pcb_hdr h;
+            if (fsz < sizeof h) {
+                why = "truncated";
+            } else {
+                memcpy(&h, data, sizeof h);
+                if (memcmp(h.magic, PCB_MAGIC, 8) != 0)
+                    why = "not one of ours (the format before BO-208)";
+                else if (h.len != fsz - sizeof h)
+                    why = "truncated";
+                else if (crc32_buf((char *)data + sizeof h, h.len) != h.crc)
+                    why = "damaged (CRC)";
+                else if (h.vendor != C->props.vendorID || h.device != C->props.deviceID
+                         || h.driver != C->props.driverVersion || h.uuid != pcb_uuid4())
+                    why = "of another driver build";
+                else {
+                    payload = (char *)data + sizeof h;
+                    n = h.len;
+                }
+            }
+        }
+        if (why) {
+            fprintf(stderr, LOGP "pipeline cache: %s is %s: discarded, built again\n", path, why);
+            remove(path);
+        }
     }
     memset(&ci, 0, sizeof ci);
     ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
     ci.initialDataSize = n;
-    ci.pInitialData = n ? data : NULL;
-    /* The driver validates the header (vendor, device, cache UUID) and
+    ci.pInitialData = n ? payload : NULL;
+    /* The driver validates its own header (vendor, device, cache UUID) and
      * starts empty when it does not match. */
     if (vkCreatePipelineCache(s_dev, &ci, NULL, &pc) != VK_SUCCESS) {
         ci.initialDataSize = 0;
@@ -4336,9 +5334,12 @@ static VkPipelineCache pcache_load(void)
         /* What the driver kept of the file (it drops one of another driver). */
         size_t kept = 0;
         vkGetPipelineCacheData(s_dev, pc, &kept, NULL);
+        s_blob_cold = kept < 64;
         fprintf(stderr, LOGP "pipeline cache: %s (%zu bytes, %zu kept by the driver)\n",
                 n ? path : "empty", n, kept);
     }
+    if (ok)
+        pcache_prune(path);
     return pc;
 }
 
@@ -4348,17 +5349,44 @@ static pthread_mutex_t s_pcf_mu = PTHREAD_MUTEX_INITIALIZER;   /* s_pcf itself *
 static int      s_pc_rescan;            /* asked for while one ran */
 static uint64_t s_pc_warm[3], s_pc_warm_ns;
 static char     s_pc_path[1100], s_pc_ver[256];
+static int      s_pc_cold;              /* BO-208: a first build: the manifest brought keys or the driver's cache was empty */
+static uint64_t s_pc_hold_ns = 3000000000ull;   /* how long the title may be held for the first pre-warm */
 
 /* Appends a key the ack thread just built. */
-static void pc_put(uint32_t type, const void *data, uint32_t len)
+static nv2a_pcache *s_gapf;             /* BO-208: gaps.bin: what the render thread had to build */
+static void pc_put_(uint32_t type, const void *data, uint32_t len, int gap)
 {
     pthread_mutex_lock(&s_pcf_mu);
-    if (s_pcf && nv2a_pcache_put(s_pcf, type, data, len) < 0) {
+    int added = s_pcf ? nv2a_pcache_put(s_pcf, type, data, len) : 0;
+    if (s_pcf && added < 0) {
         static int said;
         if (!said++)
             XR_ERROR( LOGP "pcache: cannot append; the key list is not written\n");
     }
+    if (gap && added > 0 && s_gapf) {
+        /* A key the lists lacked when the title needed it: the field's gap in
+         * the manifest. A vertex program as its hash only (the microcode is
+         * the title's); pcache_keys.py manifest takes the file as it is. */
+        if (type == PC_VS) {
+            uint64_t h = nv2a_fnv64(data, len, NV2A_FNV64_INIT);
+            nv2a_pcache_put(s_gapf, NV2A_PC_MANIFEST_VS, &h, 8);
+        } else {
+            nv2a_pcache_put(s_gapf, type, data, len);
+        }
+    }
     pthread_mutex_unlock(&s_pcf_mu);
+}
+
+/* The render thread's builds: a gap if the lists had it not. */
+static void pc_put(uint32_t type, const void *data, uint32_t len)
+{
+    pc_put_(type, data, len, 1);
+}
+
+/* The seeds of a pre-build: not gaps. */
+static void pc_seed(uint32_t type, const void *data, uint32_t len)
+{
+    pc_put_(type, data, len, 0);
 }
 
 /* A module of the tables by its key id, or VK_NULL_HANDLE. s_pc_mu held. */
@@ -4381,24 +5409,251 @@ static VkShaderModule module_by_kid(uint64_t kid, int fragment)
     return VK_NULL_HANDLE;
 }
 
-/* Builds every key of the list into the ack thread's own tables: first the
- * shaders the list's pipelines use, then the pipelines, then the other
- * shaders (keys seeded from the title's executable that nothing drew yet:
- * nobody waits for those), so the ack thread finds them built: with the SPIR-V cache and the driver's pipeline cache warm this is
- * a few lookups, and after a driver update or a changed shader generator it
- * is the compiling the ack thread would otherwise do mid-game. One thread,
- * below the title's: it shares the machine with a title that is starting. */
+/* BO-208. Builds every key of the list into the ack thread's own tables:
+ * first the shaders the list's pipelines use, then the pipelines, then the
+ * other shaders (keys seeded from the title's executable or the shipped
+ * manifest that nothing drew yet: nobody waits for those), so the ack thread
+ * finds them built. With the SPIR-V cache and the driver's pipeline cache
+ * warm this is a few lookups; after a driver update, a changed shader
+ * generator or a new manifest it is the compiling the ack thread would
+ * otherwise do mid-game.
+ *
+ * Two rounds. Round 0 builds the variant the targets are in now (SDR, or
+ * HDR with HDR on) on several threads, and is what the title is held for
+ * ("Preparing graphics N of M"). Round 1 builds the other variant, when the
+ * display or the system can do HDR at all (pc_hdr_reachable), on one
+ * low-priority thread after the game has started, so that switching HDR in
+ * the settings later waits for nothing. What the other settings change (the
+ * AA modes, sharpening, render scale) is the presenter's and is built at its
+ * first frame (fb_present_*.c); the title's own pipelines have one sample
+ * and no resolution in their keys. */
+typedef struct {
+    nv2a_pcache *pc;
+    size_t       n;
+    uint64_t    *need;
+    size_t       nneed;
+    int          want_sdr, want_hdr, pass;
+    size_t       next;                  /* the next record to take (atomic) */
+    uint64_t     nb[3];                 /* built (atomic) */
+    uint32_t     done;                  /* records handled (atomic) */
+    uint32_t     total;
+    int          report;                /* round 0: tell the window */
+    int          cold;
+} PcJob;
+
+/* The other variant can be reached: the display or the OS can do HDR (the
+ * toolkit's nv2a_host_hdr_potential: BO-207 sets it on Windows too) or HDR
+ * is on, or a pre-build was told so. */
+static int pc_hdr_reachable(void)
+{
+    const char *ph = recomp_env(RENV_PCACHE_HDR);
+    return __atomic_load_n(&s_hdr, __ATOMIC_ACQUIRE) || nv2a_host_hdr_potential() > 1.0f
+           || (ph && (*ph == '1' || *ph == '2'));     /* 2: a test of the background round */
+}
+
+/* One record of the list for the job's pass, as the single thread did.
+ * `parsed` and `glsl` are the calling thread's. */
+static void pc_warm_item(PcJob *J, size_t i, NV2AVshProgram *parsed, char *glsl)
+{
+    nv2a_pcache *pc = J->pc;
+    uint64_t *need = J->need;
+    size_t nneed = J->nneed, q;
+    int pass = J->pass, want_sdr = J->want_sdr, want_hdr = J->want_hdr, v, handled = 0;
+    const void *d;
+    uint32_t type, len;
+
+    if (!nv2a_pcache_get(pc, i, &type, &d, &len))
+        return;
+    if (pass == 0 && type == PC_VS) {
+        uint64_t kid = vs_kid(d, len);
+        for (q = 0; q < nneed && need[q] != kid; q++)
+            ;
+        if (q == nneed)
+            return;                     /* pass 2 */
+    }
+    if (pass == 0 && (type == PC_FS || type == PC_FS_HDR)) {
+        /* Needed when a pipeline names it in either variant. */
+        uint64_t k0 = fs_kid(d, len, 0), k1 = fs_kid(d, len, 1);
+        for (q = 0; q < nneed && need[q] != k0 && need[q] != k1; q++)
+            ;
+        if (q == nneed)
+            return;                     /* pass 2 */
+    }
+    if (pass != 1 && type == PC_VS && len >= 16 && len % 16 == 0
+            && len <= NV2A_VSH_SLOTS * 16u) {
+        uint32_t hash = 2166136261u, k;
+        uint16_t inputs = 0;
+        VkShaderModule mod;
+        VsEntry *e;
+        handled = 1;
+        for (k = 0; k < len / 4u; k++)      /* nv2a_vsh_program_hash */
+            hash = (hash ^ ((const uint32_t *)d)[k]) * 16777619u;
+        if (!hash)
+            hash = 1;
+        pthread_mutex_lock(&s_pc_mu);
+        e = vs_find(hash);
+        pthread_mutex_unlock(&s_pc_mu);
+        if (e || !(mod = vs_build((const uint32_t *)d, (int)(len / 16u), hash, &inputs, parsed,
+                                  glsl, 1)))
+            goto out;
+        pthread_mutex_lock(&s_pc_mu);
+        if (vs_find(hash) || !vs_take(hash, vs_kid(d, len), mod, inputs))
+            e = NULL;                   /* the ack thread was first, or the table is full */
+        else
+            e = s_vs, __atomic_fetch_add(&J->nb[PC_VS], 1, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&s_pc_mu);
+        if (!e)
+            vkDestroyShaderModule(s_dev, mod, NULL);
+    } else if (pass != 1 && (type == PC_FS || type == PC_FS_HDR)
+               && len == sizeof(NV2ACombinerState)) {
+        handled = 1;
+        for (v = type == PC_FS_HDR; v < 2; v++) {
+            NV2ACombinerState st;
+            VkShaderModule mod;
+            uint32_t hash;
+            FsEntry *e;
+            if (!(v ? want_hdr : want_sdr))
+                continue;
+            memcpy(&st, d, sizeof st);
+            hash = fnv(&st, sizeof st);
+            if (v)
+                hash ^= 0x48445200u;    /* as fs_select */
+            pthread_mutex_lock(&s_pc_mu);
+            e = fs_find(hash, &st, v);
+            pthread_mutex_unlock(&s_pc_mu);
+            if (e || !(mod = fs_build(&st, hash, glsl, 1, v)))
+                continue;
+            pthread_mutex_lock(&s_pc_mu);
+            if (fs_find(hash, &st, v) || !fs_take(hash, &st, mod, v))
+                e = NULL;
+            else
+                e = s_fs, __atomic_fetch_add(&J->nb[PC_FS], 1, __ATOMIC_RELAXED);
+            pthread_mutex_unlock(&s_pc_mu);
+            if (!e)
+                vkDestroyShaderModule(s_dev, mod, NULL);
+        }
+    } else if (pass == 1 && type == PC_PSO && len == sizeof(PsoDisk)) {
+        handled = 1;
+        for (v = 0; v < 3; v++) {
+            PsoDisk dk;
+            PsoKey k;
+            VkPipeline p;
+            uint32_t at;
+            int found, full;
+            memcpy(&dk, d, sizeof dk);
+            if (dk.depth & 2u) {
+                /* A half-float target's, recorded so. */
+                if (v || !want_hdr)
+                    continue;
+            } else if (!v) {
+                /* SDR's, or (its fs an HDR variant) an 8-bit
+                 * target's with HDR on, recorded so. */
+                if (!want_sdr && !want_hdr)
+                    continue;
+            } else {
+                /* BO-110: the same pipeline with the HDR variant of
+                 * its combiners, on a half-float target (v 1) or an
+                 * 8-bit one (v 2: the small 2D targets, rt_format). */
+                if (!want_hdr)
+                    continue;
+                if (v == 1)
+                    dk.depth |= 2u;
+                if (dk.fs != PC_FS_BASIC)
+                    dk.fs = fs_kid_hdr_of(dk.fs);
+                else if (v == 2)
+                    continue;           /* fs_basic on 8-bit: the SDR record itself */
+            }
+            memset(&k, 0, sizeof k);
+            pthread_mutex_lock(&s_pc_mu);
+            k.vs = (uint64_t)(uintptr_t)module_by_kid(dk.vs, 0);
+            k.fs = (uint64_t)(uintptr_t)module_by_kid(dk.fs, 1);
+            k.nf4 = dk.nf4;
+            k.topo = dk.topo;
+            k.depth = dk.depth;
+            k.wmask = dk.wmask;
+            memcpy(k.blend, dk.blend, sizeof k.blend);
+            found = 1;
+            full = 0;
+            if (k.vs && k.fs && dk.nf4 <= NV2A_VS_MAX_INPUTS) {
+                (void)pso_slot(&k, &found);
+                full = s_pso_n + 1 >= PSO_CAP * 3 / 4;
+            }
+            pthread_mutex_unlock(&s_pc_mu);
+            if (found || full || !(p = pipeline_new(&k, 1)))
+                continue;
+            pthread_mutex_lock(&s_pc_mu);
+            at = pso_slot(&k, &found);
+            if (!found) {
+                s_pso[at].k = k;
+                s_pso[at].p = p;
+                s_pso[at].used = 1;
+                s_pso_n++;
+                __atomic_fetch_add(&J->nb[PC_PSO], 1, __ATOMIC_RELAXED);
+            }
+            pthread_mutex_unlock(&s_pc_mu);
+            if (found)                  /* the ack thread was first */
+                vkDestroyPipeline(s_dev, p, NULL);
+        }
+    }
+out:
+    if (handled && J->report) {
+        uint32_t dn = __atomic_add_fetch(&J->done, 1, __ATOMIC_RELAXED);
+        nv2a_pcache_stat_hold(dn > J->total ? J->total : dn, J->total, J->cold);
+    }
+}
+
+/* One of the threads of a pass: takes records until none are left. */
+static void *pc_worker(void *arg)
+{
+    PcJob *J = (PcJob *)arg;
+    NV2AVshProgram *parsed = (NV2AVshProgram *)malloc(sizeof *parsed);
+    char *glsl = (char *)malloc(65536);
+    if (parsed && glsl) {
+        size_t i;
+        while ((i = __atomic_fetch_add(&J->next, 1, __ATOMIC_RELAXED)) < J->n
+               && !__atomic_load_n(&s_pc_stop, __ATOMIC_ACQUIRE))
+            pc_warm_item(J, i, parsed, glsl);
+    }
+    free(parsed);
+    free(glsl);
+    return NULL;
+}
+
+/* A pass over the list on `threads` threads (this one is one of them). */
+static void pc_run_pass(PcJob *J, int threads)
+{
+    pthread_t th[8];
+    int t, started = 0;
+    J->next = 0;
+    if (threads > 8)
+        threads = 8;
+    for (t = 1; t < threads; t++)
+        if (pthread_create(&th[started], NULL, pc_worker, J) == 0)
+            started++;
+    pc_worker(J);
+    for (t = 0; t < started; t++)
+        pthread_join(th[t], NULL);
+}
+
+static int pc_thread_count(void)
+{
+    long e = recomp_env_int(RENV_PCACHE_THREADS, 0);
+    int n = nv2a_pcache_cpu_count() - 2;
+    if (e > 0)
+        return e > 8 ? 8 : (int)e;
+    return n < 1 ? 1 : n > 4 ? 4 : n;
+}
+
 static void *pc_prewarm(void *arg)
 {
-    static char glsl[65536];
-    NV2AVshProgram *parsed = (NV2AVshProgram *)malloc(sizeof *parsed);
     (void)arg;
     do {
         nv2a_pcache *pc;
         size_t n, i, nneed;
         uint64_t t0 = now_ns(), nb[3] = {0, 0, 0}, *need;
         uint32_t listed[3] = {0, 0, 0};
-        int pass;
+        int pass, hdr, round, rounds;
+        PcJob J;
 
         __atomic_store_n(&s_pc_rescan, 0, __ATOMIC_RELEASE);
         /* The list as it is on disk now (a pre-build may have appended to it
@@ -4416,8 +5671,8 @@ static void *pc_prewarm(void *arg)
         for (i = 0; i < n; i++) {
             const void *d;
             uint32_t type, len;
-            if (nv2a_pcache_get(pc, i, &type, &d, &len) && type <= PC_PSO)
-                listed[type]++;
+            if (nv2a_pcache_get(pc, i, &type, &d, &len) && type <= PC_FS_HDR)
+                listed[type == PC_FS_HDR ? PC_FS : type]++;
         }
         nv2a_pcache_stat_open(s_pc_path, listed);
         /* The shader ids the list's pipelines name. */
@@ -4432,118 +5687,79 @@ static void *pc_prewarm(void *arg)
                 nneed += 2;
             }
         }
-        for (pass = 0; parsed && pass < 3 && !__atomic_load_n(&s_pc_stop, __ATOMIC_ACQUIRE); pass++) {
-            if (pass == 2)              /* the pipelines are in: nobody waits now */
+        memset(&J, 0, sizeof J);
+        J.pc = pc;
+        J.n = n;
+        J.need = need;
+        J.nneed = nneed;
+        J.total = listed[0] + listed[1] + listed[2];
+        J.cold = s_pc_cold;
+        /* BO-110, BO-208: the variants. Round 0: SDR while the targets are
+         * SDR; HDR while they are half float (the HDR variant of every SDR
+         * key is derived), and beside SDR in a pre-build that was told the
+         * display can show HDR (RECOMP_PCACHE_HDR=1). Round 1, when HDR can
+         * be reached at all: the other one. */
+        hdr = __atomic_load_n(&s_hdr, __ATOMIC_ACQUIRE);
+        {
+            const char *ph = recomp_env(RENV_PCACHE_HDR);
+            J.want_hdr = hdr || (ph && *ph == '1');
+            J.want_sdr = !hdr;
+        }
+        /* Round 1 is decided after round 0: the presenter publishes the
+         * display's HDR potential (Windows: BO-207) when its swapchain is
+         * made, which can be after this thread started. */
+        rounds = need && !(J.want_hdr && J.want_sdr) ? 2 : 1;
+        for (round = 0; round < rounds && need; round++) {
+            if (round) {
+                if (!pc_hdr_reachable()) {
+                    rounds = 1;
+                    break;
+                }
+                nv2a_pcache_lower_priority();
+                J.want_sdr = hdr;
+                J.want_hdr = !hdr;
+                J.report = 0;
+                memset(J.nb, 0, sizeof J.nb);
+                fprintf(stderr, LOGP "pcache: building the %s variants in the background"
+                        " at %.2f s\n", hdr ? "SDR" : "HDR", (double)(now_ns() - s_t0_ns) / 1e9);
+            } else {
+                J.report = __atomic_load_n(&s_pc_warm_urgent, __ATOMIC_ACQUIRE);
+            }
+            for (pass = 0; pass < 3 && !__atomic_load_n(&s_pc_stop, __ATOMIC_ACQUIRE); pass++) {
+                if (pass == 2 && !round)    /* the pipelines are in: nobody waits now */
+                    __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
+                J.pass = pass;
+                pc_run_pass(&J, round ? 1 : pc_thread_count());
+            }
+            for (i = 0; i < 3; i++)
+                nb[i] += J.nb[i];
+            if (!round && J.report)
+                nv2a_pcache_stat_hold(J.total, J.total, J.cold);
+            if (!round) {
+                nv2a_pcache_stat_warm_ms((uint32_t)((now_ns() - t0) / 1000000ull));
+                fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines of %u/%u/%u"
+                        " on disk in %.0f ms on %d threads (done at %.2f s)\n",
+                        (unsigned long long)nb[PC_VS], (unsigned long long)nb[PC_FS],
+                        (unsigned long long)nb[PC_PSO], listed[0], listed[1], listed[2],
+                        (double)(now_ns() - t0) / 1e6, pc_thread_count(),
+                        (double)(now_ns() - s_t0_ns) / 1e9);
                 __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
-            for (i = 0; i < n && !__atomic_load_n(&s_pc_stop, __ATOMIC_ACQUIRE); i++) {
-                const void *d;
-                uint32_t type, len;
-                size_t q;
-                if (!nv2a_pcache_get(pc, i, &type, &d, &len))
-                    continue;
-                if (pass == 0 && (type == PC_VS || type == PC_FS)) {
-                    uint64_t kid = vs_kid(d, len);      /* the id rule is one for both */
-                    for (q = 0; q < nneed && need[q] != kid; q++)
-                        ;
-                    if (q == nneed)
-                        continue;       /* pass 2 */
-                }
-                if (pass != 1 && type == PC_VS && len >= 16 && len % 16 == 0
-                        && len <= NV2A_VSH_SLOTS * 16u) {
-                    uint32_t hash = 2166136261u, k;
-                    uint16_t inputs = 0;
-                    VkShaderModule mod;
-                    VsEntry *e;
-                    for (k = 0; k < len / 4u; k++)      /* nv2a_vsh_program_hash */
-                        hash = (hash ^ ((const uint32_t *)d)[k]) * 16777619u;
-                    if (!hash)
-                        hash = 1;
-                    pthread_mutex_lock(&s_pc_mu);
-                    e = vs_find(hash);
-                    pthread_mutex_unlock(&s_pc_mu);
-                    if (e || !(mod = vs_build((const uint32_t *)d, (int)(len / 16u), hash,
-                                              &inputs, parsed, glsl, 1)))
-                        continue;
-                    pthread_mutex_lock(&s_pc_mu);
-                    if (vs_find(hash) || !vs_take(hash, vs_kid(d, len), mod, inputs))
-                        e = NULL;       /* the ack thread was first, or the table is full */
-                    else
-                        e = s_vs, nb[PC_VS]++;
-                    pthread_mutex_unlock(&s_pc_mu);
-                    if (!e)
-                        vkDestroyShaderModule(s_dev, mod, NULL);
-                } else if (pass != 1 && type == PC_FS && len == sizeof(NV2ACombinerState)) {
-                    NV2ACombinerState st;
-                    VkShaderModule mod;
-                    uint32_t hash;
-                    FsEntry *e;
-                    memcpy(&st, d, sizeof st);
-                    hash = fnv(&st, sizeof st);
-                    pthread_mutex_lock(&s_pc_mu);
-                    e = fs_find(hash, &st);
-                    pthread_mutex_unlock(&s_pc_mu);
-                    if (e || !(mod = fs_build(&st, hash, glsl, 1)))
-                        continue;
-                    pthread_mutex_lock(&s_pc_mu);
-                    if (fs_find(hash, &st) || !fs_take(hash, &st, mod))
-                        e = NULL;
-                    else
-                        e = s_fs, nb[PC_FS]++;
-                    pthread_mutex_unlock(&s_pc_mu);
-                    if (!e)
-                        vkDestroyShaderModule(s_dev, mod, NULL);
-                } else if (pass == 1 && type == PC_PSO && len == sizeof(PsoDisk)) {
-                    PsoDisk dk;
-                    PsoKey k;
-                    VkPipeline p;
-                    uint32_t at;
-                    int found, full;
-                    memcpy(&dk, d, sizeof dk);
-                    memset(&k, 0, sizeof k);
-                    pthread_mutex_lock(&s_pc_mu);
-                    k.vs = (uint64_t)(uintptr_t)module_by_kid(dk.vs, 0);
-                    k.fs = (uint64_t)(uintptr_t)module_by_kid(dk.fs, 1);
-                    k.nf4 = dk.nf4;
-                    k.topo = dk.topo;
-                    k.depth = dk.depth;
-                    k.wmask = dk.wmask;
-                    memcpy(k.blend, dk.blend, sizeof k.blend);
-                    found = 1;
-                    full = 0;
-                    if (k.vs && k.fs && dk.nf4 <= NV2A_VS_MAX_INPUTS) {
-                        (void)pso_slot(&k, &found);
-                        full = s_pso_n + 1 >= PSO_CAP * 3 / 4;
-                    }
-                    pthread_mutex_unlock(&s_pc_mu);
-                    if (found || full || !(p = pipeline_new(&k, 1)))
-                        continue;
-                    pthread_mutex_lock(&s_pc_mu);
-                    at = pso_slot(&k, &found);
-                    if (!found) {
-                        s_pso[at].k = k;
-                        s_pso[at].p = p;
-                        s_pso[at].used = 1;
-                        s_pso_n++;
-                        nb[PC_PSO]++;
-                    }
-                    pthread_mutex_unlock(&s_pc_mu);
-                    if (found)          /* the ack thread was first */
-                        vkDestroyPipeline(s_dev, p, NULL);
-                }
+                /* The title's variant is in: the pipeline cache goes to disk
+                 * now, not after the background round. */
+                __atomic_store_n(&s_pc_save, 1, __ATOMIC_RELEASE);
             }
         }
         free(need);
         for (i = 0; i < 3; i++)
             s_pc_warm[i] += nb[i];
         s_pc_warm_ns += now_ns() - t0;
-        fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines of %u/%u/%u"
-                " on disk in %.0f ms (done at %.2f s)\n",
-                (unsigned long long)nb[PC_VS], (unsigned long long)nb[PC_FS],
-                (unsigned long long)nb[PC_PSO], listed[0], listed[1], listed[2],
-                (double)(now_ns() - t0) / 1e6, (double)(now_ns() - s_t0_ns) / 1e9);
+        if (rounds > 1)
+            fprintf(stderr, LOGP "pcache: both variants built: %llu vs, %llu fs, %llu pipelines"
+                    " in all (done at %.2f s)\n", (unsigned long long)nb[PC_VS],
+                    (unsigned long long)nb[PC_FS], (unsigned long long)nb[PC_PSO],
+                    (double)(now_ns() - s_t0_ns) / 1e9);
     } while (__atomic_load_n(&s_pc_rescan, __ATOMIC_ACQUIRE)
              && !__atomic_load_n(&s_pc_stop, __ATOMIC_ACQUIRE));
-    free(parsed);
     __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
     nv2a_pcache_stat_warming(0);
     __atomic_store_n(&s_pc_warming, 0, __ATOMIC_RELEASE);
@@ -4554,7 +5770,9 @@ static void *pc_prewarm(void *arg)
 
 /* Starts the pre-warm thread, or has the one running go round again.
  * `first`: the one the backend starts with, whose pipelines the ack thread
- * may wait for (pc_wait_more). */
+ * may wait for (pc_wait_more): 3 s, or on a cold start (the manifest brought
+ * keys, or the driver's cache was empty) as long as the build takes, to a
+ * cap. */
 static void pc_warm_begin(int first)
 {
     pthread_t th;
@@ -4563,7 +5781,8 @@ static void pc_warm_begin(int first)
         return;
     nv2a_pcache_stat_warming(1);
     if (first) {
-        __atomic_store_n(&s_pc_wait_until, now_ns() + 3000000000ull, __ATOMIC_RELEASE);
+        s_pc_hold_t0 = now_ns();
+        __atomic_store_n(&s_pc_wait_until, now_ns() + s_pc_hold_ns, __ATOMIC_RELEASE);
         __atomic_store_n(&s_pc_warm_urgent, 1, __ATOMIC_RELEASE);
     }
     if (pthread_create(&th, NULL, pc_prewarm, NULL) == 0) {
@@ -4613,9 +5832,30 @@ static void pc_start(void)
         uint32_t none[3] = {0, 0, 0};
         nv2a_pcache_stat_open(s_pc_path, none);
     }
+    {
+        char gp[1100], gv[300], gm[128];
+        snprintf(gp, sizeof gp, "%s/gaps_vulkan.bin", dir);
+        snprintf(gv, sizeof gv, "%s; gaps", s_pc_ver);
+        s_gapf = nv2a_pcache_open(gp, gv, gm, sizeof gm);
+    }
     nv2a_pcache_set_rescan(pc_warm_start);
-    nv2a_pcache_set_seed(pc_put);
-    if (nv2a_pcache_count(s_pcf))
+    nv2a_pcache_set_seed(pc_seed);
+    {
+        /* BO-208: the shipped manifest's keys join the list; a first build
+         * (it brought keys, or the driver's cache is empty) holds the title
+         * for its pipelines behind "Preparing graphics N/M". */
+        nv2a_pcache_manifest_stat ms;
+        uint32_t added = nv2a_pcache_manifest_apply(s_pcf, "vulkan", s_pc_ver, &ms);
+        long hold = recomp_env_int(RENV_PCACHE_HOLD_S, 180);
+        s_pc_cap_ns = (uint64_t)(hold < 3 ? 3 : hold) * 1000000000ull;
+        s_pc_cold = (added > 0 || s_blob_cold) && (added > 64 || nv2a_pcache_count(s_pcf) > 64);
+        s_pc_hold_ns = s_pc_cold ? (uint64_t)(hold < 3 ? 3 : hold) * 1000000000ull
+                                 : 3000000000ull;
+        fprintf(stderr, LOGP "pcache: %s start (%u keys new from the manifest, driver cache %s),"
+                " the title may be held up to %llu s\n", s_pc_cold ? "cold" : "warm", added,
+                s_blob_cold ? "empty" : "kept", (unsigned long long)(s_pc_hold_ns / 1000000000ull));
+    }
+    if (nv2a_pcache_count(s_pcf) || s_pc_cold)
         pc_warm_begin(1);
 }
 
@@ -4682,6 +5922,20 @@ static int init(void)
     tried = 1;
     s_failed = 1;
 
+    {   /* BO-110: HDR asked for (graphics.hdr where the display can, or
+         * RECOMP_DEBUG=hdr), A/B and the scene bound for tests. */
+        const char *e = recomp_env(RENV_HDR), *a = recomp_env(RENV_HDR_AB),
+                   *h = recomp_env(RENV_HDR_HI);
+        int dbg = e && *e && strcmp(e, "0") != 0;
+        s_hdr_ab = dbg && a ? atoi(a) : 0;
+        if (h && atof(h) >= 1.0)
+            s_hdr_hi = (float)atof(h);
+        s_hdr = dbg || nv2a_host_hdr_active();
+        nv2a_texrep_set_hdr(s_hdr);     /* BO-203: the title's HDR pictures */
+        if (s_hdr)
+            fprintf(stderr, LOGP "HDR (BO-110): half-float targets, scene bound %.1f%s\n",
+                    s_hdr_hi, s_hdr_ab ? ", A/B" : "");
+    }
     s_win = xbox_FramebufferWindowVulkan();
     C = nvk_core_get();
     if (!C)
@@ -5018,6 +6272,81 @@ static void vf_flip(void)
     s_vf_last_rt = NULL;
 }
 
+/* BO-110: at every flip the stream tag goes back to UI (a frame without the
+ * title's scene marks -- menus, movies, loading -- is all at the HUD's
+ * white); HDR follows the setting (or hdr_ab): every target is dropped
+ * (written back first when the guest may read it) and made again in the
+ * other format from the next draw on, as at a start. */
+static int s_hdr_said_switch;   /* log the present after a switch */
+
+static void hdr_flip(void)
+{
+    uint32_t flip = nv2a_pb_gpu_state()->flips;
+    int want, i, nkeep = 0;
+    static int dbg = -1;
+    static RenderTarget keep[RT_MAX];
+
+    nv2a_pb_stream_tag_set(0);
+    if (dbg < 0) {
+        const char *e = recomp_env(RENV_HDR);
+        dbg = e && *e && strcmp(e, "0") != 0;
+    }
+    if ((flip % 600u) == 0 && s_hdr)
+        fprintf(stderr, LOGP "HDR: flip %u; draws %llu UI-bound, %llu scene-bound (%llu with a"
+                " texture's gain), %llu flip maps\n",
+                flip, (unsigned long long)s_hdr_draws[0], (unsigned long long)s_hdr_draws[1],
+                (unsigned long long)s_hdr_gain_draws, (unsigned long long)s_hdr_maps);
+    want = s_hdr_ab ? ((flip / (uint32_t)s_hdr_ab) & 1u) == 0 : (dbg || nv2a_host_hdr_active());
+    nv2a_texrep_flip(flip);             /* BO-203, hdr_image_ab */
+    if (want == s_hdr)
+        return;
+    end_encoder();
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (!rt->im.img)
+            continue;
+        if (rt->presented)
+            keep[nkeep++] = *rt;
+        rt_free(rt);
+    }
+    for (i = 0; i < CUBE_MAX; i++) {
+        if (s_cube[i].im.img)
+            garbage_push(&s_cube[i].im, VK_NULL_HANDLE, NULL);
+        memset(&s_cube[i], 0, sizeof s_cube[i]);
+    }
+    if (s_self.img) {
+        garbage_push(&s_self, VK_NULL_HANDLE, NULL);
+        memset(&s_self, 0, sizeof s_self);
+    }
+    __atomic_store_n(&s_hdr, want, __ATOMIC_RELEASE);
+    nv2a_texrep_set_hdr(want);          /* BO-203: textures with an HDR picture upload again */
+    s_dyn_valid = 0;
+    s_tset_last = VK_NULL_HANDLE;
+    /* The targets a flip has shown come back at once, in the new format,
+     * at their old size, from the bytes rt_free wrote back. Left to the next
+     * draw, one is made at that draw's clip: Burnout 3's loading and menu
+     * screens draw 640x448+16, so a 640x464 target that present_target never
+     * takes for the 640x480 frame, and every flip went out as guest bytes
+     * (the CPU path, stale pixels, 15 fps under HDR) until a full clear. */
+    for (i = 0; i < nkeep; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (rt_make(rt, keep[i].offset, keep[i].w, keep[i].h, keep[i].pitch, keep[i].swz))
+            rt->presented = 1;
+    }
+    s_hdr_said_switch = !s_hdr_ab || flip < 4000u;
+    if (s_pcf) {
+        /* The key list's shaders and pipelines in the other variant, in the
+         * background; switching on, the draws wait for its pipelines as at
+         * a start (at most 3 s, "Preparing shaders" on the screen; the
+         * switch is made in the paused settings overlay). */
+        nv2a_pcache_stat_hdr(want);
+        pc_warm_begin(want);
+    }
+    if (!s_hdr_ab || flip < 4000u)
+        fprintf(stderr, LOGP "HDR%s: flip %u, HDR %s\n", s_hdr_ab ? " A/B" : "", flip,
+                want ? "on" : "off");
+}
+
 /* RECOMP_TRACE=vk_prof: on_flip's cost every 300 flips. */
 static struct { uint64_t n, flip, wait, wb, blit, waits; } s_pa;
 
@@ -5045,6 +6374,16 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
             s_vf->ready_done = s_done_serial >= s_next_serial - 1;
         }
         rt = present_target(surface_offset);
+        if (s_hdr_said_switch) {
+            /* The first present after an HDR switch: on the GPU path still. */
+            s_hdr_said_switch = 0;
+            fprintf(stderr, LOGP "HDR: present after the switch: surface 0x%08X (%s)\n",
+                    surface_offset, rt ? "drawn here" : "guest bytes");
+        }
+        if (rt != s_hdr_prt[0]) {
+            s_hdr_prt[1] = s_hdr_prt[0];
+            s_hdr_prt[0] = rt;
+        }
         if (rt) {
             present_extent(rt, &cw, &ch);
             hcw = (uint32_t)((uint64_t)cw * rt->hw / rt->w);
@@ -5067,6 +6406,31 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
             slot = (struct nvk_image *)xbox_FramebufferWindowBackTexture(hcw, hch);
             if (s_vf)
                 vt2 = now_ns();
+            if (slot && slot->format != (s_hdr ? HDR_SLOT_FORMAT : rt->im.format)) {
+                static int said;   /* BO-110: the slots follow at the next present */
+                if (said++ < 4)
+                    fprintf(stderr, LOGP "HDR: window slot format differs; frame not shown\n");
+                slot = NULL;
+            }
+            if (slot && s_hdr) {
+                /* BO-110: mapped for the display into the 10-bit slot. */
+                if (hdr_flip_pass(rt, slot, hcw, hch)) {
+                    if (s_vf)
+                        vt3 = now_ns();
+                    s_flush_fence = !(rt && wb);
+                    flush(0, FL_FLIP);
+                    if (s_vf)
+                        vt4 = now_ns();
+                    xbox_FramebufferWindowPublishTexture();
+                    if (s_vf) {
+                        s_vf->f_back = vt2 - vt1;
+                        s_vf->f_copy = vt3 - vt2;
+                        s_vf->f_submit = vt4 - vt3;
+                        s_vf->f_pub = now_ns() - vt4;
+                    }
+                }
+                slot = NULL;
+            }
             if (slot) {
                 VkImageCopy ic;
                 end_encoder();
@@ -5116,6 +6480,10 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
             if (prof)
                 s_pa.wb += now_ns() - t;
         }
+        /* BO-110: RECOMP_DEBUG=hdr_dump, at fb_dump_at flips (after the
+         * write-back: it reads back through the same buffer). */
+        if (rt && hcw && hch)
+            hdr_dump(rt, hcw, hch);
         /* Submit the frame and move on: the GPU runs it while the next
          * one is recorded. */
         s_flush_fence = 1;
@@ -5139,6 +6507,10 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
         if ((s_pso_since_save && (s_presents % 600) == 599)
                 || __atomic_exchange_n(&s_pc_save, 0, __ATOMIC_ACQ_REL))
             pcache_save();
+    }
+    if (!s_failed) {
+        hdr_flip();
+        hdr_gains_flip(nv2a_pb_gpu_state()->flips);
     }
     if (s_pc_trace)
         tex_upload_log();

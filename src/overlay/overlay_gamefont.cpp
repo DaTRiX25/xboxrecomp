@@ -144,7 +144,17 @@ uint8_t *gf_read_verified(const char *path, uint64_t size, const char *sha_hex, 
 {
     const char *why = NULL;
     uint8_t *file = NULL;
+#if defined(__ANDROID__)
+    /* SDL on Android opens a relative path in the app's internal storage (or
+     * the APK's assets), not the current folder the host chdir()s to, where
+     * the title's install and the port's paths are. */
+    FILE *fp = fopen(path, "rb");
+    SDL_RWops *rw = fp ? SDL_RWFromFP(fp, SDL_TRUE) : NULL;
+    if (fp && !rw)
+        fclose(fp);
+#else
     SDL_RWops *rw = SDL_RWFromFile(path, "rb");
+#endif
     Sint64 n = rw ? SDL_RWsize(rw) : -1;
     if (!rw)
         why = "not readable";

@@ -18,7 +18,8 @@ add_executable(pad_script_test
     ${INPUT_SRC}/input_core.c
     ${INPUT_SRC}/rumble_curve.c
     ${INPUT_SRC}/pad_glyphs.c
-    ${INPUT_SRC}/keyboard.c)
+    ${INPUT_SRC}/keyboard.c
+    ${INPUT_SRC}/touch_pad.c)
 target_include_directories(pad_script_test PRIVATE ${INPUT_SRC} ${USB_SRC})
 target_link_libraries(pad_script_test PRIVATE platform)
 if(NOT WIN32)

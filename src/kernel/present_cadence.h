@@ -91,7 +91,16 @@ const char *pc_strategy_name(int strategy);
 #define PC_LATES_RAISE    6              /* lates in the window that raise the lead */
 #define PC_LEAD_STEP_NS   2000000ull
 #define PC_LEAD_MAX_NS    33000000ull
-
+/* A raise is taken back, one step at a time, after this many frames on the
+ * glass with no slip (no late frame) since the last raise or step back: a
+ * shader-compile burst or a load early in a session no longer leaves the Mac
+ * a refresh or two later for the rest of it (BO-211). */
+#define PC_DECAY_FRAMES   600
+/* A raise right after a step back (within two slip windows): the step back
+ * was too soon, and the next waits twice as long, up to 8 x (80 s), so a
+ * Mac whose slips come back at the lower depth does not drop and repeat a
+ * frame every 12 s for the session. */
+#define PC_DECAY_MAX      (8 * PC_DECAY_FRAMES)
 typedef struct {
     int      strategy;
     uint64_t period_ns;    /* the display's refresh period (PC_LOCK, PC_TIMED_ODD) */
@@ -101,10 +110,15 @@ typedef struct {
     int      depth_max;    /* the most that keeps a frame inside PC_LATENCY_MAX_NS */
     int      grace;        /* frames still not counted */
     uint64_t lead_ns;      /* PC_TIMED*: present at the vblank plus this */
+    int      depth0;       /* what the setting asked: a raise decays back to these */
+    uint64_t lead0_ns;
+    int      calm;         /* frames since the last slip (late), raise or step back */
+    int      decay_frames; /* calm frames a step back needs now */
+    int      since_back;   /* frames since the last step back */
     /* the window's counts */
     int      frames, slips, lates;
     /* since pc_pacer_init */
-    uint32_t slips_all, lates_all, raised;
+    uint32_t slips_all, lates_all, raised, lowered;
 } pc_pacer;
 
 /* What one present is aimed at. */
@@ -119,8 +133,13 @@ void pc_pacer_init(pc_pacer *p, int strategy, const pc_display *d,
 /* The frame whose emulated vblank was vblank_ns, picked up at now_ns. */
 void pc_pacer_aim(const pc_pacer *p, uint64_t vblank_ns, uint64_t now_ns, pc_aim *out);
 /* The frame aimed with *aim reached the glass at glass_ns (0: never shown).
- * Returns 1 when the depth or the lead was raised. */
+ * Returns 1 when the depth or the lead was raised, -1 when a raise was taken
+ * back (PC_DECAY_FRAMES calm frames). */
 int  pc_pacer_glass(pc_pacer *p, const pc_aim *aim, uint64_t glass_ns);
+/* The pacing watchdog's reset (BO-211): the depth and lead back to the
+ * setting's, the grace anew. The grid (the display's) is kept: a reset
+ * drops no frame when the depth was already the setting's. */
+void pc_pacer_relearn(pc_pacer *p);
 /* PC_LOCK: the time to report to the vblank's display lock for an on-glass
  * time (a point `phase` before the display's grid); 0 for other strategies. */
 uint64_t pc_pacer_lock_report(const pc_pacer *p, uint64_t glass_ns);

@@ -34,17 +34,27 @@
 
 #include "input_backend.h"
 #include "input_map.h"
+#include "touch_pad.h"
 #include "kernel_pause.h"
 #include "present_cadence.h"    /* what reached the glass, for the graph */
 #include "kernel_pacing.h"     /* power mode Auto's state (BO-175) */
 extern "C" uint64_t xbox_HostNowNs(void);   /* platform/host_time.h */
 #include "apu.h"                /* the speaker test */
 #include "apu_bus.h"            /* the Mixer page */
+#include "overlay_sounds.h"      /* the title's menu sounds (BO-190) */
 #include "apu_gp.h"             /* is the title's effects image modelled */
 #include "recomp_restart.h"
 #include "recomp_save_dir.h"
+#include "kernel_save_import.h"   /* Import Xbox save */
 #include "xbox_soundtrack.h"    /* the music folder browser's model (xsb_*) */
 #include "xbox_update.h"        /* Check for updates */
+/* BO-110, HDR (kernel/nv2a_backend_common.h, C). */
+extern "C" {
+float nv2a_host_hdr_potential(void);
+void  nv2a_host_hdr_levels(float *peak_nits, float *paper_nits, float *hud_nits);
+void *nv2a_host_hdr_patch(float symbol_nits);
+void  nv2a_host_hdr_pattern(int kind, float x0, float y0, float x1, float y1, float a, float b);
+}
 
 #include <math.h>
 #include <stdint.h>
@@ -68,6 +78,18 @@ static SDL_Window *s_win;
 static bool s_enabled;          /* RECOMP_OVERLAY is not 0 */
 static bool s_open;
 static float s_alpha;           /* 0..1, the fade */
+/* The rows coming in (BO-190), as the title's menus bring theirs: each row
+ * slides in from the left and fades up, one after another. Timed from frame
+ * captures of the title at 60 Hz: a row takes 2 frames from -12% of the
+ * screen's width, the next starts 3 frames later on a page change (the
+ * front end's Driver Details) and 4 frames later when the pause menu opens.
+ * Drawing only: a row takes input where it ends up from the first frame. */
+static uint32_t s_rows_t0;      /* when the first row starts; 0: none running */
+static uint32_t s_rows_step_ms;
+#define ROWS_IN_MS 33u          /* one row: 2 frames */
+#define ROWS_STEP_PAGE_MS 50u   /* the next row: 3 frames (a page change) */
+#define ROWS_STEP_OPEN_MS 67u   /* 4 frames (the pause menu opening) */
+#define ROWS_IN_SLOTS 6         /* rows further down come in with the sixth */
 static bool s_core_ready;
 static bool s_vulkan;
 static uint32_t s_last_ms;
@@ -97,8 +119,10 @@ static bool s_scroll_to_sel;
 static bool s_save_pending;
 static uint32_t s_save_at;
 
-/* Fullscreen follows the setting when the setting changes. */
+/* Fullscreen follows the setting when the setting changes (not Android). */
+#if !defined(__ANDROID__)
 static int s_fs_applied = -1;
+#endif
 
 /* RECOMP_OVERLAY=toggle=<s>[,<s>...]: the overlay opens and closes at those
  * seconds after the window came up, for scripted runs (the pause, the
@@ -122,7 +146,7 @@ static volatile uint32_t s_presents;
 
 /* ── rows ──────────────────────────────────────────────────────────── */
 
-enum { FMT_PLAIN, FMT_PERCENT, FMT_PERCENT_OF_MAX, FMT_TIMES, FMT_GAIN };
+enum { FMT_PLAIN, FMT_PERCENT, FMT_PERCENT_OF_MAX, FMT_TIMES, FMT_GAIN, FMT_NITS };
 
 struct Meta {
     const char *label;
@@ -137,6 +161,7 @@ static const char *const n_aspect[]    = { "4:3", "16:9", NULL };
 static const char *const n_filter[]    = { "Nearest", "Linear", "Integer", NULL };
 static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", NULL };
 static const char *const n_timing[]    = { "Legacy (when ready)", "Auto (even frames)", NULL };
+static const char *const n_frame_pacing[] = { "Automatic", "Low latency", "Smooth", NULL };
 static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the sides)", NULL };
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_lod[]       = { "Off", "Auto (from the render scale)", "-0.5", "-1.0", "-1.5", NULL };
@@ -146,6 +171,7 @@ static const char *const n_custom_level[] = { "Off", "Quieter", "Match game musi
 static const char *const n_lfe_lowpass[] = { "Off", "80 Hz", "100 Hz", "120 Hz", NULL };
 #if defined(__ANDROID__)
 static const char *const n_vibration[] = { "Auto", "Controller", "This device", "Off", NULL };
+static const char *const n_touch[]     = { "Auto (hidden while a controller is used)", "Always", "Off", NULL };
 #endif
 #if defined(__ANDROID__)
 static const char *const n_scale[]     = { "1x (640x480)", "1.5x (960x720)", "2x (1280x960)", "3x", "4x", NULL };
@@ -199,8 +225,8 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_GAME_SPEED_UNITS */   { "Speed units", "Speed and distance in km/h and metres instead of mph and miles, using the game's own metric display. Applies from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
     /* XS_DISPLAY_HUD_FIX */    { "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On keeps the HUD at its 4:3 proportions, pinned to the screen edges. Applies from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_DISPLAY_ULTRAWIDE */  { "Ultrawide", "For displays wider than 16:9, with Aspect set to 16:9. Races fill the whole width, showing more at the sides without stretching. Menus, loading screens and videos stay 16:9 in the middle. Window matches the window's or screen's own shape. Applies from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
-    /* XS_GRAPHICS_BLOOM */     { "Bloom", "The game's soft glow over the picture, strongest while boosting. Turning it off skips three render passes.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "The game's speed blur: streaks towards the edges at speed and while boosting. Turning it off skips two render passes.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_BLOOM */     { "Bloom", "How strong the game's own bloom is. 100% is the original.", 0.1, FMT_PERCENT, NULL, 0 },
+    /* XS_GRAPHICS_MOTION_BLUR */ { "Motion blur", "How strong the game's own motion blur is. 100% is the original.", 0.1, FMT_PERCENT, NULL, 0 },
     /* XS_GRAPHICS_CRASH_60FPS */ { "60 fps crash cameras", "The game drops to 30 fps in its crash and takedown cameras. On keeps them at 60. Needs a fast machine: if 60 can't be held, the game itself slows down, not just the picture. Leave it off on a Steam Deck or other handheld.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_SPLIT_60FPS */ { "60 fps split screen", "Two-player split screen runs at 30 fps in the original. On runs it at 60 and draws the scene twice per frame. Needs a fast machine: if 60 can't be held, the game itself slows down. Leave it off on a Steam Deck or other handheld. Applies from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_SPLIT_MUSIC */  { "Music in split screen", "The original plays no music in split screen. On plays EA GAMES TRAX or your custom music in two-player Race and Road Rage, as in one-player. Applies from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
@@ -217,8 +243,22 @@ static const Meta k_meta[XS_COUNT] = {
     /* XS_INTERFACE_MENU_ENTRY */ { "Entry in the game's menu", "Adds TAKEDAWN SETTINGS to the game's Settings menu (Driver Details > Settings). It opens this menu, like the hotkey. Shows the next time that menu opens.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_CUSTOM_LEVEL */ { "Custom music loudness", "Modern songs are mastered louder than the game's music, and the game plays them louder still, so they distort. Match game music brings each song to the level of EA GAMES TRAX with a slow gain that never pumps within a song. Quieter and Louder sit 4 dB below and above that. Off plays songs as the game sends them. Custom music only.", 1, FMT_PLAIN, n_custom_level, 0 },
     /* XS_DISPLAY_SCORE_BOARD */ { "Score board", "The SCORE board at the top of the screen. Original is the console's look: the dark plate behind the score vanishes a moment after its text fades. Smooth fades the plate with the text, and fades the board back in after a crash camera. Changes at once.", 1, FMT_PLAIN, n_score_board, 0 },
+    /* XS_AUDIO_MENU_SOUNDS */  { "Menu sounds", "This menu clicks with the game's own menu sounds, read from your copy of the game.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_HDR */       { "HDR", "High dynamic range output on a display that can show it (on macOS: a display with HDR or XDR brightness headroom; on Steam Deck and Linux: game mode with HDR switched on in the display settings; on Windows: Use HDR switched on for the display in Windows' display settings). The game's light keeps its strength: lamps, brake lights, sparks, the boost glow and the sun go brighter than white, while the HUD and menus stay at their own brightness. Off is the original picture.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_HDR_PEAK */  { "Peak brightness", "The brightest the display can show. Display uses what the display reports (on a Steam Deck that is right). To set it by eye: raise it until the symbol in the box disappears into the bright background, then stop.", 50.0, FMT_NITS, NULL, 0 },
+    /* XS_GRAPHICS_HDR_PAPER */ { "Paper white", "How bright the game's ordinary white is: the scene's overall brightness. Light above it uses the room up to the peak. Raise it if the whole picture looks dimmer than without HDR. The box shows paper white (left) beside the HUD's white (right).", 10.0, FMT_NITS, NULL, 0 },
+    /* XS_GRAPHICS_HDR_HUD */   { "HUD and menu brightness", "How bright the HUD, the game's menus and its text are. Same as paper white unless set.", 10.0, FMT_NITS, NULL, 0 },
+    /* XS_GRAPHICS_HDR_SHADOWS */ { "Shadows", "Deepens the dark parts of the picture. 1.00 is the game's own, as it looks without HDR; higher makes shadows and night darker without touching the bright parts. 1.10 suits an OLED in a dark room; above 1.20 the darkest steps start to merge.", 0.05, FMT_GAIN, NULL, 0 },
+    /* XS_GRAPHICS_HDR_HIGHLIGHTS */ { "Highlight gain", "Strengthens the light above paper white (lamps, sparks, flames) before it rolls off to the peak. 1.00 is as the game stacks it; more helps a display with little room above paper white.", 0.1, FMT_GAIN, NULL, 0 },
+    /* XS_GRAPHICS_HDR_DECODE */ { "Gamma", "How the game's colours become light: 2.2 as a TV shows it, or the sRGB curve (lighter near black).", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_DISPLAY_FRAME_PACING */ { "Frame pacing", "Low latency shows each frame at the first refresh it can make. Smooth keeps one finished frame in hand, so a late frame does not show as a repeated one; it adds one refresh (16.7 ms at 60 Hz) to the delay from the pad to the screen. Automatic picks Smooth on the Steam Deck and Low latency elsewhere. On a variable-refresh display (G-Sync, FreeSync) or one well above 60 Hz there is no queue to keep, and Smooth works like Low latency.", 1, FMT_PLAIN, n_frame_pacing, 0 },
+    /* XS_GAME_RACE_CLOCK */    { "Potato mode", "Keeps the race at real speed on a slow machine by skipping frames. Without it, a machine under 60 fps runs the race in slow motion until the first crash. Leave it off on a fast PC: at 60 fps it gains nothing, and lap times can come out a few seconds slower. Applies from the next race.", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { "Vibration", "Where rumble goes. Auto uses this device's vibrator while its built-in controls are in use. External controllers don't rumble on Android; This device vibrates anyway.", 1, FMT_PLAIN, n_vibration, 0 },
+    /* XS_INPUT_TOUCH */        { "Touch controls", "On-screen controls. In a race: steer with the left thumb anywhere on the left half, GAS, BRAKE and BOOST on the right (BOOST keeps accelerating). In menus: a d-pad and A B X Y. Pause and this menu are at the top, left of centre. Auto hides them while a controller is used and shows them again when you touch the screen.", 1, FMT_PLAIN, n_touch, 0 },
+    /* XS_INPUT_TOUCH_OPACITY */ { "Touch controls opacity", "How solid the on-screen controls look.", 0.1, FMT_PERCENT, NULL, 0 },
+    /* XS_INPUT_TOUCH_SCALE */  { "Touch controls size", "100% suits a phone or a 6-7 inch handheld held in both hands.", 0.1, FMT_PERCENT, NULL, 0 },
+    /* XS_INPUT_TOUCH_AUTO_GAS */ { "Touch: accelerate automatically", "In a race the car accelerates by itself; hold BRAKE to slow down or reverse. Touch controls only.", 1, FMT_PLAIN, NULL, 0 },
 #endif
 };
 
@@ -228,15 +268,17 @@ static const Meta k_meta[XS_COUNT] = {
 extern "C" const char *nvk_core_describe(void);   /* nv2a_vk_core.c */
 #endif
 enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS, R_FOLDER };
-enum Action { A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
+enum Action { A_NONE,                                               /* 0 is "no question asked" (s_confirm) */
+              A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_HOST0, A_HOST1, A_HOST2, A_HOST3,                  /* xbox_OverlaySetHostRows */
               A_SHADERS,                                          /* the Graphics page's shader build */
               A_MIXER,                                            /* the Mixer page (overlay_mixer.inc) */
               A_UPDATE_CHECK, A_UPDATE_OPEN,                      /* Check for updates (xbox_update.h) */
               A_STEAM_ART,                                        /* xbox_OverlaySetSteamArt */
-              A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_RESTORE, A_SAVE_CANCEL,  /* xbox_OverlaySetSaveIO */
+              A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_XBOX, A_SAVE_RESTORE, A_SAVE_CANCEL,  /* xbox_OverlaySetSaveIO */
               A_CHEAT0, A_CHEAT1, A_CHEAT2, A_CHEAT3,              /* xbox_OverlaySetCheats */
               A_CHEAT_KEEP, A_CHEAT_DISCARD,
+              A_HDR_RESET,                                        /* BO-110: HDR levels to the display's */
               A_RESTART_PIN, A_QUIT };       /* the two rows at the foot of every page: they ask first */
 
 /* The most rows a page has (the Audio page, with the music folder's lines
@@ -469,6 +511,8 @@ static int music_access_thread(void *)
 }
 
 static void music_browser_open();
+static void xbox_browser_open();
+static int s_mf_acc_for;                  /* 0: the music folder, 1: the Xbox save */
 
 /* The answer, once a frame: the browser opens when the hook said so. */
 static void music_access_poll()
@@ -479,24 +523,35 @@ static void music_access_poll()
     s_mf_acc_state.store(0, std::memory_order_release);
     fprintf(stderr, LOGP "music folder access: %s%s%s\n", s_mf_acc_ok ? "yes" : "no",
             s_mf_acc_line[0] ? ": " : "", s_mf_acc_line);
-    if (s_mf_acc_ok && s_open)
-        music_browser_open();
+    if (s_mf_acc_ok && s_open) {
+        if (s_mf_acc_for == 1)
+            xbox_browser_open();
+        else
+            music_browser_open();
+    }
 }
 
 /* The row is pressed: through the access hook when there is one. */
-static void music_access_start()
+static void music_access_start(int for_xbox = 0)
 {
     int expect = 0;
     if (!s_mf || !s_mf->access) {
-        music_browser_open();
+        if (for_xbox)
+            xbox_browser_open();
+        else
+            music_browser_open();
         return;
     }
+    s_mf_acc_for = for_xbox;
     if (!s_mf_acc_state.compare_exchange_strong(expect, 1))
         return;                           /* still waiting for the answer */
     SDL_Thread *t = SDL_CreateThread(music_access_thread, "music access", NULL);
     if (!t) {
         s_mf_acc_state.store(0, std::memory_order_release);
-        music_browser_open();
+        if (for_xbox)
+            xbox_browser_open();
+        else
+            music_browser_open();
         return;
     }
     SDL_DetachThread(t);
@@ -533,7 +588,7 @@ static uint32_t now_ms();
 static char s_sio_dir[1024], s_sio_dest[1024], s_sio_note[200];
 static char s_sio_info[200];          /* the line under the rows */
 static char s_sio_msg[2600];          /* the whole of it, for the rows' note */
-enum { FB_MUSIC, FB_SAVE };
+enum { FB_MUSIC, FB_SAVE, FB_XBOX };
 static int s_fb_purpose;              /* what the folder browser is open for */
 
 void xbox_OverlaySetSaveIO(const xbox_save_io *io)
@@ -555,6 +610,11 @@ void xbox_OverlaySetSaveIO(const xbox_save_io *io)
 static int sio_mark(const char *dir)
 {
     return recomp_save_export_check(dir, s_sio_id, NULL, 0);
+}
+
+static int sio_mark_xbox(const char *dir)
+{
+    return xbox_SaveImportCheck(dir, s_sio_id);
 }
 
 static bool sio_staged(char *folder, unsigned n)
@@ -579,6 +639,42 @@ static void sio_stage(const char *folder)
         snprintf(s_sio_info, sizeof s_sio_info, "Not imported (reason in the note below).");
         fprintf(stderr, LOGP "save import refused: %s\n", err);
     }
+}
+
+/* An original Xbox save (folder) is made into an export-shaped folder, with
+ * its profile signed again, and staged like any other import. */
+static void sio_stage_xbox(const char *folder)
+{
+    char out[1024] = "", info[400] = "", err[1400] = "";
+    if (!xbox_SaveImportPrepare(folder, s_sio_id, s_sio_dir, s_sio_dir, out, sizeof out, info, sizeof info,
+                                err, sizeof err)) {
+        snprintf(s_sio_msg, sizeof s_sio_msg, "%s", err);
+        snprintf(s_sio_info, sizeof s_sio_info, "Not imported (reason in the note below).");
+        fprintf(stderr, LOGP "xbox save import refused: %s\n", err);
+        return;
+    }
+    sio_stage(out);
+    if (recomp_save_import_staged(s_sio_dir, out, sizeof out)) {
+        char more[2600];
+        snprintf(more, sizeof more, "%s  %s", info, s_sio_msg);
+        snprintf(s_sio_msg, sizeof s_sio_msg, "%s", more);
+        snprintf(s_sio_info, sizeof s_sio_info, "Xbox save ready. Restart the game to import it.");
+        snprintf(s_restart_save, sizeof s_restart_save, "An Xbox save import is waiting for the next start.");
+        fprintf(stderr, LOGP "xbox save import staged: %s\n", info);
+    }
+}
+
+static void xbox_browser_open()
+{
+    xsb_options o;
+    memset(&o, 0, sizeof o);
+    o.use_label = "Import the Xbox save in this folder";
+    o.top_label = "Home folder";
+    o.mark = sio_mark_xbox;
+    s_fb_purpose = FB_XBOX;
+    xsb_open_with(&o);
+    s_fb_sel = 0;
+    s_fb_scroll = true;
 }
 
 static void sio_action(int action)
@@ -624,6 +720,9 @@ static void sio_action(int action)
         s_fb_scroll = true;
         break;
     }
+    case A_SAVE_XBOX:
+        music_access_start(1);          /* Android asks for its file access first */
+        break;
     case A_SAVE_RESTORE: {
         /* The save history (recomp_save_dir.h): each an export, put back the
          * same way, newest first. */
@@ -670,8 +769,8 @@ static void browser_count(const xsb_row &r, char *out, size_t n)
     out[0] = 0;
     if (r.kind == XSB_OFF || r.kind == XSB_UP)
         return;
-    if (s_fb_purpose == FB_SAVE) {
-        snprintf(out, n, "%s", r.songs < 0 ? "..." : r.songs ? "a save of this game" : "");
+    if (s_fb_purpose == FB_SAVE || s_fb_purpose == FB_XBOX) {
+        snprintf(out, n, "%s", r.songs < 0 ? "..." : r.songs ? (s_fb_purpose == FB_XBOX ? "an Xbox save" : "a save of this game") : "");
         return;
     }
     if (r.songs < 0)
@@ -689,6 +788,7 @@ static void browser_pick(int i)
 {
     char dir[1024] = "";
     int sel = 0;
+    menusnd_play(XBOX_OVERLAY_SND_SELECT);
     xsb_result res = xsb_activate(i, dir, sizeof dir, &sel);
     if (res == XSB_MOVED) {
         s_fb_sel = sel;
@@ -696,6 +796,9 @@ static void browser_pick(int i)
     } else if (res == XSB_CHOSEN && s_fb_purpose == FB_SAVE) {
         /* A folder for the import: checked, and either way back to the page. */
         sio_stage(dir);
+        xsb_close();
+    } else if (res == XSB_CHOSEN && s_fb_purpose == FB_XBOX) {
+        sio_stage_xbox(dir);
         xsb_close();
     } else if (res == XSB_CHOSEN || res == XSB_TURNED_OFF) {
         if (res == XSB_TURNED_OFF)
@@ -898,11 +1001,21 @@ static int page_rows(int page, Row *r)
 #define SPK(a, t) r[n++] = Row{ R_SPEAKERS, XS_COUNT, (a), (t) }
     switch (page) {
     case P_DISPLAY:
-        SET(XS_DISPLAY_FULLSCREEN); SET(XS_DISPLAY_ASPECT); SET(XS_DISPLAY_FILTER);
+#if !defined(__ANDROID__)
+        /* Android: the game is the whole screen always (immersive); out of
+         * fullscreen SDL brings the system bars back over a smaller window,
+         * and the touch controls with it. */
+        SET(XS_DISPLAY_FULLSCREEN);
+#endif
+        SET(XS_DISPLAY_ASPECT); SET(XS_DISPLAY_FILTER);
         SET(XS_DISPLAY_OVERSCAN); SET(XS_DISPLAY_FIT);
 #if defined(__APPLE__)
         if (!s_vulkan)                 /* the Metal presenter's (BO-115) */
             SET(XS_DISPLAY_PRESENT_TIMING);
+#endif
+#if (defined(__linux__) && !defined(__ANDROID__)) || defined(_WIN32)
+        if (s_vulkan)                  /* the Vulkan presenter's queue (BO-110, BO-207) */
+            SET(XS_DISPLAY_FRAME_PACING);
 #endif
         if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_SPEED_UNITS)->key))
             SET(XS_GAME_SPEED_UNITS);
@@ -922,6 +1035,17 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_UI_SCALE);
         /* Dither (graphics.dither) has no row: settings.toml or
          * RECOMP_GFX_DITHER only (docs/runtime/overlay.md). */
+        /* BO-110: HDR, where the display can show more than SDR white. */
+        if (nv2a_host_hdr_potential() > 1.0f) {
+            SET(XS_GRAPHICS_HDR);
+            if (xbox_SettingValue(XS_GRAPHICS_HDR) != 0.0) {
+                SET(XS_GRAPHICS_HDR_PEAK); SET(XS_GRAPHICS_HDR_PAPER); SET(XS_GRAPHICS_HDR_HUD);
+#if !defined(__APPLE__)
+                SET(XS_GRAPHICS_HDR_SHADOWS); SET(XS_GRAPHICS_HDR_HIGHLIGHTS);
+#endif
+                ACT(A_HDR_RESET, "Reset HDR to the display's defaults");
+            }
+        }
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_BLOOM)->key))
             SET(XS_GRAPHICS_BLOOM);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_MOTION_BLUR)->key))
@@ -930,6 +1054,8 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_CRASH_60FPS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SPLIT_60FPS)->key))
             SET(XS_GRAPHICS_SPLIT_60FPS);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_RACE_CLOCK)->key))
+            SET(XS_GAME_RACE_CLOCK);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))
             SET(XS_GRAPHICS_VEHICLE_DETAIL);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SCENERY_DETAIL)->key))
@@ -980,6 +1106,8 @@ static int page_rows(int page, Row *r)
         if (s_mf)
             SET(XS_AUDIO_CUSTOM_LEVEL);
         SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
+        if (menusnd_named())
+            SET(XS_AUDIO_MENU_SOUNDS);
         /* The dry effect sends' level: only where no model of the title's
          * effects image runs (apu_gp.h); with one they are not dry. */
         if (!apu_gp_wired())
@@ -1004,6 +1132,10 @@ static int page_rows(int page, Row *r)
         SET(XS_INPUT_GLYPHS);
 #if defined(__ANDROID__)
         SET(XS_INPUT_VIBRATION);
+        SET(XS_INPUT_TOUCH);
+        if ((int)xbox_SettingValue(XS_INPUT_TOUCH) != XBOX_TOUCH_OFF) {
+            SET(XS_INPUT_TOUCH_OPACITY); SET(XS_INPUT_TOUCH_SCALE); SET(XS_INPUT_TOUCH_AUTO_GAS);
+        }
 #endif
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
@@ -1085,6 +1217,16 @@ static int page_rows(int page, Row *r)
                 INFO(s_glass_info[2]);
         }
 #endif
+        /* The console key (kernel_console_keys.h): read at the start. */
+        {
+            static char ck[200];
+            bool set = xbox_SettingsText("console.hdd_key", NULL)[0] || xbox_SettingsText("console.eeprom", NULL)[0];
+            snprintf(ck, sizeof ck, set ? "Console key: set; read at the next start. Saves signed by an original Xbox load,"
+                                          " the port's own earlier saves show as Unusable while it is."
+                                        : "Console key: not set. For saves from an original Xbox or xemu, set console.eeprom"
+                                          " (path of your eeprom.bin) or console.hdd_key in settings.toml.");
+            INFO(ck);
+        }
         SET(XS_INTERFACE_MENU_ENTRY);
         /* The print gate (BO-125), next to the report it feeds. */
         SET(XS_ADVANCED_DIAG_LOG);
@@ -1110,6 +1252,7 @@ static int page_rows(int page, Row *r)
                     snprintf(imp, sizeof imp, "Import save from home folder (none found there)");
                 ACT(A_SAVE_IMPORT, imp);
                 ACT(A_SAVE_BROWSE, "Import save from another folder...");
+                ACT(A_SAVE_XBOX, "Import Xbox save...");
                 /* Counted now and then, not at every frame. */
                 static int kept = -1;
                 static uint32_t kept_at;
@@ -1321,6 +1464,17 @@ static void value_text(xs_id id, char *out, size_t n)
         case FMT_PERCENT:        snprintf(out, n, "%d%%", (int)floor(v * 100.0 + 0.5)); break;
         case FMT_PERCENT_OF_MAX: snprintf(out, n, "%d%%", (int)floor(v / s->max * 100.0 + 0.5)); break;
         case FMT_TIMES:          snprintf(out, n, "%dx", (int)v); break;
+        case FMT_NITS:
+            if (v <= 0.0 && id == XS_GRAPHICS_HDR_PEAK) {
+                float pk, pw, hw;
+                nv2a_host_hdr_levels(&pk, &pw, &hw);
+                snprintf(out, n, "Display (%d nits)", (int)(pk + 0.5f));
+            } else if (v <= 0.0) {
+                snprintf(out, n, "Same as paper white");
+            } else {
+                snprintf(out, n, "%d nits", (int)(v + 0.5));
+            }
+            break;
         case FMT_GAIN:
             if (v <= 0.0)
                 snprintf(out, n, "Off");
@@ -1371,12 +1525,33 @@ static void adjust(xs_id id, int dir)
         break;
     }
     default:
+        if (id == XS_GRAPHICS_HDR_PEAK || id == XS_GRAPHICS_HDR_HUD) {
+            /* 0 is "the display's" / "same as paper white": the first step
+             * up starts from the value in use, a step below the minimum goes
+             * back to 0. */
+            float pk, pw, hw;
+            nv2a_host_hdr_levels(&pk, &pw, &hw);
+            double lo = id == XS_GRAPHICS_HDR_PEAK ? 200.0 : 80.0;
+            if (v <= 0.0)
+                v = dir > 0 ? (id == XS_GRAPHICS_HDR_PEAK ? floor(pk / 50.0 + 0.5) * 50.0 : pw) : 0.0;
+            else {
+                v += dir * m.step;
+                if (v < lo)
+                    v = 0.0;
+            }
+            if (v > s->max)
+                v = s->max;
+            break;
+        }
         v += dir * m.step;
         break;
     }
     if (v != s->value) {
+        const double was = s->value;
         xbox_SettingSet(id, v);
         changed();
+        if (xbox_SettingValue(id) != was)    /* not at the end of its range */
+            menusnd_play(XBOX_OVERLAY_SND_CHANGE);
     }
 }
 
@@ -1429,7 +1604,9 @@ static const char *confirm_text(int action)
     static char ring[4][160];
     static unsigned n;
     char *b = ring[n++ & 3];
-    const char *what = action >= A_CHEAT0 && action <= A_CHEAT3 ? "switch it on" : action == A_QUIT ? "quit" : "restart";
+    const char *what = action >= A_CHEAT0 && action <= A_CHEAT3 ? "switch it on"
+                     : action == A_QUIT ? "quit"
+                     : action == A_RESET_PAGE || action == A_RESET_ALL ? "reset" : "restart";
 
     snprintf(b, sizeof ring[0], "Press %s again to %s, %s to cancel", act_name(0), what, act_name(1));
     return b;
@@ -1437,7 +1614,17 @@ static const char *confirm_text(int action)
 
 static void quit_now();
 
+static void activate_row(const Row &r);
+/* The title's confirm sound, after what the row did (it replaces a value
+ * change's); the speaker test is heard alone, a locked setting is silent. */
 static void activate(const Row &r)
+{
+    activate_row(r);
+    if (r.kind != R_SPEAKERS && !(r.kind == R_SETTING && xbox_SettingGet(r.id)->locked))
+        menusnd_play(XBOX_OVERLAY_SND_SELECT);
+}
+
+static void activate_row(const Row &r)
 {
     if (s_confirm && !(r.kind == R_ACTION && r.action == s_confirm))
         s_confirm = 0;
@@ -1462,6 +1649,15 @@ static void activate(const Row &r)
         }
         s_confirm = 0;
         cheat_action(r.action);
+        return;
+    }
+    if (r.kind == R_ACTION && r.action == A_HDR_RESET) {
+        xbox_SettingReset(XS_GRAPHICS_HDR_PEAK);
+        xbox_SettingReset(XS_GRAPHICS_HDR_PAPER);
+        xbox_SettingReset(XS_GRAPHICS_HDR_HUD);
+        xbox_SettingReset(XS_GRAPHICS_HDR_SHADOWS);
+        xbox_SettingReset(XS_GRAPHICS_HDR_HIGHLIGHTS);
+        changed();
         return;
     }
     if (r.kind == R_ACTION && r.action == A_MIXER) {
@@ -1533,6 +1729,15 @@ static void activate(const Row &r)
         return;
     }
     if (r.kind == R_ACTION) {
+        /* Resetting asks once more: the cursor keeps its index when the rows
+         * change under it (an import staged from the Advanced page shortens
+         * the save rows), so one Enter can land here unseen, and a reset
+         * rewrites settings.toml to the defaults. */
+        if (s_confirm != r.action) {
+            s_confirm = r.action;
+            return;
+        }
+        s_confirm = 0;
         if (r.action == A_RESET_ALL) {
             xbox_SettingsResetAll();
         } else {
@@ -1567,10 +1772,11 @@ static void clear_nav()
 /* The title is paused while the overlay is open, except on the Mixer page:
  * a mix is set by ear, so there the game keeps running and sounding (its
  * input still held: the car coasts). Called wherever either changes. */
+static uint32_t s_pause_at;            /* the pause waits until then (set_open) */
 static void pause_sync()
 {
     static int applied = -1;
-    int want = s_open && !s_mx_open;
+    int want = s_open && !s_mx_open && (int32_t)(now_ms() - s_pause_at) >= 0;
     if (want != applied) {
         applied = want;
         xbox_HostPause(want);
@@ -1579,12 +1785,24 @@ static void pause_sync()
     }
 }
 
-static void set_open(bool on)
+/* from_title: asked for by the title's own menu row (xbox_OverlayRequestOpen).
+ * The title has just played its confirm sound for that press: the overlay
+ * plays no sound of its own over it, and the pause waits until that sound
+ * is out (a paused title's voices stop where they are and would finish
+ * when the overlay closes). Its input is held at once all the same. */
+static void set_open(bool on, bool from_title = false)
 {
     if (on == s_open)
         return;
     s_open = on;
     clear_nav();
+    s_pause_at = on && from_title ? now_ms() + 700 : 0;
+    if (on) {
+        s_rows_t0 = now_ms();
+        s_rows_step_ms = ROWS_STEP_OPEN_MS;
+    }
+    if (!from_title)
+        menusnd_play(on ? XBOX_OVERLAY_SND_OPEN : XBOX_OVERLAY_SND_CLOSE);
     if (on) {
         s_scroll_to_sel = true;
         xbox_InputSetBlocked(1);
@@ -1989,6 +2207,9 @@ void xbox_OverlayPoll(void)
     test_poll();
 
     if (s_open_request.exchange(0) && !s_open)
+        set_open(true, true);
+    /* The on-screen controls' menu button. */
+    if (xbox_InputTouchTakeMenu() && !s_open)
         set_open(true);
 
     while (s_toggle_i < s_toggle_n && (int32_t)(now_ms() - s_t0_ms - s_toggle_ms[s_toggle_i]) >= 0) {
@@ -2015,9 +2236,12 @@ void xbox_OverlayPoll(void)
         s_back = 0;
         if (s_open && s_confirm) {
             s_confirm = 0;                /* B takes back a Restart / Quit question */
+            menusnd_play(XBOX_OVERLAY_SND_BACK);
         } else if (s_open && s_mx_open) {
             mx_back();
+            menusnd_play(XBOX_OVERLAY_SND_BACK);
         } else if (s_open && xsb_is_open()) {
+            menusnd_play(XBOX_OVERLAY_SND_BACK);
             /* In the folder browser: one level up, then back to the page. */
             int sel = 0;
             if (xsb_back(&sel) == XSB_CLOSED)
@@ -2031,7 +2255,9 @@ void xbox_OverlayPoll(void)
     }
     pause_sync();
 
-    /* The fullscreen setting, when it changes. */
+    /* The fullscreen setting, when it changes (not on Android: always the
+     * whole screen there, whatever an older settings file says). */
+#if !defined(__ANDROID__)
     if (s_win) {
         int fs = xbox_SettingValue(XS_DISPLAY_FULLSCREEN) != 0.0;
         if (s_fs_applied < 0)
@@ -2041,6 +2267,7 @@ void xbox_OverlayPoll(void)
             SDL_SetWindowFullscreen(s_win, fs ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
         }
     }
+#endif
     if (s_save_pending && (int32_t)(now_ms() - s_save_at) >= 0) {
         s_save_pending = false;
         xbox_SettingsFlush();
@@ -2099,11 +2326,13 @@ int xbox_OverlayOpen(void)
  * compiled shaders the system no longer has: up to 3 s, once, before the
  * title's first pictures): the window says what it is doing instead of
  * standing black. */
+static bool s_notice_hdr;      /* BO-110: the HDR variants after a switch to HDR */
 static bool notice_on()
 {
     nv2a_pcache_stat st;
     nv2a_pcache_stat_get(&st);
-    return st.waiting != 0;
+    s_notice_hdr = st.warming && st.hdr_round;
+    return st.waiting != 0 || s_notice_hdr;
 }
 
 /* A pad script is driving a pad (RECOMP_PAD_LIVE / RECOMP_PAD_SCRIPT: a test
@@ -2146,10 +2375,17 @@ int xbox_OverlayNotice(void)
     return s_enabled && notice_on();
 }
 
+/* The on-screen controls show (touch_pad.h): drawn with the title's frames
+ * while the overlay is closed. */
+static bool touch_on()
+{
+    return xbox_InputTouchVisible() != 0;
+}
+
 int xbox_OverlayWants(void)
 {
     return s_enabled && (s_open || s_alpha > 0.0f || xbox_SettingValue(XS_ADVANCED_PERF) != 0.0
-                         || notice_on() || scripted_on() || sg_banner_on());
+                         || notice_on() || scripted_on() || sg_banner_on() || touch_on());
 }
 
 void xbox_OverlayFramePresented(void)
@@ -2515,8 +2751,9 @@ static void glass_info()
 static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs, float max_w = 0.0f, float max_h = 0.0f)
 {
     uint64_t t[256];
-    float iv[255];
-    int n = xbox_HostFlipTimes(t, 256), m = 0, i;
+    uint8_t asked[256];
+    float iv[255], due[255];
+    int n = xbox_HostFlipTimesIv(t, asked, 256), m = 0, i;
     uint64_t newest = 0;
     float fps = 0, last = 0, p50 = 0, p99 = 0, mx = 0;
     static uint32_t pres_prev, pres_ms;
@@ -2524,8 +2761,10 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs, float max_w = 0.0
     uint32_t now = now_ms();
 
     for (i = 1; i < n; i++)
-        if (t[i] && t[i - 1])
+        if (t[i] && t[i - 1]) {
+            due[m] = 16.667f * (float)(asked[i] ? asked[i] : 1);
             iv[m++] = (float)((double)(t[i] - t[i - 1]) / 1e6);
+        }
     for (i = 0; i < n; i++)
         if (t[i] > newest)
             newest = t[i];
@@ -2625,16 +2864,20 @@ static void draw_perf(ImDrawList *dl, ImVec2 origin, float fs, float max_w = 0.0
                     solid(g.warn_uneven || g.warn_rate ? T->perf_bad : T->perf_text2), l4);
 
     /* Bars: the last 120 flip intervals against a 50 ms ceiling; the thin
-     * line across is one frame at 60 Hz. */
+     * line across is one frame at 60 Hz. The colour is how late a flip was
+     * against the interval the title asked for, not the interval itself: a
+     * 33 ms frame where the title runs at 30 fps on purpose (its crash
+     * camera) is on time, green; up to 0.8 ms over is still green, up to
+     * half a 60 Hz frame yellow, more red. */
     const float gx = a.x + pad, gy1 = b.y - pad, gh = h - lh * lines - fs * 0.7f - pad, gw = w - 2 * pad;
     const int bars = 120;
     const float bw = gw / bars;
     for (i = 0; i < bars && i < m; i++) {
-        float v = iv[m - 1 - i];
+        float v = iv[m - 1 - i], late = v - due[m - 1 - i];
         float f = v / 50.0f;
         if (f > 1.0f) f = 1.0f;
-        ImU32 c = v <= 17.5f ? solid(T->perf_good)
-                : v <= 25.0f ? solid(T->perf_warn) : solid(T->perf_bad);
+        ImU32 c = late <= 0.833f ? solid(T->perf_good)
+                : late <= 8.333f ? solid(T->perf_warn) : solid(T->perf_bad);
         float x1 = gx + gw - i * bw;
         dl->AddRectFilled(ImVec2(x1 - bw + 0.5f, gy1 - gh * f), ImVec2(x1, gy1), c);
     }
@@ -2950,10 +3193,25 @@ static void value_box(ImDrawList *dl, float x0, float y0, float x1, float y1, bo
 
 /* The title's tick bar in [x0, x1], `h` high at most, `on` of its ticks lit.
  * A tick is 4 x 8 texels at a pitch of 6; without the sprites, blocks. */
-static void tick_bar(ImDrawList *dl, float x0, float x1, float cy, float h, double t, bool dim)
+static void tick_bar(ImDrawList *dl, float x0, float x1, float cy, float h, double t, bool dim, bool sel)
 {
     if (t < 0) t = 0;
     if (t > 1) t = 1;
+    if (art_on() && gameart_sprite(AS_VOL_FULL) && gameart_sprite(AS_VOL_EMPTY)) {
+        /* The title's own volume bar: its full cells (white on the selected
+         * row, the text's pale blue on the others, as the pause menu's AUDIO
+         * page draws them) up to the value, its empty blue outlines after. */
+        const float k = h / 12.5f;                     /* pixels a texel: a cell 16 texels high */
+        int n = (int)floorf((x1 - x0) / (6.0f * k));
+        if (n < 4) n = 4;
+        const int on = (int)floor(t * n + 0.5);
+        const float pitch = (x1 - x0) / n;
+        const ImU32 full = sel ? col({255, 255, 255}, dim ? 0.55f : 1.0f) : col(T->text, dim ? 0.5f : 1.0f);
+        const ImU32 empty = col({255, 255, 255}, dim ? 0.45f : 0.9f);
+        for (int i = 0; i < n; i++)
+            spr_at(dl, i < on ? AS_VOL_FULL : AS_VOL_EMPTY, x0 + pitch * (i + 0.5f), cy, k, i < on ? full : empty);
+        return;
+    }
     if (!art_on()) {
         const float bh = h * 0.8f, by = cy - bh * 0.5f, seg = (x1 - x0) / 20.0f;
         const int on = (int)floor(t * 20 + 0.5);
@@ -2970,6 +3228,30 @@ static void tick_bar(ImDrawList *dl, float x0, float x1, float cy, float h, doub
     for (int i = 0; i < n; i++)
         spr_at(dl, AS_TICK, x0 + pitch * (i + 0.5f), cy, k,
                i < on ? col({255, 255, 255}, dim ? 0.55f : 1.0f) : col({0x30, 0x40, 0x50}, 0.9f));
+}
+
+/* A switch's state at the left of its value box, `h` high: the title's tick
+ * in its blue disc for on, a ring for off. False without those pictures. */
+static bool switch_icon(ImDrawList *dl, float x, float cy, float h, bool on, bool dim)
+{
+    if (!art_on() || !gameart_sprite(AS_CHECK) || !gameart_sprite(AS_RING))
+        return false;
+    const ArtRect *r = gameart_sprite(on ? AS_CHECK : AS_RING);
+    const float k = h / r->h;
+    if (on)
+        spr_at(dl, AS_CHECK, x + h * 0.5f, cy, k, col({255, 255, 255}, dim ? 0.5f : 1.0f));
+    else
+        spr_at(dl, AS_RING, x + h * 0.5f, cy, k * 0.82f, col(T->text_dim, dim ? 0.5f : 0.9f));
+    return true;
+}
+
+/* A setting fixed elsewhere (the environment): the title's padlock, `h`
+ * high, centred on (cx, cy), where the left arrow would be. */
+static void padlock_spr(ImDrawList *dl, float cx, float cy, float h)
+{
+    if (!art_on() || !gameart_sprite(AS_PADLOCK))
+        return;
+    spr_at(dl, AS_PADLOCK, cx, cy, h / gameart_sprite(AS_PADLOCK)->h, col({255, 255, 255}));
 }
 
 /* The d-pad: four triangles from the title's two, `gh` high. */
@@ -3141,6 +3423,51 @@ static float restart_tag(ImDrawList *dl, float x, float cy, float label, bool ch
     return tw(sz, "RESTART");
 }
 
+/* ── touch gestures in the lists ─────────────────────────────────── */
+
+/* A press in a list is a tap until it moves 2.5 mm: then it scrolls the
+ * list (up or down) or drags a slider (sideways), and clicks nothing. The
+ * mouse is the same, so a mouse drags a list too. SDL makes mouse events of
+ * the fingers, which is what ImGui reads. */
+enum { G_NONE, G_PRESS, G_SCROLL, G_SIDEWAYS };
+static int s_gest;
+static ImVec2 s_gest_at;
+static float display_dpi();
+
+static void gesture_frame()
+{
+    ImGuiIO &io = ImGui::GetIO();
+    const float dpi = display_dpi();
+    const float th = dpi > 0.0f ? 2.5f * dpi / 25.4f : 0.012f * io.DisplaySize.y;
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        s_gest = G_PRESS;
+        s_gest_at = io.MousePos;
+    } else if (s_gest == G_PRESS && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const float dx = io.MousePos.x - s_gest_at.x, dy = io.MousePos.y - s_gest_at.y;
+        if (fabsf(dy) > th && fabsf(dy) >= fabsf(dx))
+            s_gest = G_SCROLL;
+        else if (fabsf(dx) > th)
+            s_gest = G_SIDEWAYS;
+    } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        s_gest = G_NONE;
+    }
+}
+
+/* The press so far is a tap (on its release: act). */
+static bool gesture_tap() { return s_gest == G_PRESS; }
+
+/* In a scrolling child, right after BeginChild: a vertical drag that began
+ * in it scrolls it with the finger. */
+static void gesture_scroll()
+{
+    if (s_gest != G_SCROLL || !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        return;
+    const ImVec2 p = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
+    if (s_gest_at.x < p.x || s_gest_at.x > p.x + sz.x || s_gest_at.y < p.y || s_gest_at.y > p.y + sz.y)
+        return;
+    ImGui::SetScrollY(ImGui::GetScrollY() - ImGui::GetIO().MouseDelta.y);
+}
+
 /* One row. `fs` is the label's size, `rh` the pitch; the columns are the
  * layout's. */
 static void draw_row(const Row &r, int idx, bool sel, float width, float rh, float fs, ImDrawList *dl,
@@ -3150,11 +3477,14 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     if (r.kind == R_INFO)
         rh *= 0.7f;
     ImGui::PushID(idx);
-    ImGui::InvisibleButton("##row", ImVec2(width, rh));
+    /* A row acts on release, and only for a tap: a finger that went on to
+     * scroll the list (or to drag a slider) clicks nothing. */
+    *clicked = ImGui::InvisibleButton("##row", ImVec2(width, rh)) && gesture_tap();
     *hovered = ImGui::IsItemHovered();
-    *clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     ImVec2 mp = ImGui::GetIO().MousePos;
-    *click_dir = mp.x > (LY.x_val0 + LY.x_val1) * 0.5f ? 1 : -1;
+    /* The value box's left half steps back, the rest (its right half, the
+     * label) forward: a tap anywhere on a choice's row moves it on. */
+    *click_dir = mp.x > LY.x_val0 && mp.x < (LY.x_val0 + LY.x_val1) * 0.5f ? -1 : 1;
     ImGui::PopID();
 
     const float cy = p.y + rh * 0.5f;
@@ -3172,6 +3502,39 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         txt_fit(dl, LY.hint, ImVec2(lx, top_for(cy, LY.hint)), r.action ? col(T->attn) : col(T->hint), r.text,
                 LY.x_val1 - lx);
         return;
+    }
+    if (sel && r.kind == R_SETTING && r.id == XS_GRAPHICS_HDR_PEAK) {
+        /* BO-110: the calibration patch, right of the value: a symbol at the
+         * peak set here on a background as bright as the display goes. */
+        float pk, pw, hw;
+        nv2a_host_hdr_levels(&pk, &pw, &hw);
+        void *tex = nv2a_host_hdr_patch(pk);
+        const float ph = rh * 2.2f, pwid = ph * 2.0f;
+        float px = arr + ah * 1.5f;
+        if (px + pwid > p.x + width)
+            px = arl - ah * 1.5f - pwid;   /* no room right of the value: left of its arrow */
+        if (tex && px + pwid <= p.x + width)
+            dl->AddImage((ImTextureID)tex, ImVec2(px, cy - ph * 0.5f), ImVec2(px + pwid, cy + ph * 0.5f));
+        else if (!tex && px + pwid <= p.x + width) {
+            /* Vulkan: drawn by the presenter over the overlay (past its white). */
+            const ImVec2 sc = ImGui::GetIO().DisplayFramebufferScale;
+            nv2a_host_hdr_pattern(0, px * sc.x, (cy - ph * 0.5f) * sc.y, (px + pwid) * sc.x,
+                                  (cy + ph * 0.5f) * sc.y, pk, 10000.0f);
+        }
+    }
+    if (sel && r.kind == R_SETTING && r.id == XS_GRAPHICS_HDR_PAPER) {
+        /* BO-110: paper white (left) beside the HUD's white (right), for
+         * setting the two together (drawn by a presenter that can). */
+        float pk, pw, hw;
+        nv2a_host_hdr_levels(&pk, &pw, &hw);
+        const float ph = rh * 2.2f, pwid = ph * 2.0f;
+        float px = arr + ah * 1.5f;
+        if (px + pwid > p.x + width)
+            px = arl - ah * 1.5f - pwid;
+        const ImVec2 sc = ImGui::GetIO().DisplayFramebufferScale;
+        if (px + pwid <= p.x + width)
+            nv2a_host_hdr_pattern(1, px * sc.x, (cy - ph * 0.5f) * sc.y, (px + pwid) * sc.x,
+                                  (cy + ph * 0.5f) * sc.y, pw, hw);
     }
     if (sel) {
         if (art_on())
@@ -3200,6 +3563,7 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
                 txt_fit(dl, fs, ImVec2(vr, ty), col(T->attn), confirm_text(r.action), vr - LY.x_val0, true);
             else {
                 value_box(dl, LY.x_val0, by0, vr, by1, sel);
+                switch_icon(dl, LY.x_val0 + bpad * 0.6f, cy, bh * 0.78f, on, false);
                 txt_fit(dl, fs, ImVec2(bmid, ty), on ? col(T->attn) : sel ? col(T->text_hi) : col(T->text), v,
                         vr - LY.x_val0 - 2.0f * bpad, false, true);
             }
@@ -3232,6 +3596,8 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
                 vr - LY.x_val0 - 2.0f * bpad, false, true);
         if (sel && !locked)
             arrow_spr(dl, arr, cy, ah, 1, col({255, 255, 255}), T->arrow);
+        if (locked)
+            padlock_spr(dl, LY.x_val0 - ah * 0.9f, cy, bh * 0.9f);
         return;
     }
     if (r.kind == R_SPEAKERS) {
@@ -3288,20 +3654,28 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
         const float bw = bx1 - bx0;
         double t = (s->value - s->min) / (s->max - s->min);
         t = t < 0 ? 0 : t > 1 ? 1 : t;
-        tick_bar(dl, bx0, bx1, cy, bh * 0.55f, t, dim);
+        tick_bar(dl, bx0, bx1, cy, bh * 0.55f, t, dim, sel);
         txt(dl, fs, ImVec2(vr - bpad - tw(fs, v), ty), vc, v);
-        if (drag_t && ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::IsItemActive()) {
-            double f = (ImGui::GetIO().MousePos.x - bx0) / bw;
+        /* A sideways drag along the row moves it; a tap on the bar sets it. */
+        const float mx = ImGui::GetIO().MousePos.x;
+        if (drag_t && ((ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::IsItemActive() && s_gest == G_SIDEWAYS)
+                       || (*clicked && mx >= bx0 - fs * 0.5f && mx <= bx1 + fs * 0.5f))) {
+            double f = (mx - bx0) / bw;
             *drag_t = f < 0 ? 0 : f > 1 ? 1 : f;
         }
     } else {
-        /* A choice or a switch: its value, centred in the box (On / Off for a switch). */
+        /* A choice or a switch: its value, centred in the box (On / Off for a
+         * switch, with the title's tick or a ring at the box's left). */
+        if (s->type == XS_BOOL)
+            switch_icon(dl, LY.x_val0 + bpad * 0.6f, cy, bh * 0.78f, s->value != 0.0, dim);
         txt_fit(dl, fs, ImVec2(bmid, ty), vc, v, vr - LY.x_val0 - 2.0f * bpad, false, true);
     }
     if (sel && !dim) {
         arrow_spr(dl, arl, cy, ah, -1, col({255, 255, 255}), T->arrow);
         arrow_spr(dl, arr, cy, ah, 1, col({255, 255, 255}), T->arrow);
     }
+    if (dim)
+        padlock_spr(dl, arl, cy, bh * 0.9f);
 }
 
 /* The footer bar: a band under the page with the keys, in the hint blue
@@ -3462,6 +3836,33 @@ static void draw_arc(ImDrawList *dl)
  * font (red, a white outline, a dark shadow, leant), the page's name in
  * white italics on the right between its arrows, a rule at 19% of the
  * height, the pages as a row of names under it. */
+static void rows_in_page()
+{
+    s_rows_t0 = now_ms();
+    s_rows_step_ms = ROWS_STEP_PAGE_MS;
+}
+
+/* A row's vertices from v0 on, where it is in its coming in: moved left and
+ * faded. `slot` is its place among the rows in view (0 the top one). */
+static void rows_in_apply(ImDrawList *dl, int v0, int slot)
+{
+    if (!s_rows_t0)
+        return;
+    const int32_t t = (int32_t)(now_ms() - s_rows_t0)
+                    - (int32_t)((slot < ROWS_IN_SLOTS ? slot : ROWS_IN_SLOTS) * s_rows_step_ms);
+    if (t >= (int32_t)ROWS_IN_MS)
+        return;
+    const float f = t <= 0 ? 0.0f : (float)t / ROWS_IN_MS;
+    const float e = 1.0f - (1.0f - f) * (1.0f - f);     /* eases out */
+    const float dx = -0.12f * LY.W * (1.0f - e);
+    for (int i = v0; i < dl->VtxBuffer.Size; i++) {
+        ImDrawVert &v = dl->VtxBuffer[i];
+        v.pos.x += dx;
+        const ImU32 a = (v.col >> IM_COL32_A_SHIFT) & 0xFF;
+        v.col = (v.col & ~IM_COL32_A_MASK) | ((ImU32)(a * f + 0.5f) << IM_COL32_A_SHIFT);
+    }
+}
+
 static void draw_header(ImDrawList *dl)
 {
     dl->AddRectFilled(ImVec2(0, 0), ImVec2(LY.W, LY.y_rule), col(T->head_band, 0.55f));
@@ -3499,6 +3900,8 @@ static void draw_header(ImDrawList *dl)
             ImGui::InvisibleButton("##pg", ImVec2(x1 - x0, sz * 1.2f));
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                 s_page = (s_page + (k ? 1 : -1) + P_COUNT) % P_COUNT;
+                menusnd_play(XBOX_OVERLAY_SND_PAGE);
+                rows_in_page();
                 s_scroll_to_sel = true;
                 s_mx_open = false;
                 s_confirm = 0;
@@ -3521,6 +3924,10 @@ static void draw_header(ImDrawList *dl)
             ImGui::PushID(i);
             ImGui::InvisibleButton("##tab", ImVec2(w + gap, th));
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                if (s_page != i) {
+                    menusnd_play(XBOX_OVERLAY_SND_PAGE);
+                    rows_in_page();
+                }
                 s_page = i;
                 s_scroll_to_sel = true;
                 s_mx_open = false;
@@ -3576,8 +3983,13 @@ static void build_browser(float fs, ImDrawList *dl)
     collect_steps();
     if (s_fb_sel >= n) s_fb_sel = n - 1;
     if (s_fb_sel < 0) s_fb_sel = 0;
-    while (s_steps[D_UP]-- > 0)   { s_fb_sel = (s_fb_sel + n - 1) % (n ? n : 1); s_fb_scroll = true; }
-    while (s_steps[D_DOWN]-- > 0) { s_fb_sel = (s_fb_sel + 1) % (n ? n : 1); s_fb_scroll = true; }
+    {
+        const int was = s_fb_sel;
+        while (s_steps[D_UP]-- > 0)   { s_fb_sel = (s_fb_sel + n - 1) % (n ? n : 1); s_fb_scroll = true; }
+        while (s_steps[D_DOWN]-- > 0) { s_fb_sel = (s_fb_sel + 1) % (n ? n : 1); s_fb_scroll = true; }
+        if (s_fb_sel != was)
+            menusnd_play(XBOX_OVERLAY_SND_MOVE);
+    }
     memset(s_steps, 0, sizeof s_steps);
     s_reset = 0;
     s_page_delta = 0;
@@ -3600,6 +4012,7 @@ static void build_browser(float fs, ImDrawList *dl)
     {
         ImVec2 p = ImGui::GetCursorScreenPos();
         const char *t = where[0] ? where
+                      : s_fb_purpose == FB_XBOX ? "Import Xbox save: pick the save's folder"
                       : s_fb_purpose == FB_SAVE ? "Import save: pick an exported save's folder"
                       : "Custom music folder: choose where to look";
         char cut[1100];
@@ -3615,7 +4028,9 @@ static void build_browser(float fs, ImDrawList *dl)
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + fs * 1.6f));
     }
 
-    const char *note = s_fb_purpose == FB_SAVE
+    const char *note = s_fb_purpose == FB_XBOX
+        ? "Pick the save folder from your Xbox (UDATA/4541005b/<save>) or a folder that holds it. It is signed again for this port and imported at the next start. For a .zip, use --import-save."
+        : s_fb_purpose == FB_SAVE
         ? "An exported save is a dated folder with UDATA inside. It is imported at the next start."
         : "Every folder with music in it becomes a soundtrack in the game's own music menu.";
     const float note_h = ImGui::GetFont()->CalcTextSizeA(LY.hint, FLT_MAX, wrap_w, note).y;
@@ -3624,6 +4039,7 @@ static void build_browser(float fs, ImDrawList *dl)
     ImVec2 avail = ImGui::GetContentRegionAvail();
     ImGui::BeginChild("folders", ImVec2(avail.x, avail.y - footer), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoNav);
+    gesture_scroll();
     ImDrawList *cdl = ImGui::GetWindowDrawList();
     const float rw = ImGui::GetContentRegionAvail().x - fs * 0.5f;
     int picked = -1;
@@ -3632,12 +4048,12 @@ static void build_browser(float fs, ImDrawList *dl)
         ImVec2 p = ImGui::GetCursorScreenPos();
         bool sel = i == s_fb_sel;
         ImGui::PushID(i);
-        ImGui::InvisibleButton("##dir", ImVec2(rw, rh));
+        const bool tap = ImGui::InvisibleButton("##dir", ImVec2(rw, rh)) && gesture_tap();
         if (ImGui::IsItemHovered() && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
             s_fb_sel = i;
             s_last_input_pad = false;
         }
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+        if (tap)
             picked = i;
         ImGui::PopID();
         if (!ImGui::IsRectVisible(p, ImVec2(p.x + rw, p.y + rh)) && !(sel && s_fb_scroll))
@@ -3745,6 +4161,8 @@ static bool row_hint(const Row &r, char *hint, size_t n)
             ? "Imports the newest exported save from"
             : r.action == A_SAVE_BROWSE
             ? "Pick an exported save's dated folder, on a drive or card too. The usual place is"
+            : r.action == A_SAVE_XBOX
+            ? "Pick a Burnout 3 save copied from an original Xbox or from xemu (the folder with Profile 1 in it, or one that holds it). Your save goes to"
             : r.action == A_SAVE_RESTORE
             ? "Your save as it was before each game save, newest first: the latest 20, then one a"
               " day for a week and one a week for a month. Kept in"
@@ -3757,8 +4175,10 @@ static bool row_hint(const Row &r, char *hint, size_t n)
               " The running game is not affected.";
         char hist[1024];
         recomp_save_history_dir(s_sio_dir, hist, sizeof hist);
+        if (r.action == A_SAVE_XBOX)
+            snprintf(hist, sizeof hist, "%s/save-before-import", s_sio_dir);
         snprintf(hint, n, "%s%s%s %s. %s", s_sio_msg, s_sio_msg[0] ? "  |  " : "", what,
-                 r.action == A_SAVE_RESTORE ? hist : s_sio_dest, then);
+                 r.action == A_SAVE_RESTORE || r.action == A_SAVE_XBOX ? hist : s_sio_dest, then);
     } else if (r.kind == R_ACTION && r.action == A_RESTART_PIN) {
         char why[400];
         restart_reason(why, sizeof why);
@@ -3834,8 +4254,13 @@ static void build_pages_inner()
     const ImVec2 disp = io.DisplaySize;
 
     layout_compute(disp);
-    /* Dim the game (it stays in sight, paused), and the arc over it. */
-    bg->AddRectFilled(ImVec2(0, 0), disp, col(T->scrim, 0.72f));
+    /* Dim the game (it stays in sight, paused), less than before (BO-190):
+     * the title's own pause menu leaves its frame bright and puts dark
+     * plates where its text is. So a half dim, and a plate behind the rows
+     * (the header has its band, the footer its bar); the arc over it. */
+    bg->AddRectFilled(ImVec2(0, 0), disp, col(T->scrim, 0.5f));
+    bg->AddRectFilled(ImVec2(LY.body_x0, LY.y_rows - 0.008f * LY.H), ImVec2(LY.body_x1, LY.y_foot),
+                      col(T->head_band, 0.72f), 0.012f * LY.H, ImDrawFlags_RoundCornersTop);
     if (art_on()) {
         draw_grid(bg);
         draw_bigcurve(bg);
@@ -3903,8 +4328,13 @@ static void build_pages_inner()
         }
         s_scroll_to_sel = true;
     };
-    while (s_steps[D_UP]-- > 0) move(-1);
-    while (s_steps[D_DOWN]-- > 0) move(1);
+    {
+        const int was = sel;
+        while (s_steps[D_UP]-- > 0) move(-1);
+        while (s_steps[D_DOWN]-- > 0) move(1);
+        if (sel != was)
+            menusnd_play(XBOX_OVERLAY_SND_MOVE);
+    }
     s_steps[D_UP] = s_steps[D_DOWN] = 0;
     if (s_confirm && !(rows[sel].kind == R_ACTION && rows[sel].action == s_confirm))
         s_confirm = 0;                    /* moved off the row that was asked */
@@ -3990,6 +4420,7 @@ static void build_pages_inner()
     ImGui::SetCursorScreenPos(ImVec2(LY.body_x0, LY.y_rows));
     ImGui::BeginChild("rows", ImVec2(LY.body_x1 - LY.body_x0, rows_h), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground);
+    gesture_scroll();
     ImDrawList *cdl = ImGui::GetWindowDrawList();
     const float rw = ImGui::GetContentRegionAvail().x;
     auto rows_run = [&](int from, int to, ImDrawList *rdl) {
@@ -3997,7 +4428,10 @@ static void build_pages_inner()
         bool clicked, hov;
         int cdir;
         double drag = -1;
+        const int v0 = rdl->VtxBuffer.Size;
+        const float ry = ImGui::GetCursorScreenPos().y;
         draw_row(rows[i], i, i == sel, rw, pitch, fs, rdl, &clicked, &cdir, &hov, &drag);
+        rows_in_apply(rdl, v0, ry < LY.y_rows ? 0 : (int)((ry - LY.y_rows) / pitch));
         if (hov && selectable(rows[i]) && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
             sel = i;
             s_last_input_pad = false;
@@ -4011,8 +4445,17 @@ static void build_pages_inner()
                 else
                     v = floor(v / k_meta[rows[i].id].step + 0.5) * k_meta[rows[i].id].step;
                 sel = i;
-                xbox_SettingSet(rows[i].id, v);
-                changed();
+                if (v != s->value) {
+                    /* A finger along a slider: the change sound per step, at
+                     * most as often as a held d-pad repeats it. */
+                    static uint32_t snd_at;
+                    xbox_SettingSet(rows[i].id, v);
+                    changed();
+                    if (now_ms() - snd_at >= 80) {
+                        snd_at = now_ms();
+                        menusnd_play(XBOX_OVERLAY_SND_CHANGE);
+                    }
+                }
             } else if (clicked && s->type != XS_INT && s->type != XS_FLOAT) {
                 sel = i;
                 if (s->type == XS_BOOL)
@@ -4020,7 +4463,8 @@ static void build_pages_inner()
                 else
                     adjust(rows[i].id, cdir);
             } else if (clicked) {
-                sel = i;
+                sel = i;                  /* a tap beside a slider's bar, or a locked row */
+                menusnd_play(XBOX_OVERLAY_SND_MOVE);
             }
         } else if (clicked && (rows[i].kind == R_ACTION || rows[i].kind == R_FOLDER)) {
             sel = i;
@@ -4078,10 +4522,14 @@ static void build_pages_inner()
     ImGui::End();
     ImGui::PopStyleVar(6);
 
+    if (s_rows_t0 && now_ms() - s_rows_t0 > ROWS_IN_SLOTS * s_rows_step_ms + ROWS_IN_MS)
+        s_rows_t0 = 0;
     /* A page change shows from the next frame. */
     if (s_page_delta) {
         s_page = (s_page + (s_page_delta > 0 ? 1 : -1) + P_COUNT) % P_COUNT;
         s_page_delta = 0;
+        menusnd_play(XBOX_OVERLAY_SND_PAGE);
+        rows_in_page();
         s_confirm = 0;
         s_scroll_to_sel = true;
     }
@@ -4091,10 +4539,112 @@ static void build_pages_inner()
  * draw without naming one). */
 static void build_pages(float)
 {
+    gesture_frame();
     layout_compute(ImGui::GetIO().DisplaySize);
     ImGui::PushFont(nullptr, LY.label);
     build_pages_inner();
     ImGui::PopFont();
+}
+
+/* ── the on-screen controls (touch_pad.h) ──────────────────────────── */
+
+static ImU32 touch_col(uint32_t rgb, float a)
+{
+    return IM_COL32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, (int)(a * 255.0f + 0.5f));
+}
+
+/* Under everything else of the overlay's, over the game. White rings on a
+ * dark wash, the accent of the button's colour, brighter while held. */
+static void draw_touch(ImDrawList *dl, ImVec2 disp)
+{
+    xbox_touch_draw c[XBOX_TOUCH_MAX_CONTROLS];
+    const float op = xbox_InputTouchOpacity();
+    ImFont *font = ImGui::GetFont();
+    int n;
+
+    static uint32_t insets_at;
+    if (!insets_at || now_ms() - insets_at > 2000u) {
+        insets_at = now_ms() | 1u;
+        xbox_InputTouchReadInsets();
+    }
+    xbox_InputTouchSetScreen(disp.x, disp.y);
+    xbox_InputTouchSetDpi(display_dpi());
+    n = xbox_InputTouchDrawList(c, XBOX_TOUCH_MAX_CONTROLS);
+    for (int i = 0; i < n; i++) {
+        const xbox_touch_draw &d = c[i];
+        const ImVec2 o(d.x, d.y);
+        const ImU32 ring = touch_col(0xFFFFFF, op * (d.pressed ? 1.0f : 0.75f));
+        const ImU32 wash = touch_col(0x000000, op * 0.45f);
+        const float th = fmaxf(2.0f, d.r * 0.05f);
+        if (d.kind == XBOX_TOUCH_KIND_STICK) {
+            dl->AddCircleFilled(o, d.r, touch_col(0x000000, op * 0.30f), 48);
+            dl->AddCircle(o, d.r, touch_col(0xFFFFFF, op * 0.55f), 48, th);
+            /* Left and right marks: it steers. */
+            const float a = d.r * 0.16f, e = d.r * 0.80f;
+            dl->AddTriangleFilled(ImVec2(d.x - e, d.y), ImVec2(d.x - e + a, d.y - a), ImVec2(d.x - e + a, d.y + a),
+                                  touch_col(0xFFFFFF, op * 0.5f));
+            dl->AddTriangleFilled(ImVec2(d.x + e, d.y), ImVec2(d.x + e - a, d.y + a), ImVec2(d.x + e - a, d.y - a),
+                                  touch_col(0xFFFFFF, op * 0.5f));
+            dl->AddCircleFilled(ImVec2(d.kx, d.ky), d.r * 0.42f,
+                                touch_col(0xFFFFFF, op * (d.pressed ? 0.75f : 0.45f)), 36);
+            continue;
+        }
+        if (d.kind == XBOX_TOUCH_KIND_DPAD) {
+            const float w = d.r * 0.34f, l = d.r;
+            for (int k = 0; k < 4; k++) {
+                const float ux = k == 0 ? -1.0f : k == 1 ? 1.0f : 0.0f;
+                const float uy = k == 2 ? -1.0f : k == 3 ? 1.0f : 0.0f;
+                const bool held = d.pressed && d.kx == ux && d.ky == uy;
+                /* The arm from the centre square's edge out to l, 2w wide. */
+                const float g0 = w * 1.05f;
+                const ImVec2 a(ux ? (ux < 0 ? d.x - l : d.x + g0) : d.x - w, uy ? (uy < 0 ? d.y - l : d.y + g0) : d.y - w);
+                const ImVec2 b(ux ? (ux < 0 ? d.x - g0 : d.x + l) : d.x + w, uy ? (uy < 0 ? d.y - g0 : d.y + l) : d.y + w);
+                dl->AddRectFilled(a, b, held ? touch_col(0xFFFFFF, op * 0.6f) : wash, w * 0.35f);
+                dl->AddRect(a, b, ring, w * 0.35f, 0, th);
+                /* The arrow near the arm's end. */
+                const float tx = d.x + ux * l * 0.68f, ty = d.y + uy * l * 0.68f, t = w * 0.45f;
+                const ImU32 ac = touch_col(held ? 0x000000 : 0xFFFFFF, op * 0.9f);
+                if (ux)
+                    dl->AddTriangleFilled(ImVec2(tx + ux * t, ty), ImVec2(tx - ux * t * 0.6f, ty - t),
+                                          ImVec2(tx - ux * t * 0.6f, ty + t), ac);
+                else
+                    dl->AddTriangleFilled(ImVec2(tx, ty + uy * t), ImVec2(tx + t, ty - uy * t * 0.6f),
+                                          ImVec2(tx - t, ty - uy * t * 0.6f), ac);
+            }
+            continue;
+        }
+        /* A button. */
+        dl->AddCircleFilled(o, d.r, d.pressed ? touch_col(d.rgb ? d.rgb : 0xFFFFFF, op * 0.65f) : wash, 40);
+        dl->AddCircle(o, d.r, d.rgb ? touch_col(d.rgb, op) : ring, 40, th);
+        const ImU32 fg = touch_col(0xFFFFFF, fminf(1.0f, op * 1.3f));
+        if (d.icon == XBOX_TOUCH_ICON_PAUSE) {
+            const float bw = d.r * 0.16f, bh = d.r * 0.45f, gap = d.r * 0.14f;
+            dl->AddRectFilled(ImVec2(d.x - gap - bw, d.y - bh), ImVec2(d.x - gap, d.y + bh), fg);
+            dl->AddRectFilled(ImVec2(d.x + gap, d.y - bh), ImVec2(d.x + gap + bw, d.y + bh), fg);
+        } else if (d.icon == XBOX_TOUCH_ICON_MENU) {
+            const float hw = d.r * 0.45f, lh = d.r * 0.10f;
+            for (int k = -1; k <= 1; k++) {
+                const float y = d.y + k * d.r * 0.30f;
+                dl->AddRectFilled(ImVec2(d.x - hw, y - lh), ImVec2(d.x + hw, y + lh), fg, lh);
+            }
+        } else if (d.label) {
+            /* As large as fits inside the circle. */
+            float size = d.r * (strlen(d.label) <= 2 ? 0.80f : 0.42f);
+            const float w1 = font->CalcTextSizeA(size, FLT_MAX, 0.0f, d.label).x;
+            if (w1 > d.r * 1.6f)
+                size *= d.r * 1.6f / w1;
+            const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, d.label);
+            dl->AddText(font, size, ImVec2(d.x - ts.x * 0.5f, d.y - ts.y * 0.5f), fg, d.label);
+        }
+    }
+}
+
+static float s_tgt_w, s_tgt_h;
+
+void overlay_set_target(uint32_t w, uint32_t h)
+{
+    s_tgt_w = (float)w;
+    s_tgt_h = (float)h;
 }
 
 bool overlay_begin_frame()
@@ -4109,7 +4659,8 @@ bool overlay_begin_frame()
     s_alpha = s_alpha < 0 ? 0 : s_alpha > 1 ? 1 : s_alpha;
     bool perf = xbox_SettingValue(XS_ADVANCED_PERF) != 0.0;
     bool note = notice_on(), scripted = scripted_on(), sg = sg_banner_on();
-    if (!s_open && s_alpha <= 0.0f && !perf && !note && !scripted && !sg)
+    bool touch = touch_on() && !s_open && s_alpha <= 0.0f;
+    if (!s_open && s_alpha <= 0.0f && !perf && !note && !scripted && !sg && !touch)
         return false;
 
     ImGuiIO &io = ImGui::GetIO();
@@ -4120,6 +4671,11 @@ bool overlay_begin_frame()
     ImGui::GetStyle().FontSizeBase = 17.0f * scale;
 
     ImGui_ImplSDL2_NewFrame();
+    /* The image drawn into, in pixels, for the window's points: a swapchain
+     * smaller or larger than the window (Android's scaled swapchain) still
+     * gets the whole picture, every control where the fingers are. */
+    if (s_tgt_w > 0.0f && io.DisplaySize.x > 0.0f && io.DisplaySize.y > 0.0f)
+        io.DisplayFramebufferScale = ImVec2(s_tgt_w / io.DisplaySize.x, s_tgt_h / io.DisplaySize.y);
     ImGui::NewFrame();
     const float fs = ImGui::GetFontSize();
 
@@ -4158,10 +4714,23 @@ bool overlay_begin_frame()
         /* Centred, low on the screen; the dots move so it is seen to live. */
         static const char *const dots[4] = { "", ".", "..", "..." };
         char text[64];
-        snprintf(text, sizeof text, "Preparing shaders%s", dots[(now / 300u) & 3u]);
+        nv2a_pcache_stat pst;
+        char what[64];
+        char widest[64];
+        nv2a_pcache_stat_get(&pst);
+        if (s_notice_hdr)
+            snprintf(what, sizeof what, "Preparing HDR shaders");
+        else if (pst.hold_total)        /* BO-208: the first build, counted */
+            snprintf(what, sizeof what, "Preparing graphics %u/%u", pst.hold_done,
+                     pst.hold_total);
+        else
+            snprintf(what, sizeof what, "Preparing shaders");
+        snprintf(text, sizeof text, "%s%s", what, dots[(now / 300u) & 3u]);
+        snprintf(widest, sizeof widest, "Preparing graphics %u/%u...", pst.hold_total,
+                 pst.hold_total);
         ImDrawList *dl = ImGui::GetForegroundDrawList();
         const ImVec2 disp = ImGui::GetIO().DisplaySize;
-        const float tw = ImGui::CalcTextSize("Preparing shaders...").x;
+        const float tw = ImGui::CalcTextSize(widest).x;
         const ImVec2 p((disp.x - tw) * 0.5f, disp.y * 0.72f);
         dl->AddRectFilled(ImVec2(p.x - fs, p.y - fs * 0.5f), ImVec2(p.x + tw + fs, p.y + fs * 1.5f),
                           solid(T->toast_bg, 235 / 255.0f), fs * 0.5f);
@@ -4189,6 +4758,8 @@ bool overlay_begin_frame()
                           solid(T->notice_bg, 235 / 255.0f), fs * 0.5f);
         dl->AddText(ImGui::GetFont(), fs, p, solid(T->notice_text), s_sg_text, NULL, wrap);
     }
+    if (touch)
+        draw_touch(ImGui::GetBackgroundDrawList(), io.DisplaySize);
     if (s_open || s_alpha > 0.0f) {
         /* A closing overlay still draws, fading. */
         build_pages(fs);

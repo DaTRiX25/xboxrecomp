@@ -585,6 +585,51 @@ static inline int nv2a_vtx_decode(uint32_t type, uint32_t size,
     }
 }
 
+/* The slot (0 .. mask) of a small memo for a key of n 32-bit words: a word-
+ * wise FNV-1a, folded. The backends keep the last few dozen shader and
+ * pipeline choices this way, since a race frame switches between that many
+ * combiner and blend setups and a single remembered one sent most draws to
+ * the full lookup (a byte-wise hash under a lock). The memo still compares
+ * the whole key; the slot only picks where to look. */
+static inline unsigned nv2a_memo_slot(const uint32_t *w, size_t n, unsigned mask)
+{
+    uint32_t h = 2166136261u;
+    size_t i;
+    for (i = 0; i < n; i++)
+        h = (h ^ w[i]) * 16777619u;
+    return (unsigned)(h ^ (h >> 15)) & mask;
+}
+
+/* The lowest and highest of n 16-bit indices into *lo and *hi, which hold
+ * the starting values (0xFFFF and 0 for a fresh range): the scan each backend
+ * did for itself, once. The running values are 32-bit, as they were: with
+ * 16-bit ones clang 11 (the Linux release compiler) made it three times
+ * slower. */
+static inline void nv2a_idx_range(const uint16_t *v, uint32_t n,
+                                  uint32_t *lo, uint32_t *hi)
+{
+    uint32_t a = *lo, b = *hi, i;
+    for (i = 0; i < n; i++) {
+        uint32_t x = v[i];
+        if (x < a) a = x;
+        if (x > b) b = x;
+    }
+    *lo = a;
+    *hi = b;
+}
+
+/* The vertices lo .. lo + count - 1 of a draw as float4s, vertex by vertex:
+ * vertex i's input k at out[(i * nf4 + k) * 4], input k being the stream
+ * d->attr[slot[k]]. Each element is what nv2a_vtx_decode makes of it; an
+ * input that is off (no size or stride, no array offset, an inline payload
+ * too short, a type with no decoder) is its SET_VERTEX_DATA value inl[slot[k]].
+ * mem is the guest memory base (xbox_GetMemoryOffset()). The stores go out
+ * in address order, which write-combined upload memory needs; the per-element
+ * work (the stream's base and kind) is worked out once per draw. */
+void nv2a_vtx_gather(const struct nv2a_pb_draw *d, const int *slot, int nf4,
+                     uint32_t lo, uint32_t count, const float (*inl)[4],
+                     const uint8_t *mem, float *out);
+
 /* ------------------------------------------------------------------------ */
 /* Primitives and programs                                                   */
 /* ------------------------------------------------------------------------ */
@@ -1013,6 +1058,46 @@ void nv2a_host_set_aniso(int level);
 enum { NV2A_LOD_OFF = 0, NV2A_LOD_AUTO = 1, NV2A_LOD_VALUE = 2 };
 float nv2a_host_lod_bias(void);
 void  nv2a_host_set_lod_bias(int mode, float value);
+
+/* BO-110, HDR output. graphics.hdr (RECOMP_GFX_HDR) asks for it; it is
+ * active only where the window's display can show more than its SDR white
+ * (nv2a_host_hdr_display, set by the presenter) or RECOMP_DEBUG=hdr forces
+ * it (headless tests). Levels in nits: peak (0: the display's), the scene's
+ * paper white, the HUD's white (0: the paper white). On macOS 100 nits is
+ * the system's SDR white (EDR 1.0). nv2a_host_hdr_set_headroom: what the
+ * display shows now, in SDR whites (macOS changes it with the brightness). */
+#if defined(__APPLE__)
+#define NV2A_HDR_PAPER_DEFAULT 100.0
+#else
+#define NV2A_HDR_PAPER_DEFAULT 200.0
+#endif
+int   nv2a_host_hdr(void);                 /* asked for (setting or debug) */
+int   nv2a_host_hdr_active(void);          /* asked for and possible */
+void  nv2a_host_set_hdr(int on);
+void  nv2a_host_set_hdr_levels(int which, float peak, float paper, float hud);
+void  nv2a_host_hdr_levels(float *peak_nits, float *paper_nits, float *hud_nits);
+void  nv2a_host_hdr_display(float potential, float now);   /* presenter: headroom, x SDR white */
+/* The tone controls (Vulkan): shadows, a power on luminance below 0.18
+ * (1 = the art); highlights, a gain on light past paper white before the
+ * roll-off (1 = as stacked); srgb, decode with the piecewise sRGB curve
+ * instead of gamma 2.2. which: 0 shadows, 1 highlights, 2 decode (v != 0: srgb). */
+void  nv2a_host_set_hdr_tone(int which, float v);
+void  nv2a_host_hdr_tone(float *shadows, float *highlights, int *srgb);
+/* BO-195: the roll-off's softer top (0 = off) and the black level in nits. */
+void  nv2a_host_hdr_shape(float *shoulder, float *black_nits);
+float nv2a_host_hdr_potential(void);       /* 0: unknown (no window) */
+/* The provider of the peak calibration patch (overlay): a texture handle
+ * with a symbol at `symbol_nits` on a background at the display's maximum,
+ * or NULL. Set by a presenter that can make one. */
+void  nv2a_host_set_hdr_patch_fn(void *(*fn)(float symbol_nits));
+void *nv2a_host_hdr_patch(float symbol_nits);
+/* For a presenter without a patch texture (Vulkan HDR10): the overlay asks
+ * for a pattern in window pixels this frame; the presenter takes it after
+ * drawing the overlay. kind 0: a disc at a nits on a background at b nits
+ * (the peak patch); kind 1: the left half at a nits, the right half at b
+ * (paper white beside the HUD's white). */
+void  nv2a_host_hdr_pattern(int kind, float x0, float y0, float x1, float y1, float a, float b);
+int   nv2a_host_hdr_pattern_take(int *kind, float r[4], float *a, float *b);
 
 /* RECOMP_GFX_DITHER: 1 asks the Metal presenter for a +-0.5 LSB noise dither
  * in its scale to the window. Read on every present. */

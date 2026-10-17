@@ -168,9 +168,11 @@ typedef struct {
     float tex_bias[4];
     float bump_mat[4][4];   /* per stage: SET_TEXTURE_SET_BUMP_ENV_MAT 00 01 10 11 */
     float bump_lum[4][4];   /* per stage: x bump-env luminance scale, y offset */
+    float hdr[4];           /* BO-110: x the colour bound of the HDR combiners (unread by SDR ones) */
 } MsPsConsts;
 _Static_assert(offsetof(MsPsConsts, tex_bias) == 416 && offsetof(MsPsConsts, bump_mat) == 432
-               && offsetof(MsPsConsts, bump_lum) == 496 && sizeof(MsPsConsts) == 560,
+               && offsetof(MsPsConsts, bump_lum) == 496 && offsetof(MsPsConsts, hdr) == 560
+               && sizeof(MsPsConsts) == 576,
                "MsPsConsts tail moved (D3D8_MSL_PSCONSTS)");
 _Static_assert(sizeof(float) == 4 && sizeof(uint32_t) == 4, "alpha_ref is read as uint bits");
 
@@ -252,6 +254,7 @@ static id<MTLCommandQueue>         s_queue;
 static id<MTLFunction>             s_vs_pass, s_fs_basic;
 static id<MTLFunction>             s_vs_clear, s_fs_clear;
 static id<MTLRenderPipelineState>  s_clear_pso[2];   /* partial clears: without, with depth */
+static id<MTLRenderPipelineState>  s_clear_pso_hdr[2];   /* the same for half-float targets (BO-110) */
 static MTLCompileOptions          *s_opts;     /* fast math off, kept for M2's shaders */
 static id<MTLCommandBuffer>        s_cmd;      /* the frame's, begun lazily */
 static id<MTLRenderCommandEncoder> s_enc;      /* open pass, or nil */
@@ -338,6 +341,128 @@ static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
 static uint64_t      s_stale_drops, s_retired;
 static uint64_t      s_grows, s_partial_clears;   /* rt_grow, metal_on_clear */
+
+/* ---- HDR (BO-110 prototype, RECOMP_DEBUG=hdr) ---------------------------------
+ *
+ * The colour targets are RGBA16Float instead of BGRA8Unorm. Blending into a
+ * float target does not clamp, so where the title stacks light additively
+ * (flames, sparks, lights, the sun and its flare, the bloom's add) the value
+ * passes 1.0 by itself. The register combiners clamp each draw to 1.0 on the
+ * hardware; the HDR variant of their shader (d3d8_combiners_msl.c) takes its
+ * bound from pc.hdr.x: s_hdr_hi between the title's scene marks (the 3D of a
+ * stage view, nv2a_pb_stream_tag() == NV2A_HDR_TAG_SCENE), 1.0 everywhere
+ * else (HUD, menus, front end, loading screens: paper white). With it off
+ * nothing here runs: the formats, the shaders and the pipelines are the
+ * SDR ones. */
+#define NV2A_HDR_TAG_SCENE 1u
+static int   s_hdr_req = -1;      /* RECOMP_DEBUG=hdr asked for (unread: -1) */
+static int   s_hdr;               /* the targets are half float now */
+static int   s_hdr_ab;            /* RECOMP_DEBUG=hdr_ab=n */
+static float s_hdr_hi = 64.0f;
+static uint64_t s_hdr_draws[2];   /* HDR draws: UI-bound, scene-bound */
+/* The scene snapshot: the target the view's 3D ended in, copied when the
+ * first draw after the title's hdr_ui mark comes (or at the flip), before
+ * the HUD is drawn over it. The presenter tells HUD pixels (the frame differs
+ * from the snapshot) from scene pixels, so paper white, HUD white and peak
+ * apply live, also to a frame shown again under the overlay. */
+static id<MTLTexture> s_hdr_scene;
+static uint32_t       s_hdr_scene_of;     /* the snapshot's surface offset */
+static int            s_hdr_scene_ok;     /* taken this frame */
+static RenderTarget  *s_hdr_pend;         /* the last scene draw's target, not yet taken */
+static uint64_t       s_hdr_snaps;
+extern void *xbox_FramebufferWindowBackScene(uint32_t w, uint32_t h, int valid);
+static void hdr_texlog(const struct nv2a_pb_gpu *g);
+static void hdr_snapshot(void);
+static int  s_hdr_watch_hit;   /* hdr_watch: the watched texture drawn this frame */
+#define RT_FMT (s_hdr ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm)
+
+static int hdr_requested(void)
+{
+    if (s_hdr_req < 0) {
+        const char *e = recomp_env(RENV_HDR), *a = recomp_env(RENV_HDR_AB),
+                   *h = recomp_env(RENV_HDR_HI);
+        s_hdr_req = e && *e && strcmp(e, "0") != 0;
+        s_hdr_ab = s_hdr_req && a ? atoi(a) : 0;
+        if (h && atof(h) >= 1.0)
+            s_hdr_hi = (float)atof(h);
+        s_hdr = s_hdr_req || nv2a_host_hdr_active();
+        nv2a_texrep_set_hdr(s_hdr);     /* BO-203: the title's HDR pictures */
+        if (s_hdr_req)
+            fprintf(stderr, LOGP "HDR (BO-110 prototype): half-float targets, scene bound"
+                    " %.1f%s\n", s_hdr_hi, s_hdr_ab ? ", A/B" : "");
+    }
+    return s_hdr_req;
+}
+
+static int tex_is_half(id<MTLTexture> t)
+{
+    return [t pixelFormat] == MTLPixelFormatRGBA16Float;
+}
+
+static inline uint16_t hdr_f2h(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
+static inline float hdr_h2f(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
+
+/* BGRA8 rows (bpr bytes apart) into a half-float texture's region. */
+static void tex_put_half(id<MTLTexture> t, MTLRegion r, NSUInteger level, NSUInteger slice,
+                         const void *src, NSUInteger bpr)
+{
+    size_t w = r.size.width, h = r.size.height, x, y;
+    uint16_t *o = (uint16_t *)malloc(w * h * 8u);
+    static const float k = 1.0f / 255.0f;
+    if (!o)
+        return;
+    for (y = 0; y < h; y++) {
+        const uint8_t *p = (const uint8_t *)src + y * bpr;
+        uint16_t *q = o + y * w * 4u;
+        for (x = 0; x < w; x++, p += 4, q += 4) {
+            q[0] = hdr_f2h(p[2] * k);
+            q[1] = hdr_f2h(p[1] * k);
+            q[2] = hdr_f2h(p[0] * k);
+            q[3] = hdr_f2h(p[3] * k);
+        }
+    }
+    [t replaceRegion:r mipmapLevel:level slice:slice withBytes:o bytesPerRow:w * 8u
+       bytesPerImage:w * h * 8u];
+    free(o);
+}
+
+static inline uint8_t hdr_unorm8(float f)
+{
+    if (!(f > 0.0f)) return 0;
+    if (f >= 1.0f) return 255;
+    return (uint8_t)lrintf(f * 255.0f);
+}
+
+/* A half-float texture's region as BGRA8 rows (bpr bytes apart), clamped to
+ * [0, 1] as a BGRA8Unorm target would hold it. */
+static void tex_get_half(id<MTLTexture> t, void *dst, NSUInteger bpr, MTLRegion r)
+{
+    size_t w = r.size.width, h = r.size.height, x, y;
+    uint16_t *in = (uint16_t *)malloc(w * h * 8u);
+    if (!in)
+        return;
+    [t getBytes:in bytesPerRow:w * 8u fromRegion:r mipmapLevel:0];
+    for (y = 0; y < h; y++) {
+        uint8_t *p = (uint8_t *)dst + y * bpr;
+        const uint16_t *q = in + y * w * 4u;
+        for (x = 0; x < w; x++, p += 4, q += 4) {
+            p[0] = hdr_unorm8(hdr_h2f(q[2]));
+            p[1] = hdr_unorm8(hdr_h2f(q[1]));
+            p[2] = hdr_unorm8(hdr_h2f(q[0]));
+            p[3] = hdr_unorm8(hdr_h2f(q[3]));
+        }
+    }
+    free(in);
+}
+
+/* getBytes of a colour target as BGRA8, whatever its format. */
+static void rt_get_bytes(id<MTLTexture> t, void *dst, NSUInteger bpr, MTLRegion r)
+{
+    if (tex_is_half(t))
+        tex_get_half(t, dst, bpr, r);
+    else
+        [t getBytes:dst bytesPerRow:bpr fromRegion:r mipmapLevel:0];
+}
 
 /* Visibility tests (see "Visibility tests" below): the slot counting on the
  * open pass, opened by begin_pass and closed here. */
@@ -679,6 +804,7 @@ static int init(void)
             XR_ERROR( LOGP "buffer creation failed\n");
             return 0;
         }
+        hdr_requested();
         if (!pc_start()) {
             XR_ERROR( LOGP "pipeline cache allocation failed\n");
             return 0;
@@ -832,7 +958,7 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
 static id<MTLTexture> rt_texture_new(uint32_t hw, uint32_t hh)
 {
     MTLTextureDescriptor *td =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:RT_FMT
                                                            width:hw height:hh
                                                        mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
@@ -888,7 +1014,19 @@ static int rt_seed(id<MTLTexture> tex, uint32_t addr, uint32_t pitch, uint32_t w
         src = lin;
         pitch = w * 4u;
     }
-    if (hw == w) {
+    if (tex_is_half(tex)) {
+        if (hw == w) {
+            tex_put_half(tex, MTLRegionMake2D(0, 0, w, h), 0, 0, src, pitch);
+        } else {
+            unsigned n = hw / w;
+            uint8_t *up = (uint8_t *)malloc((size_t)hw * hh * 4u);
+            if (up) {
+                nv2a_upscale_nearest32(src, pitch, w, h, n, up, hw * 4u);
+                tex_put_half(tex, MTLRegionMake2D(0, 0, hw, hh), 0, 0, up, hw * 4u);
+                free(up);
+            }
+        }
+    } else if (hw == w) {
         [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
                  withBytes:src bytesPerRow:pitch];
     } else {
@@ -973,6 +1111,36 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     return 1;
 }
 
+/* rt (free) made as the target for the surface at offset, w x h guest,
+ * seeded from the guest's bytes there. */
+static int rt_make(RenderTarget *rt, uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch,
+                   int swz)
+{
+    uint32_t hw, hh;
+
+    nv2a_host_size(w, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
+    rt->tex = rt_texture_new(hw, hh);
+    if (!rt->tex)
+        return 0;
+    rt->offset = offset;
+    rt->addr = nv2a_pb_dma_resolve(offset);
+    rt->w = w;
+    rt->h = h;
+    rt->hw = hw;
+    rt->hh = hh;
+    rt->pitch = pitch;
+    rt->swz = swz;
+    rt->last_use = s_tick;
+    rt_own_reset(rt);   /* the bytes the seed reads, or would */
+    rt_seed(rt->tex, rt->addr, pitch, w, h, hw, hh, rt->swz);
+    if (hw != w)
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
+                offset, w, h, hw, hh);
+    else
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target\n", offset, w, h);
+    return 1;
+}
+
 /* The render target for the surface at color_offset, at least the size of
  * its clip extent (the D3D11 backend's rule), made on first use. A new one
  * starts from the guest's bytes (rt_seed). */
@@ -981,7 +1149,6 @@ static RenderTarget *surface(void)
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     uint32_t w = g->clip_x + g->clip_w, h = g->clip_y + g->clip_h;
     RenderTarget *free_rt = NULL, *lru = &s_rt[0];
-    uint32_t hw, hh;
     int i, swz;
 
     if (!g->color_offset || !w || !h || w > 4096 || h > 4096)
@@ -1067,28 +1234,7 @@ static RenderTarget *surface(void)
         if (free_rt->tex)
             rt_free(free_rt);
     }
-    nv2a_host_size(w, h, nv2a_host_render_scale(), METAL_MAX_DIM, &hw, &hh);
-    free_rt->tex = rt_texture_new(hw, hh);
-    if (!free_rt->tex)
-        return NULL;
-    free_rt->offset = g->color_offset;
-    free_rt->addr = nv2a_pb_dma_resolve(g->color_offset);
-    free_rt->w = w;
-    free_rt->h = h;
-    free_rt->hw = hw;
-    free_rt->hh = hh;
-    free_rt->pitch = g->pitch;
-    free_rt->swz = swz;
-    free_rt->last_use = s_tick;
-    rt_own_reset(free_rt);   /* the bytes the seed reads, or would */
-    rt_seed(free_rt->tex, free_rt->addr, g->pitch, w, h, hw, hh, free_rt->swz);
-    if (hw != w)
-        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host)\n",
-                g->color_offset, w, h, hw, hh);
-    else
-        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target\n",
-                g->color_offset, w, h);
-    return free_rt;
+    return rt_make(free_rt, g->color_offset, w, h, g->pitch, swz) ? free_rt : NULL;
 }
 
 static id<MTLDepthStencilState> depth_state(int depth, int stencil);
@@ -1097,10 +1243,28 @@ static id<MTLDepthStencilState> depth_state(int depth, int stencil);
  * attachment, made on first use; nil if it cannot be made. */
 static id<MTLRenderPipelineState> clear_pso(int dt)
 {
-    static int failed[2];
+    static int failed[2], failed_hdr[2];
     MTLRenderPipelineDescriptor *pd;
     NSError *err = nil;
 
+    if (s_hdr) {
+        if (s_clear_pso_hdr[dt] || failed_hdr[dt])
+            return s_clear_pso_hdr[dt];
+        pd = [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = s_vs_clear;
+        pd.fragmentFunction = s_fs_clear;
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+        pd.colorAttachments[0].writeMask = MTLColorWriteMaskAll;
+        if (dt) {
+            pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+            pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        }
+        s_clear_pso_hdr[dt] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        [pd release];
+        if (!s_clear_pso_hdr[dt])
+            failed_hdr[dt] = 1;
+        return s_clear_pso_hdr[dt];
+    }
     if (s_clear_pso[dt] || failed[dt])
         return s_clear_pso[dt];
     pd = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1227,29 +1391,6 @@ static void metal_on_zclear(uint32_t param)
 
 /* ---- vertices ---------------------------------------------------------------- */
 
-/* One attribute of one vertex as float4, decoded the way the CPU path's
- * fetch_attr does. 0 if the stream has no data for it. */
-static int fetch(const struct nv2a_pb_draw *d, const VertexAttr *a,
-                 uint32_t index, float out[4])
-{
-    const uint8_t *p;
-
-    out[0] = out[1] = out[2] = 0.0f;
-    out[3] = 1.0f;
-    if (d->inline_data) {
-        size_t at = (size_t)a->offset + (size_t)index * a->stride;
-        if (at + 4 > d->inline_bytes)
-            return 0;
-        p = (const uint8_t *)d->inline_buf + at;
-    } else {
-        if (!a->offset)
-            return 0;
-        p = (const uint8_t *)xbox_GetMemoryOffset() + a->offset
-          + (size_t)index * a->stride;
-    }
-    return nv2a_vtx_decode(a->type, a->size, p, out);
-}
-
 /* `bytes` from a ring, 16-aligned; on overflow the frame so far is flushed
  * (and waited for) and the ring starts over. NULL if it can never fit. */
 static void *ring_alloc(id<MTLBuffer> b, NSUInteger size, NSUInteger *pos,
@@ -1327,6 +1468,7 @@ static MTLBlendFactor blend_factor(uint32_t gl, int alpha)
  * only thread that evicts; the pre-warm thread only fills free slots, so an
  * entry the ack thread holds never moves under it. */
 
+static void pc_warm_begin(int first);
 static pthread_mutex_t s_pc_mu = PTHREAD_MUTEX_INITIALIZER;
 #define PC_MAX_DEFAULT 512
 #define PC_MAX_LIMIT   16384
@@ -1401,10 +1543,24 @@ static int      s_pc_warm_urgent;       /* the first one is on the pipelines' pa
 static uint64_t s_pc_wait_until;        /* the ack thread's waits end here */
 static uint64_t s_pc_waits, s_pc_wait_ns;
 #define PC_URGENT() __atomic_load_n(&s_pc_warm_urgent, __ATOMIC_ACQUIRE)
+static uint64_t s_pc_cap_ns = 180000000000ull;  /* BO-208: the most the title is held, in all */
+static uint64_t s_pc_hold_t0;                    /* when the first pre-warm began */
 static int pc_wait_more(void)
 {
-    if (!PC_URGENT() || pc_now() >= __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE))
+    uint64_t now;
+    if (!PC_URGENT())
         return 0;
+    now = pc_now();
+    if (now >= __atomic_load_n(&s_pc_wait_until, __ATOMIC_ACQUIRE)) {
+        /* BO-208: past the first 3 s, still holding while the pre-warm is doing
+         * real compiling (a driver, OS or shader-generator change that the
+         * lists could not tell beforehand): a build with the caches warm is
+         * lookups and has spent far less than this by now. */
+        uint64_t busy = s_cs.ns[1][0] + s_cs.ns[1][1] + s_cs.ns[1][2];
+        if (now >= s_pc_hold_t0 + s_pc_cap_ns || busy < 400000000ull)
+            return 0;
+        __atomic_store_n(&s_pc_wait_until, now + 1000000000ull, __ATOMIC_RELEASE);
+    }
     nv2a_pcache_stat_waiting(1);        /* the window shows a line meanwhile */
     usleep(500);
     return 1;
@@ -1435,7 +1591,11 @@ typedef struct {
 #define PSO_BUCKETS 2048
 static PsoEntry *s_pso;                  /* s_pc_max, allocated in init */
 static int       s_pso_head[PSO_BUCKETS];
-static int       s_pso_last = -1;
+/* The slots of the last 32 keys, by a hash of the key (nv2a_memo_slot);
+ * -1 for none. pso_insert forgets a slot it evicts. */
+#define PSO_MEMOS 32
+static int       s_pso_last[PSO_MEMOS];
+static int       s_pso_last_init;
 
 static unsigned pso_bucket(const PsoKey *k)
 {
@@ -1473,8 +1633,12 @@ static int pso_insert(const PsoKey *k, id<MTLRenderPipelineState> pso, int evict
         *pp = s_pso[i].next;
         [s_pso[i].pso release];          /* an encoded draw keeps its own reference */
         s_cs.evicted[PC_PSO]++;
-        if (s_pso_last == i)
-            s_pso_last = -1;
+        {
+            int m;
+            for (m = 0; m < PSO_MEMOS; m++)
+                if (s_pso_last[m] == i)
+                    s_pso_last[m] = -1;
+        }
     }
     b = pso_bucket(k);
     s_pso[i].k = *k;
@@ -1502,7 +1666,7 @@ static id<MTLRenderPipelineState> pso_build(const PsoKey *pk, id<MTLFunction> vs
     pd.vertexFunction = vs;
     pd.fragmentFunction = fs;
     ca = pd.colorAttachments[0];
-    ca.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    ca.pixelFormat = (key[5] & 2u) ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
     ca.blendingEnabled = key[0] ? YES : NO;
     if (key[0]) {
         ca.sourceRGBBlendFactor = blend_factor(key[1], 0);
@@ -1516,7 +1680,7 @@ static id<MTLRenderPipelineState> pso_build(const PsoKey *pk, id<MTLFunction> vs
                  | ((key[3] & 0x0000FF00u) ? 0 : MTLColorWriteMaskGreen)
                  | ((key[3] & 0x000000FFu) ? 0 : MTLColorWriteMaskBlue)
                  | ((key[3] & 0xFF000000u) ? 0 : MTLColorWriteMaskAlpha);
-    if (key[5]) {
+    if (key[5] & 1u) {
         pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
         pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     }
@@ -1546,6 +1710,7 @@ static id<MTLRenderPipelineState> pipeline(uint64_t vs_id, id<MTLFunction> vs,
     id<MTLRenderPipelineState> pso;
     PsoKey pk;
     uint32_t *key = pk.key;
+    unsigned ms;
     int i;
 
     memset(&pk, 0, sizeof pk);
@@ -1557,14 +1722,27 @@ static id<MTLRenderPipelineState> pipeline(uint64_t vs_id, id<MTLFunction> vs,
     key[3] = g->color_keep;             /* SET_COLOR_MASK, inverted */
     key[4] = key[0] ? (uint32_t)blend_op(g->blend_equation) : 0;
     key[5] = s_enc_dt ? 1 : 0;          /* the open pass has a depth buffer */
-    if (s_pso_last >= 0 && !memcmp(&s_pso[s_pso_last].k, &pk, sizeof pk)) {
-        s_pso[s_pso_last].tick = s_tick;
-        return s_pso[s_pso_last].pso;
+    if (s_hdr)
+        key[5] |= 2u;                   /* BO-110: a half-float target */
+    if (!s_pso_last_init) {
+        for (i = 0; i < PSO_MEMOS; i++)
+            s_pso_last[i] = -1;
+        s_pso_last_init = 1;
+    }
+    {
+        uint32_t w[sizeof pk / 4];
+        memcpy(w, &pk, sizeof w);
+        ms = nv2a_memo_slot(w, sizeof w / 4, PSO_MEMOS - 1);
+    }
+    i = s_pso_last[ms];
+    if (i >= 0 && s_pso[i].used && !memcmp(&s_pso[i].k, &pk, sizeof pk)) {
+        s_pso[i].tick = s_tick;
+        return s_pso[i].pso;
     }
     pthread_mutex_lock(&s_pc_mu);
     i = pso_find(&pk);
     pthread_mutex_unlock(&s_pc_mu);
-    if (i < 0 && PC_URGENT()) {
+    if (i < 0 && !s_hdr && PC_URGENT()) {
         uint64_t t0 = pc_now();
         do {
             pthread_mutex_lock(&s_pc_mu);
@@ -1582,10 +1760,11 @@ static id<MTLRenderPipelineState> pipeline(uint64_t vs_id, id<MTLFunction> vs,
         else
             i = pso_insert(&pk, pso, 1);
         pthread_mutex_unlock(&s_pc_mu);
-        pc_put(PC_PSO, &pk, sizeof pk);
+        if (!s_hdr)     /* BO-110 prototype: HDR pipelines stay out of the disk cache */
+            pc_put(PC_PSO, &pk, sizeof pk);
     }
     s_pso[i].tick = s_tick;
-    s_pso_last = i;
+    s_pso_last[ms] = i;
     return s_pso[i].pso;
 }
 
@@ -1818,6 +1997,9 @@ static id<MTLTexture> tex_upload(const Stage *t, unsigned scale, int algo, uint3
      * nv2a_texrep.h): rectangles of a registered texture replaced here. */
     s_tex_rep = nv2a_texrep_apply(mem + t->offset, t->color, t->width, t->height,
                                   t->pitch, t->levels, s_texels);
+    /* BO-204 debug: a ztint texture goes magenta (counting a decal's pixels). */
+    (void)nv2a_texrep_ztint_apply(mem + t->offset, t->color, t->width, t->height, t->pitch,
+                                  s_texels, n);
     /* An alpha-tested draw binds it: levels 1.. made again with level 0's
      * alpha coverage (nv2a_texmip.h). */
     (void)nv2a_texmip_apply(mem + t->offset, t->color, t->width, t->height, t->pitch,
@@ -2401,8 +2583,10 @@ static VsEntry *vs_cache(void)
             e->fn = fn;
         }
         pthread_mutex_unlock(&s_pc_mu);
-        if (fn)
+        if (fn) {
             pc_put(PC_VS, slots, len * 16u);
+            pc_warm_begin(0);           /* BO-208: the manifest's pipelines for a program only the title assembles */
+        }
     }
     e->tick = s_tick;
     s_vs_memo.valid = 1;
@@ -2420,11 +2604,15 @@ typedef struct {
     id<MTLFunction>   fn;
 } FsEntry;
 static FsEntry *s_fs;         /* s_pc_max, allocated in init */
-static struct { int valid; uint32_t r[39]; FsEntry *e; } s_fs_memo;
+/* The last 64 choices of fs_select, by a hash of the key (nv2a_memo_slot);
+ * fs_slot forgets those whose entry it evicts. */
+#define FS_MEMOS 64
+static struct { int valid; uint32_t r[39]; FsEntry *e; } s_fs_memo[FS_MEMOS];
 
 /* The fragment function for combiner state `st`, a new reference or nil.
  * Any thread. */
-static id<MTLFunction> fs_build(const NV2ACombinerState *st, uint64_t kid, int prewarm)
+static id<MTLFunction> fs_build(const NV2ACombinerState *st, uint64_t kid, int prewarm,
+                                int hdr)
 {
     char *msl = (char *)malloc(65536);
     id<MTLFunction> fn = nil;
@@ -2434,7 +2622,8 @@ static id<MTLFunction> fs_build(const NV2ACombinerState *st, uint64_t kid, int p
     snprintf(what, sizeof what, "combiners %08X", (uint32_t)kid);
     if (!msl)
         return nil;
-    if (d3d8_combiners_generate_msl(st, msl, 65536) <= 0) {
+    if ((hdr ? d3d8_combiners_generate_msl_hdr(st, msl, 65536)
+             : d3d8_combiners_generate_msl(st, msl, 65536)) <= 0) {
         __atomic_add_fetch(&s_compile_errors, 1, __ATOMIC_RELAXED);
         fprintf(stderr, LOGP "%s: no MSL\n", what);
     } else if ((fn = compile_fn(msl, @"fs_main", what)) != nil) {
@@ -2469,8 +2658,9 @@ static FsEntry *fs_slot(int evict)
     if (!evict)
         return NULL;
     [lru->fn release];
-    if (s_fs_memo.e == lru)
-        s_fs_memo.valid = 0;
+    for (i = 0; i < FS_MEMOS; i++)
+        if (s_fs_memo[i].e == lru)
+            s_fs_memo[i].valid = 0;
     memset(lru, 0, sizeof *lru);
     s_cs.evicted[PC_FS]++;
     return lru;
@@ -2487,6 +2677,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     id<MTLFunction> fn;
     uint64_t kid;
     FsEntry *e;
+    unsigned ms;
     int n;
 
     *fid = PC_FS_BASIC;
@@ -2516,12 +2707,13 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     key[36] = signs;
     key[37] = v->shader_ctl & 0x00FF0000u;  /* stage 2 and 3 input stages */
     key[38] = v->clip_plane_mode;
-    if (s_fs_memo.valid && !memcmp(s_fs_memo.r, key, sizeof key)) {
-        if (!s_fs_memo.e)
+    ms = nv2a_memo_slot(key, 39, FS_MEMOS - 1);
+    if (s_fs_memo[ms].valid && !memcmp(s_fs_memo[ms].r, key, sizeof key)) {
+        if (!s_fs_memo[ms].e)
             return s_fs_basic;
-        s_fs_memo.e->tick = s_tick;
-        *fid = s_fs_memo.e->id;
-        return s_fs_memo.e->fn;
+        s_fs_memo[ms].e->tick = s_tick;
+        *fid = s_fs_memo[ms].e->id;
+        return s_fs_memo[ms].e->fn;
     }
 
     memset(&st, 0, sizeof st);
@@ -2535,12 +2727,14 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
     st.input_tex[2] = (uint8_t)((v->shader_ctl >> 16) & 0xFu);
     st.input_tex[3] = (uint8_t)((v->shader_ctl >> 20) & 0xFu);
     kid = nv2a_fnv64(&st, sizeof st, NV2A_FNV64_INIT);
+    if (s_hdr)
+        kid ^= 0x4844520000000000ull;   /* BO-110: the HDR variant, its own id */
     if (!kid)
         kid = 1;
     pthread_mutex_lock(&s_pc_mu);
     e = fs_find(kid, &st);
     pthread_mutex_unlock(&s_pc_mu);
-    if (!e && PC_URGENT()) {
+    if (!e && !s_hdr && PC_URGENT()) {
         uint64_t t0 = pc_now();
         do {
             pthread_mutex_lock(&s_pc_mu);
@@ -2550,7 +2744,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
         pc_waited(t0, "fragment function");
     }
     if (!e) {
-        fn = fs_build(&st, kid, 0);
+        fn = fs_build(&st, kid, 0, s_hdr);
         pthread_mutex_lock(&s_pc_mu);
         if ((e = fs_find(kid, &st)) != NULL) {
             [fn release];               /* the pre-warm thread was first */
@@ -2563,14 +2757,14 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, uint64_t *fid)
             e->fn = fn;
         }
         pthread_mutex_unlock(&s_pc_mu);
-        if (fn)
+        if (fn && !s_hdr)
             pc_put(PC_FS, &st, sizeof st);
     }
     e->tick = s_tick;
-    memcpy(s_fs_memo.r, key, sizeof key);
-    s_fs_memo.valid = 1;
-    s_fs_memo.e = e->bad ? NULL : e;   /* as D3D11: the basic PS */
-    if (!s_fs_memo.e)
+    memcpy(s_fs_memo[ms].r, key, sizeof key);
+    s_fs_memo[ms].valid = 1;
+    s_fs_memo[ms].e = e->bad ? NULL : e;   /* as D3D11: the basic PS */
+    if (!s_fs_memo[ms].e)
         return s_fs_basic;
     *fid = e->id;
     return e->fn;
@@ -2586,15 +2780,40 @@ static char         s_pc_path[1100], s_pc_ver[256];
 
 /* Appends a key the ack thread just built (it is new to this process; the
  * file drops one it already has). */
-static void pc_put(uint32_t type, const void *data, uint32_t len)
+static nv2a_pcache *s_gapf;             /* BO-208: gaps.bin: what the render thread had to build */
+static void pc_put_(uint32_t type, const void *data, uint32_t len, int gap)
 {
     pthread_mutex_lock(&s_pcf_mu);
-    if (s_pcf && nv2a_pcache_put(s_pcf, type, data, len) < 0) {
+    int added = s_pcf ? nv2a_pcache_put(s_pcf, type, data, len) : 0;
+    if (s_pcf && added < 0) {
         static int said;
         if (!said++)
             XR_ERROR( LOGP "pcache: cannot append; the key list is not written\n");
     }
+    if (gap && added > 0 && s_gapf) {
+        /* A key the lists lacked when the title needed it: the field's gap in
+         * the manifest. A vertex program as its hash only (the microcode is
+         * the title's); pcache_keys.py manifest takes the file as it is. */
+        if (type == PC_VS) {
+            uint64_t h = nv2a_fnv64(data, len, NV2A_FNV64_INIT);
+            nv2a_pcache_put(s_gapf, NV2A_PC_MANIFEST_VS, &h, 8);
+        } else {
+            nv2a_pcache_put(s_gapf, type, data, len);
+        }
+    }
     pthread_mutex_unlock(&s_pcf_mu);
+}
+
+/* The render thread's builds: a gap if the lists had it not. */
+static void pc_put(uint32_t type, const void *data, uint32_t len)
+{
+    pc_put_(type, data, len, 1);
+}
+
+/* The seeds of a pre-build: not gaps. */
+static void pc_seed(uint32_t type, const void *data, uint32_t len)
+{
+    pc_put_(type, data, len, 0);
 }
 
 /* The function ids the list's pipelines name: built first. */
@@ -2615,7 +2834,7 @@ static int pc_needed(uint64_t kid)
  * pass 2 the other functions (keys seeded from the title's executable that
  * nothing drew yet: nobody waits for those). Never evicts: a full table
  * leaves the rest to the ack thread. */
-static void pc_warm_one(size_t i, int pass)
+static void pc_warm_one_(size_t i, int pass)
 {
     const void *data;
     uint32_t type, len;
@@ -2663,7 +2882,7 @@ static void pc_warm_one(size_t i, int pass)
         pthread_mutex_lock(&s_pc_mu);
         e = fs_find(kid, &st);
         pthread_mutex_unlock(&s_pc_mu);
-        if (e || !(fn = fs_build(&st, kid, 1)))
+        if (e || !(fn = fs_build(&st, kid, 1, 0)))
             return;
         pthread_mutex_lock(&s_pc_mu);
         if (!fs_find(kid, &st) && (e = fs_slot(0)) != NULL) {
@@ -2715,6 +2934,31 @@ static void pc_warm_one(size_t i, int pass)
     }
 }
 
+
+/* BO-208: the progress of the first build: records handled so far. */
+static uint32_t s_pc_done, s_pc_total;
+static int      s_pc_cold;
+static uint64_t s_pc_hold_ns = 3000000000ull;
+static void pc_warm_one(size_t i, int pass)
+{
+    const void *d;
+    uint32_t type, len;
+    int handled = 0;
+    pc_warm_one_(i, pass);
+    if (!nv2a_pcache_get(s_pcf, i, &type, &d, &len))
+        return;
+    if (type == PC_PSO)
+        handled = pass == 1;
+    else if (type == PC_VS || type == PC_FS) {
+        uint64_t kid = nv2a_fnv64(d, len, NV2A_FNV64_INIT);
+        handled = pass == 2 || (pass == 0 && pc_needed(kid ? kid : 1));
+    }
+    if (handled && PC_URGENT()) {
+        uint32_t dn = __atomic_add_fetch(&s_pc_done, 1, __ATOMIC_RELAXED);
+        nv2a_pcache_stat_hold(dn > s_pc_total ? s_pc_total : dn, s_pc_total, s_pc_cold);
+    }
+}
+
 /* Builds every key of the file, functions first, on the utility queues:
  * done before the title reaches the draws that need them, the ack thread
  * finds them built. Goes round again when asked to meanwhile (pc_warm_start:
@@ -2750,6 +2994,8 @@ static void *pc_prewarm(void *arg)
             before[i] = s_pc_warm[i];
         }
         nv2a_pcache_stat_open(s_pc_path, listed);
+        s_pc_total = listed[0] + listed[1] + listed[2];
+        __atomic_store_n(&s_pc_done, 0, __ATOMIC_RELAXED);
         free(s_pc_need);
         s_pc_need = (uint64_t *)malloc((listed[PC_PSO] ? listed[PC_PSO] : 1) * 2 * sizeof *s_pc_need);
         s_pc_need_n = 0;
@@ -2778,6 +3024,8 @@ static void *pc_prewarm(void *arg)
                 __atomic_store_n(&s_pc_warm_urgent, 0, __ATOMIC_RELEASE);
         }
         s_pc_warm_ns += pc_now() - t;
+        nv2a_pcache_stat_warm_ms((uint32_t)((pc_now() - t) / 1000000ull));
+        nv2a_pcache_stat_hold(s_pc_total, s_pc_total, s_pc_cold);
         if (@available(macOS 13.3, *))
             s_dev.shouldMaximizeConcurrentCompilation = NO;
         fprintf(stderr, LOGP "pcache: pre-warmed %llu vs, %llu fs, %llu pipelines of %u/%u/%u"
@@ -2805,7 +3053,8 @@ static void pc_warm_begin(int first)
         return;                         /* one is running: it will see the flag */
     nv2a_pcache_stat_warming(1);
     if (first) {
-        __atomic_store_n(&s_pc_wait_until, pc_now() + 3000000000ull, __ATOMIC_RELEASE);
+        s_pc_hold_t0 = pc_now();
+        __atomic_store_n(&s_pc_wait_until, pc_now() + s_pc_hold_ns, __ATOMIC_RELEASE);
         __atomic_store_n(&s_pc_warm_urgent, 1, __ATOMIC_RELEASE);
     }
     if (pthread_create(&th, NULL, pc_prewarm, NULL) == 0) {
@@ -2874,9 +3123,31 @@ static int pc_start(void)
         uint32_t none[3] = {0, 0, 0};
         nv2a_pcache_stat_open(s_pc_path, none);
     }
+    {
+        char gp[1100], gv[300], gm[128];
+        snprintf(gp, sizeof gp, "%s/gaps_metal.bin", dir);
+        snprintf(gv, sizeof gv, "%s; gaps", s_pc_ver);
+        s_gapf = nv2a_pcache_open(gp, gv, gm, sizeof gm);
+    }
     nv2a_pcache_set_rescan(pc_warm_start);
-    nv2a_pcache_set_seed(pc_put);
-    if (nv2a_pcache_count(s_pcf))
+    nv2a_pcache_set_seed(pc_seed);
+    {
+        /* BO-208: the shipped manifest's keys join the list; a first build
+         * holds the title for its pipelines behind "Preparing graphics N/M".
+         * (Metal keeps its compiled code in the system's cache, which the
+         * app cannot see: the manifest bringing keys is what makes it cold.) */
+        nv2a_pcache_manifest_stat ms;
+        uint32_t added = nv2a_pcache_manifest_apply(s_pcf, "metal", s_pc_ver, &ms);
+        long hold = recomp_env_int(RENV_PCACHE_HOLD_S, 180);
+        s_pc_cap_ns = (uint64_t)(hold < 3 ? 3 : hold) * 1000000000ull;
+        s_pc_cold = added > 0 && (added > 64 || nv2a_pcache_count(s_pcf) > 64);
+        s_pc_hold_ns = s_pc_cold ? (uint64_t)(hold < 3 ? 3 : hold) * 1000000000ull
+                                 : 3000000000ull;
+        fprintf(stderr, LOGP "pcache: %s start (%u keys new from the manifest), the title may be"
+                " held up to %llu s\n", s_pc_cold ? "cold" : "warm", added,
+                (unsigned long long)(s_pc_hold_ns / 1000000000ull));
+    }
+    if (nv2a_pcache_count(s_pcf) || s_pc_cold)
         pc_warm_begin(1);
     return 1;
 }
@@ -3029,7 +3300,7 @@ static RenderTarget *rt_opaque(RenderTarget *rt)
         MTLTextureSwizzleChannels sw = MTLTextureSwizzleChannelsMake(
             MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
             MTLTextureSwizzleBlue, MTLTextureSwizzleOne);
-        rt->opaque = [rt->tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm
+        rt->opaque = [rt->tex newTextureViewWithPixelFormat:[rt->tex pixelFormat]
                                                 textureType:MTLTextureType2D
                                                      levels:NSMakeRange(0, 1)
                                                      slices:NSMakeRange(0, 1)
@@ -3147,7 +3418,7 @@ static id<MTLTexture> cube_bind(const Stage *t)
         e->levels = levels;
         fresh = 1;
     }
-    if (e->side != side)
+    if (e->side != side || (e->tex && [e->tex pixelFormat] != RT_FMT))
         fresh = 1;
     if (!all && (fresh || e->gen != g->flips)) {
         uint64_t h = NV2A_TEX_HASH_SEED;
@@ -3164,7 +3435,7 @@ static id<MTLTexture> cube_bind(const Stage *t)
     }
     if (fresh) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor
-            textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm size:side
+            textureCubeDescriptorWithPixelFormat:RT_FMT size:side
                                        mipmapped:levels > 1];
         size_t n = nv2a_tex_texels(w, w, levels);
         if (levels > 1)
@@ -3195,6 +3466,10 @@ static id<MTLTexture> cube_bind(const Stage *t)
                 if (up) {
                     nv2a_upscale_nearest32((const uint8_t *)s_texels, w * 4u, w, w,
                                            side / w, up, side * 4u);
+                    if (tex_is_half(e->tex))
+                        tex_put_half(e->tex, MTLRegionMake2D(0, 0, side, side), 0, f,
+                                     up, side * 4u);
+                    else
                     [e->tex replaceRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0
                                     slice:f withBytes:up bytesPerRow:side * 4u
                             bytesPerImage:side * side * 4u];
@@ -3204,6 +3479,9 @@ static id<MTLTexture> cube_bind(const Stage *t)
             }
             for (l = 0; l < levels; l++) {
                 uint32_t lw = nv2a_tex_level_dim(w, l);
+                if (tex_is_half(e->tex))
+                    tex_put_half(e->tex, MTLRegionMake2D(0, 0, lw, lw), l, f, src, lw * 4u);
+                else
                 [e->tex replaceRegion:MTLRegionMake2D(0, 0, lw, lw) mipmapLevel:l slice:f
                             withBytes:src bytesPerRow:lw * 4u bytesPerImage:lw * lw * 4u];
                 src += (size_t)lw * lw;
@@ -3271,9 +3549,10 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
         return NULL;
     /* copyFromTexture:toTexture: wants equal sizes: the source's host size. */
     if (!s_self.tex || s_self.w != self->w || s_self.h != self->h
-            || s_self.hw != self->hw || s_self.hh != self->hh) {
+            || s_self.hw != self->hw || s_self.hh != self->hh
+            || [s_self.tex pixelFormat] != [self->tex pixelFormat]) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            texture2DDescriptorWithPixelFormat:[self->tex pixelFormat]
                                          width:self->hw height:self->hh mipmapped:NO];
         td.usage = MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModePrivate;
@@ -3431,12 +3710,21 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 mpc.bump_lum[k][2] = mpc.bump_lum[k][3] = 0.0f;
             }
         }
+        /* BO-110: the colour bound of the HDR combiners, the scene's between
+         * the title's scene marks, else the hardware's. */
+        mpc.hdr[0] = s_hdr && nv2a_pb_stream_tag() == NV2A_HDR_TAG_SCENE ? s_hdr_hi : 1.0f;
+        mpc.hdr[1] = mpc.hdr[2] = mpc.hdr[3] = 0.0f;
+        if (s_hdr) {
+            int scene = nv2a_pb_stream_tag() == NV2A_HDR_TAG_SCENE;
+            s_hdr_draws[scene]++;
+            if (scene)
+                s_hdr_pend = rt;
+            else if (s_hdr_pend)
+                hdr_snapshot();
+        }
         ffn = fs_select(v, &fid);
         s_signed_on = fid != PC_FS_BASIC;   /* fs_basic has no signed channels */
-        for (i = 0; i < d->idx_count; i++) {
-            if (d->idx[i] < lo) lo = d->idx[i];
-            if (d->idx[i] > hi) hi = d->idx[i];
-        }
+        nv2a_idx_range(d->idx, d->idx_count, &lo, &hi);
         count = hi - lo + 1;
         if (d->idx_count * 3u > idx_cap) {
             uint32_t *grown = (uint32_t *)realloc(idx, (size_t)d->idx_count * 12u);
@@ -3486,15 +3774,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         /* Each input as float4, fetched as the CPU path does; a disabled
          * one (or one without data) is its SET_VERTEX_DATA value. */
-        for (k = 0; k < nf4; k++) {
-            const VertexAttr *a = &d->attr[slot[k]];
-            int on = a->size && a->stride;
-            for (i = 0; i < count; i++) {
-                float *o = vf + ((size_t)i * nf4 + k) * 4;
-                if (!on || !fetch(d, a, lo + i, o))
-                    memcpy(o, v->inl[slot[k]], 16);
-            }
-        }
+        nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
+                        (const uint8_t *)xbox_GetMemoryOffset(), vf);
         memcpy(ip, idx, (size_t)nidx * 4u);
 
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, &vc);
@@ -3553,6 +3834,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         if (zbias != 0.0f && use_z && nv2a_texrep_zbias_on(g->flips))
             vc.c[3] += zbias / nv2a_zmax(g->format);
 
+        if (s_hdr)
+            hdr_texlog(g);
         if (!s_enc || s_enc_rt != rt)
             begin_encoder(rt, 0, NULL);
         pso = pipeline(vid, vfn, fid, ffn);
@@ -3689,16 +3972,14 @@ static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
         uint32_t *lin = (uint32_t *)swz_staging((size_t)w * rt->h * 4u);
         if (!lin)
             return;
-        [rt->tex getBytes:lin bytesPerRow:w * 4u fromRegion:MTLRegionMake2D(0, 0, w, rt->h)
-              mipmapLevel:0];
+        rt_get_bytes(rt->tex, lin, w * 4u, MTLRegionMake2D(0, 0, w, rt->h));
         swz_store(rt, dst, lin, bpp);
         s_writebacks++;
         return;
     }
 
     if (bpp >= 4) {
-        [rt->tex getBytes:dst bytesPerRow:pitch fromRegion:MTLRegionMake2D(0, 0, w, rt->h)
-              mipmapLevel:0];
+        rt_get_bytes(rt->tex, dst, pitch, MTLRegionMake2D(0, 0, w, rt->h));
     } else if (bpp == 2) {
         static uint32_t *row;
         static uint32_t row_cap;
@@ -3711,8 +3992,7 @@ static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
         }
         for (y = 0; y < rt->h; y++) {
             uint16_t *o = (uint16_t *)(dst + (size_t)y * pitch);
-            [rt->tex getBytes:row bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, y, w, 1)
-                  mipmapLevel:0];
+            rt_get_bytes(rt->tex, row, w * 4, MTLRegionMake2D(0, y, w, 1));
             for (x = 0; x < w; x++) {
                 uint32_t c = row[x];
                 o[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0)
@@ -3740,8 +4020,7 @@ static const uint8_t *host_readback(RenderTarget *rt)
         px = n;
         cap = need;
     }
-    [rt->tex getBytes:px bytesPerRow:rt->hw * 4u
-           fromRegion:MTLRegionMake2D(0, 0, rt->hw, rt->hh) mipmapLevel:0];
+    rt_get_bytes(rt->tex, px, rt->hw * 4u, MTLRegionMake2D(0, 0, rt->hw, rt->hh));
     return px;
 }
 
@@ -4505,6 +4784,240 @@ static void metal_on_flip_ready(void)
     }
 }
 
+/* BO-110: the scene snapshot of s_hdr_pend (see s_hdr_scene). */
+static void hdr_snapshot(void)
+{
+    RenderTarget *rt = s_hdr_pend;
+    id<MTLBlitCommandEncoder> b;
+
+    s_hdr_pend = NULL;
+    if (!rt || !rt->tex)
+        return;
+    if (!s_hdr_scene || [s_hdr_scene width] != rt->hw || [s_hdr_scene height] != rt->hh
+            || [s_hdr_scene pixelFormat] != [rt->tex pixelFormat]) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:[rt->tex pixelFormat]
+                                         width:rt->hw height:rt->hh mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModeShared;
+        [s_hdr_scene release];
+        s_hdr_scene = [s_dev newTextureWithDescriptor:td];
+        if (!s_hdr_scene)
+            return;
+    }
+    end_encoder();
+    ensure_cmd();
+    b = [s_cmd blitCommandEncoder];
+    [b copyFromTexture:rt->tex toTexture:s_hdr_scene];
+    [b endEncoding];
+    s_hdr_scene_of = rt->offset;
+    s_hdr_scene_ok = 1;
+    s_hdr_snaps++;
+}
+
+/* BO-110: RECOMP_DEBUG=hdr_texlog: what the title draws with which blend,
+ * by texrep_dump's hash of stage 0's texture, once per combination. */
+static void hdr_texlog(const struct nv2a_pb_gpu *g)
+{
+    static int on = -1;
+    static uint64_t seen[4096];
+    static int nseen;
+    const Stage *t = &s_stage[0];
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint64_t h, k;
+    int i;
+
+    static uint64_t watch;
+    if (on < 0) {
+        const char *w = recomp_env(RENV_HDR_WATCH);
+        on = recomp_env(RENV_HDR_TEXLOG) != NULL;
+        watch = w ? strtoull(w, NULL, 16) : 0;
+    }
+    if ((!on && !watch) || !t->offset || !t->width)
+        return;
+    h = nv2a_texrep_hash(mem + t->offset, t->color, t->width, t->height, t->pitch);
+    if (watch && h == watch && g->blend_enable && g->blend_dfactor == 0x1
+            && nv2a_pb_stream_tag() == NV2A_HDR_TAG_SCENE)
+        s_hdr_watch_hit = 1;
+    if (!on || nseen >= 4096)
+        return;
+    k = h ^ ((uint64_t)(g->blend_enable ? g->blend_sfactor : 0xFFFF) << 32)
+          ^ ((uint64_t)(g->blend_enable ? g->blend_dfactor : 0xFFFF) << 16)
+          ^ nv2a_pb_stream_tag();
+    for (i = 0; i < nseen; i++)
+        if (seen[i] == k)
+            return;
+    seen[nseen++] = k;
+    {
+        const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+        fprintf(stderr, "[HDRTEX] tex %016llx fmt 0x%02x %ux%u blend %d sf 0x%x df 0x%x tag %u flip %llu"
+                " atest %d func 0x%x ref %u\n",
+                (unsigned long long)h, t->color, t->width, t->height, g->blend_enable,
+                g->blend_sfactor, g->blend_dfactor, nv2a_pb_stream_tag(),
+                (unsigned long long)s_presents, v->atest_enable, v->atest_func, v->atest_ref);
+    }
+}
+
+/* BO-110: RECOMP_DEBUG=hdr_dump=<prefix>: the presented frame of each
+ * fb_dump_at flip, hcw x hch host pixels, as 32-bit float RGBA after a
+ * 16-byte header ("HDR1", w, h, 1 when the targets were half float). */
+static void hdr_dump(RenderTarget *rt, uint32_t w, uint32_t h)
+{
+    const char *prefix = recomp_env(RENV_HDR_DUMP);
+    uint32_t flip = nv2a_pb_gpu_state()->flips, hdr[4], y, x;
+    char path[1100];
+    FILE *f;
+
+    static uint32_t watch_last, watch_n;
+    int watched = 0;
+    if (s_hdr_watch_hit) {
+        s_hdr_watch_hit = 0;
+        if (watch_n < 60 && flip - watch_last >= 20) {
+            watched = 1;
+            watch_last = flip;
+            watch_n++;
+        }
+    }
+    if (!prefix || !*prefix || !w || !h || !(watched || nv2a_pb_dump_at_listed(flip)))
+        return;
+    rt_managed_sync(rt);
+    if (s_cmd)
+        flush(1);
+    else if (s_last_cmd && [s_last_cmd status] < MTLCommandBufferStatusCompleted)
+        [s_last_cmd waitUntilCompleted];
+    snprintf(path, sizeof path, "%sflip_%05u.rgbaf", prefix, flip);
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    memcpy(&hdr[0], "HDR1", 4);
+    hdr[1] = w;
+    hdr[2] = h;
+    hdr[3] = (uint32_t)tex_is_half(rt->tex);
+    fwrite(hdr, 4, 4, f);
+    if (tex_is_half(rt->tex)) {
+        uint16_t *row = (uint16_t *)malloc((size_t)w * 8u);
+        float *out = (float *)malloc((size_t)w * 16u);
+        for (y = 0; row && out && y < h; y++) {
+            [rt->tex getBytes:row bytesPerRow:w * 8u fromRegion:MTLRegionMake2D(0, y, w, 1)
+                  mipmapLevel:0];
+            for (x = 0; x < w * 4u; x++)
+                out[x] = hdr_h2f(row[x]);
+            fwrite(out, 16, w, f);
+        }
+        free(row);
+        free(out);
+    } else {
+        uint8_t *row = (uint8_t *)malloc((size_t)w * 4u);
+        float *out = (float *)malloc((size_t)w * 16u);
+        for (y = 0; row && out && y < h; y++) {
+            [rt->tex getBytes:row bytesPerRow:w * 4u fromRegion:MTLRegionMake2D(0, y, w, 1)
+                  mipmapLevel:0];
+            for (x = 0; x < w; x++) {
+                out[x * 4 + 0] = row[x * 4 + 2] / 255.0f;
+                out[x * 4 + 1] = row[x * 4 + 1] / 255.0f;
+                out[x * 4 + 2] = row[x * 4 + 0] / 255.0f;
+                out[x * 4 + 3] = row[x * 4 + 3] / 255.0f;
+            }
+            fwrite(out, 16, w, f);
+        }
+        free(row);
+        free(out);
+    }
+    fclose(f);
+    fprintf(stderr, LOGP "hdr_dump: flip %u %ux%u %s -> %s\n", flip, w, h,
+            tex_is_half(rt->tex) ? "half" : "bgra8", path);
+    /* The scene snapshot of the same frame, when there is one. */
+    if (s_hdr_scene_ok && s_hdr_scene && s_hdr_scene_of == rt->offset
+            && tex_is_half(s_hdr_scene) && [s_hdr_scene width] >= w && [s_hdr_scene height] >= h) {
+        uint16_t *row = (uint16_t *)malloc((size_t)w * 8u);
+        float *out = (float *)malloc((size_t)w * 16u);
+        snprintf(path, sizeof path, "%sflip_%05u_scene.rgbaf", prefix, flip);
+        f = fopen(path, "wb");
+        if (f && row && out) {
+            fwrite(hdr, 4, 4, f);
+            for (y = 0; y < h; y++) {
+                [s_hdr_scene getBytes:row bytesPerRow:w * 8u
+                           fromRegion:MTLRegionMake2D(0, y, w, 1) mipmapLevel:0];
+                for (x = 0; x < w * 4u; x++)
+                    out[x] = hdr_h2f(row[x]);
+                fwrite(out, 16, w, f);
+            }
+        }
+        if (f)
+            fclose(f);
+        free(row);
+        free(out);
+    }
+}
+
+/* BO-110: at every flip the stream tag goes back to UI (a frame without the
+ * title's scene marks -- menus, movies, loading -- is all paper white); with
+ * hdr_ab the targets change format every n flips: every target is written
+ * back (when presented) and made again in the other format from the next
+ * draw on, as at a start. */
+static int s_hdr_said_switch;   /* log the present after a switch */
+
+static void hdr_flip(void)
+{
+    uint32_t flip = nv2a_pb_gpu_state()->flips;
+    int want;
+    int i, nkeep = 0;
+    static RenderTarget keep[RT_MAX];
+
+    nv2a_pb_stream_tag_set(0);
+    s_hdr_scene_ok = 0;
+    s_hdr_pend = NULL;
+    if ((flip % 600u) == 0 && s_hdr)
+        fprintf(stderr, LOGP "HDR: flip %u, %s; draws %llu UI-bound, %llu scene-bound, %llu snapshots\n",
+                flip, s_hdr ? "on" : "off", (unsigned long long)s_hdr_draws[0],
+                (unsigned long long)s_hdr_draws[1], (unsigned long long)s_hdr_snaps);
+    want = s_hdr_ab ? ((flip / (uint32_t)s_hdr_ab) & 1u) == 0 : nv2a_host_hdr_active();
+    nv2a_texrep_flip(flip);             /* BO-203, hdr_image_ab */
+    if (want == s_hdr)
+        return;
+    @autoreleasepool {
+        end_encoder();
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            if (!rt->tex)
+                continue;
+            if (rt->presented) {
+                keep[nkeep] = *rt;
+                keep[nkeep].tex = nil;
+                keep[nkeep].opaque = nil;
+                nkeep++;
+            }
+            rt_free(rt);
+        }
+        for (i = 0; i < CUBE_MAX; i++) {
+            [s_cube[i].tex release];
+            memset(&s_cube[i], 0, sizeof s_cube[i]);
+        }
+        [s_self.tex release];
+        s_self.tex = nil;
+    }
+    s_hdr = want;
+    nv2a_texrep_set_hdr(want);          /* BO-203: textures with an HDR picture upload again */
+    memset(s_fs_memo, 0, sizeof s_fs_memo);
+    for (i = 0; i < PSO_MEMOS; i++)
+        s_pso_last[i] = -1;
+    /* The targets a flip has shown come back at once, in the new format,
+     * at their old size, from the bytes rt_free wrote back (the Vulkan
+     * backend's hdr_flip: left to the next draw, one is made at that draw's
+     * clip, 640x464 on Burnout 3's loading screens, which present_target
+     * never takes for the 640x480 frame). */
+    @autoreleasepool {
+        for (i = 0; i < nkeep; i++) {
+            RenderTarget *rt = &s_rt[i];
+            if (rt_make(rt, keep[i].offset, keep[i].w, keep[i].h, keep[i].pitch, keep[i].swz))
+                rt->presented = 1;
+        }
+    }
+    s_hdr_said_switch = !s_hdr_ab || flip < 4000u;
+    if (!s_hdr_ab || flip < 4000u)
+        fprintf(stderr, LOGP "HDR%s: flip %u, HDR %s\n", s_hdr_ab ? " A/B" : "", flip, want ? "on" : "off");
+}
+
 static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     RenderTarget *rt = NULL;
@@ -4519,7 +5032,15 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
         @autoreleasepool {
             int wb;
             id<MTLTexture> slot = nil;
+            if (s_hdr && s_hdr_pend)
+                hdr_snapshot();        /* a view with nothing drawn after it */
             rt = present_target(surface_offset);
+            if (s_hdr_said_switch) {
+                /* The first present after an HDR switch: on the GPU path still. */
+                s_hdr_said_switch = 0;
+                fprintf(stderr, LOGP "HDR: present after the switch: surface 0x%08X (%s)\n",
+                        surface_offset, rt ? "drawn here" : "guest bytes");
+            }
             if (rt) {
                 present_extent(rt, &cw, &ch);
                 hcw = (uint32_t)((uint64_t)cw * rt->hw / rt->w);
@@ -4551,6 +5072,12 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                  * thread's pass that shows it is committed after it. */
                 t = prof_t();
                 slot = (id<MTLTexture>)xbox_FramebufferWindowBackTexture(hcw, hch);
+                if (slot && [slot pixelFormat] != [rt->tex pixelFormat]) {
+                    static int said;   /* BO-110: the presenter's slots are another format */
+                    if (!said++)
+                        fprintf(stderr, LOGP "HDR: window slot format differs; frame not shown\n");
+                    slot = nil;
+                }
                 if (slot) {
                     id<MTLBlitCommandEncoder> b;
                     ensure_cmd();
@@ -4561,6 +5088,21 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                              toTexture:slot destinationSlice:0 destinationLevel:0
                      destinationOrigin:MTLOriginMake(0, 0, 0)];
                     [b endEncoding];
+                    if (s_hdr) {
+                        /* BO-110: the scene snapshot beside the frame. */
+                        int ok = s_hdr_scene_ok && s_hdr_scene && s_hdr_scene_of == rt->offset
+                                 && [s_hdr_scene width] >= hcw && [s_hdr_scene height] >= hch;
+                        id<MTLTexture> ss = (id<MTLTexture>)xbox_FramebufferWindowBackScene(hcw, hch, ok);
+                        if (ok && ss && [ss pixelFormat] == [s_hdr_scene pixelFormat]) {
+                            b = [s_cmd blitCommandEncoder];
+                            [b copyFromTexture:s_hdr_scene sourceSlice:0 sourceLevel:0
+                                  sourceOrigin:MTLOriginMake(0, 0, 0)
+                                    sourceSize:MTLSizeMake(hcw, hch, 1)
+                                     toTexture:ss destinationSlice:0 destinationLevel:0
+                             destinationOrigin:MTLOriginMake(0, 0, 0)];
+                            [b endEncoding];
+                        }
+                    }
                     flush(0);
                     xbox_FramebufferWindowPublishTexture();
                     s_window_presents++;
@@ -4588,11 +5130,14 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 if (addr == rt->addr && pitch == rt->pitch)
                     rt_own_reset(rt);
             }
+            if (rt && (s_hdr_req || s_hdr))
+                hdr_dump(rt, hcw, hch);
             t = prof_t();
             frame_advance();
             prof_add(&s_pa.wait, t);
         }
     }
+    hdr_flip();
     s_presents++;
     flip_log(surface_offset, rt);
     mf_flip();
@@ -4660,8 +5205,7 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
         }
         if (cap >= need) {
             t = prof_t();
-            [rt->tex getBytes:px bytesPerRow:cw * 4u
-                   fromRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0];
+            rt_get_bytes(rt->tex, px, cw * 4u, MTLRegionMake2D(0, 0, cw, ch));
             prof_add(&s_pa.winrb, t);
             t = prof_t();
             xbox_FramebufferWindowPresentPixels(px, cw, ch, cw * 4u, 4u);

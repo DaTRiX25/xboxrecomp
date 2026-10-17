@@ -36,6 +36,33 @@ static void settings_section(xbox_report_buf *b)
         xbox_report_printf(b, "(a setting changed in this run takes effect at the next start)\n");
 }
 
+/* BO-208: gaps_<backend>.bin, the keys the render thread had to build
+ * itself (pipeline keys, not compiled code): the cache folder's own file,
+ * whichever backend wrote it. "" when there is none. */
+static const char *gaps_path(void)
+{
+    static const char *const name[] = { "gaps_vulkan.bin", "gaps_metal.bin", "gaps_d3d11.bin" };
+    static char path[640];
+    nv2a_pcache_stat st;
+    char dir[600];
+    int i;
+
+    nv2a_pcache_stat_get(&st);
+    if (st.active)
+        snprintf(dir, sizeof dir, "%s", st.dir);
+    else if (!nv2a_pcache_dir(nv2a_host_opts()->shader_cache, nv2a_pcache_app(), dir, sizeof dir))
+        return "";
+    for (i = 0; i < 3; i++) {
+        FILE *f;
+        snprintf(path, sizeof path, "%s/%s", dir, name[i]);
+        if ((f = fopen(path, "rb")) != NULL) {
+            fclose(f);
+            return path;
+        }
+    }
+    return "";
+}
+
 static void shader_section(xbox_report_buf *b)
 {
     static const char *const kind[3] = { "vertex shaders", "fragment shaders", "pipelines" };
@@ -63,6 +90,7 @@ static void shader_section(xbox_report_buf *b)
 void xbox_SettingsReportRegister(void)
 {
     xbox_report_attach("settings.toml", settings_path, 65536, 0);
+    xbox_report_attach("gaps.bin", gaps_path, 262144, 0);
     xbox_report_section("settings-effective.txt", "the settings: value, source, default, variable",
                         settings_section);
     xbox_report_section("stats.txt", "shaders and pipelines", shader_section);
